@@ -129,7 +129,6 @@ int run_case(std::string_view label, std::int32_t hidden, std::int32_t value_row
     DeviceBuffer record_state       = to_device(state_before);
     DeviceBuffer device_valid;
     if (!dense) { device_valid = to_device(valid_columns); }
-    DeviceBuffer device_snapshot = to_device(snapshot_bases);
 
     GuardedBf16Tensor snapshot_query(qk_rows, aggregate_columns);
     GuardedBf16Tensor snapshot_key(qk_rows, aggregate_columns);
@@ -145,12 +144,21 @@ int run_case(std::string_view label, std::int32_t hidden, std::int32_t value_row
     Tensor conv_weight(device_conv_weight.span(), DType::BF16, {channels, 4});
     Tensor snapshot_state_view(snapshot_state.span(), DType::BF16, {channels, 3, slots});
     RecordStateFixture snapshot_history(snapshot_state_view, 2);
-    auto snapshot_offsets                = snapshot_history.record_offsets(snapshot_initial_slots);
-    DeviceBuffer device_snapshot_initial = to_device(snapshot_offsets);
+    auto snapshot_offsets = snapshot_history.record_offsets(snapshot_initial_slots);
     Tensor record_state_view(record_state.span(), DType::BF16, {channels, 3, source_slots});
     RecordStateFixture record_history(record_state_view, 2);
-    auto initial_offsets        = record_history.record_offsets(initial_slots);
-    DeviceBuffer device_initial = to_device(initial_offsets);
+    auto initial_offsets          = record_history.record_offsets(initial_slots);
+    const auto inactive_selectors = [&] {
+        for (int row = 0; row < batch; ++row)
+            if (!valid_columns[row]) {
+                snapshot_offsets[row] = initial_offsets[row] = -1;
+                snapshot_bases[row]                          = -1;
+            }
+    };
+    inactive_selectors();
+    DeviceBuffer device_snapshot         = to_device(snapshot_bases);
+    DeviceBuffer device_snapshot_initial = to_device(snapshot_offsets);
+    DeviceBuffer device_initial          = to_device(initial_offsets);
     Tensor valid;
     if (!dense) { valid = Tensor(device_valid.span(), DType::I32, {batch}); }
     Tensor initial(device_initial.span(), DType::I64, {batch});
@@ -205,7 +213,7 @@ int run_case(std::string_view label, std::int32_t hidden, std::int32_t value_row
                                    activation_bits.size() * sizeof(std::uint16_t),
                                    cudaMemcpyHostToDevice, stream));
         if (!dense) {
-            valid_columns[0] = 1;
+            if (valid_columns[0]) valid_columns[0] = 1;
             CUDA_CHECK(cudaMemcpyAsync(device_valid.data(), valid_columns.data(),
                                        device_valid.size(), cudaMemcpyHostToDevice, stream));
         }
@@ -215,6 +223,7 @@ int run_case(std::string_view label, std::int32_t hidden, std::int32_t value_row
         }
         initial_offsets  = record_history.record_offsets(initial_slots);
         snapshot_offsets = snapshot_history.record_offsets(snapshot_initial_slots);
+        inactive_selectors();
         CUDA_CHECK(cudaMemcpyAsync(device_initial.data(), initial_offsets.data(),
                                    device_initial.size(), cudaMemcpyHostToDevice, stream));
         CUDA_CHECK(cudaMemcpyAsync(device_snapshot_initial.data(), snapshot_offsets.data(),

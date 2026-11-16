@@ -74,7 +74,8 @@ void require_q4(const Weight& head) {
 
 void require_no_weight_overlap(const Weight& head, const Tensor& hidden,
                                const Tensor& candidate_ids, const Tensor& candidate_scores,
-                               const Tensor* id_map, const detail::LinearTopKWorkspace& scratch) {
+                               const Tensor* id_map, const detail::LinearTopKWorkspace& scratch,
+                               const Tensor& accumulated) {
     const std::size_t code_bytes = head.qtype == QType::Q4_G64_FP16
                                        ? static_cast<std::size_t>(head.n) * head.k / 2
                                        : static_cast<std::size_t>(head.n) * head.k;
@@ -91,7 +92,8 @@ void require_no_weight_overlap(const Weight& head, const Tensor& hidden,
                             &scratch.group_keys,
                             &scratch.secondary_keys,
                             &scratch.group_done,
-                            id_map};
+                            id_map,
+                            &accumulated};
     for (const Tensor* tensor : tensors) {
         if (tensor == nullptr) { continue; }
         if (overlaps(head.qdata, code_bytes, tensor->data, tensor->bytes()) ||
@@ -103,10 +105,11 @@ void require_no_weight_overlap(const Weight& head, const Tensor& hidden,
 
 void require_scratch_nonoverlap(const Tensor& hidden, const Tensor& candidate_ids,
                                 const Tensor& candidate_scores, const Tensor* id_map,
-                                const detail::LinearTopKWorkspace& scratch) {
+                                const detail::LinearTopKWorkspace& scratch,
+                                const Tensor& accumulated) {
     const Tensor* live[]{&hidden, &candidate_ids, &candidate_scores, id_map};
     const Tensor* work[]{&scratch.partial_keys, &scratch.group_keys, &scratch.secondary_keys,
-                         &scratch.group_done};
+                         &scratch.group_done, &accumulated};
     for (const Tensor* lhs : live) {
         if (lhs == nullptr) { continue; }
         for (const Tensor* rhs : work) {
@@ -140,11 +143,11 @@ void validate_topk_head(const Weight& head, LinearTopKProfile profile, const Ten
 
 void validate_topk_storage(const Weight& head, const Tensor& hidden, const Tensor& ids,
                            const Tensor& scores, const Tensor* id_map,
-                           const LinearTopKWorkspace& scratch) {
+                           const LinearTopKWorkspace& scratch, const Tensor& accumulated) {
     if (id_map &&
         (overlaps(hidden, *id_map) || overlaps(ids, *id_map) || overlaps(scores, *id_map)))
         throw std::invalid_argument("linear_topk: id map overlaps input or output");
-    require_scratch_nonoverlap(hidden, ids, scores, id_map, scratch);
-    require_no_weight_overlap(head, hidden, ids, scores, id_map, scratch);
+    require_scratch_nonoverlap(hidden, ids, scores, id_map, scratch, accumulated);
+    require_no_weight_overlap(head, hidden, ids, scores, id_map, scratch, accumulated);
 }
 } // namespace ninfer::ops::detail

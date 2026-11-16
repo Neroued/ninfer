@@ -1,5 +1,6 @@
 #include "ops/linear/split/nvfp4/shapes/n16384_k5120/launch.h"
 #include "core/weight.h"
+#include "core/platform.h"
 #include "core/device.h"
 #include "ops/linear/common/output.cuh"
 #include "ops/linear/kernels/nvfp4/nvfp4_schedule.cuh"
@@ -20,10 +21,10 @@ using M128N128Resident  = Nvfp4A4MmaSchedule<128, 128, 256, 4, 2, 1, 2>;
 // The quantizer and contraction must select the same activation scale layout.
 constexpr bool uses_tma(std::int32_t tokens) { return tokens >= 512; }
 
-template <class Schedule>
+template <class Schedule, bool Programmatic = false>
 void launch_gemm(const Weight& weight, std::span<const Tensor> outputs, Nvfp4A4Workspace workspace,
                  std::int32_t tokens, cudaStream_t stream) {
-    launch_nvfp4_a4_mma<Nvfp4ScheduleInstance<Schedule, Geometry::kInputRows>>(
+    launch_nvfp4_a4_mma<Nvfp4ScheduleInstance<Schedule, Geometry::kInputRows>, Programmatic>(
         nvfp4_a4_operands(weight, workspace, tokens, Nvfp4ScaleLayout::RowMajor),
         LinearBf16SegmentedOutput<10240, 6144>{static_cast<__nv_bfloat16*>(outputs[0].data),
                                                static_cast<__nv_bfloat16*>(outputs[1].data)},
@@ -36,8 +37,11 @@ void launch_a4(const Tensor& x, const Weight& weight, std::span<const Tensor> ou
                Nvfp4A4Workspace workspace, cudaStream_t stream) {
     const std::int32_t tokens = x.ne[1];
     const auto layout = uses_tma(tokens) ? Nvfp4ScaleLayout::Tiled256 : Nvfp4ScaleLayout::RowMajor;
-    launch_nvfp4_a4_quantize(x, weight, workspace, layout, stream);
-    if (uses_tma(tokens)) {
+    const bool programmatic = NINFER_TARGET_RTX5090 && tokens <= 16;
+    launch_nvfp4_a4_quantize(x, weight, workspace, layout, stream, programmatic);
+    if (programmatic) {
+        launch_gemm<M32N64, true>(weight, outputs, workspace, tokens, stream);
+    } else if (uses_tma(tokens)) {
         launch_a4_tma(nvfp4_a4_operands(weight, workspace, tokens, layout), outputs, stream);
     } else if (tokens <= 64) {
         launch_gemm<M32N64>(weight, outputs, workspace, tokens, stream);

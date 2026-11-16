@@ -4,6 +4,8 @@
 
 namespace ninfer::ops::detail::moe_cuda::groupwise_int {
 
+enum class GroupDensity { Any, Spread, Packed };
+
 struct GroupedInfo {
     int jobs;
     int direct;
@@ -43,6 +45,7 @@ struct GroupedPlan {
     int shared_columns     = 0;
     int direct_numerator   = 0;
     int direct_denominator = 0;
+    int block_k            = 64;
 };
 
 struct Plan {
@@ -59,6 +62,7 @@ struct ExpertStorage {
     void* shared_activation  = nullptr;
     float* routed_sum        = nullptr;
     GroupedStorage groups;
+    TokenValidity token_validity;
 };
 
 void launch_group_count(const ExpertRoutes& routes, ExpertSubset subset,

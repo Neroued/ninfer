@@ -95,7 +95,6 @@ void row(Encoder& out, const WorkRow& r, std::uint32_t rank) {
     integers(out, r.ids);
     out.boolean(r.control_last_token.has_value());
     if (r.control_last_token) out.i32(*r.control_last_token);
-    integers(out, r.window_ends);
     integers(out, r.rope_positions);
     for (auto value : r.previous_rope) out.i32(value);
     sampling(out, r.sampling);
@@ -115,7 +114,6 @@ WorkRow row(Decoder& in, std::uint32_t rank) {
     for (auto& value : r.ple_raw_tail) value = in.i32();
     r.ids = integers<TokenId>(in);
     if (in.boolean()) r.control_last_token = in.i32();
-    r.window_ends    = integers<std::uint32_t>(in);
     r.rope_positions = integers<std::int32_t>(in);
     for (auto& value : r.previous_rope) value = in.i32();
     r.sampling          = sampling(in);
@@ -168,6 +166,8 @@ void encode_work(Encoder& out, const Work& work, const VisionInputBindings& inpu
             using T = std::decay_t<decltype(v)>;
             if constexpr (std::is_same_v<T, ForwardWork>) {
                 out.u8(1);
+                out.u32(v.shape.rows);
+                out.u32(v.shape.attention_rows);
                 out.u8(static_cast<std::uint8_t>(v.kind));
                 out.u8(static_cast<std::uint8_t>(v.sample));
                 rows(out, v.rows, rank);
@@ -185,6 +185,8 @@ void encode_work(Encoder& out, const Work& work, const VisionInputBindings& inpu
                 }
             } else if constexpr (std::is_same_v<T, MtpWork>) {
                 out.u8(2);
+                out.u32(v.shape.rows);
+                out.u32(v.shape.attention_rows);
                 rows(out, v.rows, rank);
                 integers(out, v.draft_extents);
             } else if constexpr (std::is_same_v<T, ContextWork>) {
@@ -199,6 +201,8 @@ void encode_work(Encoder& out, const Work& work, const VisionInputBindings& inpu
                 for (auto id : v.releases) residency(out, id);
             } else {
                 out.u8(4);
+                out.u32(v.shape.rows);
+                out.u32(v.shape.attention_rows);
                 row(out, v.row, rank);
                 integers(out, v.targets);
                 out.u32(v.first_target_column);
@@ -214,6 +218,7 @@ Work decode_work(Decoder& in, const VisionInputBindings& inputs) {
     switch (in.u8()) {
     case 1: {
         ForwardWork v;
+        v.shape  = {in.u32(), in.u32()};
         v.kind   = static_cast<ForwardKind>(in.u8());
         v.sample = static_cast<SampleKind>(in.u8());
         v.rows   = rows(in, rank);
@@ -231,9 +236,11 @@ Work decode_work(Decoder& in, const VisionInputBindings& inputs) {
         work.operation = std::move(v);
         break;
     }
-    case 2:
-        work.operation = MtpWork{rows(in, rank), integers<std::uint32_t>(in)};
+    case 2: {
+        const PhysicalBatchShape shape{in.u32(), in.u32()};
+        work.operation = MtpWork{rows(in, rank), integers<std::uint32_t>(in), shape};
         break;
+    }
     case 3: {
         ContextWork v;
         v.bindings.resize(in.count(68));
@@ -249,6 +256,7 @@ Work decode_work(Decoder& in, const VisionInputBindings& inputs) {
     }
     case 4: {
         ScoreWork v;
+        v.shape               = {in.u32(), in.u32()};
         v.row                 = row(in, rank);
         v.targets             = integers<TokenId>(in);
         v.first_target_column = in.u32();

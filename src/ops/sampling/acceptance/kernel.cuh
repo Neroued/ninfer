@@ -66,23 +66,22 @@ __device__ __forceinline__ void speculative_sparse_warp_store(TokenRows drafts, 
                                                               int* licensed_counts) {
     const int lane = threadIdx.x & 31;
     if (lane <= k)
-        licensed_tokens[row * (k + 1) + lane] = lane < accepted_count    ? drafts[row][lane]
-                                                : lane == accepted_count ? terminal
-                                                                         : 0;
-    if (lane == 0) {
-        licensed_counts[row] = accepted_count + 1;
-
-    }
+        licensed_tokens[std::int64_t(row) * (k + 1) + lane] = lane < accepted_count
+                                                                  ? drafts[row][lane]
+                                                              : lane == accepted_count ? terminal
+                                                                                       : 0;
+    if (lane == 0) { licensed_counts[row] = accepted_count + 1; }
 }
 
 __device__ __forceinline__ void
 speculative_sparse_warp_greedy(const int* target_tokens, TokenRows drafts, int* licensed_tokens,
                                int* licensed_counts, int row, int extent, int k) {
     const int lane = threadIdx.x & 31;
-    const bool reject   = lane < extent && target_tokens[row * (k + 1) + lane] != drafts[row][lane];
+    const bool reject =
+        lane < extent && target_tokens[std::int64_t(row) * (k + 1) + lane] != drafts[row][lane];
     const unsigned mask = __ballot_sync(0xffffffffU, reject);
     const int a         = mask ? __ffs(mask) - 1 : extent;
-    const int terminal  = target_tokens[row * (k + 1) + a];
+    const int terminal  = target_tokens[std::int64_t(row) * (k + 1) + a];
     speculative_sparse_warp_store(drafts, k, row, a, terminal, licensed_tokens, licensed_counts);
 }
 
@@ -108,7 +107,7 @@ speculative_sparse_warp_accept(Workspace workspace, TokenRows drafts, const int*
                     break;
                 }
             }
-            const int at   = (row * k + lane) * kSparseSpeculativeCandidates;
+            const auto at  = (std::int64_t(row) * k + lane) * kSparseSpeculativeCandidates;
             const float qd = speculative_sparse_probability(candidate_ids + at, proposal_q + at, d);
             const float u  = sampling_uniform(cfg.seed, old_length + lane + 1,
                                               kSamplePurposeSpeculativeAccept, 0);
@@ -129,10 +128,10 @@ speculative_sparse_warp_accept(Workspace workspace, TokenRows drafts, const int*
             token        = workspace.dist_idx[at];
             weight       = workspace.dist_prob[at];
             if (a < extent) {
-                const int q_at = (row * k + a) * kSparseSpeculativeCandidates;
-                weight         = fmaxf(weight - speculative_sparse_probability(candidate_ids + q_at,
-                                                                               proposal_q + q_at, token),
-                                       0.0f);
+                const auto q_at = (std::int64_t(row) * k + a) * kSparseSpeculativeCandidates;
+                weight = fmaxf(weight - speculative_sparse_probability(candidate_ids + q_at,
+                                                                       proposal_q + q_at, token),
+                               0.0f);
             }
         }
         float cdf = weight;
@@ -158,81 +157,21 @@ speculative_sparse_warp_accept(Workspace workspace, TokenRows drafts, const int*
     speculative_sparse_warp_store(drafts, k, row, a, terminal, licensed_tokens, licensed_counts);
 }
 
-template <class S>
-__launch_bounds__(S::kSamplerBlock) __global__ void speculative_sampling_partial_topk_kernel(
-    const __nv_bfloat16* logits, TokenRows drafts, const std::int32_t* current_extents,
-    const SamplingConfig* configs, std::int32_t token_domain, std::int32_t physical_rows,
-    std::int32_t cols, std::int32_t k, Workspace workspace, std::size_t workspace_row_stride) {
-    const int row     = static_cast<int>(blockIdx.z);
-    const int col     = static_cast<int>(blockIdx.y);
-    const int partial = static_cast<int>(blockIdx.x);
-    int extent        = current_extents[row];
-    extent            = extent < 0 ? 0 : (extent > k ? k : extent);
-    if (col > extent) { return; }
-    const SamplingConfig cfg = configs[row];
-    const bool greedy        = !(cfg.temperature > 0.0f);
-    const bool penalties     = cfg.presence_penalty != 0.0f || cfg.frequency_penalty != 0.0f;
-    if (greedy && !penalties && cfg.mask.words == nullptr) { return; }
-    workspace = speculative_workspace_row(workspace, workspace_row_stride, row);
-    if (partial == 0 && threadIdx.x == 0) {
-        workspace.group_done[col] = 0;
-        if (col == 0) { *workspace.speculative_finalize_count = 0; }
-    }
+struct SpeculativeSelectionInput {
+    const __nv_bfloat16* logits;
+    TokenRows drafts;
+    const std::int32_t* current_extents;
+    const SamplingConfig* configs;
+    const std::int32_t* live_rows;
+    std::int32_t token_domain, physical_rows, columns, draft_count;
+    Workspace workspace;
+    std::size_t row_stride;
+    std::int32_t first_row;
+};
 
-    __shared__ SamplingPartialTopKStorage<S> topk_storage;
-    __shared__ unsigned long long greedy_warp_keys[S::kSamplerBlock / 32];
-
-    const int cap                  = greedy ? 1 : sampling_candidate_cap(cfg, token_domain);
-    const std::int64_t base        = (static_cast<std::int64_t>(row) * cols + col) * physical_rows;
-    const auto row_drafts          = drafts[row];
-    const int tile_start           = partial * S::kSamplerPartialTileItems;
-    if (!penalties) {
-        unsigned int keys[S::kSamplerItemsPerThread];
-#pragma unroll
-        for (int item = 0; item < S::kSamplerItemsPerThread; ++item) {
-            const int tile_index = item * blockDim.x + threadIdx.x;
-            const int v          = tile_start + tile_index;
-            keys[item]           = (v < token_domain &&
-                          (!cfg.mask.words ||
-                           (cfg.mask.words[col * cfg.mask.stride + v / 32] & (1u << (v % 32)))))
-                                       ? sampling_bf16_tile_sort_key<S>(logits[base + v], tile_index)
-                                       : 0u;
-        }
-        sampling_store_bf16_tile_topk<S>(keys, cap, tile_start, workspace, col, partial,
-                                         topk_storage.bf16);
-        return;
-    }
-
-    unsigned long long keys[S::kSamplerItemsPerThread];
-    // Column col's penalty overlay is the first `col` drafts (see accept loop);
-    // applying it before top-k selection lets it change the candidate set, not
-    // just the post-truncation probabilities.
-#pragma unroll
-    for (int item = 0; item < S::kSamplerItemsPerThread; ++item) {
-        const int v = tile_start + item * blockDim.x + threadIdx.x;
-        if (v < token_domain) {
-            const __nv_bfloat16 raw = logits[base + v];
-            keys[item]              = score_id_order_key(
-                sampling_adjusted_logit(__bfloat162float(raw), v, cfg, row_drafts, col), v);
-        } else {
-            keys[item] = 0ull;
-        }
-    }
-    if (greedy) {
-        unsigned long long best = keys[0];
-#pragma unroll
-        for (int item = 1; item < S::kSamplerItemsPerThread; ++item) {
-            if (keys[item] > best) { best = keys[item]; }
-        }
-        best = block_reduce_max_key(best, greedy_warp_keys);
-        if (threadIdx.x == 0) {
-            const int off               = sampling_partial_offset(workspace, col, partial, 0);
-            workspace.partial_keys[off] = best;
-        }
-        return;
-    }
-    sampling_store_tile_topk<S>(keys, cap, workspace, col, partial, topk_storage.fp32);
-}
+void launch_speculative_selection(const SpeculativeSelectionInput& input, std::int32_t rows,
+                                  std::int32_t partials, std::int32_t tile,
+                                  CudaExecutionView execution);
 
 template <class S, bool SparseProposal>
 __launch_bounds__(S::kSamplerGroupBlock) __global__ void speculative_sampling_group_finalize_kernel(
@@ -241,19 +180,27 @@ __launch_bounds__(S::kSamplerGroupBlock) __global__ void speculative_sampling_gr
     const std::int32_t* base_positions, std::int32_t* licensed_tokens,
     std::int32_t* licensed_counts, const SamplingConfig* configs, std::int32_t token_domain,
     std::int32_t cols, std::int32_t partial_blocks, std::int32_t group_count, Workspace workspace,
-    std::size_t workspace_row_stride) {
-    const int row   = static_cast<int>(blockIdx.z);
+    std::size_t workspace_row_stride, const std::int32_t* live, std::int32_t row_begin) {
+    const int row   = row_begin + static_cast<int>(blockIdx.z);
     const int group = static_cast<int>(blockIdx.x);
     const int col   = static_cast<int>(blockIdx.y);
     const int tid   = threadIdx.x;
     const int k     = cols - 1;
-    int extent      = current_extents[row];
-    extent          = extent < 0 ? 0 : (extent > k ? k : extent);
+    if (live && !live[row]) {
+        if (group == 0 && col == 0) {
+            for (int column = tid; column < cols; column += blockDim.x)
+                licensed_tokens[std::int64_t(row) * cols + column] = 0;
+            if (tid == 0) licensed_counts[row] = 0;
+        }
+        return;
+    }
+    int extent = current_extents[row];
+    extent     = extent < 0 ? 0 : (extent > k ? k : extent);
     if (col > extent) { return; }
     const SamplingConfig cfg        = configs[row];
-    const std::int32_t* row_targets = target_tokens + row * cols;
+    const std::int32_t* row_targets = target_tokens + std::int64_t(row) * cols;
     const auto row_drafts           = drafts[row];
-    std::int32_t* row_tokens        = licensed_tokens + row * cols;
+    std::int32_t* row_tokens        = licensed_tokens + std::int64_t(row) * cols;
     const bool greedy               = !(cfg.temperature > 0.0f);
     const bool penalties            = cfg.presence_penalty != 0.0f || cfg.frequency_penalty != 0.0f;
 

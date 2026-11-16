@@ -32,6 +32,7 @@ struct Nvfp4Tuning {
     Nvfp4Pipeline pipeline = Nvfp4Pipeline::K128;
     Nvfp4CachePolicy cache = Nvfp4CachePolicy::Cached;
     int down_row_window    = 0;
+    int queued_ctas_per_sm = 0;
 };
 
 struct Nvfp4LoadSchedule {

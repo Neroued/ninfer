@@ -3,8 +3,10 @@
 #include "ninfer/ops/kda_replay.h"
 
 namespace ninfer::ops::detail::kimi_delta_attention {
+inline constexpr int kHostFoldRows = 8;
+
 struct KdaReplayFoldKernelRows {
-    KdaReplayFoldRow row[8];
+    KdaReplayFoldRow row[kHostFoldRows];
 };
 
 struct KdaReplayFoldDeviceRows {
@@ -13,8 +15,8 @@ struct KdaReplayFoldDeviceRows {
 };
 
 void launch_replay_fold(const KdaReplayRecords&, LinearAttentionStateAllLayersView,
-                        const KdaReplayFoldKernelRows&, int batch, int multiprocessors,
-                        cudaStream_t);
+                        const KdaReplayFoldKernelRows&, int row_begin, int batch,
+                        int multiprocessors, cudaStream_t);
 void launch_replay_fold(const KdaReplayRecords&, LinearAttentionStateAllLayersView,
                         const KdaReplayFoldDeviceRows&, int batch, int multiprocessors,
                         cudaStream_t);

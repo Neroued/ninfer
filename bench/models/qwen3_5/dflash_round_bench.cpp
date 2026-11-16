@@ -36,7 +36,7 @@ void print_usage(const char* executable) {
     std::cout << "usage: " << executable
               << " [--artifact <model.ninfer>] [--device <id>] [--context <tokens>]"
                  " [--warmup <n>] [--reps <n>] [--draft-tokens <1..15>]"
-                 " [--batch <1..8>]"
+                 " [--batch <n>]"
                  " [--proposal-head full|optimized] [--no-cuda-graph]\n";
 }
 
@@ -102,9 +102,7 @@ Options parse_options(int argc, char** argv) {
     if (options.draft_tokens == 0 || options.draft_tokens > 15) {
         throw std::invalid_argument("--draft-tokens must be in [1,15]");
     }
-    if (options.batch_size == 0 || options.batch_size > ninfer::kMaximumConcurrency) {
-        throw std::invalid_argument("--batch must be in [1,8]");
-    }
+    if (options.batch_size == 0) throw std::invalid_argument("--batch must be positive");
     return options;
 }
 
@@ -156,7 +154,7 @@ int run(const Options& options) {
     auto& instance =
         *std::get<std::unique_ptr<ninfer::bench::qwen3_5::Instance>>(constructed.instance);
     ninfer::bench::qwen3_5::RoundFixture fixture(instance);
-    std::array<q35::SequenceHandle, ninfer::kMaximumConcurrency> active_sequences{};
+    std::vector<q35::SequenceHandle> active_sequences(options.batch_size);
     for (std::uint32_t lane = 0; lane < options.batch_size; ++lane) {
         active_sequences[lane] =
             fixture.bind(prompt_tokens(options.context_tokens), ninfer::runtime::LaneId{lane},

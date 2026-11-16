@@ -150,7 +150,8 @@ struct VectorDownEpilogue : Bf16TmaVectorEpilogue {
                 const int t = i / (BR / 4), r = (i % (BR / 4)) * 4;
                 const int token = tb + t, row = rb + r;
                 const bool valid =
-                    token < logical_tokens && row + 3 < rows &&
+                    output.routed.values && token < logical_tokens && row + 3 < rows &&
+                    output.routed.token_validity.contains(token) &&
                     (!output.routed.valid_tokens || output.routed.valid_tokens[token]);
                 const void* source =
                     valid ? static_cast<const void*>(output.routed.values +
@@ -176,13 +177,17 @@ struct VectorDownEpilogue : Bf16TmaVectorEpilogue {
             for (int mi = 0; mi < C::kMmaRows; ++mi) {
 #pragma unroll
                 for (int ni = 0; ni < C::kMmaTokens; ++ni) {
-                    const int row   = wr * C::kWarpRows + mi * 16 + (lane >> 2);
-                    const int token = wt * C::kWarpTokens + ni * 8 + 2 * (lane & 3);
-                    auto& a         = acc[mi][ni];
-                    a[0] += *at(row, token);
-                    a[1] += *at(row, token + 1);
-                    a[2] += *at(row + 8, token);
-                    a[3] += *at(row + 8, token + 1);
+                    const int row    = wr * C::kWarpRows + mi * 16 + (lane >> 2);
+                    const int token  = wt * C::kWarpTokens + ni * 8 + 2 * (lane & 3);
+                    auto& a          = acc[mi][ni];
+                    const bool live0 = tb + token < logical_tokens &&
+                                       output.routed.token_validity.contains(tb + token);
+                    const bool live1 = tb + token + 1 < logical_tokens &&
+                                       output.routed.token_validity.contains(tb + token + 1);
+                    a[0] = live0 ? a[0] + *at(row, token) : 0;
+                    a[1] = live1 ? a[1] + *at(row, token + 1) : 0;
+                    a[2] = live0 ? a[2] + *at(row + 8, token) : 0;
+                    a[3] = live1 ? a[3] + *at(row + 8, token + 1) : 0;
                 }
             }
             __syncthreads();
@@ -258,7 +263,7 @@ void quantized_medium(const Tensor& x, const SwiGLUWeights& weights, Output outp
     // scalar epilogue avoids staging an all-zero tile just to add it to the result.
     if (has_routed_values(output))
         return quantized<G, D, GuTma, true, false, true>(x, weights, output, storage, physical,
-                                                       limit, stream);
+                                                         limit, stream);
     quantized<G, D, GuTma>(x, weights, output, storage, physical, limit, stream);
 }
 
@@ -298,14 +303,14 @@ void run(const Tensor& x, const SwiGLUWeights& weights, Output output, float lim
         const int narrow_waves = common::div_up(16 * columns, 48);
         if (wide_waves * 192 <= narrow_waves * 128)
             return quantized<Mxfp8A8TmaSchedule<192, 128, 128, 96, 32, 2, 1, 8, true, 1>,
-                             Mxfp8A8TmaSchedule<128, 128, 128, 64, 64, 2, 1, 8, true>, true, true, true, true>(
-                x, weights, output, storage, physical, limit, stream);
+                             Mxfp8A8TmaSchedule<128, 128, 128, 64, 64, 2, 1, 8, true>, true, true,
+                             true, true>(x, weights, output, storage, physical, limit, stream);
         [[fallthrough]];
     }
     case ScaledFp8Kernel::MtpLarge:
         return quantized<Mxfp8A8TmaSchedule<128, 128, 128, 64, 32, 2, 1, 4, true, 1>,
-                         Mxfp8A8TmaSchedule<128, 128, 128, 64, 64, 2, 1, 8, true>, true, true, true, true>(
-            x, weights, output, storage, physical, limit, stream);
+                         Mxfp8A8TmaSchedule<128, 128, 128, 64, 64, 2, 1, 8, true>, true, true, true,
+                         true>(x, weights, output, storage, physical, limit, stream);
     default:
         throw std::logic_error("shared MXFP8 FFN requires its selected kernel plan");
     }

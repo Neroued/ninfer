@@ -197,15 +197,14 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         }
         if (!message.tool_calls.empty()) {
             value["tool_calls"] = Json::array();
-            for (const auto& call : message.tool_calls) {
+            for (std::size_t j = 0; j < message.tool_calls.size(); ++j) {
+                const auto& call = message.tool_calls[j];
+                auto arguments = models::frontend::parse_tool_history_arguments(call.arguments_json,
+                                                                                call.name, i, j);
                 value["tool_calls"].push_back(
                     {{"id", call.id},
                      {"type", "function"},
-                     {"function",
-                      {{"name", call.name},
-                       {"arguments",
-                        (call.arguments_json.empty() ? Json::object()
-                                                     : Json::parse(call.arguments_json))}}}});
+                     {"function", {{"name", call.name}, {"arguments", std::move(arguments)}}}});
             }
         }
         if (!message.tool_call_id.empty()) value["tool_call_id"] = message.tool_call_id;
@@ -256,10 +255,9 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
     RenderedChat result;
     if (context.contains("enable_thinking"))
         result.enable_thinking = context["enable_thinking"].get<bool>();
-    result.continuation_content         = std::move(continuation_content);
-    result.starts_in_reasoning          = layout.starts_in_reasoning;
-    result.media_placeholders           = layout.media_placeholders;
-    result.rewrite_execution_boundaries = layout.execution_boundaries;
+    result.continuation_content = std::move(continuation_content);
+    result.starts_in_reasoning  = layout.starts_in_reasoning;
+    result.media_placeholders   = layout.media_placeholders;
     result.message_boundaries.resize(messages.size() + 1);
     result.cache_boundaries.resize(options.cache_markers.size());
 

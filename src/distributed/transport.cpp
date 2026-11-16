@@ -279,6 +279,17 @@ struct Transport::Impl {
     explicit Impl(TransportLimits limits) : limits(limits) {
         if (!limits.message_bytes || !limits.queued_bytes || !limits.queued_messages)
             throw std::invalid_argument("empty transport capacity");
+        const auto sum = [](std::size_t a, std::size_t b, std::size_t c) {
+            if (a > SIZE_MAX - b || a + b > SIZE_MAX - c)
+                throw std::overflow_error("control receive capacity overflow");
+            return a + b + c;
+        };
+        if (!limits.received_bytes)
+            this->limits.received_bytes =
+                sum(limits.queued_bytes, limits.continuation_bytes, limits.input_bytes);
+        if (!limits.received_messages)
+            this->limits.received_messages =
+                sum(limits.queued_messages, limits.continuation_messages, limits.input_messages);
     }
 
     ~Impl() { stop(); }
@@ -390,17 +401,18 @@ struct Transport::Impl {
         for (;;) {
             if (!peer.reading && peer.position == peer.header.size()) {
                 const auto h = wire::decode_header(peer.header);
-                if (h.bytes > limits.message_bytes)
-                    throw std::runtime_error("rank " + std::to_string(peer.rank) + " message " +
-                                             std::to_string(static_cast<unsigned>(h.kind)) +
-                                             " has " + std::to_string(h.bytes) +
-                                             " bytes; transport limit is " +
-                                             std::to_string(limits.message_bytes));
-                const bool diagnostic = h.kind == wire::Kind::StartupProgress;
-                if (diagnostic && h.bytes > limits.diagnostic_bytes)
-                    throw std::runtime_error("startup diagnostic exceeds its transport capacity");
                 {
                     std::lock_guard lock(mutex);
+                    if (h.bytes > limits.message_bytes)
+                        throw std::runtime_error("rank " + std::to_string(peer.rank) + " message " +
+                                                 std::to_string(static_cast<unsigned>(h.kind)) +
+                                                 " has " + std::to_string(h.bytes) +
+                                                 " bytes; transport limit is " +
+                                                 std::to_string(limits.message_bytes));
+                    const bool diagnostic = h.kind == wire::Kind::StartupProgress;
+                    if (diagnostic && h.bytes > limits.diagnostic_bytes)
+                        throw std::runtime_error(
+                            "startup diagnostic exceeds its transport capacity");
                     if (diagnostic) {
                         peer.discard =
                             receive->diagnostic_count.load(std::memory_order_relaxed) >=
@@ -408,15 +420,14 @@ struct Transport::Impl {
                             h.bytes > limits.diagnostic_bytes -
                                           receive->diagnostic_bytes.load(std::memory_order_relaxed);
                     } else if (receive->count.load(std::memory_order_relaxed) >=
-                                   limits.queued_messages + limits.continuation_messages +
-                                       limits.input_messages ||
-                               h.bytes > limits.queued_bytes + limits.continuation_bytes +
-                                             limits.input_bytes -
+                                   limits.received_messages ||
+                               h.bytes > limits.received_bytes -
                                              receive->bytes.load(std::memory_order_relaxed)) {
                         peer.blocked = true;
                         return;
                     }
                 }
+                const bool diagnostic = h.kind == wire::Kind::StartupProgress;
                 auto reservation =
                     peer.discard
                         ? nullptr
@@ -654,7 +665,28 @@ bool Transport::sending() const {
 
 void Transport::close() noexcept { impl_->stop(); }
 
-const TransportLimits& Transport::limits() const noexcept { return impl_->limits; }
+void Transport::reserve_capacity(const TransportLimits& required) {
+    std::lock_guard lock(impl_->mutex);
+    auto& limits              = impl_->limits;
+    limits.message_bytes      = std::max(limits.message_bytes, required.message_bytes);
+    limits.queued_bytes       = std::max(limits.queued_bytes, required.queued_bytes);
+    limits.queued_messages    = std::max(limits.queued_messages, required.queued_messages);
+    limits.continuation_bytes = std::max(limits.continuation_bytes, required.continuation_bytes);
+    limits.continuation_messages =
+        std::max(limits.continuation_messages, required.continuation_messages);
+    limits.input_bytes         = std::max(limits.input_bytes, required.input_bytes);
+    limits.input_messages      = std::max(limits.input_messages, required.input_messages);
+    limits.received_bytes      = std::max(limits.received_bytes, required.received_bytes);
+    limits.received_messages   = std::max(limits.received_messages, required.received_messages);
+    limits.diagnostic_bytes    = std::max(limits.diagnostic_bytes, required.diagnostic_bytes);
+    limits.diagnostic_messages = std::max(limits.diagnostic_messages, required.diagnostic_messages);
+    impl_->notify();
+}
+
+TransportLimits Transport::limits() const {
+    std::lock_guard lock(impl_->mutex);
+    return impl_->limits;
+}
 
 std::shared_ptr<std::atomic<bool>> Transport::failure_signal() const {
     return impl_->failure_signal;

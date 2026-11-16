@@ -3,6 +3,7 @@
 #include "models/qwen3_5/session/session.h"
 #include "models/qwen3_5/state/continuation.h"
 #include "models/common/context/snapshot.h"
+#include "models/common/context/identity.h"
 #include "models/common/context/work.h"
 #include "models/common/qwen/prefix_identity.h"
 #include "models/common/qwen/recovery_store.h"
@@ -10,6 +11,7 @@
 
 #include <array>
 #include <deque>
+#include <unordered_map>
 #include <memory>
 #include <optional>
 #include <span>
@@ -37,6 +39,19 @@ struct PreparedCaptureBacking {
     qwen::PrefixShortlistDigests digests;
     std::vector<TokenId> ledger;
     qwen::ResidentPrefixIdentity prefix_identity;
+    context::IdentityMetadata retention;
+
+    [[nodiscard]] std::size_t metadata_bytes() const noexcept {
+        return sizeof(*this) + ledger.capacity() * sizeof(TokenId) +
+               prefix_identity.metadata_bytes() + digests.metadata_bytes();
+    }
+
+    [[nodiscard]] static std::size_t cache_bytes(std::size_t tokens, std::size_t concurrency) {
+        return context::IdentityMetadata::cache_bytes<PreparedCaptureBacking>(
+            tokens, concurrency,
+            sizeof(TokenId) + 3 * sizeof(std::int32_t) + sizeof(std::uint8_t) +
+                sizeof(std::array<std::uint64_t, 2>));
+    }
 };
 
 struct CaptureGroup {
@@ -115,6 +130,7 @@ struct SequenceState {
     qwen::PrefixShortlistDigests prefix_digests;
     SequenceHandle id;
     runtime::ResidencyId residency;
+    bool computing = false;
 
     [[nodiscard]] context::StateId write_state() const noexcept {
         return pending_write.valid() ? pending_write : continuation.image;
@@ -126,6 +142,7 @@ struct CaptureReservation {
     std::vector<std::pair<CheckpointHandle, runtime::CheckpointRole>> points;
     context::StateId state;
     std::optional<context::RecordReservation> host;
+    std::shared_ptr<const PreparedCaptureBacking> identity;
     std::uint32_t frontier = 0;
     ~CaptureReservation();
 };
@@ -145,6 +162,7 @@ struct RequestControl {
     std::vector<CaptureGroup> capture_groups;
     std::size_t next_capture = 0;
     std::uint32_t last_saved = 0, last_intermediate_attempt = 0;
+    std::optional<std::uint32_t> retry_frontier;
     bool capture_pending = false;
 
     struct Prefill {
@@ -166,6 +184,8 @@ struct CheckpointState {
     PrefixShortlistKey key;
     runtime::CheckpointOrigin origin = runtime::CheckpointOrigin::Semantic;
     SharedCandidateEvidence evidence = SharedCandidateEvidence::None;
+
+    mutable std::weak_ptr<const runtime::RecoveryIdentity> recovery_identity_cache;
 
     [[nodiscard]] const Continuation& continuation() const noexcept {
         return snapshot.continuation();
@@ -250,6 +270,7 @@ struct CaptureOperation {
     std::uint32_t frontier         = 0;
     std::uint32_t backend_frontier = 0;
     std::vector<std::pair<CheckpointHandle, runtime::CheckpointRole>> points;
+    std::shared_ptr<const PreparedCaptureBacking> identity;
 };
 
 struct MaintenanceOperation {
@@ -321,6 +342,7 @@ public:
     [[nodiscard]] Result wait_branch_work(runtime::ExecutionTicket, bool context);
     std::unique_ptr<BranchCache> branches;
     SessionImpl(std::shared_ptr<const ModelDefinition>, SessionPlan);
+    std::uint64_t next_lane_mark();
     ~SessionImpl();
     [[nodiscard]] RequestBasePlan plan_request(qwen::PreparedPromptData&& prompt,
                                                const runtime::ResolvedExecutionOptions& options);
@@ -370,10 +392,14 @@ public:
                   ResumeState* resume           = nullptr,
                   ExecutionUnitKind resume_kind = ExecutionUnitKind::Decode,
                   std::uint32_t resume_tokens   = 1);
-    [[nodiscard]] bool start_capture(SequenceHandle sequence);
+    [[nodiscard]] runtime::ContextStart start_capture(SequenceHandle sequence);
+    [[nodiscard]] bool retry_capture(SequenceHandle sequence);
+    [[nodiscard]] std::vector<CheckpointHandle> share_capture(SequenceHandle sequence,
+                                                              CheckpointHandle source);
     [[nodiscard]] bool capture_is_input(SequenceHandle sequence) const;
     [[nodiscard]] std::optional<CapturePreparation>
-    prepare_capture(SequenceHandle sequence, std::span<const CheckpointHandle> host_victims = {});
+    prepare_capture(SequenceHandle sequence, std::span<const CheckpointHandle> victims = {},
+                    runtime::CaptureStorage storage = runtime::CaptureStorage::Automatic);
     void skip_capture(SequenceHandle sequence,
                       runtime::CaptureSkip reason = runtime::CaptureSkip::Unavailable);
     // Finite physical actions, each including every optional holder needed for its release.
@@ -403,10 +429,9 @@ public:
     [[nodiscard]] std::optional<runtime::ExecutionTicket> start_replay(SequenceHandle);
     [[nodiscard]] std::optional<runtime::ExecutionTicket>
     start_decode(std::span<const SequenceHandle>, std::span<const runtime::RoundBudget>,
-                 std::span<const bool> constrained = {});
+                 std::span<const std::uint8_t> constrained = {});
     [[nodiscard]] std::optional<runtime::ExecutionTicket>
-    start_control(std::span<const SequenceHandle>, std::span<const TokenId>, std::uint32_t stride,
-                  std::span<const std::optional<std::uint32_t>> splits);
+    start_control(std::span<const SequenceHandle>, std::span<const TokenId>, std::uint32_t stride);
     [[nodiscard]] std::optional<runtime::ExecutionTicket> start_score(qwen::PreparedPromptData&&,
                                                                       std::uint32_t first_target);
     [[nodiscard]] std::optional<SessionEvent> poll();
@@ -443,16 +468,20 @@ public:
     const ContextCacheOptions context_cache;
     const bool vision_enabled;
     const bool causal_scoring;
-    std::array<SequenceState, kMaximumConcurrency> sequences;
-    std::array<RequestControl, kMaximumConcurrency> requests;
-    std::array<std::uint64_t, kMaximumConcurrency> lane_epochs{};
-    std::uint64_t next_sequence = 1;
-    mutable context::RecoveryIndex<> recovery_index{directory.metadata_budget()};
+    std::vector<SequenceState> sequences;
+    std::vector<RequestControl> requests;
+    std::vector<std::uint64_t> lane_epochs;
+    std::vector<std::uint64_t> lane_marks;
+    std::unordered_map<std::uint64_t, std::uint32_t> resident_sequences;
+    std::uint64_t lane_mark_generation = 0;
+    std::uint64_t next_sequence        = 1;
+    context::RecoveryMetadata recovery_metadata;
+    mutable context::RecoveryIndex<> recovery_index{directory.metadata_budget(),
+                                                    &recovery_metadata};
     Checkpoints checkpoints;
     context::MetadataAccount count_storage{directory.metadata_budget()};
     TokenCountBuilder count_builder;
     std::unique_ptr<PendingContext> context_operation_;
-    std::optional<ContextAssessment> pending_maintenance_;
     std::optional<SequenceHandle> normalizing_pause_;
 
     struct PauseReservation {
@@ -488,7 +517,6 @@ public:
         std::vector<ContinuationMetadata> completed;
         std::vector<std::uint32_t> columns;
         std::vector<std::vector<TokenId>> inputs;
-        std::vector<std::optional<std::uint32_t>> splits;
         std::unique_ptr<context::ContextTransaction> preparation;
         std::unique_ptr<context::ContextTransaction> settlement;
         std::optional<GeneratedResult> generated;
@@ -565,9 +593,9 @@ public:
     void initialize_prefill(RequestControl&, std::uint32_t base);
     void initialize_captures(RequestControl&, std::uint32_t from, std::uint32_t through);
     enum class CaptureReservationStatus { Ready, NeedsContext, Unavailable };
-    [[nodiscard]] CaptureReservationStatus
-    reserve_capture_destination(std::uint32_t, std::uint32_t,
-                                std::span<const CheckpointHandle> host_victims = {});
+    [[nodiscard]] CaptureReservationStatus reserve_capture_destination(
+        std::uint32_t, std::uint32_t, std::span<const CheckpointHandle> victims = {},
+        runtime::CaptureStorage storage = runtime::CaptureStorage::Automatic);
     void prepare_capture_boundary(std::uint32_t);
     void abort_context() noexcept;
     void cancel_context() noexcept;

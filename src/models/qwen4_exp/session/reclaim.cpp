@@ -1,4 +1,5 @@
 #include "models/qwen4_exp/session/internal.h"
+#include "models/common/qwen/recovery_value.h"
 
 #include "models/common/context/physical_reclaim.h"
 #include "models/common/qwen/recovery_store.h"
@@ -422,8 +423,6 @@ runtime::ContextStart SessionImpl::start_demote(const ContextDemotion& quote,
     const auto placement  = directory.assess(demand, footprint(victims, true));
     if (!placement.feasible()) return runtime::ContextStart::Stale;
     if (placement.requires_maintenance() && executor->has_pending_work()) {
-        pending_maintenance = placement;
-        directory.request_maintenance();
         return runtime::ContextStart::Deferred;
     }
     auto execution = executor->try_reserve(runtime::FrameKind::Context);
@@ -526,14 +525,17 @@ runtime::ContextReleaseMeasure Session::release_measure(const ContextReleaseSet&
 
 runtime::ContextStart Session::start_maintenance(const ContextAssessment& assessment) {
     auto& session = *impl_;
-    if (session.operation) return runtime::ContextStart::Deferred;
-    if (!session.pending_maintenance) {
-        const auto current = session.directory.assess(assessment.demand);
-        if (!current.requires_maintenance()) return runtime::ContextStart::Stale;
-        session.pending_maintenance = current;
-        session.directory.request_maintenance();
-    }
-    return session.try_pending_maintenance();
+    if (session.operation || session.pending_maintenance || session.compute ||
+        session.executor->has_pending_work())
+        return runtime::ContextStart::Deferred;
+    const auto current = session.directory.assess(assessment.demand);
+    if (!current.requires_maintenance()) return runtime::ContextStart::Stale;
+    session.pending_maintenance = current;
+    const auto started          = session.try_pending_maintenance();
+    // A Deferred public submission belongs to the caller's retry decision. It must not
+    // later execute from poll() after that decision has been abandoned or repriced.
+    if (started == runtime::ContextStart::Deferred) session.pending_maintenance.reset();
+    return started;
 }
 
 std::size_t Session::host_bytes_released(std::span<const CheckpointHandle> records) const {
@@ -634,6 +636,150 @@ std::size_t Session::release_redundant_host(std::span<const CheckpointHandle> ex
         }
     }
     return released_bytes;
+}
+
+} // namespace ninfer::models::qwen4_exp
+
+namespace ninfer::models::qwen4_exp {
+
+context::MetadataBudget& Session::recovery_budget() const {
+    return impl_->recovery_metadata.budget();
+}
+
+std::vector<Session::RecoveryPoint>
+Session::recovery_points(const ContextReleaseSet& removed_device,
+                         std::span<const CheckpointHandle> selected) const {
+    const auto& p = *impl_;
+    std::vector<RecoveryPoint> result;
+    for (std::uint32_t i = 0; i < p.checkpoints.size(); ++i) {
+        const auto handle = p.checkpoints.handle(i);
+        if (!p.checkpoints.valid(handle)) continue;
+        if (!selected.empty() &&
+            std::find(selected.begin(), selected.end(), handle) == selected.end())
+            continue;
+        const auto& record = p.checkpoints.at(handle);
+        runtime::RecoveryDescription value;
+        value.restores.reserve(1);
+        value.placement = {};
+        value.identity  = record.recovery_identity_cache.lock();
+        if (!value.identity) {
+            value.identity = std::shared_ptr<qwen::RecoveryIdentity>(new qwen::RecoveryIdentity(
+                recovery_budget(), &p, record.snapshot.identity_owner(), record.recovery_identity(),
+                p.shape.prefill_chunk, p.plan.vision_max_features));
+            record.recovery_identity_cache = value.identity;
+        }
+        value.restores.push_back({value.placement,
+                                  record.snapshot.restore_requirements(p.directory, removed_device),
+                                  record.snapshot.replay_requirements(p.directory)});
+        result.push_back(
+            {handle, context::recovery_description(recovery_budget(), std::move(value))});
+    }
+    return result;
+}
+
+std::shared_ptr<const runtime::RecoveryDescription>
+Session::recovery_target(const RequestBasePlan& base, std::uint32_t f, runtime::PlacementId target,
+                         runtime::CaptureStorage storage) const {
+    if (target.value || !base.plan_ || !f || f > base.summary().prompt_tokens)
+        throw std::invalid_argument("invalid Qwen4Exp recovery target");
+    const auto& backing = base.plan_->identity;
+    runtime::RecoveryDescription value;
+    value.placement = target;
+    value.identity  = std::make_shared<qwen::RecoveryIdentity>(
+        recovery_budget(), impl_.get(), backing,
+        qwen::RecoveryIdentityView{f, backing->tag, backing->tokens, backing->positions,
+                                   backing->digests, backing.get()},
+        impl_->shape.prefill_chunk, impl_->plan.vision_max_features);
+    value.restores.push_back({target, {}});
+    if (storage == runtime::CaptureStorage::Host)
+        for (const auto& part : impl_->plan.context.state.layouts.front().parts) {
+            runtime::ContextTransferRequirement transfer;
+            transfer.direction   = runtime::ContextTransferDirection::HostToDevice;
+            transfer.rank        = part.rank;
+            transfer.image_count = 1;
+            transfer.work        = {part.image_bytes, 1};
+            value.restores.back().transfers.push_back(transfer);
+        }
+    return context::recovery_description(recovery_budget(), std::move(value));
+}
+
+std::vector<runtime::ContextTransferRequirement>
+Session::demotion_work(const ContextDemotion& plan,
+                       std::span<const CheckpointHandle> victims) const {
+    if (!plan.impl || plan.impl->owner != impl_.get())
+        throw std::invalid_argument("demotion quote belongs to another session");
+    auto work  = context::demotion_work(impl_->directory, plan.released);
+    auto moves = context::maintenance_work(impl_->directory.assess(
+        host_demand(demotion_host_requirements(plan)), impl_->footprint(victims, true)));
+    work.insert(work.end(), moves.begin(), moves.end());
+    return work;
+}
+
+runtime::PauseCostQuote Session::pause_cost(SequenceHandle h, const PauseOption& option,
+                                            std::span<const CheckpointHandle> sources,
+                                            std::span<const CheckpointHandle> victims) const {
+    const auto& p = *impl_;
+    const auto& s = p.sequence(h);
+    const auto end =
+        s.phase == detail::Phase::Replay ? s.replay_target : s.continuation.metadata.main_frontier;
+    const auto work = [&](std::uint32_t begin) {
+        return qwen::recovery_work(s.identity.positions.vision_items(), begin, end,
+                                   p.shape.prefill_chunk, p.plan.vision_max_features);
+    };
+    runtime::PauseCostQuote quote;
+    quote.work =
+        context::maintenance_work(p.directory.assess(option.demand, p.footprint(victims, true)));
+    if (option.action.kind == runtime::PauseKind::ReleaseAndReplay) {
+        quote.recovery.push_back({work(0), {}});
+        const qwen::RecoveryIdentityView target{
+            end,    s.identity.tag, s.identity.tokens, s.identity.positions, s.identity.digests,
+            nullptr};
+        for (auto source : sources) {
+            if (!p.checkpoints.valid(source)) continue;
+            const auto& c = p.checkpoints.at(source);
+            if (!qwen::recovery_prefix_matches(c.recovery_identity(), target)) continue;
+            auto transfers = c.snapshot.restore_requirements(p.directory);
+            if (c.frontier() < end) {
+                const auto tail = c.snapshot.replay_requirements(p.directory);
+                transfers.insert(transfers.end(), tail.begin(), tail.end());
+            }
+            quote.recovery.push_back({work(c.frontier()), std::move(transfers)});
+        }
+    } else {
+        runtime::RecoveryRouteWork route{work(s.continuation.metadata.main_frontier), {}};
+        if (option.host_write) {
+            auto copies = context::host_write_work(p.directory, *option.host_write);
+            quote.work.insert(quote.work.end(), copies.begin(), copies.end());
+            std::vector<context::HistoryId> histories;
+            for (std::uint32_t pool = 0; pool < p.pool_count(); ++pool)
+                histories.push_back(s.histories[pool].handle());
+            route.transfers = context::pause_restore_work(p.directory, s.continuation.image,
+                                                          histories, option.released);
+        }
+        quote.recovery.push_back(std::move(route));
+    }
+    return quote;
+}
+
+runtime::CaptureCostQuote Session::capture_cost(SequenceHandle h, std::uint32_t frontier,
+                                                runtime::CaptureStorage storage) const {
+    const auto& s = impl_->sequence(h);
+    const bool host =
+        storage == runtime::CaptureStorage::Host ||
+        (storage == runtime::CaptureStorage::Automatic && s.capture && s.capture->host.has_value());
+    runtime::CaptureCostQuote quote;
+    quote.retained =
+        recovery_target(RequestBasePlan(s.request), frontier, {},
+                        host ? runtime::CaptureStorage::Host : runtime::CaptureStorage::Device);
+    quote.work = quote.retained->restores.front().transfers;
+    for (auto& transfer : quote.work)
+        transfer.direction = runtime::ContextTransferDirection::DeviceToHost;
+    return quote;
+}
+
+std::vector<runtime::ContextTransferRequirement>
+Session::maintenance_work(const ContextAssessment& assessment) const {
+    return context::maintenance_work(assessment);
 }
 
 } // namespace ninfer::models::qwen4_exp

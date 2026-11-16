@@ -1,3 +1,4 @@
+#include "core/platform.h"
 #include "ops/suite.h"
 #include "kv_cache_storage.h"
 #include "prepare_fixture.h"
@@ -231,14 +232,24 @@ int verify(Fixture& f, const std::string& label) {
 }
 
 int run(DeviceContext& device, int t, int b, int axes, int alias, int layout, int capacity = 0,
-        KvCacheStorage storage = KvCacheStorage::BFloat16, int kv_heads = 2, bool kv_only = false) {
+        KvCacheStorage storage = KvCacheStorage::BFloat16, int kv_heads = 2, bool kv_only = false,
+        bool empty_replay = false) {
     Fixture f(t, b, axes, alias, layout, capacity, storage, kv_heads);
     f.kv_only = kv_only;
     DecodeGraphDefinition definition;
     DecodeGraphExecutable graph;
     int failures = 0;
-    for (int phase = 0; phase < 3; ++phase) {
+    for (int phase = 0; phase < (empty_replay ? 4 : 3); ++phase) {
         f.reset(phase, phase == 1);
+        if (phase == 3) {
+            std::fill(f.valid.host.begin(), f.valid.host.end(), 0);
+            std::fill(f.slots.host.begin(), f.slots.host.end(), -1);
+            std::fill(f.table_rows.host.begin(), f.table_rows.host.end(), -1);
+            f.valid.upload();
+            f.slots.upload();
+            f.table_rows.upload();
+            f.upload_offsets();
+        }
         if (phase == 1) {
             f.parameters.kv.rms_epsilon = 2e-5F;
             f.parameters.kv.rope_theta  = 500000;
@@ -277,7 +288,7 @@ int continuation(DeviceContext& device, KvCacheStorage storage = KvCacheStorage:
     ops::qsa_tail_extract(
         f.before,
         {f.records.view, f.record_rope.view, Tensor(base.span(), DType::I32, {1}), f.valid.view},
-        Tensor(count.span(), DType::I32, {1}), f.before, device.execution_view());
+        Tensor(count.span(), DType::I32, {1}), f.before, {}, device.execution_view());
     device.synchronize();
     for (int c = 0; c < 128; ++c) f.tail.at(c, 2, 1) = f.ik.at(c, 0, 0);
     failures += f.tail.preserved("accepted-one canonical tail") +
@@ -353,7 +364,7 @@ int chunking(DeviceContext& device, KvCacheStorage storage = KvCacheStorage::BFl
                               {f.records.view.slice(1, offset, n),
                                f.record_rope.view.slice(1, offset, n),
                                Tensor(base.span(), DType::I32, {1}), f.valid.view},
-                              f.valid.view, f.before, device.execution_view());
+                              f.valid.view, f.before, {}, device.execution_view());
         device.synchronize();
         offset += n;
     }
@@ -415,12 +426,16 @@ int norm_alignment_and_phase(DeviceContext& device,
     int failures = 0;
     for (int tokens : {129, 321}) {
         Fixture f(tokens, 1, 1, 3, 1, 0, storage, kv_heads);
-        Buffer<std::uint16_t> wq(DType::BF16, {257}), wiq(DType::BF16, {129});
+        Buffer<std::uint16_t> wq(DType::BF16, {257}), wiq(DType::BF16, {129}),
+            wk(DType::BF16, {257});
         std::copy(f.wq.host.begin(), f.wq.host.end(), wq.host.begin() + 1);
         std::copy(f.wiq.host.begin(), f.wiq.host.end(), wiq.host.begin() + 1);
+        std::copy(f.wk.host.begin(), f.wk.host.end(), wk.host.begin() + 1);
+        wk.upload();
         wq.upload();
         wiq.upload();
         for (bool shifted : {true, false}) {
+            f.parameters.kv.key_norm      = shifted ? wk.view.slice(0, 1, 256) : f.wk.view;
             f.parameters.query_norm       = shifted ? wq.view.slice(0, 1, 256) : f.wq.view;
             f.parameters.index_query_norm = shifted ? wiq.view.slice(0, 1, 128) : f.wiq.view;
             for (float theta : {1e7F, 0.5F}) {
@@ -431,7 +446,8 @@ int norm_alignment_and_phase(DeviceContext& device,
                 failures += verify(f, "norm alignment/phase domain");
             }
         }
-        failures += wq.preserved("shifted Q norm") + wiq.preserved("shifted IQ norm");
+        failures += wq.preserved("shifted Q norm") + wiq.preserved("shifted IQ norm") +
+                    wk.preserved("shifted K norm");
     }
     return failures;
 }
@@ -515,8 +531,9 @@ int validation(DeviceContext& device) {
     return failures;
 }
 
-int exact_key_encoding(DeviceContext& device, KvCacheStorage storage, bool kv_only = false) {
-    Fixture f(16, 1, 1, 3, 1, 0, storage);
+int exact_key_encoding(DeviceContext& device, KvCacheStorage storage, bool kv_only = false,
+                       int kv_heads = 2) {
+    Fixture f(16, 1, 1, 3, 1, 0, storage, kv_heads);
     f.kv_only     = kv_only;
     f.base_origin = 64;
     f.reset(0, true);
@@ -559,8 +576,9 @@ int exact_key_encoding(DeviceContext& device, KvCacheStorage storage, bool kv_on
     return failures;
 }
 
-int scale_edges(DeviceContext& device, KvCacheStorage storage, bool kv_only = false) {
-    Fixture f(8, 1, 1, 0, 1, 0, storage);
+int scale_edges(DeviceContext& device, KvCacheStorage storage, bool kv_only = false,
+                int kv_heads = 2) {
+    Fixture f(8, 1, 1, 0, 1, 0, storage, kv_heads);
     f.kv_only = kv_only;
     constexpr float amplitudes[]{0, 0x1p-30F, 0x1p-18F, 0x1p-10F, 1.0625F, 6.375F, 3072, 65536};
     constexpr float values[]{0, 0.25F, 0.75F, 1.25F, 1.75F, 2.5F, 3.5F, 6};
@@ -580,6 +598,30 @@ int scale_edges(DeviceContext& device, KvCacheStorage storage, bool kv_only = fa
 
 int main(int argc, char** argv) {
     OpSuite suite;
+    for (auto storage : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64,
+                         KvCacheStorage::Fp8E4m3fnGroup128Ue8m0, KvCacheStorage::Nvfp4Group16,
+                         KvCacheStorage::Fp8KeyNvfp4Value}) {
+        suite.add(std::string("qsa_prepare/") + kv_cache_storage_name(storage) + "/concurrency/b17",
+                  [=] {
+                      return run(cuda_environment().context, 4, 17, 3, 0, 1, 0, storage, 2, false,
+                                 true);
+                  },
+                  {{"format", kv_cache_storage_name(storage)},
+                   {"execution", "graph"},
+                   {"suite", "concurrency"}});
+    }
+    suite.add("qsa_prepare/bf16/concurrency/b129",
+              [] {
+                  return run(cuda_environment().context, 1, 129, 1, 0, 0, 0,
+                             KvCacheStorage::BFloat16, 2, false, true);
+              },
+              {{"format", "bf16"}, {"execution", "graph"}, {"suite", "concurrency"}});
+    suite.add("qsa_prepare_kv/fp8/concurrency/b9",
+              [] {
+                  return run(cuda_environment().context, 16, 9, 3, 0, 2, 0,
+                             KvCacheStorage::Fp8E4m3fnGroup128Ue8m0, 1, true, true);
+              },
+              {{"format", "fp8"}, {"execution", "graph"}, {"suite", "concurrency"}});
     const auto add = [&](int t, int b, int axes, int alias, int layout, int capacity = 0,
                          KvCacheStorage storage = KvCacheStorage::BFloat16) {
         const std::string format = kv_cache_storage_name(storage);
@@ -717,6 +759,147 @@ int main(int argc, char** argv) {
                              KvCacheStorage::BFloat16, 2, true);
               },
               {{"format", "bf16"}, {"suite", "kv"}});
+
+#if NINFER_TARGET_RTX5090
+    // Four-head FP8 cache: independent math and current-metadata replay, without
+    // taking a Cartesian product of existing layout/alias/storage cases.
+    for (bool kv_only : {false, true}) {
+        const std::string prefix =
+            std::string(kv_only ? "qsa_prepare_kv" : "qsa_prepare") + "/fp8/h24_4";
+
+        struct Case {
+            int t, b, axes, alias, layout, capacity;
+        };
+
+        std::vector<Case> cases{{1, 1, 1, 0, 0, 0},
+                                {33, 8, 3, kv_only ? 0 : 3, 2, 5},
+                                {kv_only ? 255 : 65, 1, 3, kv_only ? 0 : 1, 1, 0},
+                                {257, 1, 3, 0, 0, 0},
+                                {2048, 1, 1, 0, 0, 0}};
+        if (kv_only) cases.push_back({256, 1, 3, 0, 0, 0});
+        if (!kv_only) {
+            cases.push_back({255, 1, 3, 2, 0, 0});
+            cases.push_back({256, 1, 3, 3, 0, 0});
+        }
+        for (auto c : cases)
+            suite.add(prefix + "/t" + std::to_string(c.t) + "/b" + std::to_string(c.b),
+                      [=] {
+                          return run(cuda_environment().context, c.t, c.b, c.axes, c.alias,
+                                     c.layout, c.capacity, KvCacheStorage::Fp8E4m3fnGroup128Ue8m0,
+                                     4, kv_only);
+                      },
+                      {{"format", "fp8"}, {"execution", "graph"}});
+        suite.add(prefix + "/continuation",
+                  [=] {
+                      return continuation(cuda_environment().context,
+                                          KvCacheStorage::Fp8E4m3fnGroup128Ue8m0, 4, kv_only);
+                  },
+                  {{"format", "fp8"}});
+        suite.add(prefix + "/chunking",
+                  [=] {
+                      return chunking(cuda_environment().context,
+                                      KvCacheStorage::Fp8E4m3fnGroup128Ue8m0, 4, kv_only);
+                  },
+                  {{"format", "fp8"}});
+    }
+    suite.add("qsa_prepare/fp8/h24_4/norm_alignment",
+              [] {
+                  return norm_alignment_and_phase(cuda_environment().context,
+                                                  KvCacheStorage::Fp8E4m3fnGroup128Ue8m0, 4);
+              },
+              {{"format", "fp8"}});
+    suite.add("qsa_prepare/fp8/h24_4/encoding_boundaries",
+              [] {
+                  auto& device = cuda_environment().context;
+                  int failed   = 0;
+                  for (bool kv_only : {false, true}) {
+                      failed += exact_key_encoding(device, KvCacheStorage::Fp8E4m3fnGroup128Ue8m0,
+                                                   kv_only, 4);
+                      failed +=
+                          scale_edges(device, KvCacheStorage::Fp8E4m3fnGroup128Ue8m0, kv_only, 4);
+                      Fixture f(8, 1, 3, 0, 1, 0, KvCacheStorage::Fp8E4m3fnGroup128Ue8m0, 4);
+                      f.kv_only = kv_only;
+                      for (float epsilon : {1e-6F, std::numeric_limits<float>::max()}) {
+                          f.reset(2, true);
+                          f.parameters.kv.rms_epsilon = epsilon;
+                          const float amplitudes[]{0, 1e20F, 1e-30F, 1e18F,
+                                                   6, 256,   1e30F,  bf16_to_f32(0x7f7f)};
+                          for (int t = 0; t < 8; ++t)
+                              for (int h = 0; h < 4; ++h)
+                                  for (int c = 0; c < 256; ++c)
+                                      f.k.at(c, h, t, 0) =
+                                          f32_to_bf16((c % 3 - 1) * amplitudes[(t + h) % 8]);
+                          f.k.upload();
+                          f.launch(device.execution_view());
+                          device.synchronize();
+                          failed += verify(f, "four-head K normalization range");
+                      }
+                  }
+                  return failed;
+              },
+              {{"format", "fp8"}});
+    suite.add("qsa_prepare/fp8/h24_4/contract",
+              [] {
+                  Fixture f(1, 1, 1, 0, 0, 0, KvCacheStorage::Fp8E4m3fnGroup128Ue8m0, 4);
+                  auto e             = cuda_environment().context.execution_view();
+                  int failed         = 0;
+                  const auto rejects = [&](auto invoke) {
+                      try {
+                          invoke();
+                          ++failed;
+                      } catch (const std::invalid_argument&) {}
+                  };
+                  const auto q            = f.projected.query;
+                  f.projected.query.ne[1] = 48;
+                  rejects([&] { f.launch(e); });
+                  f.projected.query = q;
+                  return failed;
+              },
+              {{"format", "fp8"}});
+    // Each additional codec covers both semantic entries and distinct cache/record layouts,
+    // with one compact set of mathematical risks rather than a storage/layout cross product.
+    for (auto storage : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64,
+                         KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value}) {
+        const std::string format = kv_cache_storage_name(storage);
+        for (bool kv_only : {false, true}) {
+            const std::string prefix =
+                std::string(kv_only ? "qsa_prepare_kv/" : "qsa_prepare/") + format + "/h24_4/";
+
+            struct Case {
+                int t, b, axes, alias, layout, capacity;
+            };
+
+            const Case cases[]{
+                {1, 1, 1, 0, 0, 0}, {33, 8, 3, kv_only ? 0 : 3, 2, 5}, {257, 1, 3, 0, 1, 0}};
+            for (auto c : cases)
+                suite.add(prefix + "t" + std::to_string(c.t) + "/b" + std::to_string(c.b),
+                          [=] {
+                              return run(cuda_environment().context, c.t, c.b, c.axes, c.alias,
+                                         c.layout, c.capacity, storage, 4, kv_only);
+                          },
+                          {{"format", format}, {"execution", "graph"}});
+            suite.add(prefix + "continuation",
+                      [=] { return continuation(cuda_environment().context, storage, 4, kv_only); },
+                      {{"format", format}});
+        }
+        suite.add("qsa_prepare/" + format + "/h24_4/norm_alignment",
+                  [=] { return norm_alignment_and_phase(cuda_environment().context, storage, 4); },
+                  {{"format", format}});
+        if (storage != KvCacheStorage::BFloat16)
+            suite.add("qsa_prepare/" + format + "/h24_4/encoding_boundaries",
+                      [=] {
+                          auto& device = cuda_environment().context;
+                          int failed   = 0;
+                          for (bool kv_only : {false, true}) {
+                              failed += exact_key_encoding(device, storage, kv_only, 4);
+                              failed += scale_edges(device, storage, kv_only, 4);
+                          }
+                          return failed;
+                      },
+                      {{"format", format}});
+    }
+
+#endif
 
     return suite.main(argc, argv);
 }

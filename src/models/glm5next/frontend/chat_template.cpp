@@ -174,11 +174,10 @@ struct TemplateInput {
         }
         if (!message.tool_calls.empty()) {
             value["tool_calls"] = Json::array();
-            for (const auto& call : message.tool_calls) {
-                auto arguments =
-                    call.arguments_json.empty() ? Json::object() : Json::parse(call.arguments_json);
-                if (!arguments.is_object())
-                    throw std::invalid_argument("tool call arguments must be a JSON object");
+            for (std::size_t j = 0; j < message.tool_calls.size(); ++j) {
+                const auto& call = message.tool_calls[j];
+                auto arguments   = models::frontend::parse_tool_history_arguments(
+                    call.arguments_json, call.name, messages.size(), j);
                 sources.tool_calls.push_back(
                     tag(pointer + "/tool_calls/" + std::to_string(value["tool_calls"].size())));
                 value["tool_calls"].push_back(
@@ -325,17 +324,17 @@ void locate_media(RenderedChat& result, const TemplateInput& input,
             "GLM template cannot map media placeholders to their input sources");
 }
 
+text::TemplateOutput render_output(const TemplateInput& input,
+                                   const models::frontend::ChatTemplate& compiled,
+                                   text::TemplateRenderOptions execution) {
+    execution.regions = input.regions;
+    return compiled.program.render(input.context, execution);
+}
+
 RenderedChat render_input(const TemplateInput& input,
                           const models::frontend::ChatTemplate& compiled, bool continuation,
-                          const PreparationControl& control) {
-    std::vector<std::string> control_variables;
-    for (const auto& item : compiled.special_tokens.items())
-        control_variables.push_back(item.key());
-    const text::TemplateRenderOptions execution{
-        .checkpoint =
-            [&] { models::frontend::check_preparation_control(control, "GLM chat template"); },
-        .regions           = input.regions,
-        .control_variables = control_variables};
+                          text::TemplateRenderOptions execution) {
+    execution.regions = input.regions;
     RenderedChat result{.output   = compiled.program.render(input.context, execution),
                         .messages = input.messages,
                         .tools    = input.tools};
@@ -402,7 +401,14 @@ RenderedChat CompiledChatTemplate::render_impl(std::span<const ChatMessage> mess
         input.tools.push_back(input.tag("/tools/" + std::to_string(input.tools.size())));
         input.context["tools"].push_back(std::move(tool));
     }
-    auto result = render_input(input, compiled_, continuation, control);
+    std::vector<std::string> control_variables;
+    for (const auto& item : compiled_.special_tokens.items())
+        control_variables.push_back(item.key());
+    const text::TemplateRenderOptions execution{
+        .checkpoint =
+            [&] { models::frontend::check_preparation_control(control, "GLM chat template"); },
+        .control_variables = control_variables};
+    auto result = render_input(input, compiled_, continuation, execution);
     if (boundaries) {
         PromptProbes probes;
         probes.content_prefix = [&](const PromptCacheMarker& marker) {
@@ -432,7 +438,7 @@ RenderedChat CompiledChatTemplate::render_impl(std::span<const ChatMessage> mess
                 calls.erase(calls.begin() + marker.after_tool_call_count, calls.end());
             }
             source.tool_calls.resize(marker.after_tool_call_count);
-            return render_input(probe, compiled_, continuation, control);
+            return render_input(probe, compiled_, continuation, execution);
         };
         probes.next_turn = [&] {
             bool has_response = false;
@@ -443,20 +449,20 @@ RenderedChat CompiledChatTemplate::render_impl(std::span<const ChatMessage> mess
                     has_response = true;
             }
             auto probe = input;
-            std::optional<RenderedChat> synthetic;
+            std::optional<text::TemplateOutput> synthetic;
             if (!has_response) {
                 probe.append_message(ChatMessage{.role              = ChatRole::Assistant,
                                                  .parts             = {{.text = "response"}},
                                                  .reasoning_content = "reasoning"});
-                synthetic = render_input(probe, compiled_, false, control);
+                synthetic = render_output(probe, compiled_, execution);
             }
-            const auto& before = synthetic ? *synthetic : result;
+            const auto& before = synthetic ? *synthetic : result.output;
             const auto end =
-                final_assistant_body(before.output) - std::string_view("<|assistant|>").size();
+                final_assistant_body(before) - std::string_view("<|assistant|>").size();
             probe.append_message(ChatMessage{.role = ChatRole::User, .parts = {{.text = ""}}});
-            auto after         = render_input(probe, compiled_, false, control);
-            const auto retains = models::frontend::same_prefix(before.output, after.output, end);
-            return TurnProbe{retains, std::move(after.output)};
+            auto after         = render_output(probe, compiled_, execution);
+            const auto retains = models::frontend::same_prefix(before, after, end);
+            return TurnProbe{retains, std::move(after)};
         };
         *boundaries = resolve_prompt_boundaries(result, messages, continuation, markers, probes);
     }

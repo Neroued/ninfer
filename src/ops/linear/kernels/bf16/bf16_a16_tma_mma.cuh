@@ -95,6 +95,20 @@ inline constexpr int bf16_tma_scratch_bytes =
           : linear_epilogue_bytes<Schedule, Epilogue>)+127) /
     128 * 128;
 
+template <class Epilogue, class State>
+struct Bf16TmaPreparedEpilogue : Epilogue {
+    State state;
+
+    template <class Schedule, bool FullTokens, class Output>
+    __device__ __forceinline__ void
+    finish_tile(const Output& output, unsigned char* storage,
+                float (&accum)[Schedule::kMmaRows][Schedule::kMmaTokens][4], int row_begin,
+                int token_begin, int rows, int tokens) const {
+        Epilogue::template finish_tile<Schedule, FullTokens>(output, storage, accum, row_begin,
+                                                             token_begin, rows, tokens, state);
+    }
+};
+
 template <class Schedule, bool FullTokens, class Output, class Epilogue, int Splits = 1,
           class WeightAccess = Bf16ContiguousTmaWeightAccess>
 __device__ __forceinline__ void bf16_a16_tma_mma_body(const Bf16TmaDescriptors& descriptors,
@@ -129,6 +143,21 @@ __device__ __forceinline__ void bf16_a16_tma_mma_body(const Bf16TmaDescriptors& 
     constexpr bool collective = requires { Epilogue::kTmaCollective; };
     const int tid             = threadIdx.x - Schedule::kProducerThreads;
     const int warp = tid / 32, lane = tid & 31;
+    // Prepare only thread-private tile inputs. Shared staging remains owned by the
+    // contraction until its final collective barrier permits epilogue reuse.
+    const auto& prepared_epilogue = [&]() -> decltype(auto) {
+        if constexpr (requires {
+                          epilogue.template prepare_tile<Schedule, FullTokens>(
+                              row_begin, token_begin, rows, token_offset + count);
+                      }) {
+            static_assert(collective, "prepared TMA epilogues must be collective");
+            auto state = epilogue.template prepare_tile<Schedule, FullTokens>(
+                row_begin, token_begin, rows, token_offset + count);
+            return Bf16TmaPreparedEpilogue<Epilogue, decltype(state)>{epilogue, state};
+        } else {
+            return (epilogue);
+        }
+    }();
     float accum[Schedule::kMmaRows][Schedule::kMmaTokens][4] = {};
     if (threadIdx.x < Schedule::kProducerThreads) {
         if (threadIdx.x == 0) {
@@ -170,7 +199,7 @@ __device__ __forceinline__ void bf16_a16_tma_mma_body(const Bf16TmaDescriptors& 
             if (lane == 0) common::cta_mbarrier_arrive(empty + stage);
         }
     }
-    bf16_finish_mma_tile<Schedule, FullTokens>(output, epilogue, storage, accum, row_begin,
+    bf16_finish_mma_tile<Schedule, FullTokens>(output, prepared_epilogue, storage, accum, row_begin,
                                                token_begin, rows, token_offset + count, warp, lane);
 }
 

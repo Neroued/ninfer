@@ -1,4 +1,5 @@
 #include "ops/common/numeric/math.h"
+#include <algorithm>
 #include "ops/linear/topk/fp8/kernel/mma.cuh"
 
 namespace ninfer::ops::detail {
@@ -6,18 +7,21 @@ namespace {
 template <int TileColumns, int kBlockK = 128>
 void launch_tile(const Tensor& hidden, const Weight& head, const Tensor*,
                  const LinearTopKWorkspace& workspace, cudaStream_t stream) {
-    constexpr int valid_rows   = kLinearTopKFullValidRows;
+    const int valid_rows = std::clamp(kLinearTopKFullValidRows - workspace.row_begin, 0, head.n);
     constexpr int shared_bytes = sizeof(Fp8MmaReusableStorage<TileColumns, kBlockK>);
     if constexpr (shared_bytes > 48 * 1024) {
         CUDA_CHECK(cudaFuncSetAttribute(fp8_mma_linear_topk_kernel<TileColumns, kBlockK>,
                                         cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes));
     }
+    const dim3 grid =
+        hidden.ne[1] > 128
+            ? dim3(common::div_up(hidden.ne[1], TileColumns), workspace.producer_groups)
+            : dim3(workspace.producer_groups, common::div_up(hidden.ne[1], TileColumns));
     fp8_mma_linear_topk_kernel<TileColumns, kBlockK>
-        <<<dim3(workspace.producer_groups, common::div_up(hidden.ne[1], TileColumns)),
-           MmaSchedule<TileColumns, kBlockK>::kThreads, shared_bytes, stream>>>(
+        <<<grid, MmaSchedule<TileColumns, kBlockK>::kThreads, shared_bytes, stream>>>(
             static_cast<const __nv_bfloat16*>(hidden.data),
             static_cast<const std::uint8_t*>(head.qdata),
-            static_cast<const __nv_bfloat16*>(head.scales), valid_rows,
+            static_cast<const __nv_bfloat16*>(head.scales), valid_rows, workspace.row_begin,
             static_cast<std::uint64_t*>(workspace.partial_keys.data), workspace.producer_groups,
             hidden.ne[1]);
     CUDA_CHECK(cudaGetLastError());

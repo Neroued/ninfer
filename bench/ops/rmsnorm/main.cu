@@ -30,7 +30,8 @@ int main(int argc, char** argv) {
                     row.tokens      = columns;
                     row.batch       = o.batch;
                     const auto bytes =
-                        f.count * (f.gate.size() ? 6 : 4) + std::size_t(o.dimension) * 2;
+                        f.count * (f.gate.size() ? 6 : 4) + std::size_t(o.dimension) * 2 +
+                        (rmsnorm::writes_inverse(o.op) ? f.count / o.dimension * sizeof(float) : 0);
                     const auto traffic =
                         std::to_string(bytes) + ',' +
                         format_metric(bytes / (result.gpu.median_us * 1000), 3, "") + ',' +

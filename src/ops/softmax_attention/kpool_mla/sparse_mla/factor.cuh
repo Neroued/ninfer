@@ -73,21 +73,24 @@ __launch_bounds__(Rows > 128 ? 512
     // Runtime singleton splits still consume the attention stage's mapped row.
     __shared__ float merge_weights[Merge ? Queries * 32 : 1];
     __shared__ int merge_splits[Merge ? Queries : 1];
+    const int layout_splits = Merge ? a.execution_splits() : 1;
     if constexpr (Merge) {
         for (int q = warp; q < Queries; q += Threads / 32) {
             const auto work  = a.work(q0 + q);
-            const int splits = min(a.splits, (work.size + a.tile - 1) / a.tile);
+            const int splits = min(layout_splits, (work.size + a.tile - 1) / a.tile);
             if (lane == 0) merge_splits[q] = splits;
             if (splits <= 1) continue;
-            float maximum =
-                lane < splits ? a.maximum[a.partial(q0 + q, lane, head)] : -CUDART_INF_F;
-            maximum = common::warp_max(maximum);
+            float maximum = lane < splits ? a.maximum[a.partial(q0 + q, lane, head, layout_splits)]
+                                          : -CUDART_INF_F;
+            maximum       = common::warp_max(maximum);
             const float weight =
                 lane < splits
-                    ? common::exp2_approx_ftz(a.maximum[a.partial(q0 + q, lane, head)] - maximum)
+                    ? common::exp2_approx_ftz(
+                          a.maximum[a.partial(q0 + q, lane, head, layout_splits)] - maximum)
                     : 0;
             const float denominator = common::warp_sum(
-                lane < splits ? weight * a.denominator[a.partial(q0 + q, lane, head)] : 0);
+                lane < splits ? weight * a.denominator[a.partial(q0 + q, lane, head, layout_splits)]
+                              : 0);
             merge_weights[q * 32 + lane] = weight * __frcp_rn(denominator);
         }
         __syncthreads();
@@ -140,8 +143,9 @@ __launch_bounds__(Rows > 128 ? 512
                         float values[8]{};
                         for (int split = 0; split < merge_splits[q]; ++split) {
                             const float weight = merge_weights[q * 32 + split];
-                            const auto* src =
-                                a.numerator + a.partial(q0 + q, split, head) * 512 + k0 + k;
+                            const auto* src    = a.numerator +
+                                              a.partial(q0 + q, split, head, layout_splits) * 512 +
+                                              k0 + k;
                             const float4 first = *reinterpret_cast<const float4*>(src);
                             const float4 last  = *reinterpret_cast<const float4*>(src + 4);
                             values[0] += weight * first.x;

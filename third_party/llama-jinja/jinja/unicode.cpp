@@ -47,8 +47,14 @@ std::vector<Character> characters(std::string_view text) {
 
 std::size_t length(std::string_view text) {
     std::size_t result = 0;
-    for (std::size_t pos = 0; pos < text.size(); ++result) {
-        pos += utf8::utf8_codepoint_at(text, pos, "Jinja string").length;
+    for (std::size_t pos = 0; pos < text.size();) {
+        const auto begin = pos;
+        while (pos < text.size() && static_cast<unsigned char>(text[pos]) < 0x80) ++pos;
+        result += pos - begin;
+        if (pos < text.size()) {
+            pos += utf8::utf8_codepoint_at(text, pos, "Jinja string").length;
+            ++result;
+        }
     }
     return result;
 }

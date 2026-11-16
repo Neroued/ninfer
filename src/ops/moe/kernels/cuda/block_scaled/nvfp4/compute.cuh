@@ -30,6 +30,7 @@ using common::nvfp4_dequant_f16x16;
 template <int Columns, bool Gate, int Stages = 2, int KStep = 128, int Eviction = 0,
           int Intermediate = kIntermediate>
 struct Schedule {
+    static constexpr bool gate        = Gate;
     static constexpr int columns      = Columns;
     static constexpr int stages       = Stages;
     static constexpr int k_step       = KStep;
@@ -50,9 +51,16 @@ struct TileStorage {
     alignas(16) unsigned weight_scales[S::stages][128 * (S::k_step / 64)];
     alignas(16) unsigned input_scales[S::stages][S::columns * (S::k_step / 64)];
     int sources[S::columns];
+    int output_tokens[S::gate ? 1 : S::columns];
+    float output_coefficients[S::gate ? 1 : S::columns];
 };
 
-__device__ __forceinline__ int swizzle(int row, int byte) { return byte ^ ((row & 3) << 4); }
+template <class S>
+__device__ __forceinline__ int swizzle(int row, int byte) {
+    // A 64-byte row stride already toggles the high bank bit.
+    constexpr int shift = (S::k_step / 128) & 1;
+    return byte ^ (((row >> shift) & (shift ? 3 : 7)) << 4);
+}
 
 struct Matrix {
     const std::uint8_t* codes;
@@ -81,25 +89,25 @@ stage_inputs(TileStorage<S>& tile, int stage, int kt, int row0, Matrix weight,
         if constexpr (S::eviction & 4) {
             if (cache_policy & 1)
                 common::cp_async_cache_hint<Cache::cg>(
-                    tile.weight[stage] + row * (S::k_step / 2) + swizzle(row, segment * 16),
+                    tile.weight[stage] + row * (S::k_step / 2) + swizzle<S>(row, segment * 16),
                     weight.codes + std::int64_t(wr) * (S::k / 2) +
                         (valid ? kt * (S::k_step / 2) + segment * 16 : 0),
                     valid ? 16 : 0, stream);
             else
                 common::cp_async_cache_hint<Cache::ca>(
-                    tile.weight[stage] + row * (S::k_step / 2) + swizzle(row, segment * 16),
+                    tile.weight[stage] + row * (S::k_step / 2) + swizzle<S>(row, segment * 16),
                     weight.codes + std::int64_t(wr) * (S::k / 2) +
                         (valid ? kt * (S::k_step / 2) + segment * 16 : 0),
                     valid ? 16 : 0, stream);
         } else if (cache_policy & 1)
             cp_async_zfill<16, Cache::cg>(tile.weight[stage] + row * (S::k_step / 2) +
-                                              swizzle(row, segment * 16),
+                                              swizzle<S>(row, segment * 16),
                                           weight.codes + std::int64_t(wr) * (S::k / 2) +
                                               (valid ? kt * (S::k_step / 2) + segment * 16 : 0),
                                           valid ? 16 : 0);
         else
             cp_async_zfill<16>(tile.weight[stage] + row * (S::k_step / 2) +
-                                   swizzle(row, segment * 16),
+                                   swizzle<S>(row, segment * 16),
                                weight.codes + std::int64_t(wr) * (S::k / 2) +
                                    (valid ? kt * (S::k_step / 2) + segment * 16 : 0),
                                valid ? 16 : 0);
@@ -126,25 +134,25 @@ stage_inputs(TileStorage<S>& tile, int stage, int kt, int row0, Matrix weight,
         if constexpr (S::eviction & 8) {
             if (cache_policy & 2)
                 common::cp_async_cache_hint<Cache::cg>(
-                    tile.input[stage] + row * (S::k_step / 2) + swizzle(row, segment * 16),
+                    tile.input[stage] + row * (S::k_step / 2) + swizzle<S>(row, segment * 16),
                     x + std::int64_t(source >= 0 ? source : 0) * (S::k / 2) +
                         (valid ? kt * (S::k_step / 2) + segment * 16 : 0),
                     valid ? 16 : 0, retained);
             else
                 common::cp_async_cache_hint<Cache::ca>(
-                    tile.input[stage] + row * (S::k_step / 2) + swizzle(row, segment * 16),
+                    tile.input[stage] + row * (S::k_step / 2) + swizzle<S>(row, segment * 16),
                     x + std::int64_t(source >= 0 ? source : 0) * (S::k / 2) +
                         (valid ? kt * (S::k_step / 2) + segment * 16 : 0),
                     valid ? 16 : 0, retained);
         } else if (cache_policy & 2)
             cp_async_zfill<16, Cache::cg>(tile.input[stage] + row * (S::k_step / 2) +
-                                              swizzle(row, segment * 16),
+                                              swizzle<S>(row, segment * 16),
                                           x + std::int64_t(source >= 0 ? source : 0) * (S::k / 2) +
                                               (valid ? kt * (S::k_step / 2) + segment * 16 : 0),
                                           valid ? 16 : 0);
         else
             cp_async_zfill<16>(tile.input[stage] + row * (S::k_step / 2) +
-                                   swizzle(row, segment * 16),
+                                   swizzle<S>(row, segment * 16),
                                x + std::int64_t(source >= 0 ? source : 0) * (S::k / 2) +
                                    (valid ? kt * (S::k_step / 2) + segment * 16 : 0),
                                valid ? 16 : 0);
@@ -225,20 +233,20 @@ contract_tile(TileStorage<S>& tile, int row0, Matrix weight, const std::uint8_t*
                 const int col      = ki * 32 + (lane >> 4) * 16;
                 ldmatrix_x4(
                     a[m][0], a[m][1], a[m][2], a[m][3],
-                    smem_addr(tile.weight[stage] + row * (S::k_step / 2) + swizzle(row, col)));
+                    smem_addr(tile.weight[stage] + row * (S::k_step / 2) + swizzle<S>(row, col)));
                 const int sr = row_base + ((lane & 1) << 3) + (lane >> 2);
                 as[m]        = tile.weight_scales[stage][ki * 128 + (sr % 32) * 4 + sr / 32];
             }
 #pragma unroll
             for (int n = 0; n < S::mma_columns; ++n) {
                 const int column = warp_n * S::warp_columns + n * 8;
-                if (begin + column < end) {
+                if (FullColumns || begin + column < end) {
                     const int row = column + (lane & 7);
                     const int col = ki * 32 + ((lane >> 3) & 1) * 16;
                     unsigned b[2];
-                    ldmatrix_x2(
-                        b[0], b[1],
-                        smem_addr(tile.input[stage] + row * (S::k_step / 2) + swizzle(row, col)));
+                    ldmatrix_x2(b[0], b[1],
+                                smem_addr(tile.input[stage] + row * (S::k_step / 2) +
+                                          swizzle<S>(row, col)));
                     const auto bs =
                         tile.input_scales[stage][(column + (lane >> 2)) * (S::k_step / 64) + ki];
 #pragma unroll
@@ -263,7 +271,8 @@ contract_tile(TileStorage<S>& tile, int row0, Matrix weight, const std::uint8_t*
 }
 
 template <int Columns, bool Gate, bool Atomic = false, int Stages = 2, int KStep = 128,
-          int Eviction = 0, bool CachedExpertMajor = true, int Intermediate = kIntermediate>
+          int Eviction = 0, bool CachedExpertMajor = true, int Intermediate = kIntermediate,
+          bool VectorAtomic = false, bool FullTileSpecialization = false>
 __global__ __launch_bounds__(
     Schedule<Columns, Gate, Stages, KStep, Eviction, Intermediate>::threads,
     Schedule<Columns, Gate, Stages, KStep, Eviction, Intermediate>::
@@ -322,7 +331,7 @@ __global__ __launch_bounds__(
         const int offset = groups.offsets[expert], end = groups.offsets[expert + 1];
         const int expert_count = end - offset;
         if (expert_count <= minimum_expert_count || expert_count > maximum_expert_count) continue;
-        if constexpr (!Gate && Intermediate == 320) {
+        if constexpr (!Gate) {
             if (pool_token_threshold && groups.load_range[2] > pool_min_experts &&
                 expert_count >= pool_token_threshold)
                 continue;
@@ -334,53 +343,90 @@ __global__ __launch_bounds__(
             const int packed = begin + threadIdx.x;
             tile.sources[threadIdx.x] =
                 packed < end ? (Gate ? groups.assignments[packed] / kTopK : packed) : -1;
+            if constexpr (!Gate && Atomic) {
+                const int assignment            = packed < end ? groups.assignments[packed] : -1;
+                tile.output_tokens[threadIdx.x] = assignment >= 0 ? assignment / kTopK : 0;
+                tile.output_coefficients[threadIdx.x] =
+                    assignment >= 0 ? coefficients[assignment] : 0;
+            }
         }
         __syncthreads();
         float acc[2][S::mma_columns][4] = {};
-        contract_tile<S, Gate, CachedExpertMajor>(tile, row0, weight, input, input_scales, begin,
-                                                  end, cache_policy, stream, retained, acc);
+        const auto contract             = [&]<bool FullColumns>() {
+            contract_tile<S, Gate, FullColumns>(tile, row0, weight, input, input_scales, begin, end,
+                                                            cache_policy, stream, retained, acc);
+        };
+        if constexpr ((CachedExpertMajor || FullTileSpecialization) && Columns >= 128) {
+            if (end - begin >= Columns)
+                contract.template operator()<true>();
+            else
+                contract.template operator()<false>();
+        } else {
+            contract.template operator()<false>();
+        }
         const float factor = 1.0F / (activation_divisor * weight.divisor);
+        if constexpr (!Gate && Atomic && VectorAtomic) {
 #pragma unroll
-        for (int n = 0; n < S::mma_columns; ++n) {
-            if (begin + warp_n * S::warp_columns + n * 8 >= end) { continue; }
-            const int column = begin + warp_n * S::warp_columns + n * 8 + 2 * (lane & 3);
-            if constexpr (Gate) {
+            for (int n = 0; n < S::mma_columns; ++n) {
 #pragma unroll
-                for (int t = 0; t < 2; ++t) {
-                    const float g0 = acc[0][n][t] * factor, g1 = acc[0][n][t + 2] * factor;
-                    const float h0 = silu(g0) * (acc[1][n][t] * factor);
-                    const float h1 = silu(g1) * (acc[1][n][t + 2] * factor);
-                    store_product<Intermediate>(h0, h1, product_divisor, product, product_scales,
-                                                column + t < end ? column + t : -1,
-                                                row0 + warp_m * 16);
-                }
-            } else {
-#pragma unroll
-                for (int t = 0; t < 2; ++t) {
-                    const int c = column + t;
-                    if (c >= end) continue;
-                    // Every row for one column consumes the same immutable route.
-                    // Resolve it before atomic writes; otherwise conservative aliasing
-                    // reloads the assignment/coefficient after each output element.
-                    float* target;
-                    float coefficient = 1;
-                    if constexpr (Atomic) {
-                        const int assignment = groups.assignments[c];
-                        target      = routed_sum + std::int64_t(assignment / kTopK) * kHidden;
-                        coefficient = coefficients[assignment];
-                    } else {
-                        target = contributions + std::int64_t(c) * kHidden;
+                for (int m = 0; m < 2; ++m) {
+                    const auto quad = common::mma_row_quad(
+                        make_float4(acc[m][n][0], acc[m][n][1], acc[m][n][2], acc[m][n][3]));
+                    const int column = warp_n * S::warp_columns + n * 8 + quad.column;
+                    if (begin + column < end) {
+                        const int row = row0 + warp_m * 32 + m * 16 + quad.row;
+                        auto* target =
+                            routed_sum + std::int64_t(tile.output_tokens[column]) * kHidden + row;
+                        const float coefficient = tile.output_coefficients[column];
+                        atomicAdd(reinterpret_cast<float4*>(target),
+                                  make_float4(quad.values.x * factor * coefficient,
+                                              quad.values.y * factor * coefficient,
+                                              quad.values.z * factor * coefficient,
+                                              quad.values.w * factor * coefficient));
                     }
+                }
+            }
+        } else {
 #pragma unroll
-                    for (int m = 0; m < 2; ++m) {
+            for (int n = 0; n < S::mma_columns; ++n) {
+                if (begin + warp_n * S::warp_columns + n * 8 >= end) { continue; }
+                const int column = begin + warp_n * S::warp_columns + n * 8 + 2 * (lane & 3);
+                if constexpr (Gate) {
 #pragma unroll
-                        for (int half = 0; half < 2; ++half) {
-                            const int v   = t + 2 * half;
-                            const int row = row0 + warp_m * 32 + m * 16 + (lane >> 2) + half * 8;
-                            if constexpr (Atomic)
-                                atomicAdd(target + row, acc[m][n][v] * factor * coefficient);
-                            else
-                                target[row] = acc[m][n][v] * factor;
+                    for (int t = 0; t < 2; ++t) {
+                        const float g0 = acc[0][n][t] * factor, g1 = acc[0][n][t + 2] * factor;
+                        const float h0 = silu(g0) * (acc[1][n][t] * factor);
+                        const float h1 = silu(g1) * (acc[1][n][t + 2] * factor);
+                        store_product<Intermediate>(
+                            h0, h1, product_divisor, product, product_scales,
+                            column + t < end ? column + t : -1, row0 + warp_m * 16);
+                    }
+                } else {
+#pragma unroll
+                    for (int t = 0; t < 2; ++t) {
+                        const int c = column + t;
+                        if (c >= end) continue;
+                        float* target;
+                        float coefficient = 1;
+                        if constexpr (Atomic) {
+                            target =
+                                routed_sum + std::int64_t(tile.output_tokens[c - begin]) * kHidden;
+                            coefficient = tile.output_coefficients[c - begin];
+                        } else {
+                            target = contributions + std::int64_t(c) * kHidden;
+                        }
+#pragma unroll
+                        for (int m = 0; m < 2; ++m) {
+#pragma unroll
+                            for (int half = 0; half < 2; ++half) {
+                                const int v = t + 2 * half;
+                                const int row =
+                                    row0 + warp_m * 32 + m * 16 + (lane >> 2) + half * 8;
+                                if constexpr (Atomic)
+                                    atomicAdd(target + row, acc[m][n][v] * factor * coefficient);
+                                else
+                                    target[row] = acc[m][n][v] * factor;
+                            }
                         }
                     }
                 }
@@ -390,9 +436,9 @@ __global__ __launch_bounds__(
     }
 }
 
-template <int Columns>
+template <int Columns, int Intermediate>
 struct PoolContraction {
-    using S                      = Schedule<Columns, false, 2, 128, 0, 320>;
+    using S                      = Schedule<Columns, false, 2, 128, 0, Intermediate>;
     using Tile                   = TileStorage<S>;
     static constexpr int threads = S::threads;
     const std::uint8_t* input;
@@ -402,15 +448,22 @@ struct PoolContraction {
 
     __device__ __forceinline__ float operator()(Tile& tile, int row, int expert, int begin, int end,
                                                 float (&acc)[2][S::mma_columns][4]) const {
-        const auto weight = resolve(bank, expert);
-        contract_tile<S, false, true>(tile, row, weight, input, scales, begin, end, 0, 0, 0, acc);
+        const auto weight   = resolve(bank, expert);
+        const auto contract = [&]<bool FullColumns>() {
+            contract_tile<S, false, FullColumns>(tile, row, weight, input, scales, begin, end, 0, 0,
+                                                 0, acc);
+        };
+        if constexpr (Columns >= 128) {
+            if (end - begin >= Columns)
+                contract.template operator()<true>();
+            else
+                contract.template operator()<false>();
+        } else {
+            contract.template operator()<false>();
+        }
         return 1.F / (divisor * weight.divisor);
     }
 };
-
-__device__ __forceinline__ bool includes(ExpertSubsetKind kind, const int* mask, int expert) {
-    return kind == ExpertSubsetKind::All || mask[expert] == (kind == ExpertSubsetKind::MaskOnes);
-}
 
 __device__ __forceinline__ void expand_group(Matrix weight, int row, int group, int k,
                                              float* values) {
@@ -431,7 +484,7 @@ template <int Intermediate = kIntermediate>
 __global__ void vector_gate(const __nv_bfloat16* x, ExpertMatrixDeviceView bank, const int* ids,
                             ExpertSubsetKind kind, const int* mask, float* activation) {
     const int assignment = blockIdx.y, expert = ids[assignment];
-    if (!includes(kind, mask, expert)) { return; }
+    if (!expert_in_subset(kind, mask, expert)) { return; }
     const auto weight = resolve(bank, expert);
     const int row = blockIdx.x * 4 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
     const auto* input = x + std::int64_t(assignment / kTopK) * kHidden;
@@ -469,7 +522,7 @@ __global__ void vector_down(const float* activation, ExpertMatrixDeviceView bank
     for (int route = warp; route < kTopK; route += Warps) {
         const int assignment = token * kTopK + route, expert = ids[assignment];
         float sum[Rows] = {};
-        if (includes(kind, mask, expert)) {
+        if (expert_in_subset(kind, mask, expert)) {
             const auto weight = resolve(bank, expert);
             for (int group = lane; group < Intermediate / 16; group += 32) {
                 float x[16];
@@ -498,8 +551,9 @@ __global__ void vector_down(const float* activation, ExpertMatrixDeviceView bank
         float result = 0;
 #pragma unroll
         for (int j = 0; j < Warps; ++j) result += values[j][threadIdx.x];
-        const int i = token * kHidden + blockIdx.x * Rows + threadIdx.x;
-        output.store(i, output.initial(i) + result);
+        const int i     = token * kHidden + blockIdx.x * Rows + threadIdx.x;
+        const bool live = output.is_live(token);
+        output.store(i, output.initial(i, live) + result, live);
     }
 }
 

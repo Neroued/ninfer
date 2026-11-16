@@ -1006,11 +1006,11 @@ int exercise_anthropic_prefix_regression(const char* artifact) {
     // those histories fit. The independent nested-tool-markers scenario verifies both captures.
     std::cout << "anthropic mixed pressure: late_reused=" << late.stats.reused_prompt_tokens
               << " late_prompt=" << late.prompt.prompt_tokens << " late_computed=" << late_prefill
-              << " late_ttft_ms=" << late.stats.timings.first_token_seconds * 1000
+              << " late_ttft_ms=" << late.stats.timings.first_token_seconds.value() * 1000
               << " branch_reused=" << branch.stats.reused_prompt_tokens
               << " branch_prompt=" << branch.prompt.prompt_tokens
               << " branch_computed=" << branch_prefill
-              << " branch_ttft_ms=" << branch.stats.timings.first_token_seconds * 1000
+              << " branch_ttft_ms=" << branch.stats.timings.first_token_seconds.value() * 1000
               << " host_peak_bytes=" << host.peak_occupied_bytes
               << " host_capacity_bytes=" << host.capacity_bytes << '\n';
     const auto accounted = [](const ninfer::GenerationResult& result) {

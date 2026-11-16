@@ -200,6 +200,38 @@ std::shared_ptr<const ModelProfile> describe_model(const ModelDefinition& defini
         const auto& m = *w.mtp;
         out->mtp      = {d.linear({m.fc}), d.linear({m.head}), d.mla(m.attention), d.moe(m.moe)};
     }
+    if (w.draft) {
+        const auto& weights = *w.draft;
+        const auto& config  = *out->config.draft;
+        if (!config.dflash2 || config.full_layer_count())
+            throw std::invalid_argument("GLM5Next drafter requires local DFlash2 layers");
+        out->text.feature_slots.assign(c.layers.size(), -1);
+        for (std::size_t i = 0; i < config.target_layer_ids.size(); ++i) {
+            const auto layer = config.target_layer_ids[i];
+            if (layer + 1 == c.layers.size())
+                throw std::invalid_argument(
+                    "GLM5Next draft feature capture requires a post/pre boundary");
+            out->text.feature_slots.at(layer) = i;
+        }
+        auto& draft              = out->draft.emplace();
+        draft.feature_projection = d.linear({weights.feature_projection});
+        draft.head               = d.linear({weights.output_head});
+        draft.selector           = d.linear({weights.selector->hidden_projection});
+        draft.attention          = {dimension(config.attention.head_dim),
+                                    dimension(rank.draft->query_heads.size),
+                                    dimension(rank.draft->key_value_heads.size)};
+        draft.context            = {dimension(c.hidden),
+                                    draft.attention.head_dim,
+                                    draft.attention.kv_heads,
+                                    config.sliding_window.value(),
+                                    d.linear({weights.layers.front().attention.context_key}).qtype,
+                                    config.rms_norm_eps,
+                                    config.rope_theta};
+        for (const auto& layer : weights.layers)
+            draft.layers.push_back(
+                {d.linear({layer.attention.key, layer.attention.value, layer.attention.query}),
+                 d.linear({layer.mlp.gate, layer.mlp.up}), d.linear({layer.mlp.down})});
+    }
     if (w.vision) out->vision = d.vision(*w.vision);
     return out;
 }

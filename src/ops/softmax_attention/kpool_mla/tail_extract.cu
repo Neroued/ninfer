@@ -21,7 +21,7 @@ struct Extract {
     Raw records[2];
     const int* accepted;
     const int* base;
-    int dimension;
+    int dimension, batch;
 };
 
 template <class Field>
@@ -38,30 +38,33 @@ Raw raw(const Tensor& t) {
 }
 
 __global__ void extract_kernel(Extract a) {
-    const int b = blockIdx.y, l = blockIdx.x, accept = a.accepted[b];
-    if (!accept) return;
-    const int kind = threadIdx.x / 128, F = a.base[b], end = F + accept, rem = end % 4;
-    const auto& src     = a.before[kind];
-    const auto& dst     = a.after[kind];
-    const auto& records = a.records[kind];
-    for (int d = threadIdx.x % 128; d < a.dimension; d += 128) {
-        __nv_bfloat16 words[3];
+    const int l = blockIdx.x, kind = threadIdx.x / 128;
+    for (std::int64_t b = blockIdx.y; b < a.batch; b += gridDim.y) {
+        const int accept = a.accepted[b];
+        if (!accept) continue;
+        const int F = a.base[b], end = F + accept, rem = end % 4;
+        const auto& src     = a.before[kind];
+        const auto& dst     = a.after[kind];
+        const auto& records = a.records[kind];
+        for (int d = threadIdx.x % 128; d < a.dimension; d += 128) {
+            __nv_bfloat16 words[3];
 #pragma unroll
-        for (int r = 0; r < 3; ++r) {
-            const int p = end - rem + r;
-            words[r]    = __float2bfloat16_rn(0.F);
-            if (r < rem) {
-                if (p < F)
-                    words[r] = src.data[src.offsets[b] / 2 + l * src.layer +
-                                        (p - (F - F % 4)) * src.column + d];
-                else
-                    words[r] = records.data[l * records.layer + b * records.row +
-                                            (p - F) * records.column + d];
+            for (int r = 0; r < 3; ++r) {
+                const int p = end - rem + r;
+                words[r]    = __float2bfloat16_rn(0.F);
+                if (r < rem) {
+                    if (p < F)
+                        words[r] = src.data[src.offsets[b] / 2 + l * src.layer +
+                                            (p - (F - F % 4)) * src.column + d];
+                    else
+                        words[r] = records.data[l * records.layer + b * records.row +
+                                                (p - F) * records.column + d];
+                }
             }
-        }
 #pragma unroll
-        for (int r = 0; r < 3; ++r)
-            dst.data[dst.offsets[b] / 2 + l * dst.layer + r * dst.column + d] = words[r];
+            for (int r = 0; r < 3; ++r)
+                dst.data[dst.offsets[b] / 2 + l * dst.layer + r * dst.column + d] = words[r];
+        }
     }
 }
 } // namespace
@@ -72,7 +75,7 @@ void kpool_tail_extract(ConstKpoolTailStateView before, const KpoolRawRecordRead
     using namespace detail::kpool;
     const int B = accepted.ne[0], R = records.raw_keys.ne[2], L = records.raw_keys.ne[3],
               W = records.raw_keys.ne[1], D = records.raw_keys.ne[0];
-    require(B >= 1 && B <= R && R <= 8 && L > 0, "extraction geometry");
+    require(B >= 1 && B <= R && L > 0, "extraction geometry");
     const auto device = execution.device();
     operand::tensor(accepted, DType::I32, {B}, 4, kOperation, "accepted columns", device);
     operand::tensor(records.base_positions, DType::I32, {R}, 4, kOperation, "record bases", device);
@@ -87,8 +90,9 @@ void kpool_tail_extract(ConstKpoolTailStateView before, const KpoolRawRecordRead
               {raw(records.raw_keys), raw(records.raw_gates)},
               static_cast<const int*>(accepted.data),
               static_cast<const int*>(records.base_positions.data),
-              D};
-    extract_kernel<<<dim3(L, B), 256, 0, execution.stream()>>>(a);
+              D,
+              B};
+    extract_kernel<<<dim3(L, std::min(B, 65535)), 256, 0, execution.stream()>>>(a);
     CUDA_CHECK(cudaGetLastError());
 }
 } // namespace ninfer::ops

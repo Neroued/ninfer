@@ -12,24 +12,28 @@ template <bool Gate, int Columns, bool Atomic = false>
 void launch_mma(const Tensor& x, const CudaSwiGLUExperts& experts, const ExpertRoutes& routes,
                 const Storage& storage, const Plan& plan, CudaExecutionView execution,
                 int minimum_count = 0, int maximum_count = 0x7fffffff) {
-    using S                   = Schedule<Columns, Gate>;
+    constexpr int stages      = !Gate && Columns == 128 ? 1 : 2;
+    constexpr int min_blocks  = !Gate && Columns >= 64 ? 2 : 1;
+    using S                   = Schedule<Columns, Gate, stages, Atomic>;
     constexpr int row_tiles   = Gate ? (kLocalIntermediate + 127) / 128 : kHidden / 128;
     const int job_columns     = plan.job_columns();
-    const int covered_columns = std::min(job_columns, maximum_count);
+    const int covered_columns = std::min({job_columns, maximum_count, int(x.ne[1])});
     const int subtiles        = std::bit_ceil(unsigned((covered_columns + Columns - 1) / Columns));
     const int max_jobs        = (kTopK * x.ne[1] / job_columns + kExperts) * subtiles;
     const int blocks =
         std::min(max_jobs * row_tiles, execution.multiprocessor_count() * plan.queued_ctas_per_sm);
     const int bytes =
-        common::prepare_shared<sizeof(TileStorage<S>), grouped_mma<Columns, Gate, Atomic>, true>();
-    grouped_mma<Columns, Gate, Atomic><<<blocks, S::threads, bytes, execution.stream()>>>(
-        Gate ? storage.input_codes : storage.product_codes,
-        static_cast<const float*>(Gate ? storage.input_scales : storage.product_scales),
-        Gate ? experts.bank.gate_up : experts.bank.down, storage.groups, storage.product_codes,
-        static_cast<float*>(storage.product_scales), storage.contributions,
-        static_cast<const float*>(routes.coefficients.data), storage.routed_sum,
-        std::countr_zero(unsigned(subtiles)), minimum_count, maximum_count, plan.pool_expert_limit,
-        plan.pool_min_experts);
+        common::prepare_shared<sizeof(TileStorage<S>),
+                               grouped_mma<Columns, Gate, Atomic, stages, min_blocks>, true>();
+    grouped_mma<Columns, Gate, Atomic, stages, min_blocks>
+        <<<blocks, S::threads, bytes, execution.stream()>>>(
+            Gate ? storage.input_codes : storage.product_codes,
+            static_cast<const float*>(Gate ? storage.input_scales : storage.product_scales),
+            Gate ? experts.bank.gate_up : experts.bank.down, storage.groups, storage.product_codes,
+            static_cast<float*>(storage.product_scales), storage.contributions,
+            static_cast<const float*>(routes.coefficients.data), storage.routed_sum,
+            std::countr_zero(unsigned(subtiles)), minimum_count, maximum_count,
+            plan.pool_expert_limit, plan.pool_min_experts);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -49,11 +53,8 @@ void with_columns(int columns, Function&& function) {
         function.template operator()<64>();
         break;
     case 128:
-        if constexpr (Gate) {
-            function.template operator()<128>();
-            break;
-        }
-        [[fallthrough]];
+        function.template operator()<128>();
+        break;
     default:
         throw std::logic_error("invalid block64 FP8 column tile");
     }

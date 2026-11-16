@@ -12,6 +12,7 @@ namespace ninfer::ops {
 // BF16/FP16/FP32/I8/U8/I32/U32/I64/U64 are supported. Transport-only operations preserve bits.
 // Calls enqueue on execution.stream(). Buffers and groups outlive all consumers and Graphs.
 // Outputs are caller-owned; no caller workspace is needed. Size-one groups copy or do nothing.
+// The group is prepared for the operation's count/dtype domain before execution or capture.
 
 // output[i] = reduce_r input_r[i]. Equal extents; exact in-place is allowed.
 void all_reduce(const Tensor& input, Tensor& output, distributed::Reduction,

@@ -54,6 +54,25 @@ Json budget_json(const RankMemoryBudget& b) {
 }
 } // namespace
 
+const char* communication_backend_name(CommunicationBackend backend) {
+    switch (backend) {
+    case CommunicationBackend::Nccl:
+        return "nccl";
+    case CommunicationBackend::Native:
+        return "native";
+    }
+    throw std::logic_error("invalid communication backend observation");
+}
+
+Json communication_json(const CommunicationWork& value) {
+    constexpr std::array names{"all_reduce",     "broadcast", "all_gather",
+                               "reduce_scatter", "send",      "receive"};
+    Json out;
+    for (std::size_t i = 0; i < names.size(); ++i)
+        out[names[i]] = {{"calls", value.calls[i]}, {"payload_bytes", value.payload_bytes[i]}};
+    return out;
+}
+
 double seconds(std::uint64_t ns) noexcept { return static_cast<double>(ns) * 1e-9; }
 
 const char* context_domain_name(ContextMemoryDomain domain) noexcept {
@@ -189,15 +208,27 @@ Json resource_json(const RankSnapshot& rank) {
              {"ple", nullptr}};
     out["communication"] = Json::array();
     for (const auto& group : rank.communication) {
-        Json memory = nullptr;
-        if (group.startup_memory) {
-            const auto& value = *group.startup_memory;
-            memory            = {{"tracked_device_bytes", value.tracked_device_bytes},
-                                 {"persistent_device_bytes", value.persistent_device_bytes},
-                                 {"suspendable_device_bytes", value.suspendable_device_bytes}};
+        auto backends = Json::array();
+        for (const auto& backend : group.backends) {
+            const auto& memory = backend.memory;
+            Json library       = nullptr;
+            if (memory.library) {
+                const auto& value = *memory.library;
+                library           = {{"tracked_device_bytes", value.tracked_device_bytes},
+                                     {"persistent_device_bytes", value.persistent_device_bytes},
+                                     {"suspendable_device_bytes", value.suspendable_device_bytes}};
+            }
+            backends.push_back({{"backend", communication_backend_name(backend.backend)},
+                                {"eager", communication_json(backend.eager)},
+                                {"graph", communication_json(backend.graph)},
+                                {"memory",
+                                 {{"owned_host_bytes", memory.owned_host_bytes},
+                                  {"owned_device_bytes", memory.owned_device_bytes},
+                                  {"registered_host_bytes", memory.registered_host_bytes},
+                                  {"library", std::move(library)}}}});
         }
         out["communication"].push_back(
-            {{"group", group.group}, {"size", group.size}, {"startup_memory", std::move(memory)}});
+            {{"group", group.group}, {"size", group.size}, {"backends", std::move(backends)}});
     }
     if (rank.physical_memory) {
         const auto& p          = *rank.physical_memory;

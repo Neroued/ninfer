@@ -12,6 +12,7 @@ enum class SlidingWindowAttentionRoute {
 };
 
 struct SlidingWindowAttentionPlan {
+    AttentionHeadGeometry geometry;
     SlidingWindowAttentionRoute route;
     std::int32_t tokens;
     std::int32_t warps;
@@ -23,7 +24,8 @@ struct SlidingWindowAttentionPlan {
 };
 
 [[nodiscard]] SlidingWindowAttentionPlan
-select_sliding_window_attention_plan(std::uint32_t window, std::int32_t tokens, std::int32_t batch,
+select_sliding_window_attention_plan(AttentionHeadGeometry geometry, std::uint32_t window,
+                                     std::int32_t tokens, std::int32_t batch,
                                      SlidingWindowAttentionExecutionEnvelope envelope);
 
 } // namespace ninfer::ops::detail

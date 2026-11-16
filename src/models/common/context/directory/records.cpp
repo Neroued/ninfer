@@ -488,7 +488,8 @@ RecordAssessment RecordDomains::assess(std::span<const RecordDemand> demands,
         std::vector<AllocationId> freed;
         for (const auto& release : releases)
             if (release.domain == value->id) freed.push_back(release.allocation);
-        result.domains.push_back({value->id, value->pool->assess(requests, freed)});
+        result.domains.push_back({value->id, value->pool->assess(requests, freed),
+                                  value->pool->required_bytes(requests)});
     }
     return result;
 }

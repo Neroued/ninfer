@@ -54,8 +54,7 @@ std::shared_ptr<const moe::Plan> describe_moe_plan(const execution::ModelProfile
 namespace {
 EngineOptions options(const execution::ModelProfile& profile, const EngineOptions& supplied) {
     auto o = supplied;
-    if (load_options(o) != profile.options || o.max_concurrency == 0 ||
-        o.max_concurrency > kMaximumConcurrency || !o.max_context ||
+    if (load_options(o) != profile.options || o.max_concurrency == 0 || !o.max_context ||
         o.max_context > profile.config.text.max_context)
         throw std::invalid_argument(
             "execution options differ from selected Qwen4Exp components or domain");
@@ -78,15 +77,21 @@ EngineOptions options(const execution::ModelProfile& profile, const EngineOption
 
 ExecutionPlan physical_plan(std::shared_ptr<const execution::ModelProfile> profile,
                             ple::disk::TableGeometry table, const EngineOptions& o,
+                            std::shared_ptr<const BatchExecutionPlan> batches,
                             DeviceContext& device, const moe::Plan* schedule) {
     ExecutionPlan out;
-    out.profile    = std::move(profile);
-    out.shape      = describe_execution_shape(*out.profile, o);
-    out.persistent = persistent(*out.profile, o);
-    out.workspace  = execution::plan_workspace(*out.profile, o, o.prefill_chunk,
-                                               device.multiprocessor_count(), schedule);
-    out.ple.max_positions =
-        std::max(o.prefill_chunk, o.max_concurrency * (o.speculative.draft_tokens + 1));
+    if (!batches || batches->resident_capacity() != o.max_concurrency ||
+        batches->attention_owners() != 1)
+        throw std::invalid_argument("Qwen4Exp batch plan differs from execution configuration");
+    out.batches           = std::move(batches);
+    out.profile           = std::move(profile);
+    out.shape             = describe_execution_shape(*out.profile, o);
+    out.persistent        = persistent(*out.profile, o);
+    out.workspace         = execution::plan_workspace(*out.profile, o, o.prefill_chunk,
+                                                      device.multiprocessor_count(), schedule);
+    out.ple.max_rows      = o.max_concurrency;
+    out.ple.max_positions = dimension(std::max<std::uint64_t>(
+        o.prefill_chunk, std::uint64_t(o.max_concurrency) * (o.speculative.draft_tokens + 1)));
     if (out.profile->ple_placement == ple::Placement::Disk) {
         out.ple_upload        = ple::UploadSlots::memory(out.ple.max_positions, 2);
         out.ple_prepare_bytes = ple::disk::PrepareService::memory_bytes(table, out.ple, 2);
@@ -154,7 +159,7 @@ std::size_t ExecutionPlan::pinned_aux_bytes() const {
 
 std::size_t ExecutionPlan::pinned_context_counts_bytes() const {
     return persistent.buffers.token_counts
-               ? std::size_t(profile->public_tokens) * shape.max_concurrency * sizeof(std::int32_t)
+               ? std::size_t(profile->public_tokens) * sizeof(std::int32_t)
                : 0;
 }
 
@@ -212,13 +217,15 @@ runtime::ContextCapacityPlan capacity_plan(const ExecutionPlan& base, const Engi
 
 std::optional<ExecutionPlan> plan_execution(std::shared_ptr<const execution::ModelProfile> profile,
                                             ple::disk::TableGeometry table,
-                                            const EngineOptions& supplied, DeviceContext& device,
-                                            std::size_t available,
+                                            const EngineOptions& supplied,
+                                            std::shared_ptr<const BatchExecutionPlan> batches,
+                                            DeviceContext& device, std::size_t available,
                                             std::shared_ptr<const moe::Plan> prototype,
                                             bool control_owner, std::size_t available_host_bytes) {
     if (!profile) throw std::invalid_argument("execution planning requires a model profile");
-    const auto o       = options(*profile, supplied);
-    auto out           = physical_plan(std::move(profile), table, o, device, prototype.get());
+    const auto o = options(*profile, supplied);
+    auto out =
+        physical_plan(std::move(profile), table, o, std::move(batches), device, prototype.get());
     auto budget        = capacity_plan(out, o);
     const auto& policy = o.context_capacity;
     if (prototype) {
@@ -230,11 +237,14 @@ std::optional<ExecutionPlan> plan_execution(std::shared_ptr<const execution::Mod
             ((control_owner && NINFER_SHARED_PHYSICAL_MEMORY != 0) ? budget.control_bytes(capacity)
                                                                    : 0);
         if (required > available) return {};
-        out.moe =
-            prototype->resolve(available - required, out.ple.max_positions, o.moe.cpu_workers);
+        const auto geometries =
+            moe::decode_geometries(*out.batches, o.speculative.draft_tokens + 1);
+        out.moe = prototype->resolve(available - required, out.ple.max_positions, geometries,
+                                     o.moe.cpu_workers);
         if (!out.moe) return {};
-        budget.fixed_device_bytes = out.device_reservation_bytes();
-        budget.fixed_host_bytes   = out.host_reservation_bytes();
+        out.workspace = execution::plan_workspace(*out.profile, o, o.prefill_chunk,
+                                                  device.multiprocessor_count(), out.moe.get());
+        budget        = capacity_plan(out, o);
     }
     const auto minimum  = budget.minimum_capacity();
     const auto required = policy.mode == ContextCapacityMode::Explicit
@@ -254,11 +264,13 @@ std::optional<ExecutionPlan> plan_execution(std::shared_ptr<const execution::Mod
 
 ExecutionPlan plan_graph_probe(std::shared_ptr<const execution::ModelProfile> profile,
                                ple::disk::TableGeometry table, const EngineOptions& supplied,
+                               std::shared_ptr<const BatchExecutionPlan> batches,
                                DeviceContext& device, std::shared_ptr<const moe::Plan> schedule,
                                GraphProbeBacking backing) {
     auto o                              = options(*profile, supplied);
     o.context_cache.host_capacity_bytes = 0;
-    auto plan           = physical_plan(std::move(profile), table, o, device, schedule.get());
+    auto plan =
+        physical_plan(std::move(profile), table, o, std::move(batches), device, schedule.get());
     plan.moe            = std::move(schedule);
     plan.graph_probe    = true;
     auto budget         = capacity_plan(plan, o);
@@ -273,13 +285,13 @@ ExecutionPlan plan_graph_probe(std::shared_ptr<const execution::ModelProfile> pr
     return plan;
 }
 
-runtime::ContextCapacityPlan
-describe_execution_capacity(std::shared_ptr<const execution::ModelProfile> profile,
-                            const EngineOptions& supplied, DeviceContext& device) {
+runtime::ContextCapacityPlan describe_execution_capacity(
+    std::shared_ptr<const execution::ModelProfile> profile, const EngineOptions& supplied,
+    std::shared_ptr<const BatchExecutionPlan> batches, DeviceContext& device) {
     const auto o = options(*profile, supplied);
     if (profile->local.size == 1)
         throw std::invalid_argument("resident rank capacity requires partitioned execution");
-    return capacity_plan(physical_plan(profile, {}, o, device, nullptr), o);
+    return capacity_plan(physical_plan(profile, {}, o, std::move(batches), device, nullptr), o);
 }
 
 } // namespace ninfer::models::qwen4_exp

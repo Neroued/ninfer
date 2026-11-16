@@ -171,11 +171,12 @@ int main(int argc, char** argv) try {
                     const auto launch = [&](CudaExecutionView cuda) {
                         if (o.operation == "complete") {
                             ops::topk_softmax_swiglu_moe(x, profile, full, weights.subset(),
-                                                         ops::MoeEpilogue::Write, y, arena, cuda);
+                                                         ops::MoeEpilogue::Write, y, {}, arena,
+                                                         cuda);
                         } else {
                             if (o.operation == "decomposed")
                                 ops::topk_softmax_route(x, {ep::H, ep::E, ep::K}, full.control,
-                                                        selected, b, arena, cuda);
+                                                        selected, b, {}, arena, cuda);
                             if (has_shared)
                                 ops::routed_swiglu(x, profile.routed, full.routed, selected,
                                                    weights.subset(), {full.shared, b},

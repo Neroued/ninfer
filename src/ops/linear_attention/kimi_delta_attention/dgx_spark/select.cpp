@@ -41,12 +41,15 @@ int recurrence_window_peak(int heads, int first, int last) {
     return first <= kPacketWindowThreshold ? kPacketWindowThreshold : kPacketWindow;
 }
 
-int select_record_rows(int heads, int tokens, int batch) {
+RecordSchedule select_record_schedule(int heads, int tokens, int batch) {
+    // Keep repeated Q/K/gate reads adjacent to each State at larger batches.
+    if (heads == 32 && batch >= 16)
+        return tokens >= 16 ? RecordSchedule{16, true, 16} : RecordSchedule{8, true};
     if (heads == 32) {
-        if (batch >= 2 && tokens <= 4) return 2;
-        if (batch == 1 && (tokens == 2 || tokens >= 5)) return 8;
+        if (batch >= 2 && tokens <= 4) return {2};
+        if (batch == 1 && (tokens == 2 || tokens >= 5)) return {8};
     }
-    return heads == 32 && tokens >= 12 && batch != 2 ? 8 : 4;
+    return {heads == 32 && tokens >= 12 && batch != 2 ? 8 : 4};
 }
 
 FoldSchedule select_fold_schedule(int layers, int heads, int width, int batch, int sms) {

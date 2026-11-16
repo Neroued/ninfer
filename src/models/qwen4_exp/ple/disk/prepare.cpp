@@ -14,7 +14,8 @@ namespace {
 
 PrepareOptions checked_options(PrepareOptions options, std::span<const MemorySpan> outputs,
                                std::int32_t eos) {
-    if (!options.max_positions || options.max_positions > UINT32_MAX / kHeads || outputs.empty() ||
+    if (!options.max_positions || !options.max_rows || options.max_rows > options.max_positions ||
+        options.max_positions > UINT32_MAX / kHeads || outputs.empty() ||
         outputs.size() > UINT32_MAX || eos < 0)
         throw std::invalid_argument("invalid PLE preparation capacity");
     const auto bytes = std::size_t(options.max_positions) * kEmbeddingBytes;
@@ -45,10 +46,11 @@ struct PrepareService::Impl {
     struct Window {
         MemorySpan output;
         std::vector<std::int32_t> ids;
-        std::array<SequenceIdentity, 8> identities{};
-        std::array<std::uint32_t, 8> known{}, planned{}, valid{};
+        std::vector<SequenceIdentity> identities;
+        std::vector<std::uint32_t> known, planned, valid;
+        std::vector<std::uint8_t> seen;
         std::uint64_t generation = 0;
-        std::uint32_t tokens = 0, batch = 0;
+        std::uint32_t tokens = 0, batch = 0, logical_rows = 0;
         PrepareStatus status = PrepareStatus::Preparing;
         std::exception_ptr error;
         bool allocated = false, released = false, bound = false, required = true, promoted = false;
@@ -75,6 +77,11 @@ struct PrepareService::Impl {
         for (std::size_t i = 0; i < windows.size(); ++i) {
             windows[i].output = outputs[i];
             windows[i].ids.resize(this->options.max_positions);
+            windows[i].identities.resize(this->options.max_rows);
+            windows[i].known.resize(this->options.max_rows);
+            windows[i].planned.resize(this->options.max_rows);
+            windows[i].valid.resize(this->options.max_rows);
+            windows[i].seen.resize(this->options.max_rows);
         }
         std::optional<CpuTopology> topology;
         if (!this->options.affinity.empty()) {
@@ -106,9 +113,7 @@ struct PrepareService::Impl {
         return w;
     }
 
-    static WindowSnapshot snapshot(const Window& w) {
-        return {{w.tokens, w.batch, w.valid, w.identities}, w.status, w.drained, w.error};
-    }
+    static WindowSnapshot snapshot(const Window& w) { return {w.status, w.drained, w.error}; }
 
     bool tick() {
         // This bounded critical section serializes control changes with all E writers.
@@ -237,13 +242,14 @@ PrepareService::PrepareService(const Table& table, std::int32_t eos, PrepareOpti
 
 PrepareService::~PrepareService() = default;
 
-std::optional<Ticket> PrepareService::prepare(std::uint32_t tokens, std::span<const InputRow> rows,
-                                              bool required) {
+std::optional<Ticket> PrepareService::prepare(std::uint32_t tokens, std::uint32_t physical_rows,
+                                              std::span<const InputRow> rows, bool required) {
     auto& p = *impl_;
     std::lock_guard lock(p.mutex);
     if (p.fatal) std::rethrow_exception(p.fatal);
-    if (!tokens || rows.empty() || rows.size() > kMaximumConcurrency ||
-        std::uint64_t(tokens) * rows.size() > p.options.max_positions)
+    if (!tokens || rows.empty() || rows.size() > physical_rows ||
+        physical_rows > p.options.max_rows ||
+        std::uint64_t(tokens) * physical_rows > p.options.max_positions)
         throw std::invalid_argument("invalid PLE window shape");
     for (const auto& row : rows) {
         if (row.ids.size() > tokens || row.identity.raw_tail[0] < 0 || row.identity.raw_tail[1] < 0)
@@ -261,17 +267,19 @@ std::optional<Ticket> PrepareService::prepare(std::uint32_t tokens, std::span<co
         auto& w = p.windows[slot];
         if (w.allocated) continue;
         ++w.generation;
-        w.tokens    = tokens;
-        w.batch     = rows.size();
-        w.allocated = true;
+        w.tokens       = tokens;
+        w.batch        = physical_rows;
+        w.logical_rows = rows.size();
+        w.allocated    = true;
         w.released = w.bound = w.promoted = w.sealed = w.seal_applied = false;
         w.cancelled = w.cancel_applied = false;
         w.required                     = required;
         w.drained                      = false;
         w.status                       = PrepareStatus::Preparing;
         w.error                        = {};
-        w.known = w.planned = w.valid = {};
-        w.identities                  = {};
+        std::fill_n(w.known.begin(), w.batch, 0);
+        std::fill_n(w.planned.begin(), w.batch, 0);
+        std::fill_n(w.valid.begin(), w.batch, 0);
         for (std::size_t b = 0; b < rows.size(); ++b) {
             w.identities[b] = rows[b].identity;
             w.known[b]      = rows[b].ids.size();
@@ -299,12 +307,12 @@ void PrepareService::append(Ticket ticket, std::span<const Append> rows) {
     auto& w = p.get(ticket);
     if (w.sealed || w.cancelled || w.status != PrepareStatus::Preparing)
         throw std::invalid_argument("PLE window is closed to append");
-    std::array<bool, 8> seen{};
+    std::fill_n(w.seen.begin(), w.logical_rows, 0);
     for (const auto& row : rows) {
-        if (row.batch_row >= w.batch || seen[row.batch_row] ||
+        if (row.batch_row >= w.logical_rows || w.seen[row.batch_row] ||
             row.ids.size() > w.tokens - w.known[row.batch_row])
             throw std::invalid_argument("invalid PLE appended prefix");
-        seen[row.batch_row] = true;
+        w.seen[row.batch_row] = true;
         check_ids(row.ids);
     }
     for (const auto& row : rows) {
@@ -319,7 +327,8 @@ void PrepareService::seal(Ticket ticket, std::span<const std::uint32_t> valid) {
     auto& p = *impl_;
     std::lock_guard lock(p.mutex);
     auto& w = p.get(ticket);
-    if (w.sealed || w.cancelled || w.status != PrepareStatus::Preparing || valid.size() != w.batch)
+    if (w.sealed || w.cancelled || w.status != PrepareStatus::Preparing ||
+        valid.size() != w.logical_rows)
         throw std::invalid_argument("invalid PLE seal");
     for (std::size_t b = 0; b < valid.size(); ++b)
         if (valid[b] > w.known[b]) throw std::invalid_argument("PLE seal exceeds known IDs");
@@ -350,8 +359,10 @@ HostEmbedding PrepareService::embedding(Ticket ticket) const {
     const auto& w = impl_->get(ticket);
     if (w.cancelled || w.status != PrepareStatus::HostReady)
         throw std::logic_error("PLE embedding is not HostReady");
-    return {ticket, w.output.subspan(0, std::size_t(w.tokens) * w.batch * kEmbeddingBytes),
-            Impl::snapshot(w).input};
+    return {ticket,
+            w.output.subspan(0, std::size_t(w.tokens) * w.batch * kEmbeddingBytes),
+            {w.tokens, w.batch, std::span(w.valid).first(w.batch),
+             std::span(w.identities).first(w.logical_rows)}};
 }
 
 void PrepareService::release(Ticket ticket) {
@@ -374,18 +385,23 @@ ReadStats PrepareService::stats() const {
 std::size_t PrepareService::memory_bytes() const noexcept {
     const auto& p = *impl_;
     return sizeof(Impl) +
-           p.windows.size() * (sizeof(Impl::Window) +
-                               std::size_t(p.options.max_positions) * sizeof(std::int32_t)) +
+           p.windows.size() *
+               (sizeof(Impl::Window) + std::size_t(p.options.max_positions) * sizeof(std::int32_t) +
+                std::size_t(p.options.max_rows) *
+                    (sizeof(SequenceIdentity) + 3 * sizeof(std::uint32_t) + sizeof(std::uint8_t))) +
            p.reader.memory_bytes();
 }
 
 std::size_t PrepareService::memory_bytes(TableGeometry table, const PrepareOptions& options,
                                          std::uint32_t slots) {
-    if (!options.max_positions || options.max_positions > UINT32_MAX / kHeads || !slots)
+    if (!options.max_positions || !options.max_rows || options.max_rows > options.max_positions ||
+        options.max_positions > UINT32_MAX / kHeads || !slots)
         throw std::invalid_argument("invalid PLE preparation capacity");
     return sizeof(Impl) +
            std::size_t(slots) *
-               (sizeof(Impl::Window) + std::size_t(options.max_positions) * sizeof(std::int32_t)) +
+               (sizeof(Impl::Window) + std::size_t(options.max_positions) * sizeof(std::int32_t) +
+                std::size_t(options.max_rows) *
+                    (sizeof(SequenceIdentity) + 3 * sizeof(std::uint32_t) + sizeof(std::uint8_t))) +
            RowReader::memory_bytes(table, slots, options.max_positions * kHeads, options.io_depth,
                                    options.cache_bytes);
 }

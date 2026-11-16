@@ -19,6 +19,10 @@ struct Arguments {
 
 inline constexpr int kTiledTokens = 128;
 
+inline bool whole_window_tiles(int width) {
+    return width <= kTiledTokens && kTiledTokens % width == 0;
+}
+
 struct TiledWorkspace {
     std::size_t edge_words;
     std::size_t bytes;

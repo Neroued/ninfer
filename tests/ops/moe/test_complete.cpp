@@ -1,7 +1,73 @@
 #include "fixture.h"
+#include "core/decode_graph.h"
 
 namespace ninfer::test::moe {
 namespace {
+int complete_validity(Fixture& fixture, CudaExecutionView execution, int tokens, int width = 2,
+                      bool sparse_rows = false) {
+    const auto batch = fixture.batch(tokens);
+    DeviceBatch input(batch);
+    GuardedDeviceBuffer output_storage(batch.input.size() * 2);
+    Tensor output(output_storage.span(), DType::BF16, {kHidden, tokens});
+    std::vector<int> columns(tokens / width);
+    auto valid = to_device(columns);
+    const ops::MoeTokenValidity validity{Tensor(valid.span(), DType::I32, {tokens / width}), width};
+    const auto& profile = fixture.profile();
+    int failures        = 0;
+    for (const auto mode : {ops::MoeEpilogue::Write, ops::MoeEpilogue::AddResidual}) {
+        const auto bytes = ops::topk_softmax_swiglu_moe_workspace_capacity_bytes(
+            profile, ops::ExpertSubsetKind::All, mode, tokens, tokens);
+        GuardedDeviceBuffer scratch(bytes);
+        MemoryArena arena(scratch.span());
+        DecodeGraphDefinition definition;
+        DecodeGraphExecutable graph;
+        definition.capture(execution.stream(), [&] {
+            ops::topk_softmax_swiglu_moe(input.x, profile, fixture.weights(), {}, mode, output,
+                                         validity, arena, execution);
+        });
+        graph.instantiate(definition);
+        for (int replay = 0; replay < 2; ++replay) {
+            for (std::size_t row = 0; row < columns.size(); ++row)
+                columns[row] = sparse_rows ? (row == std::size_t(replay + 1) ? width - replay : 0)
+                                           : (row + replay) % (width + 1);
+            valid.copy_from_host(columns.data(), valid.size());
+            auto seed     = batch.residual;
+            auto expected = batch.complete;
+            for (int t = 0; t < tokens; ++t) {
+                const bool live = t % width < columns[t / width];
+                for (int h = 0; h < kHidden; ++h) {
+                    const auto index = std::size_t(t) * kHidden + h;
+                    if (!live) {
+                        seed[index]     = h % 2 ? 0x7fc1 : 0x8000;
+                        expected[index] = 0;
+                    } else if (mode == ops::MoeEpilogue::Write) {
+                        expected[index] -= bf16_to_f32(batch.residual[index]);
+                    }
+                }
+            }
+            output_storage.copy_from_host(seed.data(), seed.size() * 2);
+            graph.launch(execution.stream());
+            cuda_synchronize(execution.stream());
+            const auto bits = from_device<std::uint16_t>(output.data, seed.size());
+            auto actual     = from_device_bf16(output.data, seed.size());
+            for (int t = 0; t < tokens; ++t) {
+                if (t % width < columns[t / width]) continue;
+                for (int h = 0; h < kHidden; ++h) {
+                    const auto index         = std::size_t(t) * kHidden + h;
+                    const auto expected_bits = mode == ops::MoeEpilogue::Write ? 0 : seed[index];
+                    if (bits[index] != expected_bits) ++failures;
+                    actual[index] = 0;
+                }
+            }
+            failures += verify_reduction("complete validity", actual, expected, kCompleteA16);
+            failures += scratch.verify_guards("complete validity scratch") +
+                        output_storage.verify_guards("complete validity output");
+        }
+        if (arena.used() || arena.peak_used() != bytes) ++failures;
+    }
+    return failures;
+}
+
 int complete(Fixture& fixture, CudaExecutionView execution, int tokens, bool write) {
     const auto& profile = fixture.profile();
     const bool q5       = profile.routed.ffn.down_type == QType::Q5_G64_FP16;
@@ -21,7 +87,8 @@ int complete(Fixture& fixture, CudaExecutionView execution, int tokens, bool wri
                                        cudaMemcpyDeviceToDevice, execution.stream()),
                        "seed residual");
             ops::topk_softmax_swiglu_moe(input.x, profile, fixture.weights(), {},
-                                         ops::MoeEpilogue::AddResidual, output, arena, execution);
+                                         ops::MoeEpilogue::AddResidual, output, {}, arena,
+                                         execution);
         };
         if (q5 && tokens == 2) {
             cudaGraph_t graph;
@@ -62,7 +129,8 @@ int complete(Fixture& fixture, CudaExecutionView execution, int tokens, bool wri
                 bool rejected  = false;
                 try {
                     ops::topk_softmax_swiglu_moe(invalid, profile, fixture.weights(), {},
-                                                 ops::MoeEpilogue::Write, output, arena, execution);
+                                                 ops::MoeEpilogue::Write, output, {}, arena,
+                                                 execution);
                 } catch (const std::invalid_argument&) { rejected = true; }
                 if (!rejected) {
                     std::cerr << "accepted a mismatched device\n";
@@ -82,7 +150,7 @@ int complete(Fixture& fixture, CudaExecutionView execution, int tokens, bool wri
                 profile, ops::ExpertSubsetKind::All, ops::MoeEpilogue::Write, tokens, tokens));
         MemoryArena arena(scratch.span());
         ops::topk_softmax_swiglu_moe(input.x, profile, fixture.weights(), {},
-                                     ops::MoeEpilogue::Write, output, arena, execution);
+                                     ops::MoeEpilogue::Write, output, {}, arena, execution);
         cuda_synchronize(execution.stream());
         auto reference = batch.complete;
         for (std::size_t i = 0; i < reference.size(); ++i) {
@@ -115,7 +183,8 @@ int complete_subset(Fixture& fixture, CudaExecutionView execution, int tokens,
     cudaGraphExec_t executable;
     cuda_check(cudaStreamBeginCapture(execution.stream(), cudaStreamCaptureModeThreadLocal),
                "capture");
-    ops::topk_softmax_swiglu_moe(input.x, profile, weights, subset, mode, output, arena, execution);
+    ops::topk_softmax_swiglu_moe(input.x, profile, weights, subset, mode, output, {}, arena,
+                                 execution);
     cuda_check(cudaStreamEndCapture(execution.stream(), &graph), "end capture");
     cuda_check(cudaGraphInstantiate(&executable, graph, 0), "instantiate");
     int failures = 0;
@@ -162,9 +231,19 @@ int complete_subset(Fixture& fixture, CudaExecutionView execution, int tokens,
 
 void add_complete_cases(std::vector<FixtureCase>& cases, QType gate_up, QType down) {
     const bool q8 = gate_up == QType::Q8_G32_FP16, q5 = down == QType::Q5_G64_FP16;
+    cases.push_back({{"complete/validity", {{"execution", "graph"}, {"suite", "concurrency"}}},
+                     [](Fixture& f, auto e) { return complete_validity(f, e, 18); }});
+    if (!q8)
+        cases.push_back(
+            {{"complete/validity/sparse_rows", {{"execution", "graph"}, {"suite", "concurrency"}}},
+             [](Fixture& f, auto e) { return complete_validity(f, e, 768, 16, true); }});
+    if (q5)
+        cases.push_back(
+            {{"complete/validity/sliced", {{"execution", "graph"}, {"suite", "concurrency"}}},
+             [](Fixture& f, auto e) { return complete_validity(f, e, 4098, 3); }});
     const auto widths = q8   ? std::vector{1, 2, 19, 20, 383, 384, 768}
-                        : q5 ? std::vector{1, 2, 46, 47, 768, 4097}
-                             : std::vector{1, 2, 46, 47, 768};
+                        : q5 ? std::vector{1, 2, 15, 16, 46, 47, 768, 4097}
+                             : std::vector{1, 2, 15, 16, 46, 47, 768};
     for (int t : widths)
         cases.push_back(
             {{"complete/t" + std::to_string(t), {{"execution", q5 && t == 2 ? "graph" : "eager"}}},

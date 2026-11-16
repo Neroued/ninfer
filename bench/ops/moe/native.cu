@@ -247,7 +247,7 @@ void run(const Options& o) {
                 auto y = Tensor(output.span(), DType::BF16, {native::Fixture::hidden, tokens});
                 const auto launch = [&](CudaExecutionView execution) {
                     if (full)
-                        ops::topk_sigmoid_swiglu_moe(x, complete, weights, subset, y, workspace,
+                        ops::topk_sigmoid_swiglu_moe(x, complete, weights, subset, y, {}, workspace,
                                                      execution);
                     else
                         ops::routed_swiglu(x, routed, experts, routes, subset,

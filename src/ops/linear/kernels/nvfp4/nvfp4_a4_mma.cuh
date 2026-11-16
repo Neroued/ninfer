@@ -1,4 +1,5 @@
 #pragma once
+#include "core/pdl.cuh"
 #include "ops/common/cuda/pipeline.cuh"
 
 #include "ops/common/cuda/memory.cuh"
@@ -159,7 +160,8 @@ stage_nvfp4_a4_weight(const std::uint8_t* __restrict__ codes,
     }
 }
 
-template <class Schedule, bool FullTokens, class Epilogue, class OutputPolicy, class RowPolicy>
+template <class Schedule, bool FullTokens, class Epilogue, class OutputPolicy, class RowPolicy,
+          bool Programmatic = false>
 __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_mma_kernel(
     const std::uint8_t* __restrict__ x, const std::uint8_t* __restrict__ x_scales,
@@ -177,13 +179,21 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_m
     const int kKTiles           = k / Schedule::kBlockK;
     constexpr int kWaitGroups   = Schedule::kStages - 1;
 
+    if constexpr (Programmatic) {
+#pragma unroll
+        for (int stage = 0; stage < Schedule::kStages; ++stage)
+            stage_nvfp4_a4_weight<Schedule>(weight_codes, weight_scales, shared, stage, stage,
+                                            row_begin, row_policy, rows, k);
+        pdl::wait_for_dependencies();
+    }
 #pragma unroll
     for (int stage = 0; stage < Schedule::kStages; ++stage) {
         if (stage < kKTiles) {
             stage_nvfp4_a4_activation<Schedule>(x, x_scales, k, shared, stage, stage, token_begin,
                                                 tokens);
-            stage_nvfp4_a4_weight<Schedule>(weight_codes, weight_scales, shared, stage, stage,
-                                            row_begin, row_policy, rows, k);
+            if constexpr (!Programmatic)
+                stage_nvfp4_a4_weight<Schedule>(weight_codes, weight_scales, shared, stage, stage,
+                                                row_begin, row_policy, rows, k);
             common::cp_commit();
         }
     }

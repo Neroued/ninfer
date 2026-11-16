@@ -11,6 +11,7 @@ namespace ninfer::models::glm5next {
 struct ExecutionPlan {
     std::shared_ptr<const execution::ModelProfile> profile;
     ExecutionShape shape;
+    std::shared_ptr<const BatchExecutionPlan> batches;
     StateLayout state;
     CacheLayout main;
     std::optional<CacheLayout> mtp;
@@ -24,6 +25,7 @@ struct ExecutionPlan {
     bool use_cuda_graph = false;
 
     [[nodiscard]] std::size_t pinned_bytes() const;
+    [[nodiscard]] std::size_t pinned_context_counts_bytes() const;
     [[nodiscard]] std::size_t device_bytes() const;
     [[nodiscard]] std::size_t reservation_bytes() const;
 };
@@ -31,7 +33,7 @@ struct ExecutionPlan {
 // Plans eager execution resources. The Program's graph preparation accounts its own storage.
 [[nodiscard]] ExecutionPlan plan_execution(std::shared_ptr<const execution::ModelProfile>,
                                            const EngineOptions&, KvCacheVectorFormat index_format,
-                                           std::int32_t sm_count);
+                                           std::int32_t sm_count, BatchExecutionSpec);
 [[nodiscard]] runtime::ContextCapacityPlan describe_execution_capacity(const ExecutionPlan&);
 // Local parts only; the group preparation assembles the complete directory before construction.
 [[nodiscard]] context::ContextDirectorySpec describe_context(const ExecutionPlan&);

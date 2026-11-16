@@ -432,31 +432,28 @@ int paged_graph_replay_case() {
     return failures;
 }
 
-int batch_selector_case(bool cyclic, int cyclic_capacity = kDFlashWindow) {
+int batch_selector_case(bool cyclic, int cyclic_capacity = kDFlashWindow, int batch = 2) {
     constexpr int tokens = 3;
-    constexpr int batch  = 2;
-    const std::vector<std::int32_t> counts{1, 3};
-    const std::vector<std::int32_t> selectors{1, 0};
-    const std::vector<std::int32_t> positions =
-        cyclic ? std::vector<std::int32_t>{cyclic_capacity - 1,
-                                           cyclic_capacity,
-                                           cyclic_capacity + 1,
-                                           5,
-                                           6,
-                                           7}
-               : std::vector<std::int32_t>{63, 64, 65, 5, 6, 7};
+    std::vector<std::int32_t> counts(batch, 0), selectors(batch, -1), positions(tokens * batch, -1);
+    counts.front()    = 1;
+    counts.back()     = 3;
+    selectors.front() = 1;
+    selectors.back()  = 0;
+    positions.front() = cyclic ? cyclic_capacity - 1 : 63;
+    for (int i = 0; i < tokens; ++i) positions[(batch - 1) * tokens + i] = 5 + i;
     const std::size_t row_input_count  = static_cast<std::size_t>(kHeadDim) * kKVHeads * tokens;
     const std::size_t lane_cache_count = static_cast<std::size_t>(kHeadDim) * kKVHeads *
                                          (cyclic ? cyclic_capacity : kPage * kPhysicalPages);
     const auto host_k    = patterned_bits(row_input_count * batch, 0x31415926u);
     const auto host_v    = finite_patterned_bf16_bits(row_input_count * batch, 0x27182818u);
-    const auto initial_k = patterned_bits(lane_cache_count * (cyclic ? batch : 1), 0x16180339u);
-    const auto initial_v = patterned_bits(lane_cache_count * (cyclic ? batch : 1), 0x57721566u);
+    const auto initial_k = patterned_bits(lane_cache_count * (cyclic ? 2 : 1), 0x16180339u);
+    const auto initial_v = patterned_bits(lane_cache_count * (cyclic ? 2 : 1), 0x57721566u);
     const std::vector<std::int32_t> tables{0, 1, 2, 3, 4, 5};
     auto expected_k = initial_k;
     auto expected_v = initial_v;
 
     for (int b = 0; b < batch; ++b) {
+        if (counts[b] == 0) continue;
         const std::vector<std::int32_t> mapping(
             tables.begin() +
                 static_cast<std::ptrdiff_t>(selectors[static_cast<std::size_t>(b)] * kLogicalPages),
@@ -498,7 +495,7 @@ int batch_selector_case(bool cyclic, int cyclic_capacity = kDFlashWindow) {
     Tensor selector_tensor(d_selectors.span(), DType::I32, {batch});
     constexpr ops::KVCacheAppendPrefixExecutionEnvelope envelope{0, tokens};
     if (cyclic) {
-        CyclicFixture fixture(cache_k, cache_v, cyclic_capacity, batch, selectors);
+        CyclicFixture fixture(cache_k, cache_v, cyclic_capacity, 2, selectors);
         ops::kv_cache_append_prefix(k, v, position_tensor, count_tensor, envelope, fixture.view(),
                                     ninfer::test::cuda_environment().default_execution);
         cuda_synchronize();
@@ -516,7 +513,7 @@ int batch_selector_case(bool cyclic, int cyclic_capacity = kDFlashWindow) {
     cuda_synchronize();
 
     const std::string label =
-        std::string("kv_cache_append_prefix B=2 ") +
+        std::string("kv_cache_append_prefix B=") + std::to_string(batch) + " " +
         (cyclic ? "cyclic lanes capacity=" + std::to_string(cyclic_capacity) : "paged rows");
     int failures =
         verify_exact((label + " k").c_str(),
@@ -665,14 +662,17 @@ public:
                 input_v[i] = vb;
             }
             for (int b = 0; b < batch; ++b) {
-                lanes[b]       = LaneOrder[(b + 3 * phase) % Lanes];
-                const int mode = (b + phase) % 4;
-                counts[b]      = kind == 0   ? 0
-                                 : kind == 2 ? upper
-                                 : mode == 0 ? upper
-                                 : mode == 1 ? std::max(0, upper - 1)
-                                 : mode == 2 ? std::min(1, upper)
-                                             : 0;
+                const int stride = (batch + Lanes - 1) / Lanes;
+                lanes[b]         = LaneOrder[(b / stride + 3 * phase) % Lanes];
+                const int mode   = (b + phase) % 4;
+                counts[b]        = kind == 0   ? 0
+                                   : kind == 2 ? upper
+                                   : mode == 0 ? upper
+                                   : mode == 1 ? std::max(0, upper - 1)
+                                   : mode == 2 ? std::min(1, upper)
+                                               : 0;
+                if (b % stride != 0) counts[b] = 0;
+                if (counts[b] == 0) lanes[b] = -1;
                 for (int t = 0; t < width; ++t) {
                     const auto src =
                         (static_cast<std::size_t>(b) * width + t) * kKVHeads * kHeadDim;
@@ -695,7 +695,7 @@ public:
                             expected_v_[dst] = bf16_bits_to_f16_bits(input_v[source]);
                         }
                 }
-                frontier_[lanes[b]] += counts[b];
+                if (counts[b] != 0) frontier_[lanes[b]] += counts[b];
             }
             dk.copy_from_host(input_k.data(), input_k.size() * 2);
             dv.copy_from_host(input_v.data(), input_v.size() * 2);
@@ -781,6 +781,9 @@ void add_prefix_append_cases(ninfer::test::OpSuite& suite) {
               [] { return batch_selector_case(true, kDFlashWindow); }, {{"format", "bf16"}});
     suite.add("append/paged/table_rows", [] { return batch_selector_case(false); },
               {{"format", "bf16"}});
+    suite.add("append/paged/table_rows/b17",
+              [] { return batch_selector_case(false, kDFlashWindow, 17); },
+              {{"format", "bf16"}, {"suite", "concurrency"}});
     suite.add("append/cyclic/decode/capacity4096",
               [] { return cyclic_decode_batch_case(kDFlashWindow); }, {{"format", "bf16"}});
     suite.add("append/cyclic/decode/capacity2048",
@@ -816,13 +819,17 @@ void add_prefix_append_cases(ninfer::test::OpSuite& suite) {
                 for (int b : {1, 8}) append(w, b, 1, true);
             append(4096, 1, 2, true);
         }
+        append(3, 17, 1, true);
+        append(1, 129, 0, false);
         std::vector<OpCase> catalogue;
-        for (auto c : cases)
+        for (auto c : cases) {
             catalogue.push_back({"append/prefix/capacity" + std::to_string(capacity) + "/w" +
                                      std::to_string(c.width) + "/b" + std::to_string(c.batch) +
                                      "/kind" + std::to_string(c.kind) + "/bound" +
                                      std::to_string(c.upper),
                                  {{"format", "bf16"}, {"execution", c.graph ? "graph" : "eager"}}});
+            if (c.batch > 8) catalogue.back().tags.emplace_back("suite", "concurrency");
+        }
         suite.add(std::move(catalogue), [=](auto selected) {
             CyclicPrefixFixture fixture(capacity);
             int failures = 0;

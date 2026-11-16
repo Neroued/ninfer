@@ -355,17 +355,20 @@ std::string Metrics::render(const EngineSnapshot& snapshot, const ServiceSnapsho
             out << "ninfer_rank_compute_units_total{" << labels << ",path=\"" << paths[i] << "\"} "
                 << rank.compute_paths[i] << '\n';
         for (const auto& group : rank.communication) {
-            for (auto path : {false, true}) {
-                const auto& value = path ? group.graph : group.eager;
-                for (std::size_t i = 0; i < value.calls.size(); ++i) {
-                    const auto tags = labels + ",group=\"" + std::to_string(group.group) +
-                                      "\",size=\"" + std::to_string(group.size) + "\",path=\"" +
-                                      (path ? "graph" : "eager") + "\",operation=\"" +
-                                      operations[i] + "\"";
-                    out << "ninfer_communication_calls_total{" << tags << "} " << value.calls[i]
-                        << '\n';
-                    out << "ninfer_communication_payload_bytes_total{" << tags << "} "
-                        << value.payload_bytes[i] << '\n';
+            for (const auto& backend : group.backends) {
+                for (auto path : {false, true}) {
+                    const auto& value = path ? backend.graph : backend.eager;
+                    for (std::size_t i = 0; i < value.calls.size(); ++i) {
+                        const auto tags =
+                            labels + ",group=\"" + std::to_string(group.group) + "\",size=\"" +
+                            std::to_string(group.size) + "\",backend=\"" +
+                            product::communication_backend_name(backend.backend) + "\",path=\"" +
+                            (path ? "graph" : "eager") + "\",operation=\"" + operations[i] + "\"";
+                        out << "ninfer_communication_calls_total{" << tags << "} " << value.calls[i]
+                            << '\n';
+                        out << "ninfer_communication_payload_bytes_total{" << tags << "} "
+                            << value.payload_bytes[i] << '\n';
+                    }
                 }
             }
         }

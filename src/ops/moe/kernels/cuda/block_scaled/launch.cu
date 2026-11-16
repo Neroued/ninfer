@@ -2,6 +2,7 @@
 #include "ops/moe/kernels/cuda/block_scaled/nvfp4/launch.h"
 #include "ops/moe/kernels/cuda/block_scaled/fp8/launch.h"
 #include "ops/moe/kernels/cuda/block_scaled/output.cuh"
+#include "ops/moe/kernels/cuda/block_scaled/pool_down.cuh"
 
 #include <algorithm>
 #include <climits>
@@ -9,10 +10,6 @@
 
 namespace ninfer::ops::detail::moe_cuda::block_scaled {
 namespace {
-
-__device__ __forceinline__ bool selected(ExpertSubsetKind kind, const int* mask, int e) {
-    return kind == ExpertSubsetKind::All || mask[e] == (kind == ExpertSubsetKind::MaskOnes);
-}
 
 __global__ void count_assignments(const int* ids, ExpertSubsetKind kind, const int* mask,
                                   int* counts, int assignments) {
@@ -22,7 +19,7 @@ __global__ void count_assignments(const int* ids, ExpertSubsetKind kind, const i
     const int a = blockIdx.x * blockDim.x + threadIdx.x;
     if (a < assignments) {
         const int e = ids[a];
-        if (selected(kind, mask, e)) { atomicAdd(histogram + e, 1); }
+        if (expert_in_subset(kind, mask, e)) { atomicAdd(histogram + e, 1); }
     }
     __syncthreads();
     for (int e = threadIdx.x; e < kExperts; e += blockDim.x) {
@@ -72,11 +69,18 @@ __device__ __forceinline__ bool fully_covered_groups(Groups groups, int assignme
 }
 
 __global__ void index_assignments(const int* ids, ExpertSubsetKind kind, const int* mask, Groups g,
-                                  int assignments) {
+                                  int assignments, float* output, int minimum_experts,
+                                  int expert_limit, int token_threshold) {
     const int a = blockIdx.x * blockDim.x + threadIdx.x;
+    if (output &&
+        !pool_writes_output(g.load_range, minimum_experts, expert_limit, token_threshold)) {
+        const int elements = assignments / kTopK * kHidden;
+        for (int i = a * 4; i < elements; i += gridDim.x * blockDim.x * 4)
+            common::store_vec(output + i, make_float4(0, 0, 0, 0));
+    }
     if (a >= assignments) { return; }
     const int expert = ids[a];
-    if (!selected(kind, mask, expert)) {
+    if (!expert_in_subset(kind, mask, expert)) {
         if (g.inverse) { g.inverse[a] = -1; }
         return;
     }
@@ -94,7 +98,7 @@ __global__ void group_small(const int* ids, ExpertSubsetKind kind, const int* ma
     __syncthreads();
     for (int a = tid; a < assignments; a += kExperts) {
         const int e = ids[a];
-        ranks[a]    = selected(kind, mask, e) ? atomicAdd(counts + e, 1) : -1;
+        ranks[a]    = expert_in_subset(kind, mask, e) ? atomicAdd(counts + e, 1) : -1;
     }
     __syncthreads();
     const int count = counts[tid];
@@ -141,8 +145,11 @@ template <class Output>
 __global__ void reduce(Storage storage, const float* coefficients, Output output, int elements) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < elements) {
-        output.store(i, output.initial(i) +
-                            routed_value(i / kHidden, i % kHidden, storage, coefficients));
+        const int token = i / kHidden;
+        const bool live = output.is_live(token);
+        output.store(
+            i, output.initial(i, live) + routed_value(token, i % kHidden, storage, coefficients),
+            live);
     }
 }
 
@@ -243,10 +250,16 @@ void launch(const Tensor& x, const CudaSwiGLUExperts& experts, const ExpertRoute
         const int assignments = x.ne[1] * kTopK;
         const auto* ids       = static_cast<const int*>(routes.ids.data);
         const auto* mask      = static_cast<const int*>(subset.mask.data);
+        // Pool contraction owns every output element before other experts add.
+        // Decide whether clearing is needed after grouping publishes its load range.
+        const bool deferred_clear =
+            s.routed_sum && plan.pool_expert_limit && !plan.single_block_grouping;
+        auto input_storage = s;
+        if (deferred_clear) input_storage.routed_sum = nullptr;
         if (plan.format == QType::NVFP4) {
-            nvfp4::launch_input(x, experts, s, execution, !prepared.route_counts);
+            nvfp4::launch_input(x, experts, input_storage, execution, !prepared.route_counts);
         } else {
-            fp8::launch_input(x, experts, s, execution, !prepared.route_counts);
+            fp8::launch_input(x, experts, input_storage, execution, !prepared.route_counts);
         }
         if (plan.single_block_grouping) {
             group_small<<<1, kExperts, 0, stream>>>(ids, subset.kind, mask, s.groups, assignments,
@@ -260,8 +273,14 @@ void launch(const Tensor& x, const CudaSwiGLUExperts& experts, const ExpertRoute
             }
             scan_assignments<<<1, kExperts, 0, stream>>>(s.groups, plan.job_columns());
             CUDA_CHECK(cudaGetLastError());
-            index_assignments<<<(assignments + 255) / 256, 256, 0, stream>>>(ids, subset.kind, mask,
-                                                                             s.groups, assignments);
+            const int index_blocks = (assignments + 255) / 256;
+            const int blocks       = deferred_clear
+                                         ? std::max(index_blocks, 2 * execution.multiprocessor_count())
+                                         : index_blocks;
+            index_assignments<<<blocks, 256, 0, stream>>>(
+                ids, subset.kind, mask, s.groups, assignments,
+                deferred_clear ? s.routed_sum : nullptr, plan.pool_min_experts,
+                plan.pool_expert_limit, plan.pool_token_threshold);
             CUDA_CHECK(cudaGetLastError());
         }
         if (plan.format == QType::NVFP4) {

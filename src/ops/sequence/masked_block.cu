@@ -16,8 +16,12 @@ __global__ void prepare_masked_block_kernel(const std::int32_t* anchors,
     const int i = static_cast<int>(threadIdx.x);
     const int b = static_cast<int>(blockIdx.x);
     if (i >= block_size) return;
-    const int offset  = i + block_size * b;
+    const auto offset = i + std::int64_t(block_size) * b;
     const int valid   = valid_columns[b];
+    if (!valid) {
+        ids[offset] = positions[offset] = 0;
+        return;
+    }
     ids[offset]       = i == 0 ? anchors[b] : mask_id;
     positions[offset] = lengths[b] + min(i, valid - 1);
 }
@@ -45,9 +49,7 @@ void prepare_masked_block(const Tensor& anchors, const Tensor& lengths, const Te
     if (block_size < 1 || block_size > 16) {
         throw std::invalid_argument("prepare_masked_block: W must be 1..16");
     }
-    if (batch_size < 1 || batch_size > 8) {
-        throw std::invalid_argument("prepare_masked_block: B must be 1..8");
-    }
+    if (batch_size < 1) { throw std::invalid_argument("prepare_masked_block: B must be positive"); }
     if (mask_id < 0) {
         throw std::invalid_argument("prepare_masked_block: mask_id must be nonnegative");
     }

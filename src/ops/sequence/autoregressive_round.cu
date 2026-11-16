@@ -1,3 +1,4 @@
+#include "ops/common/host/launch.h"
 #include "ops/common/host/operands.h"
 #include "ninfer/ops/sequence.h"
 #include <algorithm>
@@ -35,7 +36,8 @@ __global__ void prepare_autoregressive_round_kernel(
     a             = a < 0 ? 0 : (a > k ? k : a);
     for (int j = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x; j < T;
          j += blockDim.x * gridDim.x) {
-        alignment_ids[row * T + j] = j < a ? verify_ids[row * T + j + 1] : next_anchors[row];
+        alignment_ids[std::int64_t(row) * T + j] =
+            j < a ? verify_ids[std::int64_t(row) * T + j + 1] : next_anchors[row];
     }
     if (blockIdx.x == 0 && threadIdx.x == 0) {
         const int licensed       = licensed_counts[row];
@@ -47,7 +49,7 @@ __global__ void prepare_autoregressive_round_kernel(
         next_extents[row]        = next;
         const int steps          = k > 1 ? k - 1 : 1;
         for (int s = 0; s < steps; ++s) {
-            const int offset          = s * ar_step_stride + row;
+            const auto offset         = std::int64_t(s) * ar_step_stride + row;
             const int position        = updated_frontiers[row] + s;
             ar_positions[offset]      = position;
             ar_rope_positions[offset] = position + rope_deltas[row];
@@ -69,21 +71,24 @@ void prepare_autoregressive_round_launch(const Tensor& verify_ids, const Tensor&
     const int batch      = verify_ids.ne[1];
     const int ar_step_stride =
         static_cast<int>(ar_positions.nb[1] / static_cast<std::int64_t>(sizeof(std::int32_t)));
-    const dim3 grid(static_cast<unsigned int>((k + kBlock) / kBlock),
-                    static_cast<unsigned int>(batch));
-    prepare_autoregressive_round_kernel<<<grid, kBlock, 0, stream>>>(
-        static_cast<const std::int32_t*>(verify_ids.data),
-        static_cast<const std::int32_t*>(next_anchors.data),
-        static_cast<const std::int32_t*>(accepted.data),
-        static_cast<const std::int32_t*>(updated_frontiers.data),
-        static_cast<const std::int32_t*>(remaining_budgets.data),
-        static_cast<const std::int32_t*>(licensed_counts.data),
-        static_cast<const std::int32_t*>(rope_deltas.data),
-        static_cast<std::int32_t*>(alignment_ids.data),
-        static_cast<std::int32_t*>(next_extents.data),
-        static_cast<std::int32_t*>(ar_positions.data),
-        static_cast<std::int32_t*>(ar_rope_positions.data),
-        static_cast<std::int32_t*>(ar_valid_columns.data), k, ar_step_stride, max_context);
+    common::for_each_token_slice(batch, 1, [&](int offset, int count) {
+        const dim3 grid(static_cast<unsigned int>((k + kBlock) / kBlock),
+                        static_cast<unsigned int>(count));
+        prepare_autoregressive_round_kernel<<<grid, kBlock, 0, stream>>>(
+            static_cast<const std::int32_t*>(verify_ids.data) + std::int64_t(offset) * (k + 1),
+            static_cast<const std::int32_t*>(next_anchors.data) + offset,
+            static_cast<const std::int32_t*>(accepted.data) + offset,
+            static_cast<const std::int32_t*>(updated_frontiers.data) + offset,
+            static_cast<const std::int32_t*>(remaining_budgets.data) + offset,
+            static_cast<const std::int32_t*>(licensed_counts.data) + offset,
+            static_cast<const std::int32_t*>(rope_deltas.data) + offset,
+            static_cast<std::int32_t*>(alignment_ids.data) + std::int64_t(offset) * (k + 1),
+            static_cast<std::int32_t*>(next_extents.data) + offset,
+            static_cast<std::int32_t*>(ar_positions.data) + offset,
+            static_cast<std::int32_t*>(ar_rope_positions.data) + offset,
+            static_cast<std::int32_t*>(ar_valid_columns.data) + offset, k, ar_step_stride,
+            max_context);
+    });
     CUDA_CHECK(cudaGetLastError());
 }
 

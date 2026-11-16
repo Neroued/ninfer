@@ -231,7 +231,8 @@ void mtp_forward(MtpExecutionView state, const MtpInputs& inputs,
         } else {
             const auto& moe = std::get<moe::Parameters>(parameters.ffn);
             moe::execute(post.post_mixer_hidden, moe, moe.resident, ops::MoeEpilogue::AddResidual,
-                         stem.residual, state.workspace, state.execution);
+                         stem.residual, {inputs.valid_columns, inputs.ids.ne[0]}, state.workspace,
+                         state.execution);
         }
     }
     Tensor output = hidden.view({dimension(config.hidden_size), columns});

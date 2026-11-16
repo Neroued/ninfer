@@ -45,6 +45,7 @@ public:
 
     std::shared_ptr<const execution::ModelProfile> profile;
 private:
+    std::shared_ptr<const BatchExecutionPlan> batches_;
     std::vector<WeightCandidate> placements_;
     std::shared_ptr<const moe::Plan> offload_;
     const artifact::Reader& reader_;

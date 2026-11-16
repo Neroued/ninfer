@@ -32,6 +32,7 @@ constexpr bool closed(std::span<const Route> routes) {
 
 std::span<const Route> routes_n96_k2560();
 std::span<const Route> routes_n48_k2560();
+std::span<const Route> routes_n96_k5120();
 
 struct NormPlan {
     NormKernel kernel;

@@ -116,6 +116,7 @@ struct RecordRelease {
 struct DomainAssessment {
     ContextDomainId domain;
     PoolAssessment placement;
+    std::size_t minimum_bytes = 0;
 };
 
 struct RecordAssessment {

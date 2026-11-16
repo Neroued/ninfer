@@ -2,20 +2,21 @@
 #include "ops/common/host/operands.h"
 #include "ops/linear_attention/gated_delta_net/operands.h"
 #include "ops/linear_attention/gated_delta_net/replay/launch.h"
-#include <array>
 #include <algorithm>
+#include <array>
+#include <vector>
 
 namespace ninfer::ops {
 namespace {
 using detail::gated_delta_net::kStateDim;
-using detail::gated_delta_net::kMaximumReplayRows;
+using detail::gated_delta_net::kHostFoldRows;
 
 void validate_fold_records(const GdnReplayRecords& records) {
     constexpr const char* kOp       = "gdn_replay_fold";
     const GdnReplayRecordSpec& spec = records.spec;
     (void)detail::gated_delta_net::select_fold_geometry(spec);
-    if (spec.record_capacity <= 0 || spec.record_capacity > kMaximumReplayRows || spec.width < 2 ||
-        spec.width > 16 || spec.key_dim != kStateDim || spec.value_dim != kStateDim) {
+    if (spec.record_capacity <= 0 || spec.width < 2 || spec.width > 16 ||
+        spec.key_dim != kStateDim || spec.value_dim != kStateDim) {
         throw std::invalid_argument(std::string(kOp) + ": unsupported record geometry");
     }
     if (spec.layers > std::numeric_limits<std::int32_t>::max() / spec.record_capacity) {
@@ -74,20 +75,16 @@ common::operand::Blocks selected_field(StateFieldView field, std::int64_t offset
     return {common::operand::range(first, op), field.field.layer_stride, field.field.layers};
 }
 
-detail::gated_delta_net::GdnReplayFoldKernelRows
-validate_fold_rows(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states,
-                   std::span<const GdnReplayFoldRow> rows) {
+void validate_fold_rows(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states,
+                        std::span<const GdnReplayFoldRow> rows) {
     if (rows.empty() || rows.size() > static_cast<std::size_t>(records.spec.record_capacity))
         throw std::invalid_argument("gdn_replay_fold: active row count is out of range");
-    detail::gated_delta_net::GdnReplayFoldKernelRows packed{};
     using Fields = std::array<common::operand::Blocks, 2>;
-    std::array<Fields, kMaximumReplayRows> sources{}, destinations{};
+    std::vector<Fields> sources(rows.size()), destinations(rows.size());
     for (std::size_t row = 0; row < rows.size(); ++row) {
         const auto& selected = rows[row];
         if (selected.commit_columns < 0 || selected.commit_columns > records.spec.width)
             throw std::invalid_argument("gdn_replay_fold: commit extent is out of range");
-        packed.row[row] = {selected.source_offset, selected.destination_offset,
-                           selected.commit_columns, 0};
         if (selected.commit_columns == 0) continue;
         sources[row]      = {selected_field(states.conv, selected.source_offset),
                              selected_field(states.recurrent, selected.source_offset)};
@@ -122,7 +119,6 @@ validate_fold_rows(const GdnReplayRecords& records, LinearAttentionStateAllLayer
             }
         }
     }
-    return packed;
 }
 
 } // namespace
@@ -138,15 +134,23 @@ void GdnReplayFoldPlan::execute(std::span<const GdnReplayFoldRow> rows,
                                 CudaExecutionView execution) const {
     common::operand::device(records_.conv.device, execution.device(), "gdn_replay_fold",
                             "state/records");
-    const detail::gated_delta_net::GdnReplayFoldKernelRows packed =
-        validate_fold_rows(records_, states_, rows);
+    validate_fold_rows(records_, states_, rows);
     // Row descriptors are host values, including under Graph capture. Preserve full validation
     // above; an all-zero commit has no device work or state/record reads.
-    if (std::none_of(rows.begin(), rows.end(),
-                     [](const GdnReplayFoldRow& row) { return row.commit_columns != 0; }))
-        return;
-    detail::gated_delta_net::launch_replay_fold(
-        records_, states_, packed, static_cast<std::int32_t>(rows.size()), execution.stream());
+    for (std::size_t begin = 0; begin < rows.size(); begin += kHostFoldRows) {
+        const auto count = std::min<std::size_t>(kHostFoldRows, rows.size() - begin);
+        detail::gated_delta_net::GdnReplayFoldKernelRows packed{};
+        bool live = false;
+        for (std::size_t i = 0; i < count; ++i) {
+            const auto& row = rows[begin + i];
+            packed.row[i]   = {row.source_offset, row.destination_offset, row.commit_columns, 0};
+            live |= row.commit_columns != 0;
+        }
+        if (live)
+            detail::gated_delta_net::launch_replay_fold(
+                records_, states_, packed, static_cast<std::int32_t>(count),
+                static_cast<std::int32_t>(begin), execution.stream());
+    }
 }
 
 void GdnReplayFoldPlan::execute(const Tensor& source_offsets, const Tensor& destination_offsets,
@@ -165,13 +169,15 @@ void GdnReplayFoldPlan::execute(const Tensor& source_offsets, const Tensor& dest
         for (const auto* record : {&records_.conv, &records_.key, &records_.value, &records_.gate})
             common::operand::disjoint(common::operand::range(*metadata, op),
                                       common::operand::range(*record, op), op);
-    detail::gated_delta_net::launch_replay_fold(
-        records_, states_,
-        detail::gated_delta_net::GdnReplayFoldDeviceRows{
-            static_cast<const std::int64_t*>(source_offsets.data),
-            static_cast<const std::int64_t*>(destination_offsets.data),
-            static_cast<const std::int32_t*>(commit_columns.data)},
-        batch, execution.stream());
+    for (std::int64_t begin = 0; begin < batch; begin += 65535)
+        detail::gated_delta_net::launch_replay_fold(
+            records_, states_,
+            detail::gated_delta_net::GdnReplayFoldDeviceRows{
+                static_cast<const std::int64_t*>(source_offsets.data) + begin,
+                static_cast<const std::int64_t*>(destination_offsets.data) + begin,
+                static_cast<const std::int32_t*>(commit_columns.data) + begin},
+            static_cast<std::int32_t>(std::min<std::int64_t>(65535, batch - begin)),
+            static_cast<std::int32_t>(begin), execution.stream());
 }
 
 } // namespace ninfer::ops

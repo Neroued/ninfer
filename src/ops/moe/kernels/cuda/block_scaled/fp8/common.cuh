@@ -39,8 +39,11 @@ __device__ __forceinline__ Matrix resolve(const ExpertMatrixDeviceView& matrix, 
                 matrix.scales + (matrix.offsets ? offset : expert * matrix.scale_stride))};
 }
 
-template <int Columns, bool Gate>
+template <int Columns, bool Gate, int Stages = 2, bool Atomic = false>
 struct Schedule {
+    static constexpr int stages        = Stages;
+    static constexpr bool stage_scales = Gate || Stages == 1;
+    static constexpr bool stage_routes = !Gate && Atomic;
     static constexpr int columns = Columns, bk = 128;
     static constexpr int warp_rows    = Gate ? 8 : 4;
     static constexpr int warp_groups  = Columns >= 64 ? 2 : 1;
@@ -55,23 +58,22 @@ template <class S>
 struct TileStorage {
     union {
         struct {
-            alignas(16) std::uint8_t weights[2][S::weight_rows * S::bk];
-            alignas(16) std::uint8_t input[2][S::columns * S::bk];
+            alignas(16) std::uint8_t weights[S::stages][S::weight_rows * S::bk];
+            alignas(16) std::uint8_t input[S::stages][S::columns * S::bk];
+            float input_scales[S::stage_scales ? S::stages : 1][S::stage_scales ? S::columns : 1];
         } stage;
 
         float product[S::weight_rows == 256 ? S::columns : 1][128];
     };
 
     int sources[S::columns];
+    int token_ids[S::stage_routes ? S::columns : 1];
+    float coefficients[S::stage_routes ? S::columns : 1];
 };
 
 template <class S>
 __device__ __forceinline__ int swizzle(int row, int byte) {
     return byte ^ ((row & (S::bk / 16 - 1)) << 4);
-}
-
-__device__ __forceinline__ bool includes(ExpertSubsetKind kind, const int* mask, int expert) {
-    return kind == ExpertSubsetKind::All || mask[expert] == (kind == ExpertSubsetKind::MaskOnes);
 }
 
 __device__ __forceinline__ float dot_four(unsigned codes, float4 x) {

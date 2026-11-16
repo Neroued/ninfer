@@ -13,7 +13,7 @@ struct RecoveryStoreView {
 
     const std::uint64_t& revision() const { return store.revision(); }
 
-    std::size_t capacity() const { return store.size(); }
+    std::size_t capacity() const { return store.metadata_extent(); }
 
     auto handle(std::uint32_t index) const { return store.handle(index); }
 

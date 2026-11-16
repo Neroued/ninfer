@@ -163,6 +163,7 @@ struct Resources::Impl {
     struct Pending {
         ExpertBankId bank;
         Tensor hidden, output;
+        ops::MoeTokenValidity validity;
         MemoryArena& workspace;
         ops::MoeExecutionHints hints;
         std::optional<PreparedExecution> call;
@@ -187,7 +188,7 @@ struct Resources::Impl {
     std::vector<std::size_t> needed;
     std::array<std::size_t, 2> window_layers{SIZE_MAX, SIZE_MAX};
     std::optional<std::thread::id> caller;
-    std::int32_t tokens         = 0;
+    std::int32_t tokens = 0, active_tokens = 0;
     std::size_t observed_layers = 0;
     std::size_t cpu_layers      = 0;
     std::size_t active_step     = SIZE_MAX;
@@ -345,7 +346,8 @@ Resources::Resources(std::shared_ptr<const Plan> plan,
 
 Resources::~Resources() = default;
 
-std::optional<CpuExecutionView::ActiveScope> Resources::begin(std::int32_t tokens) {
+std::optional<CpuExecutionView::ActiveScope> Resources::begin(std::int32_t tokens,
+                                                              std::int32_t active_tokens) {
     auto& state = *impl_;
     if (state.call_active) throw std::logic_error("previous MoE layer is still active");
     const auto thread = std::this_thread::get_id();
@@ -358,14 +360,18 @@ std::optional<CpuExecutionView::ActiveScope> Resources::begin(std::int32_t token
             throw std::logic_error("MoE schedule has more than one control thread");
         }
     }
-    if (tokens <= 0) throw std::invalid_argument("MoE traversal requires positive token count");
+    if (tokens <= 0 || active_tokens <= 0 || active_tokens > tokens)
+        throw std::invalid_argument("invalid MoE physical/active token count");
+    const auto previous_active = state.active_tokens;
+    state.active_tokens        = active_tokens;
     if (calibrating()) {
         state.tokens = tokens;
         return std::nullopt;
     }
     // Keep a frequent CPU contributor awake across GPU layers. Sparse CPU use should not
     // keep the entire team polling; the two thresholds avoid toggling on every token.
-    if (state.tokens != tokens || state.observed_layers != state.layers.size()) {
+    if (state.tokens != tokens || previous_active != active_tokens ||
+        state.observed_layers != state.layers.size()) {
         state.keep_cpu_active = false;
     } else if (state.cpu_layers * 4 >= state.layers.size()) {
         state.keep_cpu_active = true;
@@ -378,8 +384,8 @@ std::optional<CpuExecutionView::ActiveScope> Resources::begin(std::int32_t token
     bool hybrid = false;
     for (std::size_t i = 0; i < state.plan->layers.size(); ++i) {
         const auto& layer = state.plan->layers[i];
-        hybrid |= !layer.requires_full_bank(tokens);
-        if (layer.requires_full_bank(tokens) && !layer.stream_layout.empty())
+        hybrid |= !layer.requires_full_bank(active_tokens);
+        if (layer.requires_full_bank(active_tokens) && !layer.stream_layout.empty())
             state.needed.push_back(i);
     }
     const bool streaming = !state.needed.empty();
@@ -407,7 +413,7 @@ bool Resources::try_before_layer(ExpertBankId bank) {
     const bool published = impl_->prepare_step(index);
     impl_->progress_cache();
     // Uploading a later full bank does not delay a current hybrid layer.
-    return published || !impl_->plan->layers[index].requires_full_bank(impl_->tokens) ||
+    return published || !impl_->plan->layers[index].requires_full_bank(impl_->active_tokens) ||
            impl_->plan->layers[index].stream_layout.empty();
 }
 
@@ -445,7 +451,7 @@ std::optional<PreparedExecution> Resources::try_prepare_layer(ExpertBankId bank)
     if (calibrating()) {
         const auto& selected = state.plan->layers[index];
         const auto count     = selected.cache_experts;
-        const auto kind      = selected.requires_full_bank(state.tokens) ||
+        const auto kind      = selected.requires_full_bank(state.active_tokens) ||
                                   count == std::uint32_t(selected.spec.profile.routed.experts)
                                    ? ops::ExpertSubsetKind::All
                                : count ? ops::ExpertSubsetKind::MaskOnes
@@ -453,7 +459,7 @@ std::optional<PreparedExecution> Resources::try_prepare_layer(ExpertBankId bank)
         return prepare_calibration_layer(bank, kind);
     }
     auto kind = ops::ExpertSubsetKind::All;
-    if (state.plan->layers[index].requires_full_bank(state.tokens)) {
+    if (state.plan->layers[index].requires_full_bank(state.active_tokens)) {
         if (!layer.use) layer.use = state.cache.acquire(layer.keys, state.cuda);
         if (!layer.use) {
             state.cache.progress();
@@ -544,7 +550,7 @@ void Resources::restore_cache_after_preparation() {
         synchronize();
         return;
     }
-    const auto activity = begin(1);
+    const auto activity = begin(1, 1);
     while (!impl_->cache_settled) {
         impl_->progress_cache();
         if (!impl_->cache_settled) impl_->cache.wait_for_progress();
@@ -553,11 +559,12 @@ void Resources::restore_cache_after_preparation() {
 }
 
 bool Resources::start(ExpertBankId bank, const Tensor& hidden, Tensor& output,
-                      MemoryArena& workspace, const ops::MoeExecutionHints& hints) {
+                      ops::MoeTokenValidity validity, MemoryArena& workspace,
+                      const ops::MoeExecutionHints& hints) {
     if (impl_->pending) throw std::logic_error("MoE layer is already active");
     if (hidden.ne[1] != impl_->tokens) throw std::logic_error("MoE traversal token count changed");
     begin_call();
-    impl_->pending.emplace(Impl::Pending{bank, hidden, output, workspace, hints, {}});
+    impl_->pending.emplace(Impl::Pending{bank, hidden, output, validity, workspace, hints, {}});
     return poll();
 }
 
@@ -593,11 +600,11 @@ bool Resources::poll() {
             auto call = try_prepare_layer(pending.bank);
             if (!call) return false;
             pending.call.emplace(std::move(*call));
-            enqueue_gpu(pending.hidden, *pending.call, pending.output, pending.workspace,
-                        GpuSubmission::Eager, pending.hints);
+            enqueue_gpu(pending.hidden, *pending.call, pending.output, pending.validity,
+                        pending.workspace, GpuSubmission::Eager, pending.hints);
             gpu_submitted(pending.bank);
         }
-        const auto complete = try_complete(*pending.call, pending.output);
+        const auto complete = try_complete(*pending.call, pending.output, pending.validity);
         if (!complete) return false;
         finish_layer(*complete);
         impl_->pending.reset();

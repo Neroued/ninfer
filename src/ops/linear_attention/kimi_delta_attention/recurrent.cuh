@@ -3,17 +3,28 @@
 #include "ops/linear_attention/kimi_delta_attention/kernels/transition.cuh"
 
 namespace ninfer::ops::detail::kimi_delta_attention {
-template <bool Batched, bool Record, int Rows = kDvPerWarp>
+template <bool Batched, bool Record, int Rows = kDvPerWarp, bool GroupStateTiles = false>
 __global__ void __launch_bounds__(common::kWarpSize* kNumWarps, 2)
     recurrent_kernel(Arguments args, const std::int64_t* source_offsets,
                      const std::int64_t* destination_offsets, const std::int32_t* valid_columns,
-                     RecurrenceRecords records) {
+                     RecurrenceRecords records, int row_begin) {
     constexpr int kBlockDv = kNumWarps * Rows;
     const int lane = threadIdx.x, warp = threadIdx.y, thread = warp * common::kWarpSize + lane;
-    const int head = blockIdx.x, batch = Batched ? blockIdx.y : 0, tile = blockIdx.z;
+    constexpr int tiles = kStateDim / kBlockDv;
+    const int head      = GroupStateTiles ? blockIdx.x / tiles : blockIdx.x;
+    const int tile      = GroupStateTiles ? blockIdx.x % tiles : blockIdx.z;
+    const int batch     = Batched ? row_begin + blockIdx.y : 0;
     const int dv_base = tile * kBlockDv + warp * Rows, dqk_base = lane * kQkPerLane;
-    const int qhead       = head / (args.value_heads / args.qk_heads);
-    const int valid       = valid_columns ? valid_columns[batch] : args.tokens;
+    const int qhead = head / (args.value_heads / args.qk_heads);
+    const int valid = valid_columns ? valid_columns[batch] : args.tokens;
+    if (!valid) {
+        if (lane < Rows)
+            for (int t = 0; t < args.tokens; ++t)
+                args.out[((std::int64_t(batch) * args.tokens + t) * args.value_heads + head) *
+                             kStateDim +
+                         dv_base + lane] = __float2bfloat16(0.0F);
+        return;
+    }
     const auto state_head = static_cast<std::int64_t>(head) * kStateDim * kStateDim;
     const auto source     = state_head + (Batched ? source_offsets[batch] / sizeof(float) : 0);
     __align__(16) float state[Rows][kQkPerLane];

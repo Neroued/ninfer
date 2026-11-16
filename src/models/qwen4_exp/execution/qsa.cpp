@@ -49,7 +49,7 @@ void extract(const ops::QsaTailStateView& before, ops::QsaTailStateView after,
     ops::qsa_tail_extract(
         before,
         {records.raw_keys, records.rope_positions, batch.base_positions, batch.valid_columns},
-        batch.valid_columns, after, cuda);
+        batch.valid_columns, after, batch.live_rows, cuda);
 }
 } // namespace
 

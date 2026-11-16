@@ -7,7 +7,10 @@ namespace ninfer::models::qwen4_exp {
 
 ParallelStartup::ParallelStartup(const artifact::Reader& reader, const EngineOptions& options)
     : definition_(read_definition(reader, load_options(options))),
-      parallel_(plan_parallel(*definition_, *options.deployment)) {}
+      parallel_(plan_parallel(*definition_, *options.deployment)),
+      batches_(std::make_shared<const BatchExecutionPlan>(make_batch_execution_spec(
+          options.max_concurrency, 1,
+          options.use_cuda_graph && options.purpose == EnginePurpose::Generation))) {}
 
 qwen::Frontend ParallelStartup::frontend(const EngineOptions& options) const {
     return create_frontend(*definition_, options);
@@ -24,8 +27,8 @@ ParallelStartup::requests(const EngineOptions& options) const {
     for (const auto& rank : parallel_.ranks) {
         const bool control_owner = control != parallel_.ranks.end() && control->rank == rank.rank;
         distributed::wire::Encoder out;
-        encode_rank_load(out, {definition_->artifact_id(), rank, options, control_owner ? media : 0,
-                               control_owner});
+        encode_rank_load(out, {definition_->artifact_id(), rank, options, batches_->spec(),
+                               control_owner ? media : 0, control_owner});
         payloads.push_back(std::move(out).take());
     }
     return payloads;

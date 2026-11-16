@@ -25,8 +25,8 @@ using namespace ninfer::test::input_projection;
 
 namespace {
 
-// This criterion belongs to the complete A16 fused projection/conv/snapshot Op.
-constexpr ReductionCriterion kGdnInputProjConvSnapshotA16Tolerance{3.15e-3, 4.0e-3, 3.2e-3};
+// The complete A16 Op includes BF16 output rounding, whose unit roundoff is 1/256.
+constexpr ReductionCriterion kGdnInputProjConvSnapshotA16Tolerance{3.15e-3, 4.0e-3, 1.0 / 256.0};
 // Q8 A16 includes BF16 weight reconstruction and, in the composed arithmetic
 // profile, BF16 projection storage before convolution. The FP64 oracle keeps
 // both intermediates ideal. Allow two BF16 unit roundoffs in L2 for the projection
@@ -316,9 +316,8 @@ int run_batched_case(std::string_view label, std::int32_t hidden, std::int32_t v
         }
     }
 
-    DeviceBuffer device_activation    = to_device(activation_bits);
-    DeviceBuffer device_conv_weight   = to_device(conv_weight_bits);
-    DeviceBuffer device_snapshot_base = to_device(snapshot_bases);
+    DeviceBuffer device_activation  = to_device(activation_bits);
+    DeviceBuffer device_conv_weight = to_device(conv_weight_bits);
     DeviceBuffer device_valid;
     if (!valid_columns.empty()) { device_valid = to_device(valid_columns); }
     GuardedBf16Tensor state(channels * 3, slots);
@@ -337,14 +336,21 @@ int run_batched_case(std::string_view label, std::int32_t hidden, std::int32_t v
     if (source_aliases_snapshots)
         for (int row = 0; row < batch; ++row)
             initial_offsets[row] = std::int64_t(initial_slots[row]) * conv_state.nb[2];
-    DeviceBuffer device_initial = to_device(initial_offsets);
+    auto destinations = history.record_offsets(snapshot_bases);
+    for (int row = 0; row < batch; ++row)
+        if (!valid_columns.empty() && !valid_columns[row]) {
+            initial_offsets[row] = destinations[row] = -1;
+            snapshot_bases[row]                      = -1;
+        }
+    DeviceBuffer device_snapshot_base = to_device(snapshot_bases);
+    DeviceBuffer device_initial       = to_device(initial_offsets);
     Tensor valid;
     if (!valid_columns.empty()) { valid = Tensor(device_valid.span(), DType::I32, {batch}); }
     Tensor initial(device_initial.span(), DType::I64, {batch});
     const auto source = source_aliases_snapshots ? dense_record_field(conv_state, 2, initial)
                                                  : history.view(initial);
     Tensor snapshot_base(device_snapshot_base.span(), DType::I32, {batch});
-    auto destination_storage = to_device(history.record_offsets(snapshot_bases));
+    auto destination_storage = to_device(destinations);
     Tensor destination_offsets(destination_storage.span(), DType::I64, {batch});
     Tensor q(query.span(), DType::BF16, {qk_rows, width, batch});
     Tensor k(key.span(), DType::BF16, {qk_rows, width, batch});
@@ -373,7 +379,7 @@ int run_batched_case(std::string_view label, std::int32_t hidden, std::int32_t v
         state.copy_from_bits(state_before);
         history.upload();
         if (!valid_columns.empty()) {
-            valid_columns[0] = width > 1 ? width - 1 : 1;
+            if (valid_columns[0]) valid_columns[0] = width > 1 ? width - 1 : 1;
             CUDA_CHECK(cudaMemcpyAsync(device_valid.data(), valid_columns.data(),
                                        device_valid.size(), cudaMemcpyHostToDevice, stream));
         }
@@ -450,10 +456,12 @@ int run_batched_case(std::string_view label, std::int32_t hidden, std::int32_t v
                gather_batch_rows(z_values, z_rows, z_rows, width, batch_row, width, sample_count));
         append(z_expected, std::move(row_z_expected));
     }
-    failures += compare(std::string(label) + " query", query_actual, query_expected, criterion);
-    failures += compare(std::string(label) + " key", key_actual, key_expected, criterion);
-    failures += compare(std::string(label) + " value", value_actual, value_expected, criterion);
-    failures += compare(std::string(label) + " state", state_actual, state_expected, criterion);
+    if (!query_expected.empty()) {
+        failures += compare(std::string(label) + " query", query_actual, query_expected, criterion);
+        failures += compare(std::string(label) + " key", key_actual, key_expected, criterion);
+        failures += compare(std::string(label) + " value", value_actual, value_expected, criterion);
+        failures += compare(std::string(label) + " state", state_actual, state_expected, criterion);
+    }
     failures += compare(std::string(label) + " z", z_actual, z_expected, criterion);
     std::cout << label << ": sampled FP64 reference over " << width << " columns x " << batch
               << " batch rows (" << aggregate_columns << " aggregate columns), compared "

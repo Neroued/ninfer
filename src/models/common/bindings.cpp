@@ -2,10 +2,22 @@
 
 #include "artifact/views.h"
 
+#include <algorithm>
 #include <bit>
 #include <cmath>
 
 namespace ninfer::models {
+
+void require_shared_binding(const artifact::ParameterReference& parameter,
+                            const artifact::ParameterReference& source) {
+    const auto& parts  = parameter.binding.parts;
+    const auto& target = source.binding.parts;
+    if (!std::equal(parts.begin(), parts.end(), target.begin(), target.end(),
+                    [](const auto& a, const auto& b) {
+                        return a.object == b.object && a.begin == b.begin && a.end == b.end;
+                    }))
+        throw artifact::ArtifactError(parameter.name + ": must share storage with " + source.name);
+}
 
 WeightUseId Bindings::use(WeightId id, std::string_view input) const {
     const auto& parameter = at(id);

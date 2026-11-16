@@ -14,10 +14,11 @@
 namespace ninfer::ops {
 namespace {
 
-constexpr std::int32_t kHeadDim = 128;
-constexpr std::int32_t kQHeads  = 32;
-constexpr std::int32_t kKVHeads = 8;
-constexpr float kExpectedScale  = 0.08838834764831844055f;
+constexpr std::int32_t kMaximumGridRows = 65535;
+constexpr std::int32_t kHeadDim         = 128;
+constexpr std::int32_t kQHeads          = 32;
+constexpr std::int32_t kKVHeads         = 8;
+constexpr float kExpectedScale          = 0.08838834764831844055f;
 
 void require_profile(AttentionHeadGeometry geometry, const char* op) {
     if (!valid_attention_head_geometry(geometry) || geometry.head_dim != kHeadDim ||
@@ -83,16 +84,16 @@ std::size_t context_softmax_attention_workspace_capacity_bytes(
     std::int32_t min_tokens, std::int32_t max_tokens, std::int32_t batch_size) {
     require_profile(geometry, "context_softmax_attention workspace");
     if (min_tokens < 1 || max_tokens < min_tokens || max_tokens > 16 || batch_size < 1 ||
-        batch_size > 8 || envelope.min_context > envelope.max_context ||
+        envelope.min_context > envelope.max_context ||
         envelope.max_context >
             static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::invalid_argument(
             "context_softmax_attention workspace: invalid envelope or token interval");
     }
     const auto endpoint_capacity = [&](std::int32_t tokens) {
-        const auto plan = detail::select_context_attention_plan(tokens, envelope);
+        const auto plan = detail::select_context_attention_plan(tokens, batch_size, envelope);
         WorkspaceLayoutBuilder layout;
-        (void)allocate_workspace(layout, tokens, plan, batch_size);
+        (void)allocate_workspace(layout, tokens, plan, std::min(batch_size, kMaximumGridRows));
         return layout.peak_bytes(1);
     };
 
@@ -129,9 +130,7 @@ void context_softmax_attention(const Tensor& q, const Tensor& query_k, const Ten
     if (tokens < 1 || tokens > 16) {
         throw std::invalid_argument("context_softmax_attention: optimized domain is T=1..16");
     }
-    if (batch < 1 || batch > 8) {
-        throw std::invalid_argument("context_softmax_attention: B must be 1..8");
-    }
+    if (batch < 1) { throw std::invalid_argument("context_softmax_attention: B must be positive"); }
     common::operand::shape(q, {kHeadDim, kQHeads, tokens, batch}, op, "q");
     common::operand::shape(query_k, {kHeadDim, kKVHeads, tokens, batch}, op, "query k");
     common::operand::shape(query_v, {kHeadDim, kKVHeads, tokens, batch}, op, "query v");
@@ -154,12 +153,18 @@ void context_softmax_attention(const Tensor& q, const Tensor& query_k, const Ten
         throw std::invalid_argument("context_softmax_attention: scale must be 1/sqrt(128)");
     }
 
-    auto scope               = workspace.scope();
-    const auto plan          = detail::select_context_attention_plan(tokens, envelope);
-    PartialWorkspace partial = allocate_workspace(workspace, tokens, plan, batch);
-    detail::launch_context_attention(q, query_k, query_v, context_lengths, valid_columns,
-                                     table_rows, scale, context, plan, partial.acc, partial.m,
-                                     partial.l, out, stream);
+    const auto plan = detail::select_context_attention_plan(tokens, batch, envelope);
+    for (std::int64_t begin = 0; begin < batch; begin += kMaximumGridRows) {
+        const int rows = std::min<std::int64_t>(kMaximumGridRows, batch - begin);
+        auto scope     = workspace.scope();
+        auto partial   = allocate_workspace(workspace, tokens, plan, rows);
+        auto output    = out.slice(3, begin, rows);
+        detail::launch_context_attention(
+            q.slice(3, begin, rows), query_k.slice(3, begin, rows), query_v.slice(3, begin, rows),
+            context_lengths.slice(0, begin, rows), valid_columns.slice(0, begin, rows),
+            table_rows.slice(0, begin, rows), scale, context, plan, partial.acc, partial.m,
+            partial.l, output, stream);
+    }
 }
 
 } // namespace ninfer::ops

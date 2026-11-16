@@ -1,8 +1,13 @@
 #include "ops/softmax_attention/qsa/indexer/plan.h"
 #include "ops/common/host/launch.h"
+#include "ops/common/host/operands.h"
 #include "ops/softmax_attention/qsa/indexer/dgx_spark/score.cuh"
+#include "ops/softmax_attention/qsa/indexer/dgx_spark/score_tma.cuh"
 #include "ops/softmax_attention/qsa/indexer/dgx_spark/simt.cuh"
 #include "ops/softmax_attention/qsa/indexer/select.cuh"
+
+#include <limits>
+#include <optional>
 
 namespace ninfer::ops::detail::qsa {
 namespace {
@@ -48,10 +53,11 @@ void launch_finish(IndexerArguments args, cudaStream_t stream) {
     }
 }
 
-template <int Tile, bool Vector, int Stages, bool RetainKeys = false>
+template <int Tile, bool Vector, int Stages, bool RetainKeys = false, int MapCapacity = 32>
 void launch_score(IndexerArguments args, IndexerWindowPlan plan, cudaStream_t stream) {
     constexpr int threads = Tile > 16 ? Tile * 8 : 128;
-    constexpr auto kernel = indexer_score_pipeline_kernel<Tile, Vector, Stages, RetainKeys>;
+    constexpr auto kernel =
+        indexer_score_pipeline_kernel<Tile, Vector, Stages, RetainKeys, MapCapacity>;
     const int shared = common::prepare_shared<Stages * kIndexerKeyTile * 128 * 2, kernel, true>();
     kernel<<<plan.score_workers, threads, shared, stream>>>(args);
 }
@@ -59,7 +65,12 @@ void launch_score(IndexerArguments args, IndexerWindowPlan plan, cudaStream_t st
 template <bool Vector>
 void launch_score(IndexerArguments args, IndexerWindowPlan plan, cudaStream_t stream) {
     if (plan.score == IndexerScore::Simt16) {
-        indexer_score_simt_kernel<16, 128, Vector><<<plan.score_workers, 128, 0, stream>>>(args);
+        if (args.width * args.batch > 64)
+            indexer_score_simt_kernel<16, 128, Vector, kIndexerMaxWindowQueries>
+                <<<plan.score_workers, 128, 0, stream>>>(args);
+        else
+            indexer_score_simt_kernel<16, 128, Vector>
+                <<<plan.score_workers, 128, 0, stream>>>(args);
         return;
     }
     if (plan.score == IndexerScore::Simt8) {
@@ -67,6 +78,17 @@ void launch_score(IndexerArguments args, IndexerWindowPlan plan, cudaStream_t st
         return;
     }
     const auto submit = [&]<int Tile>() {
+        if constexpr (Tile == 4) {
+            if (args.batch > 32) {
+                if (plan.stages == 2)
+                    launch_score<Tile, Vector, 2, false, kIndexerMaxWindowQueries>(args, plan,
+                                                                                   stream);
+                else
+                    launch_score<Tile, Vector, 1, false, kIndexerMaxWindowQueries>(args, plan,
+                                                                                   stream);
+                return;
+            }
+        }
         if (plan.stages == 2) {
             launch_score<Tile, Vector, 2>(args, plan, stream);
             return;
@@ -100,11 +122,15 @@ void launch_score(IndexerArguments args, IndexerWindowPlan plan, cudaStream_t st
         break;
     }
 }
-} // namespace
 
-void launch_indexer_window(IndexerArguments args, IndexerWindowPlan plan, bool vector_cache,
-                           CudaExecutionView execution) {
-    if (vector_cache)
+void launch_window(IndexerArguments args, IndexerWindowPlan plan, bool vector_cache,
+                   const CUtensorMap* map, CudaExecutionView execution) {
+    if (plan.score == IndexerScore::Tma) {
+        const int shared =
+            common::prepare_shared<kIndexerTmaSharedBytes, indexer_score_tma_kernel, true>();
+        indexer_score_tma_kernel<<<plan.score_workers, 128, shared, execution.stream()>>>(args,
+                                                                                          *map);
+    } else if (vector_cache)
         launch_score<true>(args, plan, execution.stream());
     else
         launch_score<false>(args, plan, execution.stream());
@@ -121,5 +147,23 @@ void launch_indexer_window(IndexerArguments args, IndexerWindowPlan plan, bool v
     else
         partition.template operator()<128>();
     launch_finish(args, execution.stream());
+}
+} // namespace
+
+void launch_indexer_windows(IndexerArguments input, IndexerPlan plan, std::size_t key_bytes,
+                            std::size_t key_alignment, CudaExecutionView execution) {
+    const bool vector_cache = common::operand::aligned(input.keys, 16) &&
+                              input.key_row_stride % 8 == 0 && key_alignment % 16 == 0;
+    const bool tma_cache = vector_cache && common::operand::aligned(input.keys, 128) &&
+                           key_alignment % 128 == 0 &&
+                           key_bytes / 128 <= std::size_t(std::numeric_limits<int>::max());
+    std::optional<CUtensorMap> map;
+    for_each_indexer_window(input, plan, [&](IndexerArguments a) {
+        const auto window = select_indexer_window(plan, a.width, a.batch,
+                                                  execution.multiprocessor_count(), tma_cache);
+        if (window.score == IndexerScore::Tma && !map)
+            map.emplace(make_indexer_key_map(input, key_bytes));
+        launch_window(a, window, vector_cache, map ? &*map : nullptr, execution);
+    });
 }
 } // namespace ninfer::ops::detail::qsa

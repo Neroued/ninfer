@@ -118,8 +118,75 @@ int mixed_fields() {
     return failures + gathered.verify_guards("field hidden") +
            gathered_coordinates.verify_guards("field coordinates");
 }
+
+int expanded_fields() {
+    constexpr int d = 24, batch = 17, slots = batch + 2;
+    std::vector<std::uint16_t> words(d * slots), initial(d * slots, 0x8123);
+    for (std::size_t i = 0; i < words.size(); ++i) words[i] = std::uint16_t(i * 7919 + 0x8000);
+    auto source = to_device(words), destination = to_device(initial);
+    const std::array inputs{Tensor(source.span(), DType::BF16, {d, slots})};
+    const std::array outputs{Tensor(destination.span(), DType::BF16, {d, slots})};
+    tool::StateRecordFixture before(inputs, 1), after(outputs, 1);
+    auto ds = to_device(std::vector<std::int64_t>(batch));
+    auto dd = to_device(std::vector<std::int64_t>(batch));
+    auto da = to_device(std::vector<int>(batch)), dc = to_device(std::vector<int>(batch));
+    GuardedDeviceBuffer gathered(d * batch * 2);
+    Tensor hidden(gathered.span(), DType::BF16, {d, batch});
+    const std::array reads{ops::StateGather{before.field(0, Tensor(ds.span(), DType::I64, {batch})),
+                                            Tensor(da.span(), DType::I32, {batch}), hidden}};
+    const std::array writes{
+        ops::StateColumnScatter{hidden.view({d, 1, batch}), Tensor(dc.span(), DType::I32, {batch}),
+                                after.field(0, Tensor(dd.span(), DType::I64, {batch}))}};
+    auto& device = cuda_environment().context;
+    DecodeGraphDefinition definition;
+    DecodeGraphExecutable graph;
+    cuda_synchronize();
+    definition.capture(device.stream(), [&] {
+        ops::gather_state_fields(reads, device.execution_view());
+        ops::scatter_state_fields(writes, device.execution_view());
+    });
+    graph.instantiate(definition);
+    int failures = 0;
+    for (int phase = 0; phase < 2; ++phase) {
+        std::vector<int> active(batch), columns(batch, -1);
+        std::vector<std::int64_t> sources(batch, -1), targets(batch, -1);
+        std::vector<std::uint16_t> expected_hidden(d * batch), expected = initial;
+        for (int b = 0; b < batch; ++b) {
+            active[b] = (b + phase) % 3 != 0;
+            if (active[b]) {
+                const int slot = (b + phase + 1) % slots;
+                sources[b]     = before.byte_offset(slot);
+                std::copy_n(words.begin() + slot * d, d, expected_hidden.begin() + b * d);
+            }
+            if ((b + phase) % 4 == 0) continue;
+            columns[b] = 0;
+            targets[b] = after.byte_offset(b);
+            std::copy_n(expected_hidden.begin() + b * d, d, expected.begin() + b * d);
+        }
+        ds.copy_from_host(sources.data(), ds.size());
+        dd.copy_from_host(targets.data(), dd.size());
+        da.copy_from_host(active.data(), da.size());
+        dc.copy_from_host(columns.data(), dc.size());
+        destination.copy_from_host(initial.data(), destination.size());
+        after.upload();
+        cuda_synchronize();
+        graph.launch(device.stream());
+        device.synchronize();
+        after.copy_back();
+        failures += verify_exact(
+            "expanded field gather",
+            from_device<std::uint16_t>(gathered.data(), expected_hidden.size()), expected_hidden);
+        failures +=
+            verify_exact("expanded field scatter",
+                         from_device<std::uint16_t>(destination, expected.size()), expected);
+        failures += !before.guards_intact() || !after.guards_intact();
+    }
+    return failures + gathered.verify_guards("expanded fields");
+}
+
 } // namespace
 
 void add_state_fields_cases(OpSuite& suite) {
     suite.add("state_fields/mixed_replay", mixed_fields);
+    suite.add("state_fields/b17/replay", expanded_fields, {{"suite", "concurrency"}});
 }

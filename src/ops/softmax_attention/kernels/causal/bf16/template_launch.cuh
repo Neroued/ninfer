@@ -7,6 +7,7 @@
 #include "ops/softmax_attention/kernels/causal/bf16/grouped_mma.cuh"
 #include "ops/softmax_attention/kernels/causal/bf16/tiled_mma.cuh"
 #include "ops/softmax_attention/kernels/causal/bf16/merge.cuh"
+#include "ops/softmax_attention/kernels/causal/merge.cuh"
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
@@ -35,23 +36,27 @@ void launch_bf16_kv_grouped_mma(const CausalAttentionOperands& p, Bf16KvCacheVie
     if ((S::kFixedWidth && p.width != S::kFixedWidth) || partition.capacity < 1 ||
         partition.capacity > 256 || partition.normal_target < 1 || partition.long_target < 1 ||
         partition.key_rows != S::kKeyRows ||
-        partition.live(p.visible_capacity).splits > partition.capacity || !partials.acc ||
-        !partials.maximum || !partials.sum || MultiBatch != (p.batch > 1) ||
-        Masked != (cache.valid_columns != nullptr))
+        partition.live(p.visible_capacity).splits > partition.capacity ||
+        (partition.capacity != 1 && (!partials.acc || !partials.maximum || !partials.sum)) ||
+        MultiBatch != (p.batch > 1) || Masked != (cache.valid_columns != nullptr))
         throw std::invalid_argument("BF16 grouped attention: invalid partition or metadata");
     if constexpr (Input::writes_cache) {
         if (!input.k || !input.v) throw std::invalid_argument("BF16 grouped append requires K/V");
     }
-    {
-        constexpr auto kernel = bf16_kv_grouped_mma_kernel<G, S, MultiBatch, Masked, Input>;
+    const auto launch = [&]<bool Direct>() {
+        constexpr auto kernel = bf16_kv_grouped_mma_kernel<G, S, MultiBatch, Masked, Input, Direct>;
         constexpr int bytes   = sizeof(Bf16KvGroupedStorage<G, S>);
         const int dynamic     = common::prepare_shared<bytes, kernel>();
         const dim3 grid(G::KVHeads * common::div_up(p.width * G::GroupSize, S::kQueryRows),
                         partition.capacity, p.batch);
         kernel<<<grid, S::kThreads, dynamic, stream>>>(
             p.q, input, p.positions, cache.keys, cache.values, cache.tables, cache.valid_columns,
-            cache.table_rows, cache.table_stride, p.width, p.scale, partition, partials);
-    }
+            cache.table_rows, cache.table_stride, p.width, p.scale, partition, partials, p.out);
+    };
+    if (partition.capacity == 1)
+        launch.template operator()<true>();
+    else
+        launch.template operator()<false>();
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -59,6 +64,11 @@ template <class G, class S, bool MultiBatch, bool Masked, bool Writable>
 void launch_bf16_kv_merge(const CausalAttentionOperands& p, Bf16KvCacheView<Writable> cache,
                           Bf16KvPartition partition, CausalPartialView partials,
                           cudaStream_t stream) {
+    if (partition.capacity == 1) {
+        causal_merge_idle_kernel<<<1, 1, 0, stream>>>();
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     if (partition.capacity > S::kThreads)
         throw std::invalid_argument("BF16 merge capacity exceeds the reduction block");
     const dim3 grid(G::QHeads, common::div_up(G::kHeadDim, S::kDChunk), p.width * p.batch);

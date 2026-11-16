@@ -15,7 +15,7 @@
 namespace ninfer::ops::detail {
 
 template <class Geometry, class Schedule, bool MultiBatch, bool Masked, class CacheInput,
-          bool ParallelQueries = false>
+          bool ParallelQueries, bool Direct>
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     void fp8_kv_grouped_mma_kernel(
         const __nv_bfloat16* q, CacheInput input, const std::int32_t* positions,
@@ -26,7 +26,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
         const std::int64_t* block_tables, const std::int32_t* valid_columns,
         const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t full_width,
         std::int32_t logical_capacity, CausalKvPartition partition, float attention_scale,
-        float* partial_acc, float* partial_m, float* partial_l) {
+        float* partial_acc, float* partial_m, float* partial_l, __nv_bfloat16* out) {
     constexpr int TokenTile = Schedule::kTokenTile, WarpsPerCta = Schedule::kWarps;
     constexpr int KeyBlock             = Schedule::kKeyRows;
     constexpr bool DynamicArena        = Schedule::kDynamicArena;
@@ -92,8 +92,15 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
         const int remaining = valid_columns[batch] - column_begin;
         valid_tokens        = remaining <= 0 ? 0 : min(remaining, tile_tokens);
     }
+    if (valid_tokens == 0) {
+        if constexpr (Direct)
+            causal_zero_grouped_output<Geometry, Threads>(
+                out, kv_head, std::int64_t(batch) * full_width + column_begin, tile_tokens);
+        return;
+    }
     std::int64_t column_base = column_begin;
     if constexpr (MultiBatch) { column_base += static_cast<std::int64_t>(batch) * full_width; }
+    if constexpr (Direct) out += std::int64_t(D) * Geometry::QHeads * column_base;
     q += static_cast<std::int64_t>(D) * Geometry::QHeads * column_base;
     const int global_last_pos = positions[(MultiBatch ? batch * full_width : 0) + full_width - 1];
     positions += column_base;
@@ -104,7 +111,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     const int table_row = table_rows == nullptr ? 0 : table_rows[batch];
     const std::int64_t* block_table =
         block_tables + static_cast<std::int64_t>(table_row) * table_stride;
-    if constexpr (MultiBatch) {
+    if constexpr (MultiBatch && !Direct) {
         partial_acc +=
             static_cast<std::int64_t>(batch) * D * Geometry::QHeads * partial_width * split_count;
         partial_m +=
@@ -114,7 +121,6 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     }
 
     if (kv_head < 0 || kv_head >= Geometry::KVHeads || split_count <= 0) return;
-    if (valid_tokens == 0) return; // Merge owns exact zero for masked output columns.
 
     const std::int32_t first_pos = positions[0];
     const std::int32_t last_pos  = ParallelQueries ? global_last_pos : positions[TokenTile - 1];
@@ -405,7 +411,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                 }
             }
         } else {
-            const int loader_tid = tid - ProducerThreads;
+            const int loader_tid     = tid - ProducerThreads;
             const auto expand_values = [&]<bool SingleFactor>() {
 #pragma unroll 1
                 for (int chunk = loader_tid; chunk < Bc * (D / 8); chunk += VLoaderThreads) {
@@ -439,7 +445,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
         }
         __syncthreads();
 
-        const bool has_next = kb + 1 < key_blocks;
+        const bool has_next  = kb + 1 < key_blocks;
         bool next_value_half = true;
         if (has_next) {
             const int next_k0 = k0 + Bc;
@@ -492,54 +498,9 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
             __syncthreads();
     }
 
-    if (warp < RowTiles && lid == 0) {
-        const int row0 = warp * 16 + gid;
-        const int row1 = row0 + 8;
-        if (row0 < tile_tokens * Geometry::GroupSize) {
-            int q_head = 0;
-            int token  = 0;
-            causal_row_to_qt<Geometry>(row0, kv_head, q_head, token);
-            partial_m[causal_stat_index<Geometry>(q_head, partial_begin + token, split,
-                                                  partial_width)] = m0;
-            partial_l[causal_stat_index<Geometry>(q_head, partial_begin + token, split,
-                                                  partial_width)] = l0;
-        }
-        if (row1 < tile_tokens * Geometry::GroupSize) {
-            int q_head = 0;
-            int token  = 0;
-            causal_row_to_qt<Geometry>(row1, kv_head, q_head, token);
-            partial_m[causal_stat_index<Geometry>(q_head, partial_begin + token, split,
-                                                  partial_width)] = m1;
-            partial_l[causal_stat_index<Geometry>(q_head, partial_begin + token, split,
-                                                  partial_width)] = l1;
-        }
-    }
-
-#pragma unroll
-    for (int n = 0; n < PVNtPerWarp; ++n) {
-        const int consumer_tile     = warp % RowTiles;
-        const int consumer_slice    = warp / RowTiles;
-        const int consumer_row_base = consumer_tile * 16;
-        const int d0                = (consumer_slice * PVNtPerWarp + n) * 8 + 2 * lid;
-        const int row0              = consumer_row_base + gid;
-        const int row1              = row0 + 8;
-        if (row0 < tile_tokens * Geometry::GroupSize) {
-            int q_head = 0;
-            int token  = 0;
-            causal_row_to_qt<Geometry>(row0, kv_head, q_head, token);
-            const auto dst = causal_partial_index<Geometry>(q_head, d0, partial_begin + token,
-                                                            split, partial_width);
-            causal_store_partial_pair(partial_acc + dst, acc[n][0], acc[n][1]);
-        }
-        if (row1 < tile_tokens * Geometry::GroupSize) {
-            int q_head = 0;
-            int token  = 0;
-            causal_row_to_qt<Geometry>(row1, kv_head, q_head, token);
-            const auto dst = causal_partial_index<Geometry>(q_head, d0, partial_begin + token,
-                                                            split, partial_width);
-            causal_store_partial_pair(partial_acc + dst, acc[n][2], acc[n][3]);
-        }
-    }
+    causal_grouped_epilogue<Geometry, RowTiles, PVNtPerWarp, Threads, Direct, false, 0>(
+        acc, m0, m1, l0, l1, alpha_s, nullptr, nullptr, partial_acc, partial_m, partial_l, out,
+        kv_head, tile_tokens, valid_tokens, partial_width, partial_begin, split);
 }
 
 } // namespace ninfer::ops::detail

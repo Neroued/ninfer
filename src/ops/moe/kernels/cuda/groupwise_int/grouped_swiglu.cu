@@ -1,3 +1,4 @@
+#include "core/platform.h"
 #include "ops/moe/kernels/cuda/groupwise_int/grouped_gate_up.cuh"
 #include "ops/moe/kernels/cuda/groupwise_int/grouped_down.cuh"
 
@@ -36,10 +37,11 @@ __global__ void reduce_assignments(const __nv_bfloat16* values, const int* inver
             }
         }
     }
+    const bool live = output.is_live(token);
 #pragma unroll
     for (int item = 0; item < Items; ++item) {
         const auto index = std::int64_t(token) * Shape::hidden + tid * Items + item;
-        output.store(index, output.initial(index) + sum[item]);
+        output.store(index, output.initial(index, live) + sum[item], live);
     }
 }
 
@@ -76,16 +78,19 @@ void shared_down(const Tensor& x, const ScaledSwiGLUTerm& shared, Tensor& destin
                  int columns, cudaStream_t stream) {
     using S                = SwiGLUH2048I512E256K8;
     const auto* activation = static_cast<const __nv_bfloat16*>(storage.shared_activation);
-    with_output(destination, epilogue, [&](auto output) {
-        with_column_tile(columns, [&]<int N> {
-            grouped_q8_down<S, PackedExpertMatrix, decltype(output), false, N>
-                <<<dim3(S::hidden / 64, (x.ne[1] + N - 1) / N), N * 4, 0, stream>>>(
-                    activation, activation + S::intermediate * x.ne[1], nullptr, nullptr, nullptr,
-                    matrix(shared.weights.down.weight), nullptr, storage.routed_sum,
-                    static_cast<const float*>(shared.coefficients.data), output, x.ne[1], info);
-        });
-        CUDA_CHECK(cudaGetLastError());
-    });
+    with_output(
+        destination, epilogue,
+        [&](auto output) {
+            with_column_tile(columns, [&]<int N> {
+                grouped_q8_down<S, PackedExpertMatrix, decltype(output), false, N>
+                    <<<dim3(S::hidden / 64, (x.ne[1] + N - 1) / N), N * 4, 0, stream>>>(
+                        activation, activation + S::intermediate * x.ne[1], nullptr, nullptr,
+                        nullptr, matrix(shared.weights.down.weight), nullptr, storage.routed_sum,
+                        static_cast<const float*>(shared.coefficients.data), output, x.ne[1], info);
+            });
+            CUDA_CHECK(cudaGetLastError());
+        },
+        storage.token_validity);
 }
 } // namespace
 
@@ -105,37 +110,82 @@ void launch_grouped_swiglu(const Tensor& x, const RoutedSwiGLUProfile& profile,
     const int gate_blocks = std::min(jobs * (S::intermediate / 32), limit);
     const int down_blocks = std::min(jobs * (S::hidden / 64), limit);
     with_expert_addresses(experts, profile, [&](auto gate_up, auto down) {
-        using Access = decltype(gate_up);
-        if (profile.ffn.gate_up_type == QType::Q4_G64_FP16) {
-            if (plan.columns == 64) {
-                grouped_q4_gate_up<S, Access, 8, 64, 2, GateUpDensity::Any>
-                    <<<gate_blocks, 256, 0, stream>>>(input, group.tokens, group.offsets,
-                                                      group.job_experts, group.job_columns,
-                                                      group.info, gate_up, activation);
+        using Access               = decltype(gate_up);
+        const auto gate_projection = [&] {
+            if (profile.ffn.gate_up_type == QType::Q4_G64_FP16) {
+#if NINFER_TARGET_SPARK
+                if (plan.block_k == 128) {
+                    if (plan.columns == 64) {
+                        grouped_q4_gate_up<S, Access, 8, 64, 1, GroupDensity::Spread, 128>
+                            <<<gate_blocks, 256, 0, stream>>>(input, group.tokens, group.offsets,
+                                                              group.job_experts, group.job_columns,
+                                                              group.info, gate_up, activation);
+                        CUDA_CHECK(cudaGetLastError());
+                        grouped_q4_gate_up<S, Access, 8, 64, 2, GroupDensity::Packed>
+                            <<<gate_blocks, 256, 0, stream>>>(input, group.tokens, group.offsets,
+                                                              group.job_experts, group.job_columns,
+                                                              group.info, gate_up, activation);
+                    } else {
+                        grouped_q4_gate_up<S, Access, 4, 32, 2, GroupDensity::Any, 128>
+                            <<<gate_blocks, 128, 0, stream>>>(input, group.tokens, group.offsets,
+                                                              group.job_experts, group.job_columns,
+                                                              group.info, gate_up, activation);
+                    }
+                    return;
+                }
+#endif
+                if (plan.columns == 64) {
+                    grouped_q4_gate_up<S, Access, 8, 64, 2, GroupDensity::Any>
+                        <<<gate_blocks, 256, 0, stream>>>(input, group.tokens, group.offsets,
+                                                          group.job_experts, group.job_columns,
+                                                          group.info, gate_up, activation);
+                } else {
+                    grouped_q4_gate_up<S, Access, 4, 32, 2, GroupDensity::Packed>
+                        <<<gate_blocks, 128, 0, stream>>>(input, group.tokens, group.offsets,
+                                                          group.job_experts, group.job_columns,
+                                                          group.info, gate_up, activation);
+                    CUDA_CHECK(cudaGetLastError());
+                    grouped_q4_gate_up<S, Access, 4, 32, 6, GroupDensity::Spread>
+                        <<<gate_blocks, 128, 0, stream>>>(input, group.tokens, group.offsets,
+                                                          group.job_experts, group.job_columns,
+                                                          group.info, gate_up, activation);
+                }
             } else {
-                grouped_q4_gate_up<S, Access, 4, 32, 2, GateUpDensity::Packed>
-                    <<<gate_blocks, 128, 0, stream>>>(input, group.tokens, group.offsets,
-                                                      group.job_experts, group.job_columns,
-                                                      group.info, gate_up, activation);
-                CUDA_CHECK(cudaGetLastError());
-                grouped_q4_gate_up<S, Access, 4, 32, 6, GateUpDensity::Spread>
-                    <<<gate_blocks, 128, 0, stream>>>(input, group.tokens, group.offsets,
-                                                      group.job_experts, group.job_columns,
-                                                      group.info, gate_up, activation);
+                with_column_tile(plan.columns, [&]<int N> {
+                    grouped_q8_gate_up<S, Access, true, N><<<gate_blocks, N * 4, 0, stream>>>(
+                        input, group.tokens, group.offsets, group.job_experts, group.job_columns,
+                        gate_up, activation, activation + S::intermediate * S::top_k * x.ne[1],
+                        x.ne[1], group.info);
+                });
             }
-        } else {
-            with_column_tile(plan.columns, [&]<int N> {
-                grouped_q8_gate_up<S, Access, true, N><<<gate_blocks, N * 4, 0, stream>>>(
-                    input, group.tokens, group.offsets, group.job_experts, group.job_columns,
-                    gate_up, activation, activation + S::intermediate * S::top_k * x.ne[1], x.ne[1],
-                    group.info);
-            });
-        }
+        };
+        gate_projection();
         CUDA_CHECK(cudaGetLastError());
         if (shared) {
             shared_gate_up(x, *shared, storage, group.info, plan.shared_columns, stream);
         }
         const auto integer_down = [&]<class Codec>() {
+#if NINFER_TARGET_SPARK
+            if (plan.block_k == 128) {
+                if (plan.columns == 64) {
+                    grouped_integer_down<S, Codec, Access, 8, 64, 1, 128, GroupDensity::Spread>
+                        <<<down_blocks, 256, 0, stream>>>(activation, group.offsets,
+                                                          group.job_experts, group.job_columns,
+                                                          group.info, down, values);
+                    CUDA_CHECK(cudaGetLastError());
+                    grouped_integer_down<S, Codec, Access, 8, 64, 2, 64, GroupDensity::Packed>
+                        <<<down_blocks, 256, 0, stream>>>(activation, group.offsets,
+                                                          group.job_experts, group.job_columns,
+                                                          group.info, down, values);
+                } else {
+                    grouped_integer_down<S, Codec, Access, 4, 32, 2, 128>
+                        <<<down_blocks, 128, 0, stream>>>(activation, group.offsets,
+                                                          group.job_experts, group.job_columns,
+                                                          group.info, down, values);
+                }
+                return;
+            }
+#endif
             if (plan.columns == 64) {
                 grouped_integer_down<S, Codec, Access, 8, 64>
                     <<<down_blocks, 256, 0, stream>>>(activation, group.offsets, group.job_experts,
@@ -176,7 +226,7 @@ void launch_grouped_swiglu(const Tensor& x, const RoutedSwiGLUProfile& profile,
         shared_down(x, *shared, destination, epilogue, storage, group.info, plan.shared_columns,
                     stream);
     } else {
-        with_output(destination, epilogue, reduce);
+        with_output(destination, epilogue, reduce, storage.token_validity);
     }
 }
 

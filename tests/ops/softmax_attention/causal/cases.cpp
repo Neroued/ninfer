@@ -51,7 +51,8 @@ void add_batch_case(OpSuite& suite, Geometry geometry, KvCacheStorage storage, B
                   return run_batch_case(cuda_environment().context.execution_view(), geometry,
                                         storage, c, envelope, bounds);
               },
-              {{"format", kv_cache_storage_name(storage)},
+              {{"suite", c.contexts.size() > 8 ? "concurrency" : "causal_batch"},
+               {"format", kv_cache_storage_name(storage)},
                {"execution", c.graph_replay ? "graph" : "eager"}});
 }
 
@@ -120,6 +121,16 @@ void add_verify_width_cases(OpSuite& suite, KvCacheStorage storage) {
 }
 
 void add_batch_cases(OpSuite& suite, KvCacheStorage storage) {
+    BatchAttentionCase expanded{4, {}, {}, {}, MappingPattern::Fragmented, 1901u, true};
+    for (int b = 0; b < 17; ++b) {
+        expanded.contexts.push_back(32 + b);
+        expanded.valid_columns.push_back(b % 5);
+        expanded.table_rows.push_back((b * 7) % 17);
+    }
+    add_batch_case(suite, kGeometries[1], storage, expanded);
+    add_batch_case(suite, kGeometries[1], storage,
+                   {1, std::vector<int>(129, 0), std::vector<int>(129, 0), std::vector<int>(129, 0),
+                    MappingPattern::Identity, 1902u});
     add_batch_case(suite, kGeometries[0], storage,
                    {16, {0}, {0}, {0}, MappingPattern::Fragmented, 1501u});
     add_batch_case(suite, kGeometries[0], storage,

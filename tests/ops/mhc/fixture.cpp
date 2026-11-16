@@ -172,7 +172,8 @@ void Fixture::invoke(CudaExecutionView e, MemoryArena* workspace) {
         ops::mhc_expand_pre(ty, weights, parameters, tr, outputs, work, e);
         break;
     case Form::PostPre:
-        ops::mhc_post_pre(tx, ty, coefficients, weights, parameters, tr, outputs, work, e);
+        ops::mhc_post_pre(tx, ty, coefficients, weights, parameters, tr, outputs, work, e,
+                          mean_tap);
         break;
     case Form::PostMeanNorm:
         ops::mhc_post_mean_norm(tx, ty, coefficients, weights.gamma, final_epsilon,

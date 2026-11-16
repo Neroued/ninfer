@@ -9,13 +9,13 @@ using namespace ninfer::test;
 namespace kp = ninfer::tool::kpool;
 
 namespace {
-int run(bool alias, int D) {
+int run(bool alias, int D, int B = 8, int R = 8) {
     auto& device    = cuda_environment().context;
-    constexpr int B = 8, L = 11, W = 11;
-    kp::Buffer<std::uint16_t> keys(device.device(), DType::BF16, {D, W, B, L}, true),
-        gates(device.device(), DType::BF16, {D, W, B, L}, true);
-    kp::Buffer<int> bases(device.device(), DType::I32, {B}),
-        valid(device.device(), DType::I32, {B}), accepted(device.device(), DType::I32, {B});
+    constexpr int L = 11, W = 11;
+    kp::Buffer<std::uint16_t> keys(device.device(), DType::BF16, {D, W, R, L}, true),
+        gates(device.device(), DType::BF16, {D, W, R, L}, true);
+    kp::Buffer<int> bases(device.device(), DType::I32, {R}),
+        valid(device.device(), DType::I32, {R}), accepted(device.device(), DType::I32, {B});
     kp::Buffer<std::int64_t> src(device.device(), DType::I64, {B}),
         dst(device.device(), DType::I64, {B});
     StateImageBuilder builder;
@@ -32,7 +32,7 @@ int run(bool alias, int D) {
     for (int b = 0; b < B; ++b) {
         bases.at(b)    = 60 + b % 4;
         valid.at(b)    = W;
-        accepted.at(b) = b == 0 ? 0 : b < 4 ? 1 : b + 3;
+        accepted.at(b) = b == 0 ? 0 : b < 4 ? 1 : 1 + (b + 2) % W;
         src.at(b)      = b ? 256 + b * stride : -1;
         dst.at(b)      = b ? 256 + (alias ? b : b + B) * stride : -1;
     }
@@ -151,5 +151,9 @@ int main(int argc, char** argv) {
                           std::to_string(dimension),
                       [=] { return run(alias, dimension); },
                       {{"format", "bf16"}, {"execution", "graph"}});
+    suite.add("kpool/tail/large_batch/disjoint", [] { return run(false, 128, 17, 64); },
+              {{"format", "bf16"}, {"execution", "graph"}, {"suite", "concurrency"}});
+    suite.add("kpool/tail/large_batch/inplace", [] { return run(true, 257, 65, 128); },
+              {{"format", "bf16"}, {"execution", "graph"}, {"suite", "concurrency"}});
     return suite.main(argc, argv);
 }

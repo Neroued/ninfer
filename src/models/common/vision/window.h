@@ -2,13 +2,85 @@
 
 #include "models/common/frontend/media.h"
 #include "runtime/executor/contract.h"
+#include "runtime/contract/resources.h"
 
 #include <memory>
+#include <algorithm>
+#include <stdexcept>
 #include <optional>
 #include <span>
 #include <vector>
 
 namespace ninfer::models::vision {
+
+// Quote the serial Native window lifecycle without payloads or executor reservations.
+// A window produced for one chunk remains fixed until its last unit is consumed.
+template <class Items, class ItemView>
+std::uint64_t prefill_chunks(const Items& items, ItemView item_view, std::uint32_t begin,
+                             std::uint32_t end, std::uint32_t chunk,
+                             std::uint32_t feature_capacity) {
+    if (begin >= end || !chunk) return 0;
+    std::size_t first_item = 0, first_span = 0;
+    const auto frame = [&](std::size_t& item, std::size_t& span) -> const frontend::TokenSpan* {
+        while (item < items.size()) {
+            const auto& spans = item_view(items[item]).token_spans;
+            if (span < spans.size()) return &spans[span];
+            ++item;
+            span = 0;
+        }
+        return nullptr;
+    };
+    std::uint64_t count      = 0;
+    std::uint32_t window_end = 0;
+    while (begin < end) {
+        while (const auto* span = frame(first_item, first_span)) {
+            if (span->begin + span->count > begin) break;
+            ++first_span;
+        }
+        auto next =
+            static_cast<std::uint32_t>(std::min<std::uint64_t>(end, std::uint64_t(begin) + chunk));
+        auto item = first_item, span_index = first_span;
+        std::uint64_t used = 0;
+        auto produced_end  = window_end;
+        while (const auto* span = frame(item, span_index)) {
+            if (span->begin >= next) break;
+            if ((window_end && span->begin >= window_end) ||
+                (!window_end && span->count > feature_capacity - used)) {
+                next = static_cast<std::uint32_t>(std::max<std::size_t>(begin, span->begin));
+                break;
+            }
+            used += span->count;
+            if (!window_end) produced_end = static_cast<std::uint32_t>(span->begin + span->count);
+            ++span_index;
+        }
+        if (next == begin) throw std::logic_error("recovery Vision unit exceeds its window");
+        window_end = next >= produced_end ? 0 : produced_end;
+        begin      = next;
+        ++count;
+    }
+    return count;
+}
+
+// Native encoder units are images/video frames, not whole video payloads. A partially
+// intersected unit must still be encoded in full; text-only gaps encode no media.
+template <class Items, class ItemView>
+runtime::PrefillWork recovery_work(const Items& items, ItemView item_view, std::uint32_t begin,
+                                   std::uint32_t end, std::uint32_t chunk,
+                                   std::uint32_t feature_capacity) {
+    if (begin > end) throw std::invalid_argument("recovery begins after its target");
+    auto work = runtime::make_prefill_work(begin, end - begin, 0, 0, chunk);
+    if (begin == end || items.empty()) return work;
+    for (const auto& entry : items) {
+        const auto& item = item_view(entry);
+        for (const auto& span : item.token_spans)
+            if (span.begin < end && span.begin + span.count > begin) {
+                ++work.vision_items;
+                work.vision_patches += std::uint64_t(item.grid.height) * item.grid.width;
+            }
+    }
+    work.chunks = prefill_chunks(items, item_view, begin, end, chunk, feature_capacity);
+    return work;
+}
 
 // One independently encodable unit. Patch offsets are relative to its prepared payload.
 struct Unit {

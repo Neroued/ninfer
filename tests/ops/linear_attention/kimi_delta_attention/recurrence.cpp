@@ -404,9 +404,11 @@ int batch_update_case(const Case& test_case, const std::vector<int>& state_slots
     references.reserve(static_cast<std::size_t>(batch));
     std::vector<double> expected_output(vector_row_size * static_cast<std::size_t>(batch));
     std::vector<bool> written_slots(static_cast<std::size_t>(slots), false);
+    std::vector<int> valid(batch);
     for (int row = 0; row < batch; ++row) {
         const int slot = state_slots[static_cast<std::size_t>(row)];
-        if (slot < 0 || slot >= slots || written_slots[static_cast<std::size_t>(slot)]) {
+        if (slot < -1 || slot >= slots ||
+            (slot >= 0 && written_slots[static_cast<std::size_t>(slot)])) {
             throw std::logic_error("batch_update_case requires valid distinct slots");
         }
 
@@ -419,6 +421,11 @@ int batch_update_case(const Case& test_case, const std::vector<int>& state_slots
         aggregate.v.insert(aggregate.v.end(), input.v.begin(), input.v.end());
         aggregate.g.insert(aggregate.g.end(), input.g.begin(), input.g.end());
         aggregate.beta.insert(aggregate.beta.end(), input.beta.begin(), input.beta.end());
+        if (slot == -1) {
+            references.emplace_back();
+            continue;
+        }
+        valid[row] = 1;
         std::copy(input.state.begin(), input.state.end(),
                   initial_states.begin() + static_cast<std::size_t>(slot) * state_size);
 
@@ -446,7 +453,9 @@ int batch_update_case(const Case& test_case, const std::vector<int>& state_slots
     Tensor states_tensor(states.span(), DType::FP32,
                          {kStateDim, kStateDim, test_case.heads, slots});
     RecordStateFixture history(states_tensor, 3);
-    const auto state_offsets        = history.record_offsets(state_slots);
+    std::vector<std::int64_t> state_offsets(batch, -1);
+    for (int row = 0; row < batch; ++row)
+        if (valid[row]) state_offsets[row] = history.byte_offset(state_slots[row]);
     DeviceBuffer device_state_slots = to_device(state_offsets);
     Tensor state_slots_tensor(device_state_slots.span(), DType::I64, {batch});
     Tensor out_tensor(out.span(), DType::BF16, {kStateDim, test_case.heads, 1, batch});
@@ -454,19 +463,64 @@ int batch_update_case(const Case& test_case, const std::vector<int>& state_slots
     // Independent arenas and selectors distinguish source reads from destination writes.
     RecordStateFixture source_history(states_tensor, 3);
     auto destination_slots = state_slots;
-    std::reverse(destination_slots.begin(), destination_slots.end());
-    const auto destination_offsets = history.record_offsets(destination_slots);
-    auto destination_buffer        = to_device(destination_offsets);
+    std::vector<int> active_slots;
+    for (const auto slot : state_slots)
+        if (slot >= 0) active_slots.push_back(slot);
+    auto next = active_slots.rbegin();
+    std::vector<std::int64_t> destination_offsets(batch, -1);
+    for (int row = 0; row < batch; ++row)
+        if (valid[row]) {
+            destination_slots[row]   = *next++;
+            destination_offsets[row] = history.byte_offset(destination_slots[row]);
+        }
+    auto destination_buffer = to_device(destination_offsets);
     Tensor destination_table(destination_buffer.span(), DType::I64, {batch});
     for (int slot : destination_slots) {
+        if (slot < 0) continue;
         const auto destination = history.tensor(slot);
         CUDA_CHECK(cudaMemset(destination.data, 0xff, destination.bytes()));
     }
-    ops::kimi_delta_attention_batch_update(q, k, v, g, beta, a_log, dt_bias, kLowerBound, kScale,
-                                           source_history.view(state_slots_tensor),
-                                           history.view(destination_table), out_tensor,
-                                           ninfer::test::cuda_environment().default_execution);
+    auto valid_buffer        = to_device(valid);
+    const bool masked        = std::find(valid.begin(), valid.end(), 0) != valid.end();
+    const Tensor valid_table = masked ? Tensor(valid_buffer.span(), DType::I32, {batch}) : Tensor{};
+    const auto execution     = cuda_environment().context.execution_view();
+    const auto launch        = [&] {
+        ops::kimi_delta_attention_batch_update(q, k, v, g, beta, a_log, dt_bias, kLowerBound,
+                                                      kScale, source_history.view(state_slots_tensor),
+                                                      history.view(destination_table), valid_table,
+                                                      out_tensor, execution);
+    };
     cuda_synchronize();
+    launch();
+    cuda_synchronize();
+    if (masked) {
+        cudaGraph_t graph;
+        cudaGraphExec_t executable;
+        CUDA_CHECK(cudaStreamBeginCapture(execution.stream(), cudaStreamCaptureModeThreadLocal));
+        launch();
+        CUDA_CHECK(cudaStreamEndCapture(execution.stream(), &graph));
+        CUDA_CHECK(cudaGraphInstantiate(&executable, graph, 0));
+        const std::vector<int> inactive(batch, 0);
+        const std::vector<std::int64_t> invalid(batch, -1);
+        const auto storage = history.view().records.storage;
+        const auto before  = from_device<std::uint8_t>(storage.data, storage.bytes);
+        valid_buffer.copy_from_host(inactive.data(), valid_buffer.size());
+        device_state_slots.copy_from_host(invalid.data(), device_state_slots.size());
+        destination_buffer.copy_from_host(invalid.data(), destination_buffer.size());
+        CUDA_CHECK(cudaGraphLaunch(executable, execution.stream()));
+        cuda_synchronize();
+        if (from_device<std::uint8_t>(storage.data, storage.bytes) != before ||
+            from_device<std::uint16_t>(out.data(), aggregate.v.size()) !=
+                std::vector<std::uint16_t>(aggregate.v.size(), 0))
+            throw std::runtime_error("inactive KDA update accessed State or failed to zero output");
+        valid_buffer.copy_from_host(valid.data(), valid_buffer.size());
+        device_state_slots.copy_from_host(state_offsets.data(), device_state_slots.size());
+        destination_buffer.copy_from_host(destination_offsets.data(), destination_buffer.size());
+        CUDA_CHECK(cudaGraphLaunch(executable, execution.stream()));
+        cuda_synchronize();
+        CUDA_CHECK(cudaGraphExecDestroy(executable));
+        CUDA_CHECK(cudaGraphDestroy(graph));
+    }
 
     const std::string label =
         std::string(test_case.name) + " batch update B=" + std::to_string(batch);
@@ -481,7 +535,8 @@ int batch_update_case(const Case& test_case, const std::vector<int>& state_slots
     failures += history.verify_guards("pooled state");
     const std::vector<float> got_states = from_device<float>(states.data(), initial_states.size());
     for (int row = 0; row < batch; ++row) {
-        const int slot          = destination_slots[static_cast<std::size_t>(row)];
+        const int slot = destination_slots[static_cast<std::size_t>(row)];
+        if (slot < 0) continue;
         const std::size_t begin = static_cast<std::size_t>(slot) * state_size;
         failures += verify_reduction(
             label + " row " + std::to_string(row) + " state",
@@ -608,7 +663,7 @@ int batch_contract_rejection_cases() {
             ops::kimi_delta_attention_batch_update(
                 q, k, v, g, beta, a_log, dt_bias, kLowerBound, kScale,
                 dense_record_field(states, 3, state_slots),
-                dense_record_field(states, 3, state_slots), out,
+                dense_record_field(states, 3, state_slots), {}, out,
                 ninfer::test::cuda_environment().default_execution);
         } catch (const std::invalid_argument&) { return true; }
         cuda_synchronize();
@@ -616,10 +671,6 @@ int batch_contract_rejection_cases() {
     };
 
     int failures = 0;
-    if (!rejects(1, 9, DType::I64)) {
-        std::cerr << "kimi_delta_attention batch update accepted B=9\n";
-        ++failures;
-    }
     if (!rejects(2, 2, DType::I64)) {
         std::cerr << "kimi_delta_attention batch update accepted W=2\n";
         ++failures;
@@ -719,6 +770,11 @@ int main(int argc, char** argv) {
     batch_update({"Kimi Linear ordinary", 32, 1}, {4, 0, 5, 2}, 6, 32401U);
     batch_update({"Kimi K3 ordinary", 96, 1}, {10, 3, 7, 0, 9, 5, 1, 8}, 11, 96801U);
     batch_update({"runtime head count", 5, 1}, {3, 0, 4}, 5, 50301U);
+    std::vector<int> wide(17);
+    for (int row = 0; row < int(wide.size()); ++row) wide[row] = row % 3 ? row : -1;
+    suite.add("kda/batch/expanded",
+              [=] { return batch_update_case({"masked expanded batch", 1, 1}, wide, 20, 17403U); },
+              {{"suite", "concurrency"}});
 
     for (const auto [qheads, vheads] :
          {std::pair{16, 48}, {16, 32}, {96, 96}, {64, 64}, {1, 32}, {5, 15}}) {

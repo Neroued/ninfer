@@ -54,6 +54,33 @@ struct DownEpilogue : Bf16MmaWarpStoreEpilogue {
     }
 };
 
+struct SlicedJoinedEpilogue {
+    static constexpr bool kSwizzleRowStorage = true;
+
+    template <class Output, int Columns>
+    __device__ void apply_row(const Output& output, int row, int begin,
+                              const float (&values)[Columns], int live) const {
+        for (int t = 0; t < live; ++t) output.store(row, begin + t, values[t]);
+    }
+
+    template <class Schedule, class Output, class Tile>
+    __device__ void finish_rows(Output output, Tile tile, int row_begin, int token_begin, int rows,
+                                int tokens) const {
+        constexpr int Pairs = Schedule::kBlockRows / 2;
+        // Distribute the routed FP32 reads across the CTA before the single BF16 rounding.
+        for (int i = threadIdx.x; i < Pairs * Schedule::kBlockTokens; i += Schedule::kThreads) {
+            const int r = i % Pairs * 2, t = i / Pairs;
+            const int row = row_begin + r, token = token_begin + t;
+            if (row + 1 < rows && token < tokens) {
+                const float x     = output.combine(row, token, tile.at(r, t));
+                const float y     = output.combine(row + 1, token, tile.at(r + 1, t));
+                auto* destination = output.destination + std::int64_t(token) * rows + row;
+                *reinterpret_cast<__nv_bfloat162*>(destination) = __floats2bfloat162_rn(x, y);
+            }
+        }
+    }
+};
+
 template <class G, class D, class Output>
 void sliced(const Tensor& x, const SwiGLUWeights& w, Output output, void* storage, float limit,
             cudaStream_t stream) {
@@ -66,7 +93,10 @@ void sliced(const Tensor& x, const SwiGLUWeights& w, Output output, void* storag
     const auto& d = w.down.weight;
     Fp8BlockA16Operands<float> dn{p, (const std::uint8_t*)d.qdata, (const float*)d.scales, d.n, d.k,
                                   t};
-    launch_native_fp8_a16_sliced_k<S<D, 1024>>(dn, output, LinearIdentityEpilogue{}, stream);
+    if constexpr (requires { output.combine(0, 0, 0.F); })
+        launch_native_fp8_a16_sliced_k<S<D, 1024>>(dn, output, SlicedJoinedEpilogue{}, stream);
+    else
+        launch_native_fp8_a16_sliced_k<S<D, 1024>>(dn, output, LinearIdentityEpilogue{}, stream);
 }
 
 template <class G, class D, class Output>
@@ -128,14 +158,46 @@ void scaled_f16(const Tensor& x, const SwiGLUWeights& w, Output output,
     CUDA_CHECK(cudaGetLastError());
 }
 
+template <int Tokens, class Output>
+void scaled_f16_decode(const Tensor& x, const SwiGLUWeights& w, Output output,
+                       const ScaledFp8Storage& storage, int physical, float limit,
+                       cudaStream_t stream) {
+    const int tokens = x.ne[1];
+    auto* values     = static_cast<__half*>(storage.product);
+    using G          = S<NativeFp8A16SlicedKSchedule<32, Tokens, 4, 128, 1>, 4096>;
+    launch_native_fp8_a16_sliced_k<G>(fp8_block_a16_operands(x, w.gate_up.weight),
+                                      ScaledF16Output{values, storage.product_scales},
+                                      ScaledF16SlicedProductEpilogue{{limit}, physical}, stream,
+                                      SwiGluBranchRows<16>{});
+    using D =
+        S<InputGroup<Fp8BlockA16TmaSchedule<32, kScaledF16DecodeDownTokens, 128, 16, 8, 2, 2>, 16>,
+          1024>;
+    const auto& dw = w.down.weight;
+    const ScaledF16BlockOperands down{values,
+                                      static_cast<const std::uint8_t*>(dw.qdata),
+                                      static_cast<const float*>(dw.scales),
+                                      storage.product_scales,
+                                      dw.n,
+                                      dw.k,
+                                      physical};
+    const auto maps       = scaled_f16_block_maps<D>(down);
+    constexpr auto kernel = scaled_f16_block_tma_kernel<D, Output, DownEpilogue>;
+    constexpr int bytes   = fp8_block_a16_tma_bytes<D, DownEpilogue>;
+    common::prepare_shared<bytes, kernel, true>();
+    kernel<<<(4096 / D::kBlockRows) * common::div_up(tokens, D::kBlockTokens), D::kThreads, bytes,
+             stream>>>(maps, down, output, DownEpilogue{{}, tokens});
+    CUDA_CHECK(cudaGetLastError());
+}
+
 template <class Output>
 void run(const Tensor& x, const SwiGLUWeights& weights, Output output, float limit,
          MemoryArena& workspace, cudaStream_t stream) {
-    auto scope         = workspace.scope();
-    const auto profile = swiglu_profile(weights);
-    const int tokens   = x.ne[1];
-    const auto plan    = select_scaled_fp8(profile, tokens);
-    const auto storage = allocate_scaled_fp8(workspace, profile, tokens);
+    auto scope            = workspace.scope();
+    const auto profile    = swiglu_profile(weights);
+    const int tokens      = x.ne[1];
+    constexpr bool joined = requires { output.combine(0, 0, 0.F); };
+    const auto plan       = select_scaled_fp8(profile, tokens, joined);
+    const auto storage    = allocate_scaled_fp8(workspace, profile, tokens, joined);
     switch (plan.kernel) {
     case ScaledFp8Kernel::BlockFloat:
         return sliced<NativeFp8A16SlicedKSchedule<16, 8, 8, 128, 1>,
@@ -145,6 +207,12 @@ void run(const Tensor& x, const SwiGLUWeights& weights, Output output, float lim
         return mma<NativeFp8MmaSchedule<48, 32, 128, 16, 16, 2, 2, 2>,
                    NativeFp8MmaSchedule<32, 32, 128, 16, 16, 2, 2, 2>>(
             x, weights, output, storage.product, limit, stream);
+    case ScaledFp8Kernel::BlockScaledF16Decode:
+        if (scaled_f16_decode_gate_up_tokens(tokens) == 8)
+            return scaled_f16_decode<8>(x, weights, output, storage, plan.storage_tokens(tokens),
+                                        limit, stream);
+        return scaled_f16_decode<16>(x, weights, output, storage, plan.storage_tokens(tokens),
+                                     limit, stream);
     case ScaledFp8Kernel::BlockScaledF16Small:
         return scaled_f16<Fp8BlockA16TmaSchedule<64, 32, 128, 32, 16, 3, 2>,
                           Fp8BlockA16TmaSchedule<64, 32, 128, 32, 16, 3, 2>>(

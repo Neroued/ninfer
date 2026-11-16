@@ -31,6 +31,13 @@ int main() {
     baseline.runtime.prefix_cache.shared_prefix.adopted       = 2;
     baseline.runtime.prefix_cache.shared_prefix.reused_tokens = 256;
     baseline.ranks.resize(1);
+    CommunicationBackendStatistics communication;
+    communication.eager.calls[0]               = 3;
+    communication.graph.calls[0]               = 7;
+    communication.memory.owned_host_bytes      = 4096;
+    communication.memory.registered_host_bytes = 4096;
+    communication.memory.library               = LibraryCommunicationMemory{100, 20, 80};
+    baseline.ranks[0].communication.push_back({4, 2, {communication}});
     baseline.ranks[0].gpu_intervals[0] = {1, 1000, 1000};
     baseline.executions[1].units       = 3;
     baseline.executions[1].rows        = 5;
@@ -42,6 +49,8 @@ int main() {
     Metrics metrics;
     metrics.configure("custom\"model\\name\nline", options, startup, observations.start_seconds());
     EngineSnapshot running = baseline;
+    running.ranks[0].communication[0].backends[0].eager.calls[0] += 2;
+    running.ranks[0].communication[0].backends[0].graph.calls[0] += 4;
     running.executions[1].units += 2;
     running.executions[1].rows += 4;
     running.decode_by_batch[1].observe(
@@ -70,6 +79,20 @@ int main() {
     observations.first_token(1, {.prepare_seconds = 0.05, .elapsed_since_submit_seconds = 0.2});
     const auto live =
         metrics.render(observations.normalize(running), observations.snapshot(), true);
+    check(live.find("ninfer_communication_calls_total{rank=\"0\",node=\"0\",group=\"4\","
+                    "size=\"2\",backend=\"nccl\",path=\"graph\",operation=\"all_reduce\"} 4\n") !=
+              std::string::npos,
+          "communication metrics lost backend identity or retained preparation counters");
+    const auto communication_json = product::observation_json(observations.normalize(running), 0)
+                                        .at("ranks")[0]
+                                        .at("communication")[0]
+                                        .at("backends")[0];
+    check(communication_json.at("backend") == "nccl" &&
+              communication_json.at("eager").at("all_reduce").at("calls") == 2 &&
+              communication_json.at("graph").at("all_reduce").at("calls") == 4 &&
+              communication_json.at("memory").at("owned_host_bytes") == 4096 &&
+              communication_json.at("memory").at("library").at("tracked_device_bytes") == 100,
+          "communication JSON conflated counter deltas with resource capacities");
     check(live.find("ninfer_memory_headroom_bytes{rank=\"0\",node=\"0\"} 512\n") !=
                   std::string::npos &&
               live.find("ninfer_memory_host_reservation_bytes{rank=\"0\",node=\"0\"} 1024\n") !=

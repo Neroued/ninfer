@@ -88,9 +88,10 @@ struct Fixture {
 
     Fixture(int tokens, int batch_size, int max_history, bool padded,
             KvCacheStorage format = KvCacheStorage::BFloat16, bool padded_scales = false,
-            int query_heads = 24)
-        : T(tokens), B(batch_size), q_heads(query_heads), kv_heads(query_heads / 12),
-          history(max_history), table_width((history + 63) / 64), table_stride(table_width),
+            int query_heads = 24, int cache_heads = 0)
+        : T(tokens), B(batch_size), q_heads(query_heads),
+          kv_heads(cache_heads ? cache_heads : query_heads / 12), history(max_history),
+          table_width((history + 63) / 64), table_stride(table_width),
           pages(std::min(table_width, 521) * B + 2), qhost(std::size_t(T) * B * (256 * q_heads)),
           ghost(qhost.size()), positions(T * B), valid(B), selectors(B),
           tables(table_stride * (B + 1)), ids(std::size_t(T) * B * 512), counts(T * B),

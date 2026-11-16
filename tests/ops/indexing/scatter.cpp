@@ -140,7 +140,7 @@ int continuation_case(int width, int batch) {
     cuda_synchronize();
     const auto launch = [&] {
         ops::gather_bf16_batch_columns(h, sel, selected, context.execution_view());
-        ops::scatter(selected, records.view(indices), context.execution_view());
+        ops::scatter(selected, records.view(indices), {}, context.execution_view());
     };
     DecodeGraphDefinition definition;
     DecodeGraphExecutable graph;
@@ -196,7 +196,7 @@ int shared_image_case() {
     CUDA_CHECK(cudaMemcpy(source.data, input.data(), input.size() * 2, cudaMemcpyHostToDevice));
     DeviceBuffer selectors = to_device<std::int64_t>({std::int64_t(3 * layout.image_bytes), 0});
     const Tensor offsets(selectors.span(), DType::I64, {2});
-    ops::scatter(source.slice(1, 0, 2), images.field(destination_field, offsets),
+    ops::scatter(source.slice(1, 0, 2), images.field(destination_field, offsets), {},
                  cuda_environment().default_execution);
     cuda_synchronize();
     std::vector<std::uint16_t> actual(32), preserved(32), expected(32, 0x5a5a);
@@ -216,6 +216,56 @@ int shared_image_case() {
         ops::scatter(source.slice(1, 0, 2), indices, source, cuda_environment().default_execution);
     } catch (const std::invalid_argument&) { rejected = true; }
     if (!rejected) ++failures;
+    return failures;
+}
+
+int masked_state_case(int rows, int batch) {
+    const int slots    = batch + 2;
+    const auto values  = bit_pattern(std::size_t(rows) * batch, 1811U);
+    const auto initial = bit_pattern(std::size_t(rows) * slots, 1813U);
+    auto input = to_device(values), destination = to_device(initial);
+    auto mask    = to_device(std::vector<int>(batch));
+    auto offsets = to_device(std::vector<std::int64_t>(batch));
+    Tensor source(input.span(), DType::BF16, {rows, batch});
+    Tensor output(destination.span(), DType::BF16, {rows, slots});
+    Tensor live(mask.span(), DType::I32, {batch}), selected(offsets.span(), DType::I64, {batch});
+    RecordStateFixture records(output, 1);
+    auto& device = cuda_environment().context;
+    DecodeGraphDefinition definition;
+    DecodeGraphExecutable graph;
+    cuda_synchronize();
+    definition.capture(device.stream(), [&] {
+        ops::scatter(source, records.view(selected), live, device.execution_view());
+    });
+    graph.instantiate(definition);
+    int failures = 0;
+    for (int phase = 0; phase < 2; ++phase) {
+        auto expected = initial;
+        std::vector<int> active(batch);
+        std::vector<std::int64_t> addresses(batch, kInvalidRecordOffset);
+        for (int b = 0; b < batch; ++b) {
+            active[b] = (b + phase) % 3 != 0;
+            if (!active[b]) continue;
+            const int slot = (b + phase) % slots;
+            addresses[b]   = records.byte_offset(slot);
+            std::copy_n(values.begin() + std::size_t(b) * rows, rows,
+                        expected.begin() + std::size_t(slot) * rows);
+        }
+        destination.copy_from_host(initial.data(), destination.size());
+        records.upload();
+        mask.copy_from_host(active.data(), mask.size());
+        offsets.copy_from_host(addresses.data(), offsets.size());
+        cuda_synchronize();
+        graph.launch(device.stream());
+        device.synchronize();
+        records.copy_back();
+        failures +=
+            verify_exact("masked state scatter",
+                         from_device<std::uint16_t>(destination, expected.size()), expected);
+        failures += records.verify_guards("masked state scatter");
+    }
+    failures += verify_exact("masked scatter source preserved",
+                             from_device<std::uint16_t>(input, values.size()), values);
     return failures;
 }
 
@@ -241,6 +291,10 @@ void add_scatter_cases(ninfer::test::OpSuite& suite) {
               {{"execution", "eager"}});
     suite.add("scatter/features/7", [] { return scatter_case(7, {2, 0}, 4); },
               {{"execution", "eager"}});
+    suite.add("scatter/masked_state/b17", [] { return masked_state_case(2560, 17); },
+              {{"execution", "graph"}, {"suite", "concurrency"}});
+    suite.add("scatter/masked_state/b64", [] { return masked_state_case(7, 64); },
+              {{"execution", "graph"}, {"suite", "concurrency"}});
     suite.add("scatter/shared_image", [] { return shared_image_case(); }, {{"execution", "eager"}});
     suite.add("scatter/extract/10240", [] { return extract_case(10240, 6144, 4096, 6); },
               {{"execution", "eager"}});

@@ -1,4 +1,5 @@
 #pragma once
+#include "ops/sampling/kernels/selection.cuh"
 
 #include <type_traits>
 
@@ -12,8 +13,12 @@ __launch_bounds__(S::kSamplerBlock) __global__
     void sample_row_kernel(const __nv_bfloat16* logits, std::int32_t* out,
                            const SamplingConfig* configs, const std::int32_t* logical_positions,
                            std::int32_t purpose, std::int32_t token_domain,
-                           std::int32_t physical_rows) {
-    const int row            = static_cast<int>(blockIdx.x);
+                           std::int32_t physical_rows, const std::int32_t* live) {
+    const int row = static_cast<int>(blockIdx.x);
+    if (live && !live[row]) {
+        if (threadIdx.x == 0) out[row] = 0;
+        return;
+    }
     const std::int64_t base  = static_cast<std::int64_t>(row) * physical_rows;
     const int tid            = threadIdx.x;
     const SamplingConfig cfg = configs[row];
@@ -95,8 +100,9 @@ template <class S, bool WarpTiles = false>
 __launch_bounds__(S::kSamplerBlock) __global__
     void sampling_partial_topk_kernel(const __nv_bfloat16* logits, const SamplingConfig* cfg_ptr,
                                       std::int32_t token_domain, std::int32_t physical_rows,
-                                      Workspace workspace) {
-    const int col            = static_cast<int>(blockIdx.y);
+                                      Workspace workspace, const std::int32_t* live) {
+    const int col = static_cast<int>(blockIdx.y);
+    if (live && !live[col]) return;
     const int partial        = static_cast<int>(blockIdx.x);
     const SamplingConfig cfg = cfg_ptr[col];
     if (partial == 0 && threadIdx.x == 0) { workspace.group_done[col] = 0; }
@@ -170,16 +176,140 @@ __launch_bounds__(S::kSamplerBlock) __global__
     }
 }
 
+template <int Tile>
+__launch_bounds__(256) __global__
+    void sampling_greedy_partial_kernel(const __nv_bfloat16* logits, const SamplingConfig* configs,
+                                        int token_domain, int physical_rows, Workspace workspace,
+                                        const int* live) {
+    const int row = blockIdx.y, partial = blockIdx.x, tid = threadIdx.x;
+    if (live && !live[row]) return;
+    const SamplingConfig cfg = configs[row];
+    if (cfg.temperature > 0.F) return;
+    if (partial == 0 && tid == 0) workspace.group_done[row] = 0;
+    const int start = partial * Tile;
+    const auto base = std::int64_t(row) * physical_rows;
+    if (cfg.presence_penalty == 0.F && cfg.frequency_penalty == 0.F) {
+        using TileKey = ThresholdSelection<256, Tile / 256>;
+        __shared__ unsigned int warp_maxima[8];
+        unsigned int best = 0;
+#pragma unroll
+        for (int i = 0; i < Tile / 256; ++i) {
+            const int local = i * 256 + tid, token = start + local;
+            if (token < token_domain &&
+                (!cfg.mask.words || (cfg.mask.words[token / 32] & (1U << (token % 32)))))
+                best = max(best, sampling_bf16_tile_sort_key<TileKey>(logits[base + token], local));
+        }
+        best = __reduce_max_sync(0xffffffffU, best);
+        if ((tid & 31) == 0) warp_maxima[tid / 32] = best;
+        __syncthreads();
+        if (tid < 32) {
+            best = __reduce_max_sync(0xffffffffU, tid < 8 ? warp_maxima[tid] : 0U);
+            if (tid == 0)
+                workspace.partial_keys[sampling_partial_offset(workspace, row, partial, 0)] =
+                    sampling_expand_bf16_tile_sort_key<TileKey>(best, start);
+        }
+        return;
+    }
+    __shared__ unsigned long long warp_keys[8];
+    unsigned long long best = 0;
+#pragma unroll
+    for (int i = 0; i < Tile / 256; ++i) {
+        const int token = start + i * 256 + tid;
+        if (token < token_domain) {
+            const float score =
+                sampling_adjusted_logit(__bfloat162float(logits[base + token]), token, cfg);
+            best = max(best, static_cast<unsigned long long>(score_id_order_key(score, token)));
+        }
+    }
+    best = block_reduce_max_key(best, warp_keys);
+    if (tid == 0)
+        workspace.partial_keys[sampling_partial_offset(workspace, row, partial, 0)] = best;
+}
+
+template <int Threads, int Items>
+__launch_bounds__(Threads) __global__
+    void sampling_threshold_topk_kernel(const __nv_bfloat16* logits, const SamplingConfig* configs,
+                                        int token_domain, int physical_rows, Workspace workspace,
+                                        const int* live) {
+    const int row = blockIdx.y, partial = blockIdx.x;
+    if (live && !live[row]) return;
+    const SamplingConfig cfg = configs[row];
+    if (!(cfg.temperature > 0.F)) return;
+    if (partial == 0 && threadIdx.x == 0) workspace.group_done[row] = 0;
+    using Selector     = ThresholdSelection<Threads, Items>;
+    using Compact      = ThresholdSelection<Threads, Items, unsigned int>;
+    constexpr int Tile = Threads * Items;
+
+    __shared__ union {
+        typename Selector::Storage wide;
+        typename Compact::Storage compact;
+        SamplingInputTile<Threads, Tile> inputs;
+    } storage;
+
+    __shared__ unsigned int compact_keys[kSamplerCandidateCap];
+    const int start      = partial * Tile;
+    const auto base      = std::int64_t(row) * physical_rows;
+    const bool penalties = cfg.presence_penalty != 0.F || cfg.frequency_penalty != 0.F;
+    storage.inputs.prefetch(logits + base + start,
+                            cfg.token_counts ? cfg.token_counts + start : nullptr,
+                            min(Tile, token_domain - start), penalties);
+    cp_wait<0>();
+    __syncthreads();
+    const int cap = sampling_candidate_cap(cfg, token_domain);
+    auto* result  = workspace.partial_keys + sampling_partial_offset(workspace, row, partial, 0);
+    if (!penalties) {
+        unsigned int keys[Items];
+#pragma unroll
+        for (int i = 0; i < Items; ++i) {
+            const int local = threadIdx.x + i * Threads, token = start + local;
+            keys[i] =
+                token < token_domain &&
+                        (!cfg.mask.words || (cfg.mask.words[token / 32] & (1U << (token % 32))))
+                    ? sampling_bf16_tile_sort_key<Compact>(storage.inputs.logits[local], local)
+                    : 0;
+        }
+        __syncthreads();
+        Compact::select_values(keys, cap, compact_keys, storage.compact);
+        __syncthreads();
+        if (threadIdx.x < cap)
+            result[threadIdx.x] =
+                sampling_expand_bf16_tile_sort_key<Compact>(compact_keys[threadIdx.x], start);
+    } else {
+        unsigned long long keys[Items];
+#pragma unroll
+        for (int i = 0; i < Items; ++i) {
+            const int local = threadIdx.x + i * Threads, token = start + local;
+            keys[i] = 0;
+            if (token < token_domain) {
+                const bool valid =
+                    !cfg.mask.words || (cfg.mask.words[token / 32] & (1U << (token % 32)));
+                const float score =
+                    valid ? sampling_penalized_logit(__bfloat162float(storage.inputs.logits[local]),
+                                                     cfg, storage.inputs.counts[local])
+                          : -CUDART_INF_F;
+                keys[i] = score_id_order_key(score, token);
+            }
+        }
+        __syncthreads();
+        Selector::select_values(keys, cap, result, storage.wide);
+    }
+}
+
 template <class S, bool DirectGreedy = false>
 __launch_bounds__(S::kSamplerGroupBlock) __global__
     void sampling_group_finalize_sample_kernel(std::int32_t* out, const SamplingConfig* cfg_ptr,
                                                const std::int32_t* logical_positions,
                                                std::int32_t purpose, std::int32_t token_domain,
                                                std::int32_t partial_blocks,
-                                               std::int32_t group_count, Workspace workspace) {
-    const int group          = static_cast<int>(blockIdx.x);
-    const int col            = static_cast<int>(blockIdx.y);
-    const int tid            = threadIdx.x;
+                                               std::int32_t group_count, Workspace workspace,
+                                               const std::int32_t* live) {
+    const int group = static_cast<int>(blockIdx.x);
+    const int col   = static_cast<int>(blockIdx.y);
+    const int tid   = threadIdx.x;
+    if (live && !live[col]) {
+        if (group == 0 && tid == 0) out[col] = 0;
+        return;
+    }
     const SamplingConfig cfg = cfg_ptr[col];
     __shared__ typename SamplingGroupSort<S>::TempStorage sort_storage;
     __shared__ float cand_val[kSamplerCandidateCap];
@@ -243,8 +373,8 @@ __launch_bounds__(S::kSamplerGroupBlock) __global__
         best = block_reduce_max_key(best, greedy_warp_keys);
         if (tid == 0) {
             if (cfg.mask.words && !isfinite(score_from_order_key(best))) { asm volatile("trap;"); }
-            const int picked = id_from_order_key(best);
-            out[col]         = picked;
+            const int picked          = id_from_order_key(best);
+            out[col]                  = picked;
             workspace.group_done[col] = 0;
         }
         return;
@@ -322,7 +452,7 @@ __launch_bounds__(S::kSamplerGroupBlock) __global__
                 break;
             }
         }
-        out[col] = picked;
+        out[col]                  = picked;
         workspace.group_done[col] = 0;
     }
 }

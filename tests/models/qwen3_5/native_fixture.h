@@ -130,7 +130,8 @@ public:
         auto worker = std::make_unique<runtime::RankWorker<ObservedTypes>>(std::move(device),
                                                                            std::move(instance));
         executor_   = std::make_unique<runtime::LocalExecutor<ObservedTypes>>(
-            std::move(worker), runtime::SessionEpoch{next_epoch_.fetch_add(1)});
+            std::move(worker), runtime::SessionEpoch{next_epoch_.fetch_add(1)},
+            options.max_concurrency);
     }
 
     [[nodiscard]] DeviceContext& device() noexcept { return *device_; }
@@ -239,8 +240,8 @@ public:
 
     q35::PendingBatch decode(std::span<const q35::SequenceHandle> members,
                              std::span<const runtime::RoundBudget> budgets,
-                             std::span<const bool> constrained = {},
-                             DecisionHandler decision          = {}) {
+                             std::span<const std::uint8_t> constrained = {},
+                             DecisionHandler decision                  = {}) {
         const auto ticket = session_.start_decode(members, budgets, constrained);
         if (!ticket) throw std::logic_error("native decode had no execution capacity");
         return wait<q35::PendingBatch>(*ticket, std::move(decision));
@@ -267,9 +268,8 @@ public:
     }
 
     q35::ControlComplete control(std::span<const q35::SequenceHandle> members,
-                                 std::span<const TokenId> tokens, std::uint32_t stride,
-                                 std::span<const std::optional<std::uint32_t>> splits) {
-        const auto ticket = session_.start_control(members, tokens, stride, splits);
+                                 std::span<const TokenId> tokens, std::uint32_t stride) {
+        const auto ticket = session_.start_control(members, tokens, stride);
         if (!ticket) throw std::logic_error("native control had no execution capacity");
         return wait<q35::ControlComplete>(*ticket);
     }

@@ -44,15 +44,17 @@ void causal_conv1d_silu_split(const Tensor& x, const Tensor& weight, const Tenso
  * `source` selects a BF16 [C,3] field with device I64 [B] arena-relative byte offsets.
  * `snapshots` is contiguous BF16 [C,3,N], and `snapshot_base_slots` is contiguous I32 [B].
  * `valid_columns` is either
- * contiguous I32 [B], with every value in [1,W], or an empty Tensor meaning every row has W valid
- * columns. B=1 accepts every positive W; B=2..8 accepts W=1..16.
+ * contiguous I32 [B], with every value in [0,W], or an empty Tensor meaning every row has W valid
+ * columns. B is positive; B=1 accepts every positive W and B>1 accepts W=1..16; W*B fits I32.
+ * A zero-length row outputs exact BF16 zero without reading source offsets, history, input
+ * values or snapshot bases, and writes no snapshot.
  *
  * Row b starts from the window selected by source.records.byte_offsets[b]. After valid column j,
  * the new window is written to snapshot_base_slots[b]+j. Invalid-tail output columns are exact BF16
  * zero and do not mutate state. The caller reserves the complete [base,base+W) interval for every
- * row; all row reservations are disjoint and no row overwrites another row's source field.
- * Each source field is disjoint from snapshots or exactly aliases one complete [C,3] row in its
- * own reservation; partial overlap is not allowed. Only snapshots are mutated; accessed source
+ * live row; all live reservations are disjoint and no row overwrites another live row's source
+ * field. Each source field is disjoint from snapshots or exactly aliases one complete [C,3] row in
+ * its own reservation; partial overlap is not allowed. Only snapshots are mutated; accessed source
  * fields and snapshots must not overlap x, weight, metadata, or out. Valid byte offsets and
  * cross-row alias relationships are caller promises.
  */

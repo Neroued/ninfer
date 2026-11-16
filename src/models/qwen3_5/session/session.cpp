@@ -5,7 +5,7 @@
 
 namespace ninfer::models::qwen3_5 {
 
-RequestBasePlan::RequestBasePlan(std::shared_ptr<detail::RequestBasePlanImpl> impl) noexcept
+RequestBasePlan::RequestBasePlan(std::shared_ptr<const detail::RequestBasePlanImpl> impl) noexcept
     : impl_(std::move(impl)) {}
 
 RequestBasePlan::RequestBasePlan(RequestBasePlan&&) noexcept = default;
@@ -199,6 +199,10 @@ Session::evaluate_recovery(std::span<const CheckpointHandle> advertised) const {
 
 std::size_t Session::checkpoint_extent() const noexcept { return impl_->checkpoints.size(); }
 
+std::uint64_t Session::checkpoint_catalog_revision() const noexcept {
+    return impl_->checkpoints.revision();
+}
+
 std::vector<runtime::ContextTransferRequirement>
 Session::checkpoint_restore_requirements(CheckpointHandle h) const {
     return impl_->checkpoints.at(h).snapshot.restore_requirements(impl_->directory);
@@ -243,12 +247,22 @@ BindingReservation Session::start_binding(const RequestBasePlan& base, runtime::
     return impl_->start_binding(base, lane, source, resume, kind, tokens);
 }
 
-bool Session::start_capture(SequenceHandle h) { return impl_->start_capture(h); }
+runtime::ContextStart Session::start_capture(SequenceHandle h) { return impl_->start_capture(h); }
 
-std::vector<std::uint32_t> Session::capture_frontiers(SequenceHandle h) const {
+bool Session::retry_capture(SequenceHandle h) { return impl_->retry_capture(h); }
+
+std::vector<CheckpointHandle> Session::share_capture(SequenceHandle h, CheckpointHandle source) {
+    return impl_->share_capture(h, source);
+}
+
+std::vector<std::uint32_t> Session::capture_frontiers(SequenceHandle h, std::uint32_t begin,
+                                                      std::uint32_t end) const {
     std::vector<std::uint32_t> result;
-    for (const auto& point : impl_->requests[impl_->lane(h)].capture_groups)
-        result.push_back(point.frontier);
+    const auto& points = impl_->requests[impl_->lane(h)].capture_groups;
+    for (auto it = std::upper_bound(points.begin(), points.end(), begin,
+                                    [](auto f, const auto& point) { return f < point.frontier; });
+         it != points.end() && it->frontier <= end; ++it)
+        result.push_back(it->frontier);
     return result;
 }
 
@@ -262,8 +276,9 @@ bool Session::capture_is_shared(SequenceHandle h) const {
 bool Session::capture_is_input(SequenceHandle h) const { return impl_->capture_is_input(h); }
 
 std::optional<CapturePreparation>
-Session::prepare_capture(SequenceHandle h, std::span<const CheckpointHandle> host_victims) {
-    return impl_->prepare_capture(h, host_victims);
+Session::prepare_capture(SequenceHandle h, std::span<const CheckpointHandle> victims,
+                         runtime::CaptureStorage storage) {
+    return impl_->prepare_capture(h, victims, storage);
 }
 
 void Session::skip_capture(SequenceHandle h, runtime::CaptureSkip reason) {
@@ -351,14 +366,14 @@ std::optional<runtime::ExecutionTicket> Session::start_replay(SequenceHandle h) 
 
 std::optional<runtime::ExecutionTicket>
 Session::start_decode(std::span<const SequenceHandle> h, std::span<const runtime::RoundBudget> b,
-                      std::span<const bool> c) {
+                      std::span<const std::uint8_t> c) {
     return impl_->start_decode(h, b, c);
 }
 
-std::optional<runtime::ExecutionTicket>
-Session::start_control(std::span<const SequenceHandle> h, std::span<const TokenId> ids,
-                       std::uint32_t stride, std::span<const std::optional<std::uint32_t>> splits) {
-    return impl_->start_control(h, ids, stride, splits);
+std::optional<runtime::ExecutionTicket> Session::start_control(std::span<const SequenceHandle> h,
+                                                               std::span<const TokenId> ids,
+                                                               std::uint32_t stride) {
+    return impl_->start_control(h, ids, stride);
 }
 
 std::optional<runtime::ExecutionTicket> Session::start_score(qwen::PreparedPrompt&& prompt,
@@ -419,8 +434,13 @@ SessionImpl::SessionImpl(std::shared_ptr<const ModelDefinition> definition_in, S
       max_concurrency(plan.max_concurrency), prefill_chunk(plan.prefill_chunk),
       draft_window(plan.draft_window), speculative_backend(plan.speculative_backend),
       context_cache(plan.context_cache), vision_enabled(plan.profile->options.vision),
-      causal_scoring(plan.causal_scoring) {
-    if (!definition || !plan.profile || plan.context.pools.empty())
+      causal_scoring(plan.causal_scoring), sequences(max_concurrency), requests(max_concurrency),
+      lane_epochs(max_concurrency), lane_marks(max_concurrency),
+      recovery_metadata(directory.metadata_budget(), plan.causal_scoring ? 0 : plan.max_concurrency,
+                        1, 1,
+                        PreparedCaptureBacking::cache_bytes(
+                            plan.capacity, plan.causal_scoring ? 0 : plan.max_concurrency)) {
+    if (!definition || !plan.profile || !plan.batch_execution || plan.context.pools.empty())
         throw std::invalid_argument("Session preparation is incomplete");
     checkpoints.configure(Checkpoints::capacity_for_metadata(directory.metadata_budget().limit()),
                           directory.metadata_budget(), &recovery_index);
@@ -429,7 +449,16 @@ SessionImpl::SessionImpl(std::shared_ptr<const ModelDefinition> definition_in, S
         count_builder.prepare(plan.profile->public_tokens);
     }
     releases.reserve(max_concurrency);
+    resident_sequences.reserve(max_concurrency);
     for (std::uint32_t i = 0; i < max_concurrency; ++i) sequences[i].lane = i;
+}
+
+std::uint64_t SessionImpl::next_lane_mark() {
+    if (++lane_mark_generation == 0) {
+        std::fill(lane_marks.begin(), lane_marks.end(), 0);
+        ++lane_mark_generation;
+    }
+    return lane_mark_generation;
 }
 
 SessionImpl::~SessionImpl() {
@@ -443,7 +472,6 @@ void SessionImpl::fail_all_cleanup() noexcept {
             executor().drain();
         } catch (...) {}
     }
-    pending_maintenance_.reset();
     try {
         (void)release_branch_cache();
     } catch (...) { std::terminate(); }

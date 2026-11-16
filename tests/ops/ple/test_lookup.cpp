@@ -289,6 +289,8 @@ void add_ple_lookup_cases(ninfer::test::OpSuite& suite) {
                           "/partition" + std::to_string(partition),
                       [=] { return run(t, b, partition, t % 2); },
                       {{"format", "nf4"}, {"execution", "graph"}});
+    suite.add("ngram_embedding_lookup/t3/b17", [] { return run(3, 17, 3, true); },
+              {{"format", "nf4"}, {"execution", "graph"}, {"suite", "concurrency"}});
     suite.add("ngram_embedding_lookup/wide_hash", [] { return run(3, 1, 0, true, true); },
               {{"format", "nf4"}, {"execution", "graph"}});
     suite.add("ngram_embedding_lookup/combine_words", combine, {{"format", "nf4"}});

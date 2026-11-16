@@ -1,3 +1,4 @@
+#include <climits>
 #include "core/weight.h"
 #include "core/buffer.h"
 #include "ninfer/ops/dynamic_grouped_conv.h"
@@ -60,7 +61,7 @@ Options parse_args(int argc, char** argv) {
                 next("flush MiB"), 1, std::numeric_limits<std::size_t>::max() >> 20);
             options.flush_bytes = mib << 20;
         } else if (!std::strcmp(argv[index], "--help") || !std::strcmp(argv[index], "-h")) {
-            std::printf("usage: %s [--width 2..16] [--k 4096|17408] [--batch 1..8] [--warmup N] "
+            std::printf("usage: %s [--width 2..16] [--k 4096|17408] [--batch B] [--warmup N] "
                         "[--repeat N] "
                         "[--flush-mib N]\n",
                         argv[0]);
@@ -75,35 +76,38 @@ Options parse_args(int argc, char** argv) {
     if (options.input_rows != 0 && options.input_rows != 4096 && options.input_rows != 17408) {
         throw std::invalid_argument("K must be 4096 or 17408");
     }
-    if ((options.width && (options.width < 2 || options.width > 16)) || options.batch_size < 0 ||
-        options.batch_size > 8) {
-        throw std::invalid_argument("batch must be in [1,8]");
+    if ((options.width && (options.width < 2 || options.width > 16)) || options.batch_size < 0) {
+        throw std::invalid_argument("invalid width or batch");
     }
     return options;
 }
 
 void run_profile(std::int32_t input_rows, const Options& options, bench::L2FlushBuffer& flush,
                  CudaExecutionView cuda) {
-    DeviceBuffer input = make_bf16(static_cast<std::size_t>(input_rows) * kMaximumWidth * 8, 101U);
-    DeviceBuffer base  = make_bf16(static_cast<std::size_t>(kHidden) * kTaps * kSides, 103U);
-    DeviceBuffer delta =
-        make_bf16(static_cast<std::size_t>(kGroups) * kTaps * kMaximumWidth * 8, 105U);
-    DeviceBuffer residual = make_bf16(static_cast<std::size_t>(kHidden) * kMaximumWidth * 8, 107U);
+    const int min_width = options.width ? options.width : 2;
+    const int max_width = options.width ? options.width : kMaximumWidth;
+    const int min_batch = options.batch_size ? options.batch_size : 1;
+    const int max_batch = options.batch_size ? options.batch_size : 8;
+    if (std::int64_t(max_width) * max_batch > INT_MAX)
+        throw std::invalid_argument("too many columns");
+    const int max_columns = max_width * max_batch;
+    DeviceBuffer input    = make_bf16(static_cast<std::size_t>(input_rows) * max_columns, 101U);
+    DeviceBuffer base     = make_bf16(static_cast<std::size_t>(kHidden) * kTaps * kSides, 103U);
+    DeviceBuffer delta = make_bf16(static_cast<std::size_t>(kGroups) * kTaps * max_columns, 105U);
+    DeviceBuffer residual = make_bf16(static_cast<std::size_t>(kHidden) * max_columns, 107U);
     SavedBuffer residual_initial(residual);
     const auto restore = [&](CudaExecutionView cuda) { residual_initial.restore(cuda); };
     PackedQuantizedWeight packed =
         make_row_split_weight(QType::Q8_G32_FP16, kHidden, input_rows, input_rows, 501U);
-    const std::size_t capacity =
-        ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(input_rows, 2, 16, 1, 8);
+    const std::size_t capacity = ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
+        input_rows, min_width, max_width, min_batch, max_batch);
     ninfer::DeviceBuffer workspace_storage(ninfer::bench::device_context().device(),
                                            std::max<std::size_t>(capacity, 256));
     MemoryArena workspace(workspace_storage.span());
     Tensor base_kernel(base.span(), DType::BF16, {kHidden, kTaps, kSides});
 
-    for (int width = 2; width <= 16; ++width) {
-        if (options.width && options.width != width) continue;
-        for (std::int32_t batch_size = 1; batch_size <= 8; ++batch_size) {
-            if (options.batch_size != 0 && batch_size != options.batch_size) { continue; }
+    for (int width = min_width; width <= max_width; ++width) {
+        for (std::int32_t batch_size = min_batch; batch_size <= max_batch; ++batch_size) {
             const std::int32_t cols = width * batch_size;
             Tensor x(input.span(), DType::BF16, {input_rows, width, batch_size});
             Tensor finish_delta(delta.span(), DType::BF16, {kGroups, kTaps, width, batch_size});

@@ -45,6 +45,7 @@ The built-in recipes are ordinary Python functions in
 | `qwen3_8_27b_nvfp4` | Imported NVFP4/FP8, FP8 embedding generated from BF16 | `quantized` |
 | `qwen3_8_flash_next` | Q8 main projections, NVIDIA NVFP4 experts, block-FP8 MTP experts, NF4 PLE, BF16 auxiliary projections/Vision | `nvidia` |
 | `glm5next` | NVIDIA NVFP4 Main experts/dense MLP, Q8 KDA and MLA output/shared projections, block-FP8 MTP experts; BF16 Main head, embedding and Vision | None; NVIDIA checkpoint is the primary source |
+| `glm5next_fp4_local` | Native multiplier NVFP4/CSF, MXFP8 and block-FP8 with FP32 scales; retained floating-point parameters | None; NVIDIA FP4 Local checkpoint is the primary source |
 
 These names select conversion choices. Runtime execution is selected from the architecture,
 configuration and actual bindings stored in the artifact. `--name` sets the public model name;
@@ -103,8 +104,10 @@ See the [Qwen4Exp architecture reference](maintainer/qwen4_exp-model.md) for its
 
 ### GLM-5.3-Flash
 
-Use the NVIDIA NVFP4 checkpoint as the primary source. It supplies the configuration, calibrated
-Main weights, remaining floating-point parameters, tokenizer/template and optional components:
+Choose the recipe matching the primary checkpoint. Both recipes preserve that source's configuration
+and frontend resources, and can include Vision, MTP and a separate DFlash2 companion.
+
+For the NVFP4 checkpoint with additional Q8 projections:
 
 ```bash
 python3 -m tools.convert \
@@ -123,6 +126,33 @@ Vision and other BF16 parameters remain BF16; source FP32 KDA controls retain th
 `--ranking` and `--proposal-rows` do not crop the GLM or Flash Next draft vocabulary.
 
 GLM frontend resources come from the primary checkpoint; do not substitute a Qwen template.
+
+For native FP4 Local, including a DFlash2 companion:
+
+```bash
+python3 -m tools.convert \
+  --model /path/to/GLM-5.3-Flash-FP4-Local \
+  --recipe glm5next_fp4_local \
+  --source dflash2=/path/to/GLM-5.3-Flash-DFlash2 \
+  --components text,vision,mtp,dflash2 \
+  --proposal \
+  --name glm5.3-flash \
+  --out out/glm5_3_flash_fp4_local.ninfer
+```
+
+`glm5next_fp4_local` imports multiplier NVFP4, compressed CSF scale planes, MXFP8 and block-FP8
+with FP32 scales in their source representations. CSF stays compressed through artifact storage,
+rank slicing and GPU loading; the production kernels consume it directly. Main NVFP4 uses the
+source activation multipliers with `AllowA4`; MXFP8 uses `AllowA8`. MTP expert weights retain
+their source NVFP4 representation with `A16Only`.
+
+Either recipe accepts `--source dflash2=PATH` with `dflash2` in `--components`. DFlash2's own
+parameters retain the companion's original floating-point representation. Its embedding and full
+head share the current primary model's bindings. `--proposal` derives the optional Q4 head from
+that primary source head; choosing it changes the proposal head, not the DFlash2 decoder.
+
+At runtime, choose `--spec mtp` or `--spec dflash2`; only the selected backend and proposal head are
+loaded. `full` uses the artifact's Main head representation and `optimized` selects its Q4 head.
 After conversion, keep the entry and every part together on both Sparks and use the
 [GLM deployment example](../examples/configs/spark2-glm5_3-flash.toml).
 The [GLM5Next reference](maintainer/glm5next-model.md) records the model's representation choices.
@@ -136,7 +166,8 @@ runs on RTX 5090 and Spark; no inference service is needed.
 Built-in methods size batches by row width to target about 16 MiB of working input or output,
 with alignment where the encoding requires it. One reader prefetches the next source batch while
 the current batch is converted and written. CUDA conversion performs grouped-integer and
-row-FP8 quantization on the GPU; encoded NVFP4/block-FP8 imports retain their original codes/scales.
+row-FP8 quantization on the GPU; encoded imports retain their codes, stored scales and matrix scale
+semantics. Native CSF import streams its compressed planes.
 
 | Option | Default | Behavior |
 |---|---:|---|
@@ -222,21 +253,26 @@ The converter currently writes these formats:
 | `bf16`, `fp32`, `int32` | `cast_direct` | Direct words through the source reader |
 | `q4_g64_fp16`, `q5_g64_fp16`, `q6_g64_fp16`, `q8_g32_fp16` | `grouped_absmax` | Supply a custom method/source if needed |
 | `fp8_e4m3fn_row_bf16` | `fp8_row_maxabs` | `import_encoded` |
-| `fp8_e4m3fn_block128x128_bf16` | None | `import_encoded` |
+| `fp8_e4m3fn_block128x128_bf16`, `fp8_e4m3fn_block128x128_fp32` | None | `import_encoded` |
 | `nvfp4` | `stored_scale_mse` | `import_encoded` |
+| `nvfp4_mul` | None | `import_encoded`, including native CSF planes |
+| `mxfp8` | None | `import_encoded` |
 | `nf4_g16_e4m3fn` | `stored_scale_mse` | Supply encoded words through `TensorOutput` |
 
 `grouped_absmax` stores one FP16 scale per group and signed integer codes. `fp8_row_maxabs` first
 rounds input values to BF16, then produces E4M3FN codes and one BF16 multiplier per row.
-`import_encoded` preserves compatible code and scale words, including NVFP4's matrix weight divisor.
-It does not dequantize and requantize them.
-Rank-three NVFP4 targets select `batched_block_scale_k16_m128x4_v1` explicitly; each matrix owns
-its divisor. Block-FP8 uses `block_scale_m128_k128_v1` for matrices and banks.
+`import_encoded` preserves compatible code and scale words. `nvfp4` uses a matrix divisor;
+`nvfp4_mul` preserves a multiplier. MXFP8 has one UE8M0 multiplier per K32 group; block-FP8 preserves
+the declared BF16 or FP32 scale words. Import does not dequantize and requantize the weights.
+Rank-three divisor NVFP4 targets select `batched_block_scale_k16_m128x4_v1`; native multiplier
+weights can also use `csf_32x2_v1`. Each bank matrix owns its scale domain. Block-FP8 uses
+`block_scale_m128_k128_v1` for matrices and banks.
 
 `stored_scale_mse` computes one FP32 divisor from the complete parent amax, then searches stored
 E4M3FN scales per G16 group using FP64 reconstruction error. NF4 uses the fixed codebook;
-NVFP4 uses E2M1. The method provides no activation calibration. ModelOpt import preserves
-packed codes and scale bytes while converting FP32 global multipliers to stored reciprocals.
+NVFP4 uses E2M1. The method provides no activation calibration. ModelOpt import into `nvfp4`
+converts FP32 global multipliers to stored reciprocals; native `nvfp4_mul` import keeps them as
+multipliers. The recipe selects which numerical representation to preserve.
 
 The exact numeric and packing rules are in [numeric formats](../tools/artifact/formats.py) and
 [storage layouts](../src/core/weight_view.cpp). Source format names alone do not establish
@@ -255,9 +291,10 @@ shares one activation across several projections must respect the intersection o
 permissions. `recipe.use(parameter, input_name, ...)` can set one mathematical input independently;
 the names are available in `parameter.inputs`.
 
-An NVFP4 A4 input requires a positive finite activation divisor. `import_encoded` obtains it from
-the selected source, or a recipe supplies it through
-`recipe.use(..., auxiliaries={"activation_input_divisor": value})`. Shared weights retain separate
+An `nvfp4` A4 input requires a positive finite `activation_input_divisor`; `nvfp4_mul` uses
+`activation_input_multiplier`. `import_encoded` obtains the appropriate value from the selected
+source, or the recipe supplies it through `recipe.use(..., auxiliaries={...})`. Expert-indexed
+calibration can reference a range in a shared auxiliary tensor. Shared weights retain separate
 Use records; sharing weights does not share calibration implicitly.
 
 ## Fused parents and logical projections
@@ -293,11 +330,14 @@ For explicit organization, `recipe.group([names...])` concatenates compatible se
 given order, `recipe.separate(names)` disables automatic grouping for those parameters, and
 `recipe.share(parameter, target)` binds equal-shaped parameters to the same physical data.
 Explicit groups must be disjoint and use unsplit selections with matching format, layout, method
-and method parameters. NVFP4 parents also require a common weight divisor. Automatic grouping is
-limited to built-in methods; custom methods can request explicit groups.
+and method parameters. NVFP4 parents also require a common matrix scale with the format's
+multiplication or division semantics. Automatic grouping is limited to built-in methods;
+custom methods can request explicit groups.
 
-Grouping chooses storage. Model execution code chooses the supported fused implementation. The
-loader uploads the stored representation, without repacking an inconvenient arrangement.
+Grouping chooses storage. Model execution code chooses the supported fused implementation.
+Loading can materialize declared rank slices while preserving represented values; execution consumes
+those prepared views. Slicing and backing ownership are described in
+[weights and loading](maintainer/weights-and-loading.md).
 
 ## Read another source
 
@@ -353,7 +393,8 @@ Use this as an override. The NumPy file must already follow the logical row/colu
 unfamiliar quantized source, its reader performs the corresponding decoding before returning
 values. To preserve existing compatible encoded words, also provide `encoded_format` (a format
 name or metadata-only resolver), `read_encoded` returning `EncodedRows`, and the format's required
-divisor accessors. Their definitions are in
+weight-scale and activation-scale accessors. CSF sources additionally expose their native planes.
+Their definitions are in
 [`sources/logical.py`](../tools/convert/sources/logical.py).
 
 For a logical bank spread across several physical parents, `recipe.parent(parts, shape=...,

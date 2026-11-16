@@ -11,6 +11,8 @@ enum class Instance {
     D2048,
     D5120,
     D10240,
+    D20480Block512,
+    D20480Block1024,
     Warp,
     WarpPrefetch,
     CtaMedium,
@@ -23,5 +25,6 @@ enum class Instance {
 };
 
 void launch(const Tensor& x, const Tensor& weight, const Tensor* gate, float eps, Epilogue kind,
-            Tensor& out, Operands operands, Instance instance, cudaStream_t stream);
+            Tensor& out, Tensor* inverse, Operands operands, Instance instance,
+            cudaStream_t stream);
 } // namespace ninfer::ops::detail::rmsnorm

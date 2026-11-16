@@ -10,6 +10,8 @@
 namespace ninfer::ops::detail {
 namespace {
 
+__global__ void context_attention_idle_kernel() {}
+
 template <int Tokens, class Launch>
 void dispatch_token_case(Launch&& launch) {
     constexpr int Warps = (Tokens + 3) / 4;
@@ -85,6 +87,10 @@ void launch_context_attention(const Tensor& q, const Tensor& query_k, const Tens
                     static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data),
                     static_cast<__nv_bfloat16*>(out.data));
             CUDA_CHECK(cudaGetLastError());
+            if (plan.keep_reduce_slot) {
+                context_attention_idle_kernel<<<1, 1, 0, stream>>>();
+                CUDA_CHECK(cudaGetLastError());
+            }
             return;
         }
 
@@ -113,7 +119,7 @@ void launch_context_attention(const Tensor& q, const Tensor& query_k, const Tens
                     static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data),
                     static_cast<__nv_bfloat16*>(out.data));
             CUDA_CHECK(cudaGetLastError());
-            const dim3 reduce_grid(kContextQueryQHeads, Tokens, q.ne[3]);
+            const dim3 reduce_grid(kContextQueryQHeads * Tokens / 4, 1, q.ne[3]);
             context_attention_reduce_kernel<Tokens, KeyBlock><<<reduce_grid, 128, 0, stream>>>(
                 static_cast<const __nv_bfloat16*>(partial_acc.data),
                 static_cast<const float*>(partial_m.data),

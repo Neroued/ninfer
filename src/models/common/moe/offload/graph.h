@@ -10,7 +10,7 @@
 
 namespace ninfer::models::moe::offload {
 
-[[nodiscard]] GraphPlan graph_plan(const Plan&, ExpertBankId, std::int32_t tokens);
+[[nodiscard]] GraphPlan graph_plan(const Plan&, ExpertBankId, TokenGeometry);
 
 // Subset bodies share exact-T bindings across attention context profiles.
 struct SubsetGraphDefinitions {
@@ -19,12 +19,13 @@ struct SubsetGraphDefinitions {
 
 struct LayerGraphDefinition {
     GraphPlan plan;
+    ops::MoeTokenValidity validity;
     DecodeGraphDefinition mixer, steady, feature;
     std::shared_ptr<SubsetGraphDefinitions> moe;
 };
 
 void capture_layer(LayerGraphDefinition&, Resources&, ExpertBankId, CudaExecutionView,
-                   std::int32_t tokens, const std::function<void()>& mixer,
+                   TokenGeometry, const std::function<void()>& mixer,
                    const std::function<void(const PreparedExecution&)>& gpu_moe,
                    const std::function<void()>& feature = {});
 
@@ -56,6 +57,7 @@ private:
     [[nodiscard]] bool advance();
     std::optional<Invocation> pending_;
     GraphPlan plan_;
+    ops::MoeTokenValidity validity_;
     DecodeGraphExecutable mixer_, steady_, feature_;
     std::array<DecodeGraphExecutable, 3> subsets_;
 };

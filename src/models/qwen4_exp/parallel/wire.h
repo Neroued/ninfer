@@ -18,6 +18,7 @@ struct RankLoadRequest {
     artifact::ArtifactId artifact;
     RankPlan rank;
     EngineOptions options;
+    BatchExecutionSpec batches;
     std::size_t host_reservation_bytes = 0;
     bool control_owner                 = false;
 };

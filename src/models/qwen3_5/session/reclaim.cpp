@@ -1,4 +1,5 @@
 #include "models/qwen3_5/session/internal.h"
+#include "models/common/qwen/recovery_value.h"
 
 #include "models/common/context/physical_reclaim.h"
 
@@ -438,3 +439,184 @@ runtime::ContextStart SessionImpl::submit_demotion(const ContextDemotion& quote,
 }
 
 } // namespace ninfer::models::qwen3_5::detail
+
+namespace ninfer::models::qwen3_5 {
+
+context::MetadataBudget& Session::recovery_budget() const {
+    return impl_->recovery_metadata.budget();
+}
+
+std::vector<Session::RecoveryPoint>
+Session::recovery_points(const ContextReleaseSet& removed_device,
+                         std::span<const CheckpointHandle> selected) const {
+    const auto& p = *impl_;
+    std::vector<RecoveryPoint> result;
+    for (std::uint32_t i = 0; i < p.checkpoints.size(); ++i) {
+        const auto handle = p.checkpoints.handle(i);
+        if (!p.checkpoints.valid(handle)) continue;
+        if (!selected.empty() &&
+            std::find(selected.begin(), selected.end(), handle) == selected.end())
+            continue;
+        const auto& record = p.checkpoints.at(handle);
+        runtime::RecoveryDescription value;
+        value.restores.reserve(1);
+        value.identity = record.recovery_identity_cache.lock();
+        if (!value.identity) {
+            value.identity = std::shared_ptr<qwen::RecoveryIdentity>(new qwen::RecoveryIdentity(
+                recovery_budget(), &p, record.snapshot.identity_owner(), record.recovery_identity(),
+                p.prefill_chunk, p.plan.vision_max_features));
+            record.recovery_identity_cache = value.identity;
+        }
+        auto transfers = record.snapshot.restore_requirements(p.directory, removed_device);
+        const auto state_records = p.state_store->allocations(record.continuation().image);
+        const bool device = std::any_of(state_records.begin(), state_records.end(), [&](auto r) {
+            return r.domain.memory == context::ContextMemory::Device &&
+                   std::find(removed_device.records.begin(), removed_device.records.end(), r) ==
+                       removed_device.records.end();
+        });
+        if (device && is_masked_draft_backend(p.speculative_backend))
+            transfers.push_back(context::state_transfer_requirement(
+                p.plan.dflash_local_transfer.value(),
+                runtime::ContextTransferDirection::DeviceToDevice));
+        value.restores.push_back(
+            {{}, std::move(transfers), record.snapshot.replay_requirements(p.directory)});
+        result.push_back(
+            {handle, context::recovery_description(recovery_budget(), std::move(value))});
+    }
+    return result;
+}
+
+std::shared_ptr<const runtime::RecoveryDescription>
+Session::recovery_target(const RequestBasePlan& base, std::uint32_t f, runtime::PlacementId target,
+                         runtime::CaptureStorage storage) const {
+    if (target.value || !base.impl_ || !base.impl_->capture_backing || !f ||
+        f > base.summary().prompt_tokens)
+        throw std::invalid_argument("invalid Qwen recovery target");
+    const auto& backing = base.impl_->capture_backing;
+    runtime::RecoveryDescription value;
+    value.identity = std::make_shared<qwen::RecoveryIdentity>(
+        recovery_budget(), impl_.get(), backing,
+        qwen::RecoveryIdentityView{f, base.impl_->prefix_identity_tag, backing->ledger,
+                                   backing->prefix_identity, backing->digests, backing.get()},
+        impl_->prefill_chunk, impl_->plan.vision_max_features);
+    value.restores.push_back({target, {}});
+    if (storage == runtime::CaptureStorage::Host)
+        value.restores.back().transfers.push_back(context::state_transfer_requirement(
+            impl_->plan.state_transfer, runtime::ContextTransferDirection::HostToDevice));
+    else if (is_masked_draft_backend(impl_->speculative_backend))
+        value.restores.back().transfers.push_back(
+            context::state_transfer_requirement(impl_->plan.dflash_local_transfer.value(),
+                                                runtime::ContextTransferDirection::DeviceToDevice));
+    return context::recovery_description(recovery_budget(), std::move(value));
+}
+
+runtime::PauseCostQuote Session::pause_cost(SequenceHandle h, const PauseOption& option,
+                                            std::span<const CheckpointHandle> sources,
+                                            std::span<const CheckpointHandle> victims) const {
+    const auto& p       = *impl_;
+    const auto lane     = p.lane(h);
+    const auto& s       = p.sequences[lane];
+    const auto& control = p.requests[lane];
+    const auto end  = control.lifecycle == detail::Lifecycle::Prefilling ? control.prefill->cursor
+                      : control.lifecycle == detail::Lifecycle::Replaying
+                          ? control.replay_target
+                          : s.continuation.metadata.execution_frontier;
+    const auto work = [&](std::uint32_t begin) {
+        return qwen::recovery_work(s.prefix_identity.vision_items(), begin, end, p.prefill_chunk,
+                                   p.plan.vision_max_features);
+    };
+    runtime::PauseCostQuote quote;
+    const auto released = p.checkpoint_release_set(victims);
+    if (!released) throw std::invalid_argument("invalid pause victims");
+    quote.work = context::maintenance_work(p.directory.assess(option.demand, *released));
+    if (option.action.kind == runtime::PauseKind::ReleaseAndReplay) {
+        quote.recovery.push_back({work(0), {}});
+        const qwen::RecoveryIdentityView target{end,
+                                                control.base->prefix_identity_tag,
+                                                s.ledger,
+                                                s.prefix_identity,
+                                                s.prefix_digests,
+                                                nullptr};
+        for (auto source : sources) {
+            if (!p.valid_checkpoint(source)) continue;
+            const auto& c = p.checkpoint(source);
+            if (!qwen::recovery_prefix_matches(c.recovery_identity(), target)) continue;
+            const auto points   = recovery_points({}, {&source, 1});
+            const auto& restore = points.front().description->restores.front();
+            auto transfers      = restore.transfers;
+            if (c.frontier() < end)
+                transfers.insert(transfers.end(), restore.replay_transfers.begin(),
+                                 restore.replay_transfers.end());
+            quote.recovery.push_back({work(c.frontier()), std::move(transfers)});
+        }
+    } else {
+        quote.unpriced_work = is_masked_draft_backend(p.speculative_backend) &&
+                              s.continuation.metadata.dflash_context_frontier <
+                                  s.continuation.metadata.execution_frontier;
+        runtime::RecoveryRouteWork route{work(s.continuation.metadata.text_kv_valid), {}};
+        if (option.host_write) {
+            auto copies = context::host_write_work(p.directory, *option.host_write);
+            quote.work.insert(quote.work.end(), copies.begin(), copies.end());
+            std::vector<context::HistoryId> histories{s.kv->text.handle()};
+            if (s.kv->backend) histories.push_back(s.kv->backend->handle());
+            route.transfers = context::pause_restore_work(p.directory, s.continuation.image,
+                                                          histories, option.released);
+        }
+        const auto state_records = p.state_store->allocations(s.continuation.image);
+        const bool device = std::any_of(state_records.begin(), state_records.end(), [&](auto r) {
+            return r.domain.memory == context::ContextMemory::Device &&
+                   std::find(option.released.records.begin(), option.released.records.end(), r) ==
+                       option.released.records.end();
+        });
+        if (device && is_masked_draft_backend(p.speculative_backend) &&
+            !p.state_store->can_recover_exclusively(
+                s.continuation.image,
+                context::retired_state_references(p.checkpoints, s.continuation.image, victims), 1,
+                s.pending_write))
+            route.transfers.push_back(context::state_transfer_requirement(
+                p.plan.dflash_local_transfer.value(),
+                runtime::ContextTransferDirection::DeviceToDevice));
+        quote.recovery.push_back(std::move(route));
+    }
+    return quote;
+}
+
+runtime::CaptureCostQuote Session::capture_cost(SequenceHandle h, std::uint32_t frontier,
+                                                runtime::CaptureStorage storage) const {
+    const auto& p       = *impl_;
+    const auto& request = p.requests[p.lane(h)];
+    const bool host =
+        storage == runtime::CaptureStorage::Host ||
+        (storage == runtime::CaptureStorage::Automatic && request.capture_reservation &&
+         request.capture_reservation->host.has_value());
+    runtime::CaptureCostQuote quote;
+    quote.retained =
+        recovery_target(RequestBasePlan(request.base), frontier, {},
+                        host ? runtime::CaptureStorage::Host : runtime::CaptureStorage::Device);
+    quote.work = quote.retained->restores.front().transfers;
+    if (host)
+        for (auto& transfer : quote.work)
+            transfer.direction = runtime::ContextTransferDirection::DeviceToHost;
+    return quote;
+}
+
+std::vector<runtime::ContextTransferRequirement>
+Session::maintenance_work(const ContextAssessment& assessment) const {
+    return context::maintenance_work(assessment);
+}
+
+std::vector<runtime::ContextTransferRequirement>
+Session::demotion_work(const ContextDemotion& plan,
+                       std::span<const CheckpointHandle> victims) const {
+    if (!plan.impl || plan.impl->owner != impl_.get())
+        throw std::invalid_argument("demotion quote belongs to another session");
+    auto work           = context::demotion_work(impl_->directory, plan.released);
+    const auto released = impl_->checkpoint_release_set(victims);
+    if (!released) throw std::invalid_argument("invalid demotion victims");
+    auto moves = context::maintenance_work(
+        impl_->directory.assess(host_demand(demotion_host_requirements(plan)), *released));
+    work.insert(work.end(), moves.begin(), moves.end());
+    return work;
+}
+
+} // namespace ninfer::models::qwen3_5

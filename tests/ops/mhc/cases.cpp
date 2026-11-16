@@ -66,10 +66,11 @@ int verify(const Fixture& f, const std::string& label) {
             continue;
         }
         const auto check_pre = [&](const PreReference& expected, const char* suffix,
-                                   const ReductionCriterion& coefficient_criterion) {
+                                   const ReductionCriterion& coefficient_criterion,
+                                   const ReductionCriterion& block_criterion) {
             int errors = verify_reduction(label + suffix + " block",
                                           std::span(actual.data() + std::size_t(m) * D, D),
-                                          expected.u, kBf16);
+                                          expected.u, block_criterion);
             errors += verify_reduction(label + suffix + " q", std::span(q.data() + m * S, S),
                                        expected.q, coefficient_criterion);
             errors +=
@@ -78,11 +79,12 @@ int verify(const Fixture& f, const std::string& label) {
             return errors;
         };
         failed += check_pre(pre_reference(f, x), " formula",
-                            f.form == Form::PostPre ? kFusedCoefficients : kCoefficients);
+                            f.form == Form::PostPre ? kFusedCoefficients : kCoefficients,
+                            f.form == Form::PostPre ? kFusedBlock : kBf16);
         if (f.form == Form::PostPre)
             failed +=
                 check_pre(pre_reference(f, std::span(residual.data() + std::size_t(m) * K, K)),
-                          " published BF16 seam", kCoefficients);
+                          " published BF16 seam", kCoefficients, kBf16);
     }
     return failed;
 }
@@ -120,7 +122,10 @@ int run(Form form, int m, Pattern pattern, bool alias, bool captured, CudaExecut
 }
 } // namespace
 
+void add_tap_cases(OpSuite& suite);
+
 void add_cases(OpSuite& suite) {
+    add_tap_cases(suite);
     for (auto form : {Form::Pre, Form::Post, Form::ExpandPre, Form::PostPre, Form::PostMeanNorm}) {
         auto add = [&](int m, Pattern pattern, bool alias = false, bool graph = false) {
             const auto id = std::string(name(form)) + "/m" + std::to_string(m) + "/pattern" +

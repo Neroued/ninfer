@@ -1,5 +1,7 @@
 #include "models/qwen4_exp/state/state_image.h"
 #include "models/qwen4_exp/state/kv_cache.h"
+#include "models/qwen4_exp/program/buffers.h"
+#include "models/qwen4_exp/work.h"
 #include "core/buffer.h"
 #include "core/transfer.h"
 #include "artifact/fixture.h"
@@ -12,6 +14,23 @@ using namespace ninfer;
 using test::artifact_fixture::require;
 namespace q4 = models::qwen4_exp;
 
+void binding_contract() {
+    q4::WorkContract contract{};
+    contract.shape.max_concurrency = 17;
+    contract.shape.max_context     = 128;
+    contract.vocabulary = contract.public_tokens = 32;
+    q4::ContextWork context;
+    for (std::uint32_t lane = 0; lane < 17; ++lane) context.releases.push_back({{lane}, 1});
+    context.bindings.push_back({.member = {{1, 1}, {{3}, 2}}});
+    contract.validate({{}, context}, runtime::FrameKind::Context);
+    context.bindings.push_back({.member = {{2, 1}, {{4}, 2}}});
+    bool rejected = false;
+    try {
+        contract.validate({{}, context}, runtime::FrameKind::Context);
+    } catch (const std::invalid_argument&) { rejected = true; }
+    require(rejected, "one Context work accepted multiple bindings into its single counts staging");
+}
+
 q4::Config config(bool mtp) {
     q4::Config c{};
     c.text.hidden     = 2560;
@@ -23,6 +42,65 @@ q4::Config config(bool mtp) {
     c.text.qsa_layers = 12;
     c.mtp             = mtp;
     return c;
+}
+
+void controls() {
+    for (const bool mtp : {false, true}) {
+        EngineOptions options;
+        options.max_concurrency = 128;
+        options.speculative     = {mtp ? SpeculativeBackend::Mtp : SpeculativeBackend::None,
+                               mtp ? 3U : 0U};
+        const auto c = config(mtp);
+        LayoutBuilder builder;
+        const auto backing =
+            q4::plan_buffers(builder, c, options, 1024, 128, c.text.gdn, 128, 2, true);
+        HostBuffer host(backing.host_region.bytes);
+        auto view = backing;
+        for (const std::uint32_t rows : {1U, 9U, 10U, 64U, 128U, 1U}) {
+            q4::select_buffer_rows(view, backing, rows);
+            const auto& b   = view.batch;
+            const auto bind = [&](const TensorRegion& r) { (void)r.bind(host.span()); };
+            for (const auto* r : std::initializer_list<const TensorRegion*>{
+                     &view.anchors, &view.decode.positions, &view.decode.rope_positions,
+                     &b.live_rows, &b.valid_columns, &b.source_offsets, &b.destination_offsets,
+                     &b.main_tables, &b.base_positions, &b.record_offsets, &b.raw_tail,
+                     &b.raw_tail_offsets, &b.count_slots, &b.sampling_positions,
+                     &view.commit_destination_offsets, &b.accepted_columns, &b.count_columns})
+                bind(*r);
+            bind(*view.sampling);
+            require(b.live_rows.shape[0] == int(rows) && b.source_offsets.shape[0] == int(rows) &&
+                        view.ingress.offset + view.ingress.bytes <= view.commit_ingress.offset &&
+                        view.commit_ingress.offset + view.commit_ingress.bytes <=
+                            backing.commit_ingress.offset + backing.commit_ingress.bytes,
+                    "compact controls overlap or exceed their backing");
+            require(view.sampled_ids->shape[1] == int(rows) &&
+                        view.sampled_ids->region.offset + view.sampled_ids->region.bytes <=
+                            view.output_counts->region.offset &&
+                        view.output_counts->region.offset + view.output_counts->region.bytes <=
+                            backing.output_counts->region.offset +
+                                backing.output_counts->region.bytes,
+                    "compact results exceed their backing");
+            if (rows == 1)
+                require(view.ingress.bytes < backing.ingress.bytes / 4,
+                        "single-row controls still transfer resident capacity");
+            if (!mtp) continue;
+            for (const auto& step : view.mtp->draft_steps) {
+                bind(step.live_rows);
+                bind(step.source_offsets);
+                bind(step.record_offsets);
+            }
+            const auto history = q4::history_control_view(backing.mtp->history, 3, rows);
+            bind(history.ids);
+            bind(history.rope_positions);
+            bind(history.source_offsets);
+            bind(history.record_offsets);
+            require(history.ids.shape[0] == int(3 * rows) &&
+                        history.ingress.offset + history.ingress.bytes <=
+                            backing.mtp->history.ingress.offset +
+                                backing.mtp->history.ingress.bytes,
+                    "compact history exceeds its backing");
+        }
+    }
 }
 
 void image(DeviceContext& device, bool mtp) {
@@ -84,7 +162,7 @@ void image(DeviceContext& device, bool mtp) {
     ops::qsa_tail_extract(before,
                           {Tensor(raw.span(), DType::BF16, {128, 1, 1}),
                            Tensor(rope.span(), DType::I32, {3, 1, 1}), scalar(2), scalar(4)},
-                          scalar(3), after, device.execution_view());
+                          scalar(3), after, {}, device.execution_view());
 
     auto ple_before = state.ple(selected_row(0)), ple_after = state.ple(selected_row(1));
     std::vector<std::uint16_t> history(10240 * 9), record(10240, 0x4321);
@@ -94,7 +172,7 @@ void image(DeviceContext& device, bool mtp) {
     DeviceBuffer n(device.device(), record.size() * 2);
     n.copy_from_host(record.data(), n.size());
     ops::ple_state_extract(ple_before, {Tensor(n.span(), DType::BF16, {10240, 1, 1}), scalar(4)},
-                           scalar(3), ple_after, device.execution_view());
+                           scalar(3), ple_after, {}, device.execution_view());
     device.synchronize();
     std::vector<std::uint16_t> result(old_keys.size());
     CUDA_CHECK(cudaMemcpy(result.data(), after.raw_keys.tensor(destination).data, result.size() * 2,
@@ -155,10 +233,16 @@ void cache(DeviceContext& device, KvCacheStorage storage, std::uint32_t layers,
 }
 } // namespace
 
-int main() {
-    int count = 0;
-    if (cudaGetDeviceCount(&count) != cudaSuccess || !count) return 77;
+int main(int argc, char** argv) {
     try {
+        controls();
+        binding_contract();
+        if (argc == 2 && std::string_view(argv[1]) == "--host") {
+            std::cout << "Qwen4Exp control layouts passed\n";
+            return 0;
+        }
+        int count = 0;
+        if (cudaGetDeviceCount(&count) != cudaSuccess || !count) return 77;
         DeviceContext device;
         image(device, false);
         image(device, true);

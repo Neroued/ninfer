@@ -228,12 +228,14 @@ int main(int argc, char** argv) {
         auto definition     = q4::read_definition(reader, models::load_options(options));
         auto frontend       = q4::create_frontend(*definition, options);
         const auto parallel = q4::plan_parallel(*definition, deployment);
+        const auto batches =
+            models::make_batch_execution_spec(options.max_concurrency, 1, options.use_cuda_graph);
         std::vector<wire::Bytes> payloads;
         for (const auto& rank : parallel.ranks) {
             wire::Encoder out;
             const auto node = parallel.topology.rank(rank.rank).node;
             q4::encode_rank_load(
-                out, {definition->artifact_id(), rank, options,
+                out, {definition->artifact_id(), rank, options, batches,
                       node == deployment.coordinator_node ? options.media_live_bytes : 0,
                       node == deployment.coordinator_node});
             payloads.push_back(std::move(out).take());
@@ -268,7 +270,8 @@ int main(int argc, char** argv) {
         rt::activate_execution_group(*group, prepared, std::chrono::seconds(30));
         std::vector<RankSnapshot> initial;
         for (const auto& d : descriptions) initial.push_back(d.observation);
-        Executor executor(std::move(group), plan.capacity, std::move(codec), std::move(initial));
+        Executor executor(std::move(group), plan.capacity, std::move(codec),
+                          options.max_concurrency, std::move(initial));
         executor.bind_to_current_thread();
         contexts(executor, plan.session);
         require(executor.observations().size() == descriptions.size(),

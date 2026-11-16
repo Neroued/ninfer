@@ -10,6 +10,7 @@ struct ExecutionShape {
     KvCacheVectorFormat index_format;
     EnginePurpose purpose;
     bool context_cache, gpu_timing;
+    SpeculativeBackend speculative               = SpeculativeBackend::None;
     bool operator==(const ExecutionShape&) const = default;
 };
 

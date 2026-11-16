@@ -35,7 +35,8 @@ struct RouterLogitsOutput {
 } // namespace
 
 void moe_sigmoid::launch(const Tensor& x, const Weight& w, const Tensor& bias, ExpertRoutes& routes,
-                         const SigmoidRouteProfile& profile, float* scores, cudaStream_t stream) {
+                         const SigmoidRouteProfile& profile, float* scores,
+                         moe_cuda::TokenValidity validity, cudaStream_t stream) {
     const auto p = bf16_a16_operands(x, w);
     const RouterLogitsOutput out{scores};
     const LinearIdentityEpilogue epi{};
@@ -60,7 +61,7 @@ void moe_sigmoid::launch(const Tensor& x, const Weight& w, const Tensor& bias, E
             <<<(p.tokens + Warps - 1) / Warps, Warps * 32, 0, stream>>>(
                 scores, static_cast<const float*>(bias.data), static_cast<int*>(routes.ids.data),
                 static_cast<float*>(routes.coefficients.data), p.tokens, profile.scaling_factor,
-                profile.normalization_epsilon);
+                profile.normalization_epsilon, validity);
     };
     if (p.tokens < 512)
         select.template operator()<4>();

@@ -167,7 +167,7 @@ struct Fixture {
     Fixture(int tokens, int rows, int axes, int aliases = 0, int layout = 0, int capacity = 0,
             KvCacheStorage kv_storage = KvCacheStorage::BFloat16, int heads = 2)
         : T(tokens), B(rows), A(axes), alias(aliases), R(capacity ? capacity : tokens + 4),
-          pages_per_row((tokens + 126) / 64), kv_heads(heads), query_heads(12 * heads),
+          pages_per_row((tokens + 126) / 64), kv_heads(heads), query_heads(heads == 1 ? 12 : 24),
           storage(kv_storage), encoding(cache_encoding(storage)),
           q(DType::BF16, {256, query_heads, T, B}), k(DType::BF16, {256, kv_heads, T, B}),
           v(DType::BF16, {256, kv_heads, T, B}), iq(DType::BF16, {128, 4, T, B}),

@@ -23,7 +23,13 @@ RankPlan rank_plan(const ModelDefinition& definition, std::uint32_t size, std::u
     p.vocabulary          = partition_range(c.vocabulary, size, rank);
     p.dense_intermediate  = partition_range(c.dense_intermediate, size, rank);
     p.shared_intermediate = partition_range(dimension(c.moe.shared_intermediate()), size, rank);
-    const auto experts    = partition_range(c.moe.experts, ep_size, ep_size == 1 ? 0 : rank);
+    if (const auto& draft = definition.config().draft) {
+        p.draft = {partition_range(c.hidden, size, rank),
+                   partition_range(draft->attention.num_attention_heads, size, rank),
+                   partition_range(draft->attention.num_key_value_heads, size, rank),
+                   partition_range(draft->intermediate_size, size, rank)};
+    }
+    const auto experts = partition_range(c.moe.experts, ep_size, ep_size == 1 ? 0 : rank);
     p.experts.resize(definition.expert_banks().size());
     for (auto& bank : p.experts) {
         bank.ids.resize(experts.size);
@@ -33,7 +39,8 @@ RankPlan rank_plan(const ModelDefinition& definition, std::uint32_t size, std::u
     }
     if (size == 1) return p;
 
-    const auto rows = [&](std::initializer_list<std::pair<WeightId, bool>> weights) {
+    const auto rows =
+        [&](std::initializer_list<std::pair<WeightId, bool>> weights) -> ParameterAssembly& {
         ParameterAssembly a;
         std::uint64_t n = 0, k = 0;
         for (const auto& [id, split] : weights) {
@@ -47,6 +54,7 @@ RankPlan rank_plan(const ModelDefinition& definition, std::uint32_t size, std::u
         }
         a.shape = {n, k};
         p.assemblies.push_back(std::move(a));
+        return p.assemblies.back();
     };
     const auto columns = [&](WeightId id) {
         const auto& shape = definition.parameter(id).shape;
@@ -91,6 +99,22 @@ RankPlan rank_plan(const ModelDefinition& definition, std::uint32_t size, std::u
     if (w.mtp) {
         dense(w.mtp->moe.shared);
         rows({{w.mtp->head, true}});
+    }
+    if (w.draft) {
+        rows({{w.draft->feature_projection, true}});
+        for (const auto& layer : w.draft->layers) {
+            const auto& a    = layer.attention;
+            auto& projection = rows({{a.key, true}, {a.value, true}, {a.query, true}});
+            auto key         = projection.bindings[0];
+            auto value       = projection.bindings[1];
+            key.parameter    = a.context_key;
+            value.parameter  = a.context_value;
+            projection.bindings.push_back(std::move(key));
+            projection.bindings.push_back(std::move(value));
+            columns(a.output);
+            dense(layer.mlp);
+        }
+        rows({{w.draft->output_head, true}});
     }
     return p;
 }

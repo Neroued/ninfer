@@ -80,7 +80,7 @@ template <class S>
 __device__ __forceinline__ void produce(Shared<S>& tile, const Maps& maps,
                                         common::Nvfp4MultiplierMatrix weight, int physical_row,
                                         int row0, int begin, int rotation, int sequence) {
-    const int tid = threadIdx.x, warp = tid / 32, lane = tid & 31;
+    const int tid = threadIdx.x, warp = tid / 32;
     const auto rows = S::gate ? make_uint4(row0, row0 + S::intermediate, 0, 0)
                               : make_uint4(row0, row0 + 32, 0, 0);
     if constexpr (S::csf) {
@@ -97,7 +97,7 @@ __device__ __forceinline__ void produce(Shared<S>& tile, const Maps& maps,
             const bool scale_pair = S::step == 256 || (kt & 1) == 0;
             const unsigned bytes =
                 (64 + S::columns) * S::code_bytes + (scale_pair ? S::columns * 16 : 0);
-            common::cta_mbarrier_arrive_expect_tx(&tile.full[stage], bytes);
+            common::cta_mbarrier_expect_tx(&tile.full[stage], bytes);
             common::tma_load_2d(tile.weights[stage], &maps.weights, physical * S::code_bytes,
                                 physical_row, &tile.full[stage]);
             if constexpr (S::gate)
@@ -170,7 +170,7 @@ __device__ __forceinline__ void produce(Shared<S>& tile, const Maps& maps,
             }
         }
         __syncwarp();
-        if (!lane) common::cta_mbarrier_arrive(&tile.full[stage]);
+        common::cta_mbarrier_arrive(&tile.full[stage]);
     }
     // Neither warp may overwrite the bases until both have decoded the final
     // tile of this expert. Consumers no longer access the compressed metadata.
@@ -226,7 +226,8 @@ __device__ __forceinline__ void consume(Shared<S>& tile, int columns, float (&ac
                 }
             }
         }
-        if (!lane) common::cta_mbarrier_arrive(&tile.empty[stage]);
+        // Every consumer releases its shared reads before the producer can reuse the stage.
+        common::cta_mbarrier_arrive(&tile.empty[stage]);
     }
 }
 
@@ -246,8 +247,8 @@ __global__ __launch_bounds__(S::threads, S::min_blocks) void contract(
     if (!tid) {
 #pragma unroll
         for (int stage = 0; stage < S::stages; ++stage) {
-            common::cta_mbarrier_init(&tile.full[stage], 1 + S::producer_warps);
-            common::cta_mbarrier_init(&tile.empty[stage], S::consumer_warps);
+            common::cta_mbarrier_init(&tile.full[stage], S::producer_threads);
+            common::cta_mbarrier_init(&tile.empty[stage], S::consumer_threads);
         }
         common::cta_mbarrier_fence_init();
     }
@@ -337,9 +338,8 @@ __global__ __launch_bounds__(S::threads, S::min_blocks) void contract(
                     }
                 }
             }
-            // K/stages is even for all supported matrices: full/empty parity returns
-            // to its initial value. Producers may start the next task while consumers
-            // finish their epilogue; stage ownership protects every shared operand.
+            // Sequence carries stage parity across tasks. Producers can prepare the next
+            // task during the consumer epilogue; empty barriers protect operand reuse.
             ++sequence;
         }
     };

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "models/load_options.h"
+#include "models/common/dflash/config.h"
 
 #include <cstdint>
 #include <limits>
@@ -101,6 +102,7 @@ struct Config {
     TextConfig text;
     std::optional<VisionConfig> vision;
     bool mtp = false;
+    std::optional<dflash::Config> draft;
 };
 
 [[nodiscard]] Config parse_config(const artifact::Directory&, const LoadOptions&);

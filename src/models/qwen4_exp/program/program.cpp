@@ -29,7 +29,9 @@ RankProgramImpl::RankProgramImpl(const execution::Parameters& p, ExecutionPlan p
     : parameters(p), device(d), cuda(d.execution_view()),
       resources(p, std::move(plan), d, observer), ple_inputs(d), ple_ready(d), draft_copied(d),
       draft_output(resources.plan.pinned_draft_bytes), shape(resources.plan.shape),
-      prefill_timer(d), gpu_timer(d, shape.gpu_timing), compute_done(d), context_done(d) {
+      prefill_timer(d), gpu_timer(d, shape.gpu_timing), compute_done(d), context_done(d),
+      bindings(shape.max_concurrency), input_rows(shape.max_concurrency),
+      mtp_rows(shape.max_concurrency), valid_rows(shape.max_concurrency) {
     if (binding.group) parallel.emplace(binding);
     if (parameters.profile->local.size != (parallel ? parallel->size() : 1))
         throw std::logic_error("Qwen4Exp Program communication differs from its weight partition");
@@ -63,7 +65,8 @@ void RankProgramImpl::validate_work(const Work& work, runtime::FrameKind kind) c
                  parameters.profile->public_tokens,
                  bool(parameters.mtp),
                  bool(parameters.vision),
-                 parameters.profile->control_token_limit}
+                 parameters.profile->control_token_limit,
+                 resources.plan.batches}
         .validate(work, kind);
     const auto check_resident = [&](const runtime::ExecutionMember& member) {
         const auto& resident = bindings[member.residency.lane.value];
@@ -80,24 +83,29 @@ void RankProgramImpl::validate_work(const Work& work, runtime::FrameKind kind) c
         forward && forward->prefetch)
         check_resident(forward->prefetch->member);
     if (const auto* context = std::get_if<ContextWork>(&work.operation)) {
-        std::array<bool, kMaximumConcurrency> released{};
+        std::vector<std::uint32_t> released;
+        released.reserve(context->releases.size());
         for (const auto residency : context->releases) {
             const auto lane = residency.lane.value;
             if (!bindings[lane] || bindings[lane]->member.residency != residency)
                 throw std::logic_error("Qwen4Exp release refers to a stale resident");
-            released[lane] = true;
+            released.push_back(lane);
             if (compute)
                 for (const auto& row : work_rows(compute->request.work))
                     if (row.member.residency == residency)
                         throw std::logic_error("Qwen4Exp resident still has live compute");
         }
+        std::sort(released.begin(), released.end());
+        const auto is_released = [&](std::uint32_t lane) {
+            return std::binary_search(released.begin(), released.end(), lane);
+        };
         for (const auto& resident : context->bindings) {
             const auto lane = resident.member.residency.lane.value;
-            if ((bindings[lane] && !released[lane]) ||
+            if ((bindings[lane] && !is_released(lane)) ||
                 (bindings[lane] && bindings[lane]->member.residency == resident.member.residency))
                 throw std::logic_error("Qwen4Exp residency is already installed");
             for (std::size_t i = 0; i < bindings.size(); ++i)
-                if (bindings[i] && !released[i] &&
+                if (bindings[i] && !is_released(i) &&
                     bindings[i]->member.sequence == resident.member.sequence)
                     throw std::logic_error("Qwen4Exp sequence is already resident");
         }
@@ -114,7 +122,7 @@ void RankProgramImpl::validate_decision(runtime::ExecutionTicket ticket,
         compute->phase == ComputePhase::Retiring)
         throw std::logic_error("Qwen4Exp decision does not match the active execution");
     const auto& frame = *compute;
-    std::array<std::uint32_t, kMaximumConcurrency> positions{};
+    std::vector<std::uint32_t> positions(frame.rows.size());
     for (std::size_t b = 0; b < frame.rows.size(); ++b)
         if (frame.rows[b].constrained)
             positions[b] = frame.verify ? frame.verify->extents[b] + 1 : 1;
@@ -140,7 +148,8 @@ void RankProgramImpl::prepare_commit(runtime::ExecutionTicket ticket, const Comm
                  parameters.profile->public_tokens,
                  bool(parameters.mtp),
                  bool(parameters.vision),
-                 parameters.profile->control_token_limit}
+                 parameters.profile->control_token_limit,
+                 resources.plan.batches}
         .validate_commit(frame.request.work, frame.result.rows, commit);
     for (const auto& row : commit.rows)
         check_selectors(row.states.at(parameters.profile->local.rank), resources.states->storage());

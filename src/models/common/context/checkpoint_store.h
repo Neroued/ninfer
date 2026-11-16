@@ -164,6 +164,14 @@ public:
 
     [[nodiscard]] std::size_t size() const noexcept { return slots_ ? slots_->size() : 0; }
 
+    // Tail segments may have retired while stable slot IDs retain their high-water size.
+    [[nodiscard]] std::size_t metadata_extent() const noexcept {
+        auto extent = size();
+        while (extent && !slots_->is_allocated(static_cast<std::uint32_t>(extent - 1)))
+            extent = (extent - 1) / 256 * 256;
+        return extent;
+    }
+
     [[nodiscard]] std::size_t capacity() const noexcept { return slots_ ? slots_->limit() : 0; }
 
     [[nodiscard]] std::size_t allocated_metadata_bytes() const noexcept {
@@ -188,7 +196,13 @@ public:
         for (std::uint32_t i = 0; i < size(); ++i) {
             if (!slots_->is_allocated(i)) continue;
             auto& candidate = slot(i);
-            if (!candidate.value && !candidate.reserved) return reserve_slot(i);
+            if (!candidate.value && !candidate.reserved) {
+                const auto extent = metadata_extent();
+                if (index_ && index_->metadata_requirement(extent) > budget_->available())
+                    return {};
+                if (index_) index_->reserve_metadata(extent);
+                return reserve_slot(i);
+            }
         }
         auto index = static_cast<std::uint32_t>(size());
         for (std::uint32_t first = 0; first < size(); first += 256)
@@ -196,8 +210,8 @@ public:
                 index = first;
                 break;
             }
-        const auto target =
-            std::max<std::size_t>(size(), std::min(capacity(), std::size_t(index / 256 + 1) * 256));
+        const auto target = std::max<std::size_t>(
+            metadata_extent(), std::min(capacity(), std::size_t(index / 256 + 1) * 256));
         const auto index_bytes = index_ ? index_->metadata_requirement(target) : 0;
         if (index == capacity() || slots_->ensure_bytes(index) + index_bytes > budget_->available())
             return std::nullopt;
@@ -295,6 +309,7 @@ public:
                 if (slot(i).pins) std::terminate();
             slots_->release_segment(first);
         }
+        if (index_) index_->trim_metadata(0);
     }
 private:
     CheckpointHandle reserve_slot(std::uint32_t index) {
@@ -312,6 +327,7 @@ private:
         for (auto i = first; i < end; ++i)
             if (slot(i).value || slot(i).reserved || slot(i).pins) return;
         slots_->release_segment(first);
+        if (index_) index_->trim_metadata(metadata_extent());
     }
 
     Slot& slot(std::size_t index) {

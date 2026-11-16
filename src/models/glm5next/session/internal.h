@@ -7,6 +7,7 @@
 #include "models/glm5next/state/identity.h"
 
 #include <deque>
+#include <unordered_map>
 
 namespace ninfer::models::glm5next::detail {
 using Image        = context::StateId;
@@ -41,6 +42,8 @@ struct Checkpoint {
     runtime::CheckpointOrigin origin = runtime::CheckpointOrigin::Semantic;
     SharedCandidateEvidence evidence = SharedCandidateEvidence::None;
 
+    mutable std::weak_ptr<const runtime::RecoveryIdentity> recovery_identity_cache;
+
     [[nodiscard]] std::uint32_t frontier() const {
         return snapshot.continuation().metadata.main_frontier;
     }
@@ -59,6 +62,7 @@ struct CaptureReservation {
     context::StateDirectory* states;
     Checkpoints* checkpoints;
     Image destination;
+    std::shared_ptr<const Identity> identity;
     std::vector<std::pair<CheckpointHandle, runtime::CheckpointRole>> records;
     ~CaptureReservation();
 };
@@ -79,8 +83,11 @@ struct Sequence {
     std::size_t next_capture         = 0;
     std::vector<CapturePoint> captures;
     std::uint32_t last_saved = 0, last_intermediate_attempt = 0;
+    std::optional<std::uint32_t> retry_frontier;
     std::unique_ptr<CaptureReservation> capture;
-    bool capture_pending = false;
+    bool capture_pending          = false;
+    std::uint64_t membership_mark = 0;
+    bool computing                = false;
     SpeculativeStats speculative;
 };
 
@@ -175,7 +182,7 @@ struct ContextOperation {
 };
 
 struct ComputeTransaction {
-    enum class Kind { Prefill, Replay, Ordinary, Mtp, Control, Score };
+    enum class Kind { Prefill, Replay, Ordinary, Speculative, Control, Score };
 
     Kind kind;
     context::ContextTransaction context;
@@ -183,7 +190,6 @@ struct ComputeTransaction {
     std::vector<SequenceHandle> members;
     std::vector<WorkRow> rows;
     std::vector<std::uint32_t> draft_extents;
-    std::vector<std::optional<std::uint32_t>> splits;
     std::optional<ComputeResult> result;
     ExecutionSample observed_result;
     std::vector<runtime::CommitDecision> decisions;
@@ -290,12 +296,26 @@ public:
     std::unique_ptr<context::ContextDirectory> directory_owner;
     context::ContextDirectory& directory;
     std::vector<runtime::PlacementId> placements;
-    mutable context::RecoveryIndex<> recovery_index{directory.metadata_budget()};
+    context::RecoveryMetadata recovery_metadata;
+    mutable context::RecoveryIndex<> recovery_index{directory.metadata_budget(),
+                                                    &recovery_metadata};
     Checkpoints checkpoints;
     context::MetadataAccount count_storage{directory.metadata_budget()};
     TokenCountBuilder count_builder;
-    std::array<std::unique_ptr<Sequence>, kMaximumConcurrency> sequences;
-    std::array<std::uint64_t, kMaximumConcurrency> epochs{};
+    std::vector<std::unique_ptr<Sequence>> sequences;
+    std::unordered_map<std::uint64_t, Sequence*> resident_sequences;
+    std::uint64_t membership_clock = 0;
+
+    std::uint64_t next_membership_mark() {
+        if (!++membership_clock) {
+            for (auto& s : sequences)
+                if (s) s->membership_mark = 0;
+            ++membership_clock;
+        }
+        return membership_clock;
+    }
+
+    std::vector<std::uint64_t> epochs;
     std::vector<runtime::KvPoolDescriptor> pools;
     std::unique_ptr<ContextOperation> operation;
     std::optional<ContextAssessment> pending_maintenance;
@@ -312,8 +332,12 @@ public:
 
 [[nodiscard]] std::vector<runtime::ContextTransferRequirement>
 conversion_requirements(const SessionPlan&, const Snapshot&, std::uint32_t to);
+[[nodiscard]] std::vector<runtime::ContextTransferRequirement>
+conversion_requirements(const SessionPlan&, std::uint32_t from, std::uint32_t to,
+                        std::span<const std::uint32_t> frontiers);
 
-[[nodiscard]] std::shared_ptr<const Identity> capture_identity(const Sequence&);
+[[nodiscard]] std::shared_ptr<const Identity> capture_identity(const Sequence&,
+                                                               context::MetadataBudget&);
 [[nodiscard]] PrefixShortlistKey key(const Identity&, std::uint32_t);
 
 } // namespace ninfer::models::glm5next::detail

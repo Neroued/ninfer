@@ -180,7 +180,7 @@ PreparedExecution prepare_execution(const Parameters& parameters, PartitionView 
 }
 
 void enqueue_gpu(const Tensor& hidden, const PreparedExecution& call, Tensor& output,
-                 MemoryArena& workspace, GpuSubmission submission,
+                 ops::MoeTokenValidity validity, MemoryArena& workspace, GpuSubmission submission,
                  const ops::MoeExecutionHints& hints) {
     const auto& p        = call.parameters;
     const auto execution = call.execution.cuda;
@@ -192,7 +192,8 @@ void enqueue_gpu(const Tensor& hidden, const PreparedExecution& call, Tensor& ou
     if (hidden.ne[1] != call.tokens)
         throw std::invalid_argument("MoE prepared token count differs from input");
     if (call.partition.gpu_kind == Subset::All) {
-        moe::execute(hidden, p, call.bank, call.epilogue, output, workspace, execution, hints);
+        moe::execute(hidden, p, call.bank, call.epilogue, output, validity, workspace, execution,
+                     hints);
         return;
     }
     auto scope = workspace.scope();
@@ -205,8 +206,8 @@ void enqueue_gpu(const Tensor& hidden, const PreparedExecution& call, Tensor& ou
     const auto transfer      = parallel_copy ? host.transfer : execution;
     const ops::RouteProfile route{p.profile.routed.ffn.hidden, p.profile.routed.experts,
                                   p.profile.routed.top_k};
-    ops::topk_softmax_route(hidden, route, p.control, frame.device_routes, frame.shared, scratch,
-                            execution);
+    ops::topk_softmax_route(hidden, route, p.control, frame.device_routes, frame.shared, validity,
+                            scratch, execution);
     if (parallel_copy) {
         host.route_ready.record(execution.stream());
         host.route_ready.wait(transfer.stream());
@@ -229,11 +230,10 @@ bool compute_cpu(const PreparedExecution& call) {
     const auto* mask  = static_cast<const std::int32_t*>(call.partition.host_mask.data);
     const auto kind   = call.partition.gpu_kind;
     if (kind == Subset::All) return false;
-    const auto assignments = std::size_t(p.profile.routed.top_k) * call.tokens;
-    const auto cpu_assignments =
-        kind == Subset::None
-            ? assignments
-            : std::count_if(ids, ids + assignments, [&](auto id) { return mask[id] == 0; });
+    const auto assignments     = std::size_t(p.profile.routed.top_k) * call.tokens;
+    const auto cpu_assignments = std::count_if(ids, ids + assignments, [&](auto id) {
+        return id >= 0 && (kind == Subset::None || mask[id] == 0);
+    });
     if (!cpu_assignments) return false;
     const auto& host = *call.execution.host;
     auto scope       = host.workspace.scope();
@@ -245,7 +245,8 @@ bool compute_cpu(const PreparedExecution& call) {
     return true;
 }
 
-void enqueue_finish(const PreparedExecution& call, Tensor& output, bool cpu_work) {
+void enqueue_finish(const PreparedExecution& call, Tensor& output, ops::MoeTokenValidity validity,
+                    bool cpu_work) {
     if (call.partition.gpu_kind == Subset::All) return;
     const auto& frame      = call.frame;
     const auto execution   = call.execution.cuda;
@@ -261,10 +262,12 @@ void enqueue_finish(const PreparedExecution& call, Tensor& output, bool cpu_work
             host.partial_ready.wait(execution.stream());
         }
         const std::array contributions{frame.gpu_partial, frame.device_cpu_partial};
-        ops::sum_contributions(contributions, residual, output, execution);
+        ops::sum_contributions(contributions, residual, output, validity.valid_columns,
+                               validity.tokens_per_row, execution);
     } else {
         const std::array contributions{frame.gpu_partial};
-        ops::sum_contributions(contributions, residual, output, execution);
+        ops::sum_contributions(contributions, residual, output, validity.valid_columns,
+                               validity.tokens_per_row, execution);
     }
 }
 
@@ -273,11 +276,12 @@ void enqueue_discard(const PreparedExecution& call) {
         call.execution.host->host_ready.wait(call.execution.cuda.stream());
 }
 
-std::optional<bool> try_complete(const PreparedExecution& call, Tensor& output) {
+std::optional<bool> try_complete(const PreparedExecution& call, Tensor& output,
+                                 ops::MoeTokenValidity validity) {
     if (call.partition.gpu_kind == Subset::All) return false;
     if (!call.execution.host->host_ready.ready()) return std::nullopt;
     const bool cpu_work = compute_cpu(call);
-    enqueue_finish(call, output, cpu_work);
+    enqueue_finish(call, output, validity, cpu_work);
     return cpu_work;
 }
 

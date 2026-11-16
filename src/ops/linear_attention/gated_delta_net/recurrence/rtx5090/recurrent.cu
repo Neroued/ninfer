@@ -4,6 +4,7 @@
 #include "core/device.h"
 #include "ops/common/host/operands.h"
 #include <cuda_bf16.h>
+#include <algorithm>
 #include <cstdint>
 
 namespace ninfer::ops::detail::gated_delta_net {
@@ -29,13 +30,13 @@ template <bool NormalizeInputs>
 void launch_recurrent_batch_update_fixed(const Tensor& q, const Tensor& k, const Tensor& v,
                                          const Tensor& g, const Tensor& beta, float scale,
                                          ConstStateFieldView source_state,
-                                         StateFieldView destination_state, Tensor& out,
+                                         StateFieldView destination_state,
+                                         const Tensor& valid_columns, Tensor& out,
                                          cudaStream_t stream) {
     const auto heads = HeadMap::of(q.ne[1], v.ne[1]);
-    const dim3 grid(static_cast<unsigned>(v.ne[1]), static_cast<unsigned>(q.ne[3]),
-                    static_cast<unsigned>(kStateDim / kBlockDv));
+    dim3 grid(static_cast<unsigned>(v.ne[1]), 1, static_cast<unsigned>(kStateDim / kBlockDv));
     const dim3 block(common::kWarpSize, kNumWarps, 1);
-    const BatchUpdateAccess access{
+    BatchUpdateAccess access{
         static_cast<const __nv_bfloat16*>(q.data),
         static_cast<const __nv_bfloat16*>(k.data),
         static_cast<const __nv_bfloat16*>(v.data),
@@ -45,11 +46,16 @@ void launch_recurrent_batch_update_fixed(const Tensor& q, const Tensor& k, const
         common::operand::state_field_base<float>(destination_state),
         static_cast<const std::int64_t*>(source_state.records.byte_offsets.data),
         static_cast<const std::int64_t*>(destination_state.records.byte_offsets.data),
+        static_cast<const std::int32_t*>(valid_columns.data),
         static_cast<__nv_bfloat16*>(out.data),
         heads,
         scale,
     };
-    recurrent_batch_update_kernel<NormalizeInputs><<<grid, block, 0, stream>>>(access);
+    for (std::int64_t begin = 0; begin < q.ne[3]; begin += 65535) {
+        access.batch_begin = static_cast<int>(begin);
+        grid.y             = static_cast<unsigned>(std::min<std::int64_t>(65535, q.ne[3] - begin));
+        recurrent_batch_update_kernel<NormalizeInputs><<<grid, block, 0, stream>>>(access);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -71,14 +77,14 @@ void launch_recurrent_inout(const Tensor& q, const Tensor& k, const Tensor& v, c
 void launch_recurrent_batch_update(const Tensor& q, const Tensor& k, const Tensor& v,
                                    const Tensor& g, const Tensor& beta, float scale,
                                    bool normalize_qk, ConstStateFieldView source_state,
-                                   StateFieldView destination_state, Tensor& out,
-                                   cudaStream_t stream) {
+                                   StateFieldView destination_state, const Tensor& valid_columns,
+                                   Tensor& out, cudaStream_t stream) {
     if (normalize_qk) {
         launch_recurrent_batch_update_fixed<true>(q, k, v, g, beta, scale, source_state,
-                                                  destination_state, out, stream);
+                                                  destination_state, valid_columns, out, stream);
     } else {
         launch_recurrent_batch_update_fixed<false>(q, k, v, g, beta, scale, source_state,
-                                                   destination_state, out, stream);
+                                                   destination_state, valid_columns, out, stream);
     }
 }
 

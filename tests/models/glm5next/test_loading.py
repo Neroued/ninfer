@@ -11,7 +11,7 @@ from safetensors.torch import load_file
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT))
 
-from tests.convert.glm5next_fixture import build_checkpoint
+from tests.convert.glm5next_fixture import build_checkpoint, build_draft_checkpoint
 from tools.convert.glm5next import build_model
 from tools.convert.official_recipes import glm5next
 from tools.convert.pipeline import convert
@@ -62,8 +62,14 @@ def main() -> int:
     with tempfile.TemporaryDirectory(dir=temporary_root) as temporary:
         directory = Path(temporary)
         source_path = directory / "source"
-        with build_checkpoint(source_path) as source:
-            model = build_model(source, components=("text", "mtp", "vision"))
+        with build_checkpoint(source_path) as source, build_draft_checkpoint(
+            directory / "draft", source.config["text_config"]
+        ) as draft:
+            model = build_model(
+                source,
+                components=("text", "mtp", "vision", "dflash2"),
+                companions={"dflash2": draft},
+            )
             recipe = Recipe(model)
             glm5next(model, recipe, {"base": source})
             add_official_proposal(recipe)

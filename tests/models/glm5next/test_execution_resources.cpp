@@ -17,7 +17,8 @@ void require(bool value, const char* message) {
 // Storage geometry without model weights or arithmetic admission. Workspace is a separate
 // contract qualified by Op tests and the real startup check.
 glm::ExecutionPlan storage_plan(unsigned rank, bool mtp, KvCacheStorage storage,
-                                KvCacheVectorFormat index_format) {
+                                KvCacheVectorFormat index_format, bool dflash = false,
+                                unsigned concurrency = 3) {
     auto profile           = std::make_shared<glm::execution::ModelProfile>();
     auto& c                = profile->config.text;
     c.hidden               = 4096;
@@ -33,15 +34,32 @@ glm::ExecutionPlan storage_plan(unsigned rank, bool mtp, KvCacheStorage storage,
         rank, 2, {rank * 32, 32}, {rank * 77440, 77440}, {rank * 6144, 6144}, {rank * 1024, 1024}};
     profile->config.mtp = mtp;
     if (mtp) profile->mtp.emplace();
+    if (dflash) {
+        auto& config                     = profile->config.draft.emplace();
+        config.num_hidden_layers         = 5;
+        config.target_layer_ids          = {5, 14, 24, 33, 42};
+        config.dflash2                   = models::dflash::DFlash2Config{2, 16, 256, 16};
+        profile->draft.emplace().context = {4096, 128, 4, 2048, QType::BF16, 1e-5F, 10000.F};
+    }
     glm::ExecutionPlan p;
     p.profile = std::move(profile);
-    p.shape   = {129,  3,    128, mtp ? 3U : 0U, storage, index_format, EnginePurpose::Generation,
-                 true, false};
-    p.state   = glm::plan_state(*p.profile);
+    p.shape   = {
+        129,  concurrency, 128, mtp ? 3U : 0U, storage, index_format, EnginePurpose::Generation,
+        true, false};
+    p.shape.speculative = mtp ? SpeculativeBackend::Mtp : SpeculativeBackend::None;
+    if (dflash) {
+        p.shape.speculative  = SpeculativeBackend::DFlash2;
+        p.shape.draft_tokens = 7;
+    }
+    p.batches = std::make_shared<const models::BatchExecutionPlan>(
+        models::make_batch_execution_spec(concurrency, 2, true));
+    p.state = glm::plan_state(*p.profile);
     LayoutBuilder b;
-    p.main = glm::plan_cache(b, c.mla, 11, 129, 3, glm::latent_storage(storage), index_format);
+    p.main =
+        glm::plan_cache(b, c.mla, 11, 129, concurrency, glm::latent_storage(storage), index_format);
     if (mtp)
-        p.mtp = glm::plan_cache(b, c.mla, 1, 129, 3, glm::latent_storage(storage), index_format);
+        p.mtp = glm::plan_cache(b, c.mla, 1, 129, concurrency, glm::latent_storage(storage),
+                                index_format);
     p.frame            = glm::plan_frame(b, *p.profile, p.shape);
     p.fixed_bytes      = b.finish(256);
     p.mapping_elements = p.main.tables.page_offsets.region.bytes / 8;
@@ -75,6 +93,7 @@ struct Fixture {
             p.capacity = capacities[rank];
             descriptions.push_back({rank,
                                     p.shape,
+                                    p.batches->spec(),
                                     glm::describe_state(p.state),
                                     glm::describe_context(p),
                                     {},
@@ -162,6 +181,74 @@ void host() {
             }
 }
 
+void dflash_storage() {
+    const auto ordinary =
+        storage_plan(0, false, KvCacheStorage::BFloat16, KvCacheVectorFormat::BFloat16);
+    std::array plans{
+        storage_plan(0, false, KvCacheStorage::BFloat16, KvCacheVectorFormat::BFloat16, true),
+        storage_plan(1, false, KvCacheStorage::BFloat16, KvCacheVectorFormat::BFloat16, true)};
+    std::array placement{glm::describe_state(plans[0].state), glm::describe_state(plans[1].state)};
+    constexpr std::size_t cyclic_bytes = 5ULL * 2048 * 4 * 128 * 4;
+    for (const auto& plan : plans) {
+        require(plan.state.common.image_bytes == ordinary.state.common.image_bytes + cyclic_bytes &&
+                    plan.state.owner.image_bytes == ordinary.state.owner.image_bytes + cyclic_bytes,
+                "DFlash history was not included in both State placement variants");
+        require(!plan.mtp && plan.frame.speculative && plan.frame.dflash && plan.frame.kda_records,
+                "DFlash requires verify records and cyclic State, without MTP history");
+        const auto& s = plan.state.draft.value();
+        require(s.capacity == 2048 && s.num_kv_heads == 4 && s.layers == 5 &&
+                    s.group.bytes == cyclic_bytes,
+                "DFlash cyclic layout does not cover the local head shard");
+        require(placement[plan.profile->local.rank].draft_context == s.group,
+                "control-side State copy region differs from execution backing");
+        require(plan.frame.dflash->features.shape[0] == 20480,
+                "conditioning does not preserve all five post-residual features");
+    }
+    const auto copy = glm::state_conversion(placement, 0, 1);
+    require(copy.size() == 3, "attention relocation changed rank-local State ownership");
+    for (unsigned rank = 0; rank < 2; ++rank)
+        require(copy[rank].source_rank == rank && copy[rank].destination_rank == rank &&
+                    copy[rank].bytes == placement[rank].common.bytes,
+                "attention relocation omitted or moved a DFlash head shard");
+    require(copy[2].bytes == ordinary.state.owner_fields.bytes,
+            "owner-tail migration included TP-local cyclic history");
+}
+
+void capacity_views() {
+    const auto p =
+        storage_plan(0, true, KvCacheStorage::BFloat16, KvCacheVectorFormat::BFloat16, false, 256);
+    auto view                  = p.frame;
+    const auto records         = view.main_records;
+    const auto backing         = view.host_ingress;
+    const auto initial_ingress = view.ingress.bytes;
+    glm::reshape_frame_controls(view, {20, 6}, p.shape.draft_tokens + 1);
+    require(view.rows.live_rows.shape[0] == 20 && view.decode.valid_columns.shape[0] == 20 &&
+                view.attention.live_rows.shape[0] == 6 && view.attention.from_gather.shape[0] == 20,
+            "physical frame confused global and attention capacities");
+    require(view.ingress.bytes < initial_ingress && view.host_ingress == backing &&
+                view.main_records.raw_keys.region == records.raw_keys.region,
+            "frame view changed its backing or retained maximum-capacity ingress");
+    const auto sampling = view.sampling->region;
+    const auto extents  = view.speculative->extents.region;
+    const auto output   = view.result_egress;
+    glm::reshape_frame_controls(view, {20, 20}, p.shape.draft_tokens + 1);
+    require(view.sampling->region == sampling && view.speculative->extents.region == extents &&
+                view.result_egress == output,
+            "attention geometry changed global decision addresses");
+    const auto draft_step =
+        view.mtp->draft_steps[2].ids.region.offset - view.speculative->drafts.region.offset;
+    require(draft_step == 20 * sizeof(TokenId),
+            "draft history retained allocation-capacity stride");
+    auto keys          = records.raw_keys;
+    keys.region.offset = 0;
+    HostBuffer memory(keys.region.bytes);
+    const auto raw   = keys.bind(memory.span());
+    const auto small = raw.slice(2, 0, 6);
+    require(small.ne[2] == 6 && small.nb[3] == raw.nb[3] &&
+                small.nb[3] == 128ULL * 4 * 256 * sizeof(std::uint16_t),
+            "small local Kpool record view changed allocated layer stride");
+}
+
 void gpu() {
     DeviceContext device;
     Fixture f(true);
@@ -207,9 +294,11 @@ void gpu() {
 int main(int argc, char** argv) {
     try {
         require(argc == 2, "usage: glm-resource-test --host|--gpu");
-        if (std::string_view(argv[1]) == "--host")
+        if (std::string_view(argv[1]) == "--host") {
             host();
-        else {
+            dflash_storage();
+            capacity_views();
+        } else {
             require(std::string_view(argv[1]) == "--gpu", "invalid resource test mode");
             int count = 0;
             if (cudaGetDeviceCount(&count) != cudaSuccess || count == 0) return 77;

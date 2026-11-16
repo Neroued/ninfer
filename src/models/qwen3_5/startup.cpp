@@ -1,6 +1,7 @@
 #include "models/qwen3_5/startup.h"
 #include "models/qwen3_5/execution/profile.h"
 #include "models/qwen3_5/measurement.h"
+#include "models/qwen3_5/program/branch_scoring.h"
 #include "models/qwen3_5/program/planning/moe.h"
 #include "core/platform.h"
 
@@ -63,10 +64,23 @@ Startup::plan(DeviceContext& device, const EngineOptions& options, WeightPlaceme
         return ExecutionPlan{
             std::move(planner).finalize(resolution.capacity()), resolution, placement, chunk, {}};
     }
-    const auto max_tokens = static_cast<std::int32_t>(
+    auto max_tokens = static_cast<std::int32_t>(
         std::max(std::min(chunk, options.max_context),
                  options.max_concurrency * (options.speculative.draft_tokens + 1)));
-    auto moe = offload_->resolve(available - required_bytes, max_tokens, options.moe.cpu_workers);
+    const BatchExecutionPlan batches(
+        make_batch_execution_spec(options.max_concurrency, 1, options.use_cuda_graph));
+    auto geometries = moe::decode_geometries(batches, options.speculative.draft_tokens + 1);
+    if (options.enable_decisions) {
+        // Masked decision rows use their own width, independent of generation concurrency.
+        // Size hybrid MoE staging for the shortest active suffix at each physical width.
+        for (std::uint32_t batch = 1; batch <= kBranchBatch; ++batch) {
+            const auto physical = static_cast<std::int32_t>(kBranchWidth * batch);
+            geometries.push_back({physical, static_cast<std::int32_t>(batch)});
+            max_tokens = std::max(max_tokens, physical);
+        }
+    }
+    auto moe              = offload_->resolve(available - required_bytes, max_tokens, geometries,
+                                              options.moe.cpu_workers);
     if (!moe) return std::nullopt;
     auto final                 = make_sequence_planner(profile, device, trial, moe);
     const auto& final_capacity = final.capacity_plan();

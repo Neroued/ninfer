@@ -18,6 +18,9 @@ Frontend ParallelStartup::frontend(const EngineOptions& options) const {
 std::vector<distributed::wire::Bytes>
 ParallelStartup::requests(const EngineOptions& options) const {
     std::vector<distributed::wire::Bytes> payloads;
+    const auto batches = make_batch_execution_spec(
+        options.max_concurrency, parallel_.ranks.size(),
+        options.use_cuda_graph && options.purpose == EnginePurpose::Generation);
     const auto control =
         std::find_if(parallel_.ranks.begin(), parallel_.ranks.end(), [&](const auto& r) {
             return parallel_.topology.rank(r.rank).node == options.deployment->coordinator_node;
@@ -29,6 +32,7 @@ ParallelStartup::requests(const EngineOptions& options) const {
         encode_rank_load(out, {.artifact               = definition_->artifact_id(),
                                .rank                   = rank,
                                .options                = options,
+                               .batches                = batches,
                                .index_format           = index_format_,
                                .host_reservation_bytes = control_owner ? media : 0,
                                .control_owner          = control_owner});

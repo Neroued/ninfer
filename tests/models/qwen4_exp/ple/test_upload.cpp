@@ -39,12 +39,18 @@ void run() {
     UploadSlots uploads(context, 6, 2);
     DeviceBuffer copied(context.device(), 6 * kEmbeddingBytes);
     std::vector<std::uint16_t> actual(6 * kEmbeddingElements);
+    std::array<std::vector<std::uint32_t>, 2> lengths{std::vector<std::uint32_t>(6),
+                                                      std::vector<std::uint32_t>(6)};
+    std::array<std::vector<SequenceIdentity>, 2> identities{std::vector<SequenceIdentity>(6),
+                                                            std::vector<SequenceIdentity>(6)};
     auto input = [&](Ticket ticket, std::uint32_t tokens, std::uint32_t batch) {
         InputWindow window{};
         window.tokens = tokens;
         window.batch  = batch;
-        std::fill_n(window.valid_columns.begin(), batch, tokens);
-        const auto values = uploads.host_slots()[ticket.slot].subspan(
+        std::fill_n(lengths[ticket.slot].begin(), batch, tokens);
+        window.valid_columns = std::span(lengths[ticket.slot]).first(batch);
+        window.identities    = std::span(identities[ticket.slot]).first(batch);
+        const auto values    = uploads.host_slots()[ticket.slot].subspan(
             0, std::size_t(tokens) * batch * kEmbeddingBytes);
         auto* words = static_cast<std::uint16_t*>(values.data);
         for (std::size_t i = 0; i < values.bytes / 2; ++i) {

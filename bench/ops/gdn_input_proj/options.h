@@ -2,6 +2,7 @@
 
 #include "op_measurement.cuh"
 #include "ninfer/ops/gdn_input_proj.h"
+#include <limits>
 
 namespace ninfer::bench::gdn_input {
 struct Options {
@@ -18,7 +19,7 @@ inline Options parse_options(int argc, char** argv) {
         const std::string_view flag = argv[i];
         if (flag == "--help" || flag == "-h") {
             std::cout << "GDN input Op benchmark\n"
-                         "  --op snapshot|record --format q4q5|q8|fp8|nvfp4\n"
+                         "  --op update|snapshot|record --format q4q5|q8|fp8|nvfp4\n"
                          "  --n N --k K --query-rows Q --policy a16|allow-a8|allow-a4\n"
                          "  --tokens T[,T...] or --sweep START:END[:STEP]\n"
                          "  --batch B --valid-columns T[,T...]\n"
@@ -51,11 +52,15 @@ inline Options parse_options(int argc, char** argv) {
             o.tokens        = measurement::sweep(value);
             explicit_tokens = true;
         } else if (flag == "--valid-columns")
-            o.valid = measurement::integers(value);
+            o.valid = measurement::integers(value, 0);
         else if (!measurement::parse(o.timing, flag, value))
             throw std::invalid_argument("unknown option: " + std::string(flag));
     }
-    if (o.op != "snapshot" && o.op != "record") throw std::invalid_argument("unknown input Op");
+    if (o.op != "update" && o.op != "snapshot" && o.op != "record")
+        throw std::invalid_argument("unknown input Op");
+    if (o.op == "update" &&
+        std::any_of(o.tokens.begin(), o.tokens.end(), [](int t) { return t != 1; }))
+        throw std::invalid_argument("update requires W=1");
     if (o.policy != "a16" && o.policy != "allow-a8" && o.policy != "allow-a4")
         throw std::invalid_argument("unknown activation policy");
     if (o.format == "q4q5" && o.policy != "a16")
@@ -69,6 +74,9 @@ inline Options parse_options(int argc, char** argv) {
         throw std::invalid_argument("fixture requires N=2*Q+2*V with positive V");
     if (o.format == "q4q5" && (o.n != 16384 || o.query_rows != 2048))
         throw std::invalid_argument("paired fixture uses Q4 rows [0,4096), Q5 rows [4096,16384)");
+    for (const auto width : o.tokens)
+        if ((std::int64_t(width) + 1) * o.batch > std::numeric_limits<std::int32_t>::max())
+            throw std::invalid_argument("fixture history extent exceeds I32");
     return o;
 }
 

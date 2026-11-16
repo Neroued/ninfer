@@ -22,7 +22,7 @@ __device__ inline void write_convolution(const Arguments& a, int channel, std::i
 }
 
 template <class ConvWeight = float, class Column = int, bool SingleTile = false,
-          bool CacheColumns = false>
+          bool CacheColumns = false, bool WholeWindows = false>
 struct ConvolutionEpilogue {
     template <class S>
     static constexpr int kSharedBytes =
@@ -33,7 +33,7 @@ struct ConvolutionEpilogue {
                                 float (&acc)[S::kMmaRows][S::kMmaTokens][4], int row_begin,
                                 int token_begin, int rows, int tokens) const {
         static_assert(S::kBlockRows % 64 == 0);
-        static_assert(SingleTile || S::kBlockTokens == kTiledTokens);
+        static_assert(SingleTile || WholeWindows || S::kBlockTokens == kTiledTokens);
         const auto& a               = output.args;
         const int local_token_begin = SingleTile ? 0 : token_begin;
         const Column global_begin =
@@ -99,7 +99,7 @@ struct ConvolutionEpilogue {
                 if (a.records)
                     a.records[std::int64_t(column) * kProjectionFeatures + c] =
                         __float2bfloat16_rn(current);
-                if constexpr (!SingleTile) {
+                if constexpr (!SingleTile && !WholeWindows) {
                     if (local < 3 || local >= Block - 3) {
                         const int edge  = local < 3 ? local : 3 + local - (Block - 3);
                         output.edges[(std::int64_t(global_begin / Block) * 6 + edge) *
@@ -121,20 +121,24 @@ struct ConvolutionEpilogue {
                 }
                 write_convolution<ConvWeight>(a, c, column, h[0], h[1], h[2], current);
             }
-            if constexpr (SingleTile) {
+            if constexpr (SingleTile || WholeWindows) {
                 // Every old-history reader retires before this channel publishes its tail.
                 __syncthreads();
                 if (a.destination && tid < 64) {
-                    const int c = row_begin + first + tid;
-                    for (int b = 0; b < a.batch; ++b) {
+                    const int c             = row_begin + first + tid;
+                    const int first_request = global_begin / a.width;
+                    const int requests      = min(Block, tokens - local_token_begin) / a.width;
+                    for (int i = 0; i < requests; ++i) {
+                        const int b = first_request + i;
                         const int n = a.valid ? a.valid[b] : a.width;
+                        if (!n) continue;
                         __nv_bfloat16 history[3];
 #pragma unroll
                         for (int j = 0; j < 3; ++j) {
                             const int t = n - 3 + j;
                             history[j]  = t < 0 ? a.source[a.source_offsets[b] / 2 +
                                                           (t + 3LL) * kProjectionFeatures + c]
-                                                : __float2bfloat16_rn(*at(tid, b * a.width + t));
+                                                : __float2bfloat16_rn(*at(tid, i * a.width + t));
                         }
 #pragma unroll
                         for (int j = 0; j < 3; ++j)
@@ -183,6 +187,7 @@ __global__ void convolution_boundaries(TiledConvolution output) {
     if (output.tail)
         for (int b = 0; b < a.batch; b++) {
             int n = a.valid ? a.valid[b] : a.width;
+            if (!n) continue;
             __nv_bfloat16 h[3];
 #pragma unroll
             for (int j = 0; j < 3; j++) {
@@ -198,7 +203,8 @@ __global__ void convolution_boundaries(TiledConvolution output) {
         }
 }
 
-template <class Column = int, bool SingleTile = false, bool FastSilu = false>
+template <class Column = int, bool SingleTile = false, bool FastSilu = false,
+          bool WholeWindows = false>
 struct PackedConvolutionEpilogue {
     template <class S>
     static constexpr int kSharedBytes =
@@ -209,7 +215,7 @@ struct PackedConvolutionEpilogue {
                                 float (&acc)[S::kMmaRows][S::kMmaTokens][4], int row_begin,
                                 int token_begin, int rows, int tokens) const {
         static_assert(S::kBlockRows % 64 == 0);
-        static_assert(SingleTile || S::kBlockTokens == kTiledTokens);
+        static_assert(SingleTile || WholeWindows || S::kBlockTokens == kTiledTokens);
         const auto& a         = output.args;
         constexpr int Block   = S::kBlockTokens;
         const int local_begin = SingleTile ? 0 : token_begin;
@@ -219,16 +225,18 @@ struct PackedConvolutionEpilogue {
         auto* values    = reinterpret_cast<float*>(scratch);
         auto* metadata  = reinterpret_cast<int4*>(scratch + 64 * Block * sizeof(float));
         const auto at   = [&](int r, int t) { return values + t * 64 + (r ^ ((t & 7) << 3)); };
-        const auto pack = [](const float (&v)[4]) {
+        const auto pack = [](const float(&v)[4]) {
             return make_uint2(common::pack_bf16x2(v[0], v[1]), common::pack_bf16x2(v[2], v[3]));
         };
-        for (int t = tid; t < Block; t += S::kThreads) {
-            const Column column = begin + t;
-            const int b = column / a.width, offset = column % a.width;
-            metadata[t] = local_begin + t < tokens
-                              ? make_int4(b, offset, a.valid ? a.valid[b] : a.width, 0)
-                              : make_int4(0, 0, 0, 0);
-        }
+        const bool rolling = (SingleTile || WholeWindows) && S::kBlockRows <= 128 && a.width <= 8;
+        if (!rolling)
+            for (int t = tid; t < Block; t += S::kThreads) {
+                const Column column = begin + t;
+                const int b = column / a.width, offset = column % a.width;
+                metadata[t] = local_begin + t < tokens
+                                  ? make_int4(b, offset, a.valid ? a.valid[b] : a.width, 0)
+                                  : make_int4(0, 0, 0, 0);
+            }
         for (int first = 0; first < S::kBlockRows; first += 64) {
             __syncthreads();
 #pragma unroll
@@ -246,6 +254,65 @@ struct PackedConvolutionEpilogue {
                 }
             }
             __syncthreads();
+            if (rolling) {
+                const int first_request = begin / a.width;
+                const int requests      = min(Block, tokens - local_begin) / a.width;
+                // One thread owns a request and four channels through its complete window.
+                // Its history has no other reader, including during same-row publication.
+                for (int i = tid; i < 16 * requests; i += S::kThreads) {
+                    const int r = (i % 16) * 4, request = i / 16;
+                    const int b = first_request + request, c = row_begin + first + r;
+                    if (c >= rows) continue;
+                    const int valid     = a.valid ? a.valid[b] : a.width;
+                    const int local     = request * a.width;
+                    const Column column = begin + local;
+                    auto* dst           = c < hidden ? a.q : c < 2 * hidden ? a.k : a.v;
+                    auto* result        = dst + std::int64_t(column) * hidden + c % hidden;
+                    float history[3][4], weight[4][4];
+                    if (valid) {
+#pragma unroll
+                        for (int j = 0; j < 3; ++j)
+                            common::load_bf16x4(history[j], a.source + a.source_offsets[b] / 2 +
+                                                                std::int64_t(j) * channels + c);
+#pragma unroll
+                        for (int j = 0; j < 4; ++j)
+                            common::load_bf16x4(weight[j],
+                                                static_cast<const __nv_bfloat16*>(a.weights) +
+                                                    j * channels + c);
+                    }
+                    for (int t = 0; t < a.width; ++t) {
+                        if (t >= valid) {
+                            common::store_vec(result + std::int64_t(t) * hidden, make_uint2(0, 0));
+                            continue;
+                        }
+                        float current[4], values[4];
+                        common::store_vec(current, common::load_vec<float4>(at(r, local + t)));
+                        if (a.records)
+                            common::store_vec(a.records + (std::int64_t(column) + t) * channels + c,
+                                              pack(current));
+#pragma unroll
+                        for (int j = 0; j < 4; ++j) {
+                            float x = weight[0][j] * history[0][j];
+                            x       = fmaf(weight[1][j], history[1][j], x);
+                            x       = fmaf(weight[2][j], history[2][j], x);
+                            x       = fmaf(weight[3][j], current[j], x);
+                            values[j] =
+                                FastSilu ? __fdividef(x, 1.F + __expf(-x)) : common::silu(x);
+                            history[0][j] = history[1][j];
+                            history[1][j] = history[2][j];
+                            history[2][j] = current[j];
+                        }
+                        common::store_vec(result + std::int64_t(t) * hidden, pack(values));
+                    }
+                    if (a.destination && valid)
+#pragma unroll
+                        for (int j = 0; j < 3; ++j)
+                            common::store_vec(a.destination + a.destination_offsets[b] / 2 +
+                                                  std::int64_t(j) * channels + c,
+                                              pack(history[j]));
+                }
+                continue;
+            }
             for (int i = tid; i < 16 * Block; i += S::kThreads) {
                 const int r = (i % 16) * 4, local = i / 16, c = row_begin + first + r;
                 if (c >= rows || local_begin + local >= tokens) continue;
@@ -263,7 +330,7 @@ struct PackedConvolutionEpilogue {
                 if (a.records)
                     common::store_vec(a.records + std::int64_t(column) * channels + c,
                                       pack(current));
-                if constexpr (!SingleTile) {
+                if constexpr (!SingleTile && !WholeWindows) {
                     if (local < 3 || local >= Block - 3) {
                         const int edge = local < 3 ? local : 3 + local - (Block - 3);
                         common::store_vec(
@@ -300,13 +367,17 @@ struct PackedConvolutionEpilogue {
                 }
                 common::store_vec(result, pack(result_values));
             }
-            if constexpr (SingleTile) {
+            if constexpr (SingleTile || WholeWindows) {
                 if (a.destination) {
                     __syncthreads();
-                    for (int i = tid; i < 16 * a.batch; i += S::kThreads) {
-                        const int r = (i % 16) * 4, b = i / 16, c = row_begin + first + r;
+                    const int first_request = begin / a.width;
+                    const int requests      = min(Block, tokens - local_begin) / a.width;
+                    for (int i = tid; i < 16 * requests; i += S::kThreads) {
+                        const int r = (i % 16) * 4, request = i / 16;
+                        const int b = first_request + request, c = row_begin + first + r;
                         if (c >= rows) continue;
                         const int valid = a.valid ? a.valid[b] : a.width;
+                        if (!valid) continue;
                         uint2 history[3];
 #pragma unroll
                         for (int j = 0; j < 3; ++j) {
@@ -316,8 +387,8 @@ struct PackedConvolutionEpilogue {
                                     a.source + a.source_offsets[b] / 2 + (t + 3LL) * channels + c);
                             else {
                                 float v[4];
-                                common::store_vec(v,
-                                                  common::load_vec<float4>(at(r, b * a.width + t)));
+                                common::store_vec(
+                                    v, common::load_vec<float4>(at(r, request * a.width + t)));
                                 history[j] = pack(v);
                             }
                         }

@@ -19,7 +19,7 @@ __device__ __forceinline__ int q4_mma_swizzle_k64(int row, int col) {
 }
 
 // clang-format off
-template <class Schedule, bool Full, class Output, class Epilogue>
+template <class Schedule, bool Full, class Output, class Epilogue, bool FullTokens = Full>
 __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm)
 void q4_a16_mma_kernel(
     const __nv_bfloat16* __restrict__ x,
@@ -93,11 +93,11 @@ void q4_a16_mma_kernel(
             const int kk        = k0 + k8 * 8;
             const int col       = col0 + local_col;
             auto* dst = &Bs[stage][local_col * BK + q4_mma_swizzle_k64(local_col, k8 * 8)];
-            if constexpr (kFull) {
+            if constexpr (kFull && FullTokens) {
                 common::cp_async<16, Schedule::kActivationCache>(
                     dst, &x[static_cast<std::int64_t>(col) * k + kk]);
             } else {
-                if (col < cols && kk + 8 <= k) {
+                if ((FullTokens || col < cols) && (kFull || kk + 8 <= k)) {
                     common::cp_async<16, Schedule::kActivationCache>(
                         dst, &x[static_cast<std::int64_t>(col) * k + kk]);
                 } else {
@@ -343,7 +343,7 @@ void q4_a16_mma_kernel(
         for (int ni = 0; ni < NT; ++ni) {
             const int token0 = col0 + warp_col * WN + ni * 8 + 2 * mma_col;
             const auto store = [&](int row, int token, float value) {
-                if (kFull || (row < rows && token < cols)) {
+                if ((kFull || row < rows) && (FullTokens || token < cols)) {
                     const int global_token = token_begin + token;
                     output.store(row, global_token, epilogue.apply(row, global_token, value));
                 }

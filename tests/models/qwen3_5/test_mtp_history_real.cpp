@@ -244,6 +244,7 @@ public:
         q35::ForwardWork work;
         work.purpose = purpose;
         work.rows    = {rows_[lane]};
+        work.shape   = native_.session_plan.batch_execution->exact(1, 1);
         q35::InputWindow input;
         input.tokens.resize(count);
         input.rope_positions.resize(3 * count);
@@ -461,10 +462,10 @@ public:
                 operation.commit = q35::Commit{};
                 for (std::uint32_t lane = 0; lane < kBatch; ++lane) {
                     operation.commit->rows.push_back({accepted[lane], true, false});
-                    frame.host_commit->accepted_columns[lane] = accepted[lane];
+                    frame.host_commit.accepted_columns[lane] = accepted[lane];
                 }
                 CUDA_CHECK(cudaMemcpyAsync(frame.accepted_columns.data,
-                                           frame.host_commit->accepted_columns.data(),
+                                           frame.host_commit.accepted_columns.data(),
                                            kBatch * sizeof(std::int32_t), cudaMemcpyHostToDevice,
                                            native_.device().stream()));
                 native.rebuild_mtp_history(kBatch);
@@ -508,6 +509,7 @@ private:
     }
 
     runtime::ExecutionTicket submit(q35::Work work, runtime::FrameKind kind) {
+        q35::plan_work_batch(work, *native_.session_plan.batch_execution);
         auto reservation = native_.executor().try_reserve(kind);
         require(bool(reservation), "native MTP frame is unexpectedly occupied");
         return native_.executor().submit(std::move(*reservation), std::move(work));

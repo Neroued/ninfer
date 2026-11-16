@@ -13,6 +13,14 @@ using Small = Bf16ScheduleInstance<
                         Bf16WeightCache::Default, Bf16PhaseOrder::Sequential, 1, 4, 1, 2, 8>,
     4096>;
 using Sliced = Bf16ScheduleInstance<Bf16A16SlicedKMmaSchedule<16, 16, 8, 64, 2>, 4096>;
+using Sliced32 =
+    Bf16ScheduleInstance<Bf16A16SlicedKMmaSchedule<16, 16, 16, 32, 2, Cache::cg, Cache::cg, 1, 7,
+                                                   Bf16MmaRaster::TokenFast>,
+                         4096>;
+using Sliced128 =
+    Bf16ScheduleInstance<Bf16A16SlicedKMmaSchedule<32, 64, 8, 32, 2, Cache::cg, Cache::cg, 1, 7,
+                                                   Bf16MmaRaster::TokenFast>,
+                         4096>;
 using Hot256 = Bf16ScheduleInstance<
     Bf16A16MmaSchedule<32, 32, 256, 16, 8, 3, 1, Cache::cg, Cache::cg,
                        Bf16MmaFragmentPipeline::PingPong, Bf16MmaRaster::TokenFast>,
@@ -56,7 +64,9 @@ Bf16Launch select_bf16_n77440_k4096(std::int32_t tokens) {
     if (tokens == 1) return launch_bf16_gemv<Gemv>;
     if (tokens <= 8) return launch_bf16_simt<Small>;
     if (tokens <= 16) return launch_bf16_sliced_k_mma<Sliced>;
-    if (tokens <= 128) return launch_bf16_mma<Hot256>;
+    if (tokens <= 32) return launch_bf16_sliced_k_mma<Sliced32>;
+    if (tokens <= 96) return launch_bf16_mma<Hot256>;
+    if (tokens <= 128) return launch_bf16_sliced_k_mma<Sliced128>;
     if (tokens <= 384) return launch_bf16_tma_mma<Medium>;
     if (tokens <= 512) return launch_bf16_tma_mma<Mid128>;
     if (tokens >= 2432) return streaming;

@@ -339,16 +339,56 @@ void run_new_bf16_geometry(Suite& suite, const Geometry& shape) {
 }
 
 #if NINFER_TARGET_SPARK
+void run_dflash_bf16_projections(Suite& suite) {
+    using namespace ninfer::test::linear;
+    for (auto [n, k] : std::array<std::array<int, 2>, 5>{
+             {{2048, 20480}, {3072, 4096}, {12288, 4096}, {4096, 2048}, {4096, 6144}}}) {
+        const auto seed = std::uint32_t(n + k + 541);
+        std::vector<Invocation> full{Invocation{1}, Invocation{8}, Invocation{17}};
+        if (k == 20480 || n == 3072) full.push_back({65});
+        add_shape(suite, QType::BF16, ActivationRecipe::Hashed, make_bf16_weight,
+                  {n, k, seed, Comparison::Full, true, full});
+
+        // Odd columns exercise predicated output tiles; the larger extents cross contraction
+        // routes and include the DFlash block/batch products. This is not the performance sweep.
+        std::vector<Invocation> calls;
+        for (int t :
+             {2, 3, 4, 5, 7, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 95, 96, 97, 127, 128, 129})
+            calls.push_back({t});
+        for (int t : {8, 33, 65, 129})
+            calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only, true});
+        for (int t : {1, 33, 128}) calls.push_back({t, CallForm::A16Convenience});
+        if (k == 20480) {
+            for (int t : {255, 256, 257, 511, 512, 513, 1024, 2048, 2049}) calls.push_back({t});
+            calls.push_back({2048, CallForm::Policy, ops::LinearPolicy::A16Only, true});
+            calls.push_back({2048, CallForm::A16Convenience});
+        }
+        ShapeCase sampled{n, k, seed + 1, Comparison::Sampled, true, calls};
+        sampled.workspace_prefix = 256;
+        add_shape(suite, QType::BF16, ActivationRecipe::Hashed, make_bf16_weight, sampled);
+        add_workspace_cases(suite, QType::BF16, n, k);
+
+        const std::array tails{Invocation{1}, Invocation{16}, Invocation{33}, Invocation{128}};
+        add_shape(suite, QType::BF16, ActivationRecipe::Hashed, make_bf16_weight,
+                  {n, k, seed + 2, Comparison::Sampled, true, tails, ActivationPattern::KTail});
+        const std::array cancel{Invocation{1}, Invocation{16}, Invocation{33}, Invocation{128}};
+        add_shape(
+            suite, QType::BF16, ActivationRecipe::Hashed, cancellation_weight,
+            {n, k, seed + 3, Comparison::Sampled, true, cancel, ActivationPattern::Cancellation});
+    }
+}
+
 void run_bf16_extensions(Suite& suite) {
     using namespace ninfer::test::linear;
     const std::array native_calls{
         Invocation{1, CallForm::A16Convenience}, Invocation{8}, Invocation{129}, Invocation{4096},
         Invocation{33, CallForm::Policy, ops::LinearPolicy::A16Only, true}};
-    for (auto [n, k] : std::array<std::array<int, 2>, 3>{{{128, 4096}, {256, 4096}, {4096, 1536}}}) {
+    for (auto [n, k] :
+         std::array<std::array<int, 2>, 3>{{{128, 4096}, {256, 4096}, {4096, 1536}}}) {
         std::vector<Invocation> calls(native_calls.begin(), native_calls.end());
         if (n == 128 && k == 4096) {
-            for (int t : {2, 4, 5, 7, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512,
-                          768, 1024, 2048})
+            for (int t :
+                 {2, 4, 5, 7, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 2048})
                 calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only});
             for (int t : {3, 9, 17, 49, 65, 97, 193, 257, 385, 513, 769, 1025, 2049})
                 calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only, true});
@@ -358,18 +398,18 @@ void run_bf16_extensions(Suite& suite) {
                 calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only, true});
         }
         if (n == 256 && k == 4096) {
-            for (int t : {2, 4, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 640,
-                          1024, 1536, 2048, 3072})
+            for (int t : {2, 4, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 640, 1024, 1536,
+                          2048, 3072})
                 calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only});
             for (int t : {3, 5, 25, 65, 97, 193, 257, 385, 513, 641, 1025, 1537, 3073})
                 calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only, true});
         }
         if (n == 4096 && k == 1536) {
-            for (int t : {2, 4, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 896,
-                          1024, 1152, 1280, 1536, 2048})
+            for (int t : {2,   4,   16,  24,  32,  48,   64,   96,   128,  192,
+                          256, 384, 512, 768, 896, 1024, 1152, 1280, 1536, 2048})
                 calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only});
-            for (int t : {3, 9, 17, 65, 129, 193, 257, 385, 513, 769, 897, 1025, 1153,
-                          1281, 1537, 4097})
+            for (int t :
+                 {3, 9, 17, 65, 129, 193, 257, 385, 513, 769, 897, 1025, 1153, 1281, 1537, 4097})
                 calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only, true});
         }
         add_shape(suite, QType::BF16, ActivationRecipe::TokenBlocks, make_bf16_weight,
@@ -378,7 +418,8 @@ void run_bf16_extensions(Suite& suite) {
     const std::array geometries{
         Geometry{20480, 1536, {16, 32, 64, 128, 256, 1024}},
         Geometry{16384, 1536, {16, 32, 64, 128, 256, 1024}},
-        Geometry{4096, 8192, {1, 8, 16, 32, 128, 192, 256, 384, 512, 576, 640, 768, 1024, 1536, 2048}},
+        Geometry{
+            4096, 8192, {1, 8, 16, 32, 128, 192, 256, 384, 512, 576, 640, 768, 1024, 1536, 2048}},
         Geometry{1024, 1176, {1, 16, 32, 128, 192, 256, 512, 1536, 2304}},
         Geometry{3072, 1024, {1, 16, 32, 64, 128, 256, 2048}},
         Geometry{1024, 1024, {1, 8, 16, 32, 64, 256, 384, 768, 1536, 2304}},
@@ -398,10 +439,11 @@ void run_bf16_extensions(Suite& suite) {
         for (int t : {1, 17, 129, 4097})
             calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only, true});
         if (geometry.n == 4096 && geometry.k == 8192) {
-            for (int t : {2, 4, 8, 16, 24, 64, 128, 160, 193, 258, 272, 288, 320, 383,
-                          513, 640, 767, 1025, 1152, 1280, 1535, 2048})
+            for (int t : {2,   4,   8,   16,  24,  64,  128,  160,  193,  258,  272,
+                          288, 320, 383, 513, 640, 767, 1025, 1152, 1280, 1535, 2048})
                 calls.push_back({t});
-            for (int t : {3, 9, 193, 257, 258, 383, 385, 511, 513, 575, 577, 641, 767, 1025, 1153, 1535})
+            for (int t :
+                 {3, 9, 193, 257, 258, 383, 385, 511, 513, 575, 577, 641, 767, 1025, 1153, 1535})
                 calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only, true});
         }
         if ((geometry.n == 20480 || geometry.n == 16384) && geometry.k == 1536)
@@ -460,6 +502,7 @@ void run_bf16(Suite& suite) {
     { run_selector_linear(suite); }
     for (const auto& shape : kNewGeometries) { run_new_bf16_geometry(suite, shape); }
 #if NINFER_TARGET_SPARK
+    run_dflash_bf16_projections(suite);
     run_bf16_extensions(suite);
 #endif
 }

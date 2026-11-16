@@ -15,6 +15,7 @@ constexpr ReductionCriterion kCoefficient{5e-6, 5e-7, 1e-5};
 struct Call {
     int t;
     bool graph;
+    bool padded = false;
 };
 
 std::vector<std::uint16_t> activation(int tokens, bool repeated) {
@@ -85,7 +86,13 @@ int run(std::span<const Call> calls, int recipe = 0, bool repeated = false) {
         Tensor x(input.span(), DType::BF16, {H, call.t}), b(device_bias.span(), DType::FP32, {E});
         const auto cuda =
             call.graph ? context.execution_view() : cuda_environment().default_execution;
-        const auto launch = [&] { ops::topk_sigmoid_route(x, p, weight.view(), b, out, ws, cuda); };
+        std::vector<int> columns(call.padded ? call.t / 2 : 0);
+        DeviceBuffer valid(cuda.device(), columns.size() * sizeof(int));
+        const ops::MoeTokenValidity validity{
+            call.padded ? Tensor(valid.span(), DType::I32, {int(columns.size())}) : Tensor{}, 2};
+        const auto launch = [&] {
+            ops::topk_sigmoid_route(x, p, weight.view(), b, out, validity, ws, cuda);
+        };
         DecodeGraphDefinition def;
         DecodeGraphExecutable graph;
         cuda_check(cudaDeviceSynchronize(), "route fixture ready");
@@ -94,6 +101,8 @@ int run(std::span<const Call> calls, int recipe = 0, bool repeated = false) {
             graph.instantiate(def);
         }
         for (int phase = 0; phase < (call.graph ? 2 : 1); ++phase) {
+            for (std::size_t row = 0; row < columns.size(); ++row) columns[row] = (row + phase) % 3;
+            if (call.padded) valid.copy_from_host(columns.data(), valid.size());
             auto values      = bits;
             auto corrections = bias;
             if (phase) {
@@ -122,6 +131,13 @@ int run(std::span<const Call> calls, int recipe = 0, bool repeated = false) {
                 common = reference(weight.host, std::span(values).first(H), corrections,
                                    p.scaling_factor, p.normalization_epsilon);
             for (int t = 0; t < call.t; ++t) {
+                if (call.padded && t % 2 >= columns[t / 2]) {
+                    for (int j = 0; j < K; ++j) {
+                        ref_ids[std::size_t(t) * K + j] = -1;
+                        if (got_coefficients[std::size_t(t) * K + j] != 0) ++failures;
+                    }
+                    continue;
+                }
                 const auto value =
                     (repeated || recipe)
                         ? common
@@ -194,12 +210,13 @@ int metadata() {
         if (field == 4) bad.qdata = static_cast<const std::byte*>(bad.qdata) + 2;
         if (field == 5) bad.device = Device::cpu();
         rejected([&] {
-            ops::topk_sigmoid_route(x, p, bad, b, out, ws, cuda_environment().default_execution);
+            ops::topk_sigmoid_route(x, p, bad, b, out, {}, ws,
+                                    cuda_environment().default_execution);
         });
     }
     MemoryArena short_ws(scratch.span().subspan(0, cap - 256));
     try {
-        ops::topk_sigmoid_route(x, p, weight.view(), b, out, short_ws,
+        ops::topk_sigmoid_route(x, p, weight.view(), b, out, {}, short_ws,
                                 cuda_environment().default_execution);
 
         ++failures;
@@ -207,7 +224,7 @@ int metadata() {
     auto alias              = out;
     alias.coefficients.data = ids.data();
     rejected([&] {
-        ops::topk_sigmoid_route(x, p, weight.view(), b, alias, ws,
+        ops::topk_sigmoid_route(x, p, weight.view(), b, alias, {}, ws,
                                 cuda_environment().default_execution);
     });
     return failures + linear_common::verify_preserved(ids.data(), untouched, "route rejected IDs") +
@@ -261,6 +278,12 @@ int main(int argc, char** argv) {
               },
               {{"format", "bf16"}});
     suite.add("sigmoid-route/metadata", metadata, {{"format", "bf16"}});
+    suite.add("sigmoid-route/validity",
+              [] {
+                  const std::array<Call, 1> calls{{{18, true, true}}};
+                  return run(calls);
+              },
+              {{"format", "bf16"}, {"execution", "graph"}, {"suite", "concurrency"}});
 #endif
     return suite.main(argc, argv);
 }

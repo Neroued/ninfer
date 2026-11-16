@@ -7,16 +7,15 @@
 namespace ninfer::models::qwen3_5::detail {
 
 std::uint32_t SessionImpl::lane(SequenceHandle handle) const {
-    for (std::uint32_t i = 0; i < max_concurrency; ++i)
-        if (requests[i].lifecycle != Lifecycle::Empty && sequences[i].id == handle) return i;
+    const auto found = resident_sequences.find(handle.value);
+    if (found != resident_sequences.end() && sequences[found->second].id == handle)
+        return found->second;
     throw std::logic_error("sequence identity is not resident");
 }
 
 bool SessionImpl::valid_sequence(SequenceHandle handle) const noexcept {
-    if (!handle.value || !handle.generation) return false;
-    for (std::uint32_t i = 0; i < max_concurrency; ++i)
-        if (requests[i].lifecycle != Lifecycle::Empty && sequences[i].id == handle) return true;
-    return false;
+    const auto found = resident_sequences.find(handle.value);
+    return found != resident_sequences.end() && sequences[found->second].id == handle;
 }
 
 SequenceHandle SessionImpl::sequence_handle(std::uint32_t lane) const noexcept {
@@ -36,12 +35,14 @@ const SequenceState& SessionImpl::active_sequence(std::uint32_t lane) const {
 }
 
 void SessionImpl::invalidate_lane(std::uint32_t lane) noexcept {
+    resident_sequences.erase(sequences[lane].id.value);
     if (!++lane_epochs[lane]) ++lane_epochs[lane];
 }
 
 bool SessionImpl::execution_pending(SequenceHandle handle) const noexcept {
-    return execution && std::find(execution->members.begin(), execution->members.end(), handle) !=
-                            execution->members.end();
+    const auto found = resident_sequences.find(handle.value);
+    return found != resident_sequences.end() && sequences[found->second].id == handle &&
+           sequences[found->second].computing;
 }
 
 bool SessionImpl::recovery_pending(SequenceHandle handle) const noexcept {
@@ -101,16 +102,6 @@ InputWindow SessionImpl::input_window(const SequenceState& state, std::uint32_t 
                     ? prompt.position_axis(axis)[p]
                     : static_cast<std::int32_t>(p) + state.continuation.metadata.rope_delta;
     out.prompt_begin = begin;
-    if (!causal_scoring) {
-        const auto frontiers = state.prefix_identity.execution_frontiers();
-        for (auto it = std::upper_bound(frontiers.begin(), frontiers.end(), begin);
-             it != frontiers.end() && *it < end; ++it)
-            out.execution_splits.push_back(*it - begin);
-        std::sort(out.execution_splits.begin(), out.execution_splits.end());
-        out.execution_splits.erase(
-            std::unique(out.execution_splits.begin(), out.execution_splits.end()),
-            out.execution_splits.end());
-    }
     return out;
 }
 
@@ -121,11 +112,6 @@ std::uint32_t SessionImpl::window_end(const SequenceState& state, const RequestC
     if (request.capture_reservation) end = std::min(end, request.capture_reservation->frontier);
     if (begin < request.base->summary.prompt_tokens)
         end = std::min(end, request.base->summary.prompt_tokens);
-    if (request.lifecycle == Lifecycle::Replaying) {
-        const auto frontiers = state.prefix_identity.execution_frontiers();
-        const auto next      = std::upper_bound(frontiers.begin(), frontiers.end(), begin);
-        if (next != frontiers.end()) end = std::min(end, *next);
-    }
     if (request.base->vision && begin < request.base->summary.prompt_tokens && begin < end)
         end = window.limit({state.id, state.residency}, request.base->vision->units, begin, end,
                            plan.vision_max_features);
@@ -173,6 +159,7 @@ void SessionImpl::clear_lane(SequenceState& state, RequestControl& request) noex
     request.prefill.reset();
     release_sequence_kv(state);
     release_sequence_state(state);
+    resident_sequences.erase(state.id.value);
     state      = {};
     state.lane = lane;
     request    = {};

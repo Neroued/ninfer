@@ -1,5 +1,7 @@
 #include "distributed/transport.h"
 #include "distributed/startup.h"
+#include "distributed/communication/preparation.h"
+#include "distributed/communication/selection.h"
 #include "models/common/qwen/vision/control.h"
 #include "models/qwen4_exp/wire.h"
 #include "models/qwen4_exp/parallel/wire.h"
@@ -26,6 +28,162 @@ void require(bool value, const char* message) {
     if (!value) throw std::runtime_error(message);
 }
 
+void batch_plans() {
+    for (const bool graph : {false, true}) {
+        const auto source = models::make_batch_execution_spec(128, 3, graph);
+        wire::Encoder out;
+        models::encode_batch_execution_spec(out, source);
+        const auto payload = std::move(out).take();
+        wire::Decoder in(payload);
+        const auto decoded = models::decode_batch_execution_spec(in);
+        in.finish();
+        require(decoded == source, "rank preparation changed the batch execution specification");
+        const models::BatchExecutionPlan plan(decoded);
+        require(plan.decode(17, 6) == models::PhysicalBatchShape{graph ? 20U : 17U, 6},
+                "worker interpreted different physical batch geometry");
+    }
+}
+
+void communication_preparation() {
+    dist::ExecutionTopology topology;
+    topology.ranks.resize(2);
+    topology.ranks[1].rank = 1;
+    topology.groups        = {{0, {0, 1}}};
+    const dist::CollectiveRequirement sum{dist::Collective::AllReduce, DType::BF16, 4096, 4096 * 32,
+                                          4096};
+    std::array<dist::CommunicationPreparation, 2> ranks{
+        dist::CommunicationPreparation{
+            0, {{{0, {sum}, {{1, 64, 128}}}, {{CommunicationBackend::Nccl, {std::byte{7}}}}}}},
+        dist::CommunicationPreparation{
+            1, {{{0, {sum}, {{0, 128, 64}}}, {{CommunicationBackend::Nccl, {}}}}}}};
+    require(ranks[0].policy == dist::CommunicationPolicy::Auto,
+            "communication does not default to automatic selection");
+    ranks[0].groups[0].connections.push_back({CommunicationBackend::Native, {std::byte{3}}});
+    dist::validate_communication_preparation(topology, ranks);
+    wire::Encoder out;
+    dist::encode_communication_preparation(out, ranks[0]);
+    const auto bytes = std::move(out).take();
+    wire::Decoder in(bytes);
+    const auto decoded = dist::decode_communication_preparation(in);
+    in.finish();
+    require(decoded.rank == 0 && decoded.policy == dist::CommunicationPolicy::Auto &&
+                decoded.groups.front().requirements.collectives ==
+                    ranks[0].groups.front().requirements.collectives &&
+                decoded.groups.front().requirements.peers ==
+                    ranks[0].groups.front().requirements.peers &&
+                decoded.groups.front().connections.front().data ==
+                    std::vector<std::byte>{std::byte{7}},
+            "communication preparation lost requirements or opaque backend data");
+    require(sum.contains({dist::Collective::AllReduce, DType::BF16, 4096 * 3}) &&
+                !sum.contains({dist::Collective::AllReduce, DType::BF16, 4097}) &&
+                !sum.contains({dist::Collective::AllReduce, DType::BF16, 4096 * 33}),
+            "communication count domain lost its step or capacity");
+    ranks[1].policy = dist::CommunicationPolicy::Nccl;
+    bool mismatched = false;
+    try {
+        dist::validate_communication_preparation(topology, ranks);
+    } catch (const std::invalid_argument&) { mismatched = true; }
+    require(mismatched, "different backend policies were accepted");
+    for (auto& rank : ranks) rank.policy = dist::CommunicationPolicy::Native;
+    bool unavailable = false;
+    try {
+        dist::validate_communication_preparation(topology, ranks);
+    } catch (const std::invalid_argument&) { unavailable = true; }
+    require(unavailable, "forced native accepted an unavailable rank");
+    for (auto& rank : ranks) rank.policy = dist::CommunicationPolicy::Auto;
+    for (auto& rank : ranks)
+        rank.groups[0].routing = {{{sum, CommunicationBackend::Nccl}}, CommunicationBackend::Nccl};
+    dist::validate_communication_preparation(topology, ranks);
+    wire::Encoder selected_out;
+    dist::encode_communication_preparation(selected_out, ranks[0]);
+    const auto selected_bytes = std::move(selected_out).take();
+    wire::Decoder selected_in(selected_bytes);
+    require(dist::decode_communication_preparation(selected_in).groups[0].routing ==
+                ranks[0].groups[0].routing,
+            "communication selection lost its frozen routes");
+    selected_in.finish();
+    ranks[1].groups[0].routing.collectives[0].backend = CommunicationBackend::Native;
+    bool different_routes                             = false;
+    try {
+        dist::validate_communication_preparation(topology, ranks);
+    } catch (const std::invalid_argument&) { different_routes = true; }
+    require(different_routes, "different communication routes were accepted");
+    ranks[1].groups[0].routing = ranks[0].groups[0].routing;
+    ranks[1].groups[0].requirements.collectives[0].max_count += 4096;
+    bool rejected = false;
+    try {
+        dist::validate_communication_preparation(topology, ranks);
+    } catch (const std::invalid_argument&) { rejected = true; }
+    require(rejected, "different collective requirements were accepted");
+}
+
+class SelectionBackend final : public dist::detail::Backend {
+public:
+    SelectionBackend(CommunicationBackend kind, std::size_t capacity)
+        : kind_(kind), capacity_(capacity) {}
+
+    CommunicationBackend kind() const noexcept override { return kind_; }
+
+    dist::BackendConnection prepare(const dist::GroupRequirements&) override { return {kind_, {}}; }
+
+    dist::BackendConnection configure(const dist::GroupRequirements&) override {
+        return {kind_, {}};
+    }
+
+    bool supports(const dist::CollectiveCall& call) const noexcept override {
+        return call.count <= capacity_;
+    }
+
+    bool supports_peers(std::span<const dist::PeerRequirement>) const noexcept override {
+        return true;
+    }
+
+    std::size_t warmup_bytes() const noexcept override { return 0; }
+
+    void warmup(MemorySpan, CudaExecutionView) override {}
+
+    void enqueue(const dist::CollectiveCall&, const void*, void*, CudaExecutionView) override {}
+
+    void exchange(std::span<const dist::PeerTransfer>, CudaExecutionView) override {}
+
+    void check() override {}
+
+    void abort() noexcept override {}
+
+    void close(std::chrono::steady_clock::time_point) override {}
+
+    CommunicationMemory memory() const override { return {}; }
+private:
+    CommunicationBackend kind_;
+    std::size_t capacity_;
+};
+
+void communication_selection() {
+    using Backend = CommunicationBackend;
+    SelectionBackend native(Backend::Native, 60), nccl(Backend::Nccl, SIZE_MAX);
+    std::array<dist::detail::Backend*, 2> candidates{&nccl, &native};
+    const auto range = [](std::size_t first, std::size_t last, Backend backend) {
+        return dist::CollectiveRoute{{dist::Collective::AllReduce, DType::BF16, first, last, 10},
+                                     backend};
+    };
+    const std::array preferences{range(10, 20, Backend::Native), range(30, 40, Backend::Nccl),
+                                 range(50, 80, Backend::Native)};
+    const std::vector expected{range(10, 20, Backend::Native), range(30, 40, Backend::Nccl),
+                               range(50, 60, Backend::Native), range(70, 80, Backend::Nccl)};
+    require(dist::detail::select_collectives(preferences, candidates) == expected,
+            "measured preference bands were confused with capability limits or candidate order");
+    const std::array<dist::detail::Backend*, 1> nccl_only{&nccl}, native_only{&native};
+    auto fallback = std::vector(preferences.begin(), preferences.end());
+    for (auto& route : fallback) route.backend = Backend::Nccl;
+    require(dist::detail::select_collectives(preferences, nccl_only) == fallback,
+            "unavailable preferred backend did not use a supported candidate");
+    bool rejected = false;
+    try {
+        (void)dist::detail::select_collectives(preferences, native_only);
+    } catch (const std::invalid_argument&) { rejected = true; }
+    require(rejected, "forced backend accepted an uncovered count range");
+}
+
 std::optional<dist::IncomingMessage> poll_message(dist::Transport& transport) {
     if (auto event = transport.poll()) {
         if (auto* message = std::get_if<dist::IncomingMessage>(&*event)) return std::move(*message);
@@ -49,6 +207,8 @@ void cache_profiles_roundtrip() {
                          KvCacheStorage::Fp8KeyNvfp4Value}) {
         q::RankLoadRequest request{};
         request.options.kv_cache = storage;
+        request.batches = models::make_batch_execution_spec(request.options.max_concurrency, 1,
+                                                            request.options.use_cuda_graph);
         wire::Encoder load_out;
         q::encode_rank_load(load_out, request);
         const auto load_bytes = std::move(load_out).take();
@@ -58,15 +218,20 @@ void cache_profiles_roundtrip() {
         require(loaded.options.kv_cache == storage, "rank load changed the KV profile");
 
         q::RankExecutionDescription execution{};
-        execution.session.shape.kv_storage = storage;
+        execution.session.shape.kv_storage      = storage;
+        execution.session.shape.max_concurrency = request.options.max_concurrency;
+        execution.session.shape.cuda_graph      = request.options.use_cuda_graph;
+        execution.session.batches =
+            std::make_shared<const models::BatchExecutionPlan>(request.batches);
         wire::Encoder execution_out;
         q::encode(execution_out, execution);
         const auto execution_bytes = std::move(execution_out).take();
         wire::Decoder execution_in(execution_bytes);
         const auto decoded = q::decode_rank_execution(execution_in);
         execution_in.finish();
-        require(decoded.session.shape.kv_storage == storage,
-                "rank execution changed the KV profile");
+        require(decoded.session.shape.kv_storage == storage &&
+                    decoded.session.batches->spec() == request.batches,
+                "rank execution changed the KV profile or batch plan");
     }
 }
 
@@ -149,6 +314,7 @@ void model_preparation() {
     request.host_reservation_bytes      = 2ULL << 30;
     request.control_owner               = false;
     request.index_format                = KvCacheVectorFormat::BFloat16;
+    request.batches = models::make_batch_execution_spec(o.max_concurrency, 2, o.use_cuda_graph);
     wire::Encoder out;
     glm::encode_rank_load(out, request);
     const auto bytes = std::move(out).take();
@@ -172,8 +338,24 @@ void model_preparation() {
     require(std::move(roundtrip).take() == bytes && decoded.rank.kda_heads.begin == 32 &&
                 decoded.options.speculative.proposal_head == ProposalHead::Optimized &&
                 decoded.index_format == request.index_format &&
+                decoded.batches == request.batches &&
                 decoded.host_reservation_bytes == request.host_reservation_bytes,
             "GLM preparation lost partition, assembly, execution policy or Host reservation");
+
+    request.rank.draft          = {{2048, 2048}, {16, 16}, {4, 4}, {6144, 6144}};
+    request.options.speculative = {SpeculativeBackend::DFlash2, 7, ProposalHead::Optimized};
+    wire::Encoder draft_out;
+    glm::encode_rank_load(draft_out, request);
+    const auto draft_bytes = std::move(draft_out).take();
+    wire::Decoder draft_in(draft_bytes);
+    const auto draft = glm::decode_rank_load(draft_in);
+    draft_in.finish();
+    require(draft.rank.draft && draft.rank.draft->features == request.rank.draft->features &&
+                draft.rank.draft->query_heads == request.rank.draft->query_heads &&
+                draft.rank.draft->key_value_heads == request.rank.draft->key_value_heads &&
+                draft.rank.draft->intermediate == request.rank.draft->intermediate &&
+                draft.options.speculative.backend == SpeculativeBackend::DFlash2,
+            "GLM preparation lost the selected draft partition");
 
     q::RankLoadRequest qwen;
     qwen.options         = o;
@@ -181,6 +363,7 @@ void model_preparation() {
     qwen.rank.rank       = 1;
     qwen.rank.size       = 2;
     qwen.rank.experts    = {{{0, 1, 2}, {320, 320}}};
+    qwen.batches = models::make_batch_execution_spec(o.max_concurrency, 1, o.use_cuda_graph);
     wire::Encoder qw;
     q::encode_rank_load(qw, qwen);
     const auto qb = std::move(qw).take();
@@ -203,6 +386,7 @@ void model_preparation() {
                                        true,
                                        false};
     r.state                         = {{1024, 256}, {1536, 256}, {1024, 512, 256}};
+    r.batches                       = request.batches;
     r.context.ranks                 = {{1, 2ULL << 30, 0}};
     r.context.state                 = {100, {{0, {{1, 1024, 256}}}, {1, {{1, 1536, 256}}}}};
     r.context.pools                 = {{0, 4096, 100, 16384, 8, {{1, {8192, 256}}}},
@@ -218,7 +402,8 @@ void model_preparation() {
     wire::Decoder ri(rb);
     const auto rd = glm::decode_rank_resources(ri);
     ri.finish();
-    require(rd.shape == r.shape && rd.state == r.state && rd.context == r.context &&
+    require(rd.shape == r.shape && rd.batches == r.batches && rd.state == r.state &&
+                rd.context == r.context &&
                 rd.budget.context_capacity_bytes == r.budget.context_capacity_bytes &&
                 rd.observation.memory.allocations.device_weights_bytes == 91ULL << 30 &&
                 rd.vision_max_features == r.vision_max_features,
@@ -248,8 +433,11 @@ void native_work() {
     q::VisionInputBindings bindings;
     q::WorkContract contract{
         {128, 2, 32, 3, KvCacheStorage::BFloat16, EnginePurpose::Generation}, 256, 250, true, true};
+    contract.batches = std::make_shared<const models::BatchExecutionPlan>(
+        models::make_batch_execution_spec(2, 1, false));
     const auto original = row();
     q::Work work{{}, q::MtpWork{{original}, {3}}};
+    q::plan_work_batch(work, *contract.batches);
     work.actions[0].operations = {ctx::RecordClear{{ctx::ContextMemory::Device, 16384, 1024}},
                                   ctx::RecordCopy{{ctx::ContextMemory::Device, 2176, 256},
                                                   {ctx::ContextMemory::Device, 4224, 256},
@@ -316,6 +504,7 @@ void native_work() {
     producer.rows   = {original};
     producer.visual = models::qwen::VisionWork{use, input_owner};
     q::Work producing{{}, producer};
+    q::plan_work_batch(producing, *contract.batches);
     wire::Encoder encoded_producer;
     q::encode_work(encoded_producer, producing, bindings, 0);
     const auto producer_bytes = std::move(encoded_producer).take();
@@ -338,6 +527,7 @@ void native_work() {
                                    q::SampleKind::FirstToken,
                                    {prefill_row},
                                    q::PlePrefetch{original.member, 23, {23, 24}, {31, 32}}}};
+    q::plan_work_batch(forward, *contract.batches);
     wire::Encoder forward_out;
     q::encode_work(forward_out, forward, bindings, 0);
     const auto forward_bytes = std::move(forward_out).take();
@@ -345,14 +535,14 @@ void native_work() {
     const auto forward_copy = q::decode_work(forward_in, bindings);
     contract.validate(forward_copy, runtime::FrameKind::Compute);
     const auto& f = std::get<q::ForwardWork>(forward_copy.operation);
-    require(f.prefetch->ids == std::vector<TokenId>{31, 32} && f.prefetch->frontier == 23 &&
-                f.rows[0].window_ends.empty(),
+    require(f.prefetch->ids == std::vector<TokenId>{31, 32} && f.prefetch->frontier == 23,
             "prefill window or PLE prefetch changed in transit");
 
     auto scoring_contract          = contract;
     scoring_contract.shape.purpose = EnginePurpose::CausalScoring;
     prefill_row.constrained        = false;
     q::Work score{{}, q::ScoreWork{prefill_row, {24}, 1}};
+    q::plan_work_batch(score, *contract.batches);
     wire::Encoder score_out;
     q::encode_work(score_out, score, bindings, 0);
     const auto score_bytes = std::move(score_out).take();
@@ -502,12 +692,14 @@ void compact_payloads() {
         true,
         true,
         64};
+    contract.batches = std::make_shared<const models::BatchExecutionPlan>(
+        models::make_batch_execution_spec(8, 1, false));
     auto control               = row();
     control.ids                = {23, 5};
     control.control_last_token = 8;
     control.rope_positions.clear();
-    control.window_ends = {1};
     q::Work work{{}, q::ForwardWork{q::ForwardKind::Control, q::SampleKind::None, {control}}};
+    q::plan_work_batch(work, *contract.batches);
     contract.validate(work, runtime::FrameKind::Compute);
     q::VisionInputBindings bindings;
     wire::Encoder encoded;
@@ -520,12 +712,12 @@ void compact_payloads() {
     const auto& r = q::work_rows(decoded).front();
     std::array<TokenId, 2> forced{};
     models::ControlTokens{r.ids, *r.control_last_token}.copy(forced);
-    require(forced == std::array<TokenId, 2>{5, 8} &&
-                r.window_ends == std::vector<std::uint32_t>{1},
-            "Control lost its committed token sequence or execution split");
-    const auto p = contract.payload_capacity(2);
-    runtime::protocol::validate_control_capacity(
-        {p.compute_work, p.context_work, p.decision, p.commit, 4096, 4096}, {1, 1}, {}, 2);
+    require(forced == std::array<TokenId, 2>{5, 8}, "Control lost its committed token sequence");
+    const auto p      = contract.payload_capacity(2);
+    const auto limits = runtime::protocol::control_transport_limits(
+        {p.compute_work, p.context_work, p.decision, p.commit, 4096, 4096}, {1, 1}, 2, true);
+    require(limits.message_bytes >= p.decision && limits.continuation_bytes >= 2 * p.decision,
+            "prepared control capacity cannot carry a full decision");
     contract.vocabulary += 8;
     auto& control_row  = std::get<q::ForwardWork>(work.operation).rows[0];
     control_row.ids[1] = contract.public_tokens;
@@ -533,6 +725,39 @@ void compact_payloads() {
     control_row.ids[1] = 5;
     std::get<q::ForwardWork>(work.operation).rows[0].ids.resize(65, 5);
     rejects([&] { contract.validate(work, runtime::FrameKind::Compute); });
+}
+
+void prepared_control_capacity() {
+    const runtime::protocol::ControlBudget budget{1024, 1024, 72ULL << 20, 2048, 4096, 4096};
+    int sockets[2];
+    require(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0, sockets) == 0,
+            "control capacity socketpair failed");
+    dist::Transport source, target;
+    source.add(1, dist::Socket(sockets[0]));
+    target.add(0, dist::Socket(sockets[1]));
+    source.start();
+    target.start();
+    source.reserve_capacity(runtime::protocol::control_transport_limits(budget, {1, 1}, 2, true));
+    target.reserve_capacity(runtime::protocol::control_transport_limits(budget, {1, 1}, 2, false));
+    const auto message = std::make_shared<wire::Message>(
+        wire::Message{wire::Kind::Supply, 1, wire::Bytes(budget.decision, std::byte{37})});
+    const std::array messages{dist::OutgoingMessage{1, message}};
+    require(source.try_send(messages, dist::Traffic::Continuation),
+            "prepared continuation did not fit its queue");
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    for (;;) {
+        if (auto received = poll_message(target)) {
+            const auto& payload = received->message.payload;
+            require(payload.size() == budget.decision && payload.data()[0] == std::byte{37} &&
+                        payload.back() == std::byte{37},
+                    "large continuation was truncated");
+            break;
+        }
+        require(std::chrono::steady_clock::now() < until, "large continuation stalled");
+        std::this_thread::yield();
+    }
+    source.close();
+    target.close();
 }
 
 void retained_payload() {
@@ -759,7 +984,10 @@ void diagnostic_backpressure() {
 
 int main() {
     try {
+        batch_plans();
         topology_identity();
+        communication_preparation();
+        communication_selection();
         model_preparation();
         cache_profiles_roundtrip();
         native_work();
@@ -769,6 +997,7 @@ int main() {
         terminal_messages();
         diagnostic_backpressure();
         retained_payload();
+        prepared_control_capacity();
         compact_payloads();
         inputs();
         RankSnapshot memory;
@@ -786,7 +1015,12 @@ int main() {
                                                            .preparation_peak_bytes      = 23,
                                                            .calibration_increment_bytes = 5};
         memory.communication.push_back(
-            {.group = 1, .size = 2, .startup_memory = CommunicationMemory{100, 20, 80}});
+            {.group    = 1,
+             .size     = 2,
+             .backends = {{.backend = CommunicationBackend::Nccl,
+                           .memory  = {.owned_host_bytes      = 64,
+                                       .registered_host_bytes = 64,
+                                       .library = LibraryCommunicationMemory{100, 20, 80}}}}});
         wire::Encoder out;
         runtime::protocol::encode(out, memory);
         runtime::protocol::encode(out, budget);
@@ -795,19 +1029,31 @@ int main() {
         const auto report   = runtime::protocol::rank_snapshot(in);
         const auto planning = runtime::protocol::memory_budget(in);
         in.finish();
-        require(report.rank == 1 && report.node == 3 &&
-                    report.memory.workspace.required_peak_bytes == 96 &&
-                    planning.headroom_bytes == 512 && planning.host_reservation_bytes == 1024 &&
-                    planning.planned_slack_bytes == 7 &&
-                    planning.graphs->preparation_increment_bytes == -12 &&
-                    planning.graphs->preparation_peak_bytes == 23 &&
-                    report.communication.at(0).startup_memory->tracked_device_bytes == 100 &&
-                    report.memory.experts->fixed_experts_per_layer ==
-                        std::vector<std::uint32_t>{1, 7, 3},
-                "resource observation lost rank identity, values or signed calibration");
+        require(
+            report.rank == 1 && report.node == 3 &&
+                report.memory.workspace.required_peak_bytes == 96 &&
+                planning.headroom_bytes == 512 && planning.host_reservation_bytes == 1024 &&
+                planning.planned_slack_bytes == 7 &&
+                planning.graphs->preparation_increment_bytes == -12 &&
+                planning.graphs->preparation_peak_bytes == 23 &&
+                report.communication.at(0).backends.at(0).memory.library->tracked_device_bytes ==
+                    100 &&
+                report.communication.at(0).backends.at(0).memory.owned_host_bytes == 64 &&
+                report.memory.experts->fixed_experts_per_layer ==
+                    std::vector<std::uint32_t>{1, 7, 3},
+            "resource observation lost rank identity, values or signed calibration");
         wire::Encoder snapshot;
         runtime::protocol::encode(snapshot, memory);
         const auto snapshot_bytes = std::move(snapshot).take().size();
+        auto model_snapshot       = memory;
+        model_snapshot.communication.clear();
+        wire::Encoder model_report;
+        runtime::protocol::encode(model_report, model_snapshot);
+        const auto model_bytes   = std::move(model_report).take().size();
+        const auto report_budget = runtime::protocol::with_communication_capacity(
+            {0, 0, 0, 0, 0, model_bytes}, memory.communication);
+        require(report_budget.report == snapshot_bytes,
+                "communication report capacity differs from the prepared snapshot");
         for (const auto& error :
              {std::string{}, std::string(runtime::protocol::kMeasurementErrorBytes + 1, 'x')}) {
             wire::Encoder boundary;

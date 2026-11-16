@@ -495,10 +495,7 @@ Weight native_weight(const WeightView& view, float input_scale) {
         out.csf.row_begin          = row_begin % rows;
         return out;
     }
-    const auto planes = weight_row_planes(region);
-    if (g.layout == QuantLayout::RowScale && !is_complete_weight(view)) {
-        throw std::invalid_argument("row-scaled FP8 native input requires a complete parent");
-    }
+    const auto planes        = weight_row_planes(region);
     const auto row_alignment = planes.swizzled_scales ? 128 : g.scale_block_rows;
     if (planes.row_begin % row_alignment || planes.row_count % row_alignment) {
         throw std::invalid_argument("native weight view splits a scale tile");

@@ -60,7 +60,7 @@ pair_down_dot(const float* activation, ExpertMatrixDeviceView bank, const float*
     const int lane   = threadIdx.x & 31;
     const int expert = experts[route];
     const int mate   = mates[route];
-    if (includes(kind, mask, expert)) {
+    if (expert_in_subset(kind, mask, expert)) {
         const auto weight = resolve(bank, expert);
         float sum[Rows] = {}, other[Rows] = {};
         for (int block = 0; block < Intermediate / 128; ++block) {
@@ -96,7 +96,7 @@ pair_down_dot(const float* activation, ExpertMatrixDeviceView bank, const float*
     // Token 1's unmatched experts still execute their full original dot product.
     const int second   = experts[kTopK + route];
     const bool matched = !unmatched[route];
-    if (!matched && includes(kind, mask, second)) {
+    if (!matched && expert_in_subset(kind, mask, second)) {
         const auto weight = resolve(bank, second);
         float sum[Rows]   = {};
         for (int block = 0; block < Intermediate / 128; ++block) {
@@ -133,7 +133,8 @@ __global__ void pair_gate(const __nv_bfloat16* x, ExpertMatrixDeviceView bank, c
         const unsigned other   = matches & (a < kTopK ? 0xff00u : 0xffu);
         const int mate         = other ? __ffs(other) - 1 : -1;
         if (a < 2 * kTopK) experts[a] = e;
-        const bool active   = a < 2 * kTopK && includes(kind, mask, e) && (a < kTopK || !other);
+        const bool active =
+            a < 2 * kTopK && expert_in_subset(kind, mask, e) && (a < kTopK || !other);
         const unsigned bits = __ballot_sync(0xffffffff, active);
         if (active) {
             const int ordinal    = __popc(bits & ((1u << a) - 1));
@@ -165,7 +166,7 @@ __global__ void pair_down(const float* activation, ExpertMatrixDeviceView bank, 
     if (threadIdx.x < 32) {
         const int rank = threadIdx.x, e = rank < 2 * kTopK ? ids[rank] : kExperts + rank;
         const unsigned matches        = __match_any_sync(0xffffffff, e);
-        const bool local              = rank < 2 * kTopK && includes(kind, mask, e);
+        const bool local              = rank < 2 * kTopK && expert_in_subset(kind, mask, e);
         const unsigned second_matches = __shfl_down_sync(0xffffffff, matches, 8);
         const bool second_local       = __shfl_down_sync(0xffffffff, int(local), 8);
         const bool active = rank < kTopK && (local || (second_local && !(second_matches & 0xffu)));
@@ -180,12 +181,14 @@ __global__ void pair_down(const float* activation, ExpertMatrixDeviceView bank, 
         if (!rank) active_count = __popc(bits);
     }
     __syncthreads();
-    const int count = active_count;
+    const int count       = active_count;
+    const bool first_live = output.is_live(0), second_live = output.is_live(1);
     if (!count) {
         for (int row = blockIdx.x * 32 + threadIdx.x; row < kHidden; row += gridDim.x * 32)
             if (threadIdx.x < 32) {
-                output.store(row, output.initial(row));
-                output.store(kHidden + row, output.initial(kHidden + row));
+                output.store(row, output.initial(row, first_live), first_live);
+                output.store(kHidden + row, output.initial(kHidden + row, second_live),
+                             second_live);
             }
         return;
     }
@@ -209,8 +212,9 @@ __global__ void pair_down(const float* activation, ExpertMatrixDeviceView bank, 
                 first += values[g][0][rank][r];
                 second += values[g][1][rank][r];
             }
-            output.store(row, output.initial(row) + first);
-            output.store(kHidden + row, output.initial(kHidden + row) + second);
+            output.store(row, output.initial(row, first_live) + first, first_live);
+            output.store(kHidden + row, output.initial(kHidden + row, second_live) + second,
+                         second_live);
         }
         __syncthreads();
     }

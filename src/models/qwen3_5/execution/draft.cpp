@@ -101,8 +101,7 @@ void append_context_impl(DraftExecutionView& execution, const Tensor& features,
         if (config.dflash2) {
             std::array<ops::ContextKVMaterializeLayerView, ops::kContextKVMaterializeLayers> layers;
             if (config.num_hidden_layers != layers.size() ||
-                config.local_layer_count() != layers.size() || config.rms_norm_eps != 1e-6F ||
-                config.rope_theta != 1e7F) {
+                config.local_layer_count() != layers.size()) {
                 throw std::invalid_argument(
                     "masked draft context: config is outside the fused materialization contract");
             }
@@ -115,15 +114,16 @@ void append_context_impl(DraftExecutionView& execution, const Tensor& features,
                 replace_local_window ? positions.slice(0, local_offset, local_width) : positions;
             ops::context_kv_materialize(
                 context.view({dimension(target.hidden_size), local_width, batch}), local_positions,
-                local_counts, layers, {local_envelope.min_count, local_envelope.max_count},
-                execution.work, execution.cuda);
+                local_counts, layers, *execution.parameters.profile->draft->context_materialization,
+                {local_envelope.min_count, local_envelope.max_count}, execution.work,
+                execution.cuda);
         } else {
             for (int layer = 0; layer < dimension(config.num_hidden_layers); ++layer) {
                 auto layer_scope = execution.work.scope();
                 const auto& weight =
                     execution.parameters.draft->layers.at(static_cast<std::size_t>(layer));
                 const bool local_layer =
-                    config.layer_types[layer] == DraftAttentionKind::SlidingAttention;
+                    config.layer_types[layer] == dflash::AttentionKind::SlidingAttention;
                 const int layer_width   = local_layer ? local_width : width;
                 const int layer_columns = layer_width * batch;
                 Tensor layer_context    = local_layer && replace_local_window
@@ -182,8 +182,8 @@ void prepare_dynamic_branch(DraftExecutionView& execution, const Tensor& residua
     auto scope      = execution.work.scope();
     const int width = residual.ne[1], batch = residual.ne[2];
     MemoryArena scratch(execution.work.alloc_bytes(
-        ops::rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(width, width, batch,
-                                                                           batch)));
+        ops::rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(residual.ne[0], width,
+                                                                           width, batch, batch)));
     ops::rmsnorm_dynamic_grouped_conv_prepare(residual, norm, eps, weights.base_kernel,
                                               weights.kernel_projection.weight, branch.prepared,
                                               branch.finish_delta, scratch, execution.cuda);
@@ -204,13 +204,8 @@ void finish_dynamic_branch(DraftExecutionView& execution, const Tensor& input,
 void propose_dflash2_batch(DraftExecutionView& execution, const DraftInputs& inputs,
                            DraftOutputs& outputs, int batch, int k, DraftEnvelopes envelopes) {
     if (execution.parameters.profile->config.draft->dflash2) {
-        const auto& target = execution.parameters.profile->config.text;
-        const auto& config = *execution.parameters.profile->config.draft;
-        if (config.rms_norm_eps != 1e-6F || config.rope_theta != 1e7F) {
-            throw std::invalid_argument(
-                "DFlash2: fused norm/RoPE requires epsilon=1e-6 and theta=1e7");
-        }
-
+        const auto& target             = execution.parameters.profile->config.text;
+        const auto& config             = *execution.parameters.profile->config.draft;
         const int width                = k + 1;
         const int columns              = width * batch;
         const int mask_columns         = k * batch;
@@ -255,7 +250,8 @@ void propose_dflash2_batch(DraftExecutionView& execution, const DraftInputs& inp
                 std::array outputs{query_flat, key_flat, value_flat};
                 ops::linear_split(branch.prepared.view({dimension(target.hidden_size), columns}),
                                   layer.query_key_value.weight, outputs, cuda);
-                ops::rmsnorm_rope(positions, layer.query_norm, layer.key_norm, query, key, cuda);
+                ops::rmsnorm_rope(positions, layer.query_norm, layer.key_norm, config.rms_norm_eps,
+                                  config.rope_theta, query, key, cuda);
                 Tensor attention = work.alloc(
                     DType::BF16, {dimension(config.attention.head_dim),
                                   dimension(config.attention.num_attention_heads), width, batch});
@@ -289,7 +285,7 @@ void propose_dflash2_batch(DraftExecutionView& execution, const DraftInputs& inp
             }
         }
         Tensor hidden = work.alloc(DType::BF16, {dimension(target.hidden_size), mask_columns});
-        ops::rmsnorm_pack_tail(residual, weights.final_norm, hidden, cuda);
+        ops::rmsnorm_pack_tail(residual, weights.final_norm, config.rms_norm_eps, hidden, cuda);
         Tensor candidates = outputs.candidate_ids;
         Tensor ids_flat =
             candidates.view({dimension(config.dflash2->selector_top_k), mask_columns});
@@ -318,8 +314,9 @@ void propose_dflash2_batch(DraftExecutionView& execution, const DraftInputs& inp
         ops::candidate_selector_path(
             candidates, scores.view({dimension(config.dflash2->selector_top_k), k, batch}),
             projected.view({dimension(config.dflash2->selector_rank), k, batch}), anchors,
-            weights.selector->predecessor_codebook, weights.selector->successor_codebook, frontiers,
-            inputs.sampling, drafts, proposal_q, work, cuda);
+            weights.selector->predecessor_codebook, weights.selector->successor_codebook,
+            dimension(execution.parameters.profile->public_tokens), frontiers, inputs.sampling,
+            drafts, proposal_q, inputs.live_rows, work, cuda);
         work.reset();
     }
 }
@@ -408,7 +405,7 @@ void propose_batch_impl(DraftExecutionView& execution, const DraftInputs& inputs
                 Tensor attention_batch = roots.attention.view(
                     {dimension(config.attention.head_dim),
                      dimension(config.attention.num_attention_heads), width, batch_size});
-                if (config.layer_types[layer] == DraftAttentionKind::SlidingAttention) {
+                if (config.layer_types[layer] == dflash::AttentionKind::SlidingAttention) {
                     ops::sliding_window_attention(
                         query_batch, key_batch, value_batch, positions, valid_columns,
                         {dimension(config.attention.head_dim),
@@ -522,8 +519,8 @@ void draft_propose(DraftExecutionView execution, const DraftInputs& inputs, Draf
                    DraftEnvelopes envelopes) {
     if (!execution.parameters.draft) throw std::logic_error("draft parameters are unavailable");
     const auto width = outputs.ids.ne[0], batch = outputs.ids.ne[1];
-    if (width < 2 || width > 16 || batch < 1 || batch > static_cast<int>(kMaximumConcurrency) ||
-        outputs.drafts.ne[0] != width - 1 || outputs.drafts.ne[1] != batch) {
+    if (width < 2 || width > 16 || batch < 1 || outputs.drafts.ne[0] != width - 1 ||
+        outputs.drafts.ne[1] != batch) {
         throw std::invalid_argument("draft proposal has invalid geometry");
     }
     propose_batch_impl(execution, inputs, outputs, batch, width - 1, envelopes);

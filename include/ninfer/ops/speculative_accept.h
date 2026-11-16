@@ -9,7 +9,7 @@
 namespace ninfer::ops {
 
 struct SpeculativeAcceptExecutionEnvelope {
-    // Every row has temperature<=0, both penalties disabled and no token mask.
+    // Every live row has temperature<=0, both penalties disabled and no token mask.
     // False retains support for any registered mixture of greedy and stochastic rows.
     bool all_rows_greedy_without_penalties = false;
 };
@@ -43,14 +43,17 @@ struct SpeculativeAcceptExecutionEnvelope {
  * storage. All inputs, counts, positions and proposals remain unchanged. The caller commits
  * its final prefix and updates counts separately.
  *
+ * live_rows is empty for dense execution or contiguous Device I32 [B] with values 0/1.
+ * An inactive row writes zero tokens/count without reading proposals, logits, configs,
+ * positions or extents. A live row with zero draft extent still emits a target token.
  * Uses caller-owned workspace reported by the capacity query; no hidden Device allocation.
  */
 void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor& logits,
                                       const Tensor& drafts, const Tensor& current_extents,
                                       const Tensor& base_positions, Tensor& licensed_tokens,
                                       Tensor& licensed_counts, std::int32_t token_domain,
-                                      const SamplingConfig* configs, MemoryArena& workspace,
-                                      CudaExecutionView execution);
+                                      const SamplingConfig* configs, const Tensor& live_rows,
+                                      MemoryArena& workspace, CudaExecutionView execution);
 
 // The raw-greedy envelope requires no workspace.
 [[nodiscard]] std::size_t speculative_accept_sparse_drafts_workspace_capacity_bytes(
@@ -66,7 +69,7 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
  * acceptance samples the target bonus column. Target filtering, prefix penalties and RNG
  * positions/purposes follow speculative_accept_greedy_drafts.
  *
- * Registered profile: token_domain=248077, K=1..15, B=1..8, BF16 logits [248320,K+1,B],
+ * Registered profile: token_domain=248077, K=1..15, B>=1, BF16 logits [248320,K+1,B],
  * I32 target_tokens/licensed_tokens [K+1,B], I32 drafts [K,B], I32 candidate_ids [16,K,B],
  * FP32 proposal_q [16,K,B], I32 current_extents/base_positions/licensed_counts [B]. Everything
  * is contiguous except drafts, which permits positive, naturally aligned, non-overlapping
@@ -80,7 +83,9 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
  * The caller adopts a final output prefix and owns every persistent state/count update.
  *
  * A true all_rows_greedy_without_penalties envelope enables the raw-target warp route; false
- * supports mixed rows. Uses caller-owned capacity-query workspace with no hidden allocation.
+ * supports mixed rows. live_rows follows the greedy-proposal entry, including zero output
+ * and no input access for inactive rows. Uses caller-owned capacity-query workspace with no
+ * hidden allocation.
  */
 void speculative_accept_sparse_drafts(const Tensor& target_tokens, const Tensor& logits,
                                       const Tensor& drafts, const Tensor& candidate_ids,
@@ -89,6 +94,7 @@ void speculative_accept_sparse_drafts(const Tensor& target_tokens, const Tensor&
                                       Tensor& licensed_counts, std::int32_t token_domain,
                                       const SamplingConfig* configs,
                                       SpeculativeAcceptExecutionEnvelope envelope,
-                                      MemoryArena& workspace, CudaExecutionView execution);
+                                      const Tensor& live_rows, MemoryArena& workspace,
+                                      CudaExecutionView execution);
 
 } // namespace ninfer::ops

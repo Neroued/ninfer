@@ -62,7 +62,12 @@ void rank_loading(const artifact::Reader& reader, DeviceContext& device, std::ui
                 (ep == 1 ? QType::FP8_E4M3FN_BLOCK64X64_BF16 : QType::FP8_E4M3FN_BLOCK128X128_BF16),
         "local expert geometry or FP8 refinement differs");
     const auto weight_bytes = selected.materialization().device_capacity_bytes;
-    auto plan               = q4::plan_execution(profile, {}, options, device, 16 * GiB);
+    auto plan               = q4::plan_execution(
+        profile, {}, options,
+        std::make_shared<const models::BatchExecutionPlan>(models::make_batch_execution_spec(
+            options.max_concurrency, 1,
+            options.use_cuda_graph && options.purpose == EnginePurpose::Generation)),
+        device, 16 * GiB);
     require(plan && !plan->ple_prepare_bytes && !plan->ple_upload.device_bytes &&
                 plan->profile->local.gdn.value_heads == 24,
             "rank state/PLE planning differs");
@@ -204,7 +209,7 @@ void ple_window(q4::Resources& resources, const q4::ModelShard& model, DeviceCon
     const std::array<std::int32_t, 3> ids{123, 456, 789};
     const auto eos = model.definition().config().text.ple.eos;
     const q4::ple::InputRow row{{1, 1, 0, {eos, eos}}, ids};
-    const auto ticket = resources.ple_prepare->prepare(3, {&row, 1});
+    const auto ticket = resources.ple_prepare->prepare(3, 1, {&row, 1});
     require(ticket.has_value(), "PLE slot unavailable");
     const std::array<std::uint32_t, 1> valid{3};
     resources.ple_prepare->seal(*ticket, valid);
@@ -265,7 +270,13 @@ int main(int argc, char** argv) {
                                   const EngineOptions& options, std::size_t available) {
             auto prototype = host ? q4::describe_moe_plan(*profile, options.moe) : nullptr;
             require(!host || prototype != nullptr, "target does not provide expert offload");
-            return q4::plan_execution(profile, geometry, options, device, available, prototype);
+            return q4::plan_execution(
+                profile, geometry, options,
+                std::make_shared<const models::BatchExecutionPlan>(
+                    models::make_batch_execution_spec(
+                        options.max_concurrency, 1,
+                        options.use_cuda_graph && options.purpose == EnginePurpose::Generation)),
+                device, available, prototype);
         };
         std::unique_ptr<q4::ModelShard> model;
         std::shared_ptr<const q4::execution::ModelProfile> profile;

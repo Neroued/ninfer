@@ -14,13 +14,16 @@ PrefixShortlistKey key(const Identity& identity, std::uint32_t frontier) {
     return {identity.digests.at(frontier), frontier, identity.tag};
 }
 
-std::shared_ptr<const Identity> capture_identity(const Sequence& s) {
+std::shared_ptr<const Identity> capture_identity(const Sequence& s,
+                                                 context::MetadataBudget& budget) {
+    if (!context::IdentityMetadata::can_copy(budget, s.identity)) return {};
     auto out       = std::make_shared<Identity>(s.identity);
     const auto end = s.continuation.metadata.main_frontier;
     out->tokens.resize(end);
     out->positions.truncate(end);
     out->digests.truncate(end);
-    return out;
+    const std::shared_ptr<const Identity> immutable = std::move(out);
+    return immutable->retention.retain(budget, immutable);
 }
 
 std::shared_ptr<const qwen::VisionExecutionInput>
@@ -44,7 +47,8 @@ const models::frontend::PreparedContextCache& RequestBasePlan::context_cache() c
 }
 
 std::optional<PrefixShortlistKey> RequestBasePlan::prefix_shortlist_key(std::uint32_t f) const {
-    if (!plan_->reuse || !plan_->can_checkpoint(f) || f > plan_->summary.prompt_tokens) return {};
+    // Prefix-index branches can fall inside media even though checkpoints cannot.
+    if (!plan_->reuse || !f || f > plan_->summary.prompt_tokens) return {};
     return detail::key(*plan_->identity, f);
 }
 
@@ -64,11 +68,6 @@ RequestBasePlan Session::plan_request(qwen::PreparedPrompt&& prompt,
     for (const auto id : input.token_ids)
         if (id < 0 || std::uint32_t(id) >= p.definition->resources().text.public_token_count)
             throw std::invalid_argument("prompt token is outside the public vocabulary");
-    std::uint32_t previous = 0;
-    for (const auto f : input.identity.rewrite_execution_frontiers) {
-        if (f <= previous || f > count) throw std::invalid_argument("invalid execution frontier");
-        previous = f;
-    }
     if (const auto& r = input.identity.rewrite_checkpoint;
         r && (!r->recovery_frontier || r->recovery_frontier > r->frontier || r->frontier > count))
         throw std::invalid_argument("invalid input recovery point");

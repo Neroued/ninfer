@@ -10,6 +10,7 @@
 #include "runtime/engine/context_capacity.h"
 #include "models/common/graph_preparation.h"
 #include "models/common/moe/schedule.h"
+#include "models/common/batch.h"
 
 namespace ninfer::models::qwen4_exp {
 struct PersistentLayout {
@@ -23,6 +24,7 @@ struct PersistentLayout {
 struct ExecutionPlan {
     std::shared_ptr<const execution::ModelProfile> profile;
     ExecutionShape shape;
+    std::shared_ptr<const BatchExecutionPlan> batches;
     PersistentLayout persistent;
     execution::WorkspacePlan workspace;
     std::shared_ptr<const moe::Plan> moe;
@@ -65,16 +67,17 @@ struct ExecutionPlan {
 // Shared-memory targets include planned Host preparation storage in the physical reservation.
 [[nodiscard]] std::optional<ExecutionPlan>
 plan_execution(std::shared_ptr<const execution::ModelProfile>, ple::disk::TableGeometry,
-               const EngineOptions&, DeviceContext&, std::size_t available_bytes,
-               std::shared_ptr<const moe::Plan> prototype = {}, bool control_owner = true,
-               std::size_t available_host_bytes = SIZE_MAX);
+               const EngineOptions&, std::shared_ptr<const BatchExecutionPlan>, DeviceContext&,
+               std::size_t available_bytes, std::shared_ptr<const moe::Plan> prototype = {},
+               bool control_owner = true, std::size_t available_host_bytes = SIZE_MAX);
 
 [[nodiscard]] ExecutionPlan plan_graph_probe(std::shared_ptr<const execution::ModelProfile>,
                                              ple::disk::TableGeometry, const EngineOptions&,
+                                             std::shared_ptr<const BatchExecutionPlan>,
                                              DeviceContext&, std::shared_ptr<const moe::Plan>,
                                              GraphProbeBacking = GraphProbeBacking::Inputs);
 
 [[nodiscard]] runtime::ContextCapacityPlan
 describe_execution_capacity(std::shared_ptr<const execution::ModelProfile>, const EngineOptions&,
-                            DeviceContext&);
+                            std::shared_ptr<const BatchExecutionPlan>, DeviceContext&);
 } // namespace ninfer::models::qwen4_exp

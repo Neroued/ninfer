@@ -584,8 +584,10 @@ double registered_tensor_peak_tflops(const BenchPoint& point, const char*& profi
 
     // Report Tensor Core utilization only when the exact registered problem and extent determine
     // that the public route executes the named MMA profile.
-    if (point.qtype == QType::Q4_G64_FP16 && point.k == 2560 &&
-        (point.n == 248320 || point.n == 124160) && point.t > 1) {
+    if (point.qtype == QType::Q4_G64_FP16 &&
+        ((point.k == 2560 && (point.n == 248320 || point.n == 124160)) ||
+         (point.k == 5120 && point.n == 248320)) &&
+        point.t > 1) {
         profile = "BF16_F32ACC";
         return bench::kRoofline.bf16_f32_tflops;
     }
@@ -634,6 +636,13 @@ double registered_tensor_peak_tflops(const BenchPoint& point, const char*& profi
         profile = "BF16_F32ACC";
         return bench::kRoofline.bf16_f32_tflops;
     }
+    if (point.qtype == QType::BF16 && point.t > 1 &&
+        ((point.n == 2048 && point.k == 20480 && point.t > 8) ||
+         (point.n == 3072 && point.k == 4096) || (point.n == 12288 && point.k == 4096) ||
+         (point.n == 4096 && (point.k == 2048 || point.k == 6144)))) {
+        profile = "BF16_F32ACC";
+        return bench::kRoofline.bf16_f32_tflops;
+    }
     if (point.qtype == QType::BF16 && point.n == 1024 && point.k == 1024 && point.t > 1) {
         profile = "BF16_F32ACC";
         return bench::kRoofline.bf16_f32_tflops;
@@ -644,20 +653,22 @@ double registered_tensor_peak_tflops(const BenchPoint& point, const char*& profi
     }
     const bool nvfp4_problem =
         (point.n == 12288 && point.k == 4096) || (point.n == 4096 && point.k == 6144) ||
-        (point.k == 5120 && (point.n == 14336 || point.n == 16384 || point.n == 34816)) ||
-        (point.n == 5120 && (point.k == 6144 || point.k == 17408));
+        (point.k == 5120 &&
+         (point.n == 14336 || point.n == 16384 || point.n == 28672 || point.n == 34816)) ||
+        (point.n == 5120 && (point.k == 6144 || point.k == 14336 || point.k == 17408));
     if (point.qtype == QType::NVFP4 && nvfp4_problem) {
         const bool a4 =
             point.policy == LinearPolicy::AllowA4 &&
             ((point.n == 12288 && point.k == 4096 && point.t >= 17) ||
              (point.n == 4096 && point.k == 6144 && point.t >= 9) ||
-             (point.n == 14336 && point.t >= 4) || point.n == 16384 || point.n == 34816 ||
-             (point.k == 6144 && point.t >= 17) || (point.k == 17408 && point.t >= 8));
+             (point.n == 14336 && point.t >= 4) || (point.n == 28672 && point.t >= 8) ||
+             point.n == 16384 || point.n == 34816 || (point.k == 6144 && point.t >= 17) ||
+             (point.k == 14336 && point.t >= 5) || (point.k == 17408 && point.t >= 8));
         if (a4) {
             profile = "NVFP4_F32ACC";
             return bench::kRoofline.nvfp4_f32_tflops;
         }
-        if (point.t >= (point.k == 17408 ? 6 : 3)) {
+        if (point.t >= (point.k == 14336 ? 1 : point.n == 28672 ? 2 : point.k == 17408 ? 6 : 3)) {
             profile = "BF16_F32ACC";
             return bench::kRoofline.bf16_f32_tflops;
         }
@@ -678,6 +689,17 @@ double registered_tensor_peak_tflops(const BenchPoint& point, const char*& profi
         point.t > 1 && (point.policy == LinearPolicy::A16Only || point.t <= 16)) {
         profile = "BF16_F32ACC";
         return bench::kRoofline.bf16_f32_tflops;
+    }
+    if (point.qtype == QType::FP8_E4M3FN_ROW_BF16 && (point.n == 14976 || point.n == 5120) &&
+        point.k == 5120) {
+        if (point.policy != LinearPolicy::A16Only && point.t >= 17) {
+            profile = "MXFP8_F32ACC";
+            return bench::kRoofline.mxfp8_f32_tflops;
+        }
+        if (point.t > 1) {
+            profile = "BF16_F32ACC";
+            return bench::kRoofline.bf16_f32_tflops;
+        }
     }
     const bool fp8_problem =
         (point.n == 14336 && point.k == 5120) || (point.n == 16384 && point.k == 5120) ||
@@ -740,24 +762,25 @@ Result make_result(const BenchPoint& point, const LinearBenchWeight& weight,
         checked_add(weight.model_weight_bytes(), x_bytes, "model bytes"), out_bytes, "model bytes");
     std::uint64_t scratch_traffic = 0;
     if (point.qtype == QType::MXFP8) {
-        const auto& route = ops::detail::select_mxfp8_linear_route(
-            point.n, point.k, point.t, point.policy);
+        const auto& route =
+            ops::detail::select_mxfp8_linear_route(point.n, point.k, point.t, point.policy);
         if (route.compute == ops::detail::Mxfp8LinearCompute::A8) {
             const auto code_elements = checked_mul(static_cast<std::uint64_t>(point.k),
                                                    route.code_tokens(point.t), "code elements");
-            scratch_traffic = 2 * code_elements + 2 * x_elements / 32;
+            scratch_traffic          = 2 * code_elements + 2 * x_elements / 32;
         }
     } else if (point.qtype == QType::FP8_E4M3FN_BLOCK128X128_FP32) {
-        scratch_traffic = ops::detail::select_fp8_block_linear_route(
-                              point.n, point.k, point.t, point.policy)
-                              .scratch_traffic_bytes;
+        scratch_traffic =
+            ops::detail::select_fp8_block_linear_route(point.n, point.k, point.t, point.policy)
+                .scratch_traffic_bytes;
     }
-    const auto required_bytes = checked_add(model_bytes, scratch_traffic, "required traffic");
+    // Useful traffic is native weights, input and final output. Encoding/workspace
+    // round trips remain a separate cost; they must not inflate effective bandwidth.
     const double useful_flops = 2.0 * static_cast<double>(point.n) * static_cast<double>(point.k) *
                                 static_cast<double>(point.t);
     const double seconds = timing.median_us * 1.0e-6;
     const double memory_floor_us =
-        static_cast<double>(required_bytes) / (bench::kRoofline.memory_gbs * 1.0e9) * 1.0e6;
+        static_cast<double>(model_bytes) / (bench::kRoofline.memory_gbs * 1.0e9) * 1.0e6;
 
     Result result;
     result.labels                   = join_labels(point.labels);
@@ -777,19 +800,18 @@ Result make_result(const BenchPoint& point, const LinearBenchWeight& weight,
     result.median_us          = timing.median_us;
     result.min_us             = timing.min_us;
     result.p95_us             = timing.p95_us;
-    result.effective_gbs      = static_cast<double>(required_bytes) / seconds / 1.0e9;
+    result.effective_gbs      = static_cast<double>(model_bytes) / seconds / 1.0e9;
     result.dram_spec_pct      = result.effective_gbs / bench::kRoofline.memory_gbs * 100.0;
     result.sustained_read_pct = result.effective_gbs / bench::kRoofline.sustained_read_gbs * 100.0;
     result.useful_tflops      = useful_flops / seconds / 1.0e12;
     result.tensor_peak_tflops = registered_tensor_peak_tflops(point, result.tensor_profile);
     if (std::isfinite(result.tensor_peak_tflops)) {
-        result.tensor_peak_pct = result.useful_tflops / result.tensor_peak_tflops * 100.0;
+        result.tensor_peak_pct  = result.useful_tflops / result.tensor_peak_tflops * 100.0;
         result.compute_floor_us = useful_flops / (result.tensor_peak_tflops * 1.0e6);
     }
-    if (opt.cold && opt.graph_calls == 1 &&
-        std::isfinite(bench::kRoofline.sustained_read_gbs)) {
+    if (opt.cold && opt.graph_calls == 1 && std::isfinite(bench::kRoofline.sustained_read_gbs)) {
         result.sustained_memory_floor_us =
-            static_cast<double>(required_bytes) / (bench::kRoofline.sustained_read_gbs * 1.0e3);
+            static_cast<double>(model_bytes) / (bench::kRoofline.sustained_read_gbs * 1.0e3);
         if (std::isfinite(result.compute_floor_us)) {
             result.roofline_floor_us =
                 std::max(result.sustained_memory_floor_us, result.compute_floor_us);

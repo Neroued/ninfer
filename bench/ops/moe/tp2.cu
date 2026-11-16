@@ -155,11 +155,11 @@ void run(const Options& o) {
                 const auto call = [&](auto execution) {
                     if (complete) {
                         if (clamped)
-                            ops::topk_sigmoid_swiglu_moe(x, full_profile, weights, {}, y, workspace,
-                                                         execution);
+                            ops::topk_sigmoid_swiglu_moe(x, full_profile, weights, {}, y, {},
+                                                         workspace, execution);
                         else
                             ops::topk_softmax_swiglu_moe(x, softmax_profile, softmax_weights, {},
-                                                         ops::MoeEpilogue::Write, y, workspace,
+                                                         ops::MoeEpilogue::Write, y, {}, workspace,
                                                          execution);
                     } else
                         ops::routed_swiglu(x, profile, experts, routes, {}, ops::MoeEpilogue::Write,

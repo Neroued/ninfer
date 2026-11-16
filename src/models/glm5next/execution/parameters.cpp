@@ -168,6 +168,35 @@ Parameters::Parameters(const ModelShard& model, std::shared_ptr<const ModelProfi
                          p.mla(m.attention),
                          p.moe(m.moe)};
     }
+    if (w.draft) {
+        const auto& source       = *w.draft;
+        auto& out                = draft.emplace();
+        out.embedding            = native_weight(model.weight(source.token_embedding).view);
+        out.feature_projection   = p.linear({source.feature_projection});
+        out.head                 = p.linear({source.output_head});
+        out.selector             = p.linear({source.selector->hidden_projection});
+        out.context_norm         = p.tensor(source.context_norm);
+        out.final_norm           = p.tensor(source.final_norm);
+        out.predecessor_codebook = p.tensor(source.selector->predecessor_codebook);
+        out.successor_codebook   = p.tensor(source.selector->successor_codebook);
+        for (const auto& l : source.layers) {
+            const auto& a = l.attention;
+            out.layers.push_back(
+                {p.tensor(l.input_norm),
+                 p.tensor(l.post_attention_norm),
+                 p.tensor(a.query_norm),
+                 p.tensor(a.key_norm),
+                 p.linear({a.key, a.value, a.query}),
+                 p.linear({a.output}),
+                 p.linear({l.mlp.gate, l.mlp.up}),
+                 p.linear({l.mlp.down}),
+                 p.linear({a.context_key}).weight,
+                 p.linear({a.context_value}).weight,
+                 {p.tensor(l.attention_conv->base_kernel),
+                  p.linear({l.attention_conv->kernel_projection})},
+                 {p.tensor(l.mlp_conv->base_kernel), p.linear({l.mlp_conv->kernel_projection})}});
+        }
+    }
     if (w.vision) vision = p.vision(*w.vision);
 }
 

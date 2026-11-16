@@ -75,11 +75,12 @@ void launch(const Tensor& x, const Weight& w, const Arguments& a, float* scratch
         launch_q8_a16_sliced_k_mma<S>(operands, FloatOutput{scratch}, LinearIdentityEpilogue{},
                                       stream);
         conv_kernel<float>
-            <<<dim3(kProjectionFeatures / 128, (a.width + 3) / 4, a.batch), 128, 0, stream>>>(
-                a, scratch);
+            <<<dim3(kProjectionFeatures / 128, std::min<std::int64_t>((a.width + 3LL) / 4, 65535),
+                    std::min(a.batch, 65535)),
+               128, 0, stream>>>(a, scratch);
         if (a.destination)
-            history_kernel<<<dim3(kProjectionFeatures / 128, a.batch), 128, 0, stream>>>(a,
-                                                                                         scratch);
+            history_kernel<<<dim3(kProjectionFeatures / 128, std::min(a.batch, 65535)), 128, 0,
+                             stream>>>(a, scratch);
     } else {
         const auto layout = tiled_workspace(a.width, a.batch, a.destination != nullptr);
         TiledConvolution output{a, scratch,

@@ -29,13 +29,12 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
                                       const Tensor& drafts, const Tensor& current_extents,
                                       const Tensor& base_positions, Tensor& licensed_tokens,
                                       Tensor& licensed_counts, std::int32_t token_domain,
-                                      const SamplingConfig* configs, MemoryArena& workspace,
-                                      CudaExecutionView execution) {
+                                      const SamplingConfig* configs, const Tensor& live_rows,
+                                      MemoryArena& workspace, CudaExecutionView execution) {
     if (workspace.device() != execution.device()) {
         throw std::invalid_argument(
             "speculative_accept_greedy_drafts: workspace belongs to another device");
     }
-    const auto stream        = execution.stream();
     constexpr const char* op = "speculative_accept_greedy_drafts";
     const std::int32_t k     = drafts.ne[0];
     const std::int32_t batch = drafts.ne[1];
@@ -70,13 +69,25 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
     if (configs == nullptr) {
         throw std::invalid_argument("speculative_accept_greedy_drafts: configs must be non-null");
     }
+    if (live_rows.data) {
+        common::operand::tensor(live_rows, DType::I32, {batch}, 4, op, "live rows",
+                                execution.device());
+        for (const auto* output : {&licensed_tokens, &licensed_counts})
+            common::operand::disjoint(common::operand::range(live_rows, op),
+                                      common::operand::range(*output, op), op);
+    }
     auto scratch_scope       = workspace.scope();
     const auto plan          = greedy_drafts_detail::select_plan(token_domain, k + 1);
     const std::size_t bytes  = plan.workspace.bytes * static_cast<std::size_t>(batch);
     const MemorySpan scratch = bytes == 0 ? MemorySpan{} : workspace.alloc_bytes(bytes);
+    if (live_rows.data && scratch.data)
+        common::operand::disjoint(
+            common::operand::range(live_rows, "speculative_accept_greedy_drafts"),
+            common::operand::range(scratch.data, scratch.bytes, "speculative_accept_greedy_drafts"),
+            "speculative_accept_greedy_drafts");
     greedy_drafts_detail::launch(target_tokens, logits, drafts, current_extents, base_positions,
-                                 licensed_tokens, licensed_counts, token_domain, configs, plan,
-                                 scratch, stream);
+                                 licensed_tokens, licensed_counts, token_domain, configs, live_rows,
+                                 plan, scratch, execution);
 }
 
 } // namespace ninfer::ops

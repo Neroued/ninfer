@@ -1,3 +1,5 @@
+#include "models/common/context/recovery_value.h"
+#include "models/common/context/identity.h"
 #include "models/common/context/recovery.h"
 #include "models/common/context/release_inventory.h"
 #include "models/common/context/directory.h"
@@ -57,17 +59,25 @@ struct View {
     }
 };
 
-// Independent exhaustive definition: one maximum degradation per maximal removed branch.
+// Independent exhaustive definition: group positive recovery degradation, not removed aliases.
 std::uint64_t oracle(const View& view, std::span<const Handle> input,
                      std::span<const Handle> advertised) {
     std::vector<Handle> removed;
     for (const auto h : input)
         if (view.valid(h) && std::find(removed.begin(), removed.end(), h) == removed.end())
             removed.push_back(h);
+    const auto degraded = [&](Handle h) {
+        return std::none_of(advertised.begin(), advertised.end(), [&](auto kept) {
+            return view.valid(kept) &&
+                   std::find(removed.begin(), removed.end(), kept) == removed.end() &&
+                   view.frontier(kept) == view.frontier(h) && view.prefix(kept, h);
+        });
+    };
     std::uint64_t result = 0;
     for (const auto branch : removed) {
+        if (!degraded(branch)) continue;
         if (std::any_of(removed.begin(), removed.end(), [&](auto other) {
-                return other != branch && view.prefix(branch, other) &&
+                return other != branch && degraded(other) && view.prefix(branch, other) &&
                        (view.frontier(branch) < view.frontier(other) || other.index < branch.index);
             }))
             continue;
@@ -85,6 +95,22 @@ std::uint64_t oracle(const View& view, std::span<const Handle> input,
         result += worst;
     }
     return result;
+}
+
+void redundant_aliases_do_not_split_loss() {
+    View view;
+    const auto p = view.add({1});
+    const auto a = view.add({1, 2}), aa = view.add({1, 2});
+    const auto b = view.add({1, 3}), bb = view.add({1, 3});
+    context::RecoveryIndex index(view.metadata);
+    index.synchronize(view);
+    const std::array all{p, a, aa, b, bb};
+    auto evaluation = index.evaluate(all);
+    require(evaluation.loss(std::array{p}) == 1 && evaluation.loss(std::array{a, b}) == 0 &&
+                evaluation.loss(std::array{p, a, b}) == 1,
+            "redundant aliases split a shared ancestor's recovery loss");
+    require(evaluation.loss(std::array{p, a, aa, b}) == 2,
+            "removing the last equivalent source lost its real degradation");
 }
 
 void catalog_reclamation() {
@@ -216,9 +242,9 @@ void exhaustive_and_random() {
             std::erase_if(reduced, [&](auto h) {
                 return std::find(unavailable.begin(), unavailable.end(), h) != unavailable.end();
             });
-            require(
-                evaluation.loss(removed, unavailable) == oracle(view, removed, reduced),
-                "admission gain used a removed fallback or scored the victim as incoming value");
+            require(evaluation.loss(removed, unavailable) == oracle(view, removed, reduced),
+                    "admission gain used a removed fallback or scored the victim as incoming "
+                    "value");
         }
     }
 }
@@ -312,12 +338,140 @@ void marginal_dependencies() {
         }
     }
 }
+
+void recovery_workspace_returns_idle_high_water() {
+    context::MetadataBudget catalog(32ULL << 20);
+    context::RecoveryMetadata workspace(catalog, 2);
+    context::RecoveryIndex<> index(catalog, &workspace);
+    context::CheckpointStore<Record> store(512, catalog, &index);
+    const auto idle = workspace.budget().limit();
+    std::vector<Handle> handles;
+    for (unsigned i = 0; i < 257; ++i) {
+        const auto h = store.reserve();
+        require(h.has_value(), "workspace growth exhausted the fixture");
+        store.publish(*h, {{i + 1}, 0});
+        handles.push_back(*h);
+    }
+    const auto peak = workspace.budget().limit();
+    require(peak > idle, "catalog did not grow its protected workspace");
+    {
+        context::MetadataAccount active(workspace.budget());
+        active.acquire(1024);
+        for (auto h : handles) require(store.erase(h), "retirement failed");
+        require(store.metadata_extent() == 0 && workspace.budget().limit() == peak,
+                "active decision lost the workspace promised before checkpoint retirement");
+    }
+    require(workspace.budget().limit() == idle,
+            "idle decision workspace retained its high-water quota");
+    const auto h = store.reserve();
+    require(h && workspace.budget().limit() > idle && workspace.budget().limit() < peak,
+            "recycled low slots regrew the obsolete high-water workspace");
+    store.cancel(*h);
+    require(workspace.budget().limit() == idle, "cancelled catalog growth retained its quota");
+}
+
+void reserved_decision_metadata() {
+    context::MetadataBudget parent(1024);
+    {
+        context::MetadataBudget child(400, &parent);
+        require(parent.reserved() == 400, "child did not protect its quota");
+        child.acquire(120);
+        child.reserve(80);
+        child.consume(80);
+        require(parent.allocated() == 200 && parent.reserved() == 200,
+                "child spending was not visible to parent accounting");
+        child.release(200);
+        bool failed = false;
+        try {
+            child.grow(1025);
+        } catch (const context::MetadataExhausted&) { failed = true; }
+        require(failed && child.limit() == 400 && parent.reserved() == 400,
+                "failed quota growth changed accounting");
+    }
+    require(parent.available() == 1024, "child quota leaked on destruction");
+    const auto required = context::recovery_value_metadata_bytes(8, 2) +
+                          context::CheckpointStore<Record>::metadata_bytes(8) +
+                          context::RecoveryIndex<>::metadata_bytes(8);
+    context::MetadataBudget catalog(required);
+    context::RecoveryMetadata protected_work(catalog, 2);
+    context::RecoveryIndex<> index(catalog, &protected_work);
+    context::CheckpointStore<Record> store(8, catalog, &index);
+    auto handle = store.reserve();
+    require(handle.has_value(), "descriptor could not reserve its recovery workspace");
+    store.publish(*handle, {{1, 2, 3}, 0});
+    context::MetadataAccount other(catalog);
+    other.acquire(catalog.available());
+    context::MetadataAccount decision(protected_work.budget());
+    decision.acquire(protected_work.budget().available());
+    require(catalog.available() == 0 && decision.bytes() > 0,
+            "catalog pressure consumed its reserved eviction workspace");
+    require(store.erase(*handle), "decision metadata prevented checkpoint retirement");
+}
+
+void shared_identity_budget_survives_retirement() {
+    struct Identity {
+        std::vector<std::uint32_t> tokens;
+        context::IdentityMetadata retention;
+
+        std::size_t metadata_bytes() const {
+            return sizeof(*this) + tokens.capacity() * sizeof(std::uint32_t);
+        }
+    };
+
+    context::MetadataBudget directory(8ULL << 20);
+    context::RecoveryMetadata recovery(directory, 2, 1, 1, 2048);
+    auto& budget = recovery.identity_budget();
+    auto source  = std::make_shared<Identity>();
+    source->tokens.reserve(256);
+    source->tokens.assign(4, 7);
+    const std::shared_ptr<const Identity> immutable = source;
+    auto first                                      = source->retention.retain(budget, immutable);
+    require(first && budget.allocated() >= source->tokens.capacity() * sizeof(std::uint32_t),
+            "identity cache omitted unused vector capacity");
+    const auto charged = budget.allocated();
+    auto alias         = source->retention.retain(budget, immutable);
+    require(alias && budget.allocated() == charged,
+            "shared checkpoint identity was charged more than once");
+
+    auto other = std::make_shared<Identity>(*source);
+    other->tokens.reserve(256);
+    require(!other->retention.retain(budget, std::shared_ptr<const Identity>(other)) &&
+                budget.allocated() == charged,
+            "optional identity admission exceeded the bounded pool or inherited a copy's lease");
+
+    context::MetadataAccount remaining(budget);
+    remaining.acquire(budget.available());
+    auto decision = first->retention.retain(budget, first);
+    require(decision != nullptr, "required recovery could not borrow a paid identity at capacity");
+    remaining.release(remaining.bytes());
+    first.reset();
+    alias.reset();
+    require(budget.allocated() == charged,
+            "checkpoint retirement returned bytes still retained by a recovery decision");
+    decision.reset();
+    require(budget.allocated() == 0 && source->tokens.size() == 4,
+            "expired weak identity cache retained its quota while the request remained alive");
+
+    auto replacement = other->retention.retain(budget, std::shared_ptr<const Identity>(other));
+    require(replacement != nullptr, "retired decision quota was not reusable");
+    std::weak_ptr<const Identity> lifetime = replacement;
+    other.reset();
+    require(!lifetime.expired(), "cache lease did not own its complete identity backing");
+    replacement.reset();
+    require(lifetime.expired() && budget.allocated() == 0,
+            "last cache lease failed to release its backing and quota");
+}
+
 } // namespace
 
 int main() {
     try {
+        shared_identity_budget_survives_retirement();
+        recovery_workspace_returns_idle_high_water();
+        reserved_decision_metadata();
         catalog_reclamation();
         known_losses();
+        redundant_aliases_do_not_split_loss();
         lifecycle();
         exhaustive_and_random();
         physical_selection();

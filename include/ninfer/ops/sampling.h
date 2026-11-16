@@ -82,10 +82,12 @@ struct SamplingConfig {
  * logits, configs, logical_positions or any token-count array. The Op writes all of out, uses
  * caller-owned transient storage reported by sampling_workspace_capacity_bytes(), and has no
  * persistent-state side effect. The caller commits its final output with the count-update Op.
+ * live_rows is empty for dense execution or contiguous Device I32 [B] with values 0/1.
+ * A zero row writes token zero without reading logits, configs, positions, masks or counts.
  */
 void sample(const Tensor& logits, Tensor& out, std::int32_t token_domain,
             const SamplingConfig* configs, const Tensor& logical_positions, std::int32_t purpose,
-            MemoryArena& workspace, CudaExecutionView execution);
+            const Tensor& live_rows, MemoryArena& workspace, CudaExecutionView execution);
 
 // Adds every id in the contiguous non-empty I32 token_ids vector to the contiguous I32
 // [token_domain] committed count array. IDs must be in [0,token_domain).
@@ -93,7 +95,7 @@ void increment_token_counts(const Tensor& token_ids, Tensor& token_counts,
                             CudaExecutionView execution);
 
 // Adds the first valid_columns[b] IDs from I32 token_ids [T,B] to count slot slots[b] in
-// I32 token_counts [V,S]. T,V,S>0, B=1..8; valid_columns/slots are contiguous I32 [B].
+// I32 token_counts [V,S]. T,V,S,B>0; valid_columns/slots are contiguous I32 [B].
 // 0<=valid_columns[b]<=T; live rows have slots[b] in [0,S). IDs are in [0,V), and counts
 // remain representable in I32. A zero-length row reads neither IDs
 // nor its slot. Repeated IDs or slots add all occurrences atomically. Inputs are contiguous;

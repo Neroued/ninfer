@@ -1,7 +1,9 @@
 #pragma once
 
 #include "runtime/contract/resources.h"
+#include "runtime/contract/recovery.h"
 #include "runtime/engine/context_cache/types.h"
+#include "runtime/engine/context_cache/recovery_cost.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -38,6 +40,8 @@ class ReclaimSelection {
         bool private_proof = false;
     };
 
+    using LossSum = RecoveryCostSum;
+
     struct Part {
         std::uint32_t group;
         std::vector<Handle> additions;
@@ -53,13 +57,14 @@ class ReclaimSelection {
         std::uint64_t waiting      = 0;
         std::size_t snapshot_order = 0;
         bool allowed = true, chosen = false;
+        bool replaces_input = false;
     };
 
     struct Gain {
         const Admission* admission;
-        std::vector<Handle> matching, sources;
+        std::shared_ptr<const RecoveryDescription> target;
+        std::vector<Handle> sources;
         std::vector<std::uint32_t> groups;
-        std::size_t first = 0;
     };
 
 public:
@@ -114,10 +119,16 @@ public:
         candidates_.reserve(releases.size());
         for (const auto& release : releases) {
             Candidate candidate;
-            candidate.allowed = policy.may_revoke(release.sources, cursor.rights) &&
-                                std::none_of(release.sources.begin(), release.sources.end(),
-                                             [&](auto h) { return Policy::contains(excluded, h); });
+            candidate.allowed =
+                policy.may_revoke(release.sources, cursor.rights) &&
+                std::none_of(release.sources.begin(), release.sources.end(), [&](auto h) {
+                    return Policy::contains(excluded, h) ||
+                           Policy::contains(cursor.protected_points, h);
+                });
             if (candidate.allowed) {
+                candidate.replaces_input =
+                    cursor.admission && cursor.admission->replacement &&
+                    Policy::contains(release.sources, *cursor.admission->replacement);
                 candidate.waiting = policy.waiting_ticket(release.sources);
                 auto ordered      = release.sources;
                 std::sort(ordered.begin(), ordered.end(), [&](auto a, auto b) {
@@ -143,7 +154,10 @@ public:
                 continue;
             Gain gain{admission};
             if (admission->base) {
-                gain.matching = policy.incoming_candidates(session, *admission, evaluation);
+                gain.target = admission->target
+                                  ? admission->target
+                                  : session.recovery_target(*admission->base, admission->frontier,
+                                                            admission->placement);
             } else if (admission->checkpoint && index_.contains(*admission->checkpoint)) {
                 gain.sources = admission->sources;
                 if (gain.sources.empty()) gain.sources.push_back(*admission->checkpoint);
@@ -170,35 +184,42 @@ public:
                 continue;
             // Removing more checkpoints cannot lower recovery loss. Cached component losses
             // therefore bound this trial even after their component has changed.
-            auto bound = selected_;
-            bool known = true;
+            auto bound           = selected_;
+            auto bound_loss      = selected_loss_;
+            bound.replaces_input = bound.replaces_input || candidate.replaces_input;
+            bool known           = true;
             for (const auto& part : candidate.parts) {
                 if (!part.facts.loss) {
                     known = false;
                     break;
                 }
                 const auto prior = groups_[part.group].loss;
-                bound.loss += std::max(prior, *part.facts.loss) - prior;
+                bound_loss.replace(prior, std::max(prior, *part.facts.loss));
                 include_priority(bound.priority, part.facts.priority);
                 bound.order         = std::max(bound.order, part.facts.order);
                 bound.explicit_hint = bound.explicit_hint || part.facts.explicit_hint;
             }
+            bound.loss          = bound_loss.value();
             bound.units         = std::max<std::uint64_t>(1, value.useful_bytes(limits_));
             bound.waiting       = include_waiting(selected_.waiting, candidate.waiting);
             const auto snapshot = std::max(selected_snapshot_, candidate.snapshot_order);
             if (known && best &&
                 (snapshot > best->snapshot_order ||
-                 (snapshot == best->snapshot_order && !Policy::less_rank(bound, best->rank))))
+                 (snapshot == best->snapshot_order && !less_rank(bound, best->rank))))
                 continue;
-            auto rank = selected_;
+            auto rank           = selected_;
+            auto rank_loss      = selected_loss_;
+            rank.replaces_input = rank.replaces_input || candidate.replaces_input;
             for (auto& part : candidate.parts) {
                 const auto& group = groups_[part.group];
                 if (part.version != group.version) {
                     const auto changes =
                         std::span<const Handle>(group.removed).subspan(part.observed_removed);
                     if (!group.private_proof && part.dependencies &&
-                        !part.dependencies->intersects(changes)) {
-                        part.facts.loss = group.loss + (*part.facts.loss - part.prior_loss);
+                        *part.facts.loss != UINT64_MAX && part.prior_loss != UINT64_MAX &&
+                        group.loss != UINT64_MAX && !part.dependencies->intersects(changes)) {
+                        part.facts.loss =
+                            add_recovery_cost(group.loss, *part.facts.loss - part.prior_loss);
                     } else {
                         auto removed = group.removed;
                         for (const auto h : part.additions)
@@ -212,16 +233,18 @@ public:
                     part.observed_removed = group.removed.size();
                     part.version          = group.version;
                 }
-                rank.loss -= group.loss;
-                rank.loss += *part.facts.loss;
+                rank_loss.replace(group.loss, *part.facts.loss);
                 include_priority(rank.priority, part.facts.priority);
                 rank.order         = std::max(rank.order, part.facts.order);
                 rank.explicit_hint = rank.explicit_hint || part.facts.explicit_hint;
             }
+            rank.loss     = rank_loss.value();
             bool accepted = true;
             for (auto& gain : gains_) {
                 if (!Policy::admits_limits(rank.priority, rank.loss, *gain.admission, cursor_) ||
                     (!gain.admission->demand.reused() &&
+                     (gain.admission->purpose != CheckpointRole::InputReplay ||
+                      rank.priority.reused()) &&
                      gain_after(gain, candidate) <= rank.loss)) {
                     accepted = false;
                     break;
@@ -231,7 +254,7 @@ public:
             rank.units   = std::max<std::uint64_t>(1, value.useful_bytes(limits_));
             rank.waiting = include_waiting(selected_.waiting, candidate.waiting);
             if (!best || snapshot < best->snapshot_order ||
-                (snapshot == best->snapshot_order && Policy::less_rank(rank, best->rank)))
+                (snapshot == best->snapshot_order && less_rank(rank, best->rank)))
                 best = Choice{i, rank, snapshot};
         }
         return best;
@@ -251,6 +274,7 @@ public:
                     committed_[h.index] = true;
                     group.removed.push_back(h);
                 }
+            selected_loss_.replace(group.loss, *part.facts.loss);
             group.loss = *part.facts.loss;
             ++group.version;
         }
@@ -275,15 +299,18 @@ private:
         return values;
     }
 
-    std::uint64_t gain_after(Gain& gain, const Candidate& candidate) {
-        if (gain.admission->base) {
-            while (gain.first < gain.matching.size() && committed_[gain.matching[gain.first].index])
-                ++gain.first;
-            auto i = gain.first;
-            while (i < gain.matching.size() && measured_.contains(gain.matching[i])) ++i;
-            const auto fallback = i == gain.matching.size() ? 0 : index_.frontier(gain.matching[i]);
-            return gain.admission->frontier - fallback;
+    bool less_rank(const Rank& left, const Rank& right) const {
+        if (cursor_.admission && cursor_.admission->purpose == CheckpointRole::InputReplay &&
+            !left.waiting && !right.waiting && !left.priority.reused() &&
+            !right.priority.reused()) {
+            if (left.replaces_input != right.replaces_input) return left.replaces_input;
+            if (left.order != right.order) return left.order < right.order;
         }
+        return Policy::less_rank(left, right);
+    }
+
+    std::uint64_t gain_after(Gain& gain, const Candidate& candidate) {
+        if (gain.admission->base) { return index_.gain(*gain.target, measured_.handles()); }
         std::vector<Handle> unavailable;
         for (const auto group : gain.groups) {
             const auto& removed = groups_[group].removed;
@@ -322,6 +349,7 @@ private:
     std::vector<Candidate> candidates_;
     std::vector<Gain> gains_;
     Rank selected_;
+    LossSum selected_loss_;
     std::size_t selected_snapshot_ = 0;
 };
 

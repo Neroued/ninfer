@@ -1,4 +1,5 @@
 #pragma once
+#include "models/common/batch.h"
 #include "models/common/context/directory.h"
 #include "models/glm5next/execution_shape.h"
 #include "models/glm5next/state/context.h"
@@ -6,6 +7,7 @@
 namespace ninfer::models::glm5next {
 struct SessionPlan {
     ExecutionShape shape;
+    std::shared_ptr<const BatchExecutionPlan> batches;
     context::ContextDirectorySpec context;
     std::vector<StatePlacement> states;
     std::vector<KVPageLayout> caches;
@@ -15,5 +17,6 @@ struct SessionPlan {
 
 [[nodiscard]] runtime::ContextMetadataPlan
 session_metadata_plan(const context::ContextDirectorySpec&, const ContextPoolGeometry&,
-                      std::uint32_t rank, std::uint32_t count_vocabulary);
+                      std::uint32_t rank, std::uint32_t count_vocabulary, std::uint32_t concurrency,
+                      std::uint32_t max_context);
 } // namespace ninfer::models::glm5next

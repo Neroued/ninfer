@@ -28,7 +28,8 @@ RankPreparation::RankPreparation(const artifact::Reader& reader, std::span<const
         throw std::invalid_argument("Qwen4Exp rank plan differs from worker identity");
     if (request.artifact != reader.artifact_id())
         throw artifact::ArtifactError("Qwen4Exp worker artifact differs from coordinator");
-    options_                  = std::move(request.options);
+    batches_ = std::make_shared<const BatchExecutionPlan>(std::move(request.batches));
+    options_ = std::move(request.options);
     options_.startup_observer = observer;
     host_reservation_bytes_   = request.host_reservation_bytes;
     control_owner_            = request.control_owner;
@@ -37,13 +38,14 @@ RankPreparation::RankPreparation(const artifact::Reader& reader, std::span<const
                                     device_.device()));
     profile_       = execution::describe_model(load_->definition(), load_->weight_data(),
                                                load_->expert_data(), load_->rank_plan());
-    capacity_plan_ = describe_execution_capacity(profile_, options_, device_);
+    capacity_plan_ = describe_execution_capacity(profile_, options_, batches_, device_);
     const WorkContract contract{describe_execution_shape(*profile_, options_),
                                 profile_->config.text.vocabulary,
                                 profile_->public_tokens,
                                 bool(profile_->mtp),
                                 bool(profile_->vision),
-                                profile_->control_token_limit};
+                                profile_->control_token_limit,
+                                batches_};
     host_reservation_bytes_ +=
         runtime::protocol::work_payload_memory(contract.payload_capacity(topology.ranks.size()),
                                                {1, 1}, topology.ranks.size(), control_owner_);
@@ -61,38 +63,39 @@ void RankPreparation::materialize() {
     load_.reset();
 }
 
-void RankPreparation::prepare_communication() {
+std::vector<distributed::GroupRequirements> RankPreparation::communication_requirements() const {
     using distributed::Collective;
     using distributed::Reduction;
-    const auto plan   = plan_graph_probe(profile_, {}, options_, device_, {});
+    const auto plan   = plan_graph_probe(profile_, {}, options_, batches_, device_, {});
     const auto& shape = plan.shape;
     const auto hidden = std::size_t(profile_->config.text.hidden);
     const auto batch  = std::size_t(shape.max_concurrency);
     const auto decode = batch * (shape.draft_tokens + 1);
-    std::vector<distributed::CollectivePreparation> work;
-    for (const auto columns : {std::size_t(1), batch, decode, std::size_t(shape.prefill_chunk)}) {
-        work.push_back({Collective::AllReduce, DType::BF16, hidden * columns});
-        if (plan.persistent.buffers.ple_embedding)
-            work.push_back({Collective::AllReduce, DType::U32,
-                            profile_->config.text.ple.embedding * columns *
-                                dtype_size(DType::BF16) / dtype_size(DType::U32)});
+    distributed::GroupRequirements result{binding_.group->id(), {}, {}};
+    auto& work         = result.collectives;
+    const auto columns = std::max({batch, decode, std::size_t(shape.prefill_chunk)});
+    work.push_back({Collective::AllReduce, DType::BF16, hidden, hidden * columns, hidden});
+    if (plan.persistent.buffers.ple_embedding) {
+        const auto words =
+            profile_->config.text.ple.embedding * dtype_size(DType::BF16) / dtype_size(DType::U32);
+        work.push_back({Collective::AllReduce, DType::U32, words, words * columns, words});
     }
     if (shape.purpose == EnginePurpose::Generation) {
-        for (const auto columns : {std::size_t(1), batch, decode})
-            work.push_back(
-                {Collective::AllGather, DType::I64, DistributedVocabulary::candidates * columns});
+        constexpr auto candidates = std::size_t(DistributedVocabulary::candidates);
+        work.push_back(
+            {Collective::AllGather, DType::I64, candidates, candidates * decode, candidates});
         if (profile_->mtp)
-            work.push_back({Collective::AllReduce, DType::U64, batch, Reduction::Max});
+            work.push_back({Collective::AllReduce, DType::U64, 1, batch, 1, Reduction::Max});
     } else {
-        work.push_back({Collective::AllGather, DType::FP32,
-                        3 * std::size_t(std::min(shape.prefill_chunk, 1024U))});
+        work.push_back({Collective::AllGather, DType::FP32, 3,
+                        3 * std::size_t(std::min(shape.prefill_chunk, 1024U)), 3});
     }
     if (plan.workspace.vision)
         for (std::uint32_t root = 0; root < binding_.group->size(); ++root)
-            work.push_back({Collective::Broadcast, DType::BF16,
-                            plan.workspace.vision->output_bytes / dtype_size(DType::BF16),
+            work.push_back({Collective::Broadcast, DType::BF16, hidden,
+                            plan.workspace.vision->output_bytes / dtype_size(DType::BF16), hidden,
                             Reduction::Sum, root});
-    binding_.group->prepare(work, {}, device_.execution_view());
+    return {std::move(result)};
 }
 
 runtime::RankPreparationReport RankPreparation::report(std::size_t available) const {
@@ -123,7 +126,7 @@ void RankPreparation::prepare_rebuild_probe() {
 }
 
 void RankPreparation::create_probe(GraphProbeBacking backing) {
-    auto plan = plan_graph_probe(profile_, {}, options_, device_, {}, backing);
+    auto plan = plan_graph_probe(profile_, {}, options_, batches_, device_, {}, backing);
     probe_    = std::make_unique<RankProgram>(instance_->parameters, std::move(plan), device_,
                                               options_.startup_observer, binding_);
 }
@@ -157,7 +160,7 @@ void RankPreparation::prepare(runtime::ContextCapacity capacity, std::size_t ava
     auto options             = options_;
     options.context_capacity = ContextCapacityPolicy::explicit_capacity(capacity.device_bytes);
     const auto reserve       = graph_memory_.rebuild_estimate_bytes;
-    auto plan                = plan_execution(profile_, {}, options, device_,
+    auto plan                = plan_execution(profile_, {}, options, batches_, device_,
                                available > reserve ? available - reserve : 0, {}, control_owner_,
                                               available_host_bytes);
     if (!plan) {

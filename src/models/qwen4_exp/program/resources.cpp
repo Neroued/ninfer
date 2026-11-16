@@ -17,7 +17,7 @@ ExecutionPlan checked_plan(const execution::Parameters& p, ExecutionPlan plan) {
 
 Resources::Resources(const execution::Parameters& p, ExecutionPlan input, DeviceContext& device,
                      const StartupObserver& observer)
-    : plan(checked_plan(p, std::move(input))), device_(device),
+    : plan(checked_plan(p, std::move(input))), device_(device), buffers_(plan.persistent.buffers),
       context_(device.device(), plan.capacity.device_bytes),
       persistent_(device.device(), plan.persistent.bytes),
       workspace_(device.device(), plan.workspace.bytes), ingress_(plan.pinned_io_bytes),
@@ -93,10 +93,6 @@ Resources::Resources(const execution::Parameters& p, ExecutionPlan input, Device
         copy_bytes(raw->region.bind(backing),
                    {configs.data(), configs.size() * sizeof(configs.front()), Device::cpu()},
                    device.execution_view());
-        const std::vector<std::int32_t> columns(plan.shape.max_concurrency, 1);
-        copy_bytes(plan.persistent.buffers.proposal_columns->region.bind(backing),
-                   {columns.data(), columns.size() * sizeof(columns.front()), Device::cpu()},
-                   device.execution_view());
     }
     device.synchronize();
 }
@@ -146,10 +142,21 @@ const QsaCache& Resources::pool(std::uint32_t index) const {
 Tensor Resources::tensor(const TensorRegion& region) { return region.bind(persistent()); }
 
 Tensor Resources::packed(const TensorRegion& region, std::initializer_list<std::int32_t> shape) {
-    std::int32_t count = 1;
-    for (const auto n : shape) count *= n;
-    auto value = tensor(region);
-    return value.view({static_cast<std::int32_t>(value.numel())}).slice(0, 0, count).view(shape);
+    std::size_t bytes = dtype_size(region.dtype);
+    for (const auto extent : shape) {
+        if (extent < 1 || bytes > SIZE_MAX / std::size_t(extent))
+            throw std::invalid_argument("Qwen4Exp packed tensor extent is invalid");
+        bytes *= extent;
+    }
+    if (bytes > region.region.bytes)
+        throw std::invalid_argument("Qwen4Exp packed tensor exceeds frame capacity");
+    return Tensor(region.region.bind(persistent()).subspan(0, bytes), region.dtype, shape);
+}
+
+void Resources::select_batch(std::uint32_t rows) {
+    if (selected_rows_ == rows) return;
+    select_buffer_rows(buffers_, plan.persistent.buffers, rows);
+    selected_rows_ = rows;
 }
 
 namespace {
@@ -169,15 +176,15 @@ execution::BatchView bind_batch(Resources& resources, const Layout& layout,
             row(tables),
             row(layout.base_positions),
             row(layout.record_offsets),
-            visible};
+            visible,
+            row(layout.live_rows)};
 }
 } // namespace
 
 execution::BatchView Resources::main_batch(std::int32_t tokens, std::int32_t batch,
                                            std::uint32_t visible, bool sequence) {
-    const auto& layout = sequence ? plan.persistent.buffers.batch : plan.persistent.buffers.decode;
-    const auto& ids =
-        !sequence && tokens > 1 ? plan.persistent.buffers.mtp->verify_ids : layout.ids;
+    const auto& layout = sequence ? buffers_.batch : buffers_.decode;
+    const auto& ids    = !sequence && tokens > 1 ? buffers_.mtp->verify_ids : layout.ids;
     return bind_batch(*this, layout, layout.main_tables, ids, tokens, batch, visible);
 }
 
@@ -187,7 +194,7 @@ execution::BatchView Resources::mtp_batch(const MtpBatchLayout& layout, std::int
 }
 
 ops::QsaTailStateView Resources::mtp_working_tail(std::uint32_t slot, std::int32_t batch) {
-    const auto& frame = *plan.persistent.buffers.mtp;
+    const auto& frame = *buffers_.mtp;
     const auto& qsa   = plan.profile->config.text.qsa;
     const auto width = dimension(qsa.index_key_width()), history = dimension(qsa.compression - 1);
     const auto keys        = packed(frame.tail_keys, {width, history, batch, 3}).slice(3, slot, 1);

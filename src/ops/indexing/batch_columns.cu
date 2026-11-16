@@ -1,3 +1,4 @@
+#include "ops/common/host/launch.h"
 #include "ops/common/host/operands.h"
 #include "ninfer/ops/indexing.h"
 #include <algorithm>
@@ -50,12 +51,16 @@ void gather_bf16_batch_columns_launch(const Tensor& source, const Tensor& select
     constexpr int kBlock = 256;
     const int rows       = source.ne[0];
     const int batch      = source.ne[2];
-    const dim3 grid(static_cast<unsigned int>(std::max(1, div_up(rows, kBlock))),
-                    static_cast<unsigned int>(batch));
-    gather_bf16_batch_columns_kernel<<<grid, kBlock, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(source.data),
-        static_cast<const std::int32_t*>(selectors.data), static_cast<__nv_bfloat16*>(out.data),
-        rows, source.ne[1]);
+    common::for_each_token_slice(batch, 1, [&](int offset, int count) {
+        const dim3 grid(static_cast<unsigned int>(std::max(1, div_up(rows, kBlock))),
+                        static_cast<unsigned int>(count));
+        gather_bf16_batch_columns_kernel<<<grid, kBlock, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(source.data) +
+                std::int64_t(offset) * rows * source.ne[1],
+            static_cast<const std::int32_t*>(selectors.data) + offset,
+            static_cast<__nv_bfloat16*>(out.data) + std::int64_t(offset) * rows, rows,
+            source.ne[1]);
+    });
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -111,8 +116,7 @@ void scatter_batch_columns(const Tensor& source, const Tensor& columns,
     namespace operand        = common::operand;
     constexpr const char* op = "scatter_batch_columns";
     const int d = source.ne[0], t = source.ne[1], b = source.ne[2];
-    if (d <= 0 || t <= 0 || b < 1 || b > 8 ||
-        (source.dtype != DType::BF16 && source.dtype != DType::I32))
+    if (d <= 0 || t <= 0 || b < 1 || (source.dtype != DType::BF16 && source.dtype != DType::I32))
         throw std::invalid_argument("scatter_batch_columns: invalid shape or type");
     const auto bytes = dtype_size(source.dtype);
     operand::tensor(source, source.dtype, {d, t, b}, bytes, op, "source", execution.device());
@@ -123,17 +127,20 @@ void scatter_batch_columns(const Tensor& source, const Tensor& columns,
                     execution.device());
     if (destination.field.layers != 1)
         throw std::invalid_argument("scatter_batch_columns: expected a single-layer field");
-    const dim3 grid(std::min(32, div_up(d, 256)), b);
-    const auto launch = [&]<class Word>() {
-        scatter_columns_kernel<<<grid, 256, 0, execution.stream()>>>(
-            static_cast<const Word*>(source.data), static_cast<const int*>(columns.data),
-            static_cast<const std::int64_t*>(destination.records.byte_offsets.data),
-            operand::state_field_base<Word>(destination), d, t);
-    };
-    if (source.dtype == DType::BF16)
-        launch.template operator()<std::uint16_t>();
-    else
-        launch.template operator()<std::uint32_t>();
+    common::for_each_token_slice(b, 1, [&](int offset, int count) {
+        const dim3 grid(std::min(32, div_up(d, 256)), count);
+        const auto launch = [&]<class Word>() {
+            scatter_columns_kernel<<<grid, 256, 0, execution.stream()>>>(
+                static_cast<const Word*>(source.data) + std::int64_t(offset) * t * d,
+                static_cast<const int*>(columns.data) + offset,
+                static_cast<const std::int64_t*>(destination.records.byte_offsets.data) + offset,
+                operand::state_field_base<Word>(destination), d, t);
+        };
+        if (source.dtype == DType::BF16)
+            launch.template operator()<std::uint16_t>();
+        else
+            launch.template operator()<std::uint32_t>();
+    });
     CUDA_CHECK(cudaGetLastError());
 }
 

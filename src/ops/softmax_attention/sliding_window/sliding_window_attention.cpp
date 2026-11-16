@@ -14,27 +14,24 @@
 namespace ninfer::ops {
 namespace {
 
-constexpr std::int32_t kHeadDim = 128;
-constexpr std::int32_t kQHeads  = 32;
-constexpr std::int32_t kKVHeads = 8;
-constexpr float kExpectedScale  = 0.08838834764831844055f;
-
-bool registered_window(std::uint32_t window) { return window == 2048 || window == 4096; }
+constexpr std::int32_t kMaximumGridRows = 65535;
+constexpr std::int32_t kHeadDim         = 128;
+constexpr float kExpectedScale          = 0.08838834764831844055f;
 
 void require_profile(AttentionHeadGeometry geometry, std::uint32_t window, const char* op) {
+    const bool full =
+        geometry.query_heads == 32 && geometry.kv_heads == 8 && (window == 2048 || window == 4096);
+    const bool half = geometry.query_heads == 16 && geometry.kv_heads == 4 && window == 2048;
     if (!valid_attention_head_geometry(geometry) || geometry.head_dim != kHeadDim ||
-        geometry.query_heads != kQHeads || geometry.kv_heads != kKVHeads) {
-        throw std::invalid_argument(std::string(op) + ": unsupported head geometry");
-    }
-    if (!registered_window(window)) {
-        throw std::invalid_argument(std::string(op) + ": supported windows are 2048 and 4096");
+        (!full && !half)) {
+        throw std::invalid_argument(std::string(op) + ": unsupported head/window profile");
     }
 }
 
-void validate_context(const ConstCyclicKVCacheLayerView& context, std::uint32_t window,
-                      const char* op, Device device) {
+void validate_context(const ConstCyclicKVCacheLayerView& context, AttentionHeadGeometry geometry,
+                      std::uint32_t window, const char* op, Device device) {
     common::operand::device(context.device(), device, op, "cache");
-    if (context.num_kv_heads != kKVHeads || context.head_dim != kHeadDim ||
+    if (context.num_kv_heads != geometry.kv_heads || context.head_dim != kHeadDim ||
         context.capacity != window || context.padded_capacity < context.capacity ||
         context.k.field.layers != 1 || context.v.field.layers != 1) {
         throw std::invalid_argument(std::string(op) + ": invalid cyclic context");
@@ -44,10 +41,10 @@ void validate_context(const ConstCyclicKVCacheLayerView& context, std::uint32_t 
         throw std::overflow_error(std::string(op) + ": padded capacity exceeds int32");
     }
     const auto padded = static_cast<std::int32_t>(context.padded_capacity);
-    common::operand::state_field(context.k, DType::BF16, {kHeadDim, padded, kKVHeads}, 16, op,
-                                 "context K", device);
-    common::operand::state_field(context.v, DType::FP16, {kHeadDim, padded, kKVHeads}, 16, op,
-                                 "context V", device);
+    common::operand::state_field(context.k, DType::BF16, {kHeadDim, padded, geometry.kv_heads}, 16,
+                                 op, "context K", device);
+    common::operand::state_field(context.v, DType::FP16, {kHeadDim, padded, geometry.kv_heads}, 16,
+                                 op, "context V", device);
 }
 
 struct PartialWorkspace {
@@ -57,16 +54,39 @@ struct PartialWorkspace {
 };
 
 template <class Allocator>
-PartialWorkspace allocate_workspace(Allocator& workspace, std::int32_t tokens, std::int32_t splits,
+PartialWorkspace allocate_workspace(Allocator& workspace, AttentionHeadGeometry geometry,
+                                    std::int32_t tokens, std::int32_t splits,
                                     std::int32_t batch_size) {
     return {
-        workspace.alloc(DType::FP32, {kHeadDim, kQHeads, tokens, splits * batch_size}),
-        workspace.alloc(DType::FP32, {kQHeads, tokens, splits * batch_size}),
-        workspace.alloc(DType::FP32, {kQHeads, tokens, splits * batch_size}),
+        workspace.alloc(DType::FP32, {kHeadDim, geometry.query_heads, tokens, splits * batch_size}),
+        workspace.alloc(DType::FP32, {geometry.query_heads, tokens, splits * batch_size}),
+        workspace.alloc(DType::FP32, {geometry.query_heads, tokens, splits * batch_size}),
     };
 }
 
 } // namespace
+
+SlidingWindowAttentionGraphProfile
+sliding_window_attention_graph_profile(AttentionHeadGeometry geometry, std::uint32_t window,
+                                       SlidingWindowAttentionExecutionEnvelope envelope,
+                                       std::int32_t tokens, std::int32_t batch) {
+    require_profile(geometry, window, "sliding_window_attention graph");
+    const auto p =
+        detail::select_sliding_window_attention_plan(geometry, window, tokens, batch, envelope);
+    SlidingWindowAttentionGraphProfile out;
+    out.words_ = {geometry.head_dim,
+                  geometry.query_heads,
+                  geometry.kv_heads,
+                  tokens,
+                  batch,
+                  static_cast<int>(p.route),
+                  p.key_block,
+                  p.reduce_warps,
+                  p.split_capacity,
+                  p.max_context,
+                  p.window};
+    return out;
+}
 
 std::size_t sliding_window_attention_workspace_capacity_bytes(
     AttentionHeadGeometry geometry, std::uint32_t window,
@@ -74,7 +94,7 @@ std::size_t sliding_window_attention_workspace_capacity_bytes(
     std::int32_t max_tokens, std::int32_t batch_size) {
     require_profile(geometry, window, "sliding_window_attention workspace");
     if (min_tokens < 1 || max_tokens < min_tokens || max_tokens > 16 || batch_size < 1 ||
-        batch_size > 8 || envelope.min_context > envelope.max_context ||
+        envelope.min_context > envelope.max_context ||
         envelope.max_context >
             static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::invalid_argument(
@@ -84,11 +104,12 @@ std::size_t sliding_window_attention_workspace_capacity_bytes(
     // largest allocation (for example, a wider block can use fewer splits).
     std::size_t capacity = 0;
     for (int tokens = min_tokens; tokens <= max_tokens; ++tokens) {
-        const auto plan =
-            detail::select_sliding_window_attention_plan(window, tokens, batch_size, envelope);
+        const auto plan = detail::select_sliding_window_attention_plan(geometry, window, tokens,
+                                                                       batch_size, envelope);
         if (plan.route == detail::SlidingWindowAttentionRoute::Direct) continue;
         WorkspaceLayoutBuilder layout;
-        (void)allocate_workspace(layout, tokens, plan.split_capacity, batch_size);
+        (void)allocate_workspace(layout, geometry, tokens, plan.split_capacity,
+                                 std::min(batch_size, kMaximumGridRows));
         capacity = std::max(capacity, layout.peak_bytes(1));
     }
     return capacity;
@@ -107,6 +128,7 @@ void sliding_window_attention(const Tensor& q, const Tensor& query_k, const Tens
     const auto stream        = execution.stream();
     constexpr const char* op = "sliding_window_attention";
     require_profile(geometry, window, op);
+    const int kQHeads = geometry.query_heads, kKVHeads = geometry.kv_heads;
     if (q.dtype != DType::BF16 || query_k.dtype != DType::BF16 || query_v.dtype != DType::BF16 ||
         out.dtype != DType::BF16) {
         throw std::invalid_argument("sliding_window_attention: q/k/v/out must be BF16");
@@ -120,9 +142,7 @@ void sliding_window_attention(const Tensor& q, const Tensor& query_k, const Tens
     if (tokens < 1 || tokens > 16) {
         throw std::invalid_argument("sliding_window_attention: optimized domain is T=1..16");
     }
-    if (batch < 1 || batch > 8) {
-        throw std::invalid_argument("sliding_window_attention: B must be 1..8");
-    }
+    if (batch < 1) { throw std::invalid_argument("sliding_window_attention: B must be positive"); }
     common::operand::shape(q, {kHeadDim, kQHeads, tokens, batch}, op, "q");
     common::operand::shape(query_k, {kHeadDim, kKVHeads, tokens, batch}, op, "query k");
     common::operand::shape(query_v, {kHeadDim, kKVHeads, tokens, batch}, op, "query v");
@@ -135,7 +155,7 @@ void sliding_window_attention(const Tensor& q, const Tensor& query_k, const Tens
     common::operand::contiguous_nonnull(positions, op, "positions", execution.device());
     common::operand::contiguous_nonnull(valid_columns, op, "valid columns", execution.device());
     common::operand::contiguous_nonnull(out, op, "out", execution.device());
-    validate_context(context, window, op, execution.device());
+    validate_context(context, geometry, window, op, execution.device());
     common::operand::shape(context.k.records.byte_offsets, {batch, 1, 1, 1}, op, "K offsets");
     common::operand::shape(context.v.records.byte_offsets, {batch, 1, 1, 1}, op, "V offsets");
     if (envelope.min_context > envelope.max_context ||
@@ -147,15 +167,24 @@ void sliding_window_attention(const Tensor& q, const Tensor& query_k, const Tens
         throw std::invalid_argument("sliding_window_attention: scale must be 1/sqrt(128)");
     }
 
-    auto scope      = workspace.scope();
-    const auto plan = detail::select_sliding_window_attention_plan(window, tokens, batch, envelope);
-    PartialWorkspace partial{};
-    if (plan.route == detail::SlidingWindowAttentionRoute::SplitKv) {
-        partial = allocate_workspace(workspace, tokens, plan.split_capacity, batch);
+    const auto plan =
+        detail::select_sliding_window_attention_plan(geometry, window, tokens, batch, envelope);
+    for (std::int64_t begin = 0; begin < batch; begin += kMaximumGridRows) {
+        const int rows = std::min<std::int64_t>(kMaximumGridRows, batch - begin);
+        auto scope     = workspace.scope();
+        PartialWorkspace partial{};
+        if (plan.route == detail::SlidingWindowAttentionRoute::SplitKv) {
+            partial = allocate_workspace(workspace, geometry, tokens, plan.split_capacity, rows);
+        }
+        auto selected                   = context;
+        selected.k.records.byte_offsets = context.k.records.byte_offsets.slice(0, begin, rows);
+        selected.v.records.byte_offsets = context.v.records.byte_offsets.slice(0, begin, rows);
+        auto output                     = out.slice(3, begin, rows);
+        detail::launch_sliding_window_attention(
+            q.slice(3, begin, rows), query_k.slice(3, begin, rows), query_v.slice(3, begin, rows),
+            positions.slice(1, begin, rows), valid_columns.slice(0, begin, rows), scale, selected,
+            plan, partial.acc, partial.m, partial.l, output, stream);
     }
-    detail::launch_sliding_window_attention(q, query_k, query_v, positions, valid_columns, scale,
-                                            context, plan, partial.acc, partial.m, partial.l, out,
-                                            stream);
 }
 
 } // namespace ninfer::ops

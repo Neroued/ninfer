@@ -42,12 +42,25 @@ struct GdnConvEpilogue {
     __device__ __forceinline__ void store(std::int32_t local_row,
                                           const float (&projected)[Tokens]) const {
         static_assert(Tokens >= 1);
-        const std::int32_t row          = global_row_offset + local_row;
-        const std::int64_t initial_base = source_offsets[batch_row] / 2;
-        std::int32_t valid = valid_columns == nullptr ? Tokens : valid_columns[batch_row];
-        valid              = valid < 0 ? 0 : (valid > Tokens ? Tokens : valid);
+        const std::int32_t row = global_row_offset + local_row;
+        std::int32_t valid     = valid_columns == nullptr ? Tokens : valid_columns[batch_row];
+        valid                  = valid < 0 ? 0 : (valid > Tokens ? Tokens : valid);
+        const CausalConvOutputColumn<__nv_bfloat16> destination =
+            row < query_rows ? CausalConvOutputColumn<__nv_bfloat16>{query + row, query_rows}
+            : row < query_rows + key_rows
+                ? CausalConvOutputColumn<__nv_bfloat16>{key + row - query_rows, key_rows}
+                : CausalConvOutputColumn<__nv_bfloat16>{value + row - query_rows - key_rows,
+                                                        value_rows};
+        const std::int64_t first = static_cast<std::int64_t>(batch_row) * width;
+        if (!valid) {
+#pragma unroll
+            for (int token = 0; token < Tokens; ++token)
+                *destination.at(first + token) = __float2bfloat16_rn(0.0F);
+            return;
+        }
 
-        float s0       = __bfloat162float(state_read[initial_base + row]);
+        const std::int64_t initial_base = source_offsets[batch_row] / 2;
+        float s0                        = __bfloat162float(state_read[initial_base + row]);
         float s1       = __bfloat162float(state_read[initial_base + channels + row]);
         float s2       = __bfloat162float(state_read[initial_base + 2LL * channels + row]);
         const float w0 = __bfloat162float(conv_weight[row]);
@@ -57,28 +70,15 @@ struct GdnConvEpilogue {
 
 #pragma unroll
         for (int token = 0; token < Tokens; ++token) {
-            const std::int64_t column = static_cast<std::int64_t>(batch_row) * width + token;
+            const std::int64_t column = first + token;
             if (token >= valid) {
-                if (row < query_rows) {
-                    query[column * query_rows + row] = __float2bfloat16_rn(0.0F);
-                } else if (row < query_rows + key_rows) {
-                    key[column * key_rows + row - query_rows] = __float2bfloat16_rn(0.0F);
-                } else {
-                    value[column * value_rows + row - query_rows - key_rows] =
-                        __float2bfloat16_rn(0.0F);
-                }
+                *destination.at(column) = __float2bfloat16_rn(0.0F);
                 continue;
             }
 
             const float p              = projected[token];
             const __nv_bfloat16 output = causal_conv4_silu(w0, w1, w2, w3, s0, s1, s2, p);
-            if (row < query_rows) {
-                query[column * query_rows + row] = output;
-            } else if (row < query_rows + key_rows) {
-                key[column * key_rows + row - query_rows] = output;
-            } else {
-                value[column * value_rows + row - query_rows - key_rows] = output;
-            }
+            *destination.at(column)    = output;
 
             publish.publish(token, batch_row, row, s1, s2, p);
             s0 = s1;

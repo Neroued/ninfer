@@ -5,7 +5,8 @@
 namespace ninfer::ops::detail::moe_cuda::block_scaled::fp8 {
 template <class S, bool Gate>
 __device__ __forceinline__ void stage_inputs(TileStorage<S>& tile, int stage, int kt, int row0,
-                                             Matrix weight, const std::uint8_t* input) {
+                                             Matrix weight, const std::uint8_t* input,
+                                             const float* input_scales) {
     for (int task = threadIdx.x; task < S::weight_rows * (S::bk / 16); task += S::threads) {
         const int row = task / (S::bk / 16), col = task % (S::bk / 16) * 16;
         const int wr = row0 + (Gate && row >= 128 ? row - 128 + kIntermediate : row);
@@ -20,15 +21,27 @@ __device__ __forceinline__ void stage_inputs(TileStorage<S>& tile, int stage, in
                                           kt * S::bk + col,
                                       source >= 0 ? 16 : 0);
     }
+    if constexpr (S::stage_scales) {
+        if (threadIdx.x < S::columns) {
+            const int source = tile.sources[threadIdx.x];
+            cp_async_zfill<4>(&tile.stage.input_scales[stage][threadIdx.x],
+                              input_scales + std::int64_t(source >= 0 ? source : 0) * (S::k / 128) +
+                                  kt,
+                              source >= 0 ? 4 : 0);
+        }
+    }
     cp_commit();
 }
 
-template <int Columns, bool Gate, bool Atomic = false>
-__global__ __launch_bounds__(Schedule<Columns, Gate>::threads) void grouped_mma(
-    const std::uint8_t* input, const float* input_scales, ExpertMatrixDeviceView bank,
-    Groups groups, std::uint8_t* product, float* product_scales, float* contributions,
-    const float* coefficients, float* routed_sum, int subtiles) {
-    using S = Schedule<Columns, Gate>;
+template <int Columns, bool Gate, bool Atomic = false, int Stages = 2, int MinBlocks = 1>
+__global__
+__launch_bounds__(Schedule<Columns, Gate, Stages, Atomic>::threads,
+                  MinBlocks) void grouped_mma(const std::uint8_t* input, const float* input_scales,
+                                              ExpertMatrixDeviceView bank, Groups groups,
+                                              std::uint8_t* product, float* product_scales,
+                                              float* contributions, const float* coefficients,
+                                              float* routed_sum, int subtiles) {
+    using S = Schedule<Columns, Gate, Stages, Atomic>;
     extern __shared__ __align__(16) unsigned char shared_bytes[];
     auto& tile              = *reinterpret_cast<TileStorage<S>*>(shared_bytes);
     constexpr int row_tiles = (Gate ? kIntermediate : kHidden) / 128;
@@ -47,14 +60,20 @@ __global__ __launch_bounds__(Schedule<Columns, Gate>::threads) void grouped_mma(
             const int packed = begin + threadIdx.x;
             tile.sources[threadIdx.x] =
                 packed < end ? (Gate ? groups.assignments[packed] / kTopK : packed) : -1;
+            if constexpr (!Gate && Atomic) {
+                const int assignment           = packed < end ? groups.assignments[packed] : -1;
+                tile.token_ids[threadIdx.x]    = assignment >= 0 ? assignment / kTopK : 0;
+                tile.coefficients[threadIdx.x] = assignment >= 0 ? coefficients[assignment] : 0;
+            }
         }
         __syncthreads();
-        stage_inputs<S, Gate>(tile, 0, 0, row0, weight, input);
-        stage_inputs<S, Gate>(tile, 1, 1, row0, weight, input);
+#pragma unroll
+        for (int stage = 0; stage < S::stages; ++stage)
+            stage_inputs<S, Gate>(tile, stage, stage, row0, weight, input, input_scales);
         float acc[2][S::mma_columns][4] = {};
         for (int kt = 0; kt < S::k / S::bk; ++kt) {
-            const int stage = kt % 2;
-            cp_wait<1>();
+            const int stage = kt % S::stages;
+            cp_wait<S::stages - 1>();
             __syncthreads();
             const float sg = __bfloat162float(weight.scales[(row0 / 128) * (S::k / 128) + kt]);
             const float su =
@@ -90,18 +109,23 @@ __global__ __launch_bounds__(Schedule<Columns, Gate>::threads) void grouped_mma(
                     }
 #pragma unroll
                     for (int v = 0; v < 4; ++v) {
-                        const int source = tile.sources[column + (lane & 3) * 2 + (v & 1)];
+                        const int c      = column + (lane & 3) * 2 + (v & 1);
+                        const int source = tile.sources[c];
                         const float sx =
-                            source >= 0 ? input_scales[std::int64_t(source) * (S::k / 128) + kt]
-                                        : 0;
+                            S::stage_scales
+                                ? tile.stage.input_scales[stage][c]
+                                : (source >= 0
+                                       ? input_scales[std::int64_t(source) * (S::k / 128) + kt]
+                                       : 0);
                         acc[0][n][v] = fmaf(p[0][v], sg * sx, acc[0][n][v]);
                         acc[1][n][v] = fmaf(p[1][v], su * sx, acc[1][n][v]);
                     }
                 }
             }
             __syncthreads();
-            if (kt + 2 < S::k / S::bk) {
-                stage_inputs<S, Gate>(tile, stage, kt + 2, row0, weight, input);
+            if (kt + S::stages < S::k / S::bk) {
+                stage_inputs<S, Gate>(tile, stage, kt + S::stages, row0, weight, input,
+                                      input_scales);
             } else {
                 cp_commit();
             }
@@ -122,10 +146,9 @@ __global__ __launch_bounds__(Schedule<Columns, Gate>::threads) void grouped_mma(
                         for (int m = 0; m < 2; ++m) {
                             const int row = row0 + wm * 32 + m * 16 + (lane >> 2) + (v / 2) * 8;
                             if constexpr (Atomic) {
-                                const int assignment = groups.assignments[begin + column];
-                                atomicAdd(routed_sum + std::int64_t(assignment / kTopK) * kHidden +
-                                              row,
-                                          acc[m][n][v] * coefficients[assignment]);
+                                atomicAdd(routed_sum +
+                                              std::int64_t(tile.token_ids[column]) * kHidden + row,
+                                          acc[m][n][v] * tile.coefficients[column]);
                             } else {
                                 contributions[std::int64_t(begin + column) * kHidden + row] =
                                     acc[m][n][v];
@@ -165,7 +188,7 @@ __global__ __launch_bounds__(Schedule<Columns, Gate>::threads) void grouped_mma(
 __global__ void vector_gate(const __nv_bfloat16* x, ExpertMatrixDeviceView bank, const int* ids,
                             ExpertSubsetKind kind, const int* mask, float* activation) {
     const int assignment = blockIdx.y, expert = ids[assignment];
-    if (!includes(kind, mask, expert)) { return; }
+    if (!expert_in_subset(kind, mask, expert)) { return; }
     const auto weight = resolve(bank, expert);
     const int row = blockIdx.x * 4 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
     float gate = 0, up = 0;
@@ -197,7 +220,7 @@ __global__ void vector_down(const float* activation, ExpertMatrixDeviceView bank
     const int token = blockIdx.y, route = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int assignment = token * kTopK + route, expert = ids[assignment];
     float sum[Rows] = {};
-    if (includes(kind, mask, expert)) {
+    if (expert_in_subset(kind, mask, expert)) {
         const auto weight = resolve(bank, expert);
         for (int block = 0; block < kIntermediate / 128; ++block) {
             const int k = block * 128 + lane * 4;
@@ -228,8 +251,9 @@ __global__ void vector_down(const float* activation, ExpertMatrixDeviceView bank
         float result = 0;
 #pragma unroll
         for (int j = 0; j < kTopK; ++j) { result += values[j][threadIdx.x]; }
-        const int i = token * kHidden + blockIdx.x * Rows + threadIdx.x;
-        output.store(i, output.initial(i) + result);
+        const int i     = token * kHidden + blockIdx.x * Rows + threadIdx.x;
+        const bool live = output.is_live(token);
+        output.store(i, output.initial(i, live) + result, live);
     }
 }
 } // namespace ninfer::ops::detail::moe_cuda::block_scaled::fp8

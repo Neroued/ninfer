@@ -48,7 +48,7 @@ Options options(int argc, char** argv) {
         else
             throw std::invalid_argument("unknown option");
     }
-    if (!o.batch || o.batch > 8 || !o.tokens || !o.iterations ||
+    if (!o.batch || !o.tokens || !o.iterations ||
         std::uint64_t(o.batch) * o.tokens > std::uint32_t(INT32_MAX) / 2560)
         throw std::invalid_argument("invalid workload");
     return o;
@@ -110,6 +110,7 @@ void run(const Options& o) {
     UploadSlots uploads(context, positions, 2);
     disk::PrepareService service(table, eos,
                                  {.max_positions = positions,
+                                  .max_rows      = o.batch,
                                   .io_depth      = 128,
                                   .cache_bytes   = std::size_t(o.cache_mib) * 1024 * 1024},
                                  uploads.host_slots());
@@ -153,6 +154,10 @@ void run(const Options& o) {
     }
     CudaEventTimer work_time(context, context.stream()), exposed_time(context, context.stream());
     std::vector<std::uint16_t> downloaded(std::size_t(positions) * 2560);
+    std::vector<InputRow> rows(o.batch);
+    std::vector<std::span<const std::int32_t>> ids(o.batch);
+    std::vector<std::uint32_t> lengths(o.batch);
+    std::vector<Append> append(o.batch);
     std::cout << "sample,batch,tokens,cache_mib,host_ms,device_ms,last_ids_to_ready_ms,reads,read_"
                  "MiB,cache_hits,shared_rows,work_ms,exposed_ms\n";
     for (std::uint32_t sample = 0; sample < o.iterations; ++sample) {
@@ -160,9 +165,6 @@ void run(const Options& o) {
             std::cerr << "read budget reached after " << sample << " samples\n";
             break;
         }
-        std::array<InputRow, 8> rows;
-        std::array<std::span<const std::int32_t>, 8> ids;
-        std::array<std::uint32_t, 8> lengths;
         for (std::uint32_t b = 0; b < o.batch; ++b) {
             const auto start = 2 + 100000 + b * 100003ULL + sample * o.tokens;
             ids[b]           = std::span(corpus).subspan(start, o.tokens);
@@ -174,7 +176,7 @@ void run(const Options& o) {
         const auto start  = Clock::now();
         std::optional<Ticket> ticket;
         until([&] {
-            ticket = service.prepare(o.tokens, std::span(rows).first(o.batch));
+            ticket = service.prepare(o.tokens, o.batch, rows);
             return ticket.has_value();
         });
         if (o.work) {
@@ -185,12 +187,11 @@ void run(const Options& o) {
         }
         for (std::uint32_t t = 1; o.incremental_us && t < o.tokens; ++t) {
             std::this_thread::sleep_for(std::chrono::microseconds(o.incremental_us));
-            std::array<Append, 8> append;
             for (std::uint32_t b = 0; b < o.batch; ++b) append[b] = {b, ids[b].subspan(t, 1)};
-            service.append(*ticket, std::span(append).first(o.batch));
+            service.append(*ticket, append);
         }
         const auto last_ids = o.incremental_us ? Clock::now() : start;
-        service.seal(*ticket, std::span(lengths).first(o.batch));
+        service.seal(*ticket, lengths);
         until([&] {
             const auto state = service.poll(*ticket);
             if (state.error) std::rethrow_exception(state.error);

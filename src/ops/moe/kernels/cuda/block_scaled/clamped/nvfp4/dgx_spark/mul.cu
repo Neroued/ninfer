@@ -30,7 +30,7 @@ __device__ void group_decode(const int* ids, ExpertSubsetKind kind, const int* m
     __syncthreads();
     for (int a = tid; a < tokens * kTopK; a += kExperts) {
         const int expert = ids[a];
-        ranks[a]         = includes(kind, mask, expert) ? atomicAdd(counts + expert, 1) : -1;
+        ranks[a] = expert_in_subset(kind, mask, expert) ? atomicAdd(counts + expert, 1) : -1;
     }
     __syncthreads();
     const int count = counts[tid], jobs = (count + columns - 1) / columns;
@@ -94,7 +94,8 @@ __global__ void prepare_input(const __nv_bfloat16* x, std::uint8_t* codes, std::
         if (SkipInactive || threadIdx.x < 32) {
             bool live      = false;
             const int lane = threadIdx.x % 32;
-            if (lane < kTopK) live = includes(kind, mask, ids[std::int64_t(token) * kTopK + lane]);
+            if (lane < kTopK)
+                live = expert_in_subset(kind, mask, ids[std::int64_t(token) * kTopK + lane]);
             const auto bits = __ballot_sync(0xffffffff, live);
             if (!threadIdx.x && active_tokens) active_tokens[token] = bits != 0;
             if constexpr (SkipInactive) clear = bits != 0 || !active_tokens;
@@ -106,7 +107,7 @@ __global__ void prepare_input(const __nv_bfloat16* x, std::uint8_t* codes, std::
     if constexpr (Quantize) {
         if (threadIdx.x >= kHidden / 16) return;
         const int expert = ids[assignment];
-        if (!includes(kind, mask, expert)) return;
+        if (!expert_in_subset(kind, mask, expert)) return;
         const int group    = threadIdx.x;
         const auto encoded = common::quantize_nvfp4_mul_k16(
             x + std::int64_t(token) * kHidden + group * 16, input_scale.get(expert));
@@ -154,7 +155,7 @@ quantize_grouped_input(const __nv_bfloat16* x, const int* ids, ExpertSubsetKind 
         if constexpr (Index) {
             assignment       = task;
             const int expert = ids[assignment];
-            if (!includes(kind, mask, expert)) {
+            if (!expert_in_subset(kind, mask, expert)) {
                 if (!tid && groups.inverse) groups.inverse[assignment] = -1;
                 if constexpr (Persistent)
                     continue;

@@ -33,6 +33,7 @@ public:
 private:
     std::shared_ptr<const ModelDefinition> definition_;
     ParallelPlan parallel_;
+    std::shared_ptr<const BatchExecutionPlan> batches_;
     GroupExecutionPlan plan_;
     std::vector<RankExecutionDescription> ranks_;
 };

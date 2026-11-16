@@ -74,12 +74,13 @@ int run(int T, int B, int E, int kind = -1, bool fp8 = false, bool fp8_index = f
     return verify(f, kind >= 0);
 }
 
-int graph(bool fp8_index = false, int T = 129, int B = 3) {
+int graph(bool fp8_index = false, int T = 129, int B = 3, int maximum = 262148) {
     auto& d = cuda_environment().context;
     kp::IndexerFixture f(
-        d.execution_view(), T, B, 262148, 1, false, ops::KpoolMlaStorage::BFloat16, {}, true,
+        d.execution_view(), T, B, maximum, 1, false, ops::KpoolMlaStorage::BFloat16, {}, true,
         fp8_index ? KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0 : KvCacheVectorFormat::BFloat16);
-    const std::array bounds{2051, 262148, 131108, 0, 8192};
+    const auto bounds = maximum == 8192 ? std::vector<int>{2051, 8192, 0, 4096}
+                                        : std::vector<int>{2051, 262148, 131108, 0, 8192};
     // Capacity is for a fixed Host envelope; different envelopes may choose
     // different windows. Reserve the union before capturing any child graph.
     for (int bound : bounds)
@@ -195,6 +196,40 @@ int token_sweep(bool fp8) {
     return failures;
 }
 
+int request_groups(bool fp8) {
+    auto& d = cuda_environment().context;
+    kp::IndexerCase shape;
+    constexpr int batch = 129, tokens = 2;
+    shape.ends.resize(batch, 2052);
+    shape.valid.resize(batch, tokens);
+    shape.envelope = 2052;
+    for (int b = 0; b < batch; ++b) {
+        if (b >= 64 && b < 128)
+            shape.valid[b] = 0;
+        else if (b % 3 == 0)
+            shape.ends[b] = 2051;
+        else if (b % 3 == 1)
+            shape.valid[b] = 1;
+    }
+    kp::IndexerFixture f(d.execution_view(), tokens, batch, shape.envelope, 1, false,
+                         ops::KpoolMlaStorage::BFloat16, shape, true,
+                         fp8 ? KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0
+                             : KvCacheVectorFormat::BFloat16);
+    for (int b = 0; b < batch; ++b) {
+        if (shape.ends[b] <= 2051 || !shape.valid[b]) {
+            f.selectors.at(b) = -1;
+            for (int t = 0; t < tokens; ++t)
+                for (int h = 0; h < 32; ++h)
+                    for (int k = 0; k < 128; ++k) f.query.at(k, h, t, b) = 0x7fc0;
+        }
+    }
+    f.upload_metadata();
+    f.query.upload();
+    f.launch(d.execution_view());
+    d.synchronize();
+    return verify(f);
+}
+
 int workspace_interval(bool fp8 = false) {
     auto& d = cuda_environment().context;
     const auto format =
@@ -206,7 +241,7 @@ int workspace_interval(bool fp8 = false) {
         return ops::kpool_indexer_workspace_capacity_bytes(
             {32, 128}, format, {E}, B, lo, hi, d.execution_view().multiprocessor_count());
     };
-    for (int B : {1, 2, 3, 5, 8})
+    for (int B : {1, 2, 3, 5, 8, 9, 17, 33})
         for (unsigned E : {8192u, 65536u, 131072u, 262144u, 1048576u})
             for (auto [lo, hi] : {std::pair{1, 257}, {127, 513}}) {
                 std::size_t peak = 0;
@@ -273,6 +308,16 @@ int main(int argc, char** argv) {
         suite.add("kpool_indexer/" + std::to_string(T) + "x" + std::to_string(B) + "/" +
                       std::to_string(E),
                   [=] { return run(T, B, E); }, {{"format", "bf16"}, {"execution", "eager"}});
+    for (const bool fp8 : {false, true}) {
+        const std::string prefix = fp8 ? "kpool_indexer/fp8/" : "kpool_indexer/";
+        const std::string format = fp8 ? "fp8" : "bf16";
+        suite.add(prefix + "batch9", [=] { return run(4, 9, 8192, -1, false, fp8); },
+                  {{"format", format}, {"execution", "eager"}, {"suite", "concurrency"}});
+        suite.add(prefix + "request_groups", [=] { return request_groups(fp8); },
+                  {{"format", format}, {"execution", "eager"}, {"suite", "concurrency"}});
+        suite.add(prefix + "graph_batch17", [=] { return graph(fp8, 3, 17, 8192); },
+                  {{"format", format}, {"execution", "graph"}, {"suite", "concurrency"}});
+    }
     for (int kind : {0, 1, 2})
         suite.add("kpool_indexer/exact/" + std::to_string(kind),
                   [=] { return run(1, 1, 131076, kind); },

@@ -13,17 +13,17 @@ namespace ninfer::ops {
 
 /**
  * Returns the transient capacity required by rmsnorm_dynamic_grouped_conv_prepare for every
- * width/batch pair in the inclusive intervals. Width endpoints lie in [2,16], batch endpoints
- * in [1,8]. Capacity covers every shape-selected route in the requested domain.
+ * width/batch pair for hidden in the inclusive intervals. Width endpoints lie in [2,16];
+ * batch endpoints are positive. Capacity covers every shape-selected route in the requested domain.
  */
 [[nodiscard]] std::size_t rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(
-    std::int32_t min_width, std::int32_t max_width, std::int32_t min_batch_size,
-    std::int32_t max_batch_size);
+    std::int32_t hidden, std::int32_t min_width, std::int32_t max_width,
+    std::int32_t min_batch_size, std::int32_t max_batch_size);
 
 /**
  * Offset-free RMSNorm, dynamic coefficient projection and grouped two-tap convolution.
  *
- *   H=5120, W=2..16, group width 16, G=320, sides=2, taps=2. For h=16*g+j:
+ *   W=2..16, group width 16, G=H/16, sides=2, taps=2. For h=16*g+j:
  *
  *     inv[i,b] = rsqrt(sum_h residual[h,i,b]^2 / H + eps)
  *     n[h,i,b] = residual[h,i,b] * inv[i,b] * norm_weight[h]
@@ -38,7 +38,7 @@ namespace ninfer::ops {
  *
  * Residual/prepared are contiguous BF16 [H,W,B], norm_weight [H], base_kernel
  * [H,2,2] with axes [channel,tap,side], and finish_delta [G,2,W,B]. The projection
- * weight is contiguous BF16 [1280,H]. W is in [2,16], B in [1,8]; tensor and weight
+ * weight is contiguous BF16 [4*G,H]. W is in [2,16], B>=1; tensor and weight
  * bases are 16-byte aligned. Eps is positive and finite. Position zero has no previous
  * contribution; the Op never reads another request or an earlier round.
  *
@@ -58,8 +58,8 @@ void rmsnorm_dynamic_grouped_conv_prepare(const Tensor& residual, const Tensor& 
 
 /**
  * Returns the transient capacity required by linear_dynamic_grouped_conv_add for every width/batch
- * pair in the inclusive intervals. input_rows is 4096 or 17408, widths lie in [2,16], and batch
- * sizes in [1,8]. Capacity follows every shape-selected production route.
+ * pair in the inclusive intervals. input_rows is 4096 or 17408, widths lie in [2,16],
+ * and batch endpoints are positive. Capacity follows every shape-selected production route.
  */
 [[nodiscard]] std::size_t linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
     std::int32_t input_rows, std::int32_t min_width, std::int32_t max_width,
@@ -78,7 +78,7 @@ void rmsnorm_dynamic_grouped_conv_prepare(const Tensor& residual, const Tensor& 
  *
  * Contiguous BF16 x [C,W,B], base_kernel [H,2,2] with axes [channel,tap,side],
  * finish_delta [G,2,W,B], and residual [H,W,B]. The projection weight is Q8_G32_FP16
- * RowSplit [H,C] without padding. W is in [2,16], B in [1,8]; tensor and weight-plane
+ * RowSplit [H,C] without padding. W is in [2,16], B>=1; tensor and weight-plane
  * bases are 16-byte aligned. Position zero has no previous contribution; the Op never
  * reads another request or an earlier round.
  *
@@ -93,5 +93,25 @@ void linear_dynamic_grouped_conv_add(const Tensor& x, const Weight& projection_w
                                      const Tensor& base_kernel, const Tensor& finish_delta,
                                      Tensor& residual, MemoryArena& workspace,
                                      CudaExecutionView execution);
+
+/**
+ * Local projection contribution followed by grouped two-tap convolution, without a residual.
+ * For h=16*g+j, z[h,i,b]=sum_c W[h,c]*x[c,i,b]:
+ *
+ * partial[h,i,b] = (base[h,0,1]+delta[g,0,i,b])*z[h,i,b]
+ *                + I(i>0)*(base[h,1,1]+delta[g,1,i,b])*z[h,i-1,b].
+ *
+ * x [C,W,B], partial [H,W,B], base [H,2,2] and delta [H/16,2,W,B] are contiguous,
+ * 16-byte-aligned BF16. Projection uses native contiguous BF16 [H,C] and A16 computation.
+ * W is in [2,16], B>=1. Position zero has no previous contribution. All input,
+ * weight and output storage is pairwise disjoint. Inputs are preserved; every partial
+ * element is written. z has no observable cast boundary. The Op needs no caller workspace,
+ * allocates or retains no device storage, and supports Graph replay.
+ *
+ * Equal coefficients across shards permit summing their partials before one residual addition.
+ */
+void linear_dynamic_grouped_conv(const Tensor& x, const Weight& projection_weight,
+                                 const Tensor& base_kernel, const Tensor& finish_delta,
+                                 Tensor& partial, CudaExecutionView execution);
 
 } // namespace ninfer::ops

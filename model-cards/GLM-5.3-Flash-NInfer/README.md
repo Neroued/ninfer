@@ -27,6 +27,10 @@ A mixed-precision NInfer v3 artifact of
 [NVIDIA's NVFP4 checkpoint](https://huggingface.co/nvidia/GLM-5.3-Flash-NVFP4).
 It includes Text, Vision, native MTP and an additional full-vocabulary Q4 draft head.
 
+This card describes the `glm5next` artifact identified below. Conversion of FP4 Local weights and
+artifacts containing DFlash2 is covered in the
+[conversion guide](https://github.com/Neroued/ninfer/blob/master/docs/weight-conversion.md#glm-53-flash).
+
 The native NInfer architecture is GLM5Next, combining KDA linear attention, Kpool sparse MLA,
 mHC and MoE. The artifact includes the source tokenizer, GLM chat template and processor resources.
 Use it directly with [NInfer](https://github.com/Neroued/ninfer) for CLI generation or
@@ -71,7 +75,8 @@ The optimized draft head does not crop the vocabulary.
 
 ## Run on two Sparks
 
-Build the current NInfer revision on both nodes with NCCL development dependencies installed:
+Build the current NInfer revision on both nodes with NCCL and libibverbs development
+dependencies installed:
 
 ```bash
 cmake --preset dgx-spark-release -DNINFER_ENABLE_DISTRIBUTED=ON
@@ -88,8 +93,9 @@ cp examples/configs/spark2-glm5_3-flash.toml ninfer.local.toml
 ```
 
 The [example](https://github.com/Neroued/ninfer/blob/master/examples/configs/spark2-glm5_3-flash.toml)
-uses TP2 with attention DP2, FP8 KV, Vision, MTP3, the optimized head, CUDA Graph decode and up to
-eight active requests. Its logical context limit is **1,048,576 tokens**. The coordinator launches
+uses TP2 with attention DP2, FP8 KV, Vision, MTP3, the optimized head, CUDA Graph decode and
+`max_concurrency = 8`. This is the example's resident capacity; larger capacities can be configured
+when their working sets fit. Its logical context limit is **1,048,576 tokens**. The coordinator launches
 both workers, using SSH for the remote node. Clients connect to its single HTTP endpoint.
 
 Experts use TP by default (`ep = 1`); set `ep = 2` to select whole-expert EP while retaining TP2

@@ -102,37 +102,6 @@ std::size_t longest_suffix_prefix(std::string_view text, std::string_view marker
     return 0;
 }
 
-struct PrefixExecutionTracker {
-    const ReasoningFormat* format = nullptr;
-    std::size_t matched           = 0;
-    std::size_t content_matched   = 0;
-    bool tracking                 = false;
-
-    [[nodiscard]] std::optional<std::size_t> feed(std::string_view bytes) noexcept {
-        if (!tracking || !format || format->execution_boundary.empty()) return {};
-        const auto& boundary = format->execution_boundary;
-        for (std::size_t offset = 0; offset < bytes.size(); ++offset) {
-            const char byte  = bytes[offset];
-            bool content_end = false;
-            if (!format->content_open.empty()) {
-                const auto& open = format->content_open;
-                while (content_matched && byte != open[content_matched])
-                    content_matched = format->content_failure[content_matched - 1];
-                if (byte == open[content_matched]) ++content_matched;
-                content_end = content_matched == open.size();
-            }
-            while (matched && byte != boundary[matched])
-                matched = format->boundary_failure[matched - 1];
-            if (byte == boundary[matched]) ++matched;
-            if (matched != boundary.size() && !content_end) continue;
-            tracking = false;
-            matched  = 0;
-            return offset + 1;
-        }
-        return {};
-    }
-};
-
 struct DecoderState {
     std::string utf8_pending;
     std::string think_marker_pending;
@@ -373,8 +342,6 @@ public:
         state.content_open =
             reasoning ? std::string_view(reasoning->content_open) : std::string_view{};
         state.strip_after_reasoning = reasoning && reasoning->strip_content_leading;
-        prefix_execution.format     = reasoning.get();
-        prefix_execution.tracking   = options.starts_in_reasoning;
         semantic.budget             = options.thinking.budget;
         semantic.reasoning_close    = state.reasoning_close;
         semantic.content_open       = state.content_open;
@@ -391,9 +358,6 @@ public:
     DecoderState preview_state;
     SemanticThinkingState semantic;
     SemanticThinkingState preview_semantic;
-    PrefixExecutionTracker prefix_execution;
-    PrefixExecutionTracker preview_prefix_execution;
-    std::optional<std::uint32_t> preview_execution_split_after;
     DecodedOutput preview_output;
     std::unique_ptr<BodyDecoder> body;
     bool preview_ready                 = false;
@@ -417,23 +381,11 @@ OutputSession::~OutputSession()                                   = default;
 OutputSession::OutputSession(OutputSession&&) noexcept            = default;
 OutputSession& OutputSession::operator=(OutputSession&&) noexcept = default;
 
-ReasoningFormat::ReasoningFormat(std::string close_, std::string execution_boundary_,
+ReasoningFormat::ReasoningFormat(std::string close_,
                                  std::shared_ptr<const std::vector<TokenId>> control_tokens_,
                                  bool strip_content_leading_, std::string content_open_)
-    : close(std::move(close_)), execution_boundary(std::move(execution_boundary_)),
-      boundary_failure(execution_boundary.size()), content_open(std::move(content_open_)),
-      content_failure(content_open.size()), control_tokens(std::move(control_tokens_)),
-      strip_content_leading(strip_content_leading_) {
-    const auto build_failure = [](std::string_view marker, std::vector<std::size_t>& failure) {
-        for (std::size_t i = 1, matched = 0; i < marker.size(); ++i) {
-            while (matched && marker[i] != marker[matched]) matched = failure[matched - 1];
-            if (marker[i] == marker[matched]) ++matched;
-            failure[i] = matched;
-        }
-    };
-    build_failure(execution_boundary, boundary_failure);
-    build_failure(content_open, content_failure);
-}
+    : close(std::move(close_)), content_open(std::move(content_open_)),
+      control_tokens(std::move(control_tokens_)), strip_content_leading(strip_content_leading_) {}
 
 OutputSession::OutputSession(OutputSessionOptions options, std::unique_ptr<BodyDecoder> body,
                              std::unique_ptr<text::GrammarSession> grammar)
@@ -493,25 +445,19 @@ runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> to
 
     impl_->preview_state            = impl_->state;
     impl_->preview_semantic         = impl_->semantic;
-    impl_->preview_prefix_execution = impl_->prefix_execution;
-    impl_->preview_execution_split_after.reset();
     impl_->preview_output.clear();
 
     const auto complete = [&](std::uint32_t count, FinishReason reason,
                               runtime::ContinuationAction continuation =
                                   runtime::ContinuationAction::Decode) {
         if (reason != FinishReason::None) { impl_->preview_semantic.control_pending = false; }
-        if (impl_->preview_execution_split_after && *impl_->preview_execution_split_after > count) {
-            throw std::logic_error("prefix execution split exceeds the accepted token prefix");
-        }
         impl_->accept_grammar(tokens.first(count));
         impl_->preview_finish_reason = reason;
         impl_->preview_ready         = true;
         return runtime::OutputDecision{
-            .accepted_tokens              = count,
-            .finish_reason                = reason,
-            .continuation                 = continuation,
-            .prefix_execution_split_after = impl_->preview_execution_split_after,
+            .accepted_tokens = count,
+            .finish_reason   = reason,
+            .continuation    = continuation,
         };
     };
 
@@ -519,11 +465,6 @@ runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> to
         const std::uint32_t count                    = static_cast<std::uint32_t>(index + 1);
         const TokenId token                          = tokens[index];
         const ninfer::text::DecodedTokenView decoded = impl_->tokenizer->decoded_token(token);
-
-        if (const auto boundary = impl_->preview_prefix_execution.feed(decoded.bytes);
-            boundary && *boundary == decoded.bytes.size()) {
-            impl_->preview_execution_split_after = count;
-        }
 
         if (impl_->preview_state.in_reasoning) { ++impl_->preview_state.reasoning_tokens; }
         if (impl_->preview_semantic.in_reasoning) {
@@ -618,16 +559,10 @@ runtime::OutputDecision OutputSession::preview_control(std::span<const TokenId> 
 
     impl_->preview_state            = impl_->state;
     impl_->preview_semantic         = impl_->semantic;
-    impl_->preview_prefix_execution = impl_->prefix_execution;
-    impl_->preview_execution_split_after.reset();
     impl_->preview_output.clear();
     for (std::size_t index = 0; index < tokens.size(); ++index) {
         const TokenId token                          = tokens[index];
         const ninfer::text::DecodedTokenView decoded = impl_->tokenizer->decoded_token(token);
-        if (const auto boundary = impl_->preview_prefix_execution.feed(decoded.bytes);
-            boundary && *boundary == decoded.bytes.size()) {
-            impl_->preview_execution_split_after = static_cast<std::uint32_t>(index + 1U);
-        }
         if (impl_->preview_state.in_reasoning) { ++impl_->preview_state.reasoning_tokens; }
         feed_semantic_thinking(impl_->preview_semantic, decoded.bytes);
         const std::string_view presentation_bytes =
@@ -648,8 +583,7 @@ runtime::OutputDecision OutputSession::preview_control(std::span<const TokenId> 
     impl_->preview_finish_reason = FinishReason::None;
     impl_->preview_ready         = true;
     return runtime::OutputDecision{
-        .accepted_tokens              = static_cast<std::uint32_t>(tokens.size()),
-        .prefix_execution_split_after = impl_->preview_execution_split_after,
+        .accepted_tokens = static_cast<std::uint32_t>(tokens.size()),
     };
 }
 
@@ -679,9 +613,7 @@ runtime::OutputDecision OutputSession::preview_terminal(FinishReason reason) {
         throw std::invalid_argument("invalid between-round terminal decoder reason");
     }
     impl_->preview_state            = impl_->state;
-    impl_->preview_semantic         = impl_->semantic;
-    impl_->preview_prefix_execution = impl_->prefix_execution;
-    impl_->preview_execution_split_after.reset();
+    impl_->preview_semantic                 = impl_->semantic;
     impl_->preview_semantic.control_pending = false;
     impl_->preview_output.clear();
     terminalize(impl_->preview_state, impl_->policy, impl_->preview_output, 0);
@@ -695,7 +627,6 @@ PublishedOutput OutputSession::commit_preview() {
     using std::swap;
     swap(impl_->state, impl_->preview_state);
     swap(impl_->semantic, impl_->preview_semantic);
-    swap(impl_->prefix_execution, impl_->preview_prefix_execution);
     DecodedOutput decoded = std::move(impl_->preview_output);
     impl_->preview_output.clear();
     impl_->preview_ready = false;

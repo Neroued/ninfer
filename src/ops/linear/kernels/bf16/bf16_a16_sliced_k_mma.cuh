@@ -20,19 +20,22 @@ bf16_a16_sliced_k_mma_body(const __nv_bfloat16* __restrict__ x,
     constexpr int kBlockTokens = Schedule::kBlockTokens;
     constexpr int kTokenMmas   = Schedule::kMmaTokens;
     constexpr int kBlockK      = Schedule::kBlockK;
+    constexpr bool kCollective = requires { Epilogue::kSlicedTile; };
     const int kGroups = kHidden / kBlockK + (bf16_predicated_k<Schedule> && kHidden % kBlockK != 0);
     static_assert((kMmaK % 16) == 0);
 
     auto* staging = reinterpret_cast<__nv_bfloat16*>(shared_raw);
     auto* partial = reinterpret_cast<float*>(shared_raw);
 
-    const int tid          = static_cast<int>(threadIdx.x);
-    const int warp         = tid >> 5;
-    const int lane         = tid & 31;
-    const int gid          = lane >> 2;
-    const int lid          = lane & 3;
-    const int row0         = row_tile * Schedule::kBlockRows;
-    const auto destination = linear_output_tile<Schedule::kBlockRows>(output, row0);
+    const int tid              = static_cast<int>(threadIdx.x);
+    const int warp             = tid >> 5;
+    const int lane             = tid & 31;
+    const int gid              = lane >> 2;
+    const int lid              = lane & 3;
+    const int row0             = row_tile * Schedule::kBlockRows;
+    const auto destination     = linear_output_tile<Schedule::kBlockRows>(output, row0);
+    constexpr int kPhaseStride = Schedule::kKPhaseStride;
+    const int phase = kPhaseStride ? int(std::int64_t(row_tile) * kPhaseStride % kGroups) : 0;
 
     const int a_matrix     = lane >> 3;
     const int a_inner_row  = lane & 7;
@@ -46,7 +49,13 @@ bf16_a16_sliced_k_mma_body(const __nv_bfloat16* __restrict__ x,
     float accum[kFragments][4] = {};
 
     const auto stage_group = [&](int stage, int group) {
-        const int group_k0  = group * kBlockK;
+        int ordered_group = group;
+        if constexpr (kPhaseStride > 0) {
+            // Rotate both operands together to spread the row tiles' streaming K accesses.
+            ordered_group += phase;
+            if (ordered_group >= kGroups) ordered_group -= kGroups;
+        }
+        const int group_k0  = ordered_group * kBlockK;
         auto* weight_shared = staging + stage * Schedule::kStageElements;
         auto* x_shared      = weight_shared + kMmaRows * kBlockK;
 
@@ -96,26 +105,56 @@ bf16_a16_sliced_k_mma_body(const __nv_bfloat16* __restrict__ x,
         const auto* x_shared      = weight_shared + kMmaRows * kBlockK;
 #pragma unroll
         for (int k_step = 0; k_step < kMmaK / 16; ++k_step) {
-#pragma unroll
-            for (int mi = 0; mi < Schedule::kMmaRows; ++mi) {
-                unsigned a_frag[4];
-                const int a_col = warp_k0 + k_step * 16 + a_col_offset;
-                const int a_row = mi * 16 + a_row_offset;
-                common::ldmatrix_x4(a_frag[0], a_frag[1], a_frag[2], a_frag[3],
-                                    common::smem_addr(weight_shared + a_row * kBlockK +
-                                                      bf16_mma_shared_col<Schedule>(a_row, a_col)));
+            if constexpr (Schedule::kReuseBFragments) {
+                unsigned b_frag[kTokenMmas][2];
 #pragma unroll
                 for (int ni = 0; ni < kTokenMmas; ++ni) {
-                    unsigned b_frag[2];
                     const int b_row = ni * 8 + b_inner_row;
                     const int b_col = warp_k0 + k_step * 16 + b_k_offset;
                     common::ldmatrix_x2(
-                        b_frag[0], b_frag[1],
+                        b_frag[ni][0], b_frag[ni][1],
                         common::smem_addr(x_shared + b_row * kBlockK +
                                           bf16_mma_shared_col<Schedule>(b_row, b_col)));
-                    auto& c = accum[mi * kTokenMmas + ni];
-                    common::mma_bf16(c[0], c[1], c[2], c[3], a_frag[0], a_frag[1], a_frag[2],
-                                     a_frag[3], b_frag[0], b_frag[1]);
+                }
+#pragma unroll
+                for (int mi = 0; mi < Schedule::kMmaRows; ++mi) {
+                    unsigned a_frag[4];
+                    const int a_col = warp_k0 + k_step * 16 + a_col_offset;
+                    const int a_row = mi * 16 + a_row_offset;
+                    common::ldmatrix_x4(
+                        a_frag[0], a_frag[1], a_frag[2], a_frag[3],
+                        common::smem_addr(weight_shared + a_row * kBlockK +
+                                          bf16_mma_shared_col<Schedule>(a_row, a_col)));
+#pragma unroll
+                    for (int ni = 0; ni < kTokenMmas; ++ni) {
+                        auto& c = accum[mi * kTokenMmas + ni];
+                        common::mma_bf16(c[0], c[1], c[2], c[3], a_frag[0], a_frag[1], a_frag[2],
+                                         a_frag[3], b_frag[ni][0], b_frag[ni][1]);
+                    }
+                }
+            } else {
+#pragma unroll
+                for (int mi = 0; mi < Schedule::kMmaRows; ++mi) {
+                    unsigned a_frag[4];
+                    const int a_col = warp_k0 + k_step * 16 + a_col_offset;
+                    const int a_row = mi * 16 + a_row_offset;
+                    common::ldmatrix_x4(
+                        a_frag[0], a_frag[1], a_frag[2], a_frag[3],
+                        common::smem_addr(weight_shared + a_row * kBlockK +
+                                          bf16_mma_shared_col<Schedule>(a_row, a_col)));
+#pragma unroll
+                    for (int ni = 0; ni < kTokenMmas; ++ni) {
+                        unsigned b_frag[2];
+                        const int b_row = ni * 8 + b_inner_row;
+                        const int b_col = warp_k0 + k_step * 16 + b_k_offset;
+                        common::ldmatrix_x2(
+                            b_frag[0], b_frag[1],
+                            common::smem_addr(x_shared + b_row * kBlockK +
+                                              bf16_mma_shared_col<Schedule>(b_row, b_col)));
+                        auto& c = accum[mi * kTokenMmas + ni];
+                        common::mma_bf16(c[0], c[1], c[2], c[3], a_frag[0], a_frag[1], a_frag[2],
+                                         a_frag[3], b_frag[0], b_frag[1]);
+                    }
                 }
             }
         }
@@ -148,11 +187,12 @@ bf16_a16_sliced_k_mma_body(const __nv_bfloat16* __restrict__ x,
         }
     }
 
+    // Each warp pair reuses one partial tile: odd publishes, even consumes and replaces it.
     if ((warp & 1) != 0) {
 #pragma unroll
         for (int fragment = 0; fragment < kFragments; ++fragment) {
             const std::int64_t base =
-                (static_cast<std::int64_t>(warp) * kFragments + fragment) * 32 * 4;
+                (static_cast<std::int64_t>(warp / 2) * kFragments + fragment) * 32 * 4;
             common::store_vec(partial + base + static_cast<std::int64_t>(lane) * 4,
                               make_float4(accum[fragment][0], accum[fragment][1],
                                           accum[fragment][2], accum[fragment][3]));
@@ -164,7 +204,7 @@ bf16_a16_sliced_k_mma_body(const __nv_bfloat16* __restrict__ x,
 #pragma unroll
         for (int fragment = 0; fragment < kFragments; ++fragment) {
             const std::int64_t partner_base =
-                (static_cast<std::int64_t>(warp + 1) * kFragments + fragment) * 32 * 4;
+                (static_cast<std::int64_t>(warp / 2) * kFragments + fragment) * 32 * 4;
             float4 partner = {};
             if constexpr (kKWarps % 2 == 0) {
                 partner = common::load_vec<float4>(partial + partner_base +
@@ -179,7 +219,7 @@ bf16_a16_sliced_k_mma_body(const __nv_bfloat16* __restrict__ x,
             accum[fragment][3] += partner.w;
             if (warp != 0) {
                 const std::int64_t base =
-                    (static_cast<std::int64_t>(warp) * kFragments + fragment) * 32 * 4;
+                    (static_cast<std::int64_t>(warp / 2) * kFragments + fragment) * 32 * 4;
                 common::store_vec(partial + base + static_cast<std::int64_t>(lane) * 4,
                                   make_float4(accum[fragment][0], accum[fragment][1],
                                               accum[fragment][2], accum[fragment][3]));
@@ -196,7 +236,7 @@ bf16_a16_sliced_k_mma_body(const __nv_bfloat16* __restrict__ x,
 #pragma unroll
             for (int split = 2; split < kKWarps; split += 2) {
                 const std::int64_t base =
-                    (static_cast<std::int64_t>(split) * kFragments + fragment) * 32 * 4;
+                    (static_cast<std::int64_t>(split / 2) * kFragments + fragment) * 32 * 4;
                 const float4 value =
                     common::load_vec<float4>(partial + base + static_cast<std::int64_t>(lane) * 4);
                 sum.x += value.x;
@@ -206,10 +246,26 @@ bf16_a16_sliced_k_mma_body(const __nv_bfloat16* __restrict__ x,
             }
             const int mi = fragment / kTokenMmas, ni = fragment % kTokenMmas;
             const int token = token0 + ni * 8 + 2 * lid;
-            linear_finish_mma_fragment<false, decltype(destination), Epilogue,
-                                       !bf16_predicated_rows<Schedule>>(
-                destination, epilogue, row0 + mi * 16 + gid, token, sum, rows, tokens);
+            if constexpr (kCollective) {
+                // Pair slot zero is dead after the pair reduction. Reuse it for a complete
+                // FP32 tile; the epilogue sees only this layout, not the partial reduction.
+                const LinearFloatTileOutput<kMmaRows> tile{partial, row0, token0};
+                linear_finish_mma_fragment<false, decltype(tile), LinearIdentityEpilogue,
+                                           !bf16_predicated_rows<Schedule>>(
+                    tile, LinearIdentityEpilogue{}, row0 + mi * 16 + gid, token, sum, rows, tokens);
+            } else {
+                linear_finish_mma_fragment<false, decltype(destination), Epilogue,
+                                           !bf16_predicated_rows<Schedule>>(
+                    destination, epilogue, row0 + mi * 16 + gid, token, sum, rows, tokens);
+            }
         }
+    }
+    if constexpr (kCollective) {
+        __syncthreads();
+        // All CTA threads participate. Tile is contiguous FP32 [BlockRows,BlockTokens],
+        // and only valid rows/columns are initialized. An epilogue may declare additional
+        // scratch after the tile with kSharedBytes<Schedule>. All storage expires with this body.
+        epilogue.template finish_sliced_tile<Schedule>(output, partial, row0, token0, rows, tokens);
     }
 }
 
@@ -217,10 +273,19 @@ template <class Schedule, class Output, class Epilogue>
 __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_sliced_k_mma_kernel(
     const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ weight, Output output,
-    Epilogue epilogue, int rows, int input_rows, int tokens, int token_offset) {
+    Epilogue epilogue, int rows, int input_rows, int tokens, int token_offset, int count) {
     extern __shared__ __align__(16) unsigned char shared_raw[];
+    int row_tile = blockIdx.x, token_tile = blockIdx.y;
+    if constexpr (Schedule::kRaster != Bf16MmaRaster::RowFast) {
+        const int row_tiles = bf16_predicated_rows<Schedule>
+                                  ? (rows + Schedule::kBlockRows - 1) / Schedule::kBlockRows
+                                  : rows / Schedule::kBlockRows;
+        bf16_mma_tile_coordinates<Schedule>(
+            blockIdx.x, row_tiles, (count + Schedule::kBlockTokens - 1) / Schedule::kBlockTokens,
+            row_tile, token_tile);
+    }
     bf16_a16_sliced_k_mma_body<Schedule>(
-        x, weight, output, epilogue, rows, input_rows, tokens, blockIdx.x,
-        token_offset + blockIdx.y * Schedule::kBlockTokens, shared_raw);
+        x, weight, output, epilogue, rows, input_rows, tokens, row_tile,
+        token_offset + token_tile * Schedule::kBlockTokens, shared_raw);
 }
 } // namespace ninfer::ops::detail

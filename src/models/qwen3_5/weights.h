@@ -4,6 +4,7 @@
 
 #include "core/weight_bank.h"
 #include "models/common/weights.h"
+#include "models/common/dflash/weights.h"
 #include "ninfer/ops/linear.h"
 
 #include <cstddef>
@@ -25,10 +26,6 @@ struct GdnWeights {
     WeightId query, key, value, z;
     WeightId a_projection, b_projection, a_log, dt_bias;
     WeightId convolution, norm, output;
-};
-
-struct DenseWeights {
-    WeightId gate, up, down;
 };
 
 struct MoeWeights {
@@ -57,34 +54,6 @@ struct MtpWeights {
     WeightUseId output_head_use;
 };
 
-struct DraftAttentionWeights {
-    WeightId query, key, value, context_key, context_value;
-    WeightId query_norm, key_norm, output;
-};
-
-struct DynamicConvWeights {
-    WeightId base_kernel, kernel_projection;
-};
-
-struct DraftBlockWeights {
-    WeightId input_norm, post_attention_norm;
-    DraftAttentionWeights attention;
-    DenseWeights mlp;
-    std::optional<DynamicConvWeights> attention_conv, mlp_conv;
-};
-
-struct SelectorWeights {
-    WeightId hidden_projection, predecessor_codebook, successor_codebook;
-};
-
-struct DraftWeights {
-    WeightId feature_projection, context_norm, final_norm;
-    std::vector<DraftBlockWeights> layers;
-    std::optional<SelectorWeights> selector;
-    WeightId token_embedding, output_head;
-    WeightUseId output_head_use;
-};
-
 struct ProposalWeights {
     WeightId head;
     std::optional<WeightId> token_ids;
@@ -97,7 +66,7 @@ struct ModelWeights {
     TextWeights text;
     std::optional<qwen::VisionWeights> vision;
     std::optional<MtpWeights> mtp;
-    std::optional<DraftWeights> draft;
+    std::optional<dflash::Weights> draft;
     std::optional<ProposalWeights> proposal;
 };
 

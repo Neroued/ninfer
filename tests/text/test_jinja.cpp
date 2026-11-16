@@ -1,7 +1,12 @@
 #include "text/jinja.h"
 
+#include <jinja/parser.h>
+
+#include <algorithm>
 #include <atomic>
+#include <iterator>
 #include <future>
+#include <limits>
 #include <iostream>
 #include <stdexcept>
 
@@ -33,6 +38,35 @@ int language_semantics() {
          {{"text", "北京🌏"}},
          "3|🌏|🌏京北||"},
         {"{% for c in text %}[{{ c }}]{% endfor %}", {{"text", "北京🌏"}}, "[北][京][🌏]"},
+        {"{% for i in range(1000000000000) %}{{ i }}{% break %}{% endfor %}", Json::object(), "0"},
+        {"{% for x,y in [[1,2],[3]] %}{{ x }}{% break %}{% endfor %}", Json::object(), "1"},
+        {"{% for i in [1,2] %}A{% if true %}B{% break %}C{% endif %}D{% else %}E{% endfor %}",
+         Json::object(), "ABE"},
+        {"{% for i in [1,2] %}A{% if true %}B{% continue %}C{% endif %}D{% else %}E{% endfor %}",
+         Json::object(), "ABABE"},
+        {"{% for i in [1] %}{% set x %}A{% break %}{% endset %}B{% else %}E{% endfor %}|"
+         "{% for i in [1] %}{% filter upper %}a{% break %}{% endfilter %}B{% else %}E{% endfor %}",
+         Json::object(), "E|E"},
+        {"{% set d={1:'one',2.0:'two',true:'bool'} %}{{ d[1] }}|{{ d[2] }}|{{ d[true] }}",
+         Json::object(), "bool|two|bool"},
+        {"{% set a,b = range(3,7,2) %}{{ a }}|{{ b }}", Json::object(), "3|5"},
+        {"{% for i in [1] %}{% if loop %}{{ loop.index }}{% endif %}{% endfor %}", Json::object(),
+         "1"},
+        {"{% set x=0 %}{% for i in [1,2] %}{{ x }}{% set x=i %}{% endfor %}|{{ x }}",
+         Json::object(), "00|0"},
+        {"{% set n=namespace(v=0) %}{% for i in [1,2,3] if i>n.v %}{{ i }}"
+         "{% set n.v=3 %}{% endfor %}",
+         Json::object(), "1"},
+        {"{% set n=namespace(v=0) %}{% for i in [1,2,3] if i>n.v %}{{ i }}/{{ loop.length }}"
+         "{% set n.v=3 %}{% endfor %}",
+         Json::object(), "1/32/33/3"},
+        {"{% for i in range(5) if i%2==0 %}{{ loop.index }}:{{ i }}:"
+         "{{ loop.previtem|default('-') }}:{{ loop.nextitem|default('-') }}:"
+         "{{ loop.first }}:{{ loop.last }}:{{ loop.revindex }};{% endfor %}",
+         Json::object(), "1:0:-:2:True:False:3;2:2:0:4:False:False:2;3:4:2:-:False:True:1;"},
+        {"{{ range(8,1,-2)|list|tojson }}|{{ range(2,9,2)[1:]|list|tojson }}|"
+         "{{ range(2,9,2)[-1] }}|{{ 6 in range(2,9,2) }}|{{ range(3)|length }}",
+         Json::object(), "[8, 6, 4, 2]|[4, 6, 8]|8|True|3"},
         {"{{ text|upper }}|{{ text|lower }}|{{ text|capitalize }}",
          {{"text", "straße ΟΣ İ"}},
          "STRASSE ΟΣ İ|straße ος i̇|Straße ος i̇"},
@@ -59,6 +93,62 @@ int language_semantics() {
          Json::object(), "[value]"},
         {"{{ number }}", {{"number", 1.23456789}}, "1.23456789"},
         {"{% filter upper %}{{ text }}{% endfilter %}", {{"text", "straße"}}, "STRASSE"},
+        {"{% set ns=namespace(f=none) %}{% macro save() %}{% set ns.f=caller %}{% endmacro "
+         "%}{% set x='old' %}{% call save() %}{{ x }}{% endcall %}{% set x='new' %}{{ "
+         "ns.f() }}",
+         Json::object(), "new"},
+        {"{% set ns=namespace(f=none) %}{% for x in ['A'] %}{% macro first() %}{{ second() "
+         "}}{% endmacro %}{% macro second() %}{{ x }}{% endmacro %}{% set ns.f=first %}{% "
+         "endfor %}{{ ns.f() }}",
+         Json::object(), "A"},
+        {"{% set ns=namespace(f=none) %}{% for x in ['A'] %}{% macro a(n) %}{% if n %}{{ "
+         "b(n-1) }}{% else %}{{ x }}{% endif %}{% endmacro %}{% macro b(n) %}{{ a(n) }}{% "
+         "endmacro %}{% set ns.f=a %}{% endfor %}{{ ns.f(3) }}",
+         Json::object(), "A"},
+        {"{% set ns=namespace(f=none) %}{% for x in ['A'] %}{% macro helper() %}{{ x }}{% "
+         "endmacro %}{% macro factory() %}{% macro nested() %}{{ helper() }}{% endmacro "
+         "%}{% set ns.f=nested %}{% endmacro %}{{ factory() }}{% endfor %}{{ ns.f() }}",
+         Json::object(), "A"},
+        {"{% set x='outer' %}{% set ns=namespace(f=none) %}{% for i in [1] %}{% macro f() "
+         "%}{{ x }}{% endmacro %}{{ f() }}|{% set x='inner' %}{% set ns.f=f %}{% endfor "
+         "%}{{ ns.f() }}",
+         Json::object(), "outer|inner"},
+        {"{% set x='outer' %}{% macro f() %}{{ x }}|{% set x='inner' %}{{ x }}{% endmacro "
+         "%}{{ f() }}|{{ x }}",
+         Json::object(), "outer|inner|outer"},
+        {"{% set x='X' %}{% macro f(a=x,b=a) %}{{ a }}{{ b }}{% endmacro %}{{ f() }}|{{ "
+         "f('A') }}",
+         Json::object(), "XX|AA"},
+        {"{% set x='X' %}{% set k='key' %}{% macro f() %}{{ {'key':x}[k] }}|{{ "
+         "[x]|join(',') }}|{{ x is string }}{% endmacro %}{{ f() }}",
+         Json::object(), "X|X|True"},
+        {"{% set ns=namespace(l=none) %}{% for x in [2] %}{% for i in [1,2,3] if i>=x %}{% "
+         "set ns.l=loop %}{% break %}{% endfor %}{% endfor %}{{ ns.l.length }}|{{ "
+         "ns.l.nextitem }}",
+         Json::object(), "2|3"},
+        {"{% set ns=namespace(f=none) %}{% for x in ['A'] %}{% macro a(n) %}{% if n %}{{ "
+         "a(n-1) }}{% else %}{{ x }}{% endif %}{% endmacro %}{% set alias=a %}{% set "
+         "ns.f=alias %}{% endfor %}{{ ns.f(2) }}",
+         Json::object(), "A"},
+        {"{% for i in a if i>0 %}{{ i }}/{{ loop.length }};{% if i==1 %}{% set "
+         "_=a.append(3) %}{% endif %}{% endfor %}",
+         {{"a", Json::array({1, 2})}},
+         "1/2;2/2;"},
+        {"{% for i in a %}{{ i }}:{{ loop.last }};{% if i==2 %}{% set _=a.append(3) %}{% "
+         "endif %}{% endfor %}",
+         {{"a", Json::array({1, 2})}},
+         "1:False;2:True;"},
+        {"{% for i in a %}{{ i }}/{{ loop.length }};{% if i==2 %}{% set _=a.append(3) %}{% "
+         "endif %}{% endfor %}",
+         {{"a", Json::array({1, 2})}},
+         "1/2;2/2;3/2;"},
+        {"{{ n is divisibleby(-1) }}|{{ n is divisibleby(2) }}|{{ 7 is divisibleby(3) }}",
+         {{"n", std::numeric_limits<int64_t>::min()}},
+         "True|True|False"},
+        {"{% set x='old' %}{% set ns=namespace(f=none) %}{% for i in [1] %}"
+         "{% macro f() %}{{ x }}{% endmacro %}{% if false %}{% set x='local' %}{% endif %}"
+         "{% set ns.f=f %}{% endfor %}{% set x='new' %}{{ ns.f() }}",
+         Json::object(), "new"},
     };
     int failures = 0;
     for (const auto& item : cases) {
@@ -70,8 +160,11 @@ int language_semantics() {
             ++failures;
         }
     }
-    for (const char* source : {"{{ none + 'x' }}", "{{ 'abc'[::0] }}", "{{ missing|tojson }}",
-                               "{{ value|unknown_filter }}"}) {
+    for (const char* source :
+         {"{{ none + 'x' }}", "{{ 'abc'[::0] }}", "{{ missing|tojson }}",
+          "{{ value|unknown_filter }}", "{{ 1 is divisibleby(0) }}",
+          "{% for loop in [1] %}{{ loop }}{% endfor %}",
+          "{% for loop,x in [[1,2]] %}{{ x }}{% endfor %}", "{% macro 1() %}x{% endmacro %}"}) {
         try {
             (void)JinjaTemplate(source, "error-test").render(Json::object());
             ++failures;
@@ -80,6 +173,113 @@ int language_semantics() {
                               "template error omitted its source name");
         }
     }
+    return failures;
+}
+
+int closure_lifetimes() {
+    using namespace jinja;
+    const char* bodies[]{
+        "{% call sink() %}{% endcall %}",
+        "{% macro local() %}{{ token }}{% endmacro %}",
+        "{% call save() %}{{ token }}{% endcall %}",
+        "{% macro local() %}{{ token }}{% endmacro %}{% set ns.f=local %}",
+        "{% macro local() %}{{ token }}{{ ns.f is defined }}{% endmacro %}{% set ns.f=local %}",
+        "{% macro local(n) %}{% if n %}{{ alias(n-1) }}{% else %}{{ token }}{% endif %}"
+        "{% endmacro %}{% set alias=local %}{{ local(2) }}"};
+    const int expected_alive[]{0, 0, 1, 1, 1, 0};
+    int failures = 0;
+    for (std::size_t index = 0; index < std::size(bodies); ++index) {
+        const std::string source = "{% set ns=namespace(f=none) %}"
+                                   "{% macro sink() %}{{ caller() }}{% endmacro %}"
+                                   "{% macro save() %}{% set ns.f=caller %}{% endmacro %}"
+                                   "{% for i in range(32) %}{% set token=make_token() %}" +
+                                   std::string(bodies[index]) + "{% endfor %}";
+        auto program = parse_from_tokens(lexer().tokenize(source));
+        std::vector<std::weak_ptr<value_t>> tokens;
+        const auto alive = [&] {
+            return std::count_if(tokens.begin(), tokens.end(),
+                                 [](const auto& token) { return !token.expired(); });
+        };
+        {
+            context ctx(source);
+            ctx.set_val("make_token",
+                        mk_val<value_func>("make_token", [&](const func_args&) -> value {
+                            value token = mk_val<value_string>("value");
+                            tokens.emplace_back(token);
+                            return token;
+                        }));
+            runtime(ctx).execute(program);
+            failures +=
+                check(alive() == expected_alive[index], "closure retained unused iteration values");
+        }
+        failures += check(alive() == 0, "render teardown retained captured values");
+    }
+
+    for (bool cancel : {false, true}) {
+        const std::string source =
+            "{% set ns=namespace(f=none) %}{% for i in range(32) %}{% set token=make_token() %}"
+            "{% macro local() %}{{ token }}{{ ns.f is defined }}{% endmacro %}{% set ns.f=local %}"
+            "{% if i==4 %}{{ raise_exception('stop') }}{% endif %}{% endfor %}";
+        auto program = parse_from_tokens(lexer().tokenize(source));
+        std::vector<std::weak_ptr<value_t>> tokens;
+        bool interrupted = false;
+        try {
+            context ctx(source);
+            ctx.set_val("make_token",
+                        mk_val<value_func>("make_token", [&](const func_args&) -> value {
+                            value token = mk_val<value_string>("value");
+                            tokens.emplace_back(token);
+                            return token;
+                        }));
+            if (cancel)
+                ctx.checkpoint = [&] {
+                    if (tokens.size() >= 3) throw std::runtime_error("cancelled");
+                };
+            runtime(ctx).execute(program);
+        } catch (const std::exception&) { interrupted = true; }
+        failures += check(interrupted && !tokens.empty(),
+                          "render did not exercise interrupted capture cleanup");
+        for (const auto& token : tokens)
+            failures += check(token.expired(), "interrupted render retained a value");
+    }
+
+    const std::string source =
+        "{% set ns=namespace(l=none,f=none,c=none) %}"
+        "{% macro save() %}{% set ns.c=caller %}{% endmacro %}"
+        "{% call save() %}literal{% endcall %}{% for x in [1] %}"
+        "{% for i in [1,2] if i>=x %}{% set ns.l=loop %}{% break %}{% endfor %}"
+        "{% macro f() %}{{ x }}{% endmacro %}{% set ns.f=f %}{% endfor %}";
+    auto program = parse_from_tokens(lexer().tokenize(source));
+    value saved_loop, saved_macro, saved_caller;
+    {
+        context ctx(source);
+        runtime(ctx).execute(program);
+        saved_loop   = ctx.get_val("ns")->at("l");
+        saved_macro  = ctx.get_val("ns")->at("f");
+        saved_caller = ctx.get_val("ns")->at("c");
+    }
+    bool rejected = false;
+    try {
+        saved_loop->find(mk_val<value_string>("length"));
+    } catch (const std::runtime_error&) { rejected = true; }
+    failures += check(rejected, "loop used an ended render");
+    rejected = false;
+    try {
+        context another;
+        func_args args(another);
+        saved_macro->invoke(args);
+    } catch (const std::runtime_error&) { rejected = true; }
+    failures += check(rejected, "macro used an ended render");
+    rejected = false;
+    try {
+        context another;
+        func_args args(another);
+        saved_caller->invoke(args);
+    } catch (const std::runtime_error&) { rejected = true; }
+    failures += check(rejected, "caller used an ended render");
+    saved_loop.reset();
+    saved_macro.reset();
+    saved_caller.reset();
     return failures;
 }
 
@@ -103,6 +303,13 @@ int origins_and_requests() {
     failures += check(clipped.regions.size() == 1 && clipped.regions[0].source_offset == 1 &&
                           clipped.regions[0].end == 6,
                       "Unicode slice lost byte origin mapping");
+    const auto indexed =
+        JinjaTemplate("{{ ('a' ~ text ~ 'z')[1] }}|{{ ('a' ~ text ~ 'z')[-2] }}", "index-origin")
+            .render({{"text", "北京🌏"}}, options);
+    failures +=
+        check(indexed.text == "北|🌏" && indexed.regions.size() == 2 &&
+                  indexed.regions[0].source_offset == 0 && indexed.regions[1].source_offset == 6,
+              "Unicode indexing lost source coordinates across string parts");
     const std::vector<ninfer::text::TemplateInputRegion> nested_regions{{"/obj", 10},
                                                                         {"/obj/b", 11}};
     const auto nested =
@@ -329,8 +536,8 @@ int main(int argc, char** argv) {
         return 0;
     }
     try {
-        const int failures =
-            language_semantics() + origins_and_requests() + trim_semantics() + literal_content();
+        const int failures = language_semantics() + closure_lifetimes() + origins_and_requests() +
+                             trim_semantics() + literal_content();
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

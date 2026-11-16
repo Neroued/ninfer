@@ -1,3 +1,4 @@
+#include "ops/common/host/launch.h"
 #include "ninfer/ops/indexing.h"
 #include "ops/common/host/operands.h"
 
@@ -41,18 +42,20 @@ void gather_batch_rows(const Tensor& source, const Tensor& rows, Tensor& out,
     operand::disjoint(operand::range(out, op), operand::range(source, op), op);
     operand::disjoint(operand::range(out, op), operand::range(rows, op), op);
     const auto elements = std::int64_t(d) * t;
-    const dim3 grid(std::min<std::int64_t>(32, (elements + 255) / 256), b);
-    const auto launch = [&]<class Word>() {
-        gather_rows_kernel<<<grid, 256, 0, cuda.stream()>>>(static_cast<const Word*>(source.data),
-                                                            static_cast<const int*>(rows.data),
-                                                            static_cast<Word*>(out.data), elements);
-    };
-    if (bytes == 2)
-        launch.template operator()<std::uint16_t>();
-    else if (bytes == 4)
-        launch.template operator()<std::uint32_t>();
-    else
-        launch.template operator()<std::uint64_t>();
+    common::for_each_token_slice(b, 1, [&](int offset, int count) {
+        const dim3 grid(std::min<std::int64_t>(32, (elements + 255) / 256), count);
+        const auto launch = [&]<class Word>() {
+            gather_rows_kernel<<<grid, 256, 0, cuda.stream()>>>(
+                static_cast<const Word*>(source.data), static_cast<const int*>(rows.data) + offset,
+                static_cast<Word*>(out.data) + std::int64_t(offset) * elements, elements);
+        };
+        if (bytes == 2)
+            launch.template operator()<std::uint16_t>();
+        else if (bytes == 4)
+            launch.template operator()<std::uint32_t>();
+        else
+            launch.template operator()<std::uint64_t>();
+    });
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -69,10 +72,14 @@ void gather(const ConstStateFieldView& source, const Tensor& active, Tensor& out
     operand::tensor(source.records.byte_offsets, DType::I64, {b}, 8, op, "offsets", cuda.device());
     operand::disjoint(operand::range(out, op), operand::range(active, op), op);
     operand::disjoint(operand::range(out, op), operand::range(source.records.byte_offsets, op), op);
-    gather_field_kernel<<<dim3(std::min(32, (d + 255) / 256), b), 256, 0, cuda.stream()>>>(
-        operand::state_field_base<const std::uint16_t>(source),
-        static_cast<const std::int64_t*>(source.records.byte_offsets.data),
-        static_cast<const int*>(active.data), static_cast<std::uint16_t*>(out.data), d);
+    common::for_each_token_slice(b, 1, [&](int offset, int count) {
+        gather_field_kernel<<<dim3(std::min(32, (d - 1) / 256 + 1), count), 256, 0,
+                              cuda.stream()>>>(
+            operand::state_field_base<const std::uint16_t>(source),
+            static_cast<const std::int64_t*>(source.records.byte_offsets.data) + offset,
+            static_cast<const int*>(active.data) + offset,
+            static_cast<std::uint16_t*>(out.data) + std::int64_t(offset) * d, d);
+    });
     CUDA_CHECK(cudaGetLastError());
 }
 } // namespace ninfer::ops

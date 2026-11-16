@@ -27,7 +27,7 @@ inline Options parse_options(int argc, char** argv) {
                          "  --tokens T[,T...] or --sweep START:END[:STEP] --batch B\n"
                          "  --valid dense|mixed|N[,N...] --offset N (gate/convolution)\n"
                          "  --accepted dense|mixed|N[,N...] (state extraction) --inplace\n"
-                         "H=2560, streams=4, history=9, B=1..8. Defaults: conv-add-norm, T=B=1.\n";
+                         "H=2560, streams=4, history=9, B>=1. Defaults: conv-add-norm, T=B=1.\n";
             measurement::help();
             std::exit(0);
         }
@@ -57,9 +57,9 @@ inline Options parse_options(int argc, char** argv) {
         } else if (!measurement::parse(o.timing, flag, value))
             throw std::invalid_argument("unknown option: " + std::string(flag));
     }
-    if (o.batch > 8 || (o.op != "gate" && o.op != "conv-add" && o.op != "conv-add-norm" &&
-                        o.op != "state-extract" && o.op != "lookup"))
-        throw std::invalid_argument("unsupported Op/batch");
+    if (o.op != "gate" && o.op != "conv-add" && o.op != "conv-add-norm" &&
+        o.op != "state-extract" && o.op != "lookup")
+        throw std::invalid_argument("unsupported Op");
     if (o.op == "gate" && o.inplace) throw std::invalid_argument("gate has no in-place output");
     if ((lookup_option && o.op != "lookup") ||
         (o.op == "lookup" && (o.inplace || o.offset || o.accepted != "dense")))

@@ -11,10 +11,12 @@ SessionImpl::submit_execution(Execution&& pending, runtime::ExecutionReservation
     if (execution) throw std::logic_error("compute execution is already pending");
     execution.emplace(std::move(pending));
     try {
+        plan_work_batch(work, *plan.batch_execution);
         execution->preparation->prepare_actions();
         work.context      = execution->preparation->actions();
         const auto ticket = executor().submit(std::move(reservation), std::move(work));
         execution->ticket = ticket;
+        for (auto h : execution->members) sequences[lane(h)].computing = true;
         if (execution->vision_id) vision_window.submitted(execution->vision_id, ticket);
         execution->preparation->mark_submitted();
         return ticket;
@@ -116,7 +118,7 @@ std::optional<runtime::ExecutionTicket> SessionImpl::start_replay(SequenceHandle
 std::optional<runtime::ExecutionTicket>
 SessionImpl::start_decode(std::span<const SequenceHandle> members,
                           std::span<const runtime::RoundBudget> budgets,
-                          std::span<const bool> constrained) {
+                          std::span<const std::uint8_t> constrained) {
     if (execution) return {};
     if (members.empty() || members.size() > max_concurrency || budgets.size() != members.size() ||
         (!constrained.empty() && constrained.size() != members.size()))
@@ -128,10 +130,14 @@ SessionImpl::start_decode(std::span<const SequenceHandle> members,
         pending.members.assign(members.begin(), members.end());
         pending.preparation = std::make_unique<context::ContextTransaction>(directory);
         DecodeWork decode;
+        decode.rows.reserve(members.size());
+        pending.bases.reserve(members.size());
+        pending.columns.reserve(members.size());
+        const auto mark = next_lane_mark();
         for (std::size_t b = 0; b < members.size(); ++b) {
-            if (std::find(members.begin(), members.begin() + b, members[b]) != members.begin() + b)
-                throw std::logic_error("duplicate sequence in decode");
-            const auto l  = lane(members[b]);
+            const auto l = lane(members[b]);
+            if (lane_marks[l] == mark) throw std::logic_error("duplicate sequence in decode");
+            lane_marks[l] = mark;
             auto& state   = sequences[l];
             auto& request = requests[l];
             const auto f  = state.continuation.metadata.execution_frontier;
@@ -167,24 +173,31 @@ SessionImpl::start_decode(std::span<const SequenceHandle> members,
 
 std::optional<runtime::ExecutionTicket>
 SessionImpl::start_control(std::span<const SequenceHandle> members, std::span<const TokenId> tokens,
-                           std::uint32_t stride,
-                           std::span<const std::optional<std::uint32_t>> splits) {
+                           std::uint32_t stride) {
     if (execution) return {};
     if (members.empty() || members.size() > max_concurrency || !stride ||
-        stride > plan.profile->control_token_limit || tokens.size() != members.size() * stride ||
-        splits.size() != members.size())
+        stride > plan.profile->control_token_limit || tokens.size() != members.size() * stride)
         throw std::invalid_argument("forced control shape is invalid");
     auto reservation = executor().try_reserve(runtime::FrameKind::Compute);
     if (!reservation) return {};
     try {
         Execution pending{.kind = OperationKind::Control};
         pending.members.assign(members.begin(), members.end());
-        pending.splits.assign(splits.begin(), splits.end());
         pending.preparation = std::make_unique<context::ContextTransaction>(directory);
         ForwardWork forward;
         forward.purpose = ForwardPurpose::Control;
+        forward.rows.reserve(members.size());
+        forward.inputs.reserve(members.size());
+        forward.sampling.reserve(members.size());
+        forward.control_last_tokens.reserve(members.size());
+        pending.bases.reserve(members.size());
+        pending.columns.reserve(members.size());
+        pending.inputs.reserve(members.size());
+        const auto mark = next_lane_mark();
         for (std::size_t b = 0; b < members.size(); ++b) {
-            const auto l  = lane(members[b]);
+            const auto l = lane(members[b]);
+            if (lane_marks[l] == mark) throw std::logic_error("duplicate sequence in control");
+            lane_marks[l] = mark;
             auto& state   = sequences[l];
             auto& request = requests[l];
             const auto f  = state.continuation.metadata.execution_frontier;
@@ -195,8 +208,6 @@ SessionImpl::start_control(std::span<const SequenceHandle> members, std::span<co
             for (const auto id : forced)
                 if (id < 0 || static_cast<std::uint32_t>(id) >= plan.profile->public_tokens)
                     throw std::invalid_argument("forced token is outside the public vocabulary");
-            if (splits[b] && (!*splits[b] || *splits[b] > stride))
-                throw std::invalid_argument("forced control split is outside its span");
             pending.bases.push_back(state.continuation);
             pending.columns.push_back(stride);
             pending.inputs.emplace_back(forced.begin(), forced.end());
@@ -273,11 +284,6 @@ std::optional<SessionEvent> SessionImpl::poll() {
                     continue;
                 }
                 return event;
-            }
-            if (pending_maintenance_ && !execution && !has_context_operation()) {
-                auto assessment = std::move(*pending_maintenance_);
-                pending_maintenance_.reset();
-                (void)start_maintenance(assessment);
             }
             auto event = executor().poll();
             if (!event) return {};

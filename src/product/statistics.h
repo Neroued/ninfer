@@ -32,6 +32,8 @@ struct GenerationRates {
 [[nodiscard]] nlohmann::json request_execution_json(const RequestStats&);
 [[nodiscard]] MemoryAllocations sum_allocations(std::span<const RankSnapshot>);
 [[nodiscard]] nlohmann::json resource_json(const RankSnapshot&);
+[[nodiscard]] const char* communication_backend_name(CommunicationBackend);
+[[nodiscard]] nlohmann::json communication_json(const CommunicationWork&);
 [[nodiscard]] const char* context_domain_name(ContextMemoryDomain) noexcept;
 [[nodiscard]] nlohmann::json context_capacity_json(std::span<const ContextPoolCapacity>);
 [[nodiscard]] nlohmann::json context_usage_json(const RuntimeStats&);

@@ -1,4 +1,5 @@
 #include "fixture.cuh"
+#include "common/gpu_activity.cuh"
 
 using namespace ninfer;
 using namespace ninfer::bench;
@@ -19,8 +20,11 @@ int main(int argc, char** argv) {
                      measurement::selections(options.timing.cache, "cold", "warm")) {
                     const auto result = measurement::measure(
                         [&](CudaExecutionView cuda) { fixture.launch(cuda); },
-                        [&](CudaExecutionView cuda) { fixture.restore(cuda); }, flush,
-                        device.execution_view(), options.timing, execution, cache);
+                        [&](CudaExecutionView cuda) {
+                            fixture.restore(cuda);
+                            condition_gpu(cuda, 200);
+                        },
+                        flush, device.execution_view(), options.timing, execution, cache);
                     measurement::Row row;
                     row.op            = options.op;
                     row.format        = options.format;

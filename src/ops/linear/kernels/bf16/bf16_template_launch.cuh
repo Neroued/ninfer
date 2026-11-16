@@ -116,14 +116,22 @@ void launch_bf16_a16_sliced_k_mma(const Bf16A16Operands& p, Output output, Epilo
         p.k % (bf16_predicated_k<Schedule> ? 8 : Schedule::kBlockK))
         throw std::invalid_argument("BF16 sliced-K requires compatible row/K tiles");
     constexpr auto kernel = bf16_a16_sliced_k_mma_kernel<Schedule, Output, Epilogue>;
-    const int bytes       = common::prepare_shared<Schedule::kSharedBytes, kernel, true>();
+    const int bytes =
+        common::prepare_shared<linear_mma_shared_bytes<Schedule, Epilogue>, kernel, true>();
     common::for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
-        const dim3 grid(bf16_predicated_rows<Schedule>
-                            ? common::div_up(p.rows, Schedule::kBlockRows)
-                            : p.rows / Schedule::kBlockRows,
-                        common::div_up(count, Schedule::kBlockTokens));
+        const int row_tiles   = bf16_predicated_rows<Schedule>
+                                    ? common::div_up(p.rows, Schedule::kBlockRows)
+                                    : p.rows / Schedule::kBlockRows;
+        const int token_tiles = common::div_up(count, Schedule::kBlockTokens);
+        dim3 grid(row_tiles, token_tiles);
+        if constexpr (Schedule::kRaster != Bf16MmaRaster::RowFast) {
+            const auto blocks = std::int64_t(row_tiles) * token_tiles;
+            if (blocks > 2147483647LL)
+                throw std::invalid_argument("BF16 sliced-K grid exceeds CUDA grid.x capacity");
+            grid = dim3(static_cast<unsigned>(blocks));
+        }
         kernel<<<grid, Schedule::kThreads, bytes, stream>>>(p.x, p.weight, output, epilogue, p.rows,
-                                                            p.k, p.tokens, offset);
+                                                            p.k, p.tokens, offset, count);
         CUDA_CHECK(cudaGetLastError());
     });
 }

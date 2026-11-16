@@ -1,5 +1,6 @@
 #include "core/buffer.h"
 #include "core/decode_graph.h"
+#include "distributed/communication/preparation.h"
 #include "models/common/context/transfer.h"
 #include "models/common/context/wire.h"
 #include "ninfer/ops/collective.h"
@@ -8,6 +9,9 @@
 #include "runtime/executor/worker_loop.h"
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <bit>
+#include <limits>
 #include <sys/wait.h>
 
 #include <array>
@@ -236,9 +240,14 @@ public:
             CUDA_CHECK(cudaMemcpyAsync(f.source.data(), f.input.data(), f.input_bytes,
                                        cudaMemcpyHostToDevice, device_.stream()));
             if (w.graph) {
-                f.definition.capture(device_.stream(), [&] { collective(f); });
+                group_.record_graph(f.communication, [&] {
+                    f.definition.capture(device_.stream(), [&] { collective(f); });
+                });
                 f.graph.instantiate(f.definition);
-                for (int i = 0; i < 4; ++i) f.graph.launch(device_.stream());
+                for (int i = 0; i < 4; ++i) {
+                    f.graph.launch(device_.stream());
+                    group_.replayed(f.communication);
+                }
             } else
                 collective(f);
             CUDA_CHECK(cudaMemcpyAsync(f.output.data(), f.destination.data(), f.output_bytes,
@@ -375,6 +384,7 @@ private:
         CudaCompletionEvent done;
         DecodeGraphDefinition definition;
         DecodeGraphExecutable graph;
+        CommunicationGraphWork communication;
         rt::ExecutionRequest<Types> request;
         rt::CommandSequence command;
         Phase phase    = Phase::Empty;
@@ -565,17 +575,287 @@ private:
     std::deque<rt::ExecutionEvent<Types>> events_;
 };
 
-int worker() {
+dist::CommunicationPolicy communication_policy(std::string_view name) {
+    if (name == "nccl") return dist::CommunicationPolicy::Nccl;
+    if (name == "auto") return dist::CommunicationPolicy::Auto;
+    if (name == "native") return dist::CommunicationPolicy::Native;
+    throw std::invalid_argument("execution fixture backend must be nccl, native or auto");
+}
+
+void check_collective_windows(dist::WorkerConnection& connection) {
+    auto& device                = connection.device();
+    const auto& group           = connection.communication().group(0);
+    constexpr unsigned capacity = (1U << 20) + 3;
+    PinnedHostBuffer host(2 * capacity * sizeof(__nv_bfloat16));
+    DeviceBuffer data(device.device(), host.size());
+    auto* input          = static_cast<__nv_bfloat16*>(host.data());
+    const auto reference = [](unsigned i, unsigned rank, unsigned round) {
+        constexpr std::uint16_t edges[2][10] = {
+            {0x0000, 0x8000, 0x0001, 0x007f, 0x0080, 0x3f80, 0x3f81, 0x7f7f, 0xbf80, 0x3f80},
+            {0x8000, 0x0000, 0x0001, 0x0001, 0x8080, 0x3b80, 0x3b80, 0x7f7f, 0x3f80, 0xbb80}};
+        if (i < 10) return __ushort_as_bfloat16(edges[rank][i]);
+        const auto sign     = (i + rank + round) % 3 == 0 ? 0x8000U : 0;
+        const auto exponent = 118 + (i * 7 + rank * 11 + round) % 20;
+        const auto mantissa = (i * 13 + rank * 19 + round * 7) & 127U;
+        return __ushort_as_bfloat16(sign | exponent << 7 | mantissa);
+    };
+    const auto run = [&](unsigned count, bool gather, bool graph, bool broadcast) {
+        auto output     = Tensor(data.span(), DType::BF16, {int(count * (gather ? 2 : 1))});
+        auto source     = gather ? output.slice(0, group.rank() * count, count) : output;
+        const auto call = [&] {
+            if (gather)
+                ops::all_gather(source, output, group, device.execution_view());
+            else if (broadcast)
+                ops::broadcast(output, 0, group, device.execution_view());
+            else
+                ops::all_reduce(source, output, dist::Reduction::Sum, group,
+                                device.execution_view());
+        };
+        DecodeGraphDefinition definition;
+        DecodeGraphExecutable executable;
+        if (graph) {
+            definition.capture(device.stream(), call);
+            executable.instantiate(definition);
+        }
+        connection.communication().set_active(true);
+        CudaCompletionEvent done(device);
+        for (unsigned round = 0; round < (count > 65539 ? 3U : 7U); ++round) {
+            for (unsigned i = 0; i < count; ++i) input[i] = reference(i, group.rank(), round);
+            CUDA_CHECK(cudaMemcpyAsync(source.data, input, count * sizeof(*input),
+                                       cudaMemcpyHostToDevice, device.stream()));
+            if (graph)
+                executable.launch(device.stream());
+            else
+                call();
+            CUDA_CHECK(cudaMemcpyAsync(host.data(), output.data, output.bytes(),
+                                       cudaMemcpyDeviceToHost, device.stream()));
+            done.record(device.stream());
+            while (!done.ready()) {
+                connection.communication().check();
+                std::this_thread::yield();
+            }
+            for (unsigned i = 0; i < unsigned(output.numel()); ++i) {
+                const auto expected =
+                    gather      ? reference(i % count, i / count, round)
+                    : broadcast ? reference(i, 0, round)
+                                : __float2bfloat16(__bfloat162float(reference(i, 0, round)) +
+                                                   __bfloat162float(reference(i, 1, round)));
+                require(__bfloat16_as_ushort(input[i]) == __bfloat16_as_ushort(expected),
+                        "collective window/replay differs from represented-input reference");
+            }
+        }
+        connection.communication().set_active(false);
+    };
+    run(3, false, false, false);
+    run(4097, false, true, false);
+    run(capacity, false, true, false);
+    run(16385, true, true, false);
+    run(capacity, true, true, false);
+    run(capacity, false, true, true);
+    {
+        constexpr int count = 37;
+        Tensor all(data.span(), DType::I64, {count * 2});
+        auto local = all.slice(0, group.rank() * count, count);
+        auto* bits = static_cast<std::uint64_t*>(host.data());
+        for (unsigned i = 0; i < count; ++i) bits[i] = (1ULL << 63) + (group.rank() << 20) + i;
+        CUDA_CHECK(cudaMemcpyAsync(local.data, bits, local.bytes(), cudaMemcpyHostToDevice,
+                                   device.stream()));
+        ops::all_gather(local, all, group, device.execution_view());
+        device.synchronize();
+        data.copy_to_host(bits, all.bytes());
+        for (unsigned i = 0; i < 2 * count; ++i)
+            require(bits[i] == (1ULL << 63) + ((i / count) << 20) + i % count,
+                    "candidate all-gather changed represented bits");
+    }
+    {
+        constexpr int count = 35;
+        auto* words         = static_cast<std::uint32_t*>(host.data());
+        for (unsigned i = 0; i < count; ++i)
+            words[i] = group.rank() == 0 ? UINT32_MAX - i : 2 * i + 3;
+        data.copy_from_host(words, count * sizeof(*words));
+        Tensor values(data.span(), DType::U32, {count});
+        ops::all_reduce(values, values, dist::Reduction::Sum, group, device.execution_view());
+        device.synchronize();
+        data.copy_to_host(words, values.bytes());
+        for (unsigned i = 0; i < count; ++i)
+            require(words[i] == i + 2, "U32 sum did not preserve modular integer arithmetic");
+    }
+}
+
+template <class T>
+void check_reductions(dist::WorkerConnection& connection, DType dtype) {
+    const auto& group = connection.communication().group(0);
+    auto& device      = connection.device();
+    const int count   = std::is_same_v<T, float> ? 262147 : 37;
+    const auto value  = [](unsigned i, unsigned rank) -> T {
+        if constexpr (std::is_integral_v<T>) {
+            using U      = std::make_unsigned_t<T>;
+            const U bits = rank ? U(i * 7 + 3) : U(std::numeric_limits<U>::max() - i * 3);
+            return std::bit_cast<T>(bits);
+        } else {
+            return T(float(int((i * 7 + rank * 3) % 41) - 20) * .25f);
+        }
+    };
+    std::vector<T> input(count * 2), actual(count);
+    for (unsigned i = 0; i < input.size(); ++i) input[i] = value(i, group.rank());
+    DeviceBuffer source(device.device(), input.size() * sizeof(T));
+    DeviceBuffer output(device.device(), actual.size() * sizeof(T));
+    source.copy_from_host(input.data(), source.size());
+    for (const auto reduction : {dist::Reduction::Sum, dist::Reduction::Max}) {
+        for (const auto operation :
+             {dist::Collective::AllReduce, dist::Collective::ReduceScatter}) {
+            const dist::CollectiveCall call{operation, dtype, std::size_t(count), reduction};
+            group.enqueue(call, source.data(), output.data(), device.execution_view());
+            device.synchronize();
+            output.copy_to_host(actual.data(), output.size());
+            for (unsigned i = 0; i < actual.size(); ++i) {
+                const auto index =
+                    i + (operation == dist::Collective::ReduceScatter ? group.rank() * count : 0);
+                const auto a = value(index, 0), b = value(index, 1);
+                T expected;
+                if (reduction == dist::Reduction::Max)
+                    expected = a > b ? a : b;
+                else if constexpr (std::is_integral_v<T>) {
+                    using U     = std::make_unsigned_t<T>;
+                    const U sum = U(a) + U(b);
+                    expected    = std::bit_cast<T>(sum);
+                } else
+                    expected = T(float(a) + float(b));
+                require(std::memcmp(&actual[i], &expected, sizeof(T)) == 0,
+                        "reduction differs from mathematical reference");
+            }
+        }
+    }
+}
+
+void check_peer_directions(dist::WorkerConnection& connection) {
+    auto& device                = connection.device();
+    const auto& group           = connection.communication().group(0);
+    constexpr std::size_t bytes = (3U << 20) + 7;
+    DeviceBuffer send(device.device(), bytes), receive(device.device(), bytes);
+    bool rejected = false;
+    const dist::PeerTransfer alias{1 - group.rank(), send.span(), send.span()};
+    try {
+        group.exchange({&alias, 1}, device.execution_view());
+    } catch (const std::invalid_argument&) { rejected = true; }
+    require(rejected, "peer exchange accepted overlapping send and receive buffers");
+    const auto run = [&](const dist::Group& transport, std::size_t tx, std::size_t rx,
+                         bool separate) {
+        std::vector<std::byte> input(tx);
+        const auto value = [](std::size_t i, unsigned rank, unsigned round) {
+            return std::byte((i * 17 ^ (i >> 7) ^ (i >> 16) * 13 ^ rank * 0x53 ^ round * 23) & 255);
+        };
+        receive.fill();
+        const auto exchange = [&](std::size_t s, std::size_t r) {
+            const dist::PeerTransfer transfer{1 - group.rank(), send.span().subspan(0, s),
+                                              receive.span().subspan(0, r)};
+            transport.exchange({&transfer, 1}, device.execution_view());
+        };
+        DecodeGraphDefinition definition;
+        DecodeGraphExecutable executable;
+        definition.capture(device.stream(), [&] {
+            if (separate) {
+                exchange(0, rx);
+                exchange(tx, 0);
+            } else
+                exchange(tx, rx);
+        });
+        executable.instantiate(definition);
+        for (unsigned replay = 0; replay < 3; ++replay) {
+            for (std::size_t i = 0; i < tx; ++i) input[i] = value(i, group.rank(), replay);
+            send.copy_from_host(input.data(), tx);
+            executable.launch(device.stream());
+            device.synchronize();
+            std::vector<std::byte> actual(rx);
+            receive.copy_to_host(actual.data(), rx);
+            for (std::size_t i = 0; i < rx; ++i)
+                require(actual[i] == value(i, 1 - group.rank(), replay),
+                        "asymmetric peer exchange lost payload or generation");
+        }
+    };
+    connection.communication().set_active(true);
+    run(group, group.rank() ? 13 : bytes, group.rank() ? bytes : 13, group.rank() == 1);
+    const auto& peer_only = connection.communication().group(1);
+    run(peer_only, group.rank() ? bytes : 0, group.rank() ? 0 : bytes, false);
+    run(peer_only, group.rank() ? 393219 : bytes, group.rank() ? bytes : 393219, false);
+    connection.communication().set_active(false);
+}
+
+int worker(dist::CommunicationPolicy policy) {
     auto bootstrap = dist::read_worker_bootstrap();
     std::cerr << dist::rank_description(bootstrap.identity) << '\n';
     dist::WorkerConnection connection(std::move(bootstrap));
     try {
+        const auto& group = connection.communication().group(0);
+        std::array requirements{
+            dist::GroupRequirements{
+                0,
+                {{dist::Collective::AllReduce, DType::FP32, 1, 4096},
+                 {dist::Collective::AllReduce, DType::BF16, 1, (1U << 20) + 3},
+                 {dist::Collective::AllReduce, DType::U32, 1, 4096},
+                 {dist::Collective::AllReduce, DType::U64, 1, 4096, 1, dist::Reduction::Max},
+                 {dist::Collective::AllGather, DType::FP32, 1, 4096},
+                 {dist::Collective::AllGather, DType::BF16, 1, (1U << 20) + 3},
+                 {dist::Collective::AllGather, DType::I64, 1, 4096},
+                 {dist::Collective::ReduceScatter, DType::FP32, 1, 4096},
+                 {dist::Collective::Broadcast, DType::BF16, 1, 4096, 1, dist::Reduction::Sum,
+                  group.size() - 1},
+                 {dist::Collective::Broadcast, DType::BF16, 1, (1U << 20) + 3, 1,
+                  dist::Reduction::Sum, 0}},
+                {{1 - group.rank(), (3U << 20) + 7, (3U << 20) + 7}}},
+            ctx::peer_communication_requirements(connection.communication().group(1),
+                                                 (3U << 20) + 7),
+            dist::GroupRequirements{2,
+                                    {},
+                                    {{1 - group.rank(), group.rank() == 0 ? 1024U : 0U,
+                                      group.rank() == 1 ? 512U : 0U}}}};
+        for (const auto dtype : {DType::BF16, DType::FP16, DType::FP32, DType::I8, DType::U8,
+                                 DType::I32, DType::U32, DType::I64, DType::U64})
+            for (const auto op : {dist::Collective::AllReduce, dist::Collective::ReduceScatter})
+                for (const auto reduction : {dist::Reduction::Sum, dist::Reduction::Max})
+                    requirements[0].collectives.push_back({op, dtype, 1, 262147, 1, reduction});
+        if (!dist::prepare_communication(connection, requirements, policy)) {
+            connection.shutdown();
+            return 0;
+        }
+        check_collective_windows(connection);
+        check_reductions<__nv_bfloat16>(connection, DType::BF16);
+        check_reductions<__half>(connection, DType::FP16);
+        check_reductions<float>(connection, DType::FP32);
+        check_reductions<std::int8_t>(connection, DType::I8);
+        check_reductions<std::uint8_t>(connection, DType::U8);
+        check_reductions<std::int32_t>(connection, DType::I32);
+        check_reductions<std::uint32_t>(connection, DType::U32);
+        check_reductions<std::int64_t>(connection, DType::I64);
+        check_reductions<std::uint64_t>(connection, DType::U64);
+        check_peer_directions(connection);
+        {
+            DeviceBuffer value(connection.device().device(), 257);
+            value.fill(group.rank() == 0 ? 0x5a : 0);
+            const dist::PeerTransfer transfer{1 - group.rank(),
+                                              group.rank() == 0 ? value.span() : ConstMemorySpan{},
+                                              group.rank() == 1 ? value.span() : MemorySpan{}};
+            connection.communication().group(2).exchange({&transfer, 1},
+                                                         connection.device().execution_view());
+            connection.device().synchronize();
+            std::array<std::uint8_t, 257> actual;
+            value.copy_to_host(actual.data(), actual.size());
+            require(std::all_of(actual.begin(), actual.end(), [](auto x) { return x == 0x5a; }),
+                    "one-way peer communication lost its payload");
+        }
         {
             Program program(connection);
             connection.send(wire::Kind::Ready);
             rt::WorkerLoop<Types, Program, Codec> loop(connection, program, {});
             while (loop.advance()) std::this_thread::yield();
         }
+        // A periodic resource sample may already be in flight when Shutdown reaches a rank.
+        RankSnapshot final_sample;
+        final_sample.rank = connection.bootstrap().identity.rank;
+        final_sample.node = connection.bootstrap().identity.node;
+        wire::Encoder sample;
+        rt::protocol::encode(sample, final_sample);
+        connection.send(wire::Kind::Observation, std::move(sample).take(), false);
         connection.shutdown();
         return 0;
     } catch (const std::exception& error) {
@@ -667,7 +947,7 @@ void run_compute_with_context(Executor& executor, std::uint64_t& expected_state)
 }
 
 int coordinator(int argc, char** argv) {
-    require(argc == 3 && std::string_view(argv[1]) == "--config",
+    require((argc == 3 || argc == 5) && std::string_view(argv[1]) == "--config",
             "usage: ninfer_distributed_execution_test --config FILE");
     const auto deployment = product::read_deployment_file(argv[2]);
     dist::ExecutionTopology topology;
@@ -681,13 +961,19 @@ int coordinator(int argc, char** argv) {
                                   {r.rank, size}, {r.rank, size}, {}, {}};
     topology.groups.push_back({0, {0, 1}});
     topology.groups.push_back({1, {0, 1}, dist::GroupUsage::PeerExchange});
+    topology.groups.push_back({2, {0, 1}, dist::GroupUsage::PeerExchange});
+    topology.groups.push_back({3, {0, 1}}); // Logical group without a communication requirement.
     topology.roles = {{"tp", 0}, {"ep", 0}, {"context", 1}};
-    const std::array<std::string, 1> arguments{"--worker"};
+    const std::string backend =
+        argc == 5 && std::string_view(argv[3]) == "--backend" ? argv[4] : "nccl";
+    const auto policy = communication_policy(backend);
+    const std::array<std::string, 3> arguments{"--worker", "--backend", backend};
     const auto prepare = [&] {
         auto group = std::make_unique<dist::ExecutionGroup>(
             deployment, topology,
             ninfer::StartupObserver{[](const auto&) { throw std::runtime_error("log failure"); }},
             [](auto, auto line) { std::cerr << line << '\n'; }, arguments);
+        dist::prepare_communication(*group, std::chrono::seconds(60));
         std::size_t ready = 0;
         const auto until  = std::chrono::steady_clock::now() + std::chrono::seconds(60);
         while (ready != size) {
@@ -702,7 +988,7 @@ int coordinator(int argc, char** argv) {
         }
         return group;
     };
-    Executor executor(prepare(), {1, 1}, {});
+    Executor executor(prepare(), {1, 1}, {}, 1);
     executor.bind_to_current_thread();
     std::uint64_t state = 0;
     for (auto work : std::vector<Work>{{},
@@ -713,7 +999,7 @@ int coordinator(int argc, char** argv) {
                                        {Operation::Scatter, DType::FP32, 19},
                                        {Operation::Broadcast, DType::BF16, 32},
                                        {Operation::Exchange, DType::U8, 97},
-                                       {Operation::Sum, DType::FP32, 128, true},
+                                       {Operation::Sum, DType::BF16, 128, true},
                                        {Operation::Sum, DType::FP32, 64, false, true},
                                        {Operation::Sum, DType::FP32, 64, false, false, true}})
         run(executor, work, state);
@@ -738,6 +1024,24 @@ int coordinator(int argc, char** argv) {
                     2 * (131072 + kContextBytes) + kPeerChunkBytes,
                 "rank resource observation differs from owned buffers");
     executor.measure({rt::MeasurementAction::Reset});
+    for (const auto& rank : executor.observations()) {
+        if (policy != dist::CommunicationPolicy::Nccl)
+            for (const auto& stats : rank.communication)
+                require(std::all_of(stats.backends.begin(), stats.backends.end(),
+                                    [](const auto& backend) {
+                                        return backend.backend == CommunicationBackend::Native;
+                                    }),
+                        "native coverage left an unused NCCL backend initialized");
+        const auto& group   = rank.communication.at(0);
+        const auto expected = policy != dist::CommunicationPolicy::Nccl
+                                  ? CommunicationBackend::Native
+                                  : CommunicationBackend::Nccl;
+        const auto found    = std::find_if(group.backends.begin(), group.backends.end(),
+                                           [&](const auto& b) { return b.backend == expected; });
+        require(found != group.backends.end() && found->graph.calls[0] == 4 &&
+                    found->graph.payload_bytes[0] == 4 * 128 * sizeof(__nv_bfloat16),
+                "communication observations lost backend identity or Graph replay work");
+    }
     for (const auto& rank : executor.observations())
         require(rank.memory.workspace.measurement_peak_bytes == 0 &&
                     rank.memory.workspace.required_peak_bytes > 0,
@@ -754,12 +1058,13 @@ int coordinator(int argc, char** argv) {
     }
     executor.drain();
     for (const auto operation : {Operation::Sum, Operation::ContextScatter}) {
-        Executor failing(prepare(), {1, 1}, {});
+        Executor failing(prepare(), {1, 1}, {}, 1);
         failing.bind_to_current_thread();
         auto reservation = failing.try_reserve(
             context_operation(operation) ? rt::FrameKind::Context : rt::FrameKind::Compute);
         Work work;
         work.operation = operation;
+        work.dtype     = DType::BF16;
         work.count     = 1537;
         work.fail_rank = 1;
         (void)failing.submit(std::move(*reservation), work);
@@ -809,7 +1114,9 @@ int coordinator(int argc, char** argv) {
 
 int main(int argc, char** argv) {
     try {
-        if (argc == 2 && std::string_view(argv[1]) == "--worker") return worker();
+        if (argc == 4 && std::string_view(argv[1]) == "--worker" &&
+            std::string_view(argv[2]) == "--backend")
+            return worker(communication_policy(argv[3]));
         return coordinator(argc, argv);
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

@@ -92,13 +92,13 @@ inline Traffic record_traffic(int qk_heads, int value_heads, int width, std::spa
     const Geometry live{qk_heads, value_heads, tokens};
     const Geometry physical{qk_heads, value_heads, width, batch};
     Traffic result;
-    result.state.read    = physical.state_bytes();
+    result.active_rows   = std::count_if(valid.begin(), valid.end(), [](int n) { return n > 0; });
+    result.state.read    = Geometry{qk_heads, value_heads, 1, result.active_rows}.state_bytes();
     result.records.write = live.qk_bytes() + live.value_bytes() + 2 * live.gate_bytes();
     result.logical       = {2 * live.qk_bytes() + live.value_bytes() + 2 * live.gate_bytes() +
-                                result.state.read + sizeof(std::int64_t) * batch +
+                                result.state.read + sizeof(std::int64_t) * result.active_rows +
                                 sizeof(std::int32_t) * batch * has_valid_tensor,
                             physical.value_bytes() + result.records.write};
-    result.active_rows   = batch;
     result.valid_tokens  = tokens;
     return result;
 }

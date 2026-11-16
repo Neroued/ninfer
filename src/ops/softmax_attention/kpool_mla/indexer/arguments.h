@@ -8,7 +8,6 @@ namespace ninfer::ops::detail::kpool {
 inline constexpr int kIndexPartition = 4096;
 inline constexpr int kIndexSelected  = 512;
 inline constexpr int kIndexFanIn     = 8;
-inline constexpr int kIndexGraphRows = 16;
 
 struct IndexerArguments {
     const __nv_bfloat16 *query, *keys;

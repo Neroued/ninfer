@@ -103,6 +103,14 @@ __device__ __forceinline__ void cta_mbarrier_arrive(std::uint64_t* barrier) {
     asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" : : "r"(smem_addr(barrier)) : "memory");
 }
 
+__device__ __forceinline__ void cta_mbarrier_expect_tx(std::uint64_t* barrier,
+                                                       std::uint32_t bytes) {
+    asm volatile("mbarrier.expect_tx.relaxed.cta.shared::cta.b64 [%0], %1;"
+                 :
+                 : "r"(smem_addr(barrier)), "r"(bytes)
+                 : "memory");
+}
+
 __device__ __forceinline__ void cta_mbarrier_arrive_expect_tx(std::uint64_t* barrier,
                                                               std::uint32_t bytes) {
     asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;"

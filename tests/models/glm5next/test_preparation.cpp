@@ -94,11 +94,43 @@ void golden(const glm::Frontend& frontend, const std::filesystem::path& path) {
                 actual.emplace_back(opportunity.frontier, opportunity.input_order);
         require(actual == expected, name + ": cache marker frontiers differ; got " +
                                         Json(actual).dump() + " expected " + Json(expected).dump());
-        require(std::is_sorted(data.identity.execution_frontiers.begin(),
-                               data.identity.execution_frontiers.end()),
-                name + ": execution boundaries are not ordered");
     }
     std::cout << fixture["cases"].size() << " prepared-prompt HF cases passed\n";
+}
+
+void tool_history_arguments(const glm::Frontend& f) {
+    PromptInput input;
+    input.messages = {message(ChatRole::User, "run the tool"), message(ChatRole::Assistant, ""),
+                      message(ChatRole::Tool, "done")};
+    input.messages[1].tool_calls   = {{.id = "first", .name = "noop", .arguments_json = "{}"},
+                                      {.id = "second", .name = "legacy"}};
+    input.messages[2].tool_call_id = "second";
+    auto& arguments                = input.messages[1].tool_calls[1].arguments_json;
+    for (const auto bad : {R"({"x": nope})", R"({"x":)", "[]", "null", R"({"x":1e99999})"}) {
+        arguments     = bad;
+        bool rejected = false;
+        try {
+            (void)f.prepare(input);
+        } catch (const std::invalid_argument& error) {
+            rejected = true;
+            const std::string_view message(error.what());
+            require(message.find("messages[1].tool_calls[1]") != message.npos &&
+                        message.find("legacy") != message.npos,
+                    "invalid tool history lost its message and call identity");
+        }
+        require(rejected, "invalid tool history was accepted");
+    }
+    arguments.clear();
+    const auto empty  = f.prepare(input);
+    arguments         = "{}";
+    const auto object = f.prepare(input);
+    require(glm::PreparedPromptAccess::view(empty).token_ids ==
+                glm::PreparedPromptAccess::view(object).token_ids,
+            "empty tool arguments no longer represent an empty object");
+    arguments         = R"({"z":[1,true,null,{"s":"a\nb\"c"}],"a":2})";
+    const auto nested = f.prepare(input);
+    require(f.count_tokens(input) == nested.summary().prompt_tokens,
+            "valid tool history differs between preparation and token counting");
 }
 
 void behavior(const glm::Frontend& f, const std::filesystem::path& tokenizer) {
@@ -145,7 +177,6 @@ void behavior(const glm::Frontend& f, const std::filesystem::path& tokenizer) {
     const auto& raw_data = glm::PreparedPromptAccess::view(raw);
     require(raw_data.token_ids == data.token_ids && !raw_data.identity.reusable &&
                 !raw_data.identity.rewrite_checkpoint &&
-                raw_data.identity.execution_frontiers.empty() &&
                 !raw_data.context_cache.update_session_index,
             "raw token preparation added chat semantics");
     rejects([&] { (void)f.prepare_tokens({-1}); }, "vocabulary");
@@ -169,7 +200,6 @@ void behavior(const glm::Frontend& f, const std::filesystem::path& tokenizer) {
 
 void identities() {
     const std::vector<TokenId> tokens{1, 2, 3, 4, 5, 6, 7};
-    const std::vector<std::uint32_t> splits{2, 6};
     glm::MediaInputIdentity image;
     image.item.token_spans       = {{2, 3}};
     image.item.grid              = {1, 2, 2};
@@ -177,9 +207,9 @@ void identities() {
     image.item.content_digest[0] = 1;
     image.preparation_digest[0]  = 2;
     std::vector media{image}, changed{image};
-    const glm::InputPrefixView a{tokens, media, splits};
+    const glm::InputPrefixView a{tokens, media};
     changed[0].item.content_digest[0] = 3;
-    glm::InputPrefixView b{tokens, changed, splits};
+    glm::InputPrefixView b{tokens, changed};
     const glm::PrefixDigests left(a), right(b);
     require(left.at(2) == right.at(2) && left.at(3) != right.at(3) &&
                 glm::input_prefix_equal(a, b, 2) && !glm::input_prefix_equal(a, b, 3),
@@ -191,15 +221,10 @@ void identities() {
     changed[0].preparation_digest[0] ^= 1;
     require(!glm::input_prefix_equal(a, b, 5) && left.at(5) != glm::PrefixDigests(b).at(5),
             "different preparation reused a media identity");
-    const std::vector<std::uint32_t> other_splits{2};
-    const glm::InputPrefixView different_splits{tokens, media, other_splits};
-    require(glm::input_prefix_equal(a, different_splits, 5) &&
-                !glm::input_prefix_equal(a, different_splits, 6),
-            "future execution boundaries affected an earlier prefix");
     auto later   = tokens;
     later.back() = 99;
-    require(glm::input_prefix_equal(a, {later, media, splits}, 6) &&
-                !glm::input_prefix_equal(a, {later, media, splits}, 7),
+    require(glm::input_prefix_equal(a, {later, media}, 6) &&
+                !glm::input_prefix_equal(a, {later, media}, 7),
             "token comparison escaped its requested prefix");
     changed[0]                 = media[0];
     media[0].item.timestamps   = {0.0};
@@ -290,6 +315,7 @@ int main(int argc, char** argv) {
             throw std::invalid_argument("usage: preparation_test [--tokenizer FILE --golden FILE]");
         const auto f = frontend(tokenizer);
         golden(f, expected);
+        tool_history_arguments(f);
         behavior(f, tokenizer);
         identities();
         multi_turn(f);

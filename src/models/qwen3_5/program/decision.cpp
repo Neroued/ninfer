@@ -36,12 +36,11 @@ void RankProgramImpl::request_decision(ComputeOperation& operation) {
         runtime::DecisionRequest::Row member;
         member.member = row;
         if (operation.speculative) {
-            const auto count = resources.frame.host_ingress->extents[row];
+            const auto count = resources.frame.host_ingress.extents[row];
             for (int step = 0; step < count; ++step)
                 member.drafts.push_back(
-                    drafts[backend == SpeculativeBackend::Mtp
-                               ? step * resources.frame.spec.batch_capacity + row
-                               : row * draft_window + step]);
+                    drafts[backend == SpeculativeBackend::Mtp ? step * operation.shape.rows + row
+                                                              : row * draft_window + step]);
         }
         request.rows.push_back(std::move(member));
     }
@@ -88,26 +87,27 @@ void RankProgramImpl::decide_decode(std::uint32_t batch_value, std::uint32_t wid
                 prefix(draft.proposal_q,
                        {draft.proposal_q.ne[0], static_cast<int>(draft_window), batch}),
                 frame.extents.slice(0, 0, batch), frontiers, tokens, counts, vocabulary,
-                frame.sampling, {false}, resources.work, device.execution_view());
+                frame.sampling, {false}, frame.live_rows.slice(0, 0, batch), resources.work,
+                device.execution_view());
         } else {
             ops::speculative_accept_greedy_drafts(
                 argmax, logits, drafts, frame.extents.slice(0, 0, batch), frontiers, tokens, counts,
-                vocabulary, frame.sampling, resources.work, device.execution_view());
+                vocabulary, frame.sampling, frame.live_rows.slice(0, 0, batch), resources.work,
+                device.execution_view());
         }
     } else {
         Tensor logits = prefix(frame.logits, {rows, batch});
         Tensor tokens = prefix(frame.output_tokens, {batch});
         ops::sample(logits, tokens, vocabulary, frame.sampling,
                     frame.sampling_positions.slice(0, 0, batch), ops::kSamplePurposeDecode,
-                    resources.work, device.execution_view());
+                    frame.live_rows.slice(0, 0, batch), resources.work, device.execution_view());
     }
 }
 
 void RankProgramImpl::readback_decode(std::uint32_t batch, bool speculative) {
-    const auto bytes = speculative ? offsetof(FrameEgress, counts) + batch * sizeof(std::int32_t)
-                                   : batch * sizeof(TokenId);
-    CUDA_CHECK(cudaMemcpyAsync(resources.frame.host_egress, resources.frame.egress.data, bytes,
-                               cudaMemcpyDeviceToHost, device.stream()));
+    const auto bytes = speculative ? resources.frame.egress.bytes : batch * sizeof(TokenId);
+    CUDA_CHECK(cudaMemcpyAsync(resources.frame.host_egress_bytes.data, resources.frame.egress.data,
+                               bytes, cudaMemcpyDeviceToHost, device.stream()));
 }
 
 void RankProgramImpl::launch_decision(ComputeOperation& operation) {
@@ -134,16 +134,16 @@ void RankProgramImpl::launch_decision(ComputeOperation& operation) {
     resources.work.reset();
     if (std::holds_alternative<DecodeWork>(operation.request.work.operation)) {
         if (!operation.projected) {
-            project_decode(operation.batch, operation.width);
+            project_decode(operation.shape.rows, operation.width);
             gpu_timer.end_target();
         }
         if (graphs) {
             (void)graphs->start(operation.speculative ? GraphPhase::Accept : GraphPhase::Sample,
-                                operation.batch, operation.rows.front().main_frontier,
+                                operation.shape.rows, operation.rows.front().main_frontier, 0,
                                 device.execution_view());
         } else {
-            decide_decode(operation.batch, operation.width);
-            readback_decode(operation.batch, operation.speculative);
+            decide_decode(operation.shape.rows, operation.width);
+            readback_decode(operation.shape.rows, operation.speculative);
         }
         gpu_timer.record_result();
         result_ready.record(device.stream());
@@ -175,10 +175,10 @@ void RankProgramImpl::launch_decision(ComputeOperation& operation) {
                            device.execution_view());
         Tensor tokens = prefix(frame.output_tokens, {batch});
         ops::sample(logits, tokens, vocabulary, frame.sampling,
-                    frame.sampling_positions.slice(0, 0, batch), purpose, resources.work,
-                    device.execution_view());
+                    frame.sampling_positions.slice(0, 0, batch), purpose,
+                    frame.live_rows.slice(0, 0, batch), resources.work, device.execution_view());
     }
-    readback_decode(operation.batch, false);
+    readback_decode(operation.shape.rows, false);
     gpu_timer.record_result();
     result_ready.record(device.stream());
     operation.stage = ComputeStage::Readback;
@@ -193,7 +193,7 @@ void RankProgramImpl::publish_result(ComputeOperation& operation) {
     const bool generated = std::holds_alternative<DecodeWork>(operation.request.work.operation) ||
                            (forward && forward->sample != SamplePurpose::None);
     if (generated) {
-        auto& output = *resources.frame.host_egress;
+        auto& output = resources.frame.host_egress;
         GeneratedResult value;
         value.row_stride = operation.speculative ? draft_window + 1 : 1;
         value.tokens.assign(output.tokens.begin(),
@@ -201,7 +201,7 @@ void RankProgramImpl::publish_result(ComputeOperation& operation) {
         for (std::uint32_t row = 0; row < operation.batch; ++row) {
             const auto count   = operation.speculative ? output.counts[row] : 1;
             output.counts[row] = count;
-            const auto extent  = resources.frame.host_ingress->extents[row];
+            const auto extent  = resources.frame.host_ingress.extents[row];
             if (count < 1 || count > extent + 1)
                 throw std::runtime_error("Qwen3.5 sampling returned an invalid prefix length");
             value.counts.push_back(static_cast<std::uint32_t>(count));

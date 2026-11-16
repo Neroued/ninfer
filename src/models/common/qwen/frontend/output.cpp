@@ -18,11 +18,9 @@ OutputResources::OutputResources(const models::frontend::TextResources& resource
     const auto& control = resources.control_tokens;
     if (!control || control->empty())
         throw std::invalid_argument("thinking control tokens have not been prepared");
-    normal = std::make_shared<const models::frontend::ReasoningFormat>(
-        std::string(kThinkClose), std::string(kCanonicalReasoningCloseSerialization), control,
-        true);
+    normal = std::make_shared<const models::frontend::ReasoningFormat>(std::string(kThinkClose),
+                                                                       control, true);
     constrained = std::make_shared<const models::frontend::ReasoningFormat>(
-        std::string(kCanonicalReasoningCloseSerialization),
         std::string(kCanonicalReasoningCloseSerialization), control, false);
 }
 

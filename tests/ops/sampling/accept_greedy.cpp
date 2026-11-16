@@ -83,7 +83,7 @@ int execute_accept_case(const std::string& label, const std::vector<std::int32_t
     MemoryArena workspace(workspace_storage.span());
     ops::speculative_accept_greedy_drafts(
         targets, logits, draft_tensor, extent, length, sampled, num_sampled, token_domain,
-        static_cast<const ops::SamplingConfig*>(d_config.data()), workspace,
+        static_cast<const ops::SamplingConfig*>(d_config.data()), {}, workspace,
         ninfer::test::cuda_environment().default_execution);
     cuda_synchronize();
 
@@ -287,7 +287,7 @@ int batched_sampling_workspace_stride_case() {
     MemoryArena workspace(workspace_storage.span());
     ops::speculative_accept_greedy_drafts(
         targets, logits_tensor, draft_tensor, extents, lengths, licensed, counts, token_domain,
-        static_cast<const ops::SamplingConfig*>(d_configs.data()), workspace,
+        static_cast<const ops::SamplingConfig*>(d_configs.data()), {}, workspace,
         ninfer::test::cuda_environment().default_execution);
     cuda_synchronize();
 
@@ -320,6 +320,91 @@ int capacity_contract() {
     } catch (const std::invalid_argument&) {}
     return failures;
 }
+
+int padded_accept_contract(int domain) {
+    constexpr int batch = 17, k = 3, width = k + 1;
+    const auto cuda = cuda_environment().context.execution_view();
+    std::vector<int> targets(width * batch), drafts(k * batch), extents(batch), live(batch),
+        expected(width * batch), expected_counts(batch), positions(batch, 123);
+    std::vector<std::uint16_t> logits(std::size_t(domain) * width * batch, f32_to_bf16(-20.F));
+    std::vector<ops::SamplingConfig> configs(batch);
+    for (int b = 0; b < batch; ++b)
+        for (int t = 0; t < width; ++t) {
+            const int token                                       = 4 + t;
+            targets[b * width + t]                                = token;
+            logits[(std::size_t(b) * width + t) * domain + token] = f32_to_bf16(12.F);
+            if (t < k) drafts[t * batch + b] = token;
+        }
+    auto target = to_device(targets), proposed = to_device(drafts), input = to_device(logits);
+    auto valid = to_device(live), extent = to_device(extents), pos = to_device(positions),
+         parameters = to_device(configs);
+    GuardedDeviceBuffer output(std::size_t(width) * batch * sizeof(int)),
+        count(batch * sizeof(int));
+    Tensor tt(target.span(), DType::I32, {width, batch}),
+        x(input.span(), DType::BF16, {domain, width, batch}),
+        d = Tensor(proposed.span(), DType::I32, {batch, k}).permute({1, 0, 2, 3}),
+        n(extent.span(), DType::I32, {batch}), p(pos.span(), DType::I32, {batch}),
+        a(valid.span(), DType::I32, {batch}), y(output.span(), DType::I32, {width, batch}),
+        counts(count.span(), DType::I32, {batch});
+    DeviceBuffer storage(
+        cuda.device(),
+        std::max<std::size_t>(256, ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
+                                       domain, k, k, batch, batch)));
+    MemoryArena workspace(storage.span());
+    DecodeGraphDefinition definition;
+    definition.capture(cuda.stream(), [&] {
+        ops::speculative_accept_greedy_drafts(
+            tt, x, d, n, p, y, counts, domain,
+            static_cast<const ops::SamplingConfig*>(parameters.data()), a, workspace, cuda);
+    });
+    DecodeGraphExecutable graph;
+    graph.instantiate(definition);
+    int failures = 0;
+    for (int replay = 0; replay < 2; ++replay) {
+        std::fill(expected.begin(), expected.end(), 0);
+        for (int b = 0; b < batch; ++b) {
+            live[b]    = (b + replay) % 3 != 1;
+            extents[b] = live[b] ? b % (k + 1) : std::numeric_limits<int>::min();
+            configs[b] = {.temperature = b % 2 ? 1.F : 0.F, .top_k = 1};
+            if (!live[b]) {
+                configs[b].presence_penalty = 1;
+                configs[b].token_counts     = reinterpret_cast<const int*>(std::uintptr_t{1});
+                configs[b].mask = {reinterpret_cast<const std::uint32_t*>(std::uintptr_t{1}), 1};
+            }
+            expected_counts[b] = live[b] ? extents[b] + 1 : 0;
+            for (int t = 0; t < expected_counts[b]; ++t) expected[b * width + t] = 4 + t;
+        }
+        valid.copy_from_host(live.data(), live.size() * sizeof(int));
+        extent.copy_from_host(extents.data(), extents.size() * sizeof(int));
+        parameters.copy_from_host(configs.data(), configs.size() * sizeof(configs.front()));
+        output.fill(0x5a);
+        count.fill(0x5a);
+        graph.launch(cuda.stream());
+        cuda_synchronize(cuda.stream());
+        failures += verify_exact("greedy accept padded tokens",
+                                 from_device<int>(output.data(), expected.size()), expected);
+        failures += verify_exact("greedy accept padded counts",
+                                 from_device<int>(count.data(), batch), expected_counts);
+        failures += output.verify_guards("greedy accept padded output");
+        failures += count.verify_guards("greedy accept padded counts");
+    }
+    std::fill(live.begin(), live.end(), 0);
+    valid.copy_from_host(live.data(), live.size() * sizeof(int));
+    for (auto* tensor : {&tt, &x, &d, &n, &p})
+        tensor->data = reinterpret_cast<void*>(std::uintptr_t{256});
+    output.fill(0x5a);
+    count.fill(0x5a);
+    ops::speculative_accept_greedy_drafts(
+        tt, x, d, n, p, y, counts, domain,
+        reinterpret_cast<const ops::SamplingConfig*>(std::uintptr_t{256}), a, workspace, cuda);
+    cuda_synchronize(cuda.stream());
+    failures += verify_exact("greedy accept inactive input isolation",
+                             from_device<int>(output.data(), expected.size()),
+                             std::vector<int>(expected.size()));
+    failures += verify_exact("greedy accept inactive count isolation",
+                             from_device<int>(count.data(), batch), std::vector<int>(batch));
+    return failures;
+}
 } // namespace
 
 void add_greedy_accept_cases(ninfer::test::OpSuite& suite) {
@@ -337,4 +422,7 @@ void add_greedy_accept_cases(ninfer::test::OpSuite& suite) {
                   [=] { return greedy_penalty_case(domain); });
     suite.add("accept_greedy/deterministic_draw", deterministic_sampling_case);
     suite.add("accept_greedy/batched_workspace", batched_sampling_workspace_stride_case);
+    for (int domain : {64, 257})
+        suite.add("accept_greedy/padded_batch17/v" + std::to_string(domain),
+                  [=] { return padded_accept_contract(domain); }, {{"suite", "concurrency"}});
 }

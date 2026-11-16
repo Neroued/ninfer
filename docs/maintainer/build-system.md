@@ -37,7 +37,8 @@ Op 自己保留 format/shape 分派和调优，CMake 不成为另一套 runtime 
 模型加载、控制与设备执行保持不同依赖边界；runtime 通过 contracts/support 组织它们，
 不让通用 Core/Artifact 依赖模型或 Ops。
 
-`NINFER_ENABLE_DISTRIBUTED` 独立控制执行组和 NCCL 依赖，关闭时不发现或链接 NCCL。
+`NINFER_ENABLE_DISTRIBUTED` 控制执行组及通信后端。启用时需要 NCCL；Spark 同时编译 Native
+RDMA 后端并通过 pkg-config 查找 `libibverbs`。关闭时不发现或链接这些通信依赖。
 系统库正常安装，vendor 源码固定在仓库；配置阶段不下载依赖。
 编译器、Python 和本地依赖路径放入忽略的 `CMakeUserPresets.json`。
 

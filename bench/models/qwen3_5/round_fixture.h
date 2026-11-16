@@ -28,7 +28,7 @@ struct RoundMeasurement {
     double wall_ms                = 0;
     double host_call_ms           = 0;
     std::uint32_t licensed_tokens = 0;
-    std::array<SpeculativeStats, kMaximumConcurrency> stats{};
+    std::vector<SpeculativeStats> stats;
 };
 
 inline std::string device_name(int ordinal) {
@@ -87,11 +87,11 @@ public:
     RoundMeasurement measure(std::span<const model::SequenceHandle> sequences,
                              std::uint32_t draft_tokens) {
         const auto batch = sequences.size();
-        if (!batch || batch > kMaximumConcurrency)
-            throw std::invalid_argument("invalid benchmark batch");
+        if (!batch) throw std::invalid_argument("empty benchmark batch");
         auto& session = *instance_.session;
-        std::array<runtime::RoundBudget, kMaximumConcurrency> budgets{};
-        std::array<model::ExecutionUnit, kMaximumConcurrency> units{};
+        std::vector<runtime::RoundBudget> budgets(batch);
+        std::vector<model::ExecutionUnit> units(batch);
+        std::vector<runtime::CommitDecision> decisions(batch);
         for (std::size_t row = 0; row < batch; ++row) {
             budgets[row] = {draft_tokens + 1};
             units[row]   = {sequences[row], model::ExecutionUnitKind::Decode, draft_tokens + 1};
@@ -110,7 +110,6 @@ public:
             (!pending.row_counts().empty() && pending.row_counts().size() != batch)) {
             throw std::runtime_error("benchmark round returned invalid compact membership");
         }
-        std::array<runtime::CommitDecision, kMaximumConcurrency> decisions{};
         RoundMeasurement result;
         for (std::size_t row = 0; row < batch; ++row) {
             const auto count = pending.row_counts().empty() ? 1 : pending.row_counts()[row];
@@ -125,6 +124,7 @@ public:
         retire(*ticket, sequences);
         result.wall_ms = std::chrono::duration<double, std::milli>(Clock::now() - started).count();
         result.host_call_ms = host_call_ms_;
+        result.stats.resize(batch);
         for (std::size_t row = 0; row < batch; ++row)
             result.stats[row] = std::move(committed.rows[row].speculative);
         return result;

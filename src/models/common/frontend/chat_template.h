@@ -20,6 +20,10 @@ ChatTemplate load_chat_template(const TextResources& resources,
                                 const std::filesystem::path& override_path);
 nlohmann::ordered_json template_context(std::string_view kwargs,
                                         const nlohmann::ordered_json& special_tokens);
+nlohmann::ordered_json parse_tool_history_arguments(std::string_view arguments,
+                                                    std::string_view name,
+                                                    std::size_t message_index,
+                                                    std::size_t call_index);
 void merge_template_option(nlohmann::ordered_json& context, std::string_view key,
                            const nlohmann::ordered_json& value);
 std::optional<text::ByteSpan> unique_output_region(const text::TemplateOutput& rendered,

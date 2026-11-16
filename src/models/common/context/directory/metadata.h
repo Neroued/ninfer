@@ -37,9 +37,39 @@ public:
 
 class MetadataBudget {
 public:
-    explicit MetadataBudget(std::size_t limit) : limit_(limit) {}
+    explicit MetadataBudget(std::size_t limit, MetadataBudget* parent = nullptr)
+        : limit_(limit), idle_limit_(limit), parent_(parent) {
+        if (parent_) parent_->reserve(limit_);
+    }
+
+    ~MetadataBudget() {
+        if (parent_) {
+            if (allocated_ || reserved_) std::terminate();
+            parent_->cancel(limit_);
+        }
+    }
+
+    MetadataBudget(const MetadataBudget&)            = delete;
+    MetadataBudget& operator=(const MetadataBudget&) = delete;
 
     [[nodiscard]] std::size_t limit() const noexcept { return limit_; }
+
+    void grow(std::size_t limit) {
+        if (limit <= limit_) {
+            idle_limit_ = std::max(idle_limit_, limit);
+            return;
+        }
+        if (parent_) parent_->reserve(limit - limit_);
+        limit_      = limit;
+        idle_limit_ = std::max(idle_limit_, limit);
+    }
+
+    // Live decision metadata pins its existing guarantee. Return excess reservation only
+    // after all users of that guarantee retire, including in-flight counterfactual views.
+    void trim_when_idle(std::size_t limit) noexcept {
+        idle_limit_ = std::min(limit, limit_);
+        trim_idle();
+    }
 
     [[nodiscard]] std::size_t allocated() const noexcept { return allocated_; }
 
@@ -49,12 +79,18 @@ public:
 
     void acquire(std::size_t bytes) {
         if (bytes > available()) throw MetadataExhausted(bytes);
+        if (parent_) parent_->consume(bytes);
         allocated_ += bytes;
     }
 
     void release(std::size_t bytes) noexcept {
         if (bytes > allocated_) std::terminate();
         allocated_ -= bytes;
+        if (parent_) {
+            parent_->release(bytes);
+            parent_->reserve(bytes);
+        }
+        trim_idle();
     }
 
     void reserve(std::size_t bytes) {
@@ -64,6 +100,7 @@ public:
 
     void consume(std::size_t bytes) noexcept {
         if (bytes > reserved_) std::terminate();
+        if (parent_) parent_->consume(bytes);
         reserved_ -= bytes;
         allocated_ += bytes;
     }
@@ -71,12 +108,20 @@ public:
     void cancel(std::size_t bytes) noexcept {
         if (bytes > reserved_) std::terminate();
         reserved_ -= bytes;
+        trim_idle();
     }
 
 private:
-    std::size_t limit_;
-    std::size_t allocated_ = 0;
-    std::size_t reserved_  = 0;
+    void trim_idle() noexcept {
+        if (allocated_ || reserved_ || idle_limit_ >= limit_) return;
+        if (parent_) parent_->cancel(limit_ - idle_limit_);
+        limit_ = idle_limit_;
+    }
+
+    std::size_t limit_, idle_limit_;
+    std::size_t allocated_  = 0;
+    std::size_t reserved_   = 0;
+    MetadataBudget* parent_ = nullptr;
 };
 
 // Accounts auxiliary containers owned by one directory. Payload segment storage is charged by
@@ -136,6 +181,8 @@ public:
     virtual ~MetadataCapacity()                                               = default;
     [[nodiscard]] virtual std::size_t metadata_requirement(std::size_t) const = 0;
     virtual void reserve_metadata(std::size_t)                                = 0;
+
+    virtual void trim_metadata(std::size_t) noexcept {}
 };
 
 // The index prepares reusable evaluation storage. Extra simultaneous evaluations own separately

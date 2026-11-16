@@ -1,4 +1,5 @@
 #include "runtime/executor/preparation.h"
+#include "distributed/communication/preparation.h"
 
 #include <algorithm>
 
@@ -187,6 +188,7 @@ prepare_execution_group(dist::ExecutionGroup& group, std::span<const wire::Bytes
             reports();
             if (attempt == 0) {
                 enter_phase(PreparationAction::PrepareCommunication);
+                dist::prepare_communication(group, timeout);
                 reports();
             }
             if (attempt == 0 &&

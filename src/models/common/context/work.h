@@ -7,6 +7,9 @@
 
 namespace ninfer::models::context {
 
+class HistoryDirectory;
+struct HistoryBindingDemand;
+
 using Clock = std::chrono::steady_clock;
 
 std::uint64_t elapsed_ns(Clock::time_point started) noexcept;
@@ -22,5 +25,9 @@ runtime::ContextTransferRequirement
 kv_transfer_requirement(runtime::ContextTransferResource resource,
                         runtime::ContextTransferDirection direction, std::uint32_t pages,
                         TransferWork work);
+
+// Copy work selected by the same binding demand that prepares a writable history.
+[[nodiscard]] std::vector<runtime::ContextTransferRequirement>
+history_tail_requirements(const HistoryDirectory&, const HistoryBindingDemand&);
 
 } // namespace ninfer::models::context

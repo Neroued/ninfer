@@ -624,8 +624,7 @@ void StateDirectory::make_mutable(StateId handle) {
 void StateDirectory::consume_checkpoint(StateId handle) {
     Object& object = require(handle);
     if (object.role != StateRole::CheckpointImmutable || !device_resident(handle) ||
-        object.checkpoint_references != 1 || object.source_pins != 0 || object.destination_pinned ||
-        has_pending_replica(object)) {
+        !can_recover_exclusively(handle)) {
         throw std::logic_error("StateImage checkpoint has other owners or readers");
     }
     object.checkpoint_references = 0;
@@ -634,6 +633,23 @@ void StateDirectory::consume_checkpoint(StateId handle) {
     for (auto& part : object.parts) part.host.reset();
     object.role = StateRole::ActiveMutable;
     refresh_usage(object);
+}
+
+bool StateDirectory::can_recover_exclusively(StateId image, std::uint32_t retired_checkpoints,
+                                             std::uint32_t added_checkpoints,
+                                             StateId abandoned_writer) const {
+    const auto& object = require(image);
+    if (retired_checkpoints > object.checkpoint_references)
+        throw std::invalid_argument("State recovery retires more checkpoints than its owners");
+    auto readers = object.source_pins;
+    if (abandoned_writer.valid()) {
+        if (!can_abort_write(image, abandoned_writer))
+            throw std::invalid_argument("State recovery abandons a foreign writer");
+        --readers;
+    }
+    const auto owners =
+        std::uint64_t(object.checkpoint_references) + added_checkpoints - retired_checkpoints;
+    return owners == 1 && !readers && !object.destination_pinned && !has_pending_replica(object);
 }
 
 bool StateDirectory::drop_device_replica(StateId handle) noexcept {

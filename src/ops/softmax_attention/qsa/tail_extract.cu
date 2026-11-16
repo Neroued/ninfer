@@ -1,6 +1,7 @@
 #include "ninfer/ops/qsa.h"
 #include "ops/softmax_attention/qsa/validation.h"
 
+#include <algorithm>
 #include <cstdint>
 
 namespace ninfer::ops {
@@ -47,13 +48,15 @@ struct TailArguments {
     StateColumns<const std::int32_t> before_rope;
     Columns<const std::int32_t> record_rope;
     StateColumns<std::int32_t> after_rope;
-    const std::int32_t *base, *accepted;
+    const std::int32_t *base, *accepted, *live;
+    int layer_begin = 0;
 };
 
 template <class Word>
 __global__ void tail_extract_kernel(const __grid_constant__ TailArguments args) {
     constexpr int width = sizeof(Word) / 2;
-    const int b = blockIdx.x, l = blockIdx.y, c = threadIdx.x * width;
+    const int b = blockIdx.x, l = args.layer_begin + blockIdx.y, c = threadIdx.x * width;
+    if (args.live && !args.live[b]) return;
     const std::int64_t base = args.base[b], frontier = base + args.accepted[b];
     const int length         = frontier % 4;
     const std::int64_t begin = frontier - length;
@@ -94,40 +97,45 @@ bool pair_aligned(const Tensor& t) {
 }
 
 void launch_tail_extract(const ConstQsaTailStateView& before, const QsaRawRecordReadView& records,
-                         const Tensor& accepted, QsaTailStateView after,
+                         const Tensor& accepted, QsaTailStateView after, const Tensor& live_rows,
                          CudaExecutionView execution) {
-    const TailArguments args{state_columns<const std::uint16_t>(before.raw_keys),
-                             columns<const std::uint16_t>(records.raw_keys),
-                             state_columns<std::uint16_t>(after.raw_keys),
-                             state_columns<const std::int32_t>(before.first_rope),
-                             columns<const std::int32_t>(records.rope_positions),
-                             state_columns<std::int32_t>(after.first_rope),
-                             static_cast<const std::int32_t*>(records.base_positions.data),
-                             static_cast<const std::int32_t*>(accepted.data)};
-    if (pair_aligned(before.raw_keys) && pair_aligned(records.raw_keys) &&
-        pair_aligned(after.raw_keys))
-        tail_extract_kernel<std::uint32_t>
-            <<<dim3(accepted.ne[0], before.raw_keys.field.layers), 64, 0, execution.stream()>>>(
-                args);
-    else
-        tail_extract_kernel<std::uint16_t>
-            <<<dim3(accepted.ne[0], before.raw_keys.field.layers), 128, 0, execution.stream()>>>(
-                args);
+    TailArguments args{state_columns<const std::uint16_t>(before.raw_keys),
+                       columns<const std::uint16_t>(records.raw_keys),
+                       state_columns<std::uint16_t>(after.raw_keys),
+                       state_columns<const std::int32_t>(before.first_rope),
+                       columns<const std::int32_t>(records.rope_positions),
+                       state_columns<std::int32_t>(after.first_rope),
+                       static_cast<const std::int32_t*>(records.base_positions.data),
+                       static_cast<const std::int32_t*>(accepted.data),
+                       static_cast<const std::int32_t*>(live_rows.data)};
+    const bool paired = pair_aligned(before.raw_keys) && pair_aligned(records.raw_keys) &&
+                        pair_aligned(after.raw_keys);
+    const int layers = records.raw_keys.ne[3];
+    for (std::int64_t begin = 0; begin < layers; begin += 65535) {
+        args.layer_begin = static_cast<int>(begin);
+        const dim3 grid(accepted.ne[0], std::min(65535, layers - args.layer_begin));
+        if (paired)
+            tail_extract_kernel<std::uint32_t><<<grid, 64, 0, execution.stream()>>>(args);
+        else
+            tail_extract_kernel<std::uint16_t><<<grid, 128, 0, execution.stream()>>>(args);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 
 } // namespace
 
 void qsa_tail_extract(const ConstQsaTailStateView& before, const QsaRawRecordReadView& records,
-                      const Tensor& accepted, QsaTailStateView after, CudaExecutionView execution) {
+                      const Tensor& accepted, QsaTailStateView after, const Tensor& live_rows,
+                      CudaExecutionView execution) {
     const detail::qsa::ViewValidation v{"qsa_tail_extract", execution.device()};
     const int batch = accepted.ne[0], capacity = records.raw_keys.ne[1];
-    v.require(batch >= 1 && batch <= 8, "batch extent");
+    v.require(batch >= 1, "batch extent");
     v.metadata(accepted, batch, "accepted columns");
+    if (live_rows.data) v.metadata(live_rows, batch, "live rows");
     v.metadata(records.base_positions, batch, "record base positions");
     v.metadata(records.valid_columns, batch, "record valid columns");
     const auto layers = records.raw_keys.ne[3];
-    v.require(layers >= 1 && layers <= 65535, "layer extent");
+    v.require(layers >= 1, "layer extent");
     v.state(before, batch, layers);
     v.state(after, batch, layers);
     common::operand::strided_tensor(records.raw_keys, DType::BF16, {128, capacity, batch, layers},
@@ -139,7 +147,7 @@ void qsa_tail_extract(const ConstQsaTailStateView& before, const QsaRawRecordRea
               "contiguous record features");
     // Only Device-selected records are accessed. Overlapping pool bounds do not imply that
     // selected regions overlap; the caller guarantees their cross-row/plane relationships.
-    launch_tail_extract(before, records, accepted, after, execution);
+    launch_tail_extract(before, records, accepted, after, live_rows, execution);
 }
 
 } // namespace ninfer::ops

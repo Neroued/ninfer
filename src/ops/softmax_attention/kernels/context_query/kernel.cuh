@@ -21,35 +21,35 @@ inline constexpr int kContextQueryKVHeads  = 8;
 inline constexpr int kContextQueryGroup    = 4;
 inline constexpr int kContextQueryMaxSplit = 85;
 
+template <int QHeads = kContextQueryQHeads>
 __device__ __forceinline__ std::int64_t context_query_q_index(int q_head, int d, int token) {
     return static_cast<std::int64_t>(d) +
            static_cast<std::int64_t>(kContextQueryHeadDim) *
-               (static_cast<std::int64_t>(q_head) +
-                static_cast<std::int64_t>(kContextQueryQHeads) * token);
+               (static_cast<std::int64_t>(q_head) + static_cast<std::int64_t>(QHeads) * token);
 }
 
+template <int KVHeads = kContextQueryKVHeads>
 __device__ __forceinline__ std::int64_t context_query_query_kv_index(int kv_head, int d,
                                                                      int token) {
     return static_cast<std::int64_t>(d) +
            static_cast<std::int64_t>(kContextQueryHeadDim) *
-               (static_cast<std::int64_t>(kv_head) +
-                static_cast<std::int64_t>(kContextQueryKVHeads) * token);
+               (static_cast<std::int64_t>(kv_head) + static_cast<std::int64_t>(KVHeads) * token);
 }
 
-template <int Tokens>
+template <int Tokens, int QHeads = kContextQueryQHeads>
 __device__ __forceinline__ std::int64_t context_query_partial_index(int q_head, int d, int token,
                                                                     int split) {
     return static_cast<std::int64_t>(d) +
            static_cast<std::int64_t>(kContextQueryHeadDim) *
                (static_cast<std::int64_t>(q_head) +
-                static_cast<std::int64_t>(kContextQueryQHeads) *
+                static_cast<std::int64_t>(QHeads) *
                     (static_cast<std::int64_t>(token) + static_cast<std::int64_t>(Tokens) * split));
 }
 
-template <int Tokens>
+template <int Tokens, int QHeads = kContextQueryQHeads>
 __device__ __forceinline__ std::int64_t context_query_stat_index(int q_head, int token, int split) {
     return static_cast<std::int64_t>(q_head) +
-           static_cast<std::int64_t>(kContextQueryQHeads) *
+           static_cast<std::int64_t>(QHeads) *
                (static_cast<std::int64_t>(token) + static_cast<std::int64_t>(Tokens) * split);
 }
 
@@ -60,7 +60,7 @@ __device__ __forceinline__ void context_query_row_to_qt(int row, int kv_head, in
     q_head            = kv_head * kContextQueryGroup + q_local;
 }
 
-template <typename ContextPolicy, int KeyBlock, int Threads>
+template <typename ContextPolicy, int KeyBlock, int Threads, int KVHeads>
 __device__ __forceinline__ void
 context_query_stage_tile(__nv_bfloat16* dst, const __nv_bfloat16* context,
                          const __nv_bfloat16* query, int key0, int valid_keys, bool query_tile,
@@ -73,7 +73,7 @@ context_query_stage_tile(__nv_bfloat16* dst, const __nv_bfloat16* context,
         const bool live    = row < valid_keys;
         const int safe_row = live ? row : 0;
         const std::int64_t src_index =
-            query_tile ? context_query_query_kv_index(kv_head, d, safe_row)
+            query_tile ? context_query_query_kv_index<KVHeads>(kv_head, d, safe_row)
                        : policy.context_index(context_tile, d, live ? key0 + row : 0, safe_row);
         const __nv_bfloat16* src = query_tile ? query + src_index : context + src_index;
         __nv_bfloat16* smem = &dst[row * kContextQueryHeadDim + common::swizzle_xor_64(row, d)];
@@ -81,7 +81,7 @@ context_query_stage_tile(__nv_bfloat16* dst, const __nv_bfloat16* context,
     }
 }
 
-template <typename ContextPolicy, int KeyBlock, int Threads>
+template <typename ContextPolicy, int KeyBlock, int Threads, int KVHeads>
 __device__ __forceinline__ void
 context_query_stage_v_tile(__half* dst, const __half* context, const __nv_bfloat16* query, int key0,
                            int valid_keys, bool query_tile, int kv_head, std::int64_t record_offset,
@@ -89,10 +89,11 @@ context_query_stage_v_tile(__half* dst, const __half* context, const __nv_bfloat
     constexpr int VecsPerRow = kContextQueryHeadDim / 8;
     if (query_tile) {
         for (int chunk = tid; chunk < KeyBlock * VecsPerRow; chunk += Threads) {
-            const int row                = chunk / VecsPerRow;
-            const int d                  = (chunk - row * VecsPerRow) * 8;
-            const bool live              = row < valid_keys;
-            const std::int64_t src_index = context_query_query_kv_index(kv_head, d, live ? row : 0);
+            const int row   = chunk / VecsPerRow;
+            const int d     = (chunk - row * VecsPerRow) * 8;
+            const bool live = row < valid_keys;
+            const std::int64_t src_index =
+                context_query_query_kv_index<KVHeads>(kv_head, d, live ? row : 0);
             const int4 values =
                 live ? common::bf16x8_bits_to_f16x8_bits(common::load_vec<int4>(query + src_index))
                      : make_int4(0, 0, 0, 0);
@@ -116,7 +117,7 @@ context_query_stage_v_tile(__half* dst, const __half* context, const __nv_bfloat
 }
 
 template <typename ContextPolicy, int Tokens, int WarpsPerCta, int KeyBlock, bool DirectOutput,
-          typename Partial>
+          typename Partial, int KVHeads = kContextQueryKVHeads>
 __device__ __forceinline__ void context_query_split_partial_body(
     const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ query_k,
     const __nv_bfloat16* __restrict__ query_v, const std::int32_t* __restrict__ valid_columns,
@@ -129,6 +130,7 @@ __device__ __forceinline__ void context_query_split_partial_body(
     static_assert(WarpsPerCta == (Tokens + 3) / 4);
     static_assert(KeyBlock == 32 || KeyBlock == 64);
 
+    constexpr int QHeads        = KVHeads * kContextQueryGroup;
     constexpr int D             = kContextQueryHeadDim;
     constexpr int Wc            = WarpsPerCta;
     constexpr int Threads       = Wc * 32;
@@ -151,12 +153,10 @@ __device__ __forceinline__ void context_query_split_partial_body(
     const int warp    = tid >> 5;
     const int lane    = tid & 31;
 
-    constexpr std::int64_t QueryElements =
-        static_cast<std::int64_t>(D) * kContextQueryQHeads * Tokens;
-    constexpr std::int64_t QueryKvElements =
-        static_cast<std::int64_t>(D) * kContextQueryKVHeads * Tokens;
+    constexpr std::int64_t QueryElements   = static_cast<std::int64_t>(D) * QHeads * Tokens;
+    constexpr std::int64_t QueryKvElements = static_cast<std::int64_t>(D) * KVHeads * Tokens;
     constexpr std::int64_t PartialElements = QueryElements;
-    constexpr std::int64_t StatElements = static_cast<std::int64_t>(kContextQueryQHeads) * Tokens;
+    constexpr std::int64_t StatElements    = static_cast<std::int64_t>(QHeads) * Tokens;
     q += QueryElements * batch;
     query_k += QueryKvElements * batch;
     query_v += QueryKvElements * batch;
@@ -167,15 +167,15 @@ __device__ __forceinline__ void context_query_split_partial_body(
         partial_l += StatElements * split_capacity * batch;
     }
     const int valid = valid_columns[batch];
-    if (kv_head >= kContextQueryKVHeads || split >= split_capacity || length < 0 ||
-        length > max_context || valid < 0 || valid > Tokens) {
+    if (kv_head >= KVHeads || split >= split_capacity || length < 0 || length > max_context ||
+        valid < 0 || valid > Tokens) {
         return;
     }
     if (valid == 0) {
         if constexpr (DirectOutput) {
             constexpr int VecsPerKVHead = D * kContextQueryGroup / 8;
             constexpr int OutputVecs    = Tokens * VecsPerKVHead;
-            constexpr int TokenStride   = D * kContextQueryQHeads;
+            constexpr int TokenStride   = D * QHeads;
             for (int unit = tid; unit < OutputVecs; unit += Threads) {
                 const int token  = unit / VecsPerKVHead;
                 const int vector = unit - token * VecsPerKVHead;
@@ -217,7 +217,7 @@ __device__ __forceinline__ void context_query_split_partial_body(
         context_query_row_to_qt(row, kv_head, q_head, token);
         const bool live = row < RowCount && token < valid;
         const __nv_bfloat16* src =
-            q + context_query_q_index(live ? q_head : 0, d, live ? token : 0);
+            q + context_query_q_index<QHeads>(live ? q_head : 0, d, live ? token : 0);
         __nv_bfloat16* dst = &shared[row * D + common::swizzle_xor_64(row, d)];
         common::cp_async_zfill<16, Cache::cg>(dst, src, live ? 16 : 0);
     }
@@ -286,7 +286,7 @@ __device__ __forceinline__ void context_query_split_partial_body(
         current_record_offset =
             current_is_query ? 0 : policy.template page<Tokens>(current_key0, lane, FullMask);
     }
-    context_query_stage_tile<ContextPolicy, KeyBlock, Threads>(
+    context_query_stage_tile<ContextPolicy, KeyBlock, Threads, KVHeads>(
         k_s, context_k, query_k, current_key0, current_valid, current_is_query, kv_head,
         current_record_offset, policy, tid);
     common::cp_commit();
@@ -295,7 +295,7 @@ __device__ __forceinline__ void context_query_split_partial_body(
         common::cp_wait<0>();
         __syncthreads();
 
-        context_query_stage_v_tile<ContextPolicy, KeyBlock, Threads>(
+        context_query_stage_v_tile<ContextPolicy, KeyBlock, Threads, KVHeads>(
             v_s, context_v, query_v, current_key0, current_valid, current_is_query, kv_head,
             current_record_offset, policy, tid);
         common::cp_commit();
@@ -333,7 +333,7 @@ __device__ __forceinline__ void context_query_split_partial_body(
                                          ? current_record_offset
                                          : policy.template page<Tokens>(next_key0, lane, FullMask));
             }
-            context_query_stage_tile<ContextPolicy, KeyBlock, Threads>(
+            context_query_stage_tile<ContextPolicy, KeyBlock, Threads, KVHeads>(
                 k_s, context_k, query_k, next_key0, next_valid, next_is_query, kv_head,
                 next_record_offset, policy, tid);
             common::cp_commit();
@@ -461,14 +461,14 @@ __device__ __forceinline__ void context_query_split_partial_body(
             if (row0 < RowCount) {
                 int q_head = 0, token = 0;
                 context_query_row_to_qt(row0, kv_head, q_head, token);
-                partial_m[context_query_stat_index<Tokens>(q_head, token, split)] = m0;
-                partial_l[context_query_stat_index<Tokens>(q_head, token, split)] = l0;
+                partial_m[context_query_stat_index<Tokens, QHeads>(q_head, token, split)] = m0;
+                partial_l[context_query_stat_index<Tokens, QHeads>(q_head, token, split)] = l0;
             }
             if (row1 < RowCount) {
                 int q_head = 0, token = 0;
                 context_query_row_to_qt(row1, kv_head, q_head, token);
-                partial_m[context_query_stat_index<Tokens>(q_head, token, split)] = m1;
-                partial_l[context_query_stat_index<Tokens>(q_head, token, split)] = l1;
+                partial_m[context_query_stat_index<Tokens, QHeads>(q_head, token, split)] = m1;
+                partial_l[context_query_stat_index<Tokens, QHeads>(q_head, token, split)] = l1;
             }
         }
     }
@@ -483,11 +483,12 @@ __device__ __forceinline__ void context_query_split_partial_body(
             context_query_row_to_qt(row0, kv_head, q_head, token);
             if constexpr (DirectOutput) {
                 const float inv_l = l0 > 0.0f ? 1.0f / l0 : 0.0f;
-                const auto dst    = context_query_q_index(q_head, d0, token);
+                const auto dst    = context_query_q_index<QHeads>(q_head, d0, token);
                 common::store_vec(&out[dst],
                                   common::pack_bf16x2(acc[n][0] * inv_l, acc[n][1] * inv_l));
             } else {
-                const auto dst = context_query_partial_index<Tokens>(q_head, d0, token, split);
+                const auto dst =
+                    context_query_partial_index<Tokens, QHeads>(q_head, d0, token, split);
                 if constexpr (std::is_same_v<Partial, float>)
                     common::store_vec(&partial_acc[dst], make_float2(acc[n][0], acc[n][1]));
                 else
@@ -499,11 +500,12 @@ __device__ __forceinline__ void context_query_split_partial_body(
             context_query_row_to_qt(row1, kv_head, q_head, token);
             if constexpr (DirectOutput) {
                 const float inv_l = l1 > 0.0f ? 1.0f / l1 : 0.0f;
-                const auto dst    = context_query_q_index(q_head, d0, token);
+                const auto dst    = context_query_q_index<QHeads>(q_head, d0, token);
                 common::store_vec(&out[dst],
                                   common::pack_bf16x2(acc[n][2] * inv_l, acc[n][3] * inv_l));
             } else {
-                const auto dst = context_query_partial_index<Tokens>(q_head, d0, token, split);
+                const auto dst =
+                    context_query_partial_index<Tokens, QHeads>(q_head, d0, token, split);
                 if constexpr (std::is_same_v<Partial, float>)
                     common::store_vec(&partial_acc[dst], make_float2(acc[n][2], acc[n][3]));
                 else
@@ -513,74 +515,65 @@ __device__ __forceinline__ void context_query_split_partial_body(
     }
 }
 
-template <int Tokens, int KeyBlock>
+template <int Tokens, int KeyBlock, int WarpsPerBlock, int KVHeads, int MaxSplits, class Partial>
 __device__ __forceinline__ void
-context_query_reduce_body(const __nv_bfloat16* __restrict__ partial_acc,
+context_query_reduce_body(const Partial* __restrict__ partial_acc,
                           const float* __restrict__ partial_m, const float* __restrict__ partial_l,
                           int length, int context_count,
                           const std::int32_t* __restrict__ valid_columns, int max_context,
                           int split_capacity, __nv_bfloat16* __restrict__ out) {
-    const int q_head = static_cast<int>(blockIdx.x);
-    const int token  = static_cast<int>(blockIdx.y);
-    const int batch  = static_cast<int>(blockIdx.z);
-    const int tid    = static_cast<int>(threadIdx.x);
-    constexpr std::int64_t QueryElements =
-        static_cast<std::int64_t>(kContextQueryHeadDim) * kContextQueryQHeads * Tokens;
-    constexpr std::int64_t StatElements = static_cast<std::int64_t>(kContextQueryQHeads) * Tokens;
+    constexpr int QHeads    = KVHeads * kContextQueryGroup;
+    constexpr unsigned Mask = 0xffffffffu;
+    __shared__ float weights[WarpsPerBlock][MaxSplits];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int batch = blockIdx.z;
+    const int row   = blockIdx.x * WarpsPerBlock + warp;
+    const int token = row / QHeads, head = row % QHeads;
+    if (token >= Tokens) return;
+    constexpr std::int64_t QueryElements = std::int64_t(kContextQueryHeadDim) * QHeads * Tokens;
+    constexpr std::int64_t StatElements  = std::int64_t(QHeads) * Tokens;
     partial_acc += QueryElements * split_capacity * batch;
     partial_m += StatElements * split_capacity * batch;
     partial_l += StatElements * split_capacity * batch;
     out += QueryElements * batch;
-    if (q_head >= kContextQueryQHeads || token >= Tokens) { return; }
-    if (length < 0 || length > max_context || token >= valid_columns[batch]) {
-        if (tid < kContextQueryHeadDim) {
-            out[context_query_q_index(q_head, tid, token)] = __float2bfloat16(0.0f);
-        }
+    if (token >= valid_columns[batch] || length < 0 || length > max_context) {
+#pragma unroll
+        for (int item = 0; item < 4; ++item)
+            out[context_query_q_index<QHeads>(head, lane + item * 32, token)] =
+                __float2bfloat16(0.F);
         return;
     }
-
     const int context_tiles = (context_count + KeyBlock - 1) / KeyBlock;
-    const int active_splits = context_tiles > 0 ? min(context_tiles, split_capacity) : 1;
-    __shared__ float reduce[128];
-
-    float local_m = -CUDART_INF_F;
-    for (int split = tid; split < active_splits; split += blockDim.x) {
-        local_m = fmaxf(local_m, partial_m[context_query_stat_index<Tokens>(q_head, token, split)]);
+    const int active        = context_tiles > 0 ? min(context_tiles, split_capacity) : 1;
+    float local_m           = -CUDART_INF_F;
+    for (int split = lane; split < active; split += 32)
+        local_m =
+            fmaxf(local_m, partial_m[context_query_stat_index<Tokens, QHeads>(head, token, split)]);
+    const float maximum = common::warp_max<32>(local_m, Mask);
+    float local_l       = 0.F;
+    for (int split = lane; split < active; split += 32) {
+        const auto index     = context_query_stat_index<Tokens, QHeads>(head, token, split);
+        const float weight   = expf(partial_m[index] - maximum);
+        weights[warp][split] = weight;
+        local_l += partial_l[index] * weight;
     }
-    reduce[tid] = local_m;
-    __syncthreads();
-    for (int stride = 64; stride > 0; stride >>= 1) {
-        if (tid < stride) { reduce[tid] = fmaxf(reduce[tid], reduce[tid + stride]); }
-        __syncthreads();
-    }
-    const float global_m = reduce[0];
-    __syncthreads();
-
-    float local_l = 0.0f;
-    for (int split = tid; split < active_splits; split += blockDim.x) {
-        const auto idx = context_query_stat_index<Tokens>(q_head, token, split);
-        local_l += partial_l[idx] * expf(partial_m[idx] - global_m);
-    }
-    reduce[tid] = local_l;
-    __syncthreads();
-    for (int stride = 64; stride > 0; stride >>= 1) {
-        if (tid < stride) { reduce[tid] += reduce[tid + stride]; }
-        __syncthreads();
-    }
-    const float global_l = reduce[0];
-
-    if (tid < kContextQueryHeadDim) {
-        float numerator = 0.0f;
-        for (int split = 0; split < active_splits; ++split) {
-            const auto stat    = context_query_stat_index<Tokens>(q_head, token, split);
-            const float weight = expf(partial_m[stat] - global_m);
-            numerator +=
-                __bfloat162float(
-                    partial_acc[context_query_partial_index<Tokens>(q_head, tid, token, split)]) *
-                weight;
+    const float denominator = common::warp_sum<32>(local_l, Mask);
+    __syncwarp(Mask);
+#pragma unroll
+    for (int item = 0; item < 4; ++item) {
+        const int d     = lane + item * 32;
+        float numerator = 0.F;
+        for (int split = 0; split < active; ++split) {
+            const auto index = context_query_partial_index<Tokens, QHeads>(head, d, token, split);
+            float value;
+            if constexpr (std::is_same_v<Partial, float>)
+                value = partial_acc[index];
+            else
+                value = __bfloat162float(partial_acc[index]);
+            numerator += value * weights[warp][split];
         }
-        const float value = global_l > 0.0f ? numerator / global_l : 0.0f;
-        out[context_query_q_index(q_head, tid, token)] = __float2bfloat16(value);
+        out[context_query_q_index<QHeads>(head, d, token)] =
+            __float2bfloat16(denominator > 0.F ? numerator / denominator : 0.F);
     }
 }
 

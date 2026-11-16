@@ -19,7 +19,7 @@ __global__ void quantize_input(const __nv_bfloat16* input, std::uint8_t* codes, 
     // token liveness is identical for all its CTAs, while output clear ranges are disjoint.
     const int token = group / (kHidden / 128);
     bool hit        = false;
-    if (lane < kTopK) hit = includes(kind, mask, ids[std::int64_t(token) * kTopK + lane]);
+    if (lane < kTopK) hit = expert_in_subset(kind, mask, ids[std::int64_t(token) * kTopK + lane]);
     const bool live = __any_sync(0xffffffff, hit);
     if (!lane && group % (kHidden / 128) == 0) active_tokens[token] = live;
     if (!live) return;

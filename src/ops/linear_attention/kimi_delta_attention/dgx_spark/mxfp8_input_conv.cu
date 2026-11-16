@@ -4,7 +4,14 @@
 namespace ninfer::ops::detail::kda_input {
 namespace {
 
-bool window_route(int width, int batch) { return std::int64_t(width) * batch <= 32; }
+bool window_route(int width, int batch, LinearPolicy policy) {
+    const auto columns = std::int64_t(width) * batch;
+    if (width == 1 && policy == LinearPolicy::AllowA8 && columns > 40) return false;
+    if (columns <= 32) return true;
+    // Every tile owns complete request windows. Narrower tiles reuse weights in L2
+    // while keeping enough resident warps for the projection and convolution.
+    return width <= 8 && columns <= 64;
+}
 
 bool single_tile_route(int width, int batch, LinearPolicy policy) {
     return policy == LinearPolicy::AllowA8 && std::int64_t(width) * batch <= 128;
@@ -21,21 +28,43 @@ void window(const Mxfp8A16Operands<>& p, const Arguments& a, cudaStream_t stream
 
 template <int Width>
 void window(const Mxfp8A16Operands<>& p, const Arguments& a, cudaStream_t stream) {
-    // One token tile owns the complete physical batch, including every request window.
+    // A token tile may own several requests, but never divides a request window.
+    // Small updates publish complete 32-byte history sectors. Keep the same K
+    // partition as record so the projected values and history rounding agree exactly.
+    if (a.destination && p.tokens >= 3 && p.tokens <= 5) {
+        if constexpr (Width <= 4)
+            if (p.tokens <= 4) return window<Width, 16, 4, 8, 1, 256>(p, a, stream);
+        if constexpr (Width == 1 || Width == 5)
+            if (p.tokens == 5) return window<Width, 16, 5, 8, 1, 256>(p, a, stream);
+    }
     if constexpr (Width <= 2)
         if (p.tokens <= 2) return window<Width, 8, 2, 8, 2, 256>(p, a, stream);
     if constexpr (Width <= 4)
         if (p.tokens <= 4) return window<Width, 8, 4, 8, 1, 256>(p, a, stream);
     if constexpr (Width <= 8)
         if (p.tokens <= 8) return window<Width, 8, 8, 8, 1, 256>(p, a, stream);
+    if constexpr (Width == 3 || Width == 6)
+        if (p.tokens <= 24) return window<Width, 16, 12, 8, 1>(p, a, stream);
+    if constexpr (Width == 5) {
+        if (p.tokens <= 30) return window<Width, 16, 15, 8, 1>(p, a, stream);
+        return window<Width, 16, 20, 4, 1>(p, a, stream);
+    }
+    if constexpr (Width == 7) {
+        if (p.tokens <= 28) return window<Width, 16, 14, 8, 1>(p, a, stream);
+        return window<Width, 32, 28, 4, 1>(p, a, stream);
+    }
     if constexpr (Width <= 16)
         if (p.tokens <= 16) return window<Width, 16, 16, 8, 1>(p, a, stream);
+    if constexpr (Width > 0 && Width <= 16 && 16 % Width == 0)
+        if (p.tokens <= 32) return window<Width, 16, 16, 8, 1>(p, a, stream);
     if constexpr (Width <= 24) {
         if (p.tokens <= 24) {
             window<Width, 16, 24, 4, 1>(p, a, stream);
             return;
         }
     }
+    if constexpr (Width > 0 && Width <= 8 && 24 % Width == 0)
+        if (p.tokens <= 48 || 32 % Width != 0) return window<Width, 32, 24, 4, 1>(p, a, stream);
     window<Width, 32, 32, 4, 1>(p, a, stream);
 }
 
@@ -65,19 +94,25 @@ using A8Schedule = ConvolutionSchedule<
 } // namespace
 
 Mxfp8Workspace mxfp8_execution_workspace(int width, int batch, bool update, LinearPolicy policy) {
-    return window_route(width, batch) ? Mxfp8Workspace{}
-                                      : mxfp8_workspace(width, batch, update, policy,
-                                                        !single_tile_route(width, batch, policy));
+    return window_route(width, batch, policy)
+               ? Mxfp8Workspace{}
+               : mxfp8_workspace(width, batch, update, policy,
+                                 !single_tile_route(width, batch, policy) &&
+                                     !whole_window_tiles(width));
 }
 
-std::size_t mxfp8_workspace_capacity(int batch, int, int last, bool update, LinearPolicy policy) {
-    // The fused window domain is a prefix for fixed B; tiled scratch grows monotonically.
-    return mxfp8_execution_workspace(last, batch, update, policy).bytes;
+std::size_t mxfp8_workspace_capacity(int batch, int first, int last, bool update,
+                                     LinearPolicy policy) {
+    auto bytes = mxfp8_execution_workspace(last, batch, update, policy).bytes;
+    // Complete-window tiles omit boundary storage. The preceding width may need it.
+    if (first < last && whole_window_tiles(last))
+        bytes = std::max(bytes, mxfp8_execution_workspace(last - 1, batch, update, policy).bytes);
+    return bytes;
 }
 
 void launch_mxfp8(const Tensor& x, const Weight& w, LinearPolicy policy, const Arguments& a,
                   void* scratch, cudaStream_t stream) {
-    if (window_route(a.width, a.batch)) {
+    if (window_route(a.width, a.batch, policy)) {
         using Window = void (*)(const Mxfp8A16Operands<>&, const Arguments&, cudaStream_t);
         static constexpr Window windows[]{window<1>,  window<2>,  window<3>,  window<4>,
                                           window<5>,  window<6>,  window<7>,  window<8>,
@@ -100,11 +135,15 @@ void launch_mxfp8(const Tensor& x, const Weight& w, LinearPolicy policy, const A
             launch_mxfp8_tiled<A16Schedule, Schedule, true, true, true, true>(x, w, policy, a,
                                                                                scratch, stream);
         };
-        if (columns <= 192)
+        const bool short_windows = whole_window_tiles(a.width) && a.width <= 8;
+        if (columns <= 192 || (short_windows && columns <= 256))
             launch.template operator()<Mxfp8A8TmaSchedule<64, 128, 128, 32, 32, 3, 1, 8, true>>();
         else if (columns <= 384 || columns > 2048)
             launch
                 .template operator()<Mxfp8A8TmaSchedule<192, 128, 128, 96, 32, 2, 1, 8, true, 1>>();
+        else if (columns <= 512 && short_windows)
+            launch
+                .template operator()<Mxfp8A8TmaSchedule<128, 128, 128, 64, 32, 2, 1, 8, true, 1>>();
         else if (columns <= 512)
             launch
                 .template operator()<Mxfp8A8TmaSchedule<128, 128, 128, 64, 32, 2, 1, 2, true, 1>>();

@@ -113,7 +113,8 @@ void controls(const glm::Frontend& f, const text::Tokenizer& tokenizer) {
     session.discard_preview();
     require(!session.pending_control_tokens().empty(), "discard consumed pending control");
     const auto closed = session.preview_control(control, 100);
-    require(closed.prefix_execution_split_after == control.size(), "control lost execution split");
+    require(closed.accepted_tokens == control.size() && !closed.finished(),
+            "thinking control was not accepted atomically");
     output.append(session.commit_preview());
     commit(session, tokenizer.encode("  answer<|endoftext|>"), output);
     require(output.reasoning == "xx" && output.content == "  answer" &&

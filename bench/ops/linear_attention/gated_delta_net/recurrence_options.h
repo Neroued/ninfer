@@ -80,7 +80,7 @@ inline Options parse_options(int argc, char** argv) {
         throw std::invalid_argument("unknown state form");
     if (!explicit_state && o.mode == Mode::BatchUpdate) o.state_form = "alias";
     if (o.mode == Mode::BatchUpdate && !explicit_tokens) o.tokens = {1};
-    if (o.value_heads < o.qk_heads || o.value_heads % o.qk_heads || o.batch > 8 ||
+    if (o.value_heads < o.qk_heads || o.value_heads % o.qk_heads ||
         (o.mode != Mode::BatchUpdate && o.batch != 1))
         throw std::invalid_argument("invalid head/batch geometry");
     if (o.qk_norm != "fused" && o.qk_norm != "composed")

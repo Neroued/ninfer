@@ -137,18 +137,36 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
         __syncthreads();
 #pragma unroll
         for (int k_step = 0; k_step < kTileK / 16; ++k_step) {
-            const int code_col   = k_step * 16 + lid * 2;
-            const auto load_pair = [&](int row, int col) {
-                const int byte   = (warp_k0 + col) / 2;
-                const int offset = ((byte / 16) ^ (row & kCodeSwizzle)) * 16 + (byte & 15);
-                return common::nvfp4_scaled_pair_bf16(
-                    code_shared[stage][row][offset],
-                    scale_shared[stage][row][(warp_k0 + col) / 16]);
-            };
-            const unsigned a0 = load_pair(gid, code_col);
-            const unsigned a1 = load_pair(gid + 8, code_col);
-            const unsigned a2 = load_pair(gid, code_col + 8);
-            const unsigned a3 = load_pair(gid + 8, code_col + 8);
+            unsigned a0, a1, a2, a3;
+            if constexpr (Schedule::kVectorCodes) {
+                const int byte  = (warp_k0 + k_step * 16) / 2;
+                const auto load = [&](int row) {
+                    const int offset = ((byte / 16) ^ (row & kCodeSwizzle)) * 16 + (byte & 15);
+                    return common::load_vec<uint2>(&code_shared[stage][row][offset]);
+                };
+                auto lo = load(gid), hi = load(gid + 8);
+                unsigned sl = scale_shared[stage][gid][(warp_k0 + k_step * 16) / 16];
+                unsigned sh = scale_shared[stage][gid + 8][(warp_k0 + k_step * 16) / 16];
+                sl          = common::fp8_e4m3x2_to_bf16x2_bits(sl | (sl << 8));
+                sh          = common::fp8_e4m3x2_to_bf16x2_bits(sh | (sh << 8));
+                a0          = common::nvfp4_pair_bf16_scaled((lo.x >> (lid * 8)) & 255, sl);
+                a2          = common::nvfp4_pair_bf16_scaled((lo.y >> (lid * 8)) & 255, sl);
+                a1          = common::nvfp4_pair_bf16_scaled((hi.x >> (lid * 8)) & 255, sh);
+                a3          = common::nvfp4_pair_bf16_scaled((hi.y >> (lid * 8)) & 255, sh);
+            } else {
+                const int code_col   = k_step * 16 + lid * 2;
+                const auto load_pair = [&](int row, int col) {
+                    const int byte   = (warp_k0 + col) / 2;
+                    const int offset = ((byte / 16) ^ (row & kCodeSwizzle)) * 16 + (byte & 15);
+                    return common::nvfp4_scaled_pair_bf16(
+                        code_shared[stage][row][offset],
+                        scale_shared[stage][row][(warp_k0 + col) / 16]);
+                };
+                a0 = load_pair(gid, code_col);
+                a1 = load_pair(gid + 8, code_col);
+                a2 = load_pair(gid, code_col + 8);
+                a3 = load_pair(gid + 8, code_col + 8);
+            }
 #pragma unroll
             for (int token_mma = 0; token_mma < kTokenMmas; ++token_mma) {
                 unsigned b0;

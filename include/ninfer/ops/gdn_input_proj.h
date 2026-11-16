@@ -18,7 +18,7 @@ struct GdnConvOutputs {
 struct GdnConvSnapshotState {
     ConstStateFieldView source; // Read-only BF16 [C,3] field selected by device I64 byte offsets.
     Tensor snapshots;           // Contiguous BF16 [C,3,N] temporary histories.
-    Tensor snapshot_bases;      // Read-only device I32 [B], reserves [base,base+T).
+    Tensor snapshot_bases;      // Read-only device I32 [B], live rows reserve [base,base+T).
 };
 
 // The single-token form writes the new BF16 [C,3] history directly to destination records.
@@ -53,8 +53,10 @@ void gdn_input_proj_conv_update(const Tensor& x, const ProjectionWeights& weight
  *   Source is a BF16 [C,3] field in each record, selected by device I64 [B] byte offsets.
  *   Snapshots are contiguous BF16 [C,3,N]; snapshot_bases is contiguous device I32 [B].
  *   Fields, snapshots and other data tensors are 16-byte aligned; data tensors are contiguous.
- *   B=1 accepts every positive T; B=2..8 accepts T=1..16. Empty valid_columns means every
- *   row is dense; otherwise it is device I32 [B] with each extent in [1,T]. Projection
+ *   B=1 accepts every positive T; B>1 accepts T=1..16. B is positive and T*B must fit I32.
+ *   Empty valid_columns means every row is dense; otherwise it is device I32 [B] with
+ *   each extent in [0,T]. A zero extent reads no history or source/destination selector and
+ *   publishes no history or snapshot; its selectors may be -1. Projection
  *   processes all M=B*T safe columns.
  *
  * Numeric / effects:
@@ -62,7 +64,8 @@ void gdn_input_proj_conv_update(const Tensor& x, const ProjectionWeights& weight
  *   not an observable BF16 boundary. Outputs and published histories are BF16.
  *   Query/key/value are exact zero in invalid tails; z is written for every physical
  *   column. Only valid destination snapshot rows are written. The caller reserves disjoint
- *   complete [base,base+T) intervals and prevents a row from overwriting another row's source.
+ *   complete [base,base+T) intervals for live rows and prevents a row from overwriting another
+ *   row's source.
  *   A source field is disjoint from the snapshot destination or exactly aliases one complete
  *   [C,3] row in its own reservation; partial overlap is not allowed.
  *   Other snapshot rows are unchanged. Tensor operands are disjoint. Selected source fields
@@ -90,7 +93,8 @@ gdn_input_proj_conv_snapshot_workspace_capacity_bytes(const ProjectionProfile& w
  *
  * Evaluates the same projection/convolution/SiLU computation from a read-only source history.
  * Supported weights, tensor layouts, valid prefixes and output effects match snapshot above;
- * the record domain is B=1..8, T=2..16. conv_record is contiguous, 16-byte-aligned BF16 [C,T,B].
+ * the record domain is B>=1, T=2..16, T*B fitting I32. conv_record is contiguous,
+ * 16-byte-aligned BF16 [C,T,B].
  * Only its valid prefix is defined. It receives each newest projected history column.
  *
  * Query/key/value/z and valid record columns are bit-identical to snapshot from the same

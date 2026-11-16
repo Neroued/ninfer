@@ -37,12 +37,18 @@ struct MmaSchedule
 } // namespace
 
 Mxfp8Workspace mxfp8_execution_workspace(int width, int batch, bool update, LinearPolicy policy) {
-    return window_route(width, batch) ? Mxfp8Workspace{}
-                                      : mxfp8_workspace(width, batch, update, policy, true);
+    return window_route(width, batch)
+               ? Mxfp8Workspace{}
+               : mxfp8_workspace(width, batch, update, policy, !whole_window_tiles(width));
 }
 
-std::size_t mxfp8_workspace_capacity(int batch, int, int last, bool update, LinearPolicy policy) {
-    return mxfp8_execution_workspace(last, batch, update, policy).bytes;
+std::size_t mxfp8_workspace_capacity(int batch, int first, int last, bool update,
+                                     LinearPolicy policy) {
+    auto bytes = mxfp8_execution_workspace(last, batch, update, policy).bytes;
+    // Complete-window tiles omit boundary storage. The preceding width may need it.
+    if (first < last && whole_window_tiles(last))
+        bytes = std::max(bytes, mxfp8_execution_workspace(last - 1, batch, update, policy).bytes);
+    return bytes;
 }
 
 void launch_mxfp8(const Tensor& x, const Weight& w, LinearPolicy policy, const Arguments& a,

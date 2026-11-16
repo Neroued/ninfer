@@ -12,7 +12,6 @@ namespace ninfer::ops::detail::kpool {
 enum class ProjectionRoute {
     Gemv,
     Simt2,
-    Simt4,
     Sliced8,
     Sliced16,
     SlicedHistory,
@@ -123,6 +122,15 @@ inline std::size_t prepare_capacity(const PrepareGeometry& geometry, bool update
         if (t >= lo && t <= hi)
             result = std::max(result, prepare_workspace(geometry, update, int(t), batch).bytes);
     };
+    if (batch > window) {
+        // Above one request window, projection scratch repeats by residue. Carry can differ
+        // only for divisors of the window, all of which occur in this bounded prefix.
+        for (std::int64_t t = lo; t <= std::min(hi, window); ++t) examine(t);
+        const auto begin = std::max<std::int64_t>(lo, window + 1);
+        const auto end   = std::min<std::int64_t>(hi, begin + period - 1);
+        for (auto t = begin; t <= end; ++t) examine(t);
+        return result;
+    }
     const auto endpoint = [&](std::int64_t t) {
         examine(t);
         // A request divisor needs no carry. Its predecessor or earlier same-residue

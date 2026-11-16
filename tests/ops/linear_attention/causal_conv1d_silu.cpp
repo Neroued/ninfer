@@ -638,7 +638,7 @@ int batched_snapshot_case(std::int32_t C, std::int32_t width,
                           const std::vector<std::int32_t>& initial_slots,
                           const std::vector<std::int32_t>& snapshot_bases,
                           const std::vector<std::int32_t>& valid_columns, std::int32_t slots,
-                          std::uint32_t seed) {
+                          std::uint32_t seed, bool captured = false) {
     const std::int32_t batch        = static_cast<std::int32_t>(initial_slots.size());
     const bool masked               = !valid_columns.empty();
     const LogicalInput input        = make_input(C, width * batch, seed);
@@ -656,6 +656,7 @@ int batched_snapshot_case(std::int32_t C, std::int32_t width,
     std::vector<float> expected_states = states;
     for (std::int32_t row = 0; row < batch; ++row) {
         const std::int32_t valid = masked ? valid_columns[static_cast<std::size_t>(row)] : width;
+        if (!valid) continue;
         const std::size_t input_begin = static_cast<std::size_t>(row) * row_elements;
         std::vector<float> row_input(input.x.begin() + input_begin,
                                      input.x.begin() + input_begin +
@@ -701,9 +702,11 @@ int batched_snapshot_case(std::int32_t C, std::int32_t width,
     Tensor tstate(state.span(), DType::BF16, {C, 3, slots});
     RecordStateFixture history(tstate, 2);
     bool source_aliases_snapshots = false;
-    for (int row = 0; row < batch; ++row)
+    for (int row = 0; row < batch; ++row) {
+        if (masked && !valid_columns[row]) continue;
         source_aliases_snapshots |= initial_slots[row] >= snapshot_bases[row] &&
                                     initial_slots[row] < snapshot_bases[row] + width;
+    }
     auto initial_offsets = history.record_offsets(initial_slots);
     if (source_aliases_snapshots)
         for (int row = 0; row < batch; ++row)
@@ -716,8 +719,23 @@ int batched_snapshot_case(std::int32_t C, std::int32_t width,
         source_aliases_snapshots ? dense_record_field(tstate, 2, tinitial) : history.view(tinitial);
     Tensor tbases(bases.span(), DType::I32, {batch});
     Tensor tout(output.span(), DType::BF16, {C, width, batch});
-    ops::causal_conv1d_silu_snapshot(tx, tw, source, tstate, tvalid, tbases, tout,
-                                     ninfer::test::cuda_environment().default_execution);
+    const auto execution = ninfer::test::cuda_environment().context.execution_view();
+    const auto invoke    = [&] {
+        ops::causal_conv1d_silu_snapshot(tx, tw, source, tstate, tvalid, tbases, tout, execution);
+    };
+    if (captured) {
+        const std::vector<std::int32_t> dense(batch, width);
+        valid->copy_from_host(dense.data(), valid->bytes());
+        DecodeGraphDefinition definition;
+        definition.capture(execution.stream(), invoke);
+        DecodeGraphExecutable graph;
+        graph.instantiate(definition);
+        valid->copy_from_host(valid_columns.data(), valid->bytes());
+        graph.launch(execution.stream());
+        cuda_synchronize();
+    } else {
+        invoke();
+    }
     cuda_synchronize();
 
     const std::string tag = "causal_conv1d_silu batched snapshot C=" + std::to_string(C) +
@@ -726,6 +744,19 @@ int batched_snapshot_case(std::int32_t C, std::int32_t width,
     int failures = 0;
     failures += verify_output(tag + " output", from_device_bf16(output.data(), x_bits.size()),
                               expected_output);
+    if (masked) {
+        const auto words = from_device<std::uint16_t>(output.data(), x_bits.size());
+        for (int row = 0; row < batch; ++row) {
+            const auto first = words.begin() + std::size_t(row) * row_elements +
+                               std::size_t(valid_columns[row]) * C;
+            const auto last = words.begin() + std::size_t(row + 1) * row_elements;
+            if (!std::all_of(first, last, [](auto word) { return word == 0; })) {
+                std::cerr << tag << " invalid output tail is not exact +0\n";
+                ++failures;
+                break;
+            }
+        }
+    }
     failures += history.verify_guards("snapshot history");
     failures += verify_bits(tag + " all state slots", state.data(), expected_bits);
     failures += verify_bits(tag + " x preserved", x.data(), x_bits);
@@ -772,13 +803,18 @@ int main(int argc, char** argv) {
     };
     const auto batched_snapshot = [&](int channels, int width, std::vector<int> initial,
                                       std::vector<int> destinations, std::vector<int> valid,
-                                      int slots, unsigned seed) {
-        suite.add("causal_conv/batched_snapshot/c" + std::to_string(channels) + "/w" +
-                      std::to_string(width),
-                  [=] {
-                      return batched_snapshot_case(channels, width, initial, destinations, valid,
-                                                   slots, seed);
-                  });
+                                      int slots, unsigned seed, bool captured = false) {
+        std::vector<std::pair<std::string, std::string>> tags;
+        if (initial.size() > 8) tags.emplace_back("suite", "concurrency");
+        suite.add(
+            "causal_conv/batched_snapshot/c" + std::to_string(channels) + "/w" +
+                std::to_string(width) + "/b" + std::to_string(initial.size()) +
+                (captured ? "/graph" : ""),
+            [=] {
+                return batched_snapshot_case(channels, width, initial, destinations, valid, slots,
+                                             seed, captured);
+            },
+            std::move(tags));
     };
     const auto split = [&](int channels, int q, int k, int v, int t, bool alias, bool offset,
                            unsigned seed, bool captured = false) {
@@ -834,6 +870,19 @@ int main(int argc, char** argv) {
     // Row 0 reads slot 15 and overwrites it only after the final valid column. This is the
     // production same-row alias pattern; row 1 remains fully disjoint.
     batched_snapshot(kQwen35Channels, 16, {15, 33}, {0, 16}, {16, 7}, 34, 5016U);
+    for (const auto [channels, width, batch] :
+         {std::array{8192, 1, 9}, std::array{10240, 4, 17}, std::array{256, 16, 64}}) {
+        std::vector<int> initial(batch), destinations(batch), valid(batch);
+        const int slots = batch * (width + 1);
+        for (int row = 0; row < batch; ++row) {
+            valid[row]        = row % 3 == 0 ? 0 : row % 3 == 1 ? 1 : width;
+            initial[row]      = valid[row] ? batch * width + row : -1;
+            destinations[row] = valid[row] ? row * width : -1;
+        }
+        if (batch == 17) initial[1] = destinations[1];
+        batched_snapshot(channels, width, initial, destinations, valid, slots, 5100U + batch,
+                         batch == 17);
+    }
 
     // The split entry: both channel geometries, across the column counts that select each of its
     // two routes and the boundary between them.

@@ -27,7 +27,7 @@ namespace {
 constexpr std::int32_t kHeadDim             = 256;
 constexpr float kExpectedScale              = 0.0625f;
 constexpr std::int32_t kMaximumVerifyTokens = 16;
-constexpr std::int32_t kMaximumBatchSize    = 8;
+constexpr std::int32_t kMaximumGridRows     = 65535;
 
 void require_causal_geometry(AttentionHeadGeometry geometry, const char* op) {
     if (!valid_attention_head_geometry(geometry) || geometry.head_dim != kHeadDim ||
@@ -156,8 +156,7 @@ void validate_batched_attention_tensors(const Tensor& q, const Tensor& positions
     const std::int32_t kv_heads = geometry.kv_heads;
     const std::int32_t width    = q.ne[2];
     const std::int32_t batch    = q.ne[3];
-    if (width <= 0 || batch <= 0 || batch > kMaximumBatchSize ||
-        (batch > 1 && width > kMaximumVerifyTokens)) {
+    if (width <= 0 || batch <= 0 || (batch > 1 && width > kMaximumVerifyTokens)) {
         throw std::invalid_argument(std::string(op) + ": unsupported B/W domain");
     }
     common::operand::shape(q, {kHeadDim, q_heads, width, batch}, op, "q");
@@ -174,8 +173,7 @@ void validate_batched_attention_tensors(const Tensor& q, const Tensor& positions
         throw std::invalid_argument(std::string(op) + ": invalid KV cache head geometry");
     }
     const std::uint32_t capacity = validate_batch_cache(cache, kv_heads, op, device);
-    if (cache.k_pages.records.page_offsets.ne[1] < batch || envelope.min_visible_keys == 0 ||
-        envelope.min_visible_keys > envelope.max_visible_keys ||
+    if (envelope.min_visible_keys == 0 || envelope.min_visible_keys > envelope.max_visible_keys ||
         envelope.max_visible_keys > kCausalAttentionMaximumVisibleKeys ||
         envelope.max_visible_keys > capacity ||
         (!masked && envelope.max_visible_keys < static_cast<std::uint32_t>(width))) {
@@ -195,33 +193,45 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
     try {
         (void)paged_kv_storage_layout(cache_storage, kHeadDim);
     } catch (const std::invalid_argument&) { supported_dtype = false; }
-    if (multiprocessor_count <= 0 || !supported_dtype || batch_size <= 0 ||
-        batch_size > kMaximumBatchSize || min_width <= 0 || max_width < min_width ||
-        (batch_size > 1 && max_width > kMaximumVerifyTokens) || envelope.min_visible_keys == 0 ||
-        envelope.min_visible_keys > envelope.max_visible_keys ||
+    if (multiprocessor_count <= 0 || !supported_dtype || batch_size <= 0 || min_width <= 0 ||
+        max_width < min_width || (batch_size > 1 && max_width > kMaximumVerifyTokens) ||
+        envelope.min_visible_keys == 0 || envelope.min_visible_keys > envelope.max_visible_keys ||
         envelope.max_visible_keys > kCausalAttentionMaximumVisibleKeys) {
         throw std::invalid_argument(
             "causal_softmax_attention workspace: invalid profile or interval");
     }
 
-    if (cache_storage == KvCacheStorage::BFloat16)
-        return detail::bf16_kv_workspace_bytes(q_heads, batch_size, min_width, max_width, envelope,
+    const auto capacity = [&](int rows, int first_width, int last_width) {
+        if (cache_storage == KvCacheStorage::BFloat16)
+            return detail::bf16_kv_workspace_bytes(q_heads, rows, first_width, last_width, envelope,
+                                                   multiprocessor_count);
+
+        if (cache_storage == KvCacheStorage::Fp8E4m3fnGroup128Ue8m0)
+            return detail::fp8_kv_workspace_bytes(q_heads, rows, first_width, last_width, envelope,
+                                                  multiprocessor_count);
+
+        if (cache_storage == KvCacheStorage::Int8Group64)
+            return detail::int8_kv_workspace_bytes(q_heads, rows, first_width, last_width, envelope,
+                                                   multiprocessor_count);
+
+        if (cache_storage == KvCacheStorage::Nvfp4Group16)
+            return detail::nvfp4_kv_workspace_bytes(q_heads, rows, first_width, last_width,
+                                                    envelope, multiprocessor_count);
+
+        return detail::k8v4_kv_workspace_bytes(q_heads, rows, first_width, last_width, envelope,
                                                multiprocessor_count);
-
-    if (cache_storage == KvCacheStorage::Fp8E4m3fnGroup128Ue8m0)
-        return detail::fp8_kv_workspace_bytes(q_heads, batch_size, min_width, max_width, envelope,
-                                              multiprocessor_count);
-
-    if (cache_storage == KvCacheStorage::Int8Group64)
-        return detail::int8_kv_workspace_bytes(q_heads, batch_size, min_width, max_width, envelope,
-                                               multiprocessor_count);
-
-    if (cache_storage == KvCacheStorage::Nvfp4Group16)
-        return detail::nvfp4_kv_workspace_bytes(q_heads, batch_size, min_width, max_width, envelope,
-                                                multiprocessor_count);
-
-    return detail::k8v4_kv_workspace_bytes(q_heads, batch_size, min_width, max_width, envelope,
-                                           multiprocessor_count);
+    };
+    if (batch_size == 1 || batch_size <= kMaximumGridRows / max_width) {
+        return capacity(batch_size, min_width, max_width);
+    }
+    std::size_t maximum = 0;
+    for (int width = min_width; width <= max_width; ++width) {
+        const int rows = std::min(batch_size, kMaximumGridRows / width);
+        maximum        = std::max(maximum, capacity(rows, width, width));
+        const int tail = batch_size % rows;
+        if (tail != 0) maximum = std::max(maximum, capacity(tail, width, width));
+    }
+    return maximum;
 }
 
 void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
@@ -248,32 +258,46 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     common::operand::contiguous_nonnull(k, op, "k", execution.device());
     common::operand::contiguous_nonnull(v, op, "v", execution.device());
 
-    if (cache.storage == KvCacheStorage::BFloat16) {
-        detail::bf16_kv_append_attention(q, k, v, positions, valid_columns, kv_table_rows, scale,
+    const auto dispatch = [&](const Tensor& q, const Tensor& k, const Tensor& v,
+                              const Tensor& positions, const Tensor& valid_columns,
+                              const Tensor& kv_table_rows, Tensor& out) {
+        if (cache.storage == KvCacheStorage::BFloat16) {
+            detail::bf16_kv_append_attention(q, k, v, positions, valid_columns, kv_table_rows,
+                                             scale, cache, envelope, workspace, out, execution);
+            return;
+        }
+
+        if (cache.storage == KvCacheStorage::Fp8E4m3fnGroup128Ue8m0) {
+            detail::fp8_kv_append_attention(q, k, v, positions, valid_columns, kv_table_rows, scale,
+                                            cache, envelope, workspace, out, execution);
+            return;
+        }
+
+        if (cache.storage == KvCacheStorage::Int8Group64) {
+            detail::int8_kv_append_attention(q, k, v, positions, valid_columns, kv_table_rows,
+                                             scale, cache, envelope, workspace, out, execution);
+            return;
+        }
+
+        if (cache.storage == KvCacheStorage::Nvfp4Group16) {
+            detail::nvfp4_kv_append_attention(q, k, v, positions, valid_columns, kv_table_rows,
+                                              scale, cache, envelope, workspace, out, execution);
+            return;
+        }
+
+        detail::k8v4_kv_append_attention(q, k, v, positions, valid_columns, kv_table_rows, scale,
                                          cache, envelope, workspace, out, execution);
-        return;
+    };
+    // The merge launch places W*B in grid.z. Slice physical rows without changing validity.
+    const int rows_per_launch = batch == 1 ? 1 : kMaximumGridRows / width;
+    for (std::int64_t begin = 0; begin < batch; begin += rows_per_launch) {
+        const int rows = std::min<std::int64_t>(rows_per_launch, batch - begin);
+        auto output    = out.slice(3, begin, rows);
+        dispatch(q.slice(3, begin, rows), k.slice(3, begin, rows), v.slice(3, begin, rows),
+                 positions.slice(1, begin, rows),
+                 valid_columns.data ? valid_columns.slice(0, begin, rows) : Tensor{},
+                 kv_table_rows.slice(0, begin, rows), output);
     }
-
-    if (cache.storage == KvCacheStorage::Fp8E4m3fnGroup128Ue8m0) {
-        detail::fp8_kv_append_attention(q, k, v, positions, valid_columns, kv_table_rows, scale,
-                                        cache, envelope, workspace, out, execution);
-        return;
-    }
-
-    if (cache.storage == KvCacheStorage::Int8Group64) {
-        detail::int8_kv_append_attention(q, k, v, positions, valid_columns, kv_table_rows, scale,
-                                         cache, envelope, workspace, out, execution);
-        return;
-    }
-
-    if (cache.storage == KvCacheStorage::Nvfp4Group16) {
-        detail::nvfp4_kv_append_attention(q, k, v, positions, valid_columns, kv_table_rows, scale,
-                                          cache, envelope, workspace, out, execution);
-        return;
-    }
-
-    detail::k8v4_kv_append_attention(q, k, v, positions, valid_columns, kv_table_rows, scale, cache,
-                                     envelope, workspace, out, execution);
 }
 
 void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,

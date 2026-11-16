@@ -6,4 +6,5 @@ ninfer_add_op_test(ninfer_normalization_test
           "${CMAKE_CURRENT_LIST_DIR}/rmsnorm.cpp"
           "${CMAKE_CURRENT_LIST_DIR}/gated_rmsnorm.cpp"
           "${CMAKE_CURRENT_LIST_DIR}/fused.cpp"
+          "${CMAKE_CURRENT_LIST_DIR}/gathered_features.cpp"
   LIBRARIES ninfer_ops)

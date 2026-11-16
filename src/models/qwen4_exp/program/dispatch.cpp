@@ -17,8 +17,13 @@ void RankProgramImpl::start(runtime::ExecutionRequest<ExecutionTypes>&& request)
     if (compute) throw std::logic_error("Qwen4Exp compute frame is occupied");
     gpu_timer.begin();
     compute.emplace();
-    auto& f      = *compute;
-    f.request    = std::move(request);
+    auto& f             = *compute;
+    f.request           = std::move(request);
+    f.physical          = work_shape(f.request.work);
+    const auto* forward = std::get_if<ForwardWork>(&f.request.work.operation);
+    f.graphable         = std::holds_alternative<MtpWork>(f.request.work.operation) ||
+                  (forward && forward->kind == ForwardKind::Ordinary);
+    resources.select_batch(f.physical.rows);
     f.retirement = f.request.command;
     std::visit(
         [&](const auto& work) {
@@ -56,7 +61,7 @@ void RankProgramImpl::advance_compute() {
             request_decision();
             if (!host_ple) {
                 ple_ready.wait(cuda.stream());
-                f.run->consume_ple(device_embedding(f.tokens, f.rows.size()));
+                f.run->consume_ple(device_embedding(f.tokens, f.sequence ? 1 : f.physical.rows));
                 f.phase = ComputePhase::Suffix;
                 break;
             }
@@ -97,10 +102,10 @@ void RankProgramImpl::advance_compute() {
                 Tensor logits;
                 const auto* forward = std::get_if<ForwardWork>(&f.request.work.operation);
                 if (f.verify || (forward && forward->sample == SampleKind::NextToken))
-                    logits = packed_tensor(*resources.plan.persistent.buffers.logits,
+                    logits = packed_tensor(*resources.buffers().logits,
                                            {dimension(parameters.profile->local.vocabulary),
                                             static_cast<int>(f.tokens),
-                                            static_cast<int>(f.rows.size())});
+                                            static_cast<int>(f.sequence ? 1 : f.physical.rows)});
                 f.run->finish({f.sample, f.conditioning}, logits);
             }
             f.phase = ComputePhase::AfterMain;
@@ -163,7 +168,7 @@ void RankProgramImpl::finish_result() {
     auto& f      = *compute;
     auto& result = f.result;
     result.rows.resize(f.rows.size());
-    const auto& buffers        = resources.plan.persistent.buffers;
+    const auto& buffers        = resources.buffers();
     const auto* ids            = static_cast<const TokenId*>(resources.egress().data);
     const auto* forward        = std::get_if<ForwardWork>(&f.request.work.operation);
     const bool sampled         = f.verify || (forward && forward->sample != SampleKind::None);
@@ -212,7 +217,7 @@ void RankProgramImpl::commit(runtime::ExecutionTicket ticket, runtime::CommandSe
         commit_verify(commit);
     else if (const auto* work = std::get_if<ForwardWork>(&f.request.work.operation);
              work && work->sample != SampleKind::None) {
-        const auto& io  = resources.plan.persistent.buffers;
+        const auto& io  = resources.buffers();
         const int batch = commit.rows.size();
         auto* lengths   = static_cast<std::int32_t*>(host_tensor(io.batch.count_columns).data);
         bool any        = false;

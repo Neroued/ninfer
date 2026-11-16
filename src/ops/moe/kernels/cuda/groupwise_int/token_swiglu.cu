@@ -51,7 +51,8 @@ __global__ void token_gate_up(const __nv_bfloat16* __restrict__ input, const int
                 if constexpr (Routed) {
                     if (path < K) {
                         const int expert = ids[token * K + path];
-                        if constexpr (Masked) { selected = mask[expert] == member; }
+                        selected         = expert >= 0;
+                        if constexpr (Masked) { selected = selected && mask[expert] == member; }
                         if (selected) { matrix = weights.template resolve<2 * I>(expert); }
                     }
                 }
@@ -63,8 +64,8 @@ __global__ void token_gate_up(const __nv_bfloat16* __restrict__ input, const int
             } else {
                 if (path < K) {
                     const int expert = ids[token * K + path];
-                    bool selected    = true;
-                    if constexpr (Masked) { selected = mask[expert] == member; }
+                    bool selected    = expert >= 0;
+                    if constexpr (Masked) { selected = selected && mask[expert] == member; }
                     if (selected) {
                         const auto matrix = weights.template resolve<2 * I>(expert);
                         dot_two_rows<Codec, H>(matrix.codes, matrix.high, matrix.scales,
@@ -120,7 +121,8 @@ __global__ void token_down(const int* __restrict__ ids, const float* __restrict_
             if constexpr (Routed) {
                 if (warp < K) {
                     const int expert = ids[token * K + warp];
-                    if constexpr (Masked) { selected = mask[expert] == member; }
+                    selected         = expert >= 0;
+                    if constexpr (Masked) { selected = selected && mask[expert] == member; }
                     if (selected) {
                         matrix      = weights.template resolve<H>(expert);
                         coefficient = coefficients[token * K + warp];
@@ -139,8 +141,8 @@ __global__ void token_down(const int* __restrict__ ids, const float* __restrict_
         } else {
             if (warp < K) {
                 const int expert = ids[token * K + warp];
-                bool selected    = true;
-                if constexpr (Masked) { selected = mask[expert] == member; }
+                bool selected    = expert >= 0;
+                if constexpr (Masked) { selected = selected && mask[expert] == member; }
                 if (selected) {
                     const auto matrix = weights.template resolve<H>(expert);
                     dot_fp32_rows<Codec, Rows, I>(matrix.codes, matrix.high, matrix.scales,
@@ -165,10 +167,11 @@ __global__ void token_down(const int* __restrict__ ids, const float* __restrict_
         __syncthreads();
         if (!warp && lane < Rows) {
             const auto index = std::int64_t(token) * H + row + lane;
-            float sum        = output.initial(index);
+            const bool live  = output.is_live(token);
+            float sum        = output.initial(index, live);
 #pragma unroll
             for (int p = 0; p < Contributions; ++p) { sum += values[p][lane]; }
-            output.store(index, sum);
+            output.store(index, sum, live);
         }
         if constexpr (Adaptive) {
             __syncthreads();
@@ -248,59 +251,62 @@ void token_launch(const Tensor& x, const RoutedSwiGLUProfile& profile, Access ga
         gate_codec.template operator()<Q8Codec>();
     }
 
-    with_output(destination, epilogue, [&](auto output) {
-        const auto finish = [&]<class Codec, int Rows>() {
-            const dim3 grid =
-                adaptive ? dim3(5 * (S::hidden / 4)) : dim3(S::hidden / Rows, x.ne[1]);
-            const auto kernel = token_down<S, Codec, Access, decltype(output), Routed, Shared,
-                                           Masked, Rows, Traversal>;
-            if constexpr (single) {
-                CUDA_CHECK(pdl::launch_dependent({grid, dim3(Contributions * 32), 0, stream},
-                                                 kernel, ids, alpha, down, shared_down, mask,
-                                                 member, beta, storage.token_activation, output,
-                                                 x.ne[1], info, hints));
-            } else {
-                kernel<<<grid, Contributions * 32, 0, stream>>>(
-                    ids, alpha, down, shared_down, mask, member, beta, storage.token_activation,
-                    output, x.ne[1], info, hints);
-                CUDA_CHECK(cudaGetLastError());
-            }
-        };
-        const auto codec = [&]<class Codec>() {
-            if constexpr (single) {
-                finish.template operator()<Codec, 1>();
-            } else if constexpr (adaptive) {
-                finish.template operator()<Codec, 4>();
-            } else if (plan.output_rows == 1) {
-                finish.template operator()<Codec, 1>();
-            } else if (plan.output_rows == 2) {
-                finish.template operator()<Codec, 2>();
-            } else {
-                finish.template operator()<Codec, 4>();
-            }
-        };
-        if constexpr (!Routed) {
-            codec.template operator()<Q8Codec>();
-        } else if constexpr (adaptive) {
-            if (profile.ffn.down_type == QType::Q5_G64_FP16) {
-                codec.template operator()<Q5Codec>();
-            } else {
-                codec.template operator()<Q6Codec>();
-            }
-        } else {
-            switch (profile.ffn.down_type) {
-            case QType::Q5_G64_FP16:
-                codec.template operator()<Q5Codec>();
-                break;
-            case QType::Q6_G64_FP16:
-                codec.template operator()<Q6Codec>();
-                break;
-            default:
+    with_output(
+        destination, epilogue,
+        [&](auto output) {
+            const auto finish = [&]<class Codec, int Rows>() {
+                const dim3 grid =
+                    adaptive ? dim3(5 * (S::hidden / 4)) : dim3(S::hidden / Rows, x.ne[1]);
+                const auto kernel = token_down<S, Codec, Access, decltype(output), Routed, Shared,
+                                               Masked, Rows, Traversal>;
+                if constexpr (single) {
+                    CUDA_CHECK(pdl::launch_dependent({grid, dim3(Contributions * 32), 0, stream},
+                                                     kernel, ids, alpha, down, shared_down, mask,
+                                                     member, beta, storage.token_activation, output,
+                                                     x.ne[1], info, hints));
+                } else {
+                    kernel<<<grid, Contributions * 32, 0, stream>>>(
+                        ids, alpha, down, shared_down, mask, member, beta, storage.token_activation,
+                        output, x.ne[1], info, hints);
+                    CUDA_CHECK(cudaGetLastError());
+                }
+            };
+            const auto codec = [&]<class Codec>() {
+                if constexpr (single) {
+                    finish.template operator()<Codec, 1>();
+                } else if constexpr (adaptive) {
+                    finish.template operator()<Codec, 4>();
+                } else if (plan.output_rows == 1) {
+                    finish.template operator()<Codec, 1>();
+                } else if (plan.output_rows == 2) {
+                    finish.template operator()<Codec, 2>();
+                } else {
+                    finish.template operator()<Codec, 4>();
+                }
+            };
+            if constexpr (!Routed) {
                 codec.template operator()<Q8Codec>();
-                break;
+            } else if constexpr (adaptive) {
+                if (profile.ffn.down_type == QType::Q5_G64_FP16) {
+                    codec.template operator()<Q5Codec>();
+                } else {
+                    codec.template operator()<Q6Codec>();
+                }
+            } else {
+                switch (profile.ffn.down_type) {
+                case QType::Q5_G64_FP16:
+                    codec.template operator()<Q5Codec>();
+                    break;
+                case QType::Q6_G64_FP16:
+                    codec.template operator()<Q6Codec>();
+                    break;
+                default:
+                    codec.template operator()<Q8Codec>();
+                    break;
+                }
             }
-        }
-    });
+        },
+        storage.token_validity);
 }
 
 } // namespace

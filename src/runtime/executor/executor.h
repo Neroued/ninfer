@@ -5,11 +5,19 @@
 #include "runtime/observability/execution.h"
 #include "ninfer/types.h"
 
+#include <stdexcept>
+
 namespace ninfer::runtime {
 
 template <class Types>
 class Executor {
 public:
+    explicit Executor(std::uint32_t max_decode_rows) : decode_statistics_(max_decode_rows) {
+        if (!max_decode_rows)
+            throw std::invalid_argument(
+                "executor decode statistics require a positive row capacity");
+    }
+
     virtual ~Executor()                                                              = default;
     virtual void bind_to_current_thread()                                            = 0;
     [[nodiscard]] virtual SessionEpoch epoch() const noexcept                        = 0;
@@ -77,7 +85,7 @@ protected:
     std::vector<RankSnapshot> observations_;
     std::vector<RankDescriptor> rank_descriptions_;
     ExecutionStatistics execution_statistics_{};
-    std::array<ExecutionCounters, kMaximumConcurrency> decode_statistics_{};
+    std::vector<ExecutionCounters> decode_statistics_;
 };
 
 } // namespace ninfer::runtime

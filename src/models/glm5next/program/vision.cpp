@@ -36,7 +36,7 @@ RankProgramImpl::prepare_vision(const std::optional<vision::Work>& work, std::ui
             }
         window.produced(bytes);
     }
-    const auto& region = *resources.plan.frame.visual_indices;
+    const auto& region = *frame.visual_indices;
     auto indices       = host(region);
     return models::vision::prepare_embedding_view(
         window, *work->window.plan, begin, tokens, resources.tensor(region),

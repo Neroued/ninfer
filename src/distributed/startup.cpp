@@ -77,7 +77,9 @@ std::vector<StartupEvent> decode_startup(std::span<const std::byte> bytes) {
 
 bool startup_reply(wire::Kind kind) noexcept {
     return kind == wire::Kind::Prepared || kind == wire::Kind::Connected ||
-           kind == wire::Kind::Allocated || kind == wire::Kind::Ready;
+           kind == wire::Kind::Allocated || kind == wire::Kind::Ready ||
+           kind == wire::Kind::CommunicationPrepared || kind == wire::Kind::CommunicationSelected ||
+           kind == wire::Kind::CommunicationConnected || kind == wire::Kind::CommunicationReady;
 }
 
 struct StartupReporter::State {

@@ -125,6 +125,7 @@ void SessionImpl::prepare_pause_resources(context::ContextReservation& targets) 
                                   ? context::ContextMemory::Host
                                   : context::ContextMemory::Device);
     }
+    resident_sequences.erase(sequence.id);
     pause.paused->sequence = std::move(sequences[pause.lane]);
     if (pause.paused->snapshot && pause.action.kind == runtime::PauseKind::HostSnapshot) {
         const auto plan = demotion({&*pause.paused->snapshot, 1});

@@ -71,10 +71,11 @@ bool SessionImpl::submit_score() {
         work.targets.assign(s.identity.tokens.begin() + first + 1,
                             s.identity.tokens.begin() + end + 1);
         tx.rows.push_back(work.row);
+        work.batch = plan_batch(tx.rows, *plan.batches, false);
         tx.context.prepare_actions();
         tx.ticket =
-            executor->submit(std::move(*reservation), {actions(tx.context), std::move(work),
-                                                       plan_batch(tx.rows, plan.states.size())});
+            executor->submit(std::move(*reservation), {actions(tx.context), std::move(work)});
+        for (auto h : tx.members) sequence(h).computing = true;
         tx.context.mark_submitted();
         return true;
     } catch (const std::exception& error) {

@@ -214,7 +214,7 @@ Select a backend at startup; its weights must be present in the artifact:
 |---|---|---|
 | `mtp` | All supported models with MTP weights | 1..5 |
 | `dflash` | Qwen3.6-35B-A3B with DFlash companion weights | 1..15 |
-| `dflash2` | Qwen3.8-27B with DFlash2 companion weights | 1..15 |
+| `dflash2` | Qwen3.8-27B or GLM-5.3-Flash with DFlash2 companion weights | 1..15 |
 
 ```bash
 ./build/rtx5090-release/apps/ninfer models/qwen3_6_35b_a3b.ninfer \
@@ -222,7 +222,8 @@ Select a backend at startup; its weights must be present in the artifact:
   --kv-dtype fp8 --spec dflash --draft-tokens 7 --proposal-head optimized
 ```
 
-`--proposal-head full` uses the full head; `optimized` selects additional conversion-time weights.
+`--proposal-head full` uses the artifact's full head in its stored representation;
+`optimized` selects additional conversion-time weights.
 Qwen3.5-family optimized heads use a selected vocabulary. Flash Next and GLM use an additional
 full-vocabulary Q4 A16 head, keeping the main head unchanged. The artifact must contain the selected
 head. Only one backend is active per Engine; `--spec none` disables speculation.

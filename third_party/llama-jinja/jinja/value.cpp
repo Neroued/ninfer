@@ -105,26 +105,10 @@ static value empty_value_fn(const func_args&) {
     }
 }
 
-template <typename T>
+template <typename... Types>
 static value test_type_fn(const func_args& args) {
     args.ensure_count(1);
-    bool is_type = is_val<T>(args.get_pos(0));
-    return mk_val<value_bool>(is_type);
-}
-
-template <typename T, typename U>
-static value test_type_fn(const func_args& args) {
-    args.ensure_count(1);
-    bool is_type = is_val<T>(args.get_pos(0)) || is_val<U>(args.get_pos(0));
-    return mk_val<value_bool>(is_type);
-}
-
-template <typename T, typename U, typename V>
-static value test_type_fn(const func_args& args) {
-    args.ensure_count(1);
-    bool is_type =
-        is_val<T>(args.get_pos(0)) || is_val<U>(args.get_pos(0)) || is_val<V>(args.get_pos(0));
-    return mk_val<value_bool>(is_type);
+    return mk_val<value_bool>((is_val<Types>(args.get_pos(0)) || ...));
 }
 
 template <value_compare_op op>
@@ -155,7 +139,7 @@ static value tojson(const func_args& args) {
     if (args.get_pos(0)->origin)
         result->val_str.tag(args.get_pos(0)->origin, false);
     else if (is_val<value_string>(args.get_pos(0))) {
-        const auto& parts = args.get_pos(0)->val_str.parts;
+        const auto& parts         = cast_val<value_string>(args.get_pos(0))->val_str.parts;
         const string_part* source = nullptr;
         for (const auto& part : parts) {
             if (part.collapsed_source_end) continue;
@@ -320,16 +304,7 @@ const func_builtins& global_builtins() {
                  step  = arg2->as_int();
              }
 
-             auto out = mk_val<value_array>();
-             if (step == 0) { throw raised_exception("range() step argument must not be zero"); }
-             for (int64_t i = start; step > 0 ? i < stop : i > stop;) {
-                 if (args.ctx.checkpoint) args.ctx.checkpoint();
-                 out->push_back(mk_val<value_int>(i));
-                 if ((step > 0 && i > INT64_MAX - step) || (step < 0 && i < INT64_MIN - step))
-                     break;
-                 i += step;
-             }
-             return out;
+             return mk_val<value_range>(start, stop, step);
          }},
         {"tojson", tojson},
 
@@ -363,25 +338,28 @@ const func_builtins& global_builtins() {
         {"test_is_divisibleby",
          [](const func_args& args) -> value {
              args.ensure_vals<value_int, value_int>();
-             bool res = args.get_pos(0)->val_int % args.get_pos(1)->val_int == 0;
-             return mk_val<value_bool>(res);
+             const auto divisor = args.get_pos(1)->as_int();
+             if (divisor == 0) throw std::runtime_error("integer modulo by zero");
+             return mk_val<value_bool>(divisor == -1 || args.get_pos(0)->as_int() % divisor == 0);
          }},
         {"test_is_string", test_type_fn<value_string>},
         {"test_is_integer", test_type_fn<value_int>},
         {"test_is_float", test_type_fn<value_float>},
         {"test_is_number", test_type_fn<value_int, value_float>},
-        {"test_is_iterable", test_type_fn<value_array, value_string, value_undefined>},
-        {"test_is_sequence", test_type_fn<value_array, value_string, value_undefined>},
+        {"test_is_iterable", test_type_fn<value_array, value_string, value_range, value_undefined>},
+        {"test_is_sequence", test_type_fn<value_array, value_string, value_range, value_undefined>},
         {"test_is_mapping", test_type_fn<value_object>},
         {"test_is_lower",
          [](const func_args& args) -> value {
              args.ensure_vals<value_string>();
-             return mk_val<value_bool>(args.get_pos(0)->val_str.is_lowercase());
+             return mk_val<value_bool>(
+                 cast_val<value_string>(args.get_pos(0))->val_str.is_lowercase());
          }},
         {"test_is_upper",
          [](const func_args& args) -> value {
              args.ensure_vals<value_string>();
-             return mk_val<value_bool>(args.get_pos(0)->val_str.is_uppercase());
+             return mk_val<value_bool>(
+                 cast_val<value_string>(args.get_pos(0))->val_str.is_uppercase());
          }},
         {"test_is_none", test_type_fn<value_none>},
         {"test_is_defined",
@@ -405,6 +383,8 @@ const func_builtins& global_builtins() {
              auto needle   = args.get_pos(0);
              auto haystack = args.get_pos(1);
              if (is_val<value_undefined>(haystack)) { return mk_val<value_bool>(false); }
+             if (is_val<value_range>(haystack))
+                 return mk_val<value_bool>(cast_val<value_range>(haystack)->contains(needle));
              if (is_val<value_array>(haystack)) {
                  for (const auto& item : haystack->as_array()) {
                      if (*needle == *item) { return mk_val<value_bool>(true); }
@@ -430,7 +410,7 @@ const func_builtins& global_builtins() {
          [](const func_args& args) -> value {
              args.ensure_vals<value_string>();
              auto& builtins        = global_builtins();
-             std::string test_name = args.get_pos(0)->val_str.str();
+             std::string test_name = args.get_pos(0)->as_string().str();
              auto it               = builtins.find("test_is_" + test_name);
              bool res              = it != builtins.end();
              return mk_val<value_bool>(res);
@@ -782,6 +762,109 @@ const func_builtins& value_bool_t::get_builtins() const {
 
 [[noreturn]] static value array_unique_not_implemented(const func_args&) {
     throw not_implemented_exception("Array unique builtin not implemented");
+}
+
+value_range_t::value_range_t(int64_t start_, int64_t stop_, int64_t step_)
+    : value_t(kind_id), start(start_), stop(stop_), step(step_), count(0) {
+    if (!step) throw raised_exception("range() step argument must not be zero");
+    const __int128 distance = step > 0 ? __int128(stop) - start : __int128(start) - stop;
+    const __int128 stride   = step > 0 ? __int128(step) : -__int128(step);
+    if (distance > 0) count = static_cast<uint64_t>((distance - 1) / stride + 1);
+}
+
+value value_range_t::item(uint64_t index) const {
+    if (index >= count) return mk_val<value_undefined>("range index");
+    return mk_val<value_int>(static_cast<int64_t>(__int128(start) + __int128(step) * index));
+}
+
+bool value_range_t::contains(const value& item) const {
+    if (!item->is_numeric() || !count) return false;
+    const auto number = item->as_float();
+    if (is_val<value_float>(item) && (!std::isfinite(number) || std::trunc(number) != number ||
+                                      number < double(INT64_MIN) || number >= -double(INT64_MIN)))
+        return false;
+    const __int128 difference = __int128(item->as_int()) - start;
+    return difference % step == 0 && difference / step >= 0 &&
+           static_cast<unsigned __int128>(difference / step) < count;
+}
+
+string value_range_t::as_string() const {
+    return string("range(" + std::to_string(start) + ", " + std::to_string(stop) +
+                      (step == 1 ? "" : ", " + std::to_string(step)) + ")",
+                  0, true);
+}
+
+hasher value_range_t::unique_hash() const noexcept {
+    auto hash = hasher(typeid(*this)).update(&count, sizeof(count));
+    if (count) hash.update(&start, sizeof(start));
+    if (count > 1) hash.update(&step, sizeof(step));
+    return hash;
+}
+
+bool value_range_t::equivalent(const value_t& other) const {
+    const auto* range = dynamic_cast<const value_range_t*>(&other);
+    return range && count == range->count && (!count || start == range->start) &&
+           (count <= 1 || step == range->step);
+}
+
+const func_builtins& value_range_t::get_builtins() const {
+    static const func_builtins builtins = [] {
+        func_builtins result;
+        // These filters consume a complete sequence. Materialization belongs here, not
+        // to range construction, ordinary iteration, indexing or length queries.
+        for (const auto& [name, fn] : value_array_t().get_builtins()) {
+            if (name == "append" || name == "pop") continue;
+            result.emplace(name, [fn](const func_args& args) -> value {
+                auto array        = mk_val<value_array>();
+                const auto* range = cast_val<value_range>(args.get_pos(0));
+                for (uint64_t i = 0; i < range->count; ++i) {
+                    if (args.ctx.checkpoint) args.ctx.checkpoint();
+                    array->push_back(range->item(i));
+                }
+                func_args converted(args.ctx);
+                converted.func_name = args.func_name;
+                converted.push_back(array);
+                for (size_t i = 1; i < args.count(); ++i) converted.push_back(args.get_pos(i));
+                return fn(converted);
+            });
+        }
+        result["default"] = default_value;
+        result["tojson"]  = tojson;
+        result["string"]  = [](const func_args& args) -> value {
+            return mk_val<value_string>(args.get_pos(0)->as_string());
+        };
+        result["length"] = [](const func_args& args) -> value {
+            const auto count = cast_val<value_range>(args.get_pos(0))->count;
+            if (count > INT64_MAX) throw raised_exception("range length exceeds int64");
+            return mk_val<value_int>(static_cast<int64_t>(count));
+        };
+        result["first"] = [](const func_args& args) -> value {
+            return cast_val<value_range>(args.get_pos(0))->item(0);
+        };
+        result["last"] = [](const func_args& args) -> value {
+            const auto* range = cast_val<value_range>(args.get_pos(0));
+            return range->item(range->count ? range->count - 1 : 0);
+        };
+        result["slice"] = [](const func_args& args) -> value {
+            args.ensure_count(4, 4);
+            const auto* range = cast_val<value_range>(args.get_pos(0));
+            if (range->count > INT64_MAX) throw raised_exception("range slice exceeds int64");
+            const auto bounds =
+                unicode::slice_indices(range->count, slice_bound(args.get_pos(1)),
+                                       slice_bound(args.get_pos(2)), args.get_pos(3)->as_int());
+            const auto checked = [](__int128 n) {
+                if (n < INT64_MIN || n > INT64_MAX)
+                    throw raised_exception("range slice exceeds int64");
+                return static_cast<int64_t>(n);
+            };
+            return mk_val<value_range>(
+                checked(__int128(range->start) + __int128(range->step) * bounds.start),
+                checked(__int128(range->start) + __int128(range->step) * bounds.stop),
+                checked(__int128(range->step) * bounds.step));
+        };
+        return result;
+    }();
+    return builtins;
 }
 
 const func_builtins& value_array_t::get_builtins() const {
@@ -1177,7 +1260,7 @@ bool value_compare(const value& a, const value& b, value_compare_op op) {
         if (op == gt) return lhs > rhs;
         return lhs < rhs;
     };
-    if (a->is_numeric() && b->is_numeric()) return compare(a->val_flt, b->val_flt);
+    if (a->is_numeric() && b->is_numeric()) return compare(a->as_float(), b->as_float());
     if (is_val<value_string>(a) && is_val<value_string>(b))
         return compare(a->as_string().str(), b->as_string().str());
     throw raised_exception("Cannot order " + a->type() + " and " + b->type());

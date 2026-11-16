@@ -94,7 +94,8 @@ void launch_nvfp4_a16_sliced_k_mma(const Nvfp4A16Operands& p, Output output, Epi
     });
 }
 
-template <class Schedule, class Output, class Epilogue, class Rows = Nvfp4IdentityRows>
+template <class Schedule, bool Programmatic = false, class Output, class Epilogue,
+          class Rows = Nvfp4IdentityRows>
 void launch_nvfp4_a4_mma(const Nvfp4A4Operands& p, Output output, Epilogue epilogue,
                          cudaStream_t stream, Rows rows = {}) {
     validate_nvfp4_operands<Schedule>(p);
@@ -108,12 +109,20 @@ void launch_nvfp4_a4_mma(const Nvfp4A4Operands& p, Output output, Epilogue epilo
         const dim3 grid(p.rows / Schedule::kBlockRows,
                         common::div_up(count, Schedule::kBlockTokens));
         const auto launch = [&]<bool Full>() {
-            constexpr auto kernel = nvfp4_a4_mma_kernel<Schedule, Full, Epilogue, Output, Rows>;
+            constexpr auto kernel =
+                nvfp4_a4_mma_kernel<Schedule, Full, Epilogue, Output, Rows, Programmatic>;
             const int bytes =
                 common::prepare_shared<linear_mma_shared_bytes<Schedule, Epilogue>, kernel>();
-            kernel<<<grid, Schedule::kThreads, bytes, stream>>>(p.x, p.x_scales, p.codes, p.scales,
-                                                                p.rows, p.k, p.alpha, output,
-                                                                epilogue, rows, offset, count);
+            if constexpr (Programmatic) {
+                CUDA_CHECK(pdl::launch_dependent(
+                    {grid, dim3(Schedule::kThreads), std::size_t(bytes), stream}, kernel, p.x,
+                    p.x_scales, p.codes, p.scales, p.rows, p.k, p.alpha, output, epilogue, rows,
+                    offset, count));
+            } else {
+                kernel<<<grid, Schedule::kThreads, bytes, stream>>>(
+                    p.x, p.x_scales, p.codes, p.scales, p.rows, p.k, p.alpha, output, epilogue,
+                    rows, offset, count);
+            }
             CUDA_CHECK(cudaGetLastError());
         };
         if (count % Schedule::kBlockTokens == 0)

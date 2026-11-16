@@ -16,6 +16,8 @@ struct BatchView {
     Tensor source_offsets, destination_offsets, table_rows;
     Tensor base_positions, record_offsets;
     std::uint32_t max_visible_tokens;
+    Tensor live_rows;
+    std::uint32_t active_tokens = 0;
 };
 
 struct SequenceState {

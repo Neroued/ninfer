@@ -67,7 +67,7 @@ __launch_bounds__(256) __global__
         const auto offset = static_cast<std::int64_t>(batch) * width * 256 * Geometry::KVHeads;
         k += offset;
         v += offset;
-        positions += batch * width;
+        positions += static_cast<std::int64_t>(batch) * width;
     }
     constexpr int Warps         = 8;
     constexpr unsigned FullMask = 0xffffffffU;

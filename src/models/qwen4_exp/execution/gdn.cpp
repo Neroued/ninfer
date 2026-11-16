@@ -84,9 +84,9 @@ void gdn(const Tensor& input, const GdnConfig& c, const GdnParameters& p, const 
                 arena, cuda);
         }
         auto recurrent = b.recurrent.view({vd, vh, 1, batch.batch});
-        ops::gated_delta_net_batch_update(q, k, v, b.g.view({vh, 1, batch.batch}),
-                                          b.beta.view({vh, 1, batch.batch}), scale, true,
-                                          before.recurrent, after.recurrent, recurrent, cuda);
+        ops::gated_delta_net_batch_update(
+            q, k, v, b.g.view({vh, 1, batch.batch}), b.beta.view({vh, 1, batch.batch}), scale, true,
+            before.recurrent, after.recurrent, batch.valid_columns, recurrent, cuda);
     }
     auto normalized = b.normalized.view({vd, vh, m});
     ops::sigmoid_gated_rmsnorm(b.recurrent.view({vd, vh, m}), p.norm, b.z.view({vd, vh, m}),

@@ -17,6 +17,49 @@ struct ScaledF16Output {
 };
 
 template <int Group>
+__device__ __forceinline__ void store_scaled_f16_product(ScaledF16Output output, float4 v, int row,
+                                                         int token, bool valid) {
+    float m = fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w)));
+    for (int d = Group / 8; d; d >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, d, Group / 4));
+    if (m == 0) m = 1;
+    const bool normal = m >= 1e-30F && m <= 1e30F;
+    const auto divide = [&](float value) {
+        return normal ? __fdividef(value, m) : __fdiv_rn(value, m);
+    };
+    const auto h0 = __floats2half2_rn(divide(v.x), divide(v.y)),
+               h1 = __floats2half2_rn(divide(v.z), divide(v.w));
+    if (valid) {
+        common::store_vec(output.values + std::int64_t(token) * 1024 + row,
+                          make_uint2(scaled_product_half2_bits(h0), scaled_product_half2_bits(h1)));
+        if (row % Group == 0) output.scales[std::int64_t(token) * (1024 / Group) + row / Group] = m;
+    }
+}
+
+// The sliced-K contraction has already reduced both branches into its FP32 tile.
+// One four-lane group normalizes sixteen products before any observable rounding.
+struct ScaledF16SlicedProductEpilogue {
+    static constexpr bool kSwizzleRowStorage = true;
+    ClampedSwiGluProduct product;
+    int physical_tokens;
+
+    template <class C, class Tile>
+    __device__ void finish_rows(ScaledF16Output output, Tile tile, int rb, int tb, int rows,
+                                int) const {
+        constexpr int Group = C::kBlockRows / 2;
+        static_assert(Group == 16);
+        for (int i = threadIdx.x; i < C::kBlockTokens * (Group / 4); i += C::kThreads) {
+            const int t = i / (Group / 4), r = i % (Group / 4) * 4;
+            const float4 value{product(tile.at(r, t), tile.at(r + Group, t)),
+                               product(tile.at(r + 1, t), tile.at(r + 1 + Group, t)),
+                               product(tile.at(r + 2, t), tile.at(r + 2 + Group, t)),
+                               product(tile.at(r + 3, t), tile.at(r + 3 + Group, t))};
+            store_scaled_f16_product<Group>(output, value, rb + r, tb + t,
+                                            rb + r + 3 < rows / 2 && tb + t < physical_tokens);
+        }
+    }
+};
+
+template <int Group>
 struct ScaledF16ProductEpilogue {
     ClampedSwiGluProduct product;
     template <class C>
@@ -58,22 +101,9 @@ struct ScaledF16ProductEpilogue {
         __syncthreads();
         for (int i = tid; i < C::kBlockTokens * (P / 4); i += C::kThreads) {
             int t = i / (P / 4), r = i % (P / 4) * 4;
-            auto v  = common::load_vec<float4>(&at(r, t));
-            float m = fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w)));
-            for (int d = Group / 8; d; d >>= 1)
-                m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, d, Group / 4));
-            if (m == 0) m = 1;
-            const bool normal = m >= 1e-30F && m <= 1e30F;
-            auto divide   = [&](float v) { return normal ? __fdividef(v, m) : __fdiv_rn(v, m); };
-            const auto h0 = __floats2half2_rn(divide(v.x), divide(v.y)),
-                       h1 = __floats2half2_rn(divide(v.z), divide(v.w));
-            if (rb + r + 3 < rows / 2 && (Full || tb + t < tokens)) {
-                common::store_vec(
-                    output.values + std::int64_t(tb + t) * 1024 + rb + r,
-                    make_uint2(scaled_product_half2_bits(h0), scaled_product_half2_bits(h1)));
-                if (!(lane & (Group / 4 - 1)))
-                    output.scales[std::int64_t(tb + t) * (1024 / Group) + (rb + r) / Group] = m;
-            }
+            auto v = common::load_vec<float4>(&at(r, t));
+            store_scaled_f16_product<Group>(output, v, rb + r, tb + t,
+                                            rb + r + 3 < rows / 2 && (Full || tb + t < tokens));
         }
     }
 };
@@ -115,7 +145,7 @@ __device__ __forceinline__ void scaled_f16_block_tma_body(const Fp8TmaDescriptor
     constexpr int BR = S::kBlockRows, BT = S::kBlockTokens, BK = S::kBlockK, ST = S::kStages;
     constexpr int Group = S::kInputGroup;
     static_assert(S::kBlockRows <= 128 && 128 % S::kBlockRows == 0);
-    static_assert(Group == 32 || Group == 64 || Group == 128);
+    static_assert(Group == 16 || Group == 32 || Group == 64 || Group == 128);
     extern __shared__ __align__(128) unsigned char raw[];
     auto* weights = raw;
     auto* inputs  = reinterpret_cast<__half*>(raw + ST * BR * BK);

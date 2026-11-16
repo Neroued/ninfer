@@ -1,6 +1,7 @@
 #pragma once
 
 #include "artifact/reader.h"
+#include "distributed/communication/preparation.h"
 #include "runtime/executor/preparation.h"
 #include "runtime/engine/startup_memory.h"
 #include "runtime/engine/context_cache/context_cost.h"
@@ -150,11 +151,9 @@ prepare_rank(distributed::WorkerConnection& connection, std::unique_ptr<artifact
         const auto planning_slack        = command.u64();
         command.finish();
         if (action == PreparationAction::PrepareCommunication) {
-            StartupPhaseScope phase(observer, StartupPhase::CommunicationWarmup);
-            preparing->prepare_communication();
-            device.synchronize();
-            connection.communication().sample_startup_memory();
-            phase.complete();
+            if (!distributed::prepare_communication(connection,
+                                                    preparing->communication_requirements()))
+                return std::nullopt;
             report();
             continue;
         }

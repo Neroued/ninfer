@@ -1,7 +1,5 @@
 #include "models/glm5next/load/bindings.h"
 
-#include <algorithm>
-
 namespace ninfer::models::glm5next::loading {
 namespace {
 
@@ -79,17 +77,6 @@ MoeWeights moe(Bindings& b, const TextConfig& c, const std::string& layer) {
             {}};
 }
 
-void require_shared(const artifact::ParameterReference& parameter,
-                    const artifact::ParameterReference& main) {
-    const auto& parts  = parameter.binding.parts;
-    const auto& target = main.binding.parts;
-    if (!std::equal(parts.begin(), parts.end(), target.begin(), target.end(),
-                    [](const auto& a, const auto& b) {
-                        return a.object == b.object && a.begin == b.begin && a.end == b.end;
-                    }))
-        throw artifact::ArtifactError(parameter.name + ": must share Main weight storage");
-}
-
 } // namespace
 
 TextWeights bind_text(Bindings& b, const TextConfig& c) {
@@ -118,24 +105,30 @@ TextWeights bind_text(Bindings& b, const TextConfig& c) {
     return out;
 }
 
-MtpWeights bind_mtp(Bindings& b, const TextConfig& c, const TextWeights& main,
-                    ProposalHead proposal_head) {
-    MtpWeights out;
-    out.embedding = b.direct("mtp/token_embedding", {c.vocabulary, c.hidden});
-    require_shared(b.at(out.embedding).reference, b.at(main.embedding).reference);
-    require_shared(b.binder.parameter("mtp/output_head", {c.vocabulary, c.hidden}),
-                   b.at(main.head).reference);
+WeightId bind_speculative_head(Bindings& b, const TextConfig& c, WeightId main_head,
+                               std::string_view component, ProposalHead proposal_head) {
+    const auto full  = std::string(component) + "/output_head";
+    const auto input = std::string(component) + "/final_hidden";
+    require_shared_binding(b.binder.parameter(full, {c.vocabulary, c.hidden}),
+                           b.at(main_head).reference);
     if (proposal_head == ProposalHead::Optimized) {
         const auto& proposal = b.binder.reader().directory().component("text").proposal;
         if (!proposal || proposal->indexed)
             throw artifact::ArtifactError("GLM5Next requires a full-vocabulary proposal head");
-        out.head = b.parameter("proposal/head", {c.vocabulary, c.hidden}, {"mtp/final_hidden"},
-                               QType::Q4_G64_FP16);
+        return b.parameter("proposal/head", {c.vocabulary, c.hidden}, {input}, QType::Q4_G64_FP16);
     } else if (proposal_head == ProposalHead::Full) {
-        out.head = b.parameter("mtp/output_head", {c.vocabulary, c.hidden}, {"mtp/final_hidden"});
+        return b.parameter(full, {c.vocabulary, c.hidden}, {input});
     } else {
         throw artifact::ArtifactError("invalid GLM5Next proposal head selection");
     }
+}
+
+MtpWeights bind_mtp(Bindings& b, const TextConfig& c, const TextWeights& main,
+                    ProposalHead proposal_head) {
+    MtpWeights out;
+    out.embedding = b.direct("mtp/token_embedding", {c.vocabulary, c.hidden});
+    require_shared_binding(b.at(out.embedding).reference, b.at(main.embedding).reference);
+    out.head           = bind_speculative_head(b, c, main.head, "mtp", proposal_head);
     out.embedding_norm = b.direct("mtp/pre_fc_embedding_norm", {c.hidden});
     out.hidden_norm    = b.direct("mtp/pre_fc_hidden_norm", {c.hidden});
     out.fc =

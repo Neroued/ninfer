@@ -37,6 +37,10 @@ struct string {
 
     void tag(std::uint32_t origin, bool exact = true);
     std::string str() const;
+    bool empty() const noexcept;
+    bool equals(const string&) const noexcept;
+    bool equals(std::string_view) const noexcept;
+    std::optional<string> at(std::int64_t index) const;
     std::size_t length() const;
     std::size_t byte_size() const;
     void hash_update(hasher& hash) const noexcept;

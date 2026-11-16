@@ -3,6 +3,11 @@
 #include "ops/linear/kernels/bf16/bf16_launch.h"
 
 namespace ninfer::ops::detail {
+[[nodiscard]] Bf16Launch select_bf16_n2048_k20480(std::int32_t tokens);
+[[nodiscard]] Bf16Launch select_bf16_n3072_k4096(std::int32_t tokens);
+[[nodiscard]] Bf16Launch select_bf16_n12288_k4096(std::int32_t tokens);
+[[nodiscard]] Bf16Launch select_bf16_n4096_k2048(std::int32_t tokens);
+[[nodiscard]] Bf16Launch select_bf16_n4096_k6144(std::int32_t tokens);
 [[nodiscard]] Bf16Launch select_bf16_n8192_k1024(std::int32_t tokens);
 [[nodiscard]] Bf16Launch select_bf16_n1024_k4096(std::int32_t tokens);
 [[nodiscard]] Bf16Launch select_bf16_n4096_k4096(std::int32_t tokens);

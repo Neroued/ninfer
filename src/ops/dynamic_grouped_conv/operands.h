@@ -8,12 +8,22 @@ inline constexpr int kTaps = 2, kSides = 2, kCoefficientRows = kGroups * kTaps *
 inline constexpr const char* kPrepareOp = "dynamic grouped conv prepare";
 inline constexpr const char* kAddOp     = "linear dynamic grouped conv add";
 
+struct PrepareGeometry {
+    int hidden;
+
+    constexpr int groups() const { return hidden / kGroupWidth; }
+
+    constexpr int coefficient_rows() const { return groups() * kTaps * kSides; }
+};
+
+PrepareGeometry prepare_geometry(int hidden);
+
 void validate_interval(int min_width, int max_width, int min_batch, int max_batch, const char* op);
 void validate_input_rows(int input_rows);
-void validate_prepare(const Tensor& residual, const Tensor& norm_weight, float epsilon,
-                      const Tensor& base_kernel, const Weight& projection, const Tensor& prepared,
-                      const Tensor& finish_delta, const MemoryArena& workspace,
-                      CudaExecutionView execution);
+PrepareGeometry validate_prepare(const Tensor& residual, const Tensor& norm_weight, float epsilon,
+                                 const Tensor& base_kernel, const Weight& projection,
+                                 const Tensor& prepared, const Tensor& finish_delta,
+                                 const MemoryArena& workspace, CudaExecutionView execution);
 void validate_add(const Tensor& x, const Weight& projection, const Tensor& base_kernel,
                   const Tensor& finish_delta, const Tensor& residual, const MemoryArena& workspace,
                   CudaExecutionView execution);

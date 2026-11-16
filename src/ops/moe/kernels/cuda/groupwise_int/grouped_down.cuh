@@ -39,19 +39,25 @@ struct Q6DownMma {
     }
 };
 
-template <class Shape, class Codec, class Access, int ExpertWarps, int ExpertBN>
+template <class Shape, class Codec, class Access, int ExpertWarps, int ExpertBN, int Stages = 2,
+          int BlockK = 64, GroupDensity Density = GroupDensity::Any>
 __global__ __launch_bounds__(ExpertWarps * 32, 3) void grouped_integer_down(
     const __nv_bfloat16* __restrict__ activation, const int* __restrict__ expert_offsets,
     const int* __restrict__ route_job_experts, const int* __restrict__ route_job_columns,
     const GroupedInfo* __restrict__ info, Access weights, __nv_bfloat16* __restrict__ output) {
-    constexpr int BM = 64, BK = 64, Stages = 2;
+    constexpr int BM = 64, BK = BlockK, GroupsPerTile = BK / 64;
+    static_assert(BK == 64 || BK == 128);
+    static_assert(ExpertBN == ExpertWarps * 8);
     if (info->direct) { return; }
+    if constexpr (Density != GroupDensity::Any) {
+        if (bool(info->spread) != (Density == GroupDensity::Spread)) { return; }
+    }
     constexpr int ExpertThreads = ExpertWarps * 32;
     constexpr int GroupsPerRow  = Shape::intermediate / 64;
     __shared__ __align__(16) __nv_bfloat16 As[BM * BK];
     __shared__ __align__(16) __nv_bfloat16 Bs[Stages][ExpertBN * BK];
-    __shared__ __align__(16) std::uint8_t Cr[Stages][BM * 32];
-    __shared__ __align__(16) std::uint8_t Hr[Stages][BM * Codec::kHighBytes];
+    __shared__ __align__(16) std::uint8_t Cr[Stages][BM * (BK / 2)];
+    __shared__ __align__(16) std::uint8_t Hr[Stages][BM * GroupsPerTile * Codec::kHighBytes];
     __shared__ __align__(16) std::uint8_t Sr[BM * GroupsPerRow * 2];
 
     const int tid  = static_cast<int>(threadIdx.x);
@@ -106,40 +112,48 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void grouped_integer_down(
                 cp_async_zfill<16, Cache::cg>(dst, src, col < cols ? 16 : 0);
             }
 
-            for (int item = tid; item < BM * 2; item += ExpertThreads) {
-                const int row         = item >> 1;
-                const int half        = item & 1;
-                const int global_row  = matrix.row + row0 + row;
-                const std::int64_t gi = static_cast<std::int64_t>(global_row) * GroupsPerRow + kt;
-                cp_async<16, Cache::cg>(&Cr[stage][row * 32 + half * 16],
-                                        &codes[gi * 32 + half * 16]);
+            constexpr int ChunksPerRow = (BK / 2) / 16;
+            for (int item = tid; item < BM * ChunksPerRow; item += ExpertThreads) {
+                const int row        = item / ChunksPerRow;
+                const int chunk      = item % ChunksPerRow;
+                const int global_row = matrix.row + row0 + row;
+                const std::int64_t gi =
+                    static_cast<std::int64_t>(global_row) * GroupsPerRow + kt * GroupsPerTile;
+                cp_async<16, Cache::cg>(&Cr[stage][row * (BK / 2) + chunk * 16],
+                                        &codes[gi * 32 + chunk * 16]);
             }
-            for (int row = tid; row < BM; row += ExpertThreads) {
+            for (int item = tid; item < BM * GroupsPerTile; item += ExpertThreads) {
+                const int row         = item / GroupsPerTile;
+                const int group       = item % GroupsPerTile;
                 const int global_row  = matrix.row + row0 + row;
-                const std::int64_t gi = static_cast<std::int64_t>(global_row) * GroupsPerRow + kt;
+                const std::int64_t gi = static_cast<std::int64_t>(global_row) * GroupsPerRow +
+                                        kt * GroupsPerTile + group;
                 if constexpr (Codec::kHighBytes == 8) {
-                    cp_async<8>(&Hr[stage][row * Codec::kHighBytes], &high[gi * Codec::kHighBytes]);
+                    cp_async<8>(&Hr[stage][item * Codec::kHighBytes],
+                                &high[gi * Codec::kHighBytes]);
                 } else {
-                    cp_async<16, Cache::cg>(&Hr[stage][row * Codec::kHighBytes],
+                    cp_async<16, Cache::cg>(&Hr[stage][item * Codec::kHighBytes],
                                             &high[gi * Codec::kHighBytes]);
                 }
             }
         };
 
         auto decode_weight = [&](int stage, int kt) {
-            constexpr int CodeChunksPerRow = Codec::kCodeBytes / 4;
+            constexpr int CodeChunksPerRow = GroupsPerTile * Codec::kCodeBytes / 4;
             constexpr int HighPerChunk     = Codec::kHighPerChunk;
             static_assert(CodeChunksPerRow * 8 == BK,
                           "a row of codes must decode to exactly the tile's k width");
             for (int item = tid; item < BM * CodeChunksPerRow; item += ExpertThreads) {
-                const int row     = item / CodeChunksPerRow;
-                const int chunk   = item - row * CodeChunksPerRow;
-                const float scale = __half2float(__ushort_as_half(
-                    *reinterpret_cast<const std::uint16_t*>(&Sr[(row * GroupsPerRow + kt) * 2])));
+                const int row   = item / CodeChunksPerRow;
+                const int chunk = item - row * CodeChunksPerRow;
+                const float scale =
+                    __half2float(__ushort_as_half(*reinterpret_cast<const std::uint16_t*>(
+                        &Sr[(row * GroupsPerRow + kt * GroupsPerTile + chunk / 8) * 2])));
                 unsigned decoded[4];
                 Codec::decode_eight(
-                    *reinterpret_cast<const unsigned*>(&Cr[stage][row * 32 + chunk * 4]),
-                    &Hr[stage][row * Codec::kHighBytes + chunk * HighPerChunk], scale, decoded);
+                    *reinterpret_cast<const unsigned*>(&Cr[stage][row * (BK / 2) + chunk * 4]),
+                    &Hr[stage][row * GroupsPerTile * Codec::kHighBytes + chunk * HighPerChunk],
+                    scale, decoded);
                 store_vec(&As[row * BK + common::swizzle_xor_64(row, chunk * 8)],
                           make_int4(static_cast<int>(decoded[0]), static_cast<int>(decoded[1]),
                                     static_cast<int>(decoded[2]), static_cast<int>(decoded[3])));
@@ -156,7 +170,7 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void grouped_integer_down(
 
 #pragma unroll
         for (int kt = 0; kt < Shape::intermediate / BK; ++kt) {
-            const int stage = kt & 1;
+            const int stage = kt % Stages;
             cp_wait<Stages - 1>();
             __syncthreads();
             decode_weight(stage, kt);
@@ -413,9 +427,10 @@ __global__ __launch_bounds__(Columns * 4, 1) void grouped_q8_down(
                             __float2bfloat16_rn(value);
                     } else {
                         const auto index = static_cast<std::int64_t>(col) * Shape::hidden + row;
-                        float value_sum  = destination.initial(index);
+                        const bool live  = destination.is_live(col);
+                        float value_sum  = destination.initial(index, live);
                         if (routed_sum) { value_sum += routed_sum[index]; }
-                        destination.store(index, value_sum + shared_scale[col] * value);
+                        destination.store(index, value_sum + shared_scale[col] * value, live);
                     }
                 };
                 if (local_col0 < cols) {

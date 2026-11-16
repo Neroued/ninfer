@@ -15,8 +15,9 @@ bool same(const runtime::ExecutionMember& a, const runtime::ExecutionMember& b) 
 RankProgramImpl::RankProgramImpl(const execution::Parameters& p, std::unique_ptr<Resources> r,
                                  DeviceContext& d, ParallelBinding binding)
     : parameters(p), device(d), cuda(d.execution_view()), owner(std::move(r)), resources(*owner),
-      shape(resources.plan.shape), timer(d, shape.gpu_timing), compute_done(d), context_done(d),
-      drafts_done(d) {
+      shape(resources.plan.shape), frame(resources.plan.frame), timer(d, shape.gpu_timing),
+      compute_done(d), context_done(d), drafts_done(d) {
+    bindings.resize(shape.max_concurrency);
     if (p.profile != resources.plan.profile)
         throw std::invalid_argument("GLM5Next resources have another profile");
     if (binding.group) parallel.emplace(binding);
@@ -36,6 +37,7 @@ RankProgramImpl::~RankProgramImpl() {
 
 WorkContract RankProgramImpl::contract() const {
     return {shape,
+            resources.plan.batches,
             parameters.profile->config.text.vocabulary,
             parameters.profile->public_tokens,
             parameters.profile->local.size,
@@ -63,7 +65,7 @@ void RankProgramImpl::validate_work(const Work& work, runtime::FrameKind kind) c
             throw std::invalid_argument("GLM5Next MTP table row exceeds rank storage");
     }
     if (const auto* c = std::get_if<ContextWork>(&work.operation)) {
-        std::array<bool, kMaximumConcurrency> released{};
+        std::vector<std::uint8_t> released(bindings.size());
         for (auto r : c->releases) {
             if (!bindings[r.lane.value] || bindings[r.lane.value]->residency != r)
                 throw std::logic_error("GLM5Next stale residency release");
@@ -187,17 +189,15 @@ void RankProgramImpl::advance_context() {
             retire_vision(r);
             bindings[r.lane.value].reset();
         }
-        for (std::size_t i = 0; i < work.bindings.size(); ++i) {
-            const auto& b   = work.bindings[i];
+        for (const auto& b : work.bindings) {
             const auto lane = b.member.residency.lane.value;
             bindings[lane]  = b.member;
-            if (!resources.plan.frame.token_counts) continue;
-            auto counts = resources.tensor(*resources.plan.frame.token_counts).slice(1, lane, 1);
+            if (!frame.token_counts) continue;
+            auto counts = resources.tensor(*frame.token_counts).slice(1, lane, 1);
             if (b.counts.empty())
                 CUDA_CHECK(cudaMemsetAsync(counts.data, 0, counts.bytes(), transfer.stream()));
             else {
-                auto* host =
-                    static_cast<std::int32_t*>(resources.context_counts().data) + i * vocabulary;
+                auto* host = static_cast<std::int32_t*>(resources.context_counts().data);
                 b.counts.restore({host, vocabulary});
                 copy_bytes_async({counts.data, counts.bytes(), transfer.device()},
                                  {host, counts.bytes(), Device::cpu(), true}, transfer);

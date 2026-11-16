@@ -9,8 +9,6 @@
 namespace ninfer::distributed {
 class Group;
 struct PeerTransfer;
-enum class Collective;
-enum class Reduction;
 } // namespace ninfer::distributed
 
 namespace ninfer::models {
@@ -35,12 +33,10 @@ public:
     void broadcast(Tensor&, CudaExecutionView);
     void broadcast(Tensor&, std::uint32_t owner, CudaExecutionView);
     void exchange(std::span<const distributed::PeerTransfer>, CudaExecutionView);
-    void record_graph(CommunicationWork&, const std::function<void()>&);
-    void replayed(const CommunicationWork&) const;
+    void record_graph(CommunicationGraphWork&, const std::function<void()>&);
+    void replayed(const CommunicationGraphWork&) const;
 
 private:
-    void enqueue(distributed::Collective, distributed::Reduction, const Tensor&, Tensor&, DType,
-                 std::size_t count, std::uint32_t owner, CudaExecutionView);
     ParallelBinding binding_;
 };
 

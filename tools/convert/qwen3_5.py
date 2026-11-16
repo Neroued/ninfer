@@ -6,11 +6,12 @@ Official checkpoint names and quantization assignments live in official_recipes.
 
 from __future__ import annotations
 
-from math import isfinite, isqrt
+from math import isqrt
 from pathlib import Path
-import struct
 from typing import Mapping
 
+from .config import expect_value, positive_float, positive_integer, rope_parameters
+from .dflash import add_draft, draft_config
 from .model import Model, Parameter
 from .qwen_resources import load_qwen_resources
 from .sources.logical import LogicalSource, select_rows, transpose_source
@@ -25,52 +26,6 @@ _TEXT_ARCHITECTURES = {
 }
 
 
-def _positive(value, name):
-    if type(value) is not int or value <= 0:
-        raise ValueError(f"{name}: expected a positive integer")
-    return value
-
-
-def _f32(value, name):
-    if type(value) not in (float, int):
-        raise ValueError(f"{name}: expected a real value")
-    try:
-        result = struct.unpack("<f", struct.pack("<f", value))[0]
-    except (OverflowError, struct.error) as error:
-        raise ValueError(f"{name}: not representable as F32") from error
-    if not isfinite(result) or result <= 0:
-        raise ValueError(f"{name}: expected positive finite F32")
-    return result
-
-
-def _fixed(config, key, value, label):
-    if key in config and (
-        config[key] != value
-        or isinstance(value, bool)
-        and type(config[key]) is not bool
-    ):
-        raise ValueError(f"{label}.{key}: expected {value!r}, got {config[key]!r}")
-
-
-def _rope_source(raw: dict, label: str) -> dict:
-    rope = {}
-    for field in ("rope_scaling", "rope_parameters"):
-        value = raw.get(field)
-        if value is None:
-            continue
-        if not isinstance(value, dict):
-            raise ValueError(f"{label}.{field}: expected an object")
-        for alias in ("type", "rope_type"):
-            _fixed(value, alias, "default", label + "." + field)
-        if "factor" in value and _f32(value["factor"], label + ".factor") != 1.0:
-            raise ValueError(f"{label}: scaled RoPE is not implemented")
-        for key, item in value.items():
-            if key in rope and rope[key] != item:
-                raise ValueError(f"{label}: conflicting RoPE field {key}")
-            rope[key] = item
-    return rope
-
-
 def text_config(source: dict, *, mtp: bool) -> dict:
     architectures = source.get("architectures")
     if (
@@ -81,9 +36,9 @@ def text_config(source: dict, *, mtp: bool) -> dict:
         raise ValueError(f"unsupported Qwen text architecture {architectures!r}")
     moe = _TEXT_ARCHITECTURES[architectures[0]]
     raw = source.get("text_config", source)
-    _fixed(raw, "hidden_act", "silu", "text")
-    _fixed(raw, "attention_bias", False, "text")
-    _fixed(raw, "attn_output_gate", True, "text")
+    expect_value(raw, "hidden_act", "silu", "text")
+    expect_value(raw, "attention_bias", False, "text")
+    expect_value(raw, "attn_output_gate", True, "text")
     result = {
         "architectures": ["Qwen3_5MoeForCausalLM" if moe else "Qwen3_5ForCausalLM"],
         "model_type": "qwen3_5_moe_text" if moe else "qwen3_5_text",
@@ -94,15 +49,17 @@ def text_config(source: dict, *, mtp: bool) -> dict:
         "num_hidden_layers",
         "max_position_embeddings",
     ):
-        result[key] = _positive(raw.get(key), "text." + key)
+        result[key] = positive_integer(raw.get(key), "text." + key)
     tied = raw.get("tie_word_embeddings", source.get("tie_word_embeddings", False))
     if type(tied) is not bool:
         raise ValueError("text.tie_word_embeddings must be boolean")
     result["tie_word_embeddings"] = tied
-    result["rms_norm_eps"] = _f32(raw.get("rms_norm_eps", 1e-6), "text.rms_norm_eps")
+    result["rms_norm_eps"] = positive_float(
+        raw.get("rms_norm_eps", 1e-6), "text.rms_norm_eps"
+    )
     layers = raw.get("layer_types")
     if layers is None:
-        interval = _positive(
+        interval = positive_integer(
             raw.get("full_attention_interval", 4), "full_attention_interval"
         )
         layers = [
@@ -118,16 +75,16 @@ def text_config(source: dict, *, mtp: bool) -> dict:
     result["layer_types"] = list(layers)
     if "full_attention" in layers or mtp:
         for key in ("num_attention_heads", "num_key_value_heads", "head_dim"):
-            result[key] = _positive(raw.get(key), "text." + key)
+            result[key] = positive_integer(raw.get(key), "text." + key)
         if result["num_attention_heads"] % result["num_key_value_heads"]:
             raise ValueError("text attention heads must be divisible by KV heads")
-        rope = _rope_source(raw, "text")
-        _fixed(rope, "mrope_interleaved", True, "text.rope_parameters")
-        factor = _f32(
+        rope = rope_parameters(raw, "text")
+        expect_value(rope, "mrope_interleaved", True, "text.rope_parameters")
+        factor = positive_float(
             rope.get("partial_rotary_factor", raw.get("partial_rotary_factor", 0.25)),
             "partial_rotary_factor",
         )
-        theta = _f32(
+        theta = positive_float(
             rope.get("rope_theta", raw.get("rope_theta", 10_000_000)), "rope_theta"
         )
         sections = rope.get("mrope_section")
@@ -156,7 +113,7 @@ def text_config(source: dict, *, mtp: bool) -> dict:
             "mrope_section": list(sections),
         }
     if "linear_attention" in layers:
-        _fixed(raw, "mamba_ssm_dtype", "float32", "text")
+        expect_value(raw, "mamba_ssm_dtype", "float32", "text")
         for key in (
             "linear_num_key_heads",
             "linear_key_head_dim",
@@ -164,7 +121,7 @@ def text_config(source: dict, *, mtp: bool) -> dict:
             "linear_value_head_dim",
             "linear_conv_kernel_dim",
         ):
-            result[key] = _positive(raw.get(key), "text." + key)
+            result[key] = positive_integer(raw.get(key), "text." + key)
         if result["linear_num_value_heads"] % result["linear_num_key_heads"]:
             raise ValueError("linear value heads must be divisible by key heads")
     fields = (
@@ -178,12 +135,12 @@ def text_config(source: dict, *, mtp: bool) -> dict:
         else ("intermediate_size",)
     )
     for key in fields:
-        result[key] = _positive(raw.get(key), "text." + key)
+        result[key] = positive_integer(raw.get(key), "text." + key)
     if moe and result["num_experts_per_tok"] > result["num_experts"]:
         raise ValueError("selected experts exceed expert count")
     if mtp:
-        _fixed(raw, "mtp_num_hidden_layers", 1, "text")
-        _fixed(raw, "mtp_use_dedicated_embeddings", False, "text")
+        expect_value(raw, "mtp_num_hidden_layers", 1, "text")
+        expect_value(raw, "mtp_use_dedicated_embeddings", False, "text")
     return result
 
 
@@ -191,10 +148,10 @@ def vision_config(source: dict, text: dict) -> dict:
     raw = source.get("vision_config")
     if not isinstance(raw, dict):
         raise ValueError("Vision requires vision_config")
-    _fixed(raw, "in_channels", 3, "vision")
-    _fixed(raw, "hidden_act", "gelu_pytorch_tanh", "vision")
-    _fixed(raw, "deepstack_visual_indexes", [], "vision")
-    _fixed(raw, "out_hidden_size", text["hidden_size"], "vision")
+    expect_value(raw, "in_channels", 3, "vision")
+    expect_value(raw, "hidden_act", "gelu_pytorch_tanh", "vision")
+    expect_value(raw, "deepstack_visual_indexes", [], "vision")
+    expect_value(raw, "out_hidden_size", text["hidden_size"], "vision")
     result = {
         "model_type": (
             "qwen3_5_moe_vision" if "num_experts" in text else "qwen3_5_vision"
@@ -210,113 +167,11 @@ def vision_config(source: dict, text: dict) -> dict:
         "spatial_merge_size",
         "num_position_embeddings",
     ):
-        result[key] = _positive(raw.get(key), "vision." + key)
+        result[key] = positive_integer(raw.get(key), "vision." + key)
     h, heads = result["hidden_size"], result["num_heads"]
     positions = result["num_position_embeddings"]
     if h % heads or (h // heads) % 4 or isqrt(positions) ** 2 != positions:
         raise ValueError("Vision head or square position geometry is invalid")
-    return result
-
-
-def draft_config(raw: dict, target: dict, backend: str) -> dict:
-    architecture = "DFlash2DraftModel" if backend == "dflash2" else "DFlashDraftModel"
-    _fixed(raw, "architectures", [architecture], backend)
-    _fixed(raw, "model_type", "qwen3", backend)
-    _fixed(raw, "hidden_act", "silu", backend)
-    _fixed(raw, "attention_bias", False, backend)
-    _fixed(raw, "is_causal", False, backend)
-    for key, value in (
-        ("hidden_size", target["hidden_size"]),
-        ("vocab_size", target["vocab_size"]),
-        ("num_target_layers", target["num_hidden_layers"]),
-    ):
-        _fixed(raw, key, value, backend)
-    result = {"architectures": [architecture], "model_type": "qwen3"}
-    for key in (
-        "intermediate_size",
-        "num_attention_heads",
-        "num_key_value_heads",
-        "head_dim",
-        "num_hidden_layers",
-        "max_position_embeddings",
-    ):
-        result[key] = _positive(raw.get(key), backend + "." + key)
-    if (
-        result["num_attention_heads"] % result["num_key_value_heads"]
-        or result["head_dim"] % 2
-    ):
-        raise ValueError(f"{backend}: invalid attention geometry")
-    result["rms_norm_eps"] = _f32(
-        raw.get("rms_norm_eps", 1e-6), backend + ".rms_norm_eps"
-    )
-    rope = _rope_source(raw, backend)
-    result["rope_parameters"] = {
-        "rope_theta": _f32(
-            rope.get("rope_theta", raw.get("rope_theta", 10_000_000)),
-            backend + ".rope_theta",
-        )
-    }
-    layers = raw.get("layer_types")
-    if layers is None:
-        enabled = raw.get("use_sliding_window", False)
-        if type(enabled) is not bool:
-            raise ValueError(f"{backend}.use_sliding_window must be boolean")
-        # Qwen3Config applies sliding attention at and above this layer index.
-        threshold = raw.get("max_window_layers", 28)
-        if type(threshold) is not int or threshold < 0:
-            raise ValueError(f"{backend}.max_window_layers must be nonnegative")
-        layers = [
-            "sliding_attention" if enabled and i >= threshold else "full_attention"
-            for i in range(result["num_hidden_layers"])
-        ]
-    if (
-        not isinstance(layers, list)
-        or len(layers) != result["num_hidden_layers"]
-        or any(k not in ("sliding_attention", "full_attention") for k in layers)
-    ):
-        raise ValueError(f"{backend}: invalid layer_types")
-    result["layer_types"] = list(layers)
-    if "sliding_attention" in layers:
-        result["sliding_window"] = _positive(
-            raw.get("sliding_window"), backend + ".sliding_window"
-        )
-    draft = raw.get("dflash_config", {})
-    taps = draft.get("target_layer_ids")
-    if (
-        not isinstance(taps, list)
-        or not taps
-        or any(
-            type(i) is not int or not 0 <= i < target["num_hidden_layers"] for i in taps
-        )
-        or len(set(taps)) != len(taps)
-    ):
-        raise ValueError(f"{backend}: invalid target_layer_ids")
-    mask = draft.get("mask_token_id")
-    if type(mask) is not int or not 0 <= mask < target["vocab_size"]:
-        raise ValueError(f"{backend}: mask token outside target embedding")
-    output = {"target_layer_ids": list(taps), "mask_token_id": mask}
-    if backend == "dflash2":
-        for key in (
-            "conv_kernel_size",
-            "conv_group_size",
-            "selector_rank",
-            "selector_top_k",
-        ):
-            output[key] = _positive(draft.get(key), backend + "." + key)
-        if target["hidden_size"] % output["conv_group_size"]:
-            raise ValueError(
-                "DFlash2 hidden width must be divisible by conv_group_size"
-            )
-        for scope in (raw, draft):
-            for key, expected in (
-                ("sample_from_anchor", False),
-                ("input_embedding_scale", 1.0),
-                ("output_multiplier", 1.0),
-            ):
-                _fixed(scope, key, expected, backend)
-            if scope.get("final_logit_softcapping") not in (None, 0, 0.0):
-                raise ValueError("DFlash2 final_logit_softcapping must be disabled")
-    result["dflash_config"] = output
     return result
 
 
@@ -612,8 +467,8 @@ class _Builder:
         self.group(*roles[2:])
         self.group(prefix + "gdn/a_projection", prefix + "gdn/b_projection")
 
-    def dense(self, prefix, source_prefix, store, h, intermediate, *, draft=False):
-        stem_input = prefix + ("mlp_input" if draft else "ffn_input")
+    def dense(self, prefix, source_prefix, store, h, intermediate):
+        stem_input = prefix + "ffn_input"
         for role in ("gate", "up"):
             self.add(
                 prefix + "mlp/" + role,
@@ -627,7 +482,7 @@ class _Builder:
             store,
             source_prefix + "mlp.down_proj.weight",
             (h, intermediate),
-            inputs=(prefix + ("mlp_product" if draft else "mlp/product"),),
+            inputs=(prefix + "mlp/product",),
         )
         self.group(prefix + "mlp/gate", prefix + "mlp/up")
 
@@ -812,97 +667,6 @@ class _Builder:
                 inputs=inputs,
             )
 
-    def draft(self, store, config, target, backend):
-        h, d = target["hidden_size"], config["head_dim"]
-        q, k = config["num_attention_heads"] * d, config["num_key_value_heads"] * d
-        draft = config["dflash_config"]
-        self.add(
-            backend + "/feature_projection",
-            store,
-            "fc.weight",
-            (h, len(draft["target_layer_ids"]) * h),
-            inputs=(backend + "/target_features",),
-        )
-        self.add(backend + "/context_norm", store, "hidden_norm.weight", (h,))
-        self.add(backend + "/final_norm", store, "norm.weight", (h,))
-        for i in range(config["num_hidden_layers"]):
-            p, sp = f"{backend}/layers/{i}/", f"layers.{i}."
-            self.add(p + "input_norm", store, sp + "input_layernorm.weight", (h,))
-            self.add(
-                p + "post_attention_norm",
-                store,
-                sp + "post_attention_layernorm.weight",
-                (h,),
-            )
-            for role, field, rows in (
-                ("query", "q_proj", q),
-                ("key", "k_proj", k),
-                ("value", "v_proj", k),
-            ):
-                self.add(
-                    p + "attention/" + role,
-                    store,
-                    sp + "self_attn." + field + ".weight",
-                    (rows, h),
-                    inputs=(p + "query_projection_input",),
-                )
-                if role in ("key", "value"):
-                    self.add(
-                        p + "attention/context_" + role,
-                        store,
-                        sp + "self_attn." + field + ".weight",
-                        (rows, h),
-                        inputs=(backend + "/context_input",),
-                    )
-            self.group(*(p + "attention/" + r for r in ("query", "key", "value")))
-            for role, field in (("query_norm", "q_norm"), ("key_norm", "k_norm")):
-                self.add(
-                    p + "attention/" + role,
-                    store,
-                    sp + "self_attn." + field + ".weight",
-                    (d,),
-                )
-            self.add(
-                p + "attention/output",
-                store,
-                sp + "self_attn.o_proj.weight",
-                (h, q),
-                inputs=(p + "attention_output",),
-            )
-            self.dense(p, sp, store, h, config["intermediate_size"], draft=True)
-            if backend == "dflash2":
-                taps, groups = draft["conv_kernel_size"], h // draft["conv_group_size"]
-                for branch in ("attention_conv", "mlp_conv"):
-                    self.add(
-                        p + branch + "/base_kernel",
-                        store,
-                        sp + branch + ".base_kernel",
-                        (2, taps, h),
-                    )
-                    self.add(
-                        p + branch + "/kernel_projection",
-                        store,
-                        sp + branch + ".kernel_projection.weight",
-                        (2 * taps * groups, h),
-                        inputs=(p + branch + "_input",),
-                    )
-        if backend == "dflash2":
-            rank = draft["selector_rank"]
-            self.add(
-                backend + "/candidate_selector/hidden_projection",
-                store,
-                "candidate_selector.hidden_projection.weight",
-                (rank, h),
-                inputs=(backend + "/final_hidden",),
-            )
-            for role in ("predecessor_codebook", "successor_codebook"):
-                self.add(
-                    backend + "/candidate_selector/" + role,
-                    store,
-                    "candidate_selector." + role,
-                    (target["vocab_size"], rank),
-                )
-
 
 def build_model(
     base: SafetensorsSource,
@@ -995,7 +759,12 @@ def build_model(
                 > count
             ):
                 raise ValueError("DFlash2 selector_top_k exceeds public token domain")
-            builder.draft(
-                companions[backend], records[backend]["config"], config, backend
+            add_draft(
+                model,
+                builder.add,
+                companions[backend],
+                records[backend]["config"],
+                config,
+                backend,
             )
     return model

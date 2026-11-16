@@ -347,10 +347,10 @@ void run_profile(Profile profile, const Options& o, std::ofstream& csv) {
     const int max_t =
         std::max(o.reserve_tokens, *std::max_element(o.tokens.begin(), o.tokens.end()));
     std::vector<int> host_ids(max_t);
-    const int mask = spec.d == 4096 ? spec.vocab - 1 : spec.d == 2048 ? 248077 : 248070;
+    const int mask = spec.d == 4096 ? 154856 : spec.d == 2048 ? 248077 : 248070;
     for (int i = 0; i < max_t; ++i) {
-        const int normal =
-            (static_cast<std::int64_t>(i) * 9973 + 12345) % std::min(spec.vocab, 248077);
+        const int normal = (static_cast<std::int64_t>(i) * 9973 + 12345) %
+                           (spec.d == 4096 ? 154856 : std::min(spec.vocab, 248077));
         host_ids[i] = o.pattern == "repeated"                      ? 12345
                       : o.pattern == "masked" && i % o.block_width ? mask
                                                                    : normal;

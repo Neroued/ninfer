@@ -30,12 +30,12 @@ __device__ __forceinline__ __nv_bfloat162 update(__nv_bfloat162 h, __nv_bfloat16
     }
 }
 
-template <Form Kind, int Block>
+template <int Width, Form Kind, int Block>
 __launch_bounds__(Block) __global__
     void combine_vector_kernel(Operands o, std::int64_t first, std::int64_t vectors) {
     const std::int64_t i = first + std::int64_t(blockIdx.x) * Block + threadIdx.x;
     if (i >= first + vectors) return;
-    constexpr int per_row = kWidth / 8;
+    constexpr int per_row = Width / 8;
     const auto row = i / per_row, m = row / kStreams;
 
     const auto h_bits = static_cast<const uint4*>(o.input)[i];

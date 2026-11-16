@@ -64,4 +64,26 @@ __device__ __forceinline__ void normalized_hadamard_d256_inplace(float (&values)
     for (float& value : values) { value = __fmul_rn(value, 0x1p-4f); }
 }
 
+// Contiguous eight-feature lane layout: values[j] is feature 8*lane+j.
+// Low three butterflies stay in registers; the remaining five use warp lanes.
+// Logical bit order and the final 2^-4 normalization match the strided layout.
+__device__ __forceinline__ void normalized_hadamard_d256_contiguous_inplace(float (&values)[8],
+                                                                            int lane) {
+#pragma unroll
+    for (int span = 1; span < 8; span <<= 1) {
+#pragma unroll
+        for (int base = 0; base < 8; base += 2 * span) {
+#pragma unroll
+            for (int i = 0; i < span; ++i) {
+                const float low = values[base + i], high = values[base + i + span];
+                values[base + i]        = __fadd_rn(low, high);
+                values[base + i + span] = __fsub_rn(low, high);
+            }
+        }
+    }
+    hadamard_d32_columns_inplace(values, lane);
+#pragma unroll
+    for (float& x : values) x = __fmul_rn(x, 0x1p-4f);
+}
+
 } // namespace ninfer::ops::detail::kv

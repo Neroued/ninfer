@@ -163,12 +163,14 @@ struct Bf16A16MmaSchedule {
 };
 
 template <int BlockRows, int BlockTokens, int KWarps, int WarpK = 64, int Stages = 2,
-          Cache WeightCache = Cache::cg, Cache ActivationCache = Cache::cg, int MinBlocksPerSm = 1>
+          Cache WeightCache = Cache::cg, Cache ActivationCache = Cache::cg, int MinBlocksPerSm = 1,
+          int KPhaseStride = 0, Bf16MmaRaster Raster = Bf16MmaRaster::RowFast,
+          bool ReuseBFragments = false>
 struct Bf16A16SlicedKMmaSchedule {
     static_assert(BlockRows > 0 && BlockRows % 16 == 0);
     static_assert(BlockTokens > 0 && BlockTokens % 8 == 0);
     static_assert(KWarps > 0 && KWarps <= 32);
-    static_assert(WarpK > 0 && WarpK % 64 == 0);
+    static_assert(WarpK > 0 && WarpK % 16 == 0 && (KWarps * WarpK) % 64 == 0);
     static_assert(Stages >= 1 && Stages <= 8 && MinBlocksPerSm > 0);
     static constexpr int kStaticK            = 0;
     static constexpr int kBlockRows          = BlockRows;
@@ -179,6 +181,10 @@ struct Bf16A16SlicedKMmaSchedule {
     static constexpr int kStages             = Stages;
     static constexpr int kThreads            = KWarps * 32;
     static constexpr int kMinBlocksPerSm     = MinBlocksPerSm;
+    static constexpr int kKPhaseStride       = KPhaseStride;
+    static constexpr bool kReuseBFragments   = ReuseBFragments;
+    static constexpr Bf16MmaRaster kRaster   = Raster;
+    static constexpr int kRasterGroupRows    = 1;
     static constexpr int kMmaRows            = BlockRows / 16;
     static constexpr int kMmaTokens          = BlockTokens / 8;
     static constexpr Cache kWeightCache      = WeightCache;
@@ -186,10 +192,12 @@ struct Bf16A16SlicedKMmaSchedule {
     static constexpr Bf16MmaSwizzle kSwizzle = Bf16MmaSwizzle::Xor64;
     static constexpr int kStageElements      = (BlockRows + BlockTokens) * kBlockK;
     static constexpr int kStagingBytes       = Stages * kStageElements * 2;
-    static constexpr int kPartialBytes       = KWarps * BlockRows * BlockTokens * sizeof(float);
+    static constexpr int kPartialBytes =
+        ((KWarps + 1) / 2) * BlockRows * BlockTokens * sizeof(float);
     static constexpr int kSharedBytes =
         kStagingBytes > kPartialBytes ? kStagingBytes : kPartialBytes;
     static_assert(kSharedBytes <= 99 * 1024);
+    static_assert(KPhaseStride >= 0);
 };
 
 template <int BlockRows, int BlockTokens, int BlockK, int WarpRows, int WarpTokens, int Stages,

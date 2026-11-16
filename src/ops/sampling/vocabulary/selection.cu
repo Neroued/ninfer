@@ -1,6 +1,7 @@
 #include "ninfer/ops/vocabulary.h"
 #include "ops/common/host/operands.h"
 #include "ops/sampling/kernels/distribution.cuh"
+#include "ops/sampling/kernels/selection.cuh"
 
 #include <algorithm>
 
@@ -8,14 +9,15 @@ namespace ninfer::ops {
 namespace {
 using namespace sampling_detail;
 using namespace common;
-using Schedule            = TopKSchedule<128, 4, 128, 4, 25>;
-constexpr int kItems      = Schedule::kSamplerItemsPerThread;
-constexpr int kGreedyTile = 1024;
-constexpr int kColumnSlab = 65535;
-constexpr const char* kOp = "vocabulary_candidates";
+using Schedule                  = TopKSchedule<128, 4, 128, 4, 25>;
+constexpr int kItems            = Schedule::kSamplerItemsPerThread;
+constexpr int kGreedyTile       = 1024;
+constexpr int kColumnSlab       = 65535;
+constexpr int kThresholdColumns = 8;
+constexpr const char* kOp       = "vocabulary_candidates";
 
 struct Plan {
-    int partials;
+    int partials, tile;
     std::size_t first_bytes, second_bytes;
 
     std::size_t bytes() const { return first_bytes + second_bytes; }
@@ -25,11 +27,14 @@ Plan plan(int rows, std::int64_t columns, int cap) {
     if (rows <= 0 || columns <= 0 || (cap != 1 && cap != 20))
         throw std::invalid_argument("vocabulary_candidates: invalid workspace profile");
     columns            = std::min(columns, std::int64_t(kColumnSlab));
-    const int partials = (rows - 1) / (cap == 1 ? kGreedyTile : 512) + 1;
+    const int tile     = rows >= 4096 && columns >= kThresholdColumns ? 4096
+                         : cap == 1                                   ? kGreedyTile
+                                                                      : 512;
+    const int partials = (rows - 1) / tile + 1;
     const auto bytes   = [&](int lists) {
         return (std::size_t(lists) * columns * cap * 8 + 255) & ~std::size_t(255);
     };
-    return {partials, partials == 1 ? 0 : bytes(partials),
+    return {partials, tile, partials == 1 ? 0 : bytes(partials),
             cap == 20 && partials > 25 ? bytes(div_up(partials, 25)) : 0};
 }
 
@@ -52,8 +57,13 @@ __global__ void partial_kernel(const __nv_bfloat16* logits, int rows, int begin,
     const int column         = blockIdx.y;
     const auto global_column = column_offset + column;
     const int b = global_column / tokens, t = global_column % tokens;
-    const int start    = blockIdx.x * (Greedy ? kGreedyTile : 512);
-    const bool active  = t < valid[b];
+    const int start = blockIdx.x * (Greedy ? kGreedyTile : 512);
+    if (t >= valid[b]) {
+        constexpr int count = Greedy ? 1 : 20;
+        if (threadIdx.x < count)
+            output[(std::int64_t(column) * partials + blockIdx.x) * count + threadIdx.x] = 0;
+        return;
+    }
     const auto cfg     = configs[b];
     const auto overlay = drafts[b];
     const auto base    = global_column * rows;
@@ -62,7 +72,7 @@ __global__ void partial_kernel(const __nv_bfloat16* logits, int rows, int begin,
         for (int offset = threadIdx.x; offset < min(kGreedyTile, rows - start);
              offset += blockDim.x) {
             const int local = start + offset;
-            if (active && std::int64_t(begin) + local < domain) {
+            if (std::int64_t(begin) + local < domain) {
                 const int id = begin + local;
                 const float value =
                     adjusted(__bfloat162float(logits[base + local]), id, cfg, overlay, t);
@@ -85,7 +95,7 @@ __global__ void partial_kernel(const __nv_bfloat16* logits, int rows, int begin,
             for (int i = 0; i < kItems; ++i) {
                 const int index = threadIdx.x * kItems + i;
                 keys[i]         = 0;
-                if (active && index < rows - start) {
+                if (index < rows - start) {
                     const int local = start + index;
                     if (std::int64_t(begin) + local >= domain) continue;
                     const int id = begin + local;
@@ -105,7 +115,7 @@ __global__ void partial_kernel(const __nv_bfloat16* logits, int rows, int begin,
             for (int i = 0; i < kItems; ++i) {
                 const int index = threadIdx.x * kItems + i;
                 keys[i]         = 0;
-                if (active && index < rows - start) {
+                if (index < rows - start) {
                     const int local = start + index;
                     if (std::int64_t(begin) + local >= domain) continue;
                     const int id = begin + local;
@@ -122,6 +132,95 @@ __global__ void partial_kernel(const __nv_bfloat16* logits, int rows, int begin,
     }
 }
 
+template <int Items>
+__launch_bounds__(256, 3) __global__
+    void threshold_partial(const __nv_bfloat16* logits, int rows, int begin, int domain,
+                           const SamplingConfig* configs, const int* valid, TokenRows drafts,
+                           int tokens, std::int64_t column_offset, unsigned long long* output,
+                           int partials, int capacity) {
+    const auto column = column_offset + blockIdx.y;
+    const int b = column / tokens, t = column % tokens, partial = blockIdx.x;
+    auto* result = output + (std::int64_t(blockIdx.y) * partials + partial) * capacity;
+    if (t >= valid[b]) {
+        if (threadIdx.x < capacity) result[threadIdx.x] = 0;
+        return;
+    }
+    const auto cfg        = configs[b];
+    const auto drafts_row = drafts[b];
+    using Selector        = ThresholdSelection<256, Items>;
+    using Compact         = ThresholdSelection<256, Items, unsigned int>;
+    constexpr int Tile    = 256 * Items;
+
+    __shared__ union {
+        typename Selector::Storage wide;
+        typename Compact::Storage compact;
+        SamplingInputTile<256, Tile> inputs;
+    } storage;
+
+    __shared__ DraftCountTile<Tile> overlay;
+    __shared__ unsigned int compact_keys[kSamplerCandidateCap];
+    const int start      = partial * Tile;
+    const auto base      = column * rows;
+    const int origin     = std::int64_t(begin) + start < domain ? begin + start : 0;
+    const auto remaining = std::int64_t(domain) - begin - start;
+    const int available  = remaining > 0 ? int(min(std::int64_t(rows - start), remaining)) : 0;
+    const bool penalties = cfg.presence_penalty != 0.F || cfg.frequency_penalty != 0.F;
+    storage.inputs.prefetch(logits + base + start,
+                            cfg.token_counts ? cfg.token_counts + origin : nullptr, available,
+                            penalties);
+    if (penalties && drafts_row && t <= DraftCountTile<Tile>::kMaxPrefix)
+        overlay.prepare(drafts_row, t, origin);
+    cp_wait<0>();
+    __syncthreads();
+    const int cap =
+        capacity == 1 || !(cfg.temperature > 0) ? 1 : sampling_candidate_cap(cfg, domain);
+    if (!penalties) {
+        unsigned int keys[Items];
+#pragma unroll
+        for (int i = 0; i < Items; ++i) {
+            const int local = threadIdx.x + i * 256, token = origin + local;
+            keys[i] =
+                local < available &&
+                        (!cfg.mask.words ||
+                         (cfg.mask.words[std::int64_t(t) * cfg.mask.stride + token / 32] &
+                          (1U << (token % 32))))
+                    ? sampling_bf16_tile_sort_key<Compact>(storage.inputs.logits[local], local)
+                    : 0;
+        }
+        __syncthreads();
+        Compact::select_values(keys, cap, compact_keys, storage.compact);
+        __syncthreads();
+        if (threadIdx.x < cap)
+            result[threadIdx.x] =
+                sampling_expand_bf16_tile_sort_key<Compact>(compact_keys[threadIdx.x], origin);
+    } else {
+        unsigned long long keys[Items];
+#pragma unroll
+        for (int i = 0; i < Items; ++i) {
+            const int local = threadIdx.x + i * 256, token = origin + local;
+            keys[i] = 0;
+            if (local < available &&
+                (!cfg.mask.words ||
+                 (cfg.mask.words[std::int64_t(t) * cfg.mask.stride + token / 32] &
+                  (1U << (token % 32))))) {
+                int count = storage.inputs.counts[local];
+                if (drafts_row) {
+                    if (t <= DraftCountTile<Tile>::kMaxPrefix)
+                        count += overlay.count(local);
+                    else
+                        for (int j = 0; j < t; ++j) count += drafts_row[j] == token;
+                }
+                const float score = sampling_penalized_logit(
+                    __bfloat162float(storage.inputs.logits[local]), cfg, count);
+                keys[i] = score_id_order_key(score, token);
+            }
+        }
+        __syncthreads();
+        Selector::select_values(keys, cap, result, storage.wide);
+    }
+    if (threadIdx.x < capacity && threadIdx.x >= cap) result[threadIdx.x] = 0;
+}
+
 __global__ void merge_greedy(const unsigned long long* input, unsigned long long* output,
                              int partials) {
     unsigned long long key = 0;
@@ -134,7 +233,13 @@ __global__ void merge_greedy(const unsigned long long* input, unsigned long long
 
 __global__ void merge_topk(const unsigned long long* input, unsigned long long* output, int lists,
                            int groups, const SamplingConfig* configs, int tokens,
-                           std::int64_t column_offset) {
+                           std::int64_t column_offset, const int* valid) {
+    const auto column = column_offset + blockIdx.y;
+    if (column % tokens >= valid[column / tokens]) {
+        if (threadIdx.x < 20)
+            output[(std::int64_t(blockIdx.y) * groups + blockIdx.x) * 20 + threadIdx.x] = 0;
+        return;
+    }
     const int begin = blockIdx.x * 25 * 20;
     const auto cfg  = configs[(column_offset + blockIdx.y) / tokens];
     const int cap   = cfg.temperature > 0 ? sampling_candidate_cap(cfg, 20) : 1;
@@ -161,7 +266,10 @@ __global__ void merge_topk(const unsigned long long* input, unsigned long long* 
 std::size_t vocabulary_candidates_workspace_capacity_bytes(int physical_rows,
                                                            std::int64_t max_columns,
                                                            int candidates) {
-    return plan(physical_rows, max_columns, candidates).bytes();
+    return std::max(
+        plan(physical_rows, max_columns, candidates).bytes(),
+        plan(physical_rows, std::min<std::int64_t>(max_columns, kThresholdColumns - 1), candidates)
+            .bytes());
 }
 
 void vocabulary_candidates(const Tensor& logits, int token_begin, int token_domain,
@@ -169,7 +277,7 @@ void vocabulary_candidates(const Tensor& logits, int token_begin, int token_doma
                            const Tensor& drafts, Tensor& keys, MemoryArena& workspace,
                            CudaExecutionView execution) {
     const int rows = logits.ne[0], tokens = logits.ne[1], batch = logits.ne[2], cap = keys.ne[0];
-    if (tokens <= 0 || batch < 1 || batch > 8 || token_begin < 0 || token_domain <= 0)
+    if (tokens <= 0 || batch < 1 || token_begin < 0 || token_domain <= 0)
         throw std::invalid_argument("vocabulary_candidates: invalid vocabulary or T/B");
     const auto columns  = std::int64_t(tokens) * batch;
     const auto selected = plan(rows, columns, cap);
@@ -210,26 +318,35 @@ void vocabulary_candidates(const Tensor& logits, int token_begin, int token_doma
         auto* result    = output + offset * cap;
         auto* partial   = selected.partials == 1 ? result : first;
         const dim3 grid(selected.partials, width);
-        if (cap == 1) {
+        if (selected.tile == 4096) {
+            threshold_partial<16><<<grid, 256, 0, execution.stream()>>>(
+                static_cast<const __nv_bfloat16*>(logits.data), rows, token_begin, token_domain,
+                configs, static_cast<const int*>(valid_columns.data), token_rows(drafts), tokens,
+                offset, partial, selected.partials, cap);
+        } else if (cap == 1) {
             partial_kernel<true><<<grid, 128, 0, execution.stream()>>>(
                 static_cast<const __nv_bfloat16*>(logits.data), rows, token_begin, token_domain,
                 configs, static_cast<const int*>(valid_columns.data), token_rows(drafts), tokens,
                 offset, partial, selected.partials);
-            if (selected.partials > 1)
-                merge_greedy<<<width, 128, 0, execution.stream()>>>(partial, result,
-                                                                    selected.partials);
         } else {
             partial_kernel<false><<<grid, Schedule::kSamplerBlock, 0, execution.stream()>>>(
                 static_cast<const __nv_bfloat16*>(logits.data), rows, token_begin, token_domain,
                 configs, static_cast<const int*>(valid_columns.data), token_rows(drafts), tokens,
                 offset, partial, selected.partials);
+        }
+        if (cap == 1) {
+            if (selected.partials > 1)
+                merge_greedy<<<width, 128, 0, execution.stream()>>>(partial, result,
+                                                                    selected.partials);
+        } else {
             auto* next = second;
             for (int lists = selected.partials; lists > 1;) {
                 const int groups  = div_up(lists, 25);
                 auto* destination = groups == 1 ? result : next;
                 merge_topk<<<dim3(groups, width), Schedule::kSamplerGroupBlock, 0,
                              execution.stream()>>>(partial, destination, lists, groups, configs,
-                                                   tokens, offset);
+                                                   tokens, offset,
+                                                   static_cast<const int*>(valid_columns.data));
                 std::swap(partial, next);
                 lists = groups;
             }

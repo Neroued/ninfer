@@ -755,6 +755,10 @@ std::uint32_t ContextPool::pool_id() const noexcept { return impl_->pool_id; }
 
 std::size_t ContextPool::capacity_bytes() const noexcept { return impl_->capacity; }
 
+std::size_t ContextPool::required_bytes(std::span<const RecordRequest> requests) const {
+    return impl_->geometry.required_bytes(requests);
+}
+
 std::size_t ContextPool::alignment() const noexcept { return impl_->geometry.alignment; }
 
 std::size_t ContextPool::block_bytes() const noexcept { return impl_->geometry.block_bytes; }

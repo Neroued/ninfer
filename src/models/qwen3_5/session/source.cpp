@@ -1,3 +1,4 @@
+#include "models/common/qwen/recovery_value.h"
 #include "models/qwen3_5/session/internal.h"
 #include "models/common/context/work.h"
 
@@ -45,17 +46,9 @@ SessionImpl::inspect_source(const RequestBasePlan& base, std::optional<Checkpoin
                               .reused_tokens = handle ? checkpoint(*handle).frontier() : 0};
     const auto& prompt         = *base.impl_->prompt;
     const auto target_frontier = resume ? resume->frontier() : base.summary().prompt_tokens;
-    candidate.remaining_work   = runtime::make_prefill_work(
-        candidate.reused_tokens, target_frontier - candidate.reused_tokens, 0, 0, prefill_chunk);
-    for (const auto& item : prompt.vision_items) {
-        if (std::any_of(item.token_spans.begin(), item.token_spans.end(), [&](const auto& span) {
-                return span.begin < target_frontier &&
-                       span.begin + span.count > candidate.reused_tokens;
-            })) {
-            ++candidate.remaining_work.vision_items;
-            candidate.remaining_work.vision_patches += item.patch_count;
-        }
-    }
+    candidate.remaining_work =
+        qwen::recovery_work(prompt.vision_items, candidate.reused_tokens, target_frontier,
+                            prefill_chunk, plan.vision_max_features);
     if (!handle) { return candidate; }
     const auto& record       = checkpoint(*handle);
     candidate.consume_source = consume_source;
@@ -97,7 +90,8 @@ SessionImpl::inspect_source(const RequestBasePlan& base, std::optional<Checkpoin
     candidate.state_action = state_store->device_resident(image) ? StateBindingAction::Fork
                                                                  : StateBindingAction::Restore;
     if (consume_source && !keep_source && checkpoints[handle->index].pins == 0 &&
-        state_references == 1 && state_store->source_pins(image) == 0) {
+        state_store->can_recover_exclusively(image, state_store->checkpoint_references(image) -
+                                                        state_references)) {
         candidate.state_action = StateBindingAction::Move;
     }
     const auto backend_frontier = record.backend_frontier();
@@ -157,16 +151,13 @@ SessionImpl::inspect_source(const RequestBasePlan& base, std::optional<Checkpoin
         is_masked_draft_backend(speculative_backend))
         candidate.transfers.push_back(context::state_transfer_requirement(
             plan.dflash_local_transfer.value(), runtime::ContextTransferDirection::DeviceToDevice));
-    const auto tail = [&](const context::PageDirectory& pages, runtime::KvPoolId pool,
-                          std::uint32_t copies) {
-        if (copies)
-            candidate.transfers.push_back(context::kv_transfer_requirement(
-                {pool}, runtime::ContextTransferDirection::DeviceToDevice, copies,
-                TransferWork{std::uint64_t(pages.layout().parts.front().record.bytes) * copies,
-                             copies}));
+    const auto tail = [&](const context::HistoryDirectory& histories,
+                          const context::HistoryBindingDemand& demand) {
+        auto copies = context::history_tail_requirements(histories, demand);
+        candidate.transfers.insert(candidate.transfers.end(), copies.begin(), copies.end());
     };
-    tail(*text_kv_pages, kTextKvPool, main_binding.tail_copies);
-    if (backend_kv_pages) tail(*backend_kv_pages, kBackendKvPool, backend_binding.tail_copies);
+    tail(*text_kv_histories, main_binding);
+    if (backend_kv_histories) tail(*backend_kv_histories, backend_binding);
     return candidate;
 }
 } // namespace ninfer::models::qwen3_5::detail

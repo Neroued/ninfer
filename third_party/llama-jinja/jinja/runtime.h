@@ -5,9 +5,12 @@
 
 #include <cassert>
 #include <ctime>
+#include <deque>
 #include <memory>
 #include <sstream>
 #include <string>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace jinja {
@@ -51,74 +54,161 @@ const T* cast_stmt(const statement_ptr& ptr) {
 using visitor_pair = std::pair<std::string, std::vector<statement*>>;
 using visitor_fn   = std::function<void(bool, statement*, std::vector<visitor_pair>)>;
 
+struct macro_statement;
+struct closure_environment;
+class render_scopes;
+using scope_names = std::vector<std::string>;
+
+struct binding_cell {
+    value data;
+    macro_statement* macro = nullptr;
+    std::weak_ptr<closure_environment> owner;
+    std::shared_ptr<binding_cell> inherited;
+
+    value read() const;
+    void assign(value input);
+};
+
+struct scope {
+    scope* parent = nullptr;
+    std::unordered_map<std::string, value> bindings;
+    const scope_names* locals = nullptr;
+    std::shared_ptr<closure_environment> imports;
+    std::shared_ptr<closure_environment> environment;
+    std::size_t references = 0;
+};
+
+enum class loop_flow { none, stop, next };
+
+// Definitions use weak environment links; materialized callable values own their captures.
+struct closure_environment : std::enable_shared_from_this<closure_environment> {
+    explicit closure_environment(std::shared_ptr<render_scopes> owner) : owner(std::move(owner)) {}
+
+    ~closure_environment();
+
+    std::shared_ptr<render_scopes> owner;
+    std::unordered_map<std::string, std::shared_ptr<binding_cell>> locals;
+    std::unordered_map<std::string, std::shared_ptr<binding_cell>> bindings;
+    std::vector<std::shared_ptr<closure_environment>> dependencies;
+    closure_environment* previous = nullptr;
+    closure_environment* next     = nullptr;
+    bool registered               = false;
+};
+
+class render_scopes : public std::enable_shared_from_this<render_scopes> {
+public:
+    scope* acquire(scope* parent, const scope_names* locals,
+                   std::shared_ptr<closure_environment> imports = {});
+    void release(scope* frame);
+    std::shared_ptr<closure_environment> environment(scope* frame);
+    std::shared_ptr<closure_environment> capture(scope* frame, const scope_names& names);
+    std::shared_ptr<binding_cell> local_cell(scope* frame, const std::string& name);
+    void detach(closure_environment* environment);
+    void close();
+    void ensure_active() const;
+
+    loop_flow flow = loop_flow::none;
+
+private:
+    std::pair<std::shared_ptr<binding_cell>, std::shared_ptr<closure_environment>>
+    resolve_cell(scope* frame, const std::string& name);
+    std::deque<scope> frames_;
+    scope* free_                       = nullptr;
+    closure_environment* environments_ = nullptr;
+    bool closed_                       = false;
+};
+
 struct context {
-    std::shared_ptr<std::string>
-        src;                  // for debugging; use shared_ptr to avoid copying on scope creation
-    std::time_t current_time; // for functions that need current time
-
+    std::shared_ptr<std::string> src;
+    std::time_t current_time;
     std::function<void()> checkpoint;
-
     visitor_fn visitor;
 
-    // src is optional, used for error reporting
-    context(std::string src = "") : src(std::make_shared<std::string>(std::move(src))) {
-        env               = mk_val<value_object>();
-        env->has_builtins = false; // context object has no builtins
-        env->insert("true", mk_val<value_bool>(true));
-        env->insert("True", mk_val<value_bool>(true));
-        env->insert("false", mk_val<value_bool>(false));
-        env->insert("False", mk_val<value_bool>(false));
-        env->insert("none", mk_val<value_none>());
-        env->insert("None", mk_val<value_none>());
-        current_time = std::time(nullptr);
+    explicit context(std::string source = "")
+        : src(std::make_shared<std::string>(std::move(source))), current_time(std::time(nullptr)),
+          scopes(std::make_shared<render_scopes>()), env(scopes->acquire(nullptr, nullptr)),
+          root(true) {
+        set_val("true", mk_val<value_bool>(true));
+        set_val("True", mk_val<value_bool>(true));
+        set_val("false", mk_val<value_bool>(false));
+        set_val("False", mk_val<value_bool>(false));
+        set_val("none", mk_val<value_none>());
+        set_val("None", mk_val<value_none>());
     }
 
-    ~context() = default;
-
-    // Keep macro definition scopes alive for this render. Callables refer back weakly,
-    // so an environment containing its own macro does not form an ownership cycle.
-    std::weak_ptr<value_object_t> capture_scope() {
-        captured_scopes->push_back(env);
-        return env;
+    ~context() {
+        if (root)
+            scopes->close();
+        else
+            scopes->release(env);
     }
 
-    std::weak_ptr<value_object_t> current_scope() const { return env; }
+    context(const context& parent, const scope_names* locals = nullptr)
+        : src(parent.src), current_time(parent.current_time), checkpoint(parent.checkpoint),
+          scopes(parent.scopes), env(scopes->acquire(parent.env, locals)) {}
 
-    context(const context& caller, const std::weak_ptr<value_object_t>& lexical_scope) : context() {
-        const auto scope = lexical_scope.lock();
-        if (!scope) throw std::runtime_error("macro definition scope has expired");
-        for (const auto& pair : scope->as_ordered_object()) set_val(pair.first, pair.second);
-        current_time    = caller.current_time;
-        checkpoint      = caller.checkpoint;
-        src             = caller.src;
-        captured_scopes = caller.captured_scopes;
+    context(const context& caller, std::shared_ptr<closure_environment> captured,
+            const scope_names* locals)
+        : src(caller.src), current_time(caller.current_time), checkpoint(caller.checkpoint),
+          scopes(caller.scopes), env(nullptr) {
+        if (captured && captured->owner != scopes)
+            throw std::runtime_error("Closure belongs to a different render");
+        env = scopes->acquire(nullptr, locals, std::move(captured));
     }
 
-    context(const context& parent) : context() {
-        // inherit variables (for example, when entering a new scope)
-        auto& pvar = parent.env->as_ordered_object();
-        for (const auto& pair : pvar) { set_val(pair.first, pair.second); }
-        current_time    = parent.current_time;
-        checkpoint      = parent.checkpoint;
-        src             = parent.src;
-        captured_scopes = parent.captured_scopes;
+    context& operator=(const context&) = delete;
+
+    value find_val(const std::string& name) {
+        for (auto* frame = env; frame; frame = frame->parent) {
+            if (frame->environment) {
+                const auto found = frame->environment->locals.find(name);
+                if (found != frame->environment->locals.end()) return found->second->read();
+            }
+            if (const auto found = frame->bindings.find(name); found != frame->bindings.end())
+                return found->second;
+            if (frame->imports) {
+                const auto found = frame->imports->bindings.find(name);
+                if (found != frame->imports->bindings.end()) return found->second->read();
+            }
+        }
+        return {};
     }
 
     value get_val(const std::string& name) {
-        value default_val = mk_val<value_undefined>(name);
-        return env->at(name, default_val);
+        auto result = find_val(name);
+        return result ? result : mk_val<value_undefined>(name);
     }
 
-    void set_val(const std::string& name, const value& val) { env->insert(name, val); }
+    void set_val(const std::string& name, const value& input) {
+        if (env->environment) {
+            const auto found = env->environment->locals.find(name);
+            if (found != env->environment->locals.end()) {
+                found->second->assign(input);
+                return;
+            }
+        }
+        env->bindings[name] = input;
+    }
 
-    void set_val(const value& name, const value& val) { env->insert(name, val); }
+    void set_val(const value& name, const value& input) { set_val(name->as_string().str(), input); }
 
-    void print_vars() const { printf("Context Variables:\n%s\n", value_to_json(env, 2).c_str()); }
+    void define_macro(const std::string& name, macro_statement* definition,
+                      const scope_names& captures);
+
+    std::shared_ptr<closure_environment> capture(const scope_names& names) const {
+        return scopes->capture(env, names);
+    }
+
+    void set_locals(const scope_names& names) { env->locals = &names; }
+    void clear_locals() { env->bindings.clear(); }
+
+    std::shared_ptr<render_scopes> storage() const { return scopes; }
+    loop_flow& flow() { return scopes->flow; }
 
 private:
-    value_object env;
-    std::shared_ptr<std::vector<value_object>> captured_scopes =
-        std::make_shared<std::vector<value_object>>();
+    std::shared_ptr<render_scopes> scopes;
+    scope* env;
+    bool root = false;
 };
 
 // utils for visiting AST nodes
@@ -142,8 +232,11 @@ struct statement {
     // execute_impl must be overridden by derived classes
     virtual value execute_impl(context&) { throw_exec_error(); }
 
+    virtual void render_impl(context&, string&);
+
     // execute is the public method to execute a statement with error handling
     value execute(context&);
+    void render(context&, string&);
 
 private:
     [[noreturn]] void throw_exec_error() const {
@@ -183,6 +276,7 @@ struct output_statement : public statement {
 
     value execute_impl(context& ctx) override {
         const auto result = operand->execute(ctx);
+        if (is_val<value_string>(result)) return result;
         return mk_val<value_string>(result->as_string());
     }
 };
@@ -190,6 +284,7 @@ struct output_statement : public statement {
 // Statements
 
 struct program : public statement {
+    scope_names locals;
     statements body;
 
     program() = default;
@@ -216,6 +311,7 @@ struct if_statement : public statement {
     std::string type() const override { return "If"; }
 
     value execute_impl(context& ctx) override;
+    void render_impl(context&, string&) override;
 
     void visit(context& ctx) override {
         ctx.visitor(false, this,
@@ -233,6 +329,8 @@ struct tuple_literal;
  * https://jinja.palletsprojects.com/en/3.0.x/templates/#for
  */
 struct for_statement : public statement {
+    scope_names locals;
+    scope_names filter_captures;
     statement_ptr loopvar; // Identifier | TupleLiteral
     statement_ptr iterable;
     statements body;
@@ -249,6 +347,7 @@ struct for_statement : public statement {
     std::string type() const override { return "For"; }
 
     value execute_impl(context& ctx) override;
+    void render_impl(context&, string&) override;
 
     void visit(context& ctx) override {
         ctx.visitor(false, this,
@@ -262,28 +361,26 @@ struct for_statement : public statement {
 struct break_statement : public statement {
     std::string type() const override { return "Break"; }
 
-    struct signal : public std::exception {
-        const char* what() const noexcept override { return "Break statement executed"; }
-    };
-
-    [[noreturn]] value execute_impl(context&) override { throw break_statement::signal(); }
+    value execute_impl(context& ctx) override {
+        ctx.flow() = loop_flow::stop;
+        return {};
+    }
 };
 
 struct continue_statement : public statement {
     std::string type() const override { return "Continue"; }
 
-    struct signal : public std::exception {
-        const char* what() const noexcept override { return "Continue statement executed"; }
-    };
-
-    [[noreturn]] value execute_impl(context&) override { throw continue_statement::signal(); }
+    value execute_impl(context& ctx) override {
+        ctx.flow() = loop_flow::next;
+        return {};
+    }
 };
 
 // do nothing
 struct noop_statement : public statement {
     std::string type() const override { return "Noop"; }
 
-    value execute_impl(context&) override { return mk_val<value_undefined>(); }
+    value execute_impl(context&) override { return {}; }
 };
 
 struct set_statement : public statement {
@@ -309,6 +406,8 @@ struct set_statement : public statement {
 };
 
 struct macro_statement : public statement {
+    scope_names locals;
+    scope_names captures;
     statement_ptr name;
     statements args;
     statements body;
@@ -337,7 +436,7 @@ struct comment_statement : public statement {
 
     std::string type() const override { return "Comment"; }
 
-    value execute_impl(context&) override { return mk_val<value_undefined>(); }
+    value execute_impl(context&) override { return {}; }
 };
 
 // Expressions
@@ -353,12 +452,9 @@ struct member_expression : public expression {
     statement_ptr object;
     statement_ptr property;
     bool computed; // true if obj[expr] and false if obj.prop
+    value static_property;
 
-    member_expression(statement_ptr&& object, statement_ptr&& property, bool computed)
-        : object(std::move(object)), property(std::move(property)), computed(computed) {
-        chk_type<expression>(this->object);
-        chk_type<expression>(this->property);
-    }
+    member_expression(statement_ptr&& object, statement_ptr&& property, bool computed);
 
     std::string type() const override { return "MemberExpression"; }
 
@@ -405,32 +501,36 @@ struct identifier : public expression {
 
 struct integer_literal : public expression {
     int64_t val;
+    value constant;
 
-    explicit integer_literal(int64_t val) : val(val) {}
+    explicit integer_literal(int64_t val) : val(val), constant(mk_val<value_int>(val)) {}
 
     std::string type() const override { return "IntegerLiteral"; }
 
-    value execute_impl(context&) override { return mk_val<value_int>(val); }
+    value execute_impl(context&) override { return constant; }
 };
 
 struct float_literal : public expression {
     double val;
+    value constant;
 
-    explicit float_literal(double val) : val(val) {}
+    explicit float_literal(double val) : val(val), constant(mk_val<value_float>(val)) {}
 
     std::string type() const override { return "FloatLiteral"; }
 
-    value execute_impl(context&) override { return mk_val<value_float>(val); }
+    value execute_impl(context&) override { return constant; }
 };
 
 struct string_literal : public expression {
     std::string val;
+    value constant;
 
-    explicit string_literal(const std::string& val) : val(val) {}
+    explicit string_literal(const std::string& val)
+        : val(val), constant(mk_val<value_string>(val)) {}
 
     std::string type() const override { return "StringLiteral"; }
 
-    value execute_impl(context&) override { return mk_val<value_string>(val); }
+    value execute_impl(context&) override { return constant; }
 };
 
 struct array_literal : public expression {
@@ -693,6 +793,8 @@ struct spread_expression : public expression {
 };
 
 struct call_statement : public statement {
+    scope_names locals;
+    scope_names captures;
     statement_ptr call;
     statements caller_args;
     statements body;
@@ -775,15 +877,9 @@ static void gather_string_parts_recursive(const value& val, value_string& parts)
         std::string str_val = val->as_string().str();
         parts->val_str.append(str_val);
     } else if (is_val<value_array>(val)) {
-        auto items = cast_val<value_array>(val)->as_array();
+        const auto& items = cast_val<value_array>(val)->as_array();
         for (const auto& item : items) { gather_string_parts_recursive(item, parts); }
     }
-}
-
-static std::string render_string_parts(const value_string& parts) {
-    std::ostringstream oss;
-    for (const auto& part : parts->val_str.parts) { oss << part.val; }
-    return oss.str();
 }
 
 struct runtime {
@@ -791,16 +887,10 @@ struct runtime {
 
     explicit runtime(context& ctx) : ctx(ctx) {}
 
-    value_array execute(const program& prog) {
-        value_array results = mk_val<value_array>();
-        for (const auto& stmt : prog.body) {
-            value res = stmt->execute(ctx);
-            results->push_back(std::move(res));
-        }
-        return results;
-    }
+    value_string execute(const program& prog);
 
     static value_string gather_string_parts(const value& val) {
+        if (is_val<value_string>(val)) return std::static_pointer_cast<value_string_t>(val);
         value_string parts = mk_val<value_string>();
         gather_string_parts_recursive(val, parts);
         return parts;

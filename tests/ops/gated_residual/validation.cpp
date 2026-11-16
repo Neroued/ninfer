@@ -14,8 +14,8 @@ int rejects(const char* label, Call&& call) {
 }
 } // namespace
 
-int validate(Form form, CudaExecutionView e) {
-    Fixture f(form, 2, false);
+int validate(Form form, CudaExecutionView e, int width) {
+    Fixture f(form, 2, false, width);
     f.set(Pattern::Random);
     f.upload(e.stream());
     int failed = 0;

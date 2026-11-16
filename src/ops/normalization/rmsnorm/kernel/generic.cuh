@@ -6,11 +6,11 @@
 namespace ninfer::ops::detail::rmsnorm {
 
 // Complete scalar route for odd dimensions and backing without BF16x2 alignment.
-template <Epilogue Kind>
+template <Epilogue Kind, bool SaveInverse = false>
 __launch_bounds__(256) __global__
     void rmsnorm_generic_kernel(const __nv_bfloat16* x, const __nv_bfloat16* weight,
                                 const __nv_bfloat16* z, __nv_bfloat16* out, std::int32_t d,
-                                std::int64_t rows, float eps) {
+                                std::int64_t rows, float eps, float* inverse_output) {
     const std::int64_t row = static_cast<std::int64_t>(blockIdx.x);
     if (row >= rows) { return; }
 
@@ -30,6 +30,9 @@ __launch_bounds__(256) __global__
     }
 
     const float inv = rsqrtf(scratch[0] / static_cast<float>(d) + eps);
+    if constexpr (SaveInverse) {
+        if (threadIdx.x == 0) inverse_output[row] = inv;
+    }
     for (std::int64_t i = threadIdx.x; i < static_cast<std::int64_t>(d); i += blockDim.x) {
         const std::int64_t index = base + i;
         const float xv           = __bfloat162float(x[index]);

@@ -79,6 +79,9 @@ void add_scatter_columns_cases(OpSuite& suite) {
               [] { return run<std::uint16_t>(DType::BF16, 2560, 6, 8); });
     suite.add("scatter_columns/bf16/tail",
               [] { return run<std::uint16_t>(DType::BF16, 384, 1, 4); });
+    suite.add("scatter_columns/bf16/b17",
+              [] { return run<std::uint16_t>(DType::BF16, 520, 4, 17); },
+              {{"suite", "concurrency"}});
     suite.add("scatter_columns/i32/coordinates",
               [] { return run<std::uint32_t>(DType::I32, 3, 1, 4); });
 }

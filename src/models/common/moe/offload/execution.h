@@ -71,15 +71,17 @@ struct PreparedExecution {
 
 // Capture orders input D2H before GPU experts and records a Host-observable input event.
 enum class GpuSubmission { Eager, Capture };
-void enqueue_gpu(const Tensor& hidden, const PreparedExecution&, Tensor& output, MemoryArena&,
-                 GpuSubmission, const ops::MoeExecutionHints& = {});
+void enqueue_gpu(const Tensor& hidden, const PreparedExecution&, Tensor& output,
+                 ops::MoeTokenValidity validity, MemoryArena&, GpuSubmission,
+                 const ops::MoeExecutionHints& = {});
 // Host input must be ready. Returns false without a collective when all routes hit the GPU.
 [[nodiscard]] bool compute_cpu(const PreparedExecution&);
-void enqueue_finish(const PreparedExecution&, Tensor& output, bool cpu_work);
+void enqueue_finish(const PreparedExecution&, Tensor& output, ops::MoeTokenValidity, bool cpu_work);
 // Join the already submitted input transfer into compute retirement without running CPU work.
 void enqueue_discard(const PreparedExecution&);
 // Empty while the D2H input is pending. An engaged result submits the output chain and
 // reports whether CPU work was needed. Consume that result once; all-GPU needs no event query.
-[[nodiscard]] std::optional<bool> try_complete(const PreparedExecution&, Tensor& output);
+[[nodiscard]] std::optional<bool> try_complete(const PreparedExecution&, Tensor& output,
+                                               ops::MoeTokenValidity);
 
 } // namespace ninfer::models::moe::offload

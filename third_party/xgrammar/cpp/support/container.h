@@ -123,6 +123,8 @@ class List {
     XGRAMMAR_DCHECK(0 < node && node < node_pool_.Size());
     int next = node_pool_[node].next;
     Unlink(node);
+    // Deallocate only recycles the slot; release evicted values before reuse.
+    node_pool_[node].value = Value();
     node_pool_.Deallocate(node);
     return iterator(next, *this);
   }

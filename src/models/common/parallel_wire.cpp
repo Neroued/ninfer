@@ -17,6 +17,22 @@ artifact::Shape shape(Decoder& in) {
 }
 } // namespace
 
+void encode_batch_execution_spec(Encoder& out, const BatchExecutionSpec& spec) {
+    out.u32(spec.resident_capacity);
+    out.u32(spec.attention_owners);
+    out.u64(spec.graph_rows.size());
+    for (auto rows : spec.graph_rows) out.u32(rows);
+}
+
+BatchExecutionSpec decode_batch_execution_spec(Decoder& in) {
+    BatchExecutionSpec spec;
+    spec.resident_capacity = in.u32();
+    spec.attention_owners  = in.u32();
+    spec.graph_rows.resize(in.count(4));
+    for (auto& rows : spec.graph_rows) rows = in.u32();
+    return spec;
+}
+
 void encode_token_counts(Encoder& out, const TokenCounts& counts) {
     const auto& values = counts.storage();
     out.u8(static_cast<std::uint8_t>(values.index()));

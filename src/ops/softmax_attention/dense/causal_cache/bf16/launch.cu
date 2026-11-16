@@ -67,9 +67,11 @@ void execute_grouped(const Tensor& q, Input input, const Tensor& positions, floa
                      Cache cache, const Tensor* valid, const Tensor* rows,
                      const Bf16KvCausalPlan& plan, MemoryArena& workspace, Tensor& out,
                      cudaStream_t stream) {
-    auto scope   = workspace.scope();
-    auto storage = allocate_causal_partials(workspace, plan.query_heads, plan.width,
-                                            plan.partition.capacity, plan.batch);
+    auto scope = workspace.scope();
+    CausalPartialStorage storage;
+    if (plan.partition.capacity != 1)
+        storage = allocate_causal_partials(workspace, plan.query_heads, plan.width,
+                                           plan.partition.capacity, plan.batch);
     const auto p = make_causal_operands(q, positions, out, scale, plan.envelope.max_visible_keys);
     const auto view    = bf16_kv_cache_view<Input::writes_cache>(cache, valid, rows);
     const auto partial = storage.view();

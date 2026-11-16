@@ -1,3 +1,4 @@
+#include "ops/common/host/launch.h"
 #include "ops/dynamic_grouped_conv/add/launch.h"
 #include "core/device.h"
 #include "ops/linear/kernels/q8/q8_geometry.h"
@@ -15,9 +16,10 @@ namespace {
 __device__ __forceinline__ void finish_value(int row, int col, int width, float current,
                                              float previous, const __nv_bfloat16* base,
                                              const __nv_bfloat16* delta, __nv_bfloat16* residual) {
-    const int index = col * kHidden + row, di = col * 2 * kGroups + row / 16;
-    float value = fmaf(__bfloat162float(base[2 * kHidden + row]) + __bfloat162float(delta[di]),
-                       current, __bfloat162float(residual[index]));
+    const auto index = std::int64_t(col) * kHidden + row;
+    const auto di    = std::int64_t(col) * 2 * kGroups + row / 16;
+    float value      = fmaf(__bfloat162float(base[2 * kHidden + row]) + __bfloat162float(delta[di]),
+                            current, __bfloat162float(residual[index]));
     if (col % width != 0)
         value =
             fmaf(__bfloat162float(base[3 * kHidden + row]) + __bfloat162float(delta[di + kGroups]),
@@ -61,10 +63,11 @@ constexpr auto k4096  = make_launchers<4096>(std::make_index_sequence<11>{});
 constexpr auto k17408 = make_launchers<17408>(std::make_index_sequence<11>{});
 
 __global__ void finish_kernel(const __nv_bfloat16* projected, const __nv_bfloat16* base,
-                              const __nv_bfloat16* delta, __nv_bfloat16* residual, int width) {
-    const int row = blockIdx.x * blockDim.x + threadIdx.x, col = blockIdx.y;
+                              const __nv_bfloat16* delta, __nv_bfloat16* residual, int width,
+                              int column_offset) {
+    const int row = blockIdx.x * blockDim.x + threadIdx.x, col = column_offset + blockIdx.y;
     if (row >= kHidden) return;
-    const int index = col * kHidden + row;
+    const auto index = std::int64_t(col) * kHidden + row;
     finish_value(row, col, width, __bfloat162float(projected[index]),
                  col % width ? __bfloat162float(projected[index - kHidden]) : 0.0f, base, delta,
                  residual);
@@ -87,11 +90,14 @@ void launch(Plan plan, const Tensor& x, const Weight& weight, const Tensor& base
         launch_q8_a16_mma_r64x32_t64_k128_a1(flat, weight, result, stream);
         break;
     }
-    const dim3 grid((kHidden + 255) / 256, tokens);
-    finish_kernel<<<grid, 256, 0, stream>>>(static_cast<const __nv_bfloat16*>(projected.data),
-                                            static_cast<const __nv_bfloat16*>(base.data),
-                                            static_cast<const __nv_bfloat16*>(delta.data),
-                                            static_cast<__nv_bfloat16*>(residual.data), x.ne[1]);
+    common::for_each_token_slice(tokens, 1, [&](int offset, int count) {
+        const dim3 grid((kHidden + 255) / 256, count);
+        finish_kernel<<<grid, 256, 0, stream>>>(static_cast<const __nv_bfloat16*>(projected.data),
+                                                static_cast<const __nv_bfloat16*>(base.data),
+                                                static_cast<const __nv_bfloat16*>(delta.data),
+                                                static_cast<__nv_bfloat16*>(residual.data), x.ne[1],
+                                                offset);
+    });
     CUDA_CHECK(cudaGetLastError());
 }
 } // namespace ninfer::ops::detail::dynamic_grouped_conv::add

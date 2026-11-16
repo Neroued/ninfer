@@ -15,6 +15,7 @@ constexpr int C = 12288, H = 4096;
 // Q8 A16 reconstruction and the BF16 public result: two unit roundoffs, with a gross cap.
 constexpr ReductionCriterion a16_criterion{2.0 / 256, 1.0 / 256, 2.0 / 256};
 constexpr ReductionCriterion a8_criterion{0.04, 1.0 / 256, 0.06};
+enum class InactiveRows { None, Mixed, All };
 
 int fold_records(const Tensor& conv, const std::vector<std::uint16_t>& words,
                  const std::vector<float>& history, const std::vector<int>& selected,
@@ -78,8 +79,8 @@ int fold_records(const Tensor& conv, const std::vector<std::uint16_t>& words,
 
 int run_case(int width, int batch, bool in_place, bool graph, int capacity_last = 0,
              QType format             = QType::Q8_G32_FP16,
-             ops::LinearPolicy policy = ops::LinearPolicy::A16Only,
-             bool precision_boundary  = false) {
+             ops::LinearPolicy policy = ops::LinearPolicy::A16Only, bool precision_boundary = false,
+             InactiveRows inactive = InactiveRows::None) {
     auto packed = quantized_weight::make_patterned_weight(format, C, H, 1201);
     if (precision_boundary) {
         std::fill(packed.payload.begin(), packed.payload.end(), 0);
@@ -128,6 +129,10 @@ int run_case(int width, int batch, bool in_place, bool graph, int capacity_last 
         so[b]       = source.byte_offset(b);
         ds[b]       = in_place ? so[b] : destination.byte_offset(b);
         valid[b]    = std::max(1, width - b % width);
+        if (inactive == InactiveRows::All || (inactive == InactiveRows::Mixed && b % 3 == 0)) {
+            valid[b] = 0;
+            so[b] = ds[b] = -1;
+        }
     }
     auto sob = to_device(so), dsb = to_device(ds), vb = to_device(valid);
     Tensor st(sob.span(), DType::I64, {batch}), dt(dsb.span(), DType::I64, {batch}),
@@ -170,12 +175,14 @@ int run_case(int width, int batch, bool in_place, bool graph, int capacity_last 
         CUDA_CHECK(cudaStreamEndCapture(ex.stream(), &g));
         CUDA_CHECK(cudaGraphInstantiate(&exec, g, 0));
         const std::vector<int> one(batch, 1);
+        for (int b = 0; b < batch; ++b) so[b] = source.byte_offset(b);
+        sob.copy_from_host(so.data(), sob.size());
         vb.copy_from_host(one.data(), vb.size());
         CUDA_CHECK(cudaGraphLaunch(exec, ex.stream()));
         CUDA_CHECK(cudaStreamSynchronize(ex.stream()));
         for (int b = 0; b < batch; ++b) {
             selected[b] = batch - 1 - b;
-            so[b]       = source.byte_offset(selected[b]);
+            so[b]       = valid[b] ? source.byte_offset(selected[b]) : -1;
             if (in_place) ds[b] = so[b];
         }
         sob.copy_from_host(so.data(), sob.size());
@@ -214,6 +221,11 @@ int run_case(int width, int batch, bool in_place, bool graph, int capacity_last 
         std::vector<std::uint16_t> expected(C * 3);
         for (int j = 0; j < 3; ++j)
             for (int c = 0; c < C; ++c) {
+                if (!valid[b]) {
+                    const int original  = in_place ? selected[b] : b;
+                    expected[j * C + c] = f32_to_bf16(historyh[(original * 3 + j) * C + c]);
+                    continue;
+                }
                 const int pos = valid[b] - 3 + j;
                 expected[j * C + c] =
                     pos < 0 ? f32_to_bf16(historyh[(selected[b] * 3 + pos + 3) * C + c])
@@ -253,7 +265,8 @@ int run_case(int width, int batch, bool in_place, bool graph, int capacity_last 
                     bf16_to_f32(raw_bits[(std::size_t(b) * width + t) * C + c]));
             }
         }
-    failures += verify_reduction("fused projection/conv/SiLU", actual, reference, criterion);
+    if (!reference.empty())
+        failures += verify_reduction("fused projection/conv/SiLU", actual, reference, criterion);
     if (precision_boundary) {
         const double p        = 1.0 / 256;
         const double expected = bf16_to_f32(f32_to_bf16(p / (1 + std::exp(-p))));
@@ -261,8 +274,9 @@ int run_case(int width, int batch, bool in_place, bool graph, int capacity_last 
             if (plane[0] != expected)
                 throw std::runtime_error("projection was rounded before convolution");
     }
-    failures +=
-        verify_reduction("projected history", projected_actual, projected_reference, criterion);
+    if (!projected_reference.empty())
+        failures +=
+            verify_reduction("projected history", projected_actual, projected_reference, criterion);
     if (mx && width == 8 && batch == 8)
         failures += fold_records(records, raw_bits, historyh, selected, valid, ex);
     failures += source.verify_guards("source") + destination.verify_guards("destination") +
@@ -281,28 +295,121 @@ int main(int argc, char** argv) {
     suite.add("kda/input/materialized", [] { return run_case(9, 2, true, false); });
     suite.add("kda/input/prefill", [] { return run_case(129, 1, false, true); });
     suite.add("kda/input/workspace_interval", [] { return run_case(32, 1, false, false, 4096); });
+    suite.add("kda/input/expanded/update",
+              [] {
+                  return run_case(1, 17, true, true, 0, QType::Q8_G32_FP16,
+                                  ops::LinearPolicy::A16Only, false, InactiveRows::Mixed);
+              },
+              {{"suite", "concurrency"}});
+    suite.add("kda/input/expanded/window",
+              [] {
+                  return run_case(3, 9, false, true, 0, QType::Q8_G32_FP16,
+                                  ops::LinearPolicy::A16Only, false, InactiveRows::Mixed);
+              },
+              {{"suite", "concurrency"}});
+    suite.add("kda/input/expanded/materialized",
+              [] {
+                  return run_case(4, 64, false, false, 0, QType::Q8_G32_FP16,
+                                  ops::LinearPolicy::A16Only, false, InactiveRows::Mixed);
+              },
+              {{"suite", "concurrency"}});
+    suite.add("kda/input/expanded/all_inactive",
+              [] {
+                  return run_case(4, 9, true, true, 0, QType::Q8_G32_FP16,
+                                  ops::LinearPolicy::A16Only, false, InactiveRows::All);
+              },
+              {{"suite", "concurrency"}});
     for (int width :
          {31, 32, 33, 63, 64, 65, 127, 128, 255, 256, 257, 511, 512, 513, 2047, 2048, 2049})
         suite.add("kda/input/prefill_t" + std::to_string(width),
                   [width] { return run_case(width, 1, false, false); });
-    for (const auto [width, batch, in_place, graph] :
-         {std::tuple{1, 1, true, false}, {2, 4, false, false},   {3, 8, true, true},
-          {8, 8, false, true},           {9, 2, true, false},    {17, 1, true, true},
-          {31, 1, false, false},         {33, 1, true, true},    {9, 4, true, true},
-          {129, 1, false, true},         {24, 1, true, true},    {64, 1, true, true},
-          {65, 1, true, true},           {128, 1, true, true},   {16, 8, true, true},
-          {192, 1, false, false},        {193, 1, true, true},   {257, 1, false, true},
-          {385, 1, true, true},          {513, 1, false, true},  {1024, 1, false, false},
-          {2048, 1, false, false},       {4096, 1, false, false}})
+    for (const auto [width, batch, in_place, graph] : {std::tuple{1, 1, true, false},
+                                                       {1, 4, true, true},
+                                                       {2, 2, true, true},
+                                                       {3, 1, true, true},
+                                                       {4, 1, true, true},
+                                                       {5, 1, true, true},
+                                                       {2, 4, false, false},
+                                                       {3, 8, true, true},
+                                                       {4, 8, true, true},
+                                                       {5, 4, true, true},
+                                                       {5, 8, true, true},
+                                                       {6, 8, true, true},
+                                                       {7, 4, true, true},
+                                                       {7, 8, true, true},
+                                                       {8, 8, false, true},
+                                                       {9, 2, true, false},
+                                                       {17, 1, true, true},
+                                                       {31, 1, false, false},
+                                                       {33, 1, true, true},
+                                                       {9, 4, true, true},
+                                                       {129, 1, false, true},
+                                                       {24, 1, true, true},
+                                                       {64, 1, true, true},
+                                                       {65, 1, true, true},
+                                                       {128, 1, true, true},
+                                                       {16, 8, true, true},
+                                                       {192, 1, false, false},
+                                                       {193, 1, true, true},
+                                                       {257, 1, false, true},
+                                                       {385, 1, true, true},
+                                                       {513, 1, false, true},
+                                                       {1024, 1, false, false},
+                                                       {2048, 1, false, false},
+                                                       {4096, 1, false, false}})
         suite.add("kda/input/mxfp8/t" + std::to_string(width) + "b" + std::to_string(batch), [=] {
             return run_case(width, batch, in_place, graph, 0, QType::MXFP8,
                             ops::LinearPolicy::AllowA8);
         });
+    suite.add("kda/input/mxfp8/workspace_boundaries",
+              [] {
+                  for (const auto policy :
+                       {ops::LinearPolicy::A16Only, ops::LinearPolicy::AllowA8}) {
+                      const ops::LinearProfile profile{QType::MXFP8, C, H, policy,
+                                                       QuantLayout::RowGroupScale};
+                      for (int batch : {1, 8, 64})
+                          for (int last : {4, 8, 16, 128})
+                              for (const auto query :
+                                   {ops::kda_input_proj_conv_update_workspace_capacity_bytes,
+                                    ops::kda_input_proj_conv_record_workspace_capacity_bytes}) {
+                                  const auto capacity = query(profile, batch, 1, last);
+                                  for (int width = 1; width <= last; ++width)
+                                      if (query(profile, batch, width, width) > capacity)
+                                          throw std::runtime_error(
+                                              "KDA workspace interval omits a width");
+                              }
+                  }
+                  return 0;
+              },
+              {{"suite", "concurrency"}});
     suite.add("kda/input/mxfp8/workspace_interval", [] {
         return run_case(32, 1, false, false, 4096, QType::MXFP8, ops::LinearPolicy::AllowA8);
+    });
+    suite.add("kda/input/mxfp8/batched_workspace_interval", [] {
+        return run_case(9, 8, true, true, 9, QType::MXFP8, ops::LinearPolicy::AllowA8);
     });
     suite.add("kda/input/mxfp8/no_projection_rounding", [] {
         return run_case(129, 1, true, false, 0, QType::MXFP8, ops::LinearPolicy::A16Only, true);
     });
+    for (const auto [width, batch] : {std::pair{1, 64}, {3, 17}, {6, 9}, {4, 17}, {4, 64}})
+        suite.add("kda/input/mxfp8/expanded/t" + std::to_string(width) + "b" +
+                      std::to_string(batch),
+                  [=] {
+                      return run_case(width, batch, true, true, 0, QType::MXFP8,
+                                      ops::LinearPolicy::AllowA8, false, InactiveRows::Mixed);
+                  },
+                  {{"suite", "concurrency"}});
+    suite.add("kda/input/mxfp8/expanded/whole_window",
+              [] {
+                  return run_case(128, 2, true, true, 0, QType::MXFP8, ops::LinearPolicy::AllowA8,
+                                  false, InactiveRows::Mixed);
+              },
+              {{"suite", "concurrency"}});
+    suite.add("kda/input/mxfp8/expanded/a16",
+              [] {
+                  return run_case(4, 64, false, true, 0, QType::MXFP8, ops::LinearPolicy::A16Only,
+                                  false, InactiveRows::Mixed);
+              },
+              {{"suite", "concurrency"}});
     return suite.main(argc, argv);
 }

@@ -1,11 +1,15 @@
 #pragma once
 
+#include "models/common/batch.h"
 #include "models/common/parallel.h"
 #include "models/common/token_input.h"
 #include "distributed/wire.h"
 #include "ninfer/types.h"
 
 namespace ninfer::models {
+
+void encode_batch_execution_spec(distributed::wire::Encoder&, const BatchExecutionSpec&);
+[[nodiscard]] BatchExecutionSpec decode_batch_execution_spec(distributed::wire::Decoder&);
 
 void encode_token_counts(distributed::wire::Encoder&, const TokenCounts&);
 [[nodiscard]] TokenCounts decode_token_counts(distributed::wire::Decoder&);

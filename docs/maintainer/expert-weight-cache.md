@@ -34,6 +34,7 @@ CPU 直接读 Host bank；注册视图供异步 CUDA 传输使用，不改变 Ho
 | 大 T 返回小 T | 仅重建窗口额外集合，已 ready 部分立即可用，剩余部分由 CPU 计算 |
 
 分派依据实际 token 数与计算 profile，Prefill、Decode、Verify 和 Control 使用同一机制。
+Graph padding 不计入策略阈值；bridge、workspace 与图容量按物理形状及其可能的有效范围准备。
 切换不搬动固定区。不同层的编码大小和整 expert 取整会留下有限尾部余量，由真实布局核算。
 
 静态优先级只决定副本集合，不改变路由。默认标定属于模型，显式排序可以覆盖；

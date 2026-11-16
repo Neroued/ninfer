@@ -14,6 +14,29 @@ Weight capacity_weight(QType format, std::int32_t rows, std::int32_t columns) {
     return weight;
 }
 
+void append_batch_cases(std::vector<SnapshotCase>& result, Profile profile) {
+    using Policy      = ops::LinearPolicy;
+    const auto policy = profile.format == QType::NVFP4                 ? Policy::AllowA4
+                        : profile.format == QType::FP8_E4M3FN_ROW_BF16 ? Policy::AllowA8
+                                                                       : Policy::A16Only;
+    for (const auto [width, batch] : {std::pair{1, 9}, std::pair{4, 17}}) {
+        std::vector<int> valid(batch);
+        for (int row = 0; row < batch; ++row) valid[row] = row % 3 == 1 ? 0 : width - row % width;
+        result.push_back({.width     = width,
+                          .policy    = policy,
+                          .graph     = true,
+                          .batch     = batch,
+                          .valid     = std::move(valid),
+                          .conv_seed = 987});
+    }
+    result.push_back({.width = 3, .batch = 1, .valid = {0}, .conv_seed = 991});
+    if (profile.qk_rows == 1024)
+        for (const int batch : {17, 32})
+            result.push_back({.width = 1, .graph = true, .batch = batch, .conv_seed = 997});
+    if (profile.format == QType::Q8_G32_FP16 && profile.hidden == 2560)
+        result.push_back({.width = 1, .batch = 64, .conv_seed = 997});
+}
+
 std::vector<SnapshotCase> cases(Profile p) {
     using Policy = ops::LinearPolicy;
     std::vector<SnapshotCase> result;
@@ -41,6 +64,7 @@ std::vector<SnapshotCase> cases(Profile p) {
                 batch(t, b, std::move(valid), 739);
                 result.back().graph = (b == 2 && t == 6) || (b == 8 && t == 16);
             }
+        append_batch_cases(result, p);
         return result;
     }
     if (p.format == QType::Q4_G64_FP16) {
@@ -77,6 +101,17 @@ std::vector<SnapshotCase> cases(Profile p) {
                   {17, Policy::AllowA4, 0},
                   {1024, Policy::AllowA4}};
         batch(6, 3, {6, 3, 1}, 829, Policy::AllowA4);
+        for (int b = 2; b <= 8; ++b) {
+            batch(1, b, {}, 831U + b);
+            result.back().graph = b == 8;
+        }
+        for (auto [b, w] : {std::pair{1, 4}, std::pair{8, 4}, std::pair{4, 8}, std::pair{8, 16},
+                            std::pair{2, 4}}) {
+            std::vector<int> valid(b);
+            for (int row = 0; row < b; ++row) valid[row] = w - row % w;
+            batch(w, b, std::move(valid), 853U + b + w);
+            result.back().graph = true;
+        }
     } else {
         result = {{.width = 1},
                   {3},
@@ -97,7 +132,9 @@ std::vector<SnapshotCase> cases(Profile p) {
     }
     // The persistent single-token publication has its own public entry and offset mapping.
     batch(1, 1, {}, 977U);
-    result.back().graph = true;
+    result.back().graph          = true;
+    result.back().full_reference = p.format == QType::NVFP4;
+    append_batch_cases(result, p);
     return result;
 }
 } // namespace
@@ -164,6 +201,28 @@ int snapshot_capacity_contract() {
             }
         }
 #endif
+    const ops::SingleProjectionWeight nvfp4_a16{capacity_weight(QType::NVFP4, 16384, 5120),
+                                                ops::LinearPolicy::A16Only};
+    for (int b = 1; b <= 8; ++b) {
+        for (int first = 1; first <= 16; ++first) {
+            std::size_t snapshot_peak = 0, record_peak = 0;
+            for (int last = first; last <= 16; ++last) {
+                const auto snapshot = [&](int lo, int hi) {
+                    return ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(nvfp4_a16, b,
+                                                                                      lo, hi);
+                };
+                snapshot_peak = std::max(snapshot_peak, snapshot(last, last));
+                if (snapshot(first, last) < snapshot_peak) ++failures;
+                if (first < 2) continue;
+                const auto record = [&](int lo, int hi) {
+                    return ops::gdn_input_proj_conv_record_workspace_capacity_bytes(nvfp4_a16, b,
+                                                                                    lo, hi);
+                };
+                record_peak = std::max(record_peak, record(last, last));
+                if (record(first, last) < record_peak) ++failures;
+            }
+        }
+    }
     const std::size_t nvfp4_a4_4 = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
         ops::SingleProjectionWeight{capacity_weight(QType::NVFP4, 16384, 5120),
                                     ops::LinearPolicy::AllowA4},
@@ -192,7 +251,7 @@ int snapshot_capacity_contract() {
             batch, min_width, max_width);
     };
     for (auto policy : {ops::LinearPolicy::A16Only, ops::LinearPolicy::AllowA8}) {
-        for (int batch : {1, 2, 8}) {
+        for (int batch : {1, 2, 8, 9, 17, 64}) {
             std::size_t peak = 0;
             for (int width = 1; width <= 16; ++width) {
                 peak = std::max(peak, fp8_snapshot_capacity(policy, batch, width, width));
@@ -203,6 +262,11 @@ int snapshot_capacity_contract() {
             }
         }
     }
+    try {
+        (void)ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(q8_capacity_weights,
+                                                                         INT32_MAX, 2, 2);
+        ++failures;
+    } catch (const std::invalid_argument&) {}
     return failures;
 }
 
@@ -223,10 +287,13 @@ int main(int argc, char** argv) {
                              std::to_string(profile.hidden) + "/t" + std::to_string(c.width) +
                              (c.batch ? "/batch" + std::to_string(c.batch) : "/single") + "/" +
                              policy_name(c.policy) + (c.graph ? "/graph" : "/eager");
+            if (std::find(c.valid.begin(), c.valid.end(), 0) != c.valid.end()) id += "/inactive";
             catalogue.push_back({id,
                                  {{"format", profile.name},
                                   {"policy", policy_name(c.policy)},
                                   {"execution", c.graph ? "graph" : "eager"}}});
+            if (c.batch > 8 || std::find(c.valid.begin(), c.valid.end(), 0) != c.valid.end())
+                catalogue.back().tags.emplace_back("suite", "concurrency");
         }
         suite.add(std::move(catalogue), [=](auto selected) {
             Weights weights(profile, false);

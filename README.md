@@ -5,7 +5,8 @@
 NInfer runs text and image/video generation through a local CLI or OpenAI- and
 Anthropic-compatible HTTP APIs. It supports single-device execution and model-parallel execution
 across two DGX Sparks, with CUDA Graph decode, speculative decoding, and shared-prefix caching.
-One Engine serves one model with up to eight active requests.
+One Engine serves one model with a configurable resident-request capacity. Startup checks the
+resources required by that capacity; decode batches use the requests currently ready to run.
 
 ## Supported models and deployments
 
@@ -14,7 +15,7 @@ One Engine serves one model with up to eight active requests.
 | Qwen3.6-27B / Qwen3.8-27B | Qwen3.5 Dense | RTX 5090 | MTP; DFlash2 for Qwen3.8-27B with companion weights |
 | Qwen3.6-35B-A3B | Qwen3.5 MoE | RTX 5090, resident or CPU expert offload | MTP or DFlash with companion weights |
 | Qwen3.8-Flash-Next | Qwen4Exp | RTX 5090 with CPU expert offload; one or two Sparks | MTP |
-| GLM-5.3-Flash | GLM5Next | Two Sparks | MTP |
+| GLM-5.3-Flash | GLM5Next | Two Sparks | MTP or DFlash2 with companion weights |
 
 All rows support text, Vision, tools, constrained output, and offline perplexity scoring.
 Vision and speculative decoding require the corresponding components in the artifact and must be
@@ -43,12 +44,17 @@ cmake --build build/rtx5090-release -j
 ```
 
 For a single Spark, use `dgx-spark-release` and `build/dgx-spark-release`.
-For two Sparks, install NCCL development headers and libraries and build on **both nodes**:
+For two Sparks, install NCCL and libibverbs development headers and libraries
+(`libibverbs-dev` on Debian/Ubuntu), then build on **both nodes**:
 
 ```bash
 cmake --preset dgx-spark-release -DNINFER_ENABLE_DISTRIBUTED=ON
 cmake --build build/dgx-spark-release -j
 ```
+
+Communication is selected during preparation. Two-rank Spark groups prefer the Native RDMA
+backend; NCCL remains available for other supported routes. See the
+[deployment guide](docs/startup-configuration.md#distributed-deployment) for network selection.
 
 Product binaries are `apps/ninfer`, `apps/ninfer-serve`, `apps/ninfer-perplexity`, and, with
 distributed execution enabled, `apps/ninfer-worker`. Run them from the build tree; keep its `lib/`
@@ -95,7 +101,9 @@ the entry file and pass only the entry path to NInfer. For two Sparks, place the
 node; rank-specific slicing happens during loading. The model cards describe their mixed precision,
 components and deployment options.
 
-For custom weights, follow [weight conversion](docs/weight-conversion.md). Older v2 files can be
+For custom weights, including GLM FP4 Local and additional companion components, follow
+[weight conversion](docs/weight-conversion.md). The download table describes the
+published artifacts recorded by their model cards. Older v2 files can be
 [upgraded locally](docs/weight-conversion.md#upgrade-an-existing-v2-artifact).
 
 ## Run
@@ -154,14 +162,38 @@ See [resource controls](docs/startup-configuration.md#context-and-memory) for tu
 
 ## Performance
 
-These recorded campaigns used an RTX 5090 and the engine version identified by each result page. The [performance index](docs/performance.md) links to
-per-model run records and the [measurement rules](docs/performance/methodology.md). The tables
-below are excerpts from those detailed results. Those campaigns used FP8 E4M3 row-256 KV for Qwen3.8
-and INT8 group-64 KV for Qwen3.6.
-The measurements retain their original cache formats and resource settings; they are not measurements
-of the current Spark or distributed paths.
+The [performance index](docs/performance.md) links to recorded RTX 5090 and DGX Spark measurements,
+their configurations, and [measurement rules](docs/performance/methodology.md). The tables below
+are excerpts from the model result pages.
 
-### Concurrent MTP3 decode
+### DGX Spark: Qwen3.8-Flash-Next
+
+[Measured November 15–16, 2026](docs/performance/qwen3.8-flash-next.md): NVFP4 experts, FP8 KV,
+MTP3 with optimized head, CUDA Graphs, and a 4,096-token prefill chunk. Dual Spark uses TP2,
+including expert TP, and Native communication. Saturation uses the JSONL fixture with an
+8,192-token output budget; cells show steady decode tok/s and draft-token acceptance.
+
+| Deployment | C=1 tok/s / accept | C=2 tok/s / accept | C=4 tok/s / accept | C=8 tok/s / accept | C=16 tok/s / accept | C=32 tok/s / accept |
+|---|---:|---:|---:|---:|---:|---:|
+| Single Spark | 70.0 / 99.5% | 107.9 / 99.5% | 160.1 / 99.3% | 226.4 / 99.3% | 328.5 / 99.1% | — |
+| Dual Spark, TP2 | 109.5 / 99.6% | 177.1 / 99.3% | 281.0 / 99.6% | 399.6 / 99.4% | 581.6 / 99.5% | 811.9 / 99.1% |
+
+MTP3 single-request phase means, in tok/s:
+
+| Deployment | 7,680-token prefill | 260,096-token prefill | Structured decode |
+|---|---:|---:|---:|
+| Single Spark | 3,192.2 | 2,950.0 | 66.8 |
+| Dual Spark, TP2 | 4,251.6 | 3,873.6 | 107.2 |
+
+The [full report](docs/performance/qwen3.8-flash-next.md) includes decode step latency, MTP0/MTP3
+context profiles, scenario statistics, and the 75-request corpus at C=1/2/4/8.
+
+### RTX 5090
+
+These campaigns used FP8 E4M3 row-256 KV for Qwen3.8 and INT8 group-64 KV for Qwen3.6.
+Their model pages retain the measured engine versions, cache formats, and resource settings.
+
+#### Concurrent MTP3 decode
 
 Saturated decode used CUDA Graphs, MTP3, and one 8,192-token generation per active
 request. Throughput uses aggregate committed decode tokens from complete intervals whose actual
@@ -176,7 +208,7 @@ these rates are steady decode (tok/s).
 | [Qwen3.8-27B](docs/performance/qwen3.8-27b.md#decode-saturation) `groupwise-int` | 136.5 / 44.4% | 253.3 / 45.2% | 398.1 / 46.1% | 582.4 / 46.4% |
 | [Qwen3.8-27B](docs/performance/qwen3.8-27b.md#decode-saturation) `nvfp4` | 147.7 / 46.2% | 291.0 / 48.7% | 522.2 / 45.8% | 922.4 / 46.1% |
 
-### Single-request serving
+#### Single-request serving
 
 The serial serving corpus used CUDA Graphs, a 1,024-token prefill chunk, and five
 fixed seeds after warm-up. The table keeps one short-prefill, one extreme-prefill, and one
@@ -242,6 +274,7 @@ docker run --rm --gpus '"device=0"' --publish 8080:8080 \
 
 - [Deployment configurations](examples/configs/) and [startup parameters](docs/startup-configuration.md)
 - [CLI](docs/cli.md), [HTTP serving](docs/serving.md), and [perplexity](docs/perplexity.md)
+- [Monitoring API](docs/serving.md#monitoring-api) and [Dashboard](dashboard/README.md)
 - [Weight conversion](docs/weight-conversion.md)
 - [Recorded performance](docs/performance.md), [benchmarks](bench/README.md), and [evaluation](eval/README.md)
 - [Documentation index](docs/README.md) and [contributing](CONTRIBUTING.md)

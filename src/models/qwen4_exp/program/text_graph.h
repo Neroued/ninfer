@@ -12,7 +12,7 @@ class TextGraph {
 public:
     void prepare(execution::TextRun&, const execution::Parameters&, moe::Schedule*,
                  std::span<const std::uint32_t> bounds, std::array<ple::DeviceEmbedding, 2>,
-                 execution::TextOutputs, Tensor logits, std::int32_t columns, MemoryArena&,
+                 execution::TextOutputs, Tensor logits, moe::TokenGeometry geometry, MemoryArena&,
                  DeviceContext&, const std::function<void()>& install_inputs);
     void select(std::uint32_t visible_tokens);
     void set_head(bool enabled);
@@ -54,8 +54,8 @@ private:
                           const std::function<void()>& install_inputs);
     void prepare_offloaded(execution::TextRun&, const execution::Parameters&, moe::Schedule&,
                            std::array<ple::DeviceEmbedding, 2>, execution::TextOutputs,
-                           Tensor logits, std::int32_t columns, MemoryArena&, CudaExecutionView,
-                           const std::function<void()>& install_inputs);
+                           Tensor logits, moe::TokenGeometry geometry, MemoryArena&,
+                           CudaExecutionView, const std::function<void()>& install_inputs);
     void capture_finish(execution::TextRun&, const execution::Parameters&, execution::TextOutputs,
                         Tensor logits, MemoryArena&, CudaExecutionView);
     DecodeGraphSection head_;

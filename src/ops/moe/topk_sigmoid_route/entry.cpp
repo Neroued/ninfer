@@ -30,11 +30,12 @@ std::size_t topk_sigmoid_route_workspace_capacity_bytes(const SigmoidRouteProfil
 }
 
 void topk_sigmoid_route(const Tensor& x, const SigmoidRouteProfile& p, const Weight& control,
-                        const Tensor& bias, ExpertRoutes& routes, MemoryArena& ws,
-                        CudaExecutionView execution) {
+                        const Tensor& bias, ExpertRoutes& routes, MoeTokenValidity validity,
+                        MemoryArena& ws, CudaExecutionView execution) {
     validate(p);
     detail::MoeOperands operands("topk_sigmoid_route", execution);
     const int tokens = operands.input(x, p.route.hidden);
+    operands.validity(validity, tokens);
     operands.sigmoid_control(control, p.route);
     operands.coefficient(bias, p.route.experts, false);
     operands.routes(routes, p.route.top_k, tokens, true);
@@ -46,7 +47,7 @@ void topk_sigmoid_route(const Tensor& x, const SigmoidRouteProfile& p, const Wei
 #if NINFER_TARGET_SPARK
     auto scores = scratch.alloc(DType::FP32, {p.route.experts, tokens});
     detail::moe_sigmoid::launch(x, control, bias, routes, p, static_cast<float*>(scores.data),
-                                execution.stream());
+                                detail::moe_cuda::token_validity(validity), execution.stream());
 #endif
 }
 } // namespace ninfer::ops

@@ -107,5 +107,59 @@ MtpStemBuffers mtp_stem(Arena& a, const TextConfig& c, int columns) {
             a.alloc(DType::BF16, {dimension(2ULL * c.hidden), columns})};
 }
 
+struct DraftBranch {
+    Tensor prepared, delta, partial;
+};
+
+template <class Arena>
+DraftBranch draft_branch(Arena& a, const ModelProfile& p, int width, int batch) {
+    const int h      = dimension(p.config.text.hidden);
+    const int groups = dimension(p.config.text.hidden / p.config.draft->dflash2->conv_group_size);
+    const int taps   = dimension(p.config.draft->dflash2->conv_kernel_size);
+    return {a.alloc(DType::BF16, {h, width, batch}),
+            a.alloc(DType::BF16, {groups, taps, width, batch}),
+            a.alloc(DType::BF16, {h, width, batch})};
+}
+
+struct DraftAttentionBuffers {
+    DraftBranch branch;
+    Tensor key, value, query, output;
+};
+
+template <class Arena>
+DraftAttentionBuffers draft_attention(Arena& a, const ModelProfile& p, int width, int batch) {
+    const auto& g = p.draft->attention;
+    return {draft_branch(a, p, width, batch),
+            a.alloc(DType::BF16, {g.head_dim, g.kv_heads, width, batch}),
+            a.alloc(DType::BF16, {g.head_dim, g.kv_heads, width, batch}),
+            a.alloc(DType::BF16, {g.head_dim, g.query_heads, width, batch}),
+            a.alloc(DType::BF16, {g.head_dim, g.query_heads, width, batch})};
+}
+
+struct DraftFinishBuffers {
+    Tensor hidden, projected, keys, gathered;
+};
+
+template <class Arena>
+DraftFinishBuffers draft_finish(Arena& a, const ModelProfile& p, int steps, int batch) {
+    const auto& d = *p.config.draft->dflash2;
+    return {
+        a.alloc(DType::BF16, {dimension(p.config.text.hidden), steps * batch}),
+        a.alloc(DType::BF16, {dimension(d.selector_rank), steps, batch}),
+        a.alloc(DType::I64, {dimension(d.selector_top_k), steps, batch}),
+        a.alloc(DType::I64, {dimension(d.selector_top_k), steps, batch, dimension(p.local.size)})};
+}
+
+struct DraftContextBuffers {
+    Tensor projected, gathered, normalized;
+};
+
+template <class Arena>
+DraftContextBuffers draft_context(Arena& a, const ModelProfile& p, int columns) {
+    return {a.alloc(DType::BF16, {p.draft->feature_projection.n, columns}),
+            a.alloc(DType::BF16, {p.draft->feature_projection.n, columns, dimension(p.local.size)}),
+            a.alloc(DType::BF16, {dimension(p.config.text.hidden), columns})};
+}
+
 } // namespace workspace
 } // namespace ninfer::models::glm5next::execution

@@ -48,7 +48,6 @@ void encode_prompt(PreparedPromptData& output, const text::Tokenizer& tokenizer,
                    const std::vector<std::vector<text::ByteSpan>>& media_spans) {
     std::vector<std::size_t> offsets = boundaries.semantic;
     offsets.insert(offsets.end(), boundaries.structural.begin(), boundaries.structural.end());
-    offsets.insert(offsets.end(), boundaries.execution.begin(), boundaries.execution.end());
     for (const auto marker : boundaries.markers)
         if (marker) offsets.push_back(*marker);
     if (boundaries.rewrite) offsets.push_back(boundaries.rewrite->frontier);
@@ -87,7 +86,6 @@ void encode_prompt(PreparedPromptData& output, const text::Tokenizer& tokenizer,
         markers.push_back(marker ? frontier(*marker) : std::nullopt);
     output.context_cache = models::frontend::prepare_context_cache(
         hints, markers, convert(boundaries.semantic), convert(boundaries.structural));
-    output.identity.execution_frontiers = convert(boundaries.execution);
     if (boundaries.rewrite) {
         if (const auto value = frontier(boundaries.rewrite->frontier))
             output.identity.rewrite_checkpoint = models::frontend::RewriteCheckpointSpec{

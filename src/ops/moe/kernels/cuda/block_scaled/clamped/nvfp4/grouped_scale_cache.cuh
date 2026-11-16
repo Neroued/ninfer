@@ -41,7 +41,7 @@ __device__ __forceinline__ void produce(Shared<S>& s, const Maps& maps, int row,
         const int stage = kt % 2, physical = (kt + rotation) % (S::k / 128);
         common::cta_mbarrier_wait(&s.empty[stage], 1U ^ ((kt / 2) & 1U));
         if (!lane) {
-            common::cta_mbarrier_arrive_expect_tx(
+            common::cta_mbarrier_expect_tx(
                 &s.full[stage], (64 + S::columns) * 64 + ((kt & 1) ? 0 : S::columns * 16));
             common::tma_load_2d(s.weights[stage], &maps.weights, physical * 64, row,
                                 &s.full[stage]);
@@ -56,7 +56,7 @@ __device__ __forceinline__ void produce(Shared<S>& s, const Maps& maps, int row,
                                     begin, &s.full[stage]);
         }
         __syncwarp();
-        if (!lane) common::cta_mbarrier_arrive(&s.full[stage]);
+        common::cta_mbarrier_arrive(&s.full[stage]);
     }
 }
 
@@ -108,7 +108,7 @@ __device__ __forceinline__ void consume(Shared<S>& s, int columns, int rotation,
                 }
             }
         }
-        if (!lane) common::cta_mbarrier_arrive(&s.empty[stage]);
+        common::cta_mbarrier_arrive(&s.empty[stage]);
     }
 }
 
@@ -127,10 +127,10 @@ __global__ __launch_bounds__(S::threads, S::min_blocks) void contract(
     const int wm = (consumer / 32) % 2, wn = (consumer / 32) / 2;
     if (!tid) {
         for (int stage = 0; stage < 2; ++stage) {
-            common::cta_mbarrier_init(&s.full[stage], 2);
-            common::cta_mbarrier_init(&s.empty[stage], S::consumer_warps);
-            common::cta_mbarrier_init(&s.scale_full[stage], 1);
-            common::cta_mbarrier_init(&s.scale_empty[stage], S::consumer_warps);
+            common::cta_mbarrier_init(&s.full[stage], 32);
+            common::cta_mbarrier_init(&s.empty[stage], S::consumer_threads);
+            common::cta_mbarrier_init(&s.scale_full[stage], 32);
+            common::cta_mbarrier_init(&s.scale_empty[stage], S::consumer_threads);
         }
         common::cta_mbarrier_fence_init();
     }
@@ -178,7 +178,7 @@ __global__ __launch_bounds__(S::threads, S::min_blocks) void contract(
                     s.product_factors[slot] = product_scale.get(expert);
                 }
                 __syncwarp();
-                if (!lane) common::cta_mbarrier_arrive(&s.scale_full[slot]);
+                common::cta_mbarrier_arrive(&s.scale_full[slot]);
             } else {
                 if constexpr (Role == 2) {
                     common::cta_mbarrier_wait(&s.scale_full[slot], (sequence / 2) & 1U);
@@ -243,7 +243,7 @@ __global__ __launch_bounds__(S::threads, S::min_blocks) void contract(
                 }
                 if constexpr (Role == 2) {
                     __syncwarp();
-                    if (!lane) common::cta_mbarrier_arrive(&s.scale_empty[slot]);
+                    common::cta_mbarrier_arrive(&s.scale_empty[slot]);
                 }
             }
             ++sequence;

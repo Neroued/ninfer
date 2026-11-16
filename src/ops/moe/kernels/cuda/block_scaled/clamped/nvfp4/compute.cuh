@@ -642,10 +642,6 @@ struct PoolContraction {
     }
 };
 
-__device__ __forceinline__ bool includes(ExpertSubsetKind kind, const int* mask, int expert) {
-    return kind == ExpertSubsetKind::All || mask[expert] == (kind == ExpertSubsetKind::MaskOnes);
-}
-
 __device__ __forceinline__ void expand_group(Matrix weight, int row, int group, int k,
                                              float* values) {
     const auto decoded =
@@ -666,7 +662,7 @@ __global__ void vector_gate(const __nv_bfloat16* x, ExpertMatrixDeviceView bank,
                             ExpertSubsetKind kind, const int* mask, float* activation,
                             float limit) {
     const int assignment = blockIdx.y, expert = ids[assignment];
-    if (!includes(kind, mask, expert)) { return; }
+    if (!expert_in_subset(kind, mask, expert)) { return; }
     const auto weight = resolve(bank, expert);
     const int row = blockIdx.x * 4 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
     // Keep the shared input resident while streamed weight codes occupy L1.
@@ -712,7 +708,7 @@ __global__ void vector_down(const float* activation, ExpertMatrixDeviceView bank
     for (int route = warp; route < kTopK; route += Warps) {
         const int assignment = token * kTopK + route, expert = ids[assignment];
         float sum[Rows] = {};
-        if (includes(kind, mask, expert)) {
+        if (expert_in_subset(kind, mask, expert)) {
             const auto weight = resolve(bank, expert);
             for (int group = lane; group < Intermediate / 16; group += 32) {
                 float x[16];
@@ -741,8 +737,9 @@ __global__ void vector_down(const float* activation, ExpertMatrixDeviceView bank
         float result = 0;
 #pragma unroll
         for (int j = 0; j < Warps; ++j) result += values[j][threadIdx.x];
-        const int i = token * kHidden + blockIdx.x * Rows + threadIdx.x;
-        output.store(i, output.initial(i) + result);
+        const int i     = token * kHidden + blockIdx.x * Rows + threadIdx.x;
+        const bool live = output.is_live(token);
+        output.store(i, output.initial(i, live) + result, live);
     }
 }
 

@@ -99,20 +99,37 @@ xgrammar::Grammar choice_grammar(const std::vector<std::string>& choices) {
 
 // Consume through the first complete delimiter, including tokens that cross it.
 xgrammar::Grammar reasoning_prefix(std::string_view delimiter) {
-    auto body = xgrammar::GrammarFSMBuilder::TagDispatch({{}, false, {std::string(delimiter)}});
-    if (!body) throw std::logic_error("invalid reasoning delimiter");
-    const auto ends = body->GetEnds();
-    int tail        = body->AddState();
-    for (int end : ends) body->GetFsm().AddEpsilonEdge(end, tail);
-    for (unsigned char byte : delimiter) {
-        const int next = body->AddState();
-        body->GetFsm().AddEdge(tail, next, byte, byte);
-        tail = next;
+    if (delimiter.empty()) throw std::logic_error("empty reasoning delimiter");
+    const int length = static_cast<int>(delimiter.size());
+    std::vector<int> failure(length);
+    for (int i = 1, matched = 0; i < length; ++i) {
+        while (matched && delimiter[i] != delimiter[matched]) matched = failure[matched - 1];
+        if (delimiter[i] == delimiter[matched]) ++matched;
+        failure[i] = matched;
+    }
+    xgrammar::FSM fsm;
+    for (int state = 0; state <= length; ++state) fsm.AddState();
+    // The first complete delimiter is terminal. A separate arbitrary-prefix rule
+    // would also accept overlapping delimiters across its concatenation boundary.
+    for (int state = 0; state < length; ++state) {
+        const auto advance = [&](int byte) {
+            int matched = state;
+            while (matched && byte != static_cast<unsigned char>(delimiter[matched]))
+                matched = failure[matched - 1];
+            return matched + (byte == static_cast<unsigned char>(delimiter[matched]));
+        };
+        int begin = 0, destination = advance(0);
+        for (int byte = 1; byte <= 256; ++byte) {
+            const int next = byte < 256 ? advance(byte) : -1;
+            if (next == destination) continue;
+            fsm.AddEdge(state, destination, begin, byte - 1);
+            begin       = byte;
+            destination = next;
+        }
     }
     xgrammar::GrammarBuilder builder;
     const auto value = xgrammar::AddScalarStringFSM(
-        builder, xgrammar::FSMWithStartEnd(body->GetFsm(), body->GetStart(), {tail}), "reasoning",
-        false);
+        builder, xgrammar::FSMWithStartEnd(fsm, 0, {length}), "reasoning", false);
     return xgrammar::GrammarNormalizer::Apply(builder.Get(builder.AddRuleWithHint("root", value)));
 }
 

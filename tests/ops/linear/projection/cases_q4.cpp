@@ -53,6 +53,27 @@ void q4_a16_conformance(Suite& suite) {
                   {n, 2560, 211U, Comparison::Sampled, false, vocabulary_calls});
         add_workspace_cases(suite, QType::Q4_G64_FP16, n, 2560);
     }
+#if NINFER_TARGET_RTX5090
+    const std::array head5120_calls{
+        convenience(1), graph(4), a16(8),  a16(16), a16(32),  graph(33),  a16(64),  graph(65),
+        a16(80),        a16(81),  a16(96), a16(97), a16(112), graph(128), a16(129), a16(512)};
+    add_shape(suite, QType::Q4_G64_FP16, ActivationRecipe::Hashed, make_q4_g64_fp16_weight,
+              {248320, 5120, 217U, Comparison::Sampled, true, head5120_calls});
+    const std::array head5120_tail{a16(1), graph(17)};
+    add_shape(
+        suite, QType::Q4_G64_FP16, ActivationRecipe::TokenBlocks, make_q4_g64_fp16_weight,
+        {248320, 5120, 219U, Comparison::Sampled, true, head5120_tail, ActivationPattern::KTail});
+    const auto padded_head = +[](std::int32_t n, std::int32_t k, std::uint32_t seed) {
+        auto packed     = make_q4_g64_fp16_weight(n, k + 128, seed);
+        packed.geometry = {};
+        packed.weight.k = packed.weight.shape[1] = k;
+        return packed;
+    };
+    const std::array padded_head_calls{a16(1), graph(4), a16(8)};
+    add_shape(suite, QType::Q4_G64_FP16, ActivationRecipe::Hashed, padded_head,
+              {248320, 5120, 223U, Comparison::Sampled, true, padded_head_calls});
+    add_workspace_cases(suite, QType::Q4_G64_FP16, 248320, 5120);
+#endif
 
     const std::array kN1024K5120{
         convenience(1), graph(2), a16(3),  graph(4),  a16(5),    a16(7),    graph(8), a16(9),

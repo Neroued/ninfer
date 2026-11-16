@@ -4,6 +4,8 @@
 #include "ops/kv_cache/append/prefix.cuh"
 #include "ops/kv_cache/kernels/write.h"
 
+#include <algorithm>
+
 namespace ninfer::ops::detail {
 namespace {
 
@@ -14,7 +16,9 @@ kv::PagedWriteInstance select_append(KvCacheStorage storage, int heads, int toke
     return tokens >= 128 && heads == 2 ? Instance::Page8x256 : Instance::WarpRows256;
 }
 
-int select_cyclic_threads(int max_count, int batch) { return max_count * batch <= 128 ? 64 : 128; }
+int select_cyclic_threads(int max_count, int batch) {
+    return std::int64_t(max_count) * batch <= 128 ? 64 : 128;
+}
 
 template <int Capacity, int Threads>
 void launch_cyclic(const Tensor& k, const Tensor& v, const Tensor& positions, const Tensor& counts,
@@ -46,6 +50,17 @@ void kv_cache_append_prefix_dispatch(const Tensor& k, const Tensor& v, const Ten
                                      KVCacheAppendPrefixExecutionEnvelope envelope,
                                      cudaStream_t stream) {
     if (envelope.max_count == 0) return;
+    constexpr int MaxGridRows = 65535;
+    if (k.ne[3] > MaxGridRows) {
+        for (std::int64_t begin = 0; begin < k.ne[3]; begin += MaxGridRows) {
+            const int rows = std::min<std::int64_t>(MaxGridRows, k.ne[3] - begin);
+            kv_cache_append_prefix_dispatch(
+                k.slice(3, begin, rows), v.slice(3, begin, rows), positions.slice(1, begin, rows),
+                counts.slice(0, begin, rows), table_rows.slice(0, begin, rows), cache, envelope,
+                stream);
+        }
+        return;
+    }
     if (cache.head_dim == 256) {
         kv::launch_paged_write(kv::PagedWriteInstance::BatchRows256, k, v, positions, counts,
                                table_rows, cache, stream);
@@ -69,6 +84,19 @@ void kv_cache_append_prefix_dispatch(const Tensor& k, const Tensor& v, const Ten
                                      KVCacheAppendPrefixExecutionEnvelope envelope,
                                      cudaStream_t stream) {
     if (envelope.max_count == 0) return;
+    constexpr int MaxGridRows = 65535;
+    if (k.ne[3] > MaxGridRows) {
+        for (std::int64_t begin = 0; begin < k.ne[3]; begin += MaxGridRows) {
+            const int rows                  = std::min<std::int64_t>(MaxGridRows, k.ne[3] - begin);
+            auto selected                   = cache;
+            selected.k.records.byte_offsets = cache.k.records.byte_offsets.slice(0, begin, rows);
+            selected.v.records.byte_offsets = cache.v.records.byte_offsets.slice(0, begin, rows);
+            kv_cache_append_prefix_dispatch(
+                k.slice(3, begin, rows), v.slice(3, begin, rows), positions.slice(1, begin, rows),
+                counts.slice(0, begin, rows), selected, envelope, stream);
+        }
+        return;
+    }
     const int threads = select_cyclic_threads(envelope.max_count, k.ne[3]);
     const auto launch = [&]<int Capacity>() {
         if (threads == 64)

@@ -22,7 +22,7 @@ public:
 
     [[nodiscard]] runtime::PreparationMemory memory() const;
     void materialize();
-    void prepare_communication();
+    [[nodiscard]] std::vector<distributed::GroupRequirements> communication_requirements() const;
     void prepare_probe();
     void calibrate();
     void prepare_rebuild_probe();
@@ -40,6 +40,7 @@ public:
 private:
     void create_probe(GraphProbeBacking);
     EngineOptions options_;
+    std::shared_ptr<const BatchExecutionPlan> batches_;
     DeviceContext& device_;
     ParallelBinding binding_;
     std::size_t host_reservation_bytes_ = 0;

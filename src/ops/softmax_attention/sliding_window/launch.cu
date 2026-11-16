@@ -11,6 +11,8 @@
 namespace ninfer::ops::detail {
 namespace {
 
+__global__ void sliding_window_attention_idle_kernel() {}
+
 template <int Tokens, class Launch>
 void dispatch_token_case(Launch&& launch) {
     constexpr int Warps = (Tokens + 3) / 4;
@@ -57,58 +59,69 @@ void launch_sliding_window_attention(const Tensor& q, const Tensor& query_k, con
     const bool direct = plan.route == SlidingWindowAttentionRoute::Direct;
     if ((plan.window != 2048 && plan.window != 4096) ||
         context.capacity != static_cast<std::uint32_t>(plan.window) || plan.key_block != 32 ||
-        plan.reduce_warps != (plan.window == 2048 ? 4 : 1) || plan.split_capacity < 1 ||
+        (plan.reduce_warps != 1 && plan.reduce_warps != 4) || plan.split_capacity < 1 ||
         plan.split_capacity > kSlidingWindowMaxSplits || (direct && plan.split_capacity != 1))
         throw std::invalid_argument("sliding_window_attention: inconsistent plan");
-    dispatch_tokens(plan.tokens, [&]<int Tokens, int Warps>() {
-        constexpr int KeyBlock = 32;
-        constexpr std::size_t SmemBytes =
-            2u * KeyBlock * kContextQueryHeadDim * sizeof(__nv_bfloat16);
-        if (plan.warps != Warps)
-            throw std::invalid_argument("sliding_window_attention: inconsistent query layout");
-        // Window determines visibility and ring addressing, not the MMA storage layout.
-        const auto partial = [&]<bool Direct>() {
-            const dim3 grid(kContextQueryKVHeads, Direct ? 1 : plan.split_capacity, q.ne[3]);
-            sliding_window_attention_split_partial_kernel<Tokens, Warps, KeyBlock, Direct>
-                <<<grid, Warps * 32, SmemBytes, stream>>>(
-                    static_cast<const __nv_bfloat16*>(q.data),
-                    static_cast<const __nv_bfloat16*>(query_k.data),
-                    static_cast<const __nv_bfloat16*>(query_v.data),
-                    static_cast<const std::int32_t*>(positions.data),
-                    static_cast<const std::int32_t*>(valid_columns.data),
-                    static_cast<const std::int64_t*>(context.k.records.byte_offsets.data),
-                    static_cast<const std::int64_t*>(context.v.records.byte_offsets.data),
-                    common::operand::state_field_base<const __nv_bfloat16>(context.k),
-                    common::operand::state_field_base<const __half>(context.v),
-                    static_cast<int>(context.padded_capacity), plan.window - 1, plan.max_context,
-                    Direct ? 1 : plan.split_capacity, scale, static_cast<float*>(partial_acc.data),
-                    static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data),
-                    static_cast<__nv_bfloat16*>(out.data));
-            CUDA_CHECK(cudaGetLastError());
-        };
-        if (direct) {
-            partial.template operator()<true>();
-            return;
-        }
-        partial.template operator()<false>();
-        const auto reduce = [&]<int ReduceWarps>() {
-            constexpr int Rows = kContextQueryQHeads * Tokens;
-            const dim3 grid((Rows + ReduceWarps - 1) / ReduceWarps, 1, q.ne[3]);
-            sliding_window_attention_reduce_kernel<Tokens, KeyBlock, ReduceWarps>
-                <<<grid, ReduceWarps * 32, 0, stream>>>(
-                    static_cast<const float*>(partial_acc.data),
-                    static_cast<const float*>(partial_m.data),
-                    static_cast<const float*>(partial_l.data),
-                    static_cast<const std::int32_t*>(positions.data),
-                    static_cast<const std::int32_t*>(valid_columns.data), plan.window - 1,
-                    plan.max_context, plan.split_capacity, static_cast<__nv_bfloat16*>(out.data));
-            CUDA_CHECK(cudaGetLastError());
-        };
-        if (plan.reduce_warps == 4)
-            reduce.template operator()<4>();
-        else
-            reduce.template operator()<1>();
-    });
+    const auto geometry = [&]<int KVHeads>() {
+        dispatch_tokens(plan.tokens, [&]<int Tokens, int Warps>() {
+            constexpr int KeyBlock = 32;
+            constexpr std::size_t SmemBytes =
+                2u * KeyBlock * kContextQueryHeadDim * sizeof(__nv_bfloat16);
+            if (plan.warps != Warps)
+                throw std::invalid_argument("sliding_window_attention: inconsistent query layout");
+            // Window determines visibility and ring addressing, not the MMA storage layout.
+            const auto partial = [&]<bool Direct>() {
+                const dim3 grid(KVHeads, Direct ? 1 : plan.split_capacity, q.ne[3]);
+                sliding_window_attention_split_partial_kernel<Tokens, Warps, KeyBlock, Direct,
+                                                              KVHeads>
+                    <<<grid, Warps * 32, SmemBytes, stream>>>(
+                        static_cast<const __nv_bfloat16*>(q.data),
+                        static_cast<const __nv_bfloat16*>(query_k.data),
+                        static_cast<const __nv_bfloat16*>(query_v.data),
+                        static_cast<const std::int32_t*>(positions.data),
+                        static_cast<const std::int32_t*>(valid_columns.data),
+                        static_cast<const std::int64_t*>(context.k.records.byte_offsets.data),
+                        static_cast<const std::int64_t*>(context.v.records.byte_offsets.data),
+                        common::operand::state_field_base<const __nv_bfloat16>(context.k),
+                        common::operand::state_field_base<const __half>(context.v),
+                        static_cast<int>(context.padded_capacity), plan.window - 1,
+                        plan.max_context, Direct ? 1 : plan.split_capacity, scale,
+                        static_cast<float*>(partial_acc.data), static_cast<float*>(partial_m.data),
+                        static_cast<float*>(partial_l.data), static_cast<__nv_bfloat16*>(out.data));
+                CUDA_CHECK(cudaGetLastError());
+            };
+            if (direct) {
+                partial.template operator()<true>();
+                // Keep the reduction slot for child-node updates when the context grows.
+                sliding_window_attention_idle_kernel<<<1, 1, 0, stream>>>();
+                CUDA_CHECK(cudaGetLastError());
+                return;
+            }
+            partial.template operator()<false>();
+            const auto reduce = [&]<int ReduceWarps>() {
+                constexpr int Rows = KVHeads * kContextQueryGroup * Tokens;
+                const dim3 grid((Rows + ReduceWarps - 1) / ReduceWarps, 1, q.ne[3]);
+                sliding_window_attention_reduce_kernel<Tokens, KeyBlock, ReduceWarps, KVHeads>
+                    <<<grid, ReduceWarps * 32, 0, stream>>>(
+                        static_cast<const float*>(partial_acc.data),
+                        static_cast<const float*>(partial_m.data),
+                        static_cast<const float*>(partial_l.data),
+                        static_cast<const std::int32_t*>(positions.data),
+                        static_cast<const std::int32_t*>(valid_columns.data), plan.window - 1,
+                        plan.max_context, plan.split_capacity,
+                        static_cast<__nv_bfloat16*>(out.data));
+                CUDA_CHECK(cudaGetLastError());
+            };
+            if (plan.reduce_warps == 4)
+                reduce.template operator()<4>();
+            else
+                reduce.template operator()<1>();
+        });
+    };
+    if (plan.geometry.kv_heads == 4)
+        geometry.template operator()<4>();
+    else
+        geometry.template operator()<8>();
 }
 
 } // namespace ninfer::ops::detail

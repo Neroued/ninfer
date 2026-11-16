@@ -10,6 +10,7 @@ namespace ninfer::models::qwen4_exp::ple::disk {
 
 struct PrepareOptions {
     std::uint32_t max_positions = 0; // Maximum T*B, not max(T)*max(B).
+    std::uint32_t max_rows      = 0;
     std::uint32_t io_depth      = 128;
     std::size_t cache_bytes     = 64ULL * 1024 * 1024;
     CpuAffinity affinity;
@@ -18,7 +19,6 @@ struct PrepareOptions {
 enum class PrepareStatus { Preparing, HostReady, Cancelled, Failed };
 
 struct WindowSnapshot {
-    InputWindow input;
     PrepareStatus status;
     bool drained;
     std::exception_ptr error;
@@ -37,10 +37,12 @@ public:
     PrepareService(const PrepareService&)            = delete;
     PrepareService& operator=(const PrepareService&) = delete;
 
-    // B is rows.size(), in [1,8]. No free slot returns nullopt. Optional prefetch leaves
+    // Logical identities are rows.size(); physical_rows includes trailing inactive rows.
+    // No free slot returns nullopt. Optional prefetch leaves
     // room for a required window; prioritize promotes it when it becomes the current input.
-    [[nodiscard]] std::optional<Ticket>
-    prepare(std::uint32_t tokens, std::span<const InputRow> rows, bool required = true);
+    [[nodiscard]] std::optional<Ticket> prepare(std::uint32_t tokens, std::uint32_t physical_rows,
+                                                std::span<const InputRow> rows,
+                                                bool required = true);
     void prioritize(Ticket);
     void append(Ticket, std::span<const Append>);
     // Final lengths do not exceed known prefixes. Sealing truncates candidates for this

@@ -31,7 +31,7 @@ struct CausalPairOutputs {
 // [W,B] in, [P,C] out. Optional I32 rope [W,A,B], previous_rope [A,B], output rope [P,A,C]
 // either all exist, A=1 or 3, or are all absent. These tensors have positive, element-aligned,
 // non-overlapping strides. prefix/skip_first[B], optional rows[C], output lengths[C] are
-// contiguous I32. W,P>=1, B,C=1..8. Caller supplies rows in {-1} union [0,B), 0<=prefix<=W,
+// contiguous I32. W,P,B,C>=1. Caller supplies rows in {-1} union [0,B), 0<=prefix<=W,
 // skip_first in {0,1}, n<=P, and positive consumed positions. Read-only inputs may alias;
 // output ranges are mutually disjoint and disjoint from all inputs. Copies bits exactly,
 // including coordinates. No workspace or persistent effects; Device controls are read on replay.
@@ -104,11 +104,12 @@ void prepare_autoregressive_round(const Tensor& verify_ids, const Tensor& next_a
  *   ids[i,b]       = mask_id,                         1 <= i < W
  *   positions[i,b] = lengths[b] + min(i, V[b] - 1),  0 <= i < W
  *
- * where V[b]=valid_columns[b] and 1 <= V[b] <= W. Repeating the last valid position makes the
+ * where V[b]=valid_columns[b] and 0 <= V[b] <= W. V[b]=0 writes zero IDs and positions
+ * without reading anchors or lengths. Repeating the last valid position makes the
  * invalid physical tail safe for downstream fixed-width execution; valid_columns remains the
  * authority that excludes those rows from mathematical work and persistent-state updates.
  *
- * The registered domain is W=1..16, B=1..8, and nonnegative mask_id. The caller guarantees
+ * The registered domain is W=1..16, B>=1, and nonnegative mask_id. The caller guarantees
  * nonnegative lengths whose final valid positions fit I32. Inputs are unchanged, every output
  * element is overwritten, and the Op owns no workspace or persistent state.
  */
@@ -124,10 +125,10 @@ void prepare_masked_block(const Tensor& anchors, const Tensor& lengths, const Te
  * positions is contiguous I32 [W,B], and counts is I32 [B]. For N=ends[b]-starts[b], columns j<N
  * copy source[:,j,lanes[b]], use absolute position starts[b]+j, and publish counts[b]=N. The
  * physical tail j>=N is zero-filled and repeats the final live position (or starts[b] when N=0).
- * The caller guarantees 0<=N<=W and 0<=lanes[b]<C. D must be divisible by eight and all BF16
- * column starts must be 16-byte aligned. Physical W is independent of the live prefix N.
- * The three outputs are pairwise non-overlapping and do not overlap any input. Read-only inputs
- * may alias one another. Inputs remain unchanged; all
+ * The caller guarantees 0<=N<=W and, when N>0, 0<=lanes[b]<C. Empty rows do not read lanes or
+ * source. D must be divisible by eight and all BF16 column starts must be 16-byte aligned. Physical
+ * W is independent of the live prefix N. The three outputs are pairwise non-overlapping and do not
+ * overlap any input. Read-only inputs may alias one another. Inputs remain unchanged; all
  * destination, position and count elements are overwritten exactly. The Op needs no transient
  * workspace and supports CUDA Graph capture/replay with changing device metadata.
  */

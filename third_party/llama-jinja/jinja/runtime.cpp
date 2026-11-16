@@ -8,17 +8,197 @@
 #include <vector>
 #include <memory>
 #include <cmath>
+#include <utility>
 
 namespace jinja {
 
+static value make_macro_value(macro_statement* definition,
+                              std::shared_ptr<closure_environment> environment);
+
+value binding_cell::read() const {
+    if (!macro) return inherited ? inherited->read() : data;
+    auto captured = owner.lock();
+    if (!captured) throw std::runtime_error("Closure environment has ended");
+    captured->owner->ensure_active();
+    return make_macro_value(macro, std::move(captured));
+}
+
+closure_environment::~closure_environment() { owner->detach(this); }
+
+void render_scopes::ensure_active() const {
+    if (closed_) throw std::runtime_error("Template render has ended");
+}
+
+scope* render_scopes::acquire(scope* parent, const scope_names* locals,
+                              std::shared_ptr<closure_environment> imports) {
+    ensure_active();
+    scope* frame;
+    if (free_) {
+        frame = free_;
+        free_ = frame->parent;
+    } else {
+        frame = &frames_.emplace_back();
+    }
+    frame->parent     = parent;
+    frame->locals     = locals;
+    frame->imports    = std::move(imports);
+    frame->references = 1;
+    if (parent) ++parent->references;
+    return frame;
+}
+
+void render_scopes::release(scope* frame) {
+    if (closed_) return;
+    while (frame && --frame->references == 0) {
+        auto* parent = frame->parent;
+        frame->bindings.clear();
+        frame->environment.reset();
+        frame->imports.reset();
+        frame->parent = free_;
+        free_         = frame;
+        frame         = parent;
+    }
+}
+
+std::shared_ptr<closure_environment> render_scopes::environment(scope* frame) {
+    if (!frame->environment) {
+        auto result  = std::make_shared<closure_environment>(shared_from_this());
+        result->next = environments_;
+        if (environments_) environments_->previous = result.get();
+        environments_      = result.get();
+        result->registered = true;
+        frame->environment = std::move(result);
+    }
+    return frame->environment;
+}
+
+std::shared_ptr<binding_cell> render_scopes::local_cell(scope* frame, const std::string& name) {
+    auto captured = environment(frame);
+    if (const auto found = captured->locals.find(name); found != captured->locals.end())
+        return found->second;
+    auto cell   = std::make_shared<binding_cell>();
+    cell->owner = captured;
+    if (const auto found = frame->bindings.find(name); found != frame->bindings.end()) {
+        cell->assign(std::move(found->second));
+        frame->bindings.erase(found);
+    } else {
+        std::shared_ptr<closure_environment> owner;
+        if (frame->parent) {
+            auto inherited  = resolve_cell(frame->parent, name);
+            cell->inherited = std::move(inherited.first);
+            owner           = std::move(inherited.second);
+        } else if (frame->imports) {
+            const auto found = frame->imports->bindings.find(name);
+            if (found != frame->imports->bindings.end()) {
+                cell->inherited = found->second;
+                owner           = frame->imports;
+            }
+        }
+        if (owner && owner != captured &&
+            std::find(captured->dependencies.begin(), captured->dependencies.end(), owner) ==
+                captured->dependencies.end())
+            captured->dependencies.push_back(std::move(owner));
+    }
+    captured->locals.emplace(name, cell);
+    return cell;
+}
+
+std::pair<std::shared_ptr<binding_cell>, std::shared_ptr<closure_environment>>
+render_scopes::resolve_cell(scope* frame, const std::string& name) {
+    for (auto* current = frame; current; current = current->parent) {
+        if (current->bindings.contains(name) ||
+            (current->environment && current->environment->locals.contains(name)) ||
+            (current->locals && std::find(current->locals->begin(), current->locals->end(), name) !=
+                                    current->locals->end())) {
+            auto cell = local_cell(current, name);
+            return {std::move(cell), environment(current)};
+        }
+        if (current->imports) {
+            const auto found = current->imports->bindings.find(name);
+            if (found != current->imports->bindings.end()) return {found->second, current->imports};
+        }
+        if (!current->parent) {
+            auto cell = local_cell(current, name);
+            return {std::move(cell), environment(current)};
+        }
+    }
+    throw std::logic_error("Missing lexical scope");
+}
+
+std::shared_ptr<closure_environment> render_scopes::capture(scope* frame,
+                                                            const scope_names& names) {
+    if (names.empty()) return {};
+    auto captured = environment(frame);
+    for (const auto& name : names) {
+        if (captured->bindings.contains(name)) continue;
+        auto [cell, owner] = resolve_cell(frame, name);
+        captured->bindings.emplace(name, std::move(cell));
+        if (owner != captured &&
+            std::find(captured->dependencies.begin(), captured->dependencies.end(), owner) ==
+                captured->dependencies.end())
+            captured->dependencies.push_back(std::move(owner));
+    }
+    return captured;
+}
+
+void render_scopes::detach(closure_environment* environment) {
+    if (!environment->registered) return;
+    if (environment->previous)
+        environment->previous->next = environment->next;
+    else
+        environments_ = environment->next;
+    if (environment->next) environment->next->previous = environment->previous;
+    environment->registered = false;
+}
+
+void render_scopes::close() {
+    if (closed_) return;
+    closed_ = true;
+    for (auto& frame : frames_) {
+        frame.bindings.clear();
+        frame.imports.reset();
+        frame.environment.reset();
+    }
+    // Explicitly stored recursive values may form cycles within this render.
+    while (environments_) {
+        auto current = environments_->shared_from_this();
+        detach(current.get());
+        for (auto& [name, cell] : current->locals) cell->assign({});
+        current->bindings.clear();
+        current->locals.clear();
+        current->dependencies.clear();
+    }
+}
+
+void context::define_macro(const std::string& name, macro_statement* definition,
+                           const scope_names& captures) {
+    auto cell = scopes->local_cell(env, name);
+    scopes->capture(env, captures);
+    cell->data.reset();
+    cell->inherited.reset();
+    cell->macro = definition;
+}
+
+
+
+static void render_statements(const statements& stmts, context& ctx, string& output) {
+    for (const auto& stmt : stmts) {
+        stmt->render(ctx, output);
+        if (ctx.flow() != loop_flow::none) break;
+    }
+}
 
 static value_string exec_statements(const statements& stmts, context& ctx) {
-    auto result = mk_val<value_array>();
-    for (const auto& stmt : stmts) { result->push_back(stmt->execute(ctx)); }
-    // convert to string parts
-    value_string str = mk_val<value_string>();
-    gather_string_parts_recursive(result, str);
-    return str;
+    auto output = mk_val<value_string>();
+    render_statements(stmts, ctx, output->val_str);
+    return output;
+}
+
+value_string runtime::execute(const program& prog) {
+    ctx.set_locals(prog.locals);
+    auto result = exec_statements(prog.body, ctx);
+    if (ctx.flow() != loop_flow::none) throw std::runtime_error("Loop control used outside a loop");
+    return result;
 }
 
 static std::string get_line_col(const std::string& source, size_t pos) {
@@ -41,29 +221,26 @@ static void ensure_key_type_allowed(const value& val) {
     }
 }
 
-// execute with error handling
-value statement::execute(context& ctx) {
+template <class Operation>
+static decltype(auto) evaluate(statement& node, context& ctx, Operation&& operation) {
     if (ctx.checkpoint) ctx.checkpoint();
     try {
-        return execute_impl(ctx);
-    } catch (const continue_statement::signal& /* ex */) {
-        throw;
-    } catch (const break_statement::signal& /* ex */) {
-        throw;
+        return operation();
     } catch (const rethrown_exception& /* ex */) {
         throw;
     } catch (const not_implemented_exception& /* ex */) { throw; } catch (const std::exception& e) {
         const std::string& source = *ctx.src;
         if (source.empty()) {
             std::ostringstream oss;
-            oss << "\nError executing " << type() << " at position " << pos << ": " << e.what();
+            oss << "\nError executing " << node.type() << " at position " << node.pos << ": "
+                << e.what();
             throw rethrown_exception(oss.str());
         } else {
             std::ostringstream oss;
             oss << "\n------------\n";
-            oss << "While executing " << type() << " at " << get_line_col(source, pos)
+            oss << "While executing " << node.type() << " at " << get_line_col(source, node.pos)
                 << " in source:\n";
-            oss << peak_source(source, pos) << "\n";
+            oss << peak_source(source, node.pos) << "\n";
             oss << "Error: " << e.what();
             // throw as another exception to avoid repeated formatting
             throw rethrown_exception(oss.str());
@@ -71,10 +248,29 @@ value statement::execute(context& ctx) {
     }
 }
 
+value statement::execute(context& ctx) {
+    return evaluate(*this, ctx, [&] { return execute_impl(ctx); });
+}
+
+void statement::render(context& ctx, string& output) {
+    evaluate(*this, ctx, [&] { render_impl(ctx, output); });
+}
+
+void statement::render_impl(context& ctx, string& output) {
+    const auto result = execute_impl(ctx);
+    if (!result) return;
+    if (is_val<value_string>(result)) {
+        output.append(cast_val<value_string>(result)->val_str);
+    } else {
+        const auto text = runtime::gather_string_parts(result);
+        output.append(text->val_str);
+    }
+}
+
 value identifier::execute_impl(context& ctx) {
-    auto it              = ctx.get_val(val);
+    auto it              = ctx.find_val(val);
     const auto& builtins = global_builtins();
-    if (!it->is_undefined()) {
+    if (it && !it->is_undefined()) {
 
         return it;
     } else if (builtins.find(val) != builtins.end()) {
@@ -185,7 +381,7 @@ value binary_expression::execute_impl(context& ctx) {
             for (const auto& item : right_arr) { result->push_back(item); }
             return result;
         }
-    } else if (is_val<value_array>(right_val)) {
+    } else if (is_val<value_array>(right_val) || is_val<value_range>(right_val)) {
         // case: 1 in [0, 1, 2]
         bool member = test_is_in();
         if (op.value == "in") {
@@ -249,10 +445,10 @@ value binary_expression::execute_impl(context& ctx) {
 static value try_builtin_func(context& ctx, const std::string& name, value& input,
                               bool undef_on_missing = false) {
 
-    auto builtins = input->get_builtins();
+    const auto& builtins = input->get_builtins();
     auto it       = builtins.find(name);
     if (it != builtins.end()) { return mk_val<value_func>(name, it->second, input); }
-    if (undef_on_missing) { return mk_val<value_undefined>(name); }
+    if (undef_on_missing) { return {}; }
     throw std::runtime_error("Unknown (built-in) filter '" + name + "' for type " + input->type());
 }
 
@@ -307,7 +503,9 @@ value filter_expression::execute_impl(context& ctx) {
 }
 
 value filter_statement::execute_impl(context& ctx) {
-    return apply_filter(exec_statements(body, ctx), filter, ctx);
+    auto input = exec_statements(body, ctx);
+    if (ctx.flow() != loop_flow::none) return {};
+    return apply_filter(input, filter, ctx);
 }
 
 value test_expression::execute_impl(context& ctx) {
@@ -369,173 +567,246 @@ value unary_expression::execute_impl(context& ctx) {
 }
 
 value if_statement::execute_impl(context& ctx) {
-    value test_val = test->execute(ctx);
-
-    auto out = mk_val<value_array>();
-    if (test_val->as_bool()) {
-        for (auto& stmt : body) { out->push_back(stmt->execute(ctx)); }
-    } else {
-        for (auto& stmt : alternate) { out->push_back(stmt->execute(ctx)); }
-    }
-    // convert to string parts
-    value_string str = mk_val<value_string>();
-    gather_string_parts_recursive(out, str);
-    return str;
+    auto output = mk_val<value_string>();
+    render_impl(ctx, output->val_str);
+    return output;
 }
 
-value for_statement::execute_impl(context& ctx) {
-    context scope(ctx); // new scope for loop variables
+void if_statement::render_impl(context& ctx, string& output) {
+    value test_val = test->execute(ctx);
+    render_statements(test_val->as_bool() ? body : alternate, ctx, output);
+}
 
-    jinja::select_expression* select_expr = cast_stmt<select_expression>(iterable);
-    statement_ptr test_expr_nullptr;
-
-    statement_ptr& iter_expr = [&]() -> statement_ptr& {
-        auto tmp = cast_stmt<select_expression>(iterable);
-        return tmp ? tmp->lhs : iterable;
-    }();
-    statement_ptr& test_expr = [&]() -> statement_ptr& {
-        auto tmp = cast_stmt<select_expression>(iterable);
-        return tmp ? tmp->test : test_expr_nullptr;
-    }();
-
-
-    value iterable_val = iter_expr->execute(scope);
-
-
-
-    if (iterable_val->is_undefined()) { iterable_val = mk_val<value_array>(); }
-
-    if (!is_val<value_array>(iterable_val) && !is_val<value_object>(iterable_val) &&
-        !is_val<value_string>(iterable_val)) {
-        throw std::runtime_error("Expected iterable or object type in for loop: got " +
-                                 iterable_val->type());
+namespace {
+class IterableCursor {
+public:
+    explicit IterableCursor(value input) : input_(std::move(input)) {
+        if (is_val<value_string>(input_)) {
+            string_ = input_->as_string();
+            bytes_  = string_.str();
+        } else if (!is_val<value_array>(input_) && !is_val<value_object>(input_) &&
+                   !is_val<value_range>(input_) && !input_->is_undefined()) {
+            throw std::runtime_error("Expected iterable, got " + input_->type());
+        }
     }
 
-    std::vector<value> items;
-    if (is_val<value_object>(iterable_val)) {
-        auto& obj = iterable_val->as_ordered_object();
-        for (auto& p : obj) {
-            auto tuple = mk_val<value_tuple>(p);
-            items.push_back(std::move(tuple));
-        }
-
-    } else if (is_val<value_string>(iterable_val)) {
-        const auto str = iterable_val->as_string();
-        for (const auto& ch : unicode::characters(str.str())) {
-            if (ctx.checkpoint) ctx.checkpoint();
-            items.push_back(mk_val<value_string>(str.cut_bytes(ch.begin, ch.end)));
-        }
-    } else {
-        auto& arr = iterable_val->as_array();
-        for (const auto& item : arr) { items.push_back(item); }
+    uint64_t size() const {
+        if (is_val<value_array>(input_)) return input_->as_array().size();
+        if (is_val<value_object>(input_)) return input_->as_ordered_object().size();
+        if (is_val<value_range>(input_)) return cast_val<value_range>(input_)->count;
+        if (is_val<value_string>(input_)) return string_.length();
+        return 0;
     }
 
-    std::vector<std::function<void(context&)>> scope_update_fns;
-
-    std::vector<value> filtered_items;
-    for (size_t i = 0; i < items.size(); ++i) {
-        context loop_scope(scope);
-
-        value current = items[i];
-
-        std::function<void(context&)> scope_update_fn = [](context&) { /* no-op */ };
-        if (is_stmt<identifier>(loopvar)) {
-            auto id = cast_stmt<identifier>(loopvar)->val;
-
-            if (is_val<value_object>(iterable_val)) {
-                // case example: {% for key in dict %}
-                current         = items[i]->as_array()[0];
-                scope_update_fn = [id, &items, i](context& ctx) {
-                    ctx.set_val(id, items[i]->as_array()[0]);
-                };
-            } else {
-                // case example: {% for item in list %}
-                scope_update_fn = [id, &items, i](context& ctx) { ctx.set_val(id, items[i]); };
+    value next() {
+        if (exhausted_) return {};
+        if (is_val<value_string>(input_)) {
+            if (offset_ == bytes_.size()) {
+                exhausted_ = true;
+                return {};
             }
+            const auto begin = offset_++;
+            while (offset_ < bytes_.size() &&
+                   (static_cast<unsigned char>(bytes_[offset_]) & 0xc0) == 0x80)
+                ++offset_;
+            return mk_val<value_string>(string_.cut_bytes(begin, offset_));
+        }
+        if (offset_ >= size()) {
+            exhausted_ = true;
+            return {};
+        }
+        if (is_val<value_array>(input_)) return input_->as_array()[offset_++];
+        if (is_val<value_object>(input_)) return input_->as_ordered_object()[offset_++].first;
+        return cast_val<value_range>(input_)->item(offset_++);
+    }
 
-        } else if (is_stmt<tuple_literal>(loopvar)) {
-            // case example: {% for key, value in dict %}
-            auto tuple = cast_stmt<tuple_literal>(loopvar);
-            if (!is_val<value_array>(current)) {
-                throw std::runtime_error("Cannot unpack non-iterable type: " + current->type());
-            }
-            auto& c_arr = current->as_array();
-            if (tuple->val.size() != c_arr.size()) {
-                throw std::runtime_error(std::string("Too ") +
-                                         (tuple->val.size() > c_arr.size() ? "few" : "many") +
-                                         " items to unpack");
-            }
-            scope_update_fn = [tuple, &items, i](context& ctx) {
-                auto& c_arr = items[i]->as_array();
-                for (size_t j = 0; j < tuple->val.size(); ++j) {
-                    if (!is_stmt<identifier>(tuple->val[j])) {
-                        throw std::runtime_error("Cannot unpack non-identifier type: " +
-                                                 tuple->val[j]->type());
-                    }
-                    auto id = cast_stmt<identifier>(tuple->val[j])->val;
-                    ctx.set_val(id, c_arr[j]);
-                }
-            };
+private:
+    value input_;
+    string string_;
+    std::string bytes_;
+    uint64_t offset_ = 0;
+    bool exhausted_  = false;
+};
 
+class VariableBinding {
+public:
+    explicit VariableBinding(const statement_ptr& target) {
+        if (const auto* id = cast_stmt<identifier>(target)) {
+            names_.push_back(id->val);
+        } else if (const auto* tuple = cast_stmt<tuple_literal>(target)) {
+            unpack_ = true;
+            for (const auto& item : tuple->val) {
+                const auto* id = cast_stmt<identifier>(item);
+                if (!id) throw std::runtime_error("Cannot unpack non-identifier type");
+                names_.push_back(id->val);
+            }
         } else {
-            throw std::runtime_error("Invalid loop variable(s): " + loopvar->type());
+            throw std::runtime_error("Invalid loop variable: " + target->type());
         }
-
-        if (select_expr && test_expr) {
-            scope_update_fn(loop_scope);
-            value test_val = test_expr->execute(loop_scope);
-            if (!test_val->as_bool()) { continue; }
-        }
-        filtered_items.push_back(current);
-        scope_update_fns.push_back(scope_update_fn);
     }
 
-    auto result = mk_val<value_array>();
+    void bind(context& scope, const value& item) const {
+        if (!unpack_) {
+            scope.set_val(names_.front(), item);
+            return;
+        }
+        IterableCursor values(item);
+        for (const auto& name : names_) {
+            auto v = values.next();
+            if (!v) throw std::runtime_error("Too few items to unpack");
+            scope.set_val(name, v);
+        }
+        if (values.next()) throw std::runtime_error("Too many items to unpack");
+    }
 
-    bool noIteration = true;
-    for (size_t i = 0; i < filtered_items.size(); i++) {
-        value_object loop_obj  = mk_val<value_object>();
-        loop_obj->has_builtins = false; // loop object has no builtins
-        loop_obj->insert("index", mk_val<value_int>(i + 1));
-        loop_obj->insert("index0", mk_val<value_int>(i));
-        loop_obj->insert("revindex", mk_val<value_int>(filtered_items.size() - i));
-        loop_obj->insert("revindex0", mk_val<value_int>(filtered_items.size() - i - 1));
-        loop_obj->insert("first", mk_val<value_bool>(i == 0));
-        loop_obj->insert("last", mk_val<value_bool>(i == filtered_items.size() - 1));
-        loop_obj->insert("length", mk_val<value_int>(filtered_items.size()));
-        loop_obj->insert("previtem",
-                         i > 0 ? filtered_items[i - 1] : mk_val<value_undefined>("previtem"));
-        loop_obj->insert("nextitem", i < filtered_items.size() - 1
-                                         ? filtered_items[i + 1]
-                                         : mk_val<value_undefined>("nextitem"));
-        scope.set_val("loop", loop_obj);
-        scope_update_fns[i](scope);
-        try {
-            for (auto& stmt : body) {
-                value val = stmt->execute(scope);
-                result->push_back(val);
+private:
+    std::vector<std::string> names_;
+    bool unpack_ = false;
+};
+
+class LoopValue final : public value_object_t {
+public:
+    LoopValue(value input, context& parent, VariableBinding binding, statement* filter,
+              const scope_names& captures)
+        : source_(std::move(input)), owner_(parent.storage()), checkpoint_(parent.checkpoint),
+          binding_(std::move(binding)), filter_(filter) {
+        has_builtins = false;
+        if (filter)
+            filter_scope_ = std::make_unique<context>(parent, parent.capture(captures), nullptr);
+    }
+
+    bool advance(context& body) {
+        auto item = take();
+        if (!item) return false;
+        previous_ = std::move(current_);
+        current_  = std::move(item);
+        ++index_;
+        binding_.bind(body, current_);
+        return true;
+    }
+
+    bool as_bool() const override { return true; }
+
+    value find(const value& key) override {
+        value missing;
+        return at(key, missing);
+    }
+
+    value& at(const value& key, value& fallback) override {
+        owner_->ensure_active();
+        const auto name = key->as_string().str();
+        if (name == "index")
+            cached_ = number(index_);
+        else if (name == "index0")
+            cached_ = number(index_ - 1);
+        else if (name == "first")
+            cached_ = mk_val<value_bool>(index_ == 1);
+        else if (name == "last")
+            cached_ = mk_val<value_bool>(!peek());
+        else if (name == "length")
+            cached_ = number(length());
+        else if (name == "revindex")
+            cached_ = number(length() - index_ + 1);
+        else if (name == "revindex0")
+            cached_ = number(length() - index_);
+        else if (name == "previtem")
+            cached_ = previous_ ? previous_ : mk_val<value_undefined>("previtem");
+        else if (name == "nextitem") {
+            const auto item = peek();
+            cached_         = item ? item : mk_val<value_undefined>("nextitem");
+        } else
+            return fallback;
+        return cached_;
+    }
+
+private:
+    static value number(uint64_t n) {
+        if (n > INT64_MAX) throw std::runtime_error("loop length exceeds int64");
+        return mk_val<value_int>(static_cast<int64_t>(n));
+    }
+
+    value read() {
+        owner_->ensure_active();
+        while (auto item = source_.next()) {
+            if (checkpoint_) checkpoint_();
+            if (filter_) {
+                filter_scope_->clear_locals();
+                binding_.bind(*filter_scope_, item);
+                if (!filter_->execute(*filter_scope_)->as_bool()) continue;
             }
-        } catch (const continue_statement::signal&) {
-            continue;
-        } catch (const break_statement::signal&) { break; }
-        noIteration = false;
-    }
-
-    if (noIteration) {
-        for (auto& stmt : default_block) {
-            value val = stmt->execute(ctx);
-            result->push_back(val);
+            return item;
         }
+        return {};
     }
 
-    // convert to string parts
-    value_string str = mk_val<value_string>();
-    gather_string_parts_recursive(result, str);
-    return str;
+    value take() {
+        if (pending_.empty()) return read();
+        auto item = std::move(pending_.front());
+        pending_.pop_front();
+        return item;
+    }
+
+    value peek() {
+        if (pending_.empty()) {
+            auto item = read();
+            if (item) pending_.push_back(std::move(item));
+        }
+        return pending_.empty() ? value{} : pending_.front();
+    }
+
+    uint64_t length() {
+        if (!length_) {
+            if (filter_) {
+                while (auto item = read()) pending_.push_back(std::move(item));
+                length_ = index_ + pending_.size();
+            } else
+                length_ = source_.size();
+        }
+        return *length_;
+    }
+
+    IterableCursor source_;
+    std::shared_ptr<render_scopes> owner_;
+    std::function<void()> checkpoint_;
+    std::unique_ptr<context> filter_scope_;
+    VariableBinding binding_;
+    statement* filter_;
+    std::deque<value> pending_;
+    std::optional<uint64_t> length_;
+    uint64_t index_ = 0;
+    value current_, previous_, cached_;
+};
+} // namespace
+
+value for_statement::execute_impl(context& ctx) {
+    auto output = mk_val<value_string>();
+    render_impl(ctx, output->val_str);
+    return output;
+}
+
+void for_statement::render_impl(context& ctx, string& output) {
+    const auto* selected = cast_stmt<select_expression>(iterable);
+    auto input           = (selected ? selected->lhs : iterable)->execute(ctx);
+    auto loop =
+        std::make_shared<LoopValue>(std::move(input), ctx, VariableBinding(loopvar),
+                                    selected ? selected->test.get() : nullptr, filter_captures);
+    bool no_iteration = true;
+    for (;;) {
+        context body_scope(ctx, &locals);
+        if (!loop->advance(body_scope)) break;
+        body_scope.set_val("loop", loop);
+        render_statements(body, body_scope, output);
+        const auto flow = std::exchange(ctx.flow(), loop_flow::none);
+        if (flow == loop_flow::next) continue;
+        if (flow == loop_flow::stop) break;
+        no_iteration = false;
+    }
+    if (no_iteration) render_statements(default_block, ctx, output);
 }
 
 value set_statement::execute_impl(context& ctx) {
     auto rhs = val ? val->execute(ctx) : exec_statements(body, ctx);
+    if (ctx.flow() != loop_flow::none) return {};
 
     if (is_stmt<identifier>(assignee)) {
         // case: {% set my_var = value %}
@@ -543,25 +814,7 @@ value set_statement::execute_impl(context& ctx) {
         ctx.set_val(var_name, rhs);
 
     } else if (is_stmt<tuple_literal>(assignee)) {
-        // case: {% set a, b = value %}
-        auto tuple = cast_stmt<tuple_literal>(assignee);
-        if (!is_val<value_array>(rhs)) {
-            throw std::runtime_error("Cannot unpack non-iterable type in set: " + rhs->type());
-        }
-        auto& arr = rhs->as_array();
-        if (arr.size() != tuple->val.size()) {
-            throw std::runtime_error(std::string("Too ") +
-                                     (tuple->val.size() > arr.size() ? "few" : "many") +
-                                     " items to unpack in set");
-        }
-        for (size_t i = 0; i < tuple->val.size(); ++i) {
-            auto& elem = tuple->val[i];
-            if (!is_stmt<identifier>(elem)) {
-                throw std::runtime_error("Cannot unpack to non-identifier in set: " + elem->type());
-            }
-            auto var_name = cast_stmt<identifier>(elem)->val;
-            ctx.set_val(var_name, arr[i]);
-        }
+        VariableBinding(assignee).bind(ctx, rhs);
 
     } else if (is_stmt<member_expression>(assignee)) {
         // case: {% set ns.my_var = value %}
@@ -570,19 +823,17 @@ value set_statement::execute_impl(context& ctx) {
         if (!is_stmt<identifier>(member->property)) {
             throw std::runtime_error("Cannot assign to member with non-identifier property");
         }
-        auto prop_name = cast_stmt<identifier>(member->property)->val;
-
         value object = member->object->execute(ctx);
         if (!is_val<value_object>(object)) {
             throw std::runtime_error("Cannot assign to member of non-object");
         }
         auto obj_ptr = cast_val<value_object>(object);
-        obj_ptr->insert(prop_name, rhs);
+        obj_ptr->insert(member->static_property, rhs);
 
     } else {
         throw std::runtime_error("Invalid LHS inside assignment expression: " + assignee->type());
     }
-    return mk_val<value_undefined>();
+    return {};
 }
 
 static void bind_parameters(const std::string& name, const statements& parameters,
@@ -622,27 +873,46 @@ static void bind_parameters(const std::string& name, const statements& parameter
     if (!named.empty()) throw std::runtime_error("unknown macro argument: " + named.begin()->first);
 }
 
-value macro_statement::execute_impl(context& ctx) {
-    if (!is_stmt<identifier>(this->name)) {
-        throw std::runtime_error("Macro name must be an identifier");
-    }
-    std::string name = cast_stmt<identifier>(this->name)->val;
+namespace {
+struct macro_function final : value_func_t {
+    macro_statement* definition;
+    std::shared_ptr<closure_environment> environment;
 
-    const func_handler func = [this, name,
-                               scope = ctx.capture_scope()](const func_args& args) -> value {
-        context macro_ctx(args.ctx, scope);
+    macro_function(macro_statement* definition, std::shared_ptr<closure_environment> environment)
+        : value_func_t(cast_stmt<identifier>(definition->name)->val, {}), definition(definition),
+          environment(std::move(environment)) {}
+
+    value invoke(const func_args& args) const override {
+        environment->owner->ensure_active();
+        context macro_ctx(args.ctx, environment, &definition->locals);
         const auto caller = args.ctx.get_val("caller");
         if (!caller->is_undefined()) macro_ctx.set_val("caller", caller);
+        bind_parameters(name, definition->args, args, macro_ctx);
+        return exec_statements(definition->body, macro_ctx);
+    }
+};
+} // namespace
 
-        bind_parameters(name, this->args, args, macro_ctx);
+static value make_macro_value(macro_statement* definition,
+                              std::shared_ptr<closure_environment> environment) {
+    return std::make_shared<macro_function>(definition, std::move(environment));
+}
 
-        // execute macro body
-        auto res = exec_statements(this->body, macro_ctx);
-        return res;
-    };
+void binding_cell::assign(value input) {
+    inherited.reset();
+    if (const auto* function = dynamic_cast<const macro_function*>(input.get());
+        function && function->environment == owner.lock()) {
+        macro = function->definition;
+        data.reset();
+    } else {
+        macro = nullptr;
+        data  = std::move(input);
+    }
+}
 
-    ctx.set_val(name, mk_val<value_func>(name, func));
-    return mk_val<value_undefined>();
+value macro_statement::execute_impl(context& ctx) {
+    ctx.define_macro(cast_stmt<identifier>(name)->val, this, captures);
+    return {};
 }
 
 value call_statement::execute_impl(context& ctx) {
@@ -655,8 +925,12 @@ value call_statement::execute_impl(context& ctx) {
     }
     auto* callee_func = cast_val<value_func>(callee_val);
 
-    const func_handler func = [this, scope = ctx.current_scope()](const func_args& args) -> value {
-        context block_ctx(args.ctx, scope);
+    const func_handler func = [this, captured = ctx.capture(captures),
+                               owner = ctx.storage()](const func_args& args) -> value {
+        owner->ensure_active();
+        if (owner != args.ctx.storage())
+            throw std::runtime_error("Closure belongs to a different render");
+        context block_ctx(args.ctx, captured, &locals);
 
         bind_parameters("caller", this->caller_args, args, block_ctx);
 
@@ -675,6 +949,19 @@ value call_statement::execute_impl(context& ctx) {
     }
 
     return callee_func->invoke(args);
+}
+
+member_expression::member_expression(statement_ptr&& object, statement_ptr&& property,
+                                     bool computed)
+    : object(std::move(object)), property(std::move(property)), computed(computed) {
+    chk_type<expression>(this->object);
+    chk_type<expression>(this->property);
+    if (!computed) {
+        if (const auto* id = cast_stmt<identifier>(this->property))
+            static_property = mk_val<value_string>(id->val);
+        else if (const auto* index = cast_stmt<integer_literal>(this->property))
+            static_property = index->constant;
+    }
 }
 
 value member_expression::execute_impl(context& ctx) {
@@ -703,7 +990,7 @@ value member_expression::execute_impl(context& ctx) {
         }
     } else if (is_stmt<integer_literal>(this->property)) {
         // syntax: obj.index
-        property = mk_val<value_int>(cast_stmt<integer_literal>(this->property)->val);
+        property = static_property;
         if (property->as_int() < 0) {
             throw std::runtime_error("Static member property cannot be negative");
         }
@@ -712,8 +999,8 @@ value member_expression::execute_impl(context& ctx) {
         if (!is_stmt<identifier>(this->property)) {
             throw std::runtime_error("Static member property must be an identifier");
         }
-        property         = mk_val<value_string>(cast_stmt<identifier>(this->property)->val);
-        std::string prop = property->as_string().str();
+        property         = static_property;
+        const auto& prop = cast_stmt<identifier>(this->property)->val;
 
         // behavior of jinja2: obj having prop as a built-in function AND 'prop', as an object key,
         // then obj.prop returns the built-in function, not the property value.
@@ -722,38 +1009,40 @@ value member_expression::execute_impl(context& ctx) {
         // 123
 
         value val = try_builtin_func(ctx, prop, object, true);
-        if (!is_val<value_undefined>(val)) { return val; }
+        if (val) { return val; }
         // else, fallthrough to normal property access below
     }
 
-    value val = mk_val<value_undefined>("object_property");
+    value val;
 
-    if (property->is_undefined()) { return val; }
+    if (property->is_undefined()) { return mk_val<value_undefined>("object_property"); }
 
     ensure_key_type_allowed(property);
 
     if (is_val<value_undefined>(object)) {
-        return val;
+        return mk_val<value_undefined>("object_property");
 
     } else if (is_val<value_object>(object)) {
-        auto key = property->as_string().str();
-        val      = object->at(property, val);
-        if (is_val<value_undefined>(val)) { val = try_builtin_func(ctx, key, object, true); }
+        val = object->find(property);
+        if (!val || val->is_undefined())
+            val = try_builtin_func(ctx, property->as_string().str(), object, true);
 
-    } else if (is_val<value_array>(object) || is_val<value_string>(object)) {
+    } else if (is_val<value_array>(object) || is_val<value_string>(object) ||
+               is_val<value_range>(object)) {
         if (is_val<value_int>(property)) {
             int64_t index = property->as_int();
-            if (is_val<value_array>(object)) {
+            if (is_val<value_range>(object)) {
+                const auto* range       = cast_val<value_range>(object);
+                const __int128 position = index < 0 ? __int128(range->count) + index : index;
+                if (position >= 0 && position < range->count)
+                    val = range->item(static_cast<uint64_t>(position));
+            } else if (is_val<value_array>(object)) {
                 auto& arr = object->as_array();
                 if (index < 0) { index += static_cast<int64_t>(arr.size()); }
                 if (index >= 0 && index < static_cast<int64_t>(arr.size())) { val = arr[index]; }
             } else { // value_string
-                const auto str  = object->as_string();
-                const auto size = static_cast<int64_t>(str.length());
-                if (index < 0) index += size;
-                if (index >= 0 && index < size) {
-                    val = mk_val<value_string>(str.slice(index, index + 1));
-                }
+                auto item = cast_val<value_string>(object)->val_str.at(index);
+                if (item) val = mk_val<value_string>(std::move(*item));
             }
 
         } else if (is_val<value_string>(property)) {
@@ -775,7 +1064,7 @@ value member_expression::execute_impl(context& ctx) {
 
 
 
-    return val;
+    return val ? val : mk_val<value_undefined>("object_property");
 }
 
 value call_expression::execute_impl(context& ctx) {

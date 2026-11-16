@@ -1,13 +1,9 @@
 #pragma once
 
-#include "distributed/wire.h"
+#include "distributed/transport.h"
 #include "runtime/executor/contract.h"
 
 #include <string_view>
-
-namespace ninfer::distributed {
-struct TransportLimits;
-}
 
 namespace ninfer::runtime::protocol {
 void encode(distributed::wire::Encoder&, const RankMemoryBudget&);
@@ -23,8 +19,8 @@ inline constexpr std::size_t kMeasurementErrorBytes = 2048;
 void encode_measurement_report(distributed::wire::Encoder&, std::uint64_t query,
                                std::string_view error, const RankSnapshot&);
 
-// Execution payload ceilings include their envelopes; report is the encoded RankSnapshot bound.
-// Runtime owns measurement framing around that snapshot.
+// Execution payload ceilings include their envelopes. Codecs provide the RankSnapshot bound
+// with an empty communication vector; Runtime adds prepared communication and measurement framing.
 struct ControlBudget {
     std::size_t compute_work, context_work, decision, commit, event, report;
 
@@ -33,6 +29,9 @@ struct ControlBudget {
     }
 };
 
+[[nodiscard]] ControlBudget with_communication_capacity(ControlBudget,
+                                                        std::span<const CommunicationStatistics>);
+
 [[nodiscard]] constexpr std::size_t envelope_capacity(std::size_t owners) {
     return 57 + 4 * owners;
 }
@@ -40,8 +39,10 @@ struct ControlBudget {
 [[nodiscard]] std::size_t work_payload_memory(const WorkPayloadCapacity&, ExecutionCapacity,
                                               std::size_t ranks, bool coordinator);
 
-void validate_control_capacity(const ControlBudget&, ExecutionCapacity,
-                               const distributed::TransportLimits&, std::size_t ranks);
+[[nodiscard]] distributed::TransportLimits control_transport_limits(const ControlBudget&,
+                                                                    ExecutionCapacity,
+                                                                    std::size_t ranks,
+                                                                    bool coordinator);
 
 struct Scope {
     std::vector<distributed::RankId> owners;

@@ -46,6 +46,7 @@ enum class CacheMode : std::uint8_t { Cold, Warm, Both };
 enum class CacheState : std::uint8_t { Cold, Warm };
 
 struct Options {
+    std::vector<std::int32_t> batches{1};
     std::vector<std::int32_t> tokens{1, 2, 4, 8, 12, 16};
     std::vector<std::int32_t> contexts{0, 128, 2048, 8192, 32768, 131072, 262144};
     Execution execution = Execution::Graph;
@@ -57,6 +58,7 @@ struct Options {
 };
 
 struct Result {
+    std::int32_t batch;
     std::int32_t tokens;
     std::int32_t context;
     Execution execution;
@@ -71,7 +73,7 @@ struct Result {
     std::fprintf(stderr,
                  "error: %s\n"
                  "usage: ninfer_context_softmax_attention_bench "
-                 "[--tokens 1,...,16] [--context 0,...,262144] "
+                 "[--batch B,...] [--tokens 1,...,16] [--context 0,...,262144] "
                  "[--execution eager|graph|both] [--cache cold|warm|both] "
                  "[--warmup N] [--repeat N] [--profile] [--csv-out PATH]\n",
                  message);
@@ -117,6 +119,8 @@ Options parse_options(int argc, char** argv) {
         };
         if (argument == "--tokens") {
             options.tokens = parse_list(next("--tokens requires a value"), 1, 16, "--tokens");
+        } else if (argument == "--batch") {
+            options.batches = parse_list(next("--batch requires a value"), 1, INT32_MAX, "--batch");
         } else if (argument == "--context") {
             options.contexts =
                 parse_list(next("--context requires a value"), 0, 262144, "--context");
@@ -154,10 +158,10 @@ Options parse_options(int argc, char** argv) {
             usage("unknown argument");
         }
     }
-    if (options.profile &&
-        (options.tokens.size() != 1 || options.contexts.size() != 1 ||
-         options.execution == Execution::Both || options.cache == CacheMode::Both)) {
-        usage("--profile requires one T, one context, one execution, and one cache state");
+    if (options.profile && (options.tokens.size() != 1 || options.contexts.size() != 1 ||
+                            options.batches.size() != 1 || options.execution == Execution::Both ||
+                            options.cache == CacheMode::Both)) {
+        usage("--profile requires one B, one T, one context, one execution, and one cache state");
     }
     return options;
 }
@@ -166,15 +170,21 @@ std::int32_t paged_context(std::int32_t context) {
     return ((std::max(context, 1) + kPagedKVPageSize - 1) / kPagedKVPageSize) * kPagedKVPageSize;
 }
 
+std::int32_t page_count(std::int32_t context, std::int32_t batch) {
+    const auto pages = static_cast<std::int64_t>(paged_context(context) / kPagedKVPageSize) * batch;
+    if (pages > INT32_MAX) throw std::overflow_error("context fixture page count exceeds int32");
+    return static_cast<std::int32_t>(pages);
+}
+
 KVPageGeometry context_geometry() {
     return {kPagedKVPageSize,
             {{DType::BF16, kHeadDim, kKvHeads}, {DType::FP16, kHeadDim, kKvHeads}}};
 }
 
 PagedKVBatchLayerView make_context_view(tool::PackedKVFixture& packed, DeviceBuffer& offsets,
-                                        std::int32_t context) {
+                                        std::int32_t context, std::int32_t batch) {
     const auto pages = paged_context(context) / kPagedKVPageSize;
-    const Tensor table(offsets.span(), DType::I64, {pages, 1});
+    const Tensor table(offsets.span(), DType::I64, {pages, batch});
     return {.k_pages      = packed.plane(0, table),
             .v_pages      = packed.plane(1, table),
             .head_dim     = kHeadDim,
@@ -182,62 +192,65 @@ PagedKVBatchLayerView make_context_view(tool::PackedKVFixture& packed, DeviceBuf
             .storage      = KvCacheStorage::BFloat16};
 }
 
-std::size_t workspace_capacity(std::int32_t tokens, std::int32_t context) {
+std::size_t workspace_capacity(std::int32_t tokens, std::int32_t context, std::int32_t batch) {
     const ops::ContextAttentionExecutionEnvelope envelope{static_cast<std::uint32_t>(context),
                                                           static_cast<std::uint32_t>(context)};
     return ops::context_softmax_attention_workspace_capacity_bytes(kGeometry, envelope, tokens,
-                                                                   tokens, 1);
+                                                                   tokens, batch);
 }
 
 class Case {
 public:
-    Case(std::int32_t tokens, std::int32_t context)
-        : tokens_(tokens), context_(context),
-          q_(bench::make_bf16(static_cast<std::size_t>(kHeadDim) * kQueryHeads * tokens, 101U)),
-          query_k_(bench::make_bf16(static_cast<std::size_t>(kHeadDim) * kKvHeads * tokens, 103U)),
-          query_v_(bench::make_bf16(static_cast<std::size_t>(kHeadDim) * kKvHeads * tokens, 105U)),
-          packed_(bench::device_context().device(), context_geometry(),
-                  paged_context(context) / kPagedKVPageSize),
+    Case(std::int32_t tokens, std::int32_t context, std::int32_t batch)
+        : q_(bench::make_bf16(static_cast<std::size_t>(kHeadDim) * kQueryHeads * tokens * batch,
+                              101U)),
+          query_k_(bench::make_bf16(static_cast<std::size_t>(kHeadDim) * kKvHeads * tokens * batch,
+                                    103U)),
+          query_v_(bench::make_bf16(static_cast<std::size_t>(kHeadDim) * kKvHeads * tokens * batch,
+                                    105U)),
+          packed_(bench::device_context().device(), context_geometry(), page_count(context, batch)),
           block_table_(ninfer::bench::device_context().device(),
                        static_cast<std::size_t>(paged_context(context) / kPagedKVPageSize) *
-                           sizeof(std::int64_t)),
-          context_length_(ninfer::bench::device_context().device(), sizeof(std::int32_t)),
-          valid_(ninfer::bench::device_context().device(), sizeof(std::int32_t)),
-          table_row_(ninfer::bench::device_context().device(), sizeof(std::int32_t)),
-          output_(bench::make_zeros(static_cast<std::size_t>(kHeadDim) * kQueryHeads * tokens * 2)),
-          workspace_bytes_(workspace_capacity(tokens, context)),
+                           sizeof(std::int64_t) * batch),
+          context_length_(ninfer::bench::device_context().device(), sizeof(std::int32_t) * batch),
+          valid_(ninfer::bench::device_context().device(), sizeof(std::int32_t) * batch),
+          table_row_(ninfer::bench::device_context().device(), sizeof(std::int32_t) * batch),
+          output_(bench::make_zeros(static_cast<std::size_t>(kHeadDim) * kQueryHeads * tokens *
+                                    batch * 2)),
+          workspace_bytes_(workspace_capacity(tokens, context, batch)),
           workspace_storage_(bench::make_buffer(std::max<std::size_t>(workspace_bytes_, 1))),
           workspace_(workspace_storage_.span()),
-          q_tensor_(q_.span(), DType::BF16, {kHeadDim, kQueryHeads, tokens, 1}),
-          query_k_tensor_(query_k_.span(), DType::BF16, {kHeadDim, kKvHeads, tokens, 1}),
-          query_v_tensor_(query_v_.span(), DType::BF16, {kHeadDim, kKvHeads, tokens, 1}),
-          length_tensor_(context_length_.span(), DType::I32, {1}),
-          valid_tensor_(valid_.span(), DType::I32, {1}),
-          table_row_tensor_(table_row_.span(), DType::I32, {1}),
-          output_tensor_(output_.span(), DType::BF16, {kHeadDim, kQueryHeads, tokens, 1}),
-          context_view_(make_context_view(packed_, block_table_, context)),
+          q_tensor_(q_.span(), DType::BF16, {kHeadDim, kQueryHeads, tokens, batch}),
+          query_k_tensor_(query_k_.span(), DType::BF16, {kHeadDim, kKvHeads, tokens, batch}),
+          query_v_tensor_(query_v_.span(), DType::BF16, {kHeadDim, kKvHeads, tokens, batch}),
+          length_tensor_(context_length_.span(), DType::I32, {batch}),
+          valid_tensor_(valid_.span(), DType::I32, {batch}),
+          table_row_tensor_(table_row_.span(), DType::I32, {batch}),
+          output_tensor_(output_.span(), DType::BF16, {kHeadDim, kQueryHeads, tokens, batch}),
+          context_view_(make_context_view(packed_, block_table_, context, batch)),
           envelope_{static_cast<std::uint32_t>(context), static_cast<std::uint32_t>(context)} {
-        CUDA_CHECK(cudaMemcpy(context_length_.data(), &context_, sizeof(context_),
+        const std::vector<std::int32_t> lengths(batch, context), valid(batch, tokens);
+        std::vector<std::int32_t> rows(batch);
+        for (int b = 0; b < batch; ++b) rows[b] = b;
+        CUDA_CHECK(cudaMemcpy(context_length_.data(), lengths.data(), context_length_.size(),
                               cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(valid_.data(), &tokens_, sizeof(tokens_), cudaMemcpyHostToDevice));
-        const std::int32_t table_row = 0;
+        CUDA_CHECK(cudaMemcpy(valid_.data(), valid.data(), valid_.size(), cudaMemcpyHostToDevice));
         CUDA_CHECK(
-            cudaMemcpy(table_row_.data(), &table_row, sizeof(table_row), cudaMemcpyHostToDevice));
-        const auto pages = paged_context(context) / kPagedKVPageSize;
-        auto context_k =
-            bench::make_bf16(static_cast<std::size_t>(kHeadDim) * paged_context(context) * kKvHeads,
-                             211U, -.25F, .25F);
-        auto context_v =
-            bench::make_bf16(static_cast<std::size_t>(kHeadDim) * paged_context(context) * kKvHeads,
-                             311U, -1.F, 1.F);
+            cudaMemcpy(table_row_.data(), rows.data(), table_row_.size(), cudaMemcpyHostToDevice));
+        const auto pages = page_count(context, batch);
+        auto context_k   = bench::make_bf16(static_cast<std::size_t>(kHeadDim) *
+                                                paged_context(context) * kKvHeads * batch,
+                                            211U, -.25F, .25F);
+        auto context_v   = bench::make_bf16(static_cast<std::size_t>(kHeadDim) *
+                                                paged_context(context) * kKvHeads * batch,
+                                            311U, -1.F, 1.F);
         packed_.upload_plane(
             0, Tensor(context_k.span(), DType::BF16, {kHeadDim, kPagedKVPageSize, pages, kKvHeads}),
             true);
         packed_.upload_plane(
             1, Tensor(context_v.span(), DType::FP16, {kHeadDim, kPagedKVPageSize, pages, kKvHeads}),
             true);
-        std::vector<std::int64_t> table(
-            static_cast<std::size_t>(paged_context(context) / kPagedKVPageSize));
+        std::vector<std::int64_t> table(static_cast<std::size_t>(pages));
         for (std::int32_t page = 0; page < static_cast<std::int32_t>(table.size()); ++page) {
             table[static_cast<std::size_t>(page)] = packed_.physical_offset(page);
         }
@@ -254,8 +267,6 @@ public:
     [[nodiscard]] std::size_t workspace_bytes() const noexcept { return workspace_bytes_; }
 
 private:
-    std::int32_t tokens_;
-    std::int32_t context_;
     DeviceBuffer q_;
     DeviceBuffer query_k_;
     DeviceBuffer query_v_;
@@ -312,11 +323,11 @@ void report(const Result& result) {
     const double seconds = result.timing.median_us * 1.0e-6;
     const double gbps    = result.useful_bytes / seconds / 1.0e9;
     const double tflops  = result.useful_flops / seconds / 1.0e12;
-    std::printf("entry=context execution=%-5s cache=%-4s T=%2d L=%6d workspace=%8zu "
+    std::printf("entry=context execution=%-5s cache=%-4s B=%d T=%2d L=%6d workspace=%8zu "
                 "median=%9.3f us min=%9.3f us p95=%9.3f us useful=%8.1f GB/s "
                 "(%5.1f%% of %.0f) math=%7.2f TFLOP/s (%5s%% of %s)\n",
-                execution_name(result.execution), cache_name(result.cache), result.tokens,
-                result.context, result.workspace_bytes, result.timing.median_us,
+                execution_name(result.execution), cache_name(result.cache), result.batch,
+                result.tokens, result.context, result.workspace_bytes, result.timing.median_us,
                 result.timing.min_us, result.timing.p95_us, gbps,
                 gbps / bench::kRoofline.memory_gbs * 100.0, bench::kRoofline.memory_gbs, tflops,
                 bench::format_metric(tflops / bench::kRoofline.bf16_f32_tflops * 100.0, 1).c_str(),
@@ -329,13 +340,13 @@ void write_csv(const Options& options, const std::vector<Result>& results) {
     if (!path.parent_path().empty()) { std::filesystem::create_directories(path.parent_path()); }
     std::ofstream output(path);
     if (!output) { throw std::runtime_error("failed to open CSV output"); }
-    output << "entry,execution,cache,T,context,workspace_bytes,useful_bytes,useful_flops,"
+    output << "entry,execution,cache,B,T,context,workspace_bytes,useful_bytes,useful_flops,"
               "median_us,min_us,p95_us\n";
     for (const Result& result : results) {
         output << "context," << execution_name(result.execution) << ',' << cache_name(result.cache)
-               << ',' << result.tokens << ',' << result.context << ',' << result.workspace_bytes
-               << ',' << result.useful_bytes << ',' << result.useful_flops << ','
-               << result.timing.median_us << ',' << result.timing.min_us << ','
+               << ',' << result.batch << ',' << result.tokens << ',' << result.context << ','
+               << result.workspace_bytes << ',' << result.useful_bytes << ',' << result.useful_flops
+               << ',' << result.timing.median_us << ',' << result.timing.min_us << ','
                << result.timing.p95_us << '\n';
     }
 }
@@ -388,43 +399,48 @@ int main(int argc, char** argv) {
         bench::L2FlushBuffer flush(kFlushBytes);
 
         if (options.profile) {
-            Case data(options.tokens.front(), options.contexts.front());
+            Case data(options.tokens.front(), options.contexts.front(), options.batches.front());
             profile(data, options, flush, cuda);
             CUDA_CHECK(cudaStreamDestroy(stream));
             return 0;
         }
 
         std::vector<Result> results;
-        for (const std::int32_t context : options.contexts) {
-            for (const std::int32_t tokens : options.tokens) {
-                Case data(tokens, context);
-                bench::TimedGraph graph;
-                if (options.execution != Execution::Eager) {
-                    data.launch(cuda);
-                    CUDA_CHECK(cudaStreamSynchronize(stream));
-                    graph.capture(cuda, [&](CudaExecutionView cuda) { data.launch(cuda); });
-                }
-                for (const Execution execution : {Execution::Eager, Execution::Graph}) {
-                    if ((options.execution == Execution::Eager && execution != Execution::Eager) ||
-                        (options.execution == Execution::Graph && execution != Execution::Graph)) {
-                        continue;
+        for (const auto batch : options.batches) {
+            for (const std::int32_t context : options.contexts) {
+                for (const std::int32_t tokens : options.tokens) {
+                    Case data(tokens, context, batch);
+                    bench::TimedGraph graph;
+                    if (options.execution != Execution::Eager) {
+                        data.launch(cuda);
+                        CUDA_CHECK(cudaStreamSynchronize(stream));
+                        graph.capture(cuda, [&](CudaExecutionView cuda) { data.launch(cuda); });
                     }
-                    for (const CacheState cache : {CacheState::Cold, CacheState::Warm}) {
-                        if ((options.cache == CacheMode::Cold && cache != CacheState::Cold) ||
-                            (options.cache == CacheMode::Warm && cache != CacheState::Warm)) {
+                    for (const Execution execution : {Execution::Eager, Execution::Graph}) {
+                        if ((options.execution == Execution::Eager &&
+                             execution != Execution::Eager) ||
+                            (options.execution == Execution::Graph &&
+                             execution != Execution::Graph)) {
                             continue;
                         }
-                        Result result{tokens,
-                                      context,
-                                      execution,
-                                      cache,
-                                      data.workspace_bytes(),
-                                      useful_bytes(tokens, context),
-                                      useful_flops(tokens, context),
-                                      measure(data, execution, cache, &graph, flush, cuda,
-                                              options.warmup, options.repeat)};
-                        report(result);
-                        results.push_back(result);
+                        for (const CacheState cache : {CacheState::Cold, CacheState::Warm}) {
+                            if ((options.cache == CacheMode::Cold && cache != CacheState::Cold) ||
+                                (options.cache == CacheMode::Warm && cache != CacheState::Warm)) {
+                                continue;
+                            }
+                            Result result{batch,
+                                          tokens,
+                                          context,
+                                          execution,
+                                          cache,
+                                          data.workspace_bytes(),
+                                          batch * useful_bytes(tokens, context),
+                                          batch * useful_flops(tokens, context),
+                                          measure(data, execution, cache, &graph, flush, cuda,
+                                                  options.warmup, options.repeat)};
+                            report(result);
+                            results.push_back(result);
+                        }
                     }
                 }
             }

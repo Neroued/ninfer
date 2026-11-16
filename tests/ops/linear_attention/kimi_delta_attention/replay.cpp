@@ -37,12 +37,12 @@ std::vector<float> values(std::size_t n, unsigned seed, float amplitude = 1) {
 }
 
 int replay_case(int layers, int heads, int width, int batch, bool alias_records, bool in_place,
-                bool graph, int qheads = 0, bool projected = false) {
+                bool graph, int qheads = 0, bool projected = false, bool inactive = false) {
     auto& context = cuda_environment().context;
     CudaStream stream(context);
     const auto cuda = context.execution_view(stream.stream());
     if (!qheads) qheads = heads;
-    const int channels = (2 * qheads + heads) * 128, capacity = 8;
+    const int channels = (2 * qheads + heads) * 128, capacity = batch > 8 ? batch + 3 : 8;
     StateImageBuilder sb;
     const auto guard        = sb.add(DType::I32, {64}, 1, "unrelated field");
     const auto state_layout = plan_linear_attention_state(
@@ -65,9 +65,14 @@ int replay_case(int layers, int heads, int width, int batch, bool alias_records,
     Tensor destination_table(destination_buffer.span(), DType::I64, {batch});
     std::vector<int> valid(batch), accepted(batch);
     for (int b = 0; b < batch; ++b) {
-        valid[b]    = projected ? width : std::max(1, width - b % width);
+        valid[b] = projected ? width : std::max(1, width - b % width);
+        if (inactive && b % 3 == 0) valid[b] = 0;
         accepted[b] = batch == 1 ? valid[b] : (b == batch - 1 ? valid[b] : std::min(b, valid[b]));
     }
+    auto record_sources = sources;
+    for (int b = 0; b < batch; ++b)
+        if (!valid[b]) record_sources[b] = -1;
+    source_buffer.copy_from_host(record_sources.data(), source_buffer.size());
     auto valid_buffer = to_device(valid), accepted_buffer = to_device(accepted);
     Tensor valid_table(valid_buffer.span(), DType::I32, {batch});
     Tensor accepted_table(accepted_buffer.span(), DType::I32, {batch});
@@ -180,7 +185,8 @@ int replay_case(int layers, int heads, int width, int batch, bool alias_records,
             launch();
             CUDA_CHECK(cudaStreamEndCapture(cuda.stream(), &gr));
             CUDA_CHECK(cudaGraphInstantiate(&ex, gr, 0));
-            std::vector<int> one(batch, 1);
+            auto one = valid;
+            for (auto& n : one) n = std::min(n, 1);
             valid_buffer.copy_from_host(one.data(), valid_buffer.size());
             CUDA_CHECK(cudaGraphLaunch(ex, cuda.stream()));
             CUDA_CHECK(cudaStreamSynchronize(cuda.stream()));
@@ -195,7 +201,7 @@ int replay_case(int layers, int heads, int width, int batch, bool alias_records,
             valid_buffer.copy_from_host(valid.data(), valid_buffer.size());
             CUDA_CHECK(cudaGraphLaunch(ex, cuda.stream()));
             CUDA_CHECK(cudaStreamSynchronize(cuda.stream()));
-            source_buffer.copy_from_host(sources.data(), source_buffer.size());
+            source_buffer.copy_from_host(record_sources.data(), source_buffer.size());
             CUDA_CHECK(cudaGraphExecDestroy(ex));
             CUDA_CHECK(cudaGraphDestroy(gr));
         }
@@ -355,8 +361,17 @@ int replay_case(int layers, int heads, int width, int batch, bool alias_records,
                 for (int l = 0; l < layers; ++l) {
                     auto state = states.recurrent_tensor(l, destinations[b]);
                     auto conv  = states.conv_tensor(l, destinations[b]);
-                    CUDA_CHECK(cudaMemsetAsync(state.data, 0x35, state.bytes(), cuda.stream()));
-                    CUDA_CHECK(cudaMemsetAsync(conv.data, 0x35, conv.bytes(), cuda.stream()));
+                    if (in_place) {
+                        CUDA_CHECK(cudaMemcpyAsync(state.data, prefixes[l * batch + b][0].data(),
+                                                   state.bytes(), cudaMemcpyHostToDevice,
+                                                   cuda.stream()));
+                        CUDA_CHECK(cudaMemcpyAsync(conv.data, initial_conv[l * batch + b].data(),
+                                                   conv.bytes(), cudaMemcpyHostToDevice,
+                                                   cuda.stream()));
+                    } else {
+                        CUDA_CHECK(cudaMemsetAsync(state.data, 0x35, state.bytes(), cuda.stream()));
+                        CUDA_CHECK(cudaMemsetAsync(conv.data, 0x35, conv.bytes(), cuda.stream()));
+                    }
                 }
             }
             fold.execute(rows, cuda);
@@ -366,7 +381,7 @@ int replay_case(int layers, int heads, int width, int batch, bool alias_records,
                     const int count = rows[b].commit_columns;
                     auto state      = states.recurrent_tensor(l, destinations[b]);
                     auto conv       = states.conv_tensor(l, destinations[b]);
-                    if (count)
+                    if (count || in_place)
                         failures +=
                             verify_exact("same projection prefix state",
                                          from_device<std::uint32_t>(state.data, 128 * 128 * heads),
@@ -379,6 +394,7 @@ int replay_case(int layers, int heads, int width, int batch, bool alias_records,
                             throw std::runtime_error("zero prefix modified state");
                     }
                     std::vector<std::uint16_t> tail(channels * 3, 0x3535);
+                    if (!count && in_place) tail = initial_conv[l * batch + b];
                     if (count)
                         for (int j = 0; j < 3; ++j) {
                             const int t = count - 3 + j;
@@ -408,11 +424,27 @@ int main(int argc, char** argv) {
     suite.add("kda/replay/single", [] { return replay_case(1, 1, 1, 1, false, false, false); });
     suite.add("kda/replay/projected_t8b8",
               [] { return replay_case(1, 32, 8, 8, true, false, true, 32, true); });
+    suite.add("kda/replay/projected_t4b8",
+              [] { return replay_case(1, 32, 4, 8, true, true, true, 32, true); });
+    suite.add("kda/replay/projected_t5b4",
+              [] { return replay_case(1, 32, 5, 4, true, true, true, 32, true); });
     suite.add("kda/replay/projected_t16b4",
               [] { return replay_case(1, 32, 16, 4, true, false, true, 32, true); });
     suite.add("kda/replay/mixed_multilayer_t8",
               [] { return replay_case(2, 32, 8, 4, true, false, true); });
     suite.add("kda/replay/inplace_multilayer_t16",
               [] { return replay_case(2, 32, 16, 8, false, true, true); });
+    suite.add("kda/replay/expanded_host",
+              [] { return replay_case(2, 1, 4, 17, false, false, false, 1, false, true); },
+              {{"suite", "concurrency"}});
+    suite.add("kda/replay/expanded_device",
+              [] { return replay_case(2, 1, 3, 64, false, false, true, 1, false, true); },
+              {{"suite", "concurrency"}});
+    suite.add("kda/replay/grouped_state_tiles",
+              [] { return replay_case(1, 32, 4, 17, false, false, true, 32, false, true); },
+              {{"suite", "concurrency"}});
+    suite.add("kda/replay/grouped_long_window",
+              [] { return replay_case(1, 32, 16, 64, false, false, true, 32, false, true); },
+              {{"suite", "concurrency"}});
     return suite.main(argc, argv);
 }

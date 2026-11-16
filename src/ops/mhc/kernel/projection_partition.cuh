@@ -8,7 +8,7 @@ namespace ninfer::ops::detail::mhc {
 // Stage a complete hidden partition at once. Loading uses the full CTA, while
 // two MMA warps produce the 24 coefficients and the residual square sum in the
 // unused eight rows. Each CTA owns every residual stream, including in-place writes.
-template <Form F, int Hidden, int Threads>
+template <Form F, int Hidden, int Threads, bool Tap = false>
 __global__ __launch_bounds__(Threads) void projection_partition_kernel(Operands o, float* partial,
                                                                        std::int64_t tile_offset) {
     constexpr int Tokens = 8, Parts = kHidden / Hidden, Vector = Tokens * Hidden / Threads;
@@ -58,6 +58,7 @@ __global__ __launch_bounds__(Threads) void projection_partition_kernel(Operands 
         if (m0 + t < o.columns) {
             if constexpr (F == Form::PostPre) {
                 mixed_vectors(o, m0 + t, d0 + col, coefficients[t], coefficients[t] + 4, values);
+                if constexpr (Tap) store_mean_tap(o, m0 + t, d0 + col, values);
             } else {
                 const auto value = common::Bf16Vector<Vector>::load(
                     static_cast<const __nv_bfloat16*>(o.residual) + (m0 + t) * kHidden + d0 + col);

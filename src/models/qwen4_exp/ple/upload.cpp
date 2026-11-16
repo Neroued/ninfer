@@ -98,8 +98,7 @@ struct UploadSlots::Impl {
     }
 
     std::size_t bytes(std::uint32_t tokens, std::uint32_t batch) const {
-        if (!tokens || !batch || batch > kMaximumConcurrency ||
-            std::uint64_t(tokens) * batch > max_positions) {
+        if (!tokens || !batch || std::uint64_t(tokens) * batch > max_positions) {
             throw std::invalid_argument("invalid PLE upload shape");
         }
         return std::size_t(tokens) * batch * kEmbeddingBytes;
@@ -139,7 +138,14 @@ void UploadSlots::upload(const HostEmbedding& input, CudaExecutionView transfer)
     auto& p = *impl_;
     p.validate(transfer);
     const auto bytes = p.bytes(input.window.tokens, input.window.batch);
-    auto& slot       = p.slots.at(input.ticket.slot);
+    if (input.window.valid_columns.size() != input.window.batch ||
+        input.window.identities.empty() || input.window.identities.size() > input.window.batch)
+        throw std::invalid_argument("invalid PLE window metadata");
+    for (std::size_t row = 0; row < input.window.batch; ++row)
+        if (input.window.valid_columns[row] > input.window.tokens ||
+            (row >= input.window.identities.size() && input.window.valid_columns[row]))
+            throw std::invalid_argument("invalid PLE inactive row");
+    auto& slot = p.slots.at(input.ticket.slot);
     if (slot.active || !input.ticket.generation || input.ticket.generation <= slot.generation) {
         throw std::logic_error("PLE upload slot is busy or ticket is stale");
     }

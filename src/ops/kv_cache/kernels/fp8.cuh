@@ -41,4 +41,29 @@ __device__ __forceinline__ void store_fp8_d256(const float (&values)[8], std::ui
     }
 }
 
+// The same D256 codec with eight consecutive features owned by each lane.
+__device__ __forceinline__ void store_fp8_d256_contiguous(const float (&values)[8],
+                                                          std::uint8_t* codes, std::uint8_t* scales,
+                                                          int lane) {
+    float maximum = 0;
+#pragma unroll
+    for (float value : values) maximum = fmaxf(maximum, fabsf(value));
+    constexpr int GroupLanes = kFp8CacheGroup / 8;
+    const auto quant         = common::fp8_ue8m0_scale(common::warp_max<GroupLanes>(maximum));
+    unsigned words[2]{};
+#pragma unroll
+    for (int pair = 0; pair < 4; ++pair)
+        words[pair / 2] |= unsigned(common::fp8_quant_code2(values[2 * pair], values[2 * pair + 1],
+                                                            quant.inverse_scale))
+                           << (16 * (pair % 2));
+    auto* output = codes + 8 * lane;
+    if (reinterpret_cast<std::uintptr_t>(output) % 8 == 0)
+        *reinterpret_cast<uint2*>(output) = make_uint2(words[0], words[1]);
+    else {
+#pragma unroll
+        for (int j = 0; j < 8; ++j) output[j] = std::uint8_t(words[j / 4] >> (8 * (j % 4)));
+    }
+    if (lane % GroupLanes == 0) scales[lane / GroupLanes] = quant.scale;
+}
+
 } // namespace ninfer::ops::detail::kv

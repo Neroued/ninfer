@@ -110,6 +110,34 @@ __device__ __forceinline__ int sampling_partial_offset(const Workspace& workspac
     return ((col * workspace.partial_stride + partial) * kSamplerCandidateCap) + j;
 }
 
+// Warp-local lists are already sorted. Merge their upper halves in parallel;
+// only the global top cap entries are needed by the next stage.
+template <class S, class Key>
+__device__ inline Key sampling_merge_tile_lists(Key* candidates, int cap) {
+    const int warp = threadIdx.x / 32, lane = threadIdx.x & 31;
+    Key key = 0;
+#pragma unroll
+    for (int span = 1; span < S::kSamplingTileWarps; span *= 2) {
+        if (warp < S::kSamplingTileWarps / (2 * span)) {
+            const int first   = warp * 2 * span * kSamplerCandidateCap;
+            key               = lane < cap ? candidates[first + lane] : Key{0};
+            const int reverse = 31 - lane;
+            const Key other =
+                reverse < cap ? candidates[first + span * kSamplerCandidateCap + reverse] : Key{0};
+            key = key > other ? key : other;
+#pragma unroll
+            for (int distance = 16; distance > 0; distance /= 2) {
+                const Key opposite = __shfl_xor_sync(0xffffffffU, key, distance);
+                key                = (lane & distance) == 0 ? (key > opposite ? key : opposite)
+                                                            : (key < opposite ? key : opposite);
+            }
+            if (lane < cap) candidates[first + lane] = key;
+        }
+        __syncthreads();
+    }
+    return key;
+}
+
 template <class S>
 __device__ inline void
 sampling_store_tile_topk(unsigned long long (&keys)[S::kSamplerItemsPerThread], int cap,
@@ -127,28 +155,9 @@ sampling_store_tile_topk(unsigned long long (&keys)[S::kSamplerItemsPerThread], 
     }
     __syncthreads();
 
-    if (warp != 0) { return; }
-    if (lane < S::kSamplingTileWarps) {
-        constexpr unsigned int kMergeMask = (1u << S::kSamplingTileWarps) - 1u;
-        int position                      = 0;
-        for (int rank = 0; rank < cap; ++rank) {
-            const unsigned long long key =
-                storage.candidates[lane * kSamplerCandidateCap + position];
-            const unsigned int high     = static_cast<unsigned int>(key >> 32);
-            const unsigned int max_high = __reduce_max_sync(kMergeMask, high);
-            const unsigned int low      = high == max_high ? static_cast<unsigned int>(key) : 0u;
-            const unsigned int max_low  = __reduce_max_sync(kMergeMask, low);
-            const unsigned int winners =
-                __ballot_sync(kMergeMask, high == max_high && low == max_low);
-            const int source = __ffs(static_cast<int>(winners)) - 1;
-            if (lane == 0) {
-                const int off = sampling_partial_offset(workspace, col, partial, rank);
-                workspace.partial_keys[off] =
-                    (static_cast<unsigned long long>(max_high) << 32) | max_low;
-            }
-            if (lane == source) { ++position; }
-        }
-    }
+    const auto key = sampling_merge_tile_lists<S>(storage.candidates, cap);
+    if (warp == 0 && lane < cap)
+        workspace.partial_keys[sampling_partial_offset(workspace, col, partial, lane)] = key;
 }
 
 template <class S>
@@ -168,27 +177,21 @@ sampling_store_bf16_tile_topk(unsigned int (&keys)[S::kSamplerItemsPerThread], i
     }
     __syncthreads();
 
-    if (warp != 0) { return; }
-    if (lane < S::kSamplingTileWarps) {
-        constexpr unsigned int kMergeMask = (1u << S::kSamplingTileWarps) - 1u;
-        int position                      = 0;
-        for (int rank = 0; rank < cap; ++rank) {
-            const unsigned int key     = storage.candidates[lane * kSamplerCandidateCap + position];
-            const unsigned int best    = __reduce_max_sync(kMergeMask, key);
-            const unsigned int winners = __ballot_sync(kMergeMask, key == best);
-            const int source           = __ffs(static_cast<int>(winners)) - 1;
-            if (lane == 0) {
-                const int off = sampling_partial_offset(workspace, col, partial, rank);
-                workspace.partial_keys[off] =
-                    sampling_expand_bf16_tile_sort_key<S>(best, tile_start);
-            }
-            if (lane == source) { ++position; }
-        }
-    }
+    const auto key = sampling_merge_tile_lists<S>(storage.candidates, cap);
+    if (warp == 0 && lane < cap)
+        workspace.partial_keys[sampling_partial_offset(workspace, col, partial, lane)] =
+            sampling_expand_bf16_tile_sort_key<S>(key, tile_start);
 }
 
 __device__ __forceinline__ int sampling_dist_offset(int col, int j) {
     return col * kSamplerCandidateCap + j;
+}
+
+__device__ __forceinline__ float sampling_penalized_logit(float raw, const SamplingConfig& cfg,
+                                                          int count) {
+    if (count > 0) raw -= cfg.presence_penalty;
+    if (cfg.frequency_penalty != 0.F) raw -= cfg.frequency_penalty * static_cast<float>(count);
+    return raw;
 }
 
 // Applies presence/frequency penalties to a raw logit. `overlay`/`overlay_len`
@@ -211,9 +214,7 @@ __device__ __forceinline__ float sampling_adjusted_logit(float raw, int v, const
     for (int j = 0; j < overlay_len; ++j) {
         if (overlay[j] == v) { ++cnt; }
     }
-    if (cnt > 0) { x -= c.presence_penalty; }
-    if (c.frequency_penalty != 0.0f) { x -= c.frequency_penalty * static_cast<float>(cnt); }
-    return x;
+    return sampling_penalized_logit(x, c, cnt);
 }
 
 __device__ __forceinline__ void sampling_insert_candidate(float* vals, int* idxs, int cap, float v,
@@ -256,45 +257,48 @@ __device__ inline void sampling_sort_tile_desc(float* vals, int* idxs) {
     }
 }
 
+__device__ inline void sampling_normalize_support_values(const SamplingConfig& cfg,
+                                                         const float* cand_val, float* prob,
+                                                         int* n_support, int n) {
+    while (n > 0 && !isfinite(cand_val[n - 1])) { --n; }
+    if (n == 0 || !isfinite(cand_val[0])) {
+        // The caller provides nonempty masks. Missing finite support is a model execution
+        // failure, not a distribution from which a placeholder token can be published.
+        asm volatile("trap;");
+    } else {
+        const float inv_temp = 1.0f / cfg.temperature;
+        const float m        = cand_val[0] * inv_temp;
+        float sum            = 0.0f;
+        for (int j = 0; j < n; ++j) {
+            const float e = __expf(cand_val[j] * inv_temp - m);
+            prob[j]       = e;
+            sum += e;
+        }
+        const float e0           = prob[0];
+        const float min_p_thresh = (cfg.min_p > 0.0f) ? cfg.min_p * e0 : -1.0f;
+        const bool top_p_active  = (cfg.top_p < 1.0f);
+        const float top_p_target = cfg.top_p * sum;
+        float cum                = 0.0f;
+        int support              = 0;
+        for (int j = 0; j < n; ++j) {
+            if (min_p_thresh >= 0.0f && prob[j] < min_p_thresh) { break; }
+            cum += prob[j];
+            support = j + 1;
+            if (top_p_active && cum >= top_p_target) { break; }
+        }
+        if (support < 1) { support = 1; }
+        float ssum = 0.0f;
+        for (int j = 0; j < support; ++j) { ssum += prob[j]; }
+        const float inv = 1.0f / ssum;
+        for (int j = 0; j < support; ++j) { prob[j] *= inv; }
+        *n_support = support;
+    }
+}
+
 __device__ inline void sampling_normalize_support(const SamplingConfig& cfg, float* cand_val,
                                                   int* cand_idx, float* prob, int* n_support,
                                                   int n) {
-    const int tid = threadIdx.x;
-    if (tid == 0) {
-        while (n > 0 && !isfinite(cand_val[n - 1])) { --n; }
-        if (n == 0 || !isfinite(cand_val[0])) {
-            // The caller provides nonempty masks. Missing finite support is a model execution
-            // failure, not a distribution from which a placeholder token can be published.
-            asm volatile("trap;");
-        } else {
-            const float inv_temp = 1.0f / cfg.temperature;
-            const float m        = cand_val[0] * inv_temp;
-            float sum            = 0.0f;
-            for (int j = 0; j < n; ++j) {
-                const float e = __expf(cand_val[j] * inv_temp - m);
-                prob[j]       = e;
-                sum += e;
-            }
-            const float e0           = prob[0];
-            const float min_p_thresh = (cfg.min_p > 0.0f) ? cfg.min_p * e0 : -1.0f;
-            const bool top_p_active  = (cfg.top_p < 1.0f);
-            const float top_p_target = cfg.top_p * sum;
-            float cum                = 0.0f;
-            int support              = 0;
-            for (int j = 0; j < n; ++j) {
-                if (min_p_thresh >= 0.0f && prob[j] < min_p_thresh) { break; }
-                cum += prob[j];
-                support = j + 1;
-                if (top_p_active && cum >= top_p_target) { break; }
-            }
-            if (support < 1) { support = 1; }
-            float ssum = 0.0f;
-            for (int j = 0; j < support; ++j) { ssum += prob[j]; }
-            const float inv = 1.0f / ssum;
-            for (int j = 0; j < support; ++j) { prob[j] *= inv; }
-            *n_support = support;
-        }
-    }
+    if (threadIdx.x == 0) sampling_normalize_support_values(cfg, cand_val, prob, n_support, n);
     __syncthreads();
 }
 

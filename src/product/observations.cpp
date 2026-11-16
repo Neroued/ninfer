@@ -142,15 +142,6 @@ Json execution(const ExecutionCounters& value) {
             {"latency_bins", value.latency.bins}};
 }
 
-Json communication(const CommunicationWork& value) {
-    constexpr std::array names{"all_reduce",     "broadcast", "all_gather",
-                               "reduce_scatter", "send",      "receive"};
-    Json out;
-    for (std::size_t i = 0; i < names.size(); ++i)
-        out[names[i]] = {{"calls", value.calls[i]}, {"payload_bytes", value.payload_bytes[i]}};
-    return out;
-}
-
 template <class T>
 Json optional(const std::optional<T>& value) {
     return value ? Json(*value) : Json(nullptr);
@@ -224,8 +215,14 @@ EngineSnapshot observation_delta(EngineSnapshot current, const EngineSnapshot& b
             const auto old = std::find_if(prior->communication.begin(), prior->communication.end(),
                                           [&](const auto& g) { return g.group == group.group; });
             if (old == prior->communication.end()) continue;
-            subtract_communication(group.eager, old->eager);
-            subtract_communication(group.graph, old->graph);
+            for (auto& backend : group.backends) {
+                const auto previous =
+                    std::find_if(old->backends.begin(), old->backends.end(),
+                                 [&](const auto& b) { return b.backend == backend.backend; });
+                if (previous == old->backends.end()) continue;
+                subtract_communication(backend.eager, previous->eager);
+                subtract_communication(backend.graph, previous->graph);
+            }
         }
         if (rank.memory.experts && prior->memory.experts) {
             rank.memory.experts->uploaded_bytes -= prior->memory.experts->uploaded_bytes;
@@ -354,12 +351,8 @@ Json observation_json(const EngineSnapshot& snapshot, std::uint64_t now) {
         value["compute_paths"]       = {{"eager", rank.compute_paths[0]},
                                         {"graph", rank.compute_paths[1]},
                                         {"mixed", rank.compute_paths[2]}};
-        value["communication_eager"] = communication(rank.communication_eager);
-        value["communication_graph"] = communication(rank.communication_graph);
-        for (std::size_t i = 0; i < rank.communication.size(); ++i) {
-            value["communication"][i]["eager"] = communication(rank.communication[i].eager);
-            value["communication"][i]["graph"] = communication(rank.communication[i].graph);
-        }
+        value["communication_eager"] = communication_json(rank.communication_eager);
+        value["communication_graph"] = communication_json(rank.communication_graph);
         out["ranks"].push_back(std::move(value));
     }
     const auto& media = snapshot.media;

@@ -166,7 +166,7 @@ Reference reference(const std::vector<Expert>& experts, const std::vector<std::u
         int assignments = 0;
         for (int j = 0; j < K; ++j) {
             const int e = ids[t * K + j];
-            if (kind == ops::ExpertSubsetKind::None ||
+            if (e < 0 || kind == ops::ExpertSubsetKind::None ||
                 (kind == ops::ExpertSubsetKind::MaskOnes && !mask[e]) ||
                 (kind == ops::ExpertSubsetKind::MaskZeros && mask[e]))
                 continue;
@@ -284,7 +284,8 @@ enum class InputCase {
     Coherent,
     CodeSweep,
     LocalRoutes,
-    RaggedRoutes
+    RaggedRoutes,
+    AbsentRoutes
 };
 
 void qualify(Fixture& f, CpuExecutor& executor, int tokens, int active, ops::ExpertSubsetKind kind,
@@ -331,6 +332,14 @@ void qualify(Fixture& f, CpuExecutor& executor, int tokens, int active, ops::Exp
         if (input_case == InputCase::RaggedRoutes) {
             const int count = t >= 8 && t < 16 ? 0 : t % 9;
             for (int j = 0; j < K; ++j) ids[t * K + j] = j % 4 + 8 * (j / 4) + (j < count ? 0 : 4);
+        }
+        if (input_case == InputCase::AbsentRoutes) {
+            for (int j = 0; j < K; ++j) {
+                if (t + 1 < tokens || j >= 2) {
+                    ids[t * K + j]          = -1;
+                    coefficients[t * K + j] = 0;
+                }
+            }
         }
     }
     const auto expected     = reference(f.experts, input, ids, coefficients, mask, kind, tokens);
@@ -543,6 +552,10 @@ void validation(Fixture& f, CpuExecutor& executor) {
     ids[1] = 1;
     ids[0] = E;
     rejects([&] { call(); });
+    ids[0] = -2;
+    rejects([&] { call(); });
+    ids[0] = -1;
+    rejects([&] { call(); });
     ids[0]          = 0;
     coefficients[0] = std::numeric_limits<float>::infinity();
     rejects([&] { call(); });
@@ -590,6 +603,14 @@ void validation(Fixture& f, CpuExecutor& executor) {
     call({ExpertSubsetKind::MaskOnes, mask_view});
     std::fill(mask.begin(), mask.end(), 1);
     call({ExpertSubsetKind::MaskZeros, mask_view});
+    ids.fill(-1);
+    coefficients.fill(0);
+    std::fill_n(static_cast<float*>(out.data), H, -123.5F);
+    call();
+    check(std::all_of(static_cast<float*>(out.data), static_cast<float*>(out.data) + H,
+                      [](float value) { return value == 0; }),
+          "absent routes are not zero");
+    call({ExpertSubsetKind::MaskOnes, mask_view});
 }
 } // namespace
 
@@ -617,6 +638,8 @@ int main(int argc, char** argv) {
                      std::to_string(workers) + (overlap ? "/overlap" : "/disjoint") + "/input" +
                      std::to_string(int(input)),
                  {{"format", format}}});
+            if (input == InputCase::AbsentRoutes)
+                catalogue.back().tags.emplace_back("suite", "concurrency");
         };
         using ops::ExpertSubsetKind;
         add(1, 8, ExpertSubsetKind::All, false, InputCase::Random, 1);
@@ -627,6 +650,8 @@ int main(int argc, char** argv) {
         add(8, 8, ExpertSubsetKind::All, true);
         for (int tokens : {5, 6, 7, 9}) add(tokens, 2, ExpertSubsetKind::MaskOnes, true);
         add(25, 4, ExpertSubsetKind::MaskOnes, false, InputCase::RaggedRoutes);
+        add(9, 8, ExpertSubsetKind::All, false, InputCase::AbsentRoutes);
+        add(9, 1, ExpertSubsetKind::MaskZeros, false, InputCase::AbsentRoutes);
         for (int tokens : {32, 64, 72}) add(tokens, 1, ExpertSubsetKind::MaskOnes, false);
         add(1, 0, ExpertSubsetKind::MaskOnes, false);
         add(9, 0, ExpertSubsetKind::None, false);
@@ -665,7 +690,9 @@ int main(int argc, char** argv) {
                                     {Recipe::CodeSweep, "code_sweep"},
                                     {Recipe::Corners, "corners"},
                                     {Recipe::Tiny, "tiny"},
-                                    {Recipe::Coherent, "coherent"}})
+                                    {Recipe::Coherent, "coherent"}}) {
+            std::vector<std::pair<std::string, std::string>> tags{{"format", format}};
+            if (recipe == Recipe::Contract) tags.emplace_back("suite", "concurrency");
             suite.add(
                 "cpu_moe/" + format + "/" + name,
                 [=] {
@@ -699,7 +726,8 @@ int main(int argc, char** argv) {
                     }
                     return 0;
                 },
-                {{"format", format}});
+                std::move(tags));
+        }
     }
     return suite.main(argc, argv);
 }

@@ -172,6 +172,8 @@ void report_test() {
     expect(report["inputs"][1]["seed"] == 1, "resolved per-row seeds");
     expect(report["repetitions"][0]["requests"][0]["finish_reason"] == "stop_token",
            "early EOS retained");
+    expect(report["repetitions"][0]["requests"][0]["first_token_seconds"].is_null(),
+           "missing first-token timing is null");
     expect(Json::parse(bench::format_report(report, bench::OutputFormat::Json)) == report,
            "JSON round trip");
     expect(bench::format_report(report, bench::OutputFormat::Table).find("13.333") !=

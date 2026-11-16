@@ -10,6 +10,9 @@
 
 namespace ninfer::ops::detail::qsa {
 
+template <KvCacheStorage Storage>
+inline constexpr auto kPrepareCacheProfile = kv_cache_profile_info(Storage);
+
 __device__ __forceinline__ void store_int8(const float (&values)[8], std::uint8_t* data,
                                            std::uint8_t* scales, int lane) {
     auto* codes      = reinterpret_cast<std::int8_t*>(data);
@@ -53,15 +56,15 @@ __device__ __forceinline__ void store_nvfp4(const float (&values)[8], std::uint8
     __syncwarp();
 }
 
-template <KvCacheStorage Storage>
+template <KvCacheVectorFormat Format>
 __device__ __forceinline__ void store_quantized(const float (&values)[8], std::uint8_t* codes,
                                                 std::uint8_t* scales, int lane, float* scratch) {
-    if constexpr (Storage == KvCacheStorage::Int8Group64)
+    if constexpr (Format == KvCacheVectorFormat::Int8Group64F16)
         store_int8(values, codes, scales, lane);
-    else if constexpr (Storage == KvCacheStorage::Fp8E4m3fnGroup128Ue8m0)
+    else if constexpr (Format == KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0)
         store_fp8(values, codes, scales, lane);
     else {
-        static_assert(Storage == KvCacheStorage::Nvfp4Group16);
+        static_assert(Format == KvCacheVectorFormat::Nvfp4Group16Ue4m3);
         store_nvfp4(values, codes, scales, lane, scratch);
     }
 }
@@ -90,19 +93,140 @@ __device__ __forceinline__ void prepare_kv(const PrepareArguments& a, int head, 
         norm_rotate<256>(values, a.wk, a.epsilon, sc, lane);
         // The transformed FP32 key enters the codec directly, without a BF16 intermediate.
         kv::normalized_hadamard_d256_inplace(values, lane);
-        constexpr auto key_storage = Storage == KvCacheStorage::Fp8KeyNvfp4Value
-                                         ? KvCacheStorage::Fp8E4m3fnGroup128Ue8m0
-                                         : Storage;
-        constexpr auto value_storage =
-            Storage == KvCacheStorage::Fp8KeyNvfp4Value ? KvCacheStorage::Nvfp4Group16 : Storage;
+        constexpr auto key_storage   = kPrepareCacheProfile<Storage>.key;
+        constexpr auto value_storage = kPrepareCacheProfile<Storage>.value;
         store_quantized<key_storage>(values, key, a.key_scales.at(p % 64, head, page), lane,
                                      scratch);
 #pragma unroll
         for (int j = 0; j < 8; ++j) values[j] = __bfloat162float(raw_value[lane + 32 * j]);
-        if constexpr (value_storage == KvCacheStorage::Nvfp4Group16)
+        if constexpr (value_storage == KvCacheVectorFormat::Nvfp4Group16Ue4m3)
             kv::normalized_hadamard_d256_inplace(values, lane);
         store_quantized<value_storage>(values, value, a.value_scales.at(p % 64, head, page), lane,
                                        scratch);
+    }
+}
+
+__device__ __forceinline__ void store_int8_contiguous(const float (&values)[8], std::uint8_t* codes,
+                                                      std::uint8_t* scales, int lane) {
+    float maximum = 0;
+#pragma unroll
+    for (float x : values) maximum = fmaxf(maximum, fabsf(x));
+    // Eight contiguous lanes cover one G64 group, using its represented FP16 scale.
+    const auto quant = common::int8_fp16_scale(common::warp_max<8>(maximum));
+    unsigned words[2]{};
+#pragma unroll
+    for (int j = 0; j < 8; ++j)
+        words[j / 4] |=
+            unsigned(std::uint8_t(common::int8_quant_code(values[j], quant.inverse_scale)))
+            << (8 * (j % 4));
+    auto* output = codes + 8 * lane;
+    if (reinterpret_cast<std::uintptr_t>(output) % 8 == 0)
+        *reinterpret_cast<uint2*>(output) = make_uint2(words[0], words[1]);
+    else {
+#pragma unroll
+        for (int j = 0; j < 8; ++j) output[j] = std::uint8_t(words[j / 4] >> (8 * (j % 4)));
+    }
+    if (lane % 8 == 0) reinterpret_cast<__half*>(scales)[lane / 8] = quant.scale;
+}
+
+__device__ __forceinline__ void store_nvfp4_contiguous(const float (&values)[8],
+                                                       std::uint8_t* codes, std::uint8_t* scales,
+                                                       int lane) {
+    float maximum = 0;
+#pragma unroll
+    for (float x : values) maximum = fmaxf(maximum, fabsf(x));
+    // Two lanes own a G16 group; the shared codec owns its represented scale boundary.
+    const auto scale = common::nvfp4_fp32_scale(common::warp_max<2>(maximum));
+    unsigned word    = 0;
+    if (scale.code) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const float2 pair = make_float2(__fdiv_rn(values[2 * i], scale.represented),
+                                            __fdiv_rn(values[2 * i + 1], scale.represented));
+            word |= unsigned(__nv_cvt_float2_to_fp4x2(pair, __NV_E2M1, cudaRoundNearest))
+                    << (8 * i);
+        }
+    }
+    auto* output = codes + lane * 4;
+    if (reinterpret_cast<std::uintptr_t>(output) % 4 == 0)
+        *reinterpret_cast<unsigned*>(output) = word;
+    else {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) output[i] = std::uint8_t(word >> (8 * i));
+    }
+    if (lane % 2 == 0) scales[lane / 2] = scale.code;
+}
+
+template <KvCacheVectorFormat Format>
+__device__ __forceinline__ void store_quantized_contiguous(const float (&values)[8],
+                                                           std::uint8_t* codes,
+                                                           std::uint8_t* scales, int lane) {
+    if constexpr (Format == KvCacheVectorFormat::Int8Group64F16)
+        store_int8_contiguous(values, codes, scales, lane);
+    else if constexpr (Format == KvCacheVectorFormat::Nvfp4Group16Ue4m3)
+        store_nvfp4_contiguous(values, codes, scales, lane);
+    else {
+        static_assert(Format == KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0);
+        kv::store_fp8_d256_contiguous(values, codes, scales, lane);
+    }
+}
+
+// Natural cache alignment is two bytes, while the common packed row admits a 16-byte store.
+template <bool Half>
+__device__ __forceinline__ void store_16bit_contiguous(const float (&values)[8],
+                                                       std::uint8_t* output, int lane) {
+    unsigned words[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        if constexpr (Half)
+            words[j] = common::pack_f16x2(values[2 * j], values[2 * j + 1]);
+        else
+            words[j] = common::pack_bf16x2(values[2 * j], values[2 * j + 1]);
+    }
+    if (reinterpret_cast<std::uintptr_t>(output) % 16 == 0)
+        reinterpret_cast<uint4*>(output)[lane] = {words[0], words[1], words[2], words[3]};
+    else {
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+            reinterpret_cast<std::uint16_t*>(output)[lane * 8 + j] =
+                std::uint16_t(words[j / 2] >> (16 * (j % 2)));
+    }
+}
+
+// A warp consumes eight adjacent features per lane. Each codec receives the
+// norm/RoPE result at its declared rounding boundary, without an extra K cast.
+template <KvCacheStorage Storage, int KvHeads>
+__device__ __forceinline__ void prepare_kv_vector(const PrepareArguments& a, int head, int t, int b,
+                                                  int lane, const float2* coefficients) {
+    const auto m      = t + std::int64_t(b) * a.tokens;
+    const int p       = a.positions[m];
+    const auto page   = a.tables[p / 64 + std::int64_t(a.table_rows[b]) * a.table_stride];
+    const auto* key   = a.k + (m * KvHeads + head) * 256;
+    const auto* value = a.v + (m * KvHeads + head) * 256;
+    float x[8];
+    if (reinterpret_cast<std::uintptr_t>(a.wk) % 16 == 0)
+        vector_norm_rotate<256, true>(key, a.wk, a.epsilon, coefficients, lane, x);
+    else
+        vector_norm_rotate<256, false>(key, a.wk, a.epsilon, coefficients, lane, x);
+    if constexpr (Storage == KvCacheStorage::BFloat16) {
+        store_16bit_contiguous<false>(x, a.keys.at(p % 64, head, page), lane);
+    } else {
+        kv::normalized_hadamard_d256_contiguous_inplace(x, lane);
+        store_quantized_contiguous<kPrepareCacheProfile<Storage>.key>(
+            x, a.keys.at(p % 64, head, page), a.key_scales.at(p % 64, head, page), lane);
+    }
+    const auto v = reinterpret_cast<const uint4*>(value)[lane];
+    const unsigned words[4]{v.x, v.y, v.z, v.w};
+#pragma unroll
+    for (int j = 0; j < 8; ++j)
+        x[j] = __uint_as_float(((words[j / 2] >> (16 * (j % 2))) & 0xffff) << 16);
+    if constexpr (Storage == KvCacheStorage::BFloat16)
+        store_16bit_contiguous<true>(x, a.values.at(p % 64, head, page), lane);
+    else {
+        if constexpr (kPrepareCacheProfile<Storage>.value == KvCacheVectorFormat::Nvfp4Group16Ue4m3)
+            kv::normalized_hadamard_d256_contiguous_inplace(x, lane);
+        store_quantized_contiguous<kPrepareCacheProfile<Storage>.value>(
+            x, a.values.at(p % 64, head, page), a.value_scales.at(p % 64, head, page), lane);
     }
 }
 

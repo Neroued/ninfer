@@ -54,5 +54,6 @@ struct PrepareArguments {
     int tokens, batch, axes, kv_heads;
     float epsilon;
     double frequency[32];
+    int token_begin = 0, row_begin = 0;
 };
 } // namespace ninfer::ops::detail::qsa

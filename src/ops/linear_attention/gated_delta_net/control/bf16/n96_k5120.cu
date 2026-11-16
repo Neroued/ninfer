@@ -2,10 +2,17 @@
 #include "ops/linear_attention/gated_delta_net/control/kernels/norm.cuh"
 #include "ops/linear_attention/gated_delta_net/control/kernels/mma_launch.cuh"
 #include "ops/linear_attention/gated_delta_net/control/kernels/gemv.cuh"
+#include "core/platform.h"
 
 namespace ninfer::ops::detail::gdn_control {
 void launch_n96_k5120(const Inputs& in, GdnControlOutputs out, Plan plan, Scratch scratch,
                       CudaExecutionView e) {
+#if NINFER_TARGET_RTX5090
+    if (plan.kernel == Kernel::Mma && plan.tile_cols <= 32) {
+        launch_small_n96_k5120(in, out, plan, scratch, e);
+        return;
+    }
+#endif
     using Geometry = MmaGeometry<48, 5120, 128>;
     if (plan.kernel == Kernel::Gemv) {
         gemv_kernel<48, 5120><<<96, 256, 0, e.stream()>>>(

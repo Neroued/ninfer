@@ -45,11 +45,13 @@ void RankProgramImpl::initialize_branch(ComputeOperation& operation, const Branc
     if (work.prefill) {
         auto& frame                                      = resources.frame;
         const auto& row                                  = work.rows.front();
-        *frame.host_ingress                              = {};
-        frame.host_ingress->valid_columns[0]             = operation.width;
-        frame.host_ingress->main_table_rows[0]           = row.table.index;
-        frame.host_ingress->state_source_offsets[0]      = row.offsets.source;
-        frame.host_ingress->state_destination_offsets[0] = row.offsets.destination;
+        frame.bind_rows(1);
+        frame.clear_ingress();
+        frame.host_ingress.live_rows[0]                 = 1;
+        frame.host_ingress.valid_columns[0]             = operation.width;
+        frame.host_ingress.main_table_rows[0]           = row.table.index;
+        frame.host_ingress.state_source_offsets[0]      = row.offsets.source;
+        frame.host_ingress.state_destination_offsets[0] = row.offsets.destination;
         auto host = frame.host_input_view(operation.width, 1);
         std::copy(row.tokens.begin(), row.tokens.end(), static_cast<TokenId*>(host.ids.data));
         for (std::uint32_t i = 0; i < operation.width; ++i) {
@@ -115,6 +117,8 @@ void RankProgramImpl::initialize_branch(ComputeOperation& operation, const Branc
         update.emplace<execution::ReplayRecords>(b.records);
         arena = &b.work;
     }
+    // Physical branch rows include masked columns; MoE planning uses only real tokens.
+    for (const auto& row : work.rows) inputs.active_tokens += row.tokens.size();
     arena->reset();
     operation.text = std::make_unique<execution::TextRun>(
         execution::TextExecutionView{parameters, *arena, device.execution_view(), branches->cache,

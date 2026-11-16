@@ -30,9 +30,7 @@ struct NativeFp8A16SlicedKSchedule {
     static constexpr int kMmaRows        = (BlockRows + 15) / 16;
     static constexpr int kMmaTokens      = (BlockTokens + 7) / 8;
     static_assert(BlockRows == 8 || BlockRows == 16 || BlockRows == 32);
-    static_assert(BlockTokens > 0 && BlockTokens <= 32 &&
-                  (BlockTokens % 8 == 0 || BlockTokens == 1 || BlockTokens == 2 ||
-                   BlockTokens == 4));
+    static_assert(BlockTokens > 0 && BlockTokens <= 32);
     static_assert(KWarps == 2 || KWarps == 4 || KWarps == 8 || KWarps == 16);
     static_assert(WarpK == 128 || WarpK == 256);
     static_assert(Stages == 1 || Stages == 2);
@@ -226,7 +224,8 @@ native_fp8_a16_sliced_k_body(const Input* __restrict__ x, const std::uint8_t* __
                     for (int ni = 0; ni < MT; ++ni) {
                         // Narrow tiles repeat valid activation rows for unused MMA columns.
                         // Only the logical BT columns are stored by the epilogue.
-                        const int lt  = ni * 8 + (lane & 7) % BT;
+                        const int lt  = BT < 8 || BT % 8 == 0 ? ni * 8 + (lane & 7) % BT
+                                                              : (ni * 8 + (lane & 7)) % BT;
                         const int col = kk + ((lane >> 3) & 1) * 8;
                         common::ldmatrix_x2(bf[ni][0], bf[ni][1],
                                             common::smem_addr(xs + plane * BT * WK + lt * WK +

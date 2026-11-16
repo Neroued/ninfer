@@ -57,6 +57,26 @@ Json template_context(std::string_view kwargs, const Json& special_tokens) {
     return context;
 }
 
+Json parse_tool_history_arguments(std::string_view arguments, std::string_view name,
+                                  std::size_t message_index, std::size_t call_index) {
+    if (arguments.empty()) return Json::object();
+    const auto invalid = [&](std::string_view reason) {
+        return std::invalid_argument("messages[" + std::to_string(message_index) + "].tool_calls[" +
+                                     std::to_string(call_index) + "] ('" + std::string(name) +
+                                     "'): arguments " + std::string(reason));
+    };
+    Json value;
+    try {
+        value = Json::parse(arguments);
+    } catch (const Json::parse_error& error) {
+        throw invalid("contain invalid JSON at byte " + std::to_string(error.byte));
+    } catch (const Json::exception& error) {
+        throw invalid("cannot be represented as JSON: " + std::string(error.what()));
+    }
+    if (!value.is_object()) throw invalid("must contain a JSON object");
+    return value;
+}
+
 void merge_template_option(Json& context, std::string_view key, const Json& value) {
     const std::string name(key);
     if (context.contains(name) && !context[name].is_null() && context[name] != value) {

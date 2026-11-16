@@ -15,7 +15,7 @@ Plan select_plan(const SwiGLUProfile&, int t, int shared_intermediate) {
                            .single_block_grouping   = t <= 64,
                            .column_major_down       = t >= 1024,
                            .preserve_balanced_down  = true,
-                           .shared_algorithm        = t < 8 ? kernel::block_scaled::SharedAlgorithm::Vector
+                           .shared_algorithm        = t < 4 ? kernel::block_scaled::SharedAlgorithm::Vector
                                                             : kernel::block_scaled::SharedAlgorithm::Mma,
                            .shared_split_activation = shared_intermediate != 320 || t < 128,
                            .network_topk            = false,
@@ -44,7 +44,8 @@ Plan select_plan(const SwiGLUProfile&, int t, int shared_intermediate) {
 } // namespace
 
 const ShapePolicy& fp8_h2560_i320_e512_k10() {
-    static constexpr int boundaries[]{3, 8, 17, 32, 65, 128, 129, 256, 257, 512, 513, 1024, 2048};
+    static constexpr int boundaries[]{3,   4,   8,   17,  32,  65,   128,
+                                      129, 256, 257, 512, 513, 1024, 2048};
     static const ShapePolicy policy{.select = select_plan, .allocation_boundaries = boundaries};
     return policy;
 }

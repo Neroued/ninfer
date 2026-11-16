@@ -45,15 +45,15 @@ adp = 2
 id = 0
 worker = "/opt/ninfer/build/dgx-spark-release/apps/ninfer-worker"
 artifact = "/srv/models/glm5_3_flash.ninfer"
-# Set real interface/HCA names here when selecting the interconnect explicitly.
-# environment = { NCCL_SOCKET_IFNAME = "=your-net-device", NCCL_IB_HCA = "=your-rdma-device" }
+# Native RDMA selection; use comma-separated local HCA names when needed.
+# environment = { NINFER_COMM_HCA = "your-rdma-device" }
 
 [[distributed.nodes]]
 id = 1
 ssh = "user@192.0.2.11"
 worker = "/opt/ninfer/build/dgx-spark-release/apps/ninfer-worker"
 artifact = "/srv/models/glm5_3_flash.ninfer"
-# environment = { NCCL_SOCKET_IFNAME = "=your-net-device", NCCL_IB_HCA = "=your-rdma-device" }
+# environment = { NINFER_COMM_HCA = "your-rdma-device" }
 
 [[distributed.ranks]]
 rank = 0

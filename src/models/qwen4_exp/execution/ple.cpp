@@ -34,7 +34,7 @@ void ple(const Tensor& embedding, const TextConfig& c, const PleParameters& p,
                            cuda);
     if (after)
         ops::ple_state_extract(before, {records.values, batch.valid_columns}, batch.valid_columns,
-                               *after, cuda);
+                               *after, batch.live_rows, cuda);
 }
 
 } // namespace ninfer::models::qwen4_exp::execution

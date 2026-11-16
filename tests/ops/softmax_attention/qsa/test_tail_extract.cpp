@@ -17,7 +17,7 @@ namespace {
 enum class Binding { Separate, InPlace, ShiftedInPlace, SamePool, RawInPlace };
 
 int run(DeviceContext& device, int batch, int layout, Binding binding, int capacity,
-        bool exhaustive = true) {
+        bool exhaustive = true, bool masked = false) {
     const int slots = 2 * batch + 3;
     Plane<std::uint16_t> before(128, 3, slots, layout, true),
         after(128, 3, batch + 2, layout, true), records(128, capacity, batch, layout);
@@ -39,6 +39,8 @@ int run(DeviceContext& device, int batch, int layout, Binding binding, int capac
     DeviceBuffer base(ninfer::test::cuda_environment().context.device(), batch * 4);
     DeviceBuffer valid(ninfer::test::cuda_environment().context.device(), batch * 4);
     DeviceBuffer accepted(ninfer::test::cuda_environment().context.device(), batch * 4);
+    DeviceBuffer live_storage(device.device(), batch * sizeof(std::int32_t));
+    const Tensor live = masked ? Tensor(live_storage.span(), DType::I32, {batch}) : Tensor{};
     const ops::QsaTailStateView input{
         state_field(before.view, before.device->span(), Tensor(source.span(), DType::I64, {batch})),
         state_field(first.view, first.device->span(),
@@ -64,8 +66,9 @@ int run(DeviceContext& device, int batch, int layout, Binding binding, int capac
         records.fill(113 + phase);
         positions.fill(127 + phase);
         std::vector<int> sources(batch), destinations(batch), bases(batch), counts(batch),
-            available(batch);
+            available(batch), active(batch, 1);
         for (int b = 0; b < batch; ++b) {
+            if (masked) active[b] = phase != cases - 2 && (b + phase) % 3 != 1;
             const bool shared_source = binding == Binding::Separate && phase % 2;
             sources[b]               = shared_source ? 1 : 1 + (b + phase) % batch;
             const int remainder      = exhaustive ? phase / (capacity + 1) : (phase + b) % 4;
@@ -95,6 +98,7 @@ int run(DeviceContext& device, int batch, int layout, Binding binding, int capac
         auto expected_raw  = raw_alias ? before.host : after.host;
         auto expected_rope = rope_alias ? first.host : last.host;
         for (int b = 0; b < batch; ++b) {
+            if (!active[b]) continue;
             const auto result =
                 reference(before, first, records, positions, sources[b], b, bases[b], counts[b]);
             const int dst    = destinations[b] + (binding == Binding::ShiftedInPlace ? 1 : 0);
@@ -111,10 +115,17 @@ int run(DeviceContext& device, int batch, int layout, Binding binding, int capac
         last.upload();
         records.upload();
         positions.upload();
-        const auto source_offsets           = state_offsets(before.view, sources);
-        const auto source_rope_offsets      = state_offsets(first.view, sources, true);
-        const auto destination_offsets      = state_offsets(raw_out, destinations);
-        const auto destination_rope_offsets = state_offsets(rope_out, destinations, true);
+        auto source_offsets           = state_offsets(before.view, sources);
+        auto source_rope_offsets      = state_offsets(first.view, sources, true);
+        auto destination_offsets      = state_offsets(raw_out, destinations);
+        auto destination_rope_offsets = state_offsets(rope_out, destinations, true);
+        for (int b = 0; b < batch; ++b) {
+            if (active[b]) continue;
+            source_offsets[b] = source_rope_offsets[b] = destination_offsets[b] =
+                destination_rope_offsets[b]            = -1;
+            bases[b]                                   = std::numeric_limits<int>::min();
+            counts[b] = available[b] = std::numeric_limits<int>::max();
+        }
         source.copy_from_host(source_offsets.data(), batch * 8);
         source_rope.copy_from_host(source_rope_offsets.data(), batch * 8);
         destination.copy_from_host(destination_offsets.data(), batch * 8);
@@ -122,15 +133,16 @@ int run(DeviceContext& device, int batch, int layout, Binding binding, int capac
         base.copy_from_host(bases.data(), batch * 4);
         valid.copy_from_host(available.data(), batch * 4);
         accepted.copy_from_host(counts.data(), batch * 4);
+        if (masked) live_storage.copy_from_host(active.data(), batch * sizeof(std::int32_t));
         cuda_synchronize();
         if (phase == 0) {
             definition.capture(device.stream(), [&] {
-                ops::qsa_tail_extract(input, read, count, output, device.execution_view());
+                ops::qsa_tail_extract(input, read, count, output, live, device.execution_view());
             });
             graph.instantiate(definition);
         }
         if (phase % 2)
-            ops::qsa_tail_extract(input, read, count, output, device.execution_view());
+            ops::qsa_tail_extract(input, read, count, output, live, device.execution_view());
         else
             graph.launch(device.stream());
         device.synchronize();
@@ -195,7 +207,7 @@ int multilayer(DeviceContext& device) {
     Tensor count(accepted.span(), DType::I32, {batch});
     DecodeGraphDefinition definition;
     definition.capture(device.stream(), [&] {
-        ops::qsa_tail_extract(before, records, count, after, device.execution_view());
+        ops::qsa_tail_extract(before, records, count, after, {}, device.execution_view());
     });
     DecodeGraphExecutable graph;
     graph.instantiate(definition);
@@ -298,7 +310,7 @@ int read_footprint(DeviceContext& device) {
                          Tensor(zero.span(), DType::I64, {1})),
              state_field(Tensor(out_rope.span(), DType::I32, {3, 1}), out_rope.span(),
                          Tensor(zero.span(), DType::I64, {1}), true)},
-            device.execution_view());
+            {}, device.execution_view());
         device.synchronize();
         const auto expected = reference(before, first, records, positions, 0, 0, f0, a);
         std::vector<std::uint16_t> words;
@@ -337,7 +349,7 @@ int validation(DeviceContext& device) {
         auto s = state;
         change(s);
         failures += rejects(
-            name, [&] { ops::qsa_tail_extract(s, read, m, state, device.execution_view()); });
+            name, [&] { ops::qsa_tail_extract(s, read, m, state, {}, device.execution_view()); });
     };
     invalid_state("wrong raw dtype", [](auto& s) { s.raw_keys.field.tensor.dtype = DType::FP16; });
     invalid_state("wrong tail length", [](auto& s) { s.raw_keys.field.tensor.shape[1] = 4; });
@@ -354,21 +366,26 @@ int validation(DeviceContext& device) {
     auto bad                 = read;
     bad.rope_positions.ne[1] = 4;
     failures += rejects("record capacity mismatch", [&] {
-        ops::qsa_tail_extract(state, bad, m, state, device.execution_view());
+        ops::qsa_tail_extract(state, bad, m, state, {}, device.execution_view());
     });
     bad                = read;
     bad.raw_keys.ne[1] = 0;
     failures += rejects("empty records", [&] {
-        ops::qsa_tail_extract(state, bad, m, state, device.execution_view());
+        ops::qsa_tail_extract(state, bad, m, state, {}, device.execution_view());
     });
     auto count  = m;
     count.ne[0] = 9;
-    failures += rejects("too many rows", [&] {
-        ops::qsa_tail_extract(state, read, count, state, device.execution_view());
+    failures += rejects("inconsistent metadata rows", [&] {
+        ops::qsa_tail_extract(state, read, count, state, {}, device.execution_view());
     });
     count.ne[0] = 0;
     failures += rejects("empty batch", [&] {
-        ops::qsa_tail_extract(state, read, count, state, device.execution_view());
+        ops::qsa_tail_extract(state, read, count, state, {}, device.execution_view());
+    });
+    auto live  = m;
+    live.dtype = DType::FP32;
+    failures += rejects("live mask dtype", [&] {
+        ops::qsa_tail_extract(state, read, m, state, live, device.execution_view());
     });
     invalid_state("invalid state device",
                   [](auto& s) { s.raw_keys.records.byte_offsets.device = Device::cpu(); });
@@ -398,6 +415,13 @@ int main(int argc, char** argv) {
     add(8, 3, Binding::ShiftedInPlace, 9);
     add(8, 2, Binding::SamePool, 9);
     add(4, 1, Binding::RawInPlace, 9);
+    for (int b : {9, 17, 129})
+        suite.add("qsa_tail/concurrency/b" + std::to_string(b),
+                  [=] {
+                      return run(cuda_environment().context, b, 1, Binding::Separate, 4, false,
+                                 true);
+                  },
+                  {{"execution", "graph"}, {"suite", "concurrency"}});
     for (int b = 1; b <= 8; ++b) add(b, b % 4, Binding::Separate, 1, false);
     for (int r : {2, 3, 16, 4096}) add(8, r % 4, Binding::Separate, r, false);
 

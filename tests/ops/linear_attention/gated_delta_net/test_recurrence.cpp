@@ -425,13 +425,16 @@ int run_case(const Case& test_case, std::uint32_t seed,
 }
 
 int batch_update_case(const Case& test_case, const std::vector<int>& source_slots,
-                      const std::vector<int>& destination_slots, int slots, std::uint32_t seed) {
+                      const std::vector<int>& destination_slots, int slots, std::uint32_t seed,
+                      std::vector<int> valid = {}, bool captured = false) {
     if (test_case.tokens != 1) { throw std::logic_error("batch_update_case requires W=1"); }
     if (source_slots.size() != destination_slots.size()) {
         throw std::logic_error("batch_update_case selector sizes differ");
     }
-    const int batch   = static_cast<int>(source_slots.size());
-    const int width   = 1;
+    const int batch  = static_cast<int>(source_slots.size());
+    const int width  = 1;
+    const bool dense = valid.empty();
+    if (dense) valid.assign(batch, 1);
     const float scale = 1.0f / std::sqrt(static_cast<float>(kStateDim));
     const std::size_t qk_row_size =
         static_cast<std::size_t>(kStateDim * test_case.qk_heads * width);
@@ -480,6 +483,10 @@ int batch_update_case(const Case& test_case, const std::vector<int>& source_slot
     references.reserve(static_cast<std::size_t>(batch));
     std::vector<bool> written_slots(static_cast<std::size_t>(slots), false);
     for (int row = 0; row < batch; ++row) {
+        if (valid[row] == 0) {
+            references.emplace_back();
+            continue;
+        }
         gdn_ref::Result reference =
             gdn_ref::evaluate(rows[static_cast<std::size_t>(row)], static_cast<double>(scale),
                               test_case.normalize_qk);
@@ -502,17 +509,45 @@ int batch_update_case(const Case& test_case, const std::vector<int>& source_slot
     Tensor states_tensor(states.span(), DType::FP32,
                          {kStateDim, kStateDim, test_case.value_heads, slots});
     RecordStateFixture history(states_tensor, 3);
-    const auto source_offsets             = history.record_offsets(source_slots);
-    const auto destination_offsets        = history.record_offsets(destination_slots);
+    auto source_offsets      = history.record_offsets(source_slots);
+    auto destination_offsets = history.record_offsets(destination_slots);
+    for (int row = 0; row < batch; ++row)
+        if (valid[row] == 0) source_offsets[row] = destination_offsets[row] = -1;
+    DeviceBuffer device_valid;
+    Tensor valid_tensor;
+    if (!dense) {
+        device_valid = to_device(valid);
+        valid_tensor = Tensor(device_valid.span(), DType::I32, {batch});
+    }
     DeviceBuffer device_source_slots      = to_device(source_offsets);
     DeviceBuffer device_destination_slots = to_device(destination_offsets);
     Tensor source_slots_tensor(device_source_slots.span(), DType::I64, {batch});
     Tensor destination_slots_tensor(device_destination_slots.span(), DType::I64, {batch});
     Tensor out_tensor(out.span(), DType::BF16, {kStateDim, test_case.value_heads, width, batch});
-    ops::gated_delta_net_batch_update(q, k, v, g, beta, scale, test_case.normalize_qk,
-                                      history.view(source_slots_tensor),
-                                      history.view(destination_slots_tensor), out_tensor,
-                                      ninfer::test::cuda_environment().default_execution);
+    const auto execution = cuda_environment().context.execution_view();
+    const auto launch    = [&] {
+        ops::gated_delta_net_batch_update(
+            q, k, v, g, beta, scale, test_case.normalize_qk, history.view(source_slots_tensor),
+            history.view(destination_slots_tensor), valid_tensor, out_tensor, execution);
+    };
+    if (captured) {
+        device_valid.fill(0);
+        DecodeGraphDefinition definition;
+        DecodeGraphExecutable graph;
+        launch();
+        cuda_synchronize();
+        definition.capture(execution.stream(), launch);
+        graph.instantiate(definition);
+        graph.launch(execution.stream());
+        cuda_synchronize();
+        if (from_device<std::uint16_t>(out.data(), aggregate.v.size()) !=
+            std::vector<std::uint16_t>(aggregate.v.size(), 0))
+            throw std::runtime_error("inactive graph update did not zero output");
+        device_valid.copy_from_host(valid.data(), device_valid.size());
+        graph.launch(execution.stream());
+    } else {
+        launch();
+    }
     cuda_synchronize();
 
     const std::string label =
@@ -524,6 +559,14 @@ int batch_update_case(const Case& test_case, const std::vector<int>& source_slot
     const std::vector<float> got_states = from_device<float>(states.data(), initial_states.size());
     for (int row = 0; row < batch; ++row) {
         const auto row_label = label + " row=" + std::to_string(row);
+        if (valid[row] == 0) {
+            failures +=
+                verify_exact(row_label + " inactive output",
+                             std::vector<double>(got_output.begin() + row * value_row_size,
+                                                 got_output.begin() + (row + 1) * value_row_size),
+                             std::vector<double>(value_row_size, 0.0));
+            continue;
+        }
         failures += verify_heads(
             row_label + " out",
             std::span<const double>(got_output).subspan(row * value_row_size, value_row_size),
@@ -595,7 +638,7 @@ int graph_case(Case c, int batch, bool pooled) {
     const auto launch    = [&] {
         if (pooled) {
             ops::gated_delta_net_batch_update(q, k, v, g, beta, scale, c.normalize_qk,
-                                              history.view(sources), history.view(destinations),
+                                              history.view(sources), history.view(destinations), {},
                                               out, execution);
         } else {
             auto si = history.tensor(0);
@@ -797,6 +840,20 @@ int main(int argc, char** argv) {
         for (int x : destination) id += "/d" + std::to_string(x);
         suite.add(id, [=] { return batch_update_case(c, source, destination, slots, seed); });
     };
+    for (int batch : {9, 17, 64}) {
+        suite.add("gdn/batch/expanded/b" + std::to_string(batch),
+                  [=] {
+                      std::vector<int> source(batch), destination(batch), valid(batch, 1);
+                      std::iota(source.begin(), source.end(), 0);
+                      std::iota(destination.begin(), destination.end(), batch);
+                      if (batch != 9)
+                          for (int row = 0; row < batch; ++row) valid[row] = row % 4 == 0;
+                      return batch_update_case(
+                          {"expanded", 8, 24, 1, true}, source, destination, 2 * batch,
+                          25000U + batch, batch == 9 ? std::vector<int>{} : valid, batch == 17);
+                  },
+                  {{"suite", "concurrency"}});
+    }
     for (bool normalize : {false, true}) {
         for (int t : {1,   2,   3,   4,   5,   6,   7,    8,    9,    10,   11,  12,  13,
                       14,  15,  16,  17,  31,  32,  33,   63,   64,   65,   127, 128, 129,

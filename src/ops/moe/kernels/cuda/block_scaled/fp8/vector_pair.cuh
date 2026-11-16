@@ -13,7 +13,7 @@ __global__ void pair_gate(const __nv_bfloat16* x, ExpertMatrixDeviceView bank, c
     // Every thread reaches this barrier before any masked/duplicate CTA returns.
     __syncthreads();
     const int assignment = blockIdx.y, expert = experts[assignment];
-    if (!includes(kind, mask, expert)) { return; }
+    if (!expert_in_subset(kind, mask, expert)) { return; }
     int mate = -1;
 #pragma unroll
     for (int j = 0; j < kTopK; ++j) {
@@ -80,7 +80,7 @@ __global__ void pair_down(const float* activation, ExpertMatrixDeviceView bank, 
     for (int j = 0; j < kTopK; ++j) {
         if (experts[kTopK + j] == expert) { mate = j; }
     }
-    if (includes(kind, mask, expert)) {
+    if (expert_in_subset(kind, mask, expert)) {
         const auto weight = resolve(bank, expert);
         float sum[Rows] = {}, other[Rows] = {};
         for (int block = 0; block < kIntermediate / 128; ++block) {
@@ -118,7 +118,7 @@ __global__ void pair_down(const float* activation, ExpertMatrixDeviceView bank, 
     bool matched     = false;
 #pragma unroll
     for (int j = 0; j < kTopK; ++j) { matched |= experts[j] == second; }
-    if (!matched && includes(kind, mask, second)) {
+    if (!matched && expert_in_subset(kind, mask, second)) {
         const auto weight = resolve(bank, second);
         float sum[Rows]   = {};
         for (int block = 0; block < kIntermediate / 128; ++block) {
@@ -150,8 +150,9 @@ __global__ void pair_down(const float* activation, ExpertMatrixDeviceView bank, 
         float result = 0;
 #pragma unroll
         for (int j = 0; j < kTopK; ++j) { result += values[token][j][row]; }
-        const int i = token * kHidden + blockIdx.x * Rows + row;
-        output.store(i, output.initial(i) + result);
+        const int i     = token * kHidden + blockIdx.x * Rows + row;
+        const bool live = output.is_live(token);
+        output.store(i, output.initial(i, live) + result, live);
     }
 }
 } // namespace ninfer::ops::detail::moe_cuda::block_scaled::fp8

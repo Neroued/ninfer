@@ -48,9 +48,9 @@ void gather_conditioning(Resources& resources, int batch, CudaExecutionView cuda
 } // namespace
 
 void RankProgramImpl::prepare_mtp_draft(ComputeOperation& operation) {
-    const auto& work  = std::get<DecodeWork>(operation.request.work.operation);
-    auto& frame       = resources.frame;
-    const auto batch  = static_cast<std::int32_t>(operation.batch);
+    const auto& work = std::get<DecodeWork>(operation.request.work.operation);
+    auto& frame      = resources.frame;
+    const auto batch = static_cast<std::int32_t>(operation.shape.rows);
     for (std::uint32_t step = 0; step < draft_window; ++step) {
         auto host_positions = host_step(frame.host_step_positions, step, batch);
         auto host_rope      = host_step(frame.host_step_rope_positions, step, 3 * batch);
@@ -58,7 +58,7 @@ void RankProgramImpl::prepare_mtp_draft(ComputeOperation& operation) {
         auto* positions     = static_cast<std::int32_t*>(host_positions.data);
         auto* rope          = static_cast<std::int32_t*>(host_rope.data);
         auto* valid         = static_cast<std::int32_t*>(host_valid.data);
-        for (std::int32_t row = 0; row < batch; ++row) {
+        for (std::uint32_t row = 0; row < operation.batch; ++row) {
             const auto& binding = operation.rows[row];
             if (binding.main_frontier == 0) {
                 throw std::logic_error("MTP draft has no target conditioning");
@@ -113,7 +113,7 @@ void RankProgramImpl::begin_mtp_draft(ComputeOperation& operation) {
     if (operation.drafts == 0) return;
     std::uint32_t maximum = 1;
     for (const auto& row : operation.rows) maximum = std::max(maximum, row.main_frontier);
-    run_mtp_draft(operation.batch, operation.drafts, maximum);
+    run_mtp_draft(operation.shape.rows, operation.drafts, maximum);
 }
 
 void RankProgramImpl::align_mtp_history(ComputeOperation& operation) {
@@ -127,11 +127,12 @@ void RankProgramImpl::align_mtp_history(ComputeOperation& operation) {
     auto& mtp                = *frame.mtp;
     const auto cuda          = device.execution_view();
     const auto mtp_execution = mtp_view(parameters, resources, cuda, proposal_head);
-    const auto batch         = forward ? 1 : static_cast<std::int32_t>(operation.batch);
+    const auto batch         = forward ? 1 : static_cast<std::int32_t>(operation.shape.rows);
     const auto width         = static_cast<std::int32_t>(operation.width);
     const auto hidden        = execution::dimension(parameters.profile->config.text.hidden_size);
     const auto row_begin     = forward ? operation.forward_row : 0;
-    const auto rows    = std::span<const ExecutionRow>(operation.rows).subspan(row_begin, batch);
+    const auto rows          = std::span<const ExecutionRow>(operation.rows)
+                          .subspan(row_begin, forward ? 1 : operation.batch);
     const auto skip    = forward && rows.front().main_frontier == 0 ? 1 : 0;
     auto history_width = width - skip;
     if (history_width == 0) return;

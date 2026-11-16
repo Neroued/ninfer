@@ -40,7 +40,7 @@ inline Options parse(int argc, char** argv) {
         else if (flag == "--tokens")
             o.tokens = measurement::integers(value);
         else if (flag == "--batch")
-            o.batch = measurement::integer(value, 1, 8);
+            o.batch = measurement::integer(value);
         else if (flag == "--layers")
             o.layers = measurement::integer(value);
         else if (flag == "--qk-heads")
@@ -78,8 +78,8 @@ inline Options parse(int argc, char** argv) {
 }
 
 inline std::vector<int> counts(const std::string& value, int width, int batch, bool commit) {
-    auto out = value == "dense" ? std::vector<int>(batch, width)
-                                : measurement::integers(value, commit ? 0 : 1, width);
+    auto out =
+        value == "dense" ? std::vector<int>(batch, width) : measurement::integers(value, 0, width);
     if (out.size() == 1) out.resize(batch, out[0]);
     if (out.size() != std::size_t(batch)) throw std::invalid_argument("counts must match batch");
     return out;

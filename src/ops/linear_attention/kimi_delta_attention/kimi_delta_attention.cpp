@@ -99,13 +99,20 @@ void kimi_delta_attention_batch_update(const Tensor& q, const Tensor& k, const T
                                        const Tensor& g, const Tensor& beta, const Tensor& a_log,
                                        const Tensor& dt_bias, float lower_bound, float scale,
                                        ConstStateFieldView source, StateFieldView destination,
-                                       Tensor& out, CudaExecutionView execution) {
+                                       const Tensor& valid, Tensor& out,
+                                       CudaExecutionView execution) {
     const auto p = kda::validate_inputs(q, k, v, g, beta, a_log, dt_bias, lower_bound, scale, out,
                                         execution.device());
     if (p.tokens != 1)
         throw std::invalid_argument("kimi_delta_attention: batch update requires T=1");
     kda::validate_state(source, p, execution.device());
     kda::validate_state(destination, p, execution.device());
+    if (valid.data) {
+        common::operand::tensor(valid, DType::I32, {p.batch}, 4, op, "valid columns",
+                                execution.device());
+        common::operand::disjoint(common::operand::range(out, op),
+                                  common::operand::range(valid, op), op);
+    }
     for (const auto* metadata : {&source.records.byte_offsets, &destination.records.byte_offsets})
         common::operand::disjoint(common::operand::range(out, op),
                                   common::operand::range(*metadata, op), op);
@@ -114,8 +121,8 @@ void kimi_delta_attention_batch_update(const Tensor& q, const Tensor& k, const T
                   common::operand::state_field_base<const float>(source),
                   common::operand::state_field_base<float>(destination), out),
         static_cast<const std::int64_t*>(source.records.byte_offsets.data),
-        static_cast<const std::int64_t*>(destination.records.byte_offsets.data), p.batch,
-        execution.stream());
+        static_cast<const std::int64_t*>(destination.records.byte_offsets.data),
+        static_cast<const std::int32_t*>(valid.data), p.batch, execution.stream());
 }
 
 void kimi_delta_attention_replay_record(const Tensor& q, const Tensor& k, const Tensor& v,

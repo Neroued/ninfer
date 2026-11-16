@@ -18,9 +18,17 @@ void encode_rank_load(Encoder& out, const RankLoadRequest& request) {
         out.u32(r.begin);
         out.u32(r.size);
     }
+    out.boolean(p.draft.has_value());
+    if (p.draft)
+        for (auto r : {p.draft->features, p.draft->query_heads, p.draft->key_value_heads,
+                       p.draft->intermediate}) {
+            out.u32(r.begin);
+            out.u32(r.size);
+        }
     encode_assemblies(out, p.assemblies);
     encode_expert_partitions(out, p.experts);
     encode_rank_options(out, request.options);
+    encode_batch_execution_spec(out, request.batches);
     out.u8(static_cast<std::uint8_t>(request.index_format));
     out.u64(request.host_reservation_bytes);
     out.boolean(request.control_owner);
@@ -36,9 +44,16 @@ RankLoadRequest decode_rank_load(Decoder& in) {
     p.ep_size = in.u32();
     for (auto* r : {&p.kda_heads, &p.vocabulary, &p.dense_intermediate, &p.shared_intermediate})
         *r = {in.u32(), in.u32()};
+    if (in.boolean()) {
+        p.draft.emplace();
+        for (auto* r : {&p.draft->features, &p.draft->query_heads, &p.draft->key_value_heads,
+                        &p.draft->intermediate})
+            *r = {in.u32(), in.u32()};
+    }
     p.assemblies                   = decode_assemblies(in);
     p.experts                      = decode_expert_partitions(in);
     request.options                = decode_rank_options(in);
+    request.batches                = decode_batch_execution_spec(in);
     request.index_format           = static_cast<KvCacheVectorFormat>(in.u8());
     request.host_reservation_bytes = in.u64();
     request.control_owner          = in.boolean();
@@ -54,6 +69,8 @@ void encode(Encoder& out, const RankResourceDescription& r) {
     out.u8(static_cast<std::uint8_t>(s.purpose));
     out.boolean(s.context_cache);
     out.boolean(s.gpu_timing);
+    out.u8(static_cast<std::uint8_t>(s.speculative));
+    encode_batch_execution_spec(out, r.batches);
     for (auto record : {r.state.common, r.state.owner}) {
         out.u64(record.bytes);
         out.u64(record.alignment);
@@ -61,6 +78,11 @@ void encode(Encoder& out, const RankResourceDescription& r) {
     for (auto n :
          {r.state.owner_fields.offset, r.state.owner_fields.bytes, r.state.owner_fields.alignment})
         out.u64(n);
+    out.boolean(r.state.draft_context.has_value());
+    if (r.state.draft_context)
+        for (auto n : {r.state.draft_context->offset, r.state.draft_context->bytes,
+                       r.state.draft_context->alignment})
+            out.u64(n);
     context::encode_directory(out, r.context);
     runtime::protocol::encode(out, r.budget);
     runtime::protocol::encode(out, r.observation);
@@ -81,19 +103,22 @@ void encode(Encoder& out, const RankResourceDescription& r) {
 
 RankResourceDescription decode_rank_resources(Decoder& in) {
     RankResourceDescription r;
-    r.rank                = in.u32();
-    r.shape               = {in.u32(),
-                             in.u32(),
-                             in.u32(),
-                             in.u32(),
-                             static_cast<KvCacheStorage>(in.u8()),
-                             static_cast<KvCacheVectorFormat>(in.u8()),
-                             static_cast<EnginePurpose>(in.u8()),
-                             in.boolean(),
-                             in.boolean()};
-    r.state.common        = {in.u64(), in.u64()};
-    r.state.owner         = {in.u64(), in.u64()};
-    r.state.owner_fields  = {in.u64(), in.u64(), in.u64()};
+    r.rank               = in.u32();
+    r.shape              = {in.u32(),
+                            in.u32(),
+                            in.u32(),
+                            in.u32(),
+                            static_cast<KvCacheStorage>(in.u8()),
+                            static_cast<KvCacheVectorFormat>(in.u8()),
+                            static_cast<EnginePurpose>(in.u8()),
+                            in.boolean(),
+                            in.boolean(),
+                            static_cast<SpeculativeBackend>(in.u8())};
+    r.batches            = decode_batch_execution_spec(in);
+    r.state.common       = {in.u64(), in.u64()};
+    r.state.owner        = {in.u64(), in.u64()};
+    r.state.owner_fields = {in.u64(), in.u64(), in.u64()};
+    if (in.boolean()) r.state.draft_context = LayoutRegion{in.u64(), in.u64(), in.u64()};
     r.context             = context::decode_directory(in);
     r.budget              = runtime::protocol::memory_budget(in);
     r.observation         = runtime::protocol::rank_snapshot(in);

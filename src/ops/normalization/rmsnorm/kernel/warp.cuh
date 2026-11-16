@@ -9,11 +9,12 @@ namespace ninfer::ops::detail::rmsnorm {
 // Fast geometry for D in {64, 128, 192, 256}. One warp owns one row, keeps the input in
 // registers, and uses only warp shuffles for the reduction. Block is a scheduling choice rather
 // than part of the row geometry.
-template <Epilogue Kind, int Block, bool Prefetch, int FixedD = 0>
+template <Epilogue Kind, int Block, bool Prefetch, int FixedD = 0, bool SaveInverse = false>
 __launch_bounds__(Block) __global__
     void rmsnorm_warp_bf16x2_kernel(const __nv_bfloat162* x, const __nv_bfloat162* weight,
                                     const __nv_bfloat162* z, __nv_bfloat162* out,
-                                    std::int32_t input_d, std::int64_t rows, float eps) {
+                                    std::int32_t input_d, std::int64_t rows, float eps,
+                                    float* inverse_output) {
     const int d = FixedD ? FixedD : input_d;
     static_assert(Block % common::kWarpSize == 0);
     constexpr int kWarpsPerBlock   = Block / common::kWarpSize;
@@ -47,6 +48,9 @@ __launch_bounds__(Block) __global__
     sum       = common::warp_reduce_sum(sum);
     float inv = lane == 0 ? rsqrtf(sum / static_cast<float>(d) + eps) : 0.0f;
     inv       = __shfl_sync(common::kFullWarpMask, inv, 0);
+    if constexpr (SaveInverse) {
+        if (lane == 0) inverse_output[row] = inv;
+    }
 
 #pragma unroll
     for (int k = 0; k < kMaxPairsPerLane; ++k) {
@@ -75,11 +79,11 @@ __launch_bounds__(Block) __global__
 // Implements: include/ninfer/ops/rmsnorm.h
 // Match: aligned contiguous BF16, plain or gated epilogue, D=128, sm_120a.
 // Algorithm assumptions: exactly two BF16x2 values per lane; one warp owns one logical row.
-template <Epilogue Kind, int Block>
+template <Epilogue Kind, int Block, bool SaveInverse = false>
 __launch_bounds__(Block) __global__
     void rmsnorm_d128_bf16x2_kernel(const __nv_bfloat162* x, const __nv_bfloat162* weight,
                                     const __nv_bfloat162* z, __nv_bfloat162* out, std::int64_t rows,
-                                    float eps) {
+                                    float eps, float* inverse_output) {
     static_assert(Block % common::kWarpSize == 0);
     constexpr int kWarpsPerBlock = Block / common::kWarpSize;
     constexpr int kPairsPerRow   = 64;
@@ -99,6 +103,9 @@ __launch_bounds__(Block) __global__
     sum                         = common::warp_reduce_sum(sum);
     float inv                   = lane == 0 ? rsqrtf(sum * (1.0f / 128.0f) + eps) : 0.0f;
     inv                         = __shfl_sync(common::kFullWarpMask, inv, 0);
+    if constexpr (SaveInverse) {
+        if (lane == 0) inverse_output[row] = inv;
+    }
 
     const float2 w0 = __bfloat1622float2(weight[pair0]);
     const float2 w1 = __bfloat1622float2(weight[pair1]);

@@ -1,5 +1,8 @@
 #include "models/common/parallel_execution.h"
 #include "distributed/communication.h"
+#include "ninfer/ops/collective.h"
+
+#include <limits>
 
 namespace ninfer::models {
 
@@ -15,36 +18,42 @@ std::uint32_t ParallelExecution::size() const {
 #endif
 }
 
-void ParallelExecution::enqueue(distributed::Collective operation, distributed::Reduction reduction,
-                                const Tensor& source, Tensor& destination, DType type,
-                                std::size_t count, std::uint32_t owner,
-                                CudaExecutionView execution) {
+void ParallelExecution::sum(Tensor& value, CudaExecutionView cuda) {
 #if NINFER_ENABLE_DISTRIBUTED
-    binding_.group->enqueue(operation, source.data, destination.data, count, type, reduction, owner,
-                            execution);
+    ops::all_reduce(value, value, distributed::Reduction::Sum, *binding_.group, cuda);
 #else
     throw std::logic_error("distributed execution was not built");
 #endif
 }
 
-void ParallelExecution::sum(Tensor& value, CudaExecutionView cuda) {
-    enqueue(distributed::Collective::AllReduce, distributed::Reduction::Sum, value, value,
-            value.dtype, value.numel(), 0, cuda);
-}
-
 void ParallelExecution::merge_unique(Tensor& value, CudaExecutionView cuda) {
-    enqueue(distributed::Collective::AllReduce, distributed::Reduction::Sum, value, value,
-            DType::U32, value.bytes() / sizeof(std::uint32_t), 0, cuda);
+    const auto bytes = value.bytes();
+    if (!value.is_contiguous() || bytes % sizeof(std::uint32_t) ||
+        bytes / sizeof(std::uint32_t) > std::numeric_limits<std::int32_t>::max())
+        throw std::invalid_argument("unique-word merge requires contiguous U32-sized words");
+    Tensor words(value.data, value.device, DType::U32,
+                 {static_cast<std::int32_t>(bytes / sizeof(std::uint32_t))});
+    sum(words, cuda);
 }
 
 void ParallelExecution::maximum(Tensor& value, CudaExecutionView cuda) {
-    enqueue(distributed::Collective::AllReduce, distributed::Reduction::Max, value, value,
-            DType::U64, value.numel(), 0, cuda);
+    if (value.dtype != DType::I64 && value.dtype != DType::U64)
+        throw std::invalid_argument("vocabulary maximum requires 64-bit packed candidates");
+    auto keys  = value;
+    keys.dtype = DType::U64;
+#if NINFER_ENABLE_DISTRIBUTED
+    ops::all_reduce(keys, keys, distributed::Reduction::Max, *binding_.group, cuda);
+#else
+    throw std::logic_error("distributed execution was not built");
+#endif
 }
 
 void ParallelExecution::gather(const Tensor& source, Tensor& destination, CudaExecutionView cuda) {
-    enqueue(distributed::Collective::AllGather, distributed::Reduction::Sum, source, destination,
-            source.dtype, source.numel(), 0, cuda);
+#if NINFER_ENABLE_DISTRIBUTED
+    ops::all_gather(source, destination, *binding_.group, cuda);
+#else
+    throw std::logic_error("distributed execution was not built");
+#endif
 }
 
 void ParallelExecution::broadcast(Tensor& value, CudaExecutionView cuda) {
@@ -52,8 +61,11 @@ void ParallelExecution::broadcast(Tensor& value, CudaExecutionView cuda) {
 }
 
 void ParallelExecution::broadcast(Tensor& value, std::uint32_t owner, CudaExecutionView cuda) {
-    enqueue(distributed::Collective::Broadcast, distributed::Reduction::Sum, value, value,
-            value.dtype, value.numel(), owner, cuda);
+#if NINFER_ENABLE_DISTRIBUTED
+    ops::broadcast(value, owner, *binding_.group, cuda);
+#else
+    throw std::logic_error("distributed execution was not built");
+#endif
 }
 
 void ParallelExecution::exchange(std::span<const distributed::PeerTransfer> transfers,
@@ -65,7 +77,8 @@ void ParallelExecution::exchange(std::span<const distributed::PeerTransfer> tran
 #endif
 }
 
-void ParallelExecution::record_graph(CommunicationWork& work, const std::function<void()>& body) {
+void ParallelExecution::record_graph(CommunicationGraphWork& work,
+                                     const std::function<void()>& body) {
 #if NINFER_ENABLE_DISTRIBUTED
     binding_.group->record_graph(work, body);
 #else
@@ -73,7 +86,7 @@ void ParallelExecution::record_graph(CommunicationWork& work, const std::functio
 #endif
 }
 
-void ParallelExecution::replayed(const CommunicationWork& work) const {
+void ParallelExecution::replayed(const CommunicationGraphWork& work) const {
 #if NINFER_ENABLE_DISTRIBUTED
     binding_.group->replayed(work);
 #endif

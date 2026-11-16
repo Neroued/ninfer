@@ -16,7 +16,6 @@ struct MessageLayout {
 struct PromptLayout {
     std::vector<MessageLayout> messages;
     std::vector<MediaPlaceholderByteSpec> media_placeholders;
-    std::vector<std::size_t> execution_boundaries;
     bool starts_in_reasoning = false;
 };
 

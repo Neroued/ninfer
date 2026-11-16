@@ -4,11 +4,11 @@
 #include "runtime/contract/execution.h"
 
 #include <algorithm>
-#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <memory>
+#include <map>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -24,104 +24,113 @@ public:
     using SequenceHandle = typename Request::SequenceHandle;
 
     struct RoundMembership {
-        std::array<std::uint32_t, kMaximumConcurrency> lanes{};
-        std::array<SequenceHandle, kMaximumConcurrency> sequences{};
-        std::array<RoundBudget, kMaximumConcurrency> budgets{};
-        std::size_t size = 0;
+        std::vector<std::uint32_t> lanes;
+        std::vector<SequenceHandle> sequences;
+        std::vector<RoundBudget> budgets;
 
-        [[nodiscard]] bool empty() const noexcept { return size == 0; }
-
-        [[nodiscard]] std::span<const std::uint32_t> lane_span() const noexcept {
-            return {lanes.data(), size};
+        explicit RoundMembership(std::uint32_t capacity) {
+            lanes.reserve(capacity);
+            sequences.reserve(capacity);
+            budgets.reserve(capacity);
         }
+
+        void clear() noexcept {
+            lanes.clear();
+            sequences.clear();
+            budgets.clear();
+        }
+
+        [[nodiscard]] bool empty() const noexcept { return lanes.empty(); }
+
+        [[nodiscard]] std::size_t size() const noexcept { return lanes.size(); }
+
+        [[nodiscard]] std::span<const std::uint32_t> lane_span() const noexcept { return lanes; }
 
         [[nodiscard]] std::span<const SequenceHandle> sequence_span() const noexcept {
-            return {sequences.data(), size};
+            return sequences;
         }
 
-        [[nodiscard]] std::span<const RoundBudget> budget_span() const noexcept {
-            return {budgets.data(), size};
-        }
+        [[nodiscard]] std::span<const RoundBudget> budget_span() const noexcept { return budgets; }
     };
 
     struct ControlMembership {
-        std::array<std::uint32_t, kMaximumConcurrency> lanes{};
-        std::array<SequenceHandle, kMaximumConcurrency> sequences{};
+        std::vector<std::uint32_t> lanes;
+        std::vector<SequenceHandle> sequences;
         std::vector<TokenId> tokens;
         std::uint32_t row_stride = 0;
-        std::size_t size         = 0;
 
-        [[nodiscard]] bool empty() const noexcept { return size == 0; }
-
-        [[nodiscard]] std::span<const std::uint32_t> lane_span() const noexcept {
-            return {lanes.data(), size};
+        explicit ControlMembership(std::uint32_t capacity) {
+            lanes.reserve(capacity);
+            sequences.reserve(capacity);
         }
 
+        void clear() noexcept {
+            lanes.clear();
+            sequences.clear();
+            tokens.clear();
+            row_stride = 0;
+        }
+
+        [[nodiscard]] bool empty() const noexcept { return lanes.empty(); }
+
+        [[nodiscard]] std::size_t size() const noexcept { return lanes.size(); }
+
+        [[nodiscard]] std::span<const std::uint32_t> lane_span() const noexcept { return lanes; }
+
         [[nodiscard]] std::span<const SequenceHandle> sequence_span() const noexcept {
-            return {sequences.data(), size};
+            return sequences;
         }
     };
 
-    template <class Slots>
-    [[nodiscard]] RoundMembership build_round_membership(const Slots& slots,
-                                                         std::uint32_t max_concurrency) const {
-        RoundMembership membership;
-        for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+    template <class Slots, class Eligible>
+    void build_round_membership(const Slots& slots, Eligible eligible,
+                                RoundMembership& membership) const {
+        membership.clear();
+        for (std::size_t lane = 0; lane < slots.size(); ++lane) {
             const auto& request = slots[lane];
-            if (request == nullptr || !request->is_decode_ready() || request->capture_pending) {
+            if (!request || !request->is_decode_ready() || request->capture_pending ||
+                !eligible(static_cast<std::uint32_t>(lane)))
                 continue;
-            }
-            if (!request->budget) {
-                throw std::logic_error("decode-ready request has no generation budget");
-            }
-            if (!request->sequence) {
-                throw std::logic_error("decode-ready request has no sequence handle");
-            }
-            membership.lanes[membership.size]     = lane;
-            membership.sequences[membership.size] = *request->sequence;
-            membership.budgets[membership.size]   = RoundBudget{
-                  .generated_tokens_remaining = request->recovery_pending
-                                                    ? 1U
-                                                    : request->output.model_token_budget_remaining(
+            if (!request->budget || !request->sequence)
+                throw std::logic_error("decode-ready request has no generation state");
+            const RoundBudget budget{
+                .generated_tokens_remaining = request->recovery_pending
+                                                  ? 1U
+                                                  : request->output.model_token_budget_remaining(
                                                         request->budget->remaining()),
             };
-            if (membership.budgets[membership.size].generated_tokens_remaining == 0) {
+            if (!budget.generated_tokens_remaining)
                 throw std::logic_error("decode-ready request has no licensed model tokens");
-            }
-            ++membership.size;
+            membership.lanes.push_back(static_cast<std::uint32_t>(lane));
+            membership.sequences.push_back(*request->sequence);
+            membership.budgets.push_back(budget);
         }
-        return membership;
     }
 
-    template <class Slots>
-    [[nodiscard]] ControlMembership build_control_membership(const Slots& slots,
-                                                             std::uint32_t max_concurrency) const {
-        ControlMembership membership;
-        for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+    template <class Slots, class Eligible>
+    void build_control_membership(const Slots& slots, Eligible eligible,
+                                  ControlMembership& membership) const {
+        membership.clear();
+        for (std::size_t lane = 0; lane < slots.size(); ++lane) {
             const auto& request = slots[lane];
-            if (request == nullptr || !request->is_control_ready() || request->capture_pending) {
+            if (!request || !request->is_control_ready() || request->capture_pending ||
+                !eligible(static_cast<std::uint32_t>(lane)))
+                continue;
+            if (!request->budget || !request->sequence)
+                throw std::logic_error("control-ready request has no generation state");
+            const auto control = request->output.pending_control_tokens();
+            if (control.empty() || control.size() > request->budget->remaining())
+                throw std::logic_error("control-ready request has no admissible control span");
+            if (!membership.row_stride) {
+                membership.row_stride = static_cast<std::uint32_t>(control.size());
+                membership.tokens.reserve(std::size_t(membership.row_stride) * slots.size());
+            } else if (control.size() != membership.row_stride) {
                 continue;
             }
-            if (!request->budget || !request->sequence) {
-                throw std::logic_error("control-ready request has no generation state");
-            }
-            const std::span<const TokenId> control = request->output.pending_control_tokens();
-            if (control.empty() || control.size() > request->budget->remaining()) {
-                throw std::logic_error("control-ready request has no admissible control span");
-            }
-            if (membership.row_stride == 0) {
-                membership.row_stride = static_cast<std::uint32_t>(control.size());
-                membership.tokens.reserve(static_cast<std::size_t>(membership.row_stride) *
-                                          max_concurrency);
-            } else if (control.size() != membership.row_stride) {
-                throw std::logic_error("compact control membership has ragged target spans");
-            }
-            membership.lanes[membership.size]     = lane;
-            membership.sequences[membership.size] = *request->sequence;
+            membership.lanes.push_back(static_cast<std::uint32_t>(lane));
+            membership.sequences.push_back(*request->sequence);
             membership.tokens.insert(membership.tokens.end(), control.begin(), control.end());
-            ++membership.size;
         }
-        return membership;
     }
 
     template <class Slots>
@@ -151,9 +160,11 @@ public:
     }
 
     void admission_candidate_checked(std::uint64_t request_id) noexcept {
-        std::erase(admission_scan_remaining_, request_id);
+        admission_scan_remaining_.erase(request_id);
         if (request_id != admission_scan_head_) { scan_after_ = request_id; }
     }
+
+    static constexpr std::size_t admission_scan_batch = 8;
 
     // Only a successful younger admission consumes the older request's bypass allowance.
     [[nodiscard]] std::vector<RequestPtr> fresh_candidates(const std::deque<RequestPtr>& fresh,
@@ -165,60 +176,52 @@ public:
             return candidates;
         }
         admission_scan_head_ = fresh.front()->id;
-        std::size_t limit    = fresh.size();
-        for (std::size_t i = 0; i < fresh.size(); ++i) {
-            if (fresh[i]->admission_bypasses >= concurrency) {
-                limit = i + 1;
-                break;
-            }
-        }
         if (admission_scan_requested_) {
+            std::size_t limit = fresh.size();
+            for (std::size_t i = 0; i < fresh.size(); ++i)
+                if (fresh[i]->admission_bypasses >= concurrency) {
+                    limit = i + 1;
+                    break;
+                }
             admission_scan_remaining_.clear();
-            for (std::size_t i = 0; i < limit; ++i) {
-                admission_scan_remaining_.push_back(fresh[i]->id);
-            }
+            for (std::size_t i = 0; i < limit; ++i)
+                admission_scan_remaining_.emplace(fresh[i]->id, fresh[i]);
             admission_scan_requested_ = false;
-        } else {
-            // Cancellation and a newly exhausted bypass allowance can remove eligibility
-            // while the pass is in progress. Keep tickets, not queue positions or iterators.
-            std::erase_if(admission_scan_remaining_, [&](std::uint64_t id) {
-                return std::none_of(fresh.begin(), fresh.begin() + limit,
-                                    [id](const auto& request) { return request->id == id; });
-            });
         }
-        if (admission_scan_remaining_.empty()) { return candidates; }
+        if (admission_scan_remaining_.empty()) return candidates;
         candidates.push_back(fresh.front());
-        std::vector<RequestPtr> younger;
-        for (std::size_t i = 1; i < limit; ++i) {
-            if (std::find(admission_scan_remaining_.begin(), admission_scan_remaining_.end(),
-                          fresh[i]->id) != admission_scan_remaining_.end()) {
-                younger.push_back(fresh[i]);
+        const auto append = [&](auto first, auto last) {
+            for (auto it = first; it != last && candidates.size() <= admission_scan_batch; ++it) {
+                if (it->first == admission_scan_head_) continue;
+                if (auto request = it->second.lock()) candidates.push_back(std::move(request));
             }
-        }
-        std::sort(younger.begin(), younger.end(),
-                  [](const auto& a, const auto& b) { return a->id < b->id; });
-        const auto next = std::find_if(younger.begin(), younger.end(), [&](const auto& request) {
-            return request->id > scan_after_;
-        });
-        std::rotate(younger.begin(), next, younger.end());
-        const auto count = std::min<std::size_t>(concurrency, younger.size());
-        candidates.insert(candidates.end(), younger.begin(), younger.begin() + count);
+        };
+        const auto next = admission_scan_remaining_.upper_bound(scan_after_);
+        append(next, admission_scan_remaining_.end());
+        append(admission_scan_remaining_.begin(), next);
         return candidates;
     }
 
     void admitted(const std::deque<RequestPtr>& fresh, const Request& admitted,
                   std::uint32_t concurrency) {
+        admission_scan_remaining_.erase(admitted.id);
+        bool barrier = false;
+        bool found   = false;
         for (const auto& skipped : fresh) {
+            if (barrier) admission_scan_remaining_.erase(skipped->id);
+            if (found) continue;
             if (skipped->id == admitted.id) {
-                service_order_.push_back(admitted.id);
-                return;
+                found = true;
+                continue;
             }
             if (skipped->admission_bypasses >= concurrency) {
                 throw std::logic_error("fresh admission exceeded the FIFO bypass allowance");
             }
             ++skipped->admission_bypasses;
+            barrier |= skipped->admission_bypasses == concurrency;
         }
-        throw std::logic_error("admitted request is absent from the fresh queue");
+        if (!found) throw std::logic_error("admitted request is absent from the fresh queue");
+        service_order_.push_back(admitted.id);
     }
 
     // A pressure turn owns the next capacity handoff, including asynchronous reclamation,
@@ -269,29 +272,46 @@ public:
     }
 
     void finished(std::uint64_t request) noexcept {
-        const bool owner = progress_owner() == request;
-        std::erase(service_order_, request);
+        finished(std::span<const std::uint64_t>(&request, 1));
+    }
+
+    // IDs are sorted; survivors retain service order.
+    void finished(std::span<const std::uint64_t> requests) noexcept {
+        const bool owner = std::binary_search(requests.begin(), requests.end(), progress_owner());
+        std::erase_if(service_order_, [&](auto id) {
+            return std::binary_search(requests.begin(), requests.end(), id);
+        });
         if (owner) reset_service();
         if (service_order_.empty()) pressure_ = false;
         begin_admission_scan();
     }
 
     template <class Slots>
-    [[nodiscard]] std::optional<std::uint32_t>
-    preemption_victim(const Slots& slots, std::uint32_t concurrency,
-                      std::span<const std::uint32_t> excluded = {}) const noexcept {
+    [[nodiscard]] std::vector<std::uint32_t> preemption_candidates(const Slots& slots) const {
+        std::vector<std::uint32_t> candidates;
         const auto owner = progress_owner();
-        if (!owner) return std::nullopt;
-        std::optional<std::uint32_t> youngest;
-        for (std::uint32_t lane = 0; lane < concurrency; ++lane) {
+        if (!owner) return candidates;
+        for (std::uint32_t lane = 0; lane < slots.size(); ++lane) {
             const auto& request = slots[lane];
-            if (!request || request->id == owner || request->is_materializing() ||
-                request->is_model_finished() || request->recovery_pending ||
-                std::find(excluded.begin(), excluded.end(), lane) != excluded.end())
-                continue;
-            if (!youngest || request->id > slots[*youngest]->id) youngest = lane;
+            if (request && request->id != owner && !request->is_materializing() &&
+                !request->is_model_finished() && !request->recovery_pending)
+                candidates.push_back(lane);
         }
-        return youngest;
+        std::sort(candidates.begin(), candidates.end(),
+                  [&](auto a, auto b) { return slots[a]->id > slots[b]->id; });
+        return candidates;
+    }
+
+    template <class Slots>
+    void append_prefill_candidates(const Slots& slots, std::vector<std::uint32_t>& candidates,
+                                   std::uint32_t excluded) const {
+        for (std::size_t offset = 0; offset < slots.size(); ++offset) {
+            const auto lane     = (prefill_cursor_ + offset) % slots.size();
+            const auto& request = slots[lane];
+            if (lane != excluded && request &&
+                (request->is_prefilling() || request->is_replaying()) && !request->capture_pending)
+                candidates.push_back(lane);
+        }
     }
 
     // Grant at least one second of useful execution. An expensive restore earns up to
@@ -303,7 +323,7 @@ private:
     std::uint32_t prefill_cursor_      = 0;
     std::uint64_t scan_after_          = 0;
     std::uint64_t admission_scan_head_ = 0;
-    std::vector<std::uint64_t> admission_scan_remaining_;
+    std::map<std::uint64_t, std::weak_ptr<Request>> admission_scan_remaining_;
     bool admission_scan_requested_ = false;
     std::deque<std::uint64_t> service_order_;
     bool pressure_             = false;

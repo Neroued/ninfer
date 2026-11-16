@@ -254,7 +254,7 @@ struct Fixture {
             ops::kimi_delta_attention_batch_update(
                 vector(q, qh), vector(k, qh), vector(v, h), vector(g, h), bb, al, db, -5,
                 0.08838834764831845F, states->layer_view(0, st()).recurrent,
-                states->layer_view(0, dt()).recurrent, y, cuda);
+                states->layer_view(0, dt()).recurrent, vt(), y, cuda);
         else {
             auto si = states->recurrent_tensor(0, so[0]), sd = states->recurrent_tensor(0, ds[0]);
             ops::kimi_delta_attention(vector(q, qh), vector(k, qh), vector(v, h), vector(g, h), bb,
@@ -285,7 +285,7 @@ struct Fixture {
             ops::kimi_delta_attention_batch_update(
                 vector(q, qh), vector(k, qh), vector(v, h), vector(g, h), bb, al, db, -5,
                 0.08838834764831845F, states->layer_view(0, st()).recurrent,
-                states->layer_view(0, dt()).recurrent, y, cuda);
+                states->layer_view(0, dt()).recurrent, vt(), y, cuda);
         } else {
             auto si = states->recurrent_tensor(0, so[0]), sd = states->recurrent_tensor(0, ds[0]);
             ops::kimi_delta_attention(vector(q, qh), vector(k, qh), vector(v, h), vector(g, h), bb,

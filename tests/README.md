@@ -50,7 +50,7 @@ GPU integration tests 串行运行，以免互相争用资源。
 
 - [Qwen3.5](models/qwen3_5/tests.cmake)：加载、生成、MTP/DFlash、前缀与压力恢复。
 - [Qwen4Exp](models/qwen4_exp/tests.cmake)：加载、PLE、原生事务与模型组合。
-- [GLM5Next](models/glm5next/tests.cmake)：资源、Frontend、并行、Main/MTP/Vision 与图执行。
+- [GLM5Next](models/glm5next/tests.cmake)：资源、Frontend、并行、Main/MTP/DFlash2/Vision 与图执行。
 - [分布式](distributed/)：执行组、消息、全 rank 完成和故障清理。
 
 启用 `NINFER_ENABLE_DISTRIBUTED` 后可运行独立的执行组测试。部署 TOML 使用
@@ -60,7 +60,7 @@ GPU integration tests 串行运行，以免互相争用资源。
 ./build/dgx-spark-dev/tests/ninfer_distributed_execution_test --config distributed.local.toml
 ```
 
-这个入口使用生产 transport、Executor 与 NCCL，小型 Program 提供独立计算参考；
+这个入口使用生产 transport、Executor 与通信后端，小型 Program 提供独立计算参考；
 它不证明某个真实模型已经正确集成。模型验证通过现有原生检查与公共 Engine/产品入口完成。
 
 ## 验证边界

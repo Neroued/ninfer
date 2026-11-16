@@ -1,4 +1,5 @@
 #include "core/weight.h"
+#include "core/platform.h"
 #include "ops/linear/swiglu/nvfp4/dispatch.h"
 
 #include "core/device.h"
@@ -6,6 +7,7 @@
 #include "ops/linear/kernels/nvfp4/nvfp4_template_launch.cuh"
 #include "ops/linear/kernels/nvfp4/nvfp4_instances.cuh"
 #include "ops/linear/swiglu/paired_output.cuh"
+#include "ops/linear/swiglu/row_major_mma_epilogue.cuh"
 
 #include <cuda_bf16.h>
 
@@ -50,4 +52,12 @@ void launch_nvfp4_swiglu_decode(const Tensor& x, const Weight& w, Tensor& y, cud
                              LinearBf16Output{static_cast<__nv_bfloat16*>(y.data), w.n / 2},
                              SwiGluPairEpilogue{}, stream, SwiGluBranchRows<1>{});
 }
+#if !NINFER_TARGET_RTX5090
+void launch_nvfp4_swiglu_large_t(const Tensor& x, const Weight& w, Tensor& y, cudaStream_t stream) {
+    using S = Nvfp4ScheduleInstance<Nvfp4A16MmaSchedule<64, 64, 64, 64, 16, 2, 2>, 5120>;
+    launch_nvfp4_a16_mma<S>(nvfp4_a16_operands(x, w),
+                            LinearBf16Output{static_cast<__nv_bfloat16*>(y.data), w.n / 2},
+                            SwiGluRowMajorMmaEpilogue{}, stream, SwiGluRowMajorMmaRows<S>{});
+}
+#endif
 } // namespace ninfer::ops::detail

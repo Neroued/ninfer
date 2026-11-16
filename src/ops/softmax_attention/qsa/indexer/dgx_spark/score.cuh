@@ -4,9 +4,10 @@
 #include "ops/common/cuda/pipeline.cuh"
 
 namespace ninfer::ops::detail::qsa {
+template <int Capacity>
 struct ScoreWorkMap {
-    static constexpr int capacity = kIndexerMaxWindowQueries / 4;
-    int length[capacity], prefix[capacity + 1], groups;
+    static_assert(Capacity % 32 == 0);
+    int length[Capacity], prefix[Capacity + 1], groups;
 
     template <int Tile>
     __device__ bool build(const IndexerArguments& a) {
@@ -23,13 +24,20 @@ struct ScoreWorkMap {
         }
         if (!__syncthreads_or(visible > kIndexerSelected)) return false;
         if (tid < 32) {
-            int sum = visible > kIndexerSelected ? (visible + 63) / 64 : 0;
+            int carry = 0;
 #pragma unroll
-            for (int shift = 1; shift < 32; shift *= 2) {
-                const int x = __shfl_up_sync(0xffffffffu, sum, shift);
-                if (tid >= shift) sum += x;
+            for (int part = 0; part < Capacity / 32; ++part) {
+                const int group = part * 32 + tid;
+                const int n     = part == 0 ? visible : (group < count ? length[group] : 0);
+                int sum         = n > kIndexerSelected ? (n + 63) / 64 : 0;
+#pragma unroll
+                for (int shift = 1; shift < 32; shift *= 2) {
+                    const int x = __shfl_up_sync(0xffffffffu, sum, shift);
+                    if (tid >= shift) sum += x;
+                }
+                if (group < count) prefix[group + 1] = carry + sum;
+                carry += __shfl_sync(0xffffffffu, sum, 31);
             }
-            if (tid < count) prefix[tid + 1] = sum;
             if (tid == 0) {
                 prefix[0] = 0;
                 groups    = count;
@@ -52,7 +60,7 @@ struct ScoreWorkMap {
     }
 };
 
-template <int Tile, bool Vector, int Stages, bool RetainKeys = false>
+template <int Tile, bool Vector, int Stages, bool RetainKeys = false, int MapCapacity = 32>
 __global__ __launch_bounds__(Tile > 16 ? Tile * 8 : 128) void indexer_score_pipeline_kernel(
     const __grid_constant__ IndexerArguments a) {
     constexpr int Threads = Tile > 16 ? Tile * 8 : 128, KeyGroups = Tile > 16 ? 1 : 16 / Tile,
@@ -60,9 +68,9 @@ __global__ __launch_bounds__(Tile > 16 ? Tile * 8 : 128) void indexer_score_pipe
     if (a.columns <= kIndexerSelected) return;
     static_assert(Tile >= 4 && Tile <= 128 && (Tile & (Tile - 1)) == 0);
     static_assert(Stages == 1 || Stages == 2);
-    __shared__ ScoreWorkMap jobs;
-    extern __shared__ __align__(16) __nv_bfloat16 pipe_keys[];
-    if (!jobs.build<Tile>(a)) return;
+    __shared__ ScoreWorkMap<MapCapacity> jobs;
+    extern __shared__ __align__(1024) __nv_bfloat16 pipe_keys[];
+    if (!jobs.template build<Tile>(a)) return;
     const int tid = threadIdx.x, lane = tid % 32, warp = tid / 32,
               per_row = (a.width + Tile - 1) / Tile;
     const auto stage  = [&](int job, int buffer) {

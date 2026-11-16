@@ -47,7 +47,7 @@ Arguments arguments(const Tensor& ids, const Tensor& valid, const NgramTokenTail
                     CudaExecutionView execution) {
     const int tokens = ids.ne[0], batch = ids.ne[1];
     const auto device = execution.device();
-    require(tokens > 0 && batch >= 1 && batch <= 8, "invalid T/B");
+    require(tokens > 0 && batch >= 1, "invalid T/B");
     require(eos >= 0 && shards.size() <= 128, "invalid EOS or shard count");
     operand::slotted_tensor(ids, DType::I32, {tokens, batch}, 1, 4, kOp, "token IDs", device);
     require(before.token_ids.field.layers == 1, "tail layer");

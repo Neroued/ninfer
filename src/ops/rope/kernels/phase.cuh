@@ -7,6 +7,38 @@
 
 namespace ninfer::ops::detail {
 
+struct RopeD128Frequencies {
+    double value[64];
+};
+
+inline RopeD128Frequencies make_rope_d128_frequencies(float theta) {
+    RopeD128Frequencies result;
+    for (int i = 0; i < 64; ++i) result.value[i] = std::pow(double(theta), -double(i) / 64);
+    return result;
+}
+
+inline RopeD128Frequencies rope_d128_frequencies(float theta) {
+    static const auto qwen = make_rope_d128_frequencies(1.e7F);
+    static const auto glm  = make_rope_d128_frequencies(10000.F);
+    return theta == 1.e7F ? qwen : theta == 10000.F ? glm : make_rope_d128_frequencies(theta);
+}
+
+__device__ __forceinline__ void rope_d128_sincos(const RopeD128Frequencies& frequencies,
+                                                 int position, int pair, float* sine,
+                                                 float* cosine) {
+    const double angle = double(position) * frequencies.value[pair];
+    if (fabs(angle) <= 2147483648.0) {
+        const float reduced =
+            float(angle - nearbyint(angle * 0.159154943091895336) * 6.28318530717958648);
+        sincosf(reduced, sine, cosine);
+    } else {
+        double s, c;
+        sincos(angle, &s, &c);
+        *sine   = float(s);
+        *cosine = float(c);
+    }
+}
+
 // D128 full-head 1-D RoPE frequencies for theta=1e7.
 static __device__ __constant__ double kRopeD128Theta1e7Frequencies[64] = {
     1.00000000000000000e+00, 7.77365030238775789e-01, 6.04296390238132863e-01,

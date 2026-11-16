@@ -1,5 +1,6 @@
 #include "models/common/context/work.h"
 #include "models/common/context/contract.h"
+#include "models/common/context/directory/history.h"
 #include "core/paged_kv_cache.h"
 
 #include <algorithm>
@@ -219,6 +220,28 @@ kv_transfer_requirement(runtime::ContextTransferResource resource,
         .page_groups = pages,
         .work        = work,
     };
+}
+
+std::vector<runtime::ContextTransferRequirement>
+history_tail_requirements(const HistoryDirectory& histories, const HistoryBindingDemand& demand) {
+    std::vector<runtime::ContextTransferRequirement> result;
+    if (!demand.tail_copies) return result;
+    const auto& pages = histories.pages();
+    for (const auto& record : demand.records)
+        for (auto rank : record.ranks) {
+            const auto& parts = pages.layout().parts;
+            const auto part   = std::find_if(parts.begin(), parts.end(), [rank](const auto& value) {
+                return value.rank == rank;
+            });
+            if (part == parts.end()) throw std::logic_error("KV binding names a foreign rank");
+            auto copy = kv_transfer_requirement(
+                {runtime::KvPoolId{static_cast<std::uint16_t>(pages.pool_id())}},
+                runtime::ContextTransferDirection::DeviceToDevice, demand.tail_copies,
+                {std::uint64_t(part->record.bytes) * demand.tail_copies, demand.tail_copies});
+            copy.rank = rank;
+            result.push_back(copy);
+        }
+    return result;
 }
 
 } // namespace ninfer::models::context

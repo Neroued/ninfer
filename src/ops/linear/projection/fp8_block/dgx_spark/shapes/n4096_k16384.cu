@@ -42,7 +42,7 @@ Fp8BlockLinearRoute select(int tokens, LinearPolicy) {
         return {fp8_block_linear_sliced<Static<NativeFp8A16SlicedKSchedule<8, 8, 8, 256, 1>>>,
                 true};
     if (tokens <= 32)
-        return {fp8_block_linear_sliced<Static<NativeFp8A16SlicedKSchedule<16, 16, 4, 128, 2>>>,
+        return {fp8_block_linear_sliced<Static<NativeFp8A16SlicedKSchedule<16, 16, 4, 128, 1>>>,
                 true};
     if (tokens <= 64)
         return {fp8_block_linear_sliced<Static<NativeFp8A16SlicedKSchedule<32, 16, 4, 128, 1>>>,

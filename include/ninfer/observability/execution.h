@@ -151,16 +151,38 @@ struct CommunicationWork {
     }
 };
 
-// NCCL's tracked GPU allocations; Host buffers and driver storage are not included.
-struct CommunicationMemory {
+enum class CommunicationBackend : std::uint8_t { Nccl, Native };
+
+// Library-reported Device allocations; driver and unreported Host storage are excluded.
+struct LibraryCommunicationMemory {
     std::uint64_t tracked_device_bytes = 0, persistent_device_bytes = 0;
     std::uint64_t suspendable_device_bytes = 0;
 };
 
+struct CommunicationMemory {
+    std::uint64_t owned_host_bytes = 0, owned_device_bytes = 0;
+    // Registration covers existing backing; it is not an additional allocation.
+    std::uint64_t registered_host_bytes = 0;
+    // Library-tracked allocations exclude the explicitly owned backing above.
+    std::optional<LibraryCommunicationMemory> library;
+};
+
+struct BackendCommunicationWork {
+    CommunicationBackend backend = CommunicationBackend::Nccl;
+    CommunicationWork work;
+};
+
+using CommunicationGraphWork = std::vector<BackendCommunicationWork>;
+
+struct CommunicationBackendStatistics {
+    CommunicationBackend backend = CommunicationBackend::Nccl;
+    CommunicationWork eager, graph;
+    CommunicationMemory memory; // Sampled after startup preparation.
+};
+
 struct CommunicationStatistics {
     std::uint32_t group = 0, size = 1;
-    CommunicationWork eager, graph;
-    std::optional<CommunicationMemory> startup_memory;
+    std::vector<CommunicationBackendStatistics> backends;
 };
 
 // Target attention only: draft work and replicated FFN/KDA work are not included.
@@ -204,11 +226,12 @@ enum class SpeculativeBackend : std::uint8_t {
 // Vision is an overlapping stream interval, with coverage in max_rank_gpu. GenerationEngineTiming
 // below is the direct, mutually-exclusive Host observation contract.
 struct GenerationTimings {
-    double prepare_seconds     = 0.0;
-    double first_token_seconds = 0.0;
-    double vision_seconds      = 0.0;
-    double prefill_seconds     = 0.0;
-    double decode_seconds      = 0.0;
+    double prepare_seconds = 0.0;
+    // Absent until the first committed token, independently of visible output.
+    std::optional<double> first_token_seconds;
+    double vision_seconds  = 0.0;
+    double prefill_seconds = 0.0;
+    double decode_seconds  = 0.0;
     double replay_seconds = 0.0, control_seconds = 0.0;
     // Prompt wall time begins at the successful initial binding attempt and ends at the first
     // accepted output token. Generation spans the first through last accepted output token and

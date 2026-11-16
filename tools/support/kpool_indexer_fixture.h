@@ -77,7 +77,7 @@ struct IndexerFixture {
           keys(initialize_history ? std::size_t(physical_pages) * 16 * 128 : 0),
           workspace_bytes(ops::kpool_indexer_workspace_capacity_bytes(
               {32, 128}, index_format, envelope, B, 1, T, cuda.multiprocessor_count())) {
-        if (T <= 0 || B < 1 || B > 8 || E < 0 || E > 1048576 || (E && E < T))
+        if (T <= 0 || B < 1 || E < 0 || E > 1048576 || (E && E < T))
             throw std::invalid_argument("Indexer fixture T/B/end");
         plane_index = packed.plane_index(cache.keys.plane);
         if (index_format == KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0)

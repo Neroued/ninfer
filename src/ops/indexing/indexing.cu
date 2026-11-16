@@ -1,3 +1,4 @@
+#include "ops/common/host/launch.h"
 #include "ninfer/ops/indexing.h"
 #include "core/device.h"
 #include "core/platform.h"
@@ -17,11 +18,13 @@ __device__ std::int64_t destination_index(Index index, std::int64_t stride) {
     return static_cast<std::int64_t>(index) * stride;
 }
 
-template <class Unit, class Index>
+template <class Unit, class Index, bool Masked = false>
 __global__ void scatter_kernel(const Unit* source, const Index* indices, Unit* destination,
                                std::int32_t units, std::int64_t source_stride,
-                               std::int64_t destination_stride) {
-    const auto column      = static_cast<std::int32_t>(blockIdx.x);
+                               std::int64_t destination_stride, const std::int32_t* live) {
+    const auto column = static_cast<std::int32_t>(blockIdx.x);
+    if constexpr (Masked)
+        if (!live[column]) return;
     const auto source_base = column * source_stride;
     const auto destination_base =
         destination_index<Index, Unit>(indices[column], destination_stride);
@@ -74,17 +77,20 @@ void launch_scatter(const Tensor& source, const Tensor& indices, Tensor& destina
     scatter_kernel<<<columns, Width == 8 ? 128 : 256, 0, stream>>>(
         static_cast<const Unit*>(source.data), map, static_cast<Unit*>(destination.data), items,
         source.nb[1] / static_cast<std::int64_t>(sizeof(Unit)),
-        destination.nb[1] / static_cast<std::int64_t>(sizeof(Unit)));
+        destination.nb[1] / static_cast<std::int64_t>(sizeof(Unit)), nullptr);
 }
 
 #if NINFER_TARGET_SPARK
-template <int Blocks, int Threads, class Index>
+template <int Blocks, int Threads, class Index, bool Masked = false>
 __launch_bounds__(Threads) __global__
     void scatter_d2560_kernel(const uint4* source, const Index* indices, uint4* destination,
-                              std::int64_t source_stride, std::int64_t destination_stride) {
+                              std::int64_t source_stride, std::int64_t destination_stride,
+                              const std::int32_t* live) {
     constexpr int Vectors = 2560 / 8, Tile = Vectors / Blocks;
     static_assert(Vectors % Blocks == 0);
     const auto column = blockIdx.x / Blocks, split = blockIdx.x % Blocks;
+    if constexpr (Masked)
+        if (!live[column]) return;
     const auto source_base = std::int64_t(column) * source_stride;
     const auto destination_base =
         destination_index<Index, uint4>(indices[column], destination_stride);
@@ -99,7 +105,7 @@ void launch_scatter_d2560(const Tensor& source, const Tensor& indices, Tensor& d
                           cudaStream_t stream) {
     scatter_d2560_kernel<Blocks, Threads><<<source.ne[1] * Blocks, Threads, 0, stream>>>(
         static_cast<const uint4*>(source.data), static_cast<const std::int32_t*>(indices.data),
-        static_cast<uint4*>(destination.data), source.nb[1] / 16, destination.nb[1] / 16);
+        static_cast<uint4*>(destination.data), source.nb[1] / 16, destination.nb[1] / 16, nullptr);
 }
 #endif
 
@@ -125,13 +131,17 @@ void launch_scatter_bf16_batch(const Tensor& source, const Tensor& lanes,
     constexpr int block = kScatterBatchThreads;
     // Keep a grid-stride feature loop beyond CUDA's z-dimension limit.
     const int feature_tiles = std::min((source.ne[0] / 8 + block - 1) / block, 65535);
-    const dim3 grid(source.ne[1], source.ne[2], feature_tiles);
-    scatter_bf16_batch_kernel<<<grid, block, 0, stream>>>(
-        static_cast<const uint4*>(source.data), static_cast<const std::int32_t*>(lanes.data),
-        static_cast<const std::int32_t*>(valid_columns.data), static_cast<uint4*>(destination.data),
-        source.ne[0] / 8, source.ne[1],
-        destination.nb[1] / static_cast<std::int64_t>(sizeof(uint4)),
-        destination.nb[2] / static_cast<std::int64_t>(sizeof(uint4)));
+    common::for_each_token_slice(source.ne[2], 1, [&](int offset, int count) {
+        const dim3 grid(source.ne[1], count, feature_tiles);
+        scatter_bf16_batch_kernel<<<grid, block, 0, stream>>>(
+            static_cast<const uint4*>(source.data) +
+                std::int64_t(offset) * source.ne[1] * (source.ne[0] / 8),
+            static_cast<const std::int32_t*>(lanes.data) + offset,
+            static_cast<const std::int32_t*>(valid_columns.data) + offset,
+            static_cast<uint4*>(destination.data), source.ne[0] / 8, source.ne[1],
+            destination.nb[1] / static_cast<std::int64_t>(sizeof(uint4)),
+            destination.nb[2] / static_cast<std::int64_t>(sizeof(uint4)));
+    });
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -171,7 +181,8 @@ void scatter(const Tensor& src, const Tensor& indices, Tensor& dst, CudaExecutio
     CUDA_CHECK(cudaGetLastError());
 }
 
-void scatter(const Tensor& source, const StateFieldView& destination, CudaExecutionView execution) {
+void scatter(const Tensor& source, const StateFieldView& destination, const Tensor& live_rows,
+             CudaExecutionView execution) {
     namespace operand        = common::operand;
     constexpr const char* op = "scatter";
     const int d = source.ne[0], batch = source.ne[1];
@@ -182,28 +193,39 @@ void scatter(const Tensor& source, const StateFieldView& destination, CudaExecut
     operand::state_field(destination, DType::BF16, {d}, 2, op, "destination", execution.device());
     operand::tensor(destination.records.byte_offsets, DType::I64, {batch}, 8, op, "offsets",
                     execution.device());
+    if (live_rows.data)
+        operand::tensor(live_rows, DType::I32, {batch}, 4, op, "live rows", execution.device());
     const auto* offsets = static_cast<const std::int64_t*>(destination.records.byte_offsets.data);
+    const auto* live    = static_cast<const std::int32_t*>(live_rows.data);
     auto* target        = operand::state_field_base<std::byte>(destination);
-    const auto launch   = [&]<class Unit>() {
-        scatter_kernel<<<batch, sizeof(Unit) == 16 ? 128 : 256, 0, execution.stream()>>>(
-            static_cast<const Unit*>(source.data), offsets, reinterpret_cast<Unit*>(target),
-            d * 2 / sizeof(Unit), source.nb[1] / sizeof(Unit), 0);
-    };
-    if (d % 8 == 0 && operand::aligned(source.data, 16) && operand::aligned(target, 16) &&
-        source.nb[1] % 16 == 0) {
+    const auto dispatch = [&]<bool Masked>() {
+        const auto launch = [&]<class Unit>() {
+            scatter_kernel<Unit, std::int64_t, Masked>
+                <<<batch, sizeof(Unit) == 16 ? 128 : 256, 0, execution.stream()>>>(
+                    static_cast<const Unit*>(source.data), offsets, reinterpret_cast<Unit*>(target),
+                    std::int64_t(d) * 2 / sizeof(Unit), source.nb[1] / sizeof(Unit), 0, live);
+        };
+        if (d % 8 == 0 && operand::aligned(source.data, 16) && operand::aligned(target, 16) &&
+            source.nb[1] % 16 == 0) {
 #if NINFER_TARGET_SPARK
-        if (d == 2560)
-            scatter_d2560_kernel<5, 64><<<batch * 5, 64, 0, execution.stream()>>>(
-                static_cast<const uint4*>(source.data), offsets, reinterpret_cast<uint4*>(target),
-                source.nb[1] / 16, 0);
-        else
+            if (d == 2560)
+                scatter_d2560_kernel<5, 64, std::int64_t, Masked>
+                    <<<std::uint64_t(batch) * 5, 64, 0, execution.stream()>>>(
+                        static_cast<const uint4*>(source.data), offsets,
+                        reinterpret_cast<uint4*>(target), source.nb[1] / 16, 0, live);
+            else
 #endif
-            launch.template operator()<uint4>();
-    } else if (d % 2 == 0 && operand::aligned(source.data, 4) && operand::aligned(target, 4) &&
-               source.nb[1] % 4 == 0)
-        launch.template operator()<__nv_bfloat162>();
+                launch.template operator()<uint4>();
+        } else if (d % 2 == 0 && operand::aligned(source.data, 4) && operand::aligned(target, 4) &&
+                   source.nb[1] % 4 == 0)
+            launch.template operator()<__nv_bfloat162>();
+        else
+            launch.template operator()<__nv_bfloat16>();
+    };
+    if (live)
+        dispatch.template operator()<true>();
     else
-        launch.template operator()<__nv_bfloat16>();
+        dispatch.template operator()<false>();
     CUDA_CHECK(cudaGetLastError());
 }
 

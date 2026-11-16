@@ -36,6 +36,7 @@ struct TextInputs {
     Tensor state_source_offsets;
     Tensor state_destination_offsets;
     std::optional<Tensor> input_embeddings;
+    std::uint32_t active_tokens = 0;
 };
 
 // SequenceUpdate publishes a complete B=1 sequence with the chunked recurrence; its sole
@@ -72,6 +73,8 @@ struct DFlashFeatureSink {
 // readiness yields; destroy the traversal before reusing that arena for subsequent work.
 class TextRun {
 public:
+    [[nodiscard]] std::uint32_t active_tokens() const noexcept { return inputs_.active_tokens; }
+
     TextRun(TextExecutionView execution, TextInputs inputs, TextStateUpdate update,
             ops::CausalAttentionExecutionEnvelope envelope, Tensor hidden,
             const DFlashFeatureSink* features = nullptr);

@@ -72,12 +72,14 @@ struct BatchUpdateAccess {
     float* states_write;
     const std::int64_t* source_offsets;
     const std::int64_t* destination_offsets;
+    const std::int32_t* valid_columns;
     __nv_bfloat16* out;
     HeadMap heads;
     float scale;
+    std::int32_t batch_begin = 0;
 
     __device__ __forceinline__ RecurrentCoordinates coordinates() const {
-        return make_coordinates(static_cast<std::int32_t>(blockIdx.y), 0,
+        return make_coordinates(batch_begin + static_cast<std::int32_t>(blockIdx.y), 0,
                                 static_cast<std::int32_t>(blockIdx.z), heads);
     }
 
@@ -145,6 +147,10 @@ template <bool NormalizeInputs>
 __global__ void __launch_bounds__(common::kWarpSize* kNumWarps, 2)
     recurrent_batch_update_kernel(BatchUpdateAccess access) {
     const RecurrentCoordinates coord = access.coordinates();
+    if (access.valid_columns && !access.valid_columns[coord.batch]) {
+        zero_output_suffix(access, coord, 0, 1);
+        return;
+    }
     __align__(16) float state[kDvPerWarp][kQkPerLane];
     load_state_tile(state, access.state_read_base(coord), coord);
     run_recurrent_sequence<NormalizeInputs, OutputEffects>(state, access, coord, 1);

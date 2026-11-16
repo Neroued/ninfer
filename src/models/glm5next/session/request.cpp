@@ -16,11 +16,14 @@ PrefixShortlistKey key(const Identity& identity, std::uint32_t frontier) {
     return {identity.digests.at(frontier), frontier, identity.tag};
 }
 
-std::shared_ptr<const Identity> capture_identity(const Sequence& s) {
+std::shared_ptr<const Identity> capture_identity(const Sequence& s,
+                                                 context::MetadataBudget& budget) {
+    if (!context::IdentityMetadata::can_copy(budget, s.identity)) return {};
     auto out       = std::make_shared<Identity>(s.identity);
     const auto end = s.continuation.metadata.main_frontier;
     out->truncate(end);
-    return out;
+    const std::shared_ptr<const Identity> immutable = std::move(out);
+    return immutable->retention.retain(budget, immutable);
 }
 
 } // namespace ninfer::models::glm5next::detail
@@ -60,11 +63,6 @@ RequestBasePlan Session::plan_request(PreparedPrompt&& prompt,
     for (const auto id : input.token_ids)
         if (id < 0 || std::uint32_t(id) >= p.definition->resources().text.public_token_count)
             throw std::invalid_argument("prompt token is outside the public vocabulary");
-    std::uint32_t previous = 0;
-    for (const auto f : input.identity.execution_frontiers) {
-        if (f <= previous || f > count) throw std::invalid_argument("invalid execution frontier");
-        previous = f;
-    }
     if (const auto& r = input.identity.rewrite_checkpoint;
         r && (!r->recovery_frontier || r->recovery_frontier > r->frontier || r->frontier > count))
         throw std::invalid_argument("invalid input recovery point");

@@ -24,8 +24,7 @@ void contiguous(const Tensor& t, DType dtype, std::initializer_list<std::int32_t
 
 using common::operand::Range;
 
-// A column is contiguous. The two outer axes can be padded or interleaved. One has
-// at most nine entries (history columns or batch rows), so validation never scans R/S.
+// A column is contiguous. The two outer axes can be padded or interleaved.
 struct Columns {
     Range bounds;
     std::uint64_t width, small_count, small_stride, large_count, large_stride;
@@ -55,6 +54,9 @@ Columns columns(const Tensor& t, int count, int outer, const char* label, Device
                    t.ne[small] == 1 ? width : static_cast<std::uint64_t>(t.nb[small]),
                    static_cast<std::uint64_t>(t.ne[large]),
                    t.ne[large] == 1 ? width : static_cast<std::uint64_t>(t.nb[large])};
+    if (result.large_stride >= (result.small_count - 1) * result.small_stride + width ||
+        result.small_stride >= (result.large_count - 1) * result.large_stride + width)
+        return result;
     // Columns from different small-axis positions must not overlap any column of
     // the other progression. Only the two nearest large-axis offsets can overlap.
     for (std::uint64_t delta = 1; delta < result.small_count; ++delta) {
@@ -83,7 +85,7 @@ void metadata(const Tensor& t, int batch, const char* label, Device device) {
     contiguous(t, DType::I32, {batch}, 4, label, device);
 }
 
-void validate_batch_extent(int batch) { require(batch >= 1 && batch <= 8, "batch extent"); }
+void validate_batch_extent(int batch) { require(batch >= 1, "batch extent"); }
 
 } // namespace
 
@@ -186,10 +188,11 @@ void validate_conv(const Tensor& residual, const Tensor& gated, const Tensor& ke
 
 void validate_extract(const ConstPleConvStateView& before, const PleConvRecordReadView& records,
                       const Tensor& accepted, const PleConvStateView& after,
-                      CudaExecutionView execution) {
+                      const Tensor& live_rows, CudaExecutionView execution) {
     const int batch = accepted.ne[0];
     validate_batch_extent(batch);
     metadata(accepted, batch, "accepted columns", execution.device());
+    if (live_rows.data) metadata(live_rows, batch, "live rows", execution.device());
     metadata(records.valid_columns, batch, "record valid columns", execution.device());
     const auto validate_history = [&](const ConstStateFieldView& state) {
         require(state.field.layers == 1, "history layer");

@@ -1,12 +1,18 @@
 ninfer_add_op_bench(ninfer_silu_mul_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/silu_mul_bench.cu")
 ninfer_add_op_bench(ninfer_residual_add_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/residual_add_bench.cu")
+ninfer_add_op_bench(ninfer_sequence_indexing_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/sequence_indexing_bench.cu")
 ninfer_add_op_bench(ninfer_sigmoid_mul_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/sigmoid_mul_bench.cu")
 ninfer_add_op_bench(ninfer_rmsnorm_pack_tail_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/rmsnorm_pack_tail_bench.cu")
+ninfer_add_op_bench(ninfer_rmsnorm_gathered_features_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/rmsnorm_gathered_features_bench.cu")
 ninfer_add_op_bench(ninfer_l2norm_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/l2norm_bench.cu")
 ninfer_add_op_bench(ninfer_dynamic_grouped_conv_prepare_bench
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/dynamic_grouped_conv_prepare_bench.cu")
 ninfer_add_op_bench(ninfer_linear_dynamic_grouped_conv_add_bench
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/linear_dynamic_grouped_conv_add_bench.cu")
+ninfer_add_op_bench(ninfer_linear_dynamic_grouped_conv_bench
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/linear_dynamic_grouped_conv_bench.cu")
+ninfer_add_op_bench(ninfer_linear_topk_keys_bench
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/linear_topk_keys_bench.cu")
 ninfer_add_op_bench(ninfer_kimi_delta_attention_bench
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/linear_attention/kimi_delta_attention/main.cu")
 ninfer_add_op_bench(ninfer_rope_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/rope_bench.cu")
@@ -32,6 +38,7 @@ ninfer_add_op_bench(ninfer_causal_conv1d_silu_bench SOURCES "${CMAKE_CURRENT_LIS
 ninfer_add_op_bench(ninfer_linear_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/linear_bench.cu")
 ninfer_add_op_bench(ninfer_linear_topk_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/linear_topk_bench.cu")
 ninfer_add_op_bench(ninfer_candidate_selector_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/candidate_selector_bench.cu")
+ninfer_add_op_bench(ninfer_gathered_selector_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/gathered_selector_bench.cu")
 ninfer_add_op_bench(ninfer_linear_split_multi_output_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/linear/split/multi_output.cu")
 ninfer_add_op_bench(ninfer_linear_split_two_output_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/linear/split/two_output.cu")
 ninfer_add_op_bench(ninfer_q8_linear_swiglu_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/q8_linear_swiglu_bench.cu")
@@ -53,6 +60,7 @@ ninfer_add_op_bench(ninfer_kv_cache_append_bench SOURCES "${CMAKE_CURRENT_LIST_D
 ninfer_add_op_bench(ninfer_prepare_masked_block_bench
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/prepare_masked_block_bench.cu")
 ninfer_add_op_bench(ninfer_vocabulary_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/vocabulary_bench.cu")
+ninfer_add_op_bench(ninfer_vocabulary_sparse_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/vocabulary_sparse_bench.cu")
 ninfer_add_op_bench(ninfer_sampling_select_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/sampling_select_bench.cu")
 ninfer_add_op_bench(ninfer_moe_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/moe/main.cu")
 ninfer_add_op_bench(ninfer_moe_block_scaled_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/moe/block_scaled.cu")
@@ -120,3 +128,6 @@ foreach(target IN ITEMS ninfer_moe_clamped_ep_bench ninfer_sigmoid_moe_bench)
 endforeach()
 
 ninfer_add_op_bench(ninfer_linear_bias_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/linear_bias.cu")
+
+ninfer_add_op_bench(ninfer_context_kv_materialize_bf16_bench
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/context_kv_materialize_bf16_bench.cu")

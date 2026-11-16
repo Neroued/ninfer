@@ -9,7 +9,6 @@ namespace ninfer::models::glm5next {
 struct PromptIdentity {
     bool reusable = true;
     std::optional<models::frontend::RewriteCheckpointSpec> rewrite_checkpoint;
-    std::vector<std::uint32_t> execution_frontiers;
     std::vector<MediaInputIdentity> media;
 };
 
@@ -20,7 +19,7 @@ struct PreparedPromptData : models::frontend::PromptData {
     std::vector<std::shared_ptr<const models::frontend::PreparedMediaPayload>> media_payloads;
 
     [[nodiscard]] InputPrefixView prefix_view() const noexcept {
-        return {token_ids, identity.media, identity.execution_frontiers};
+        return {token_ids, identity.media};
     }
 };
 

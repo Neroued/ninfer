@@ -76,7 +76,8 @@ void MtpRun::feed_forward() {
     {
         auto scratch = arena_.scope();
         moe::execute(roots_.input, parameters_.layer.moe, parameters_.layer.moe.resident,
-                     ops::MoeEpilogue::Write, roots_.output, arena_, cuda_);
+                     ops::MoeEpilogue::Write, roots_.output, {batch_.valid_columns, batch_.tokens},
+                     arena_, cuda_);
     }
     if (parallel_) parallel_->sum(roots_.output, cuda_);
     ops::hc_combine_norm(roots_.residual, roots_.output, roots_.injection,

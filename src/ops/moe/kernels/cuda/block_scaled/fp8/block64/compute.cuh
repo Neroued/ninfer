@@ -5,8 +5,8 @@
 namespace ninfer::ops::detail::moe_cuda::block_scaled::fp8::block64 {
 inline constexpr int kLocalIntermediate = 320;
 
-template <int Columns, bool Gate>
-struct Schedule : fp8::Schedule<Columns, Gate> {
+template <int Columns, bool Gate, int Stages = 2, bool Atomic = false>
+struct Schedule : fp8::Schedule<Columns, Gate, Stages, Atomic> {
     static constexpr int k      = Gate ? kHidden : kLocalIntermediate;
     static constexpr int groups = (k + 127) / 128;
 };
@@ -14,7 +14,7 @@ struct Schedule : fp8::Schedule<Columns, Gate> {
 template <class S, bool Gate>
 __device__ __forceinline__ void stage_inputs(TileStorage<S>& tile, int stage, int kt, int row0,
                                              Matrix weight, const std::uint8_t* input,
-                                             int active_columns) {
+                                             int active_columns, const float* input_scales) {
     for (int task = threadIdx.x; task < S::weight_rows * 8; task += S::threads) {
         const int row = task / 8, col = task % 8 * 16;
         const int logical_row = row0 + row % 128;
@@ -35,6 +35,15 @@ __device__ __forceinline__ void stage_inputs(TileStorage<S>& tile, int stage, in
                                       input + std::int64_t(source >= 0 ? source : 0) * S::k +
                                           (valid ? kt * 128 + col : 0),
                                       valid ? 16 : 0);
+    }
+    if constexpr (S::stage_scales) {
+        if (threadIdx.x < active_columns) {
+            const int source = tile.sources[threadIdx.x];
+            cp_async_zfill<4>(&tile.stage.input_scales[stage][threadIdx.x],
+                              input_scales + std::int64_t(source >= 0 ? source : 0) * S::groups +
+                                  kt,
+                              source >= 0 ? 4 : 0);
+        }
     }
     cp_commit();
 }
@@ -88,9 +97,13 @@ __device__ __forceinline__ void contract_segment(TileStorage<S>& tile, int stage
             const int c0      = column + (lane & 3) * 2;
             const int source0 = tile.sources[c0], source1 = tile.sources[c0 + 1];
             const float sx0 =
-                source0 >= 0 ? input_scales[std::int64_t(source0) * S::groups + kt] : 0;
+                S::stage_scales
+                    ? tile.stage.input_scales[stage][c0]
+                    : (source0 >= 0 ? input_scales[std::int64_t(source0) * S::groups + kt] : 0);
             const float sx1 =
-                source1 >= 0 ? input_scales[std::int64_t(source1) * S::groups + kt] : 0;
+                S::stage_scales
+                    ? tile.stage.input_scales[stage][c0 + 1]
+                    : (source1 >= 0 ? input_scales[std::int64_t(source1) * S::groups + kt] : 0);
             const float gs0 = sg * sx0, gs1 = sg * sx1, us0 = su * sx0, us1 = su * sx1;
 #pragma unroll
             for (int v = 0; v < 4; ++v) {
@@ -104,8 +117,9 @@ __device__ __forceinline__ void contract_segment(TileStorage<S>& tile, int stage
 // Weight K64 scales and activation G128 scales are independent. Each K64
 // contraction is rescaled before it joins the FP32 sum; equal adjacent scales
 // may share that step. The last down tile keeps only its 64 valid K elements.
-template <int Columns, bool Gate, bool Atomic>
-__global__ __launch_bounds__(Schedule<Columns, Gate>::threads) void grouped_mma(
+template <int Columns, bool Gate, bool Atomic, int Stages = 2, int MinBlocks = 1>
+__global__
+__launch_bounds__(Schedule<Columns, Gate, Stages, Atomic>::threads, MinBlocks) void grouped_mma(
     const std::uint8_t* __restrict__ input, const float* __restrict__ input_scales,
     ExpertMatrixDeviceView bank, Groups groups, std::uint8_t* __restrict__ product,
     float* __restrict__ product_scales, float* __restrict__ contributions,
@@ -114,7 +128,7 @@ __global__ __launch_bounds__(Schedule<Columns, Gate>::threads) void grouped_mma(
     if (groups.load_range &&
         (groups.load_range[1] <= minimum_count || groups.load_range[0] > maximum_count))
         return;
-    using S = Schedule<Columns, Gate>;
+    using S = Schedule<Columns, Gate, Stages, Atomic>;
     if constexpr (!Gate) {
         if (pool_expert_limit && groups.load_range[2] > pool_min_experts &&
             groups.load_range[2] <= pool_expert_limit)
@@ -143,14 +157,21 @@ __global__ __launch_bounds__(Schedule<Columns, Gate>::threads) void grouped_mma(
             const int packed = begin + threadIdx.x;
             tile.sources[threadIdx.x] =
                 packed < end ? (Gate ? groups.assignments[packed] / kTopK : packed) : -1;
+            if constexpr (!Gate && Atomic) {
+                const int assignment           = packed < end ? groups.assignments[packed] : -1;
+                tile.token_ids[threadIdx.x]    = assignment >= 0 ? assignment / kTopK : 0;
+                tile.coefficients[threadIdx.x] = assignment >= 0 ? coefficients[assignment] : 0;
+            }
         }
         __syncthreads();
-        stage_inputs<S, Gate>(tile, 0, 0, row0, weight, input, active_columns);
-        stage_inputs<S, Gate>(tile, 1, 1, row0, weight, input, active_columns);
+#pragma unroll
+        for (int stage = 0; stage < S::stages; ++stage)
+            stage_inputs<S, Gate>(tile, stage, stage, row0, weight, input, active_columns,
+                                  input_scales);
         float acc[2][S::mma_columns][4]{};
         for (int kt = 0; kt < S::groups; ++kt) {
-            const int stage = kt % 2;
-            cp_wait<1>();
+            const int stage = kt % S::stages;
+            cp_wait<S::stages - 1>();
             __syncthreads();
             const int row        = row0 + (Gate ? wm * 16 : wm * 32);
             const bool valid_row = !Gate || row < kLocalIntermediate;
@@ -188,8 +209,9 @@ __global__ __launch_bounds__(Schedule<Columns, Gate>::threads) void grouped_mma(
                 }
             }
             __syncthreads();
-            if (kt + 2 < S::groups)
-                stage_inputs<S, Gate>(tile, stage, kt + 2, row0, weight, input, active_columns);
+            if (kt + S::stages < S::groups)
+                stage_inputs<S, Gate>(tile, stage, kt + S::stages, row0, weight, input,
+                                      active_columns, input_scales);
             else
                 cp_commit();
         }
@@ -215,9 +237,8 @@ __global__ __launch_bounds__(Schedule<Columns, Gate>::threads) void grouped_mma(
                     float* target;
                     float coefficient = 1;
                     if constexpr (Atomic) {
-                        const int assignment = groups.assignments[begin + column];
-                        coefficient          = coefficients[assignment];
-                        target = routed_sum + std::int64_t(assignment / kTopK) * kHidden;
+                        coefficient = tile.coefficients[column];
+                        target      = routed_sum + std::int64_t(tile.token_ids[column]) * kHidden;
                     } else
                         target = contributions + std::int64_t(begin + column) * kHidden;
 #pragma unroll
@@ -271,11 +292,12 @@ struct PoolContraction {
         const int warp = threadIdx.x >> 5, wm = warp % S::warp_rows;
         const int active_columns = min(Columns, ((end - begin + 7) / 8) * 8);
         const auto weight        = resolve(bank, expert);
-        stage_inputs<S, false>(tile, 0, 0, row0, weight, input, active_columns);
-        stage_inputs<S, false>(tile, 1, 1, row0, weight, input, active_columns);
+#pragma unroll
+        for (int stage = 0; stage < S::stages; ++stage)
+            stage_inputs<S, false>(tile, stage, stage, row0, weight, input, active_columns, scales);
         for (int kt = 0; kt < S::groups; ++kt) {
-            const int stage = kt % 2;
-            cp_wait<1>();
+            const int stage = kt % S::stages;
+            cp_wait<S::stages - 1>();
             __syncthreads();
             const int row   = row0 + wm * 32;
             const bool full = kt * 128 + 128 <= S::k;
@@ -291,8 +313,9 @@ struct PoolContraction {
                                                   acc);
             }
             __syncthreads();
-            if (kt + 2 < S::groups)
-                stage_inputs<S, false>(tile, stage, kt + 2, row0, weight, input, active_columns);
+            if (kt + S::stages < S::groups)
+                stage_inputs<S, false>(tile, stage, kt + S::stages, row0, weight, input,
+                                       active_columns, scales);
             else
                 cp_commit();
         }
@@ -304,7 +327,7 @@ struct PoolContraction {
 __global__ void vector_gate(const __nv_bfloat16* x, ExpertMatrixDeviceView bank, const int* ids,
                             ExpertSubsetKind kind, const int* mask, float* activation) {
     const int assignment = blockIdx.y, expert = ids[assignment];
-    if (!includes(kind, mask, expert)) return;
+    if (!expert_in_subset(kind, mask, expert)) return;
     const auto weight = resolve(bank, expert);
     const int row = blockIdx.x * 4 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
     float gate = 0, up = 0;
@@ -336,7 +359,7 @@ __global__ void vector_down(const float* activation, ExpertMatrixDeviceView bank
     const int token = blockIdx.y, route = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int assignment = token * kTopK + route, expert = ids[assignment];
     float sum[Rows]{};
-    if (includes(kind, mask, expert)) {
+    if (expert_in_subset(kind, mask, expert)) {
         const auto weight = resolve(bank, expert);
         for (int block = 0; block < 3; ++block) {
             const int k = block * 128 + lane * 4;
@@ -364,8 +387,9 @@ __global__ void vector_down(const float* activation, ExpertMatrixDeviceView bank
         float total = 0;
 #pragma unroll
         for (int j = 0; j < kTopK; ++j) total += values[j][threadIdx.x];
-        const int i = token * kHidden + blockIdx.x * Rows + threadIdx.x;
-        output.store(i, output.initial(i) + total);
+        const int i     = token * kHidden + blockIdx.x * Rows + threadIdx.x;
+        const bool live = output.is_live(token);
+        output.store(i, output.initial(i, live) + total, live);
     }
 }
 } // namespace ninfer::ops::detail::moe_cuda::block_scaled::fp8::block64

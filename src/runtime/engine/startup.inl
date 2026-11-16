@@ -319,7 +319,8 @@ BuiltModel<typename Setup::Types> build_local_model(const artifact::Reader& read
          .retained_bytes                    = memory.startup_retained_bytes,
          .graphs                            = memory.cuda_graph});
     auto worker = std::make_unique<RankWorker<Types>>(std::move(device_owner), std::move(instance));
-    auto executor = std::make_unique<LocalExecutor<Types>>(std::move(worker), next_session_epoch());
+    auto executor = std::make_unique<LocalExecutor<Types>>(std::move(worker), next_session_epoch(),
+                                                           options.max_concurrency);
     auto inference = std::make_unique<InferenceInstance<Types>>(
         setup.definition(), std::move(frontend), std::move(executor), std::move(*prepared_session),
         std::move(memory));

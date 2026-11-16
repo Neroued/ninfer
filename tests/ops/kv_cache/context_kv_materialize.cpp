@@ -24,7 +24,12 @@
 using namespace ninfer;
 using namespace ninfer::test;
 
+void add_bf16_context_materialize_cases(OpSuite&);
+
 namespace {
+constexpr ops::ContextKVMaterializeProfile kProfile{5120,   128,  8, 2048, QType::Q8_G32_FP16,
+                                                    1.e-6F, 1.e7F};
+
 
 constexpr int kLayers             = static_cast<int>(ops::kContextKVMaterializeLayers);
 constexpr int kHidden             = 5120;
@@ -373,7 +378,7 @@ int run_case(Fixture& fixture, const std::string& label, int width, int batch,
     const auto state_offsets      = fixture.records->record_offsets(state_records);
     DeviceBuffer offsets_device   = to_device(state_offsets);
     const std::size_t workspace_bytes =
-        ops::context_kv_materialize_workspace_capacity_bytes(batch, width, width);
+        ops::context_kv_materialize_workspace_capacity_bytes(kProfile, batch, width, width);
     GuardedDeviceBuffer scratch(std::max<std::size_t>(workspace_bytes, 1));
     MemoryArena workspace(scratch.span());
     Tensor context_tensor(context_device.span(), DType::BF16, {kHidden, width, batch});
@@ -387,7 +392,7 @@ int run_case(Fixture& fixture, const std::string& label, int width, int batch,
                : static_cast<std::uint32_t>(width)};
     const auto launch = [&](CudaExecutionView cuda) {
         ops::context_kv_materialize(context_tensor, positions_tensor, counts_tensor, fixture.views,
-                                    envelope, workspace, cuda);
+                                    kProfile, envelope, workspace, cuda);
     };
     launch(ninfer::test::cuda_environment().default_execution);
     cuda_synchronize();
@@ -462,6 +467,7 @@ int run_case(Fixture& fixture, const std::string& label, int width, int batch,
 
 int main(int argc, char** argv) {
     OpSuite suite;
+    add_bf16_context_materialize_cases(suite);
 
     struct Case {
         std::string id;
@@ -482,6 +488,7 @@ int main(int argc, char** argv) {
         const bool graph =
             !narrow && (batch == 8 || (batch == 1 && (width == 1 || width == 8 || width >= 16)));
         catalogue.push_back({id, {{"format", "q8"}, {"execution", graph ? "graph" : "eager"}}});
+        if (batch > 8) catalogue.back().tags.emplace_back("suite", "concurrency");
     };
     const std::vector<int> widths{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
     for (int width : widths)
@@ -499,6 +506,17 @@ int main(int argc, char** argv) {
             add("W=" + std::to_string(width) + " B=" + std::to_string(batch), width, batch, counts,
                 slots, positions, 0x701U + width);
         }
+    for (int batch : {9, 17, 129}) {
+        const int width = batch == 129 ? 1 : 3;
+        std::vector<int> counts(batch, 0), slots(batch, -1), positions(width * batch, -1);
+        counts.front()    = 1;
+        counts.back()     = width;
+        slots.front()     = 7;
+        slots.back()      = 2;
+        positions.front() = 2047;
+        for (int i = 0; i < width; ++i) positions[(batch - 1) * width + i] = 262142 + i;
+        add("padded B=" + std::to_string(batch), width, batch, counts, slots, positions, 0x706U);
+    }
     const auto add_narrow = [&](int width, int count) {
         std::vector<int> positions(width * 8, -1), counts(8, count), slots(8, -1);
         for (int b = 0; b < 8; ++b) {
@@ -555,15 +573,15 @@ int main(int argc, char** argv) {
                 std::size_t peak = 0;
                 int witness      = 1;
                 for (int width = 1; width <= last; ++width) {
-                    const auto capacity =
-                        ops::context_kv_materialize_workspace_capacity_bytes(batch, width, width);
+                    const auto capacity = ops::context_kv_materialize_workspace_capacity_bytes(
+                        kProfile, batch, width, width);
                     if (capacity > peak) {
                         peak    = capacity;
                         witness = width;
                     }
                 }
                 const auto interval =
-                    ops::context_kv_materialize_workspace_capacity_bytes(batch, 1, last);
+                    ops::context_kv_materialize_workspace_capacity_bytes(kProfile, batch, 1, last);
                 if (peak != interval) {
                     std::cerr << "workspace interval peak mismatch B=" << batch << '\n';
                     ++failures;

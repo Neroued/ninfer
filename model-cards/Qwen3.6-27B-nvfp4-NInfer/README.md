@@ -260,7 +260,8 @@ These are single-sample results under the stated NInfer evaluation profile, not 
 
 ## Limits
 
-- This artifact targets one RTX 5090, with one to eight active requests per Engine.
+- This artifact targets one RTX 5090. Resident request capacity is configured at startup and
+  checked against the available resources.
 - KV and continuation state share the startup Context pool. Usable context depends on the
   selected KV type, enabled components, concurrency and available memory.
 - NInfer returns generated tool calls to the client; it does not execute them.

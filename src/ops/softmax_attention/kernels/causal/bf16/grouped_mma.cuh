@@ -43,7 +43,7 @@ bf16_kv_load_grouped_tile(__nv_bfloat16* key_tile, __half* value_tile, const __n
 
 // Packed-query tiles and KV partitions are independent grid axes. Each KV row
 // has one append owner; all query CTAs read new rows from the immutable inputs.
-template <class G, class S, bool MultiBatch, bool Masked, class Input>
+template <class G, class S, bool MultiBatch, bool Masked, class Input, bool Direct>
 __launch_bounds__(S::kLaunchBoundThreads, S::kMinBlocks) __global__
     void bf16_kv_grouped_mma_kernel(const __nv_bfloat16* q, Input input, const int* positions,
                                     typename Bf16KvCacheView<Input::writes_cache>::Key* cache_k,
@@ -51,7 +51,7 @@ __launch_bounds__(S::kLaunchBoundThreads, S::kMinBlocks) __global__
                                     const std::int64_t* tables, const int* validity,
                                     const int* table_rows, int table_stride, int runtime_width,
                                     float scale, Bf16KvPartition partition,
-                                    CausalPartialView partial) {
+                                    CausalPartialView partial, __nv_bfloat16* out) {
     const int width = S::kFixedWidth ? S::kFixedWidth : runtime_width;
     constexpr int D = G::kHeadDim, M = S::kQueryRows, N = S::kKeyRows;
     constexpr int NK = N / S::kWarpsKV, QKNt = NK / 8, QKKs = D / 16;
@@ -76,12 +76,13 @@ __launch_bounds__(S::kLaunchBoundThreads, S::kMinBlocks) __global__
     const int row_begin = tile * M, packed_rows = width * G::GroupSize;
     const int live = Masked ? validity[batch] : width;
     q += static_cast<std::int64_t>(batch) * width * D * G::QHeads;
+    if constexpr (Direct) out += static_cast<std::int64_t>(batch) * width * D * G::QHeads;
     positions += batch * width;
     if constexpr (Input::writes_cache) {
         input.k += static_cast<std::int64_t>(batch) * width * D * G::KVHeads;
         input.v += static_cast<std::int64_t>(batch) * width * D * G::KVHeads;
     }
-    {
+    if constexpr (!Direct) {
         partial.acc +=
             static_cast<std::int64_t>(batch) * width * G::QHeads * D * partition.capacity;
         partial.maximum +=
@@ -94,12 +95,15 @@ __launch_bounds__(S::kLaunchBoundThreads, S::kMinBlocks) __global__
             if (row < packed_rows) {
                 const int token = row / G::GroupSize;
                 const int h     = head * G::GroupSize + row % G::GroupSize;
-                bf16_kv_store_pair<G, true>(partial, nullptr, h, token, d, width, split, 0.0f, 0.0f,
-                                            -CUDART_INF_F, 0.0f);
+                bf16_kv_store_pair<G, !Direct>(partial, out, h, token, d, width, split, 0.0f, 0.0f,
+                                               -CUDART_INF_F, 0.0f);
             }
         }
     };
-    if (row_begin >= live * G::GroupSize) return;
+    if (row_begin >= live * G::GroupSize) {
+        if constexpr (Direct) neutral();
+        return;
+    }
     const int first = positions[0], window = positions[live - 1] + 1;
     const auto work = partition.live(window);
     if (split >= work.splits) return;
@@ -322,10 +326,20 @@ __launch_bounds__(S::kLaunchBoundThreads, S::kMinBlocks) __global__
     for (int j = 0; j < 2; ++j) {
         if (tokens[j] < width) {
             const int h = head * G::GroupSize + rows[j] % G::GroupSize;
+            if constexpr (Direct) {
+                if (tokens[j] >= live) {
+#pragma unroll
+                    for (int n = 0; n < PVNt; ++n)
+                        bf16_kv_store_pair<G, false>(partial, out, h, tokens[j], n * 8 + 2 * lid,
+                                                     width, split, 0.F, 0.F, -CUDART_INF_F, 0.F);
+                    continue;
+                }
+            }
 #pragma unroll
             for (int n = 0; n < PVNt; ++n)
-                bf16_kv_store_pair<G, true>(partial, nullptr, h, tokens[j], n * 8 + 2 * lid, width,
-                                            split, acc[n][2 * j], acc[n][2 * j + 1], m[j], sums[j]);
+                bf16_kv_store_pair<G, !Direct>(partial, out, h, tokens[j], n * 8 + 2 * lid, width,
+                                               split, acc[n][2 * j], acc[n][2 * j + 1], m[j],
+                                               sums[j]);
         }
     }
 }

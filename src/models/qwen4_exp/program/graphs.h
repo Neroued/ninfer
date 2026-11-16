@@ -1,5 +1,7 @@
 #pragma once
 
+#include <map>
+
 #include "models/qwen4_exp/program/text_graph.h"
 #include "core/context_pool.h"
 
@@ -66,7 +68,7 @@ private:
     void prepare_drafts(Batch&, std::uint32_t batch, GraphInputs&, GraphPreparation&);
     RankProgramImpl& owner_;
     std::vector<std::uint32_t> bounds_;
-    std::vector<Batch> batches_;
+    std::map<std::uint32_t, Batch> batches_;
     std::size_t workspace_peak_ = 0;
 };
 
@@ -89,7 +91,7 @@ private:
     };
 
     RankProgramImpl& owner_;
-    std::vector<Batch> batches_;
+    std::map<std::uint32_t, Batch> batches_;
     std::size_t workspace_peak_ = 0;
 };
 

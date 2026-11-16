@@ -37,12 +37,13 @@ build_distributed_model(const artifact::Reader& reader, EngineOptions& options,
                                  [&] { session.reset(); }});
     setup.resolve(prepared.layouts, options);
     auto codec = setup.codec();
-    protocol::validate_control_capacity(codec.control_budget(), setup.capacity(), group->limits(),
-                                        setup.topology().ranks.size());
+    group->reserve_control_capacity(protocol::control_transport_limits(
+        codec.control_budget(), setup.capacity(), setup.topology().ranks.size(), true));
     activate_execution_group(*group, prepared,
                              std::chrono::milliseconds(options.deployment->connect_timeout_ms));
-    auto executor = std::make_unique<Distributed>(std::move(group), setup.capacity(),
-                                                  std::move(codec), setup.observations());
+    auto executor =
+        std::make_unique<Distributed>(std::move(group), setup.capacity(), std::move(codec),
+                                      options.max_concurrency, setup.observations());
     executor->bind_to_current_thread();
     StartupMemorySummary memory;
     memory.rank_budgets       = setup.memory_budgets();

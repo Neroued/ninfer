@@ -79,8 +79,11 @@ std::shared_ptr<const ModelDefinition> read_definition(const artifact::Reader& r
     }
     if (out->config.draft) {
         out->weights.draft =
-            loading::bind_draft(bindings, *out->config.draft, text, out->weights.text,
-                                std::string(options.speculative_component()));
+            dflash::bind_weights(bindings, *out->config.draft,
+                                 {text.hidden_size, text.vocab_size, text.num_hidden_layers},
+                                 std::string(options.speculative_component()));
+        out->weights.draft->token_embedding = out->weights.text.token_embedding;
+        out->weights.draft->output_head     = out->weights.text.output_head;
     }
     if (options.proposal_enabled()) {
         const auto& proposal = reader.directory().component("text").proposal;

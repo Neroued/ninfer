@@ -174,6 +174,7 @@ public:
 
     [[nodiscard]] std::uint32_t pool_id() const noexcept;
     [[nodiscard]] std::size_t capacity_bytes() const noexcept;
+    [[nodiscard]] std::size_t required_bytes(std::span<const RecordRequest>) const;
     [[nodiscard]] std::size_t alignment() const noexcept;
     [[nodiscard]] std::size_t block_bytes() const noexcept;
     [[nodiscard]] std::size_t record_limit() const noexcept;

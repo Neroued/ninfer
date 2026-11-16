@@ -37,19 +37,22 @@ void write_json(std::ostringstream& out, const value& input, int level, int inde
         }
         ancestors.push_back(input.get());
         const bool object = is_val<value_object>(input);
-        auto entries      = input->val_obj;
+        std::vector<std::pair<value, value>> sorted;
+        const auto* entries = object ? &input->as_ordered_object() : nullptr;
         if (object && sort_keys) {
-            std::stable_sort(entries.begin(), entries.end(), [](const auto& a, const auto& b) {
+            sorted = *entries;
+            std::stable_sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) {
                 return value_compare(a.first, b.first, lt);
             });
+            entries = &sorted;
         }
-        const auto size = object ? entries.size() : input->val_arr.size();
+        const auto size = object ? entries->size() : input->as_array().size();
         out << (object ? '{' : '[');
         for (size_t i = 0; i < size; ++i) {
             if (i) out << item_separator;
             if (indent >= 0) out << '\n' << std::string((level + 1) * indent, ' ');
             if (object) {
-                const auto& key = entries[i].first;
+                const auto& key = (*entries)[i].first;
                 std::string name;
                 if (is_val<value_string>(key))
                     name = key->as_string().str();
@@ -63,7 +66,7 @@ void write_json(std::ostringstream& out, const value& input, int level, int inde
                     throw std::runtime_error("Invalid JSON object key: " + key->type());
                 out << Json(name).dump(-1, ' ', ensure_ascii) << key_separator;
             }
-            write_json(out, object ? entries[i].second : input->val_arr[i], level + 1, indent,
+            write_json(out, object ? (*entries)[i].second : input->as_array()[i], level + 1, indent,
                        item_separator, key_separator, ensure_ascii, sort_keys, ancestors);
         }
         if (size && indent >= 0) out << '\n' << std::string(level * indent, ' ');

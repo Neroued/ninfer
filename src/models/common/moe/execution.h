@@ -21,7 +21,7 @@ workspace_bytes(const ops::MoeProfile& profile, ops::MoeEpilogue epilogue, std::
 // The complete GPU path preserves the fused Op and supports CUDA Graph execution.
 void execute(const Tensor& hidden, const Parameters& parameters,
              const ExpertBankDeviceView& experts, ops::MoeEpilogue epilogue, Tensor& output,
-             MemoryArena& workspace, CudaExecutionView execution,
+             ops::MoeTokenValidity validity, MemoryArena& workspace, CudaExecutionView execution,
              const ops::MoeExecutionHints& hints = {});
 
 } // namespace ninfer::models::moe

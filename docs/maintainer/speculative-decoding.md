@@ -83,7 +83,8 @@ Target 提交后，已采用的 conditioning 可以暂存为待追加特征。�
 checkpoint 前补齐 draft context；临时特征本身不是完整 checkpoint。恢复需要 target State、
 draft context 与各自 frontier 同时一致。
 
-组合代码见 [Qwen3.5 draft](../../src/models/qwen3_5/execution/draft.cpp)，
+组合代码见 [Qwen3.5 draft](../../src/models/qwen3_5/execution/draft.cpp)与
+[GLM5Next DFlash2](../../src/models/glm5next/execution/dflash.cpp)，
 数学接口在相应 attention、动态卷积和候选选择 Ops 中。
 
 ## Graph 与生命周期

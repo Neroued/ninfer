@@ -65,7 +65,8 @@ jinja::value convert(const nlohmann::ordered_json& input, const std::string& poi
         throw std::invalid_argument("Unsupported template JSON value");
     if (origin) {
         result->origin = origin;
-        if (is_val<value_string>(result)) result->val_str.tag(origin, found != tags.end());
+        if (is_val<value_string>(result))
+            cast_val<value_string>(result)->val_str.tag(origin, found != tags.end());
     }
     return result;
 }

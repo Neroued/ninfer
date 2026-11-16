@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/tensor.h"
+#include "core/platform.h"
 #include <cstdint>
 
 namespace ninfer::ops::detail {
@@ -44,6 +45,7 @@ inline CausalConvSnapshotPlan select_causal_conv_snapshot_plan(int tokens, int b
         if (tokens <= 32) return {CausalConvSnapshotRoute::TokenParallel, false};
         return {CausalConvSnapshotRoute::Sequence, false};
     }
+    if (NINFER_TARGET_SPARK && batch > 8) return {CausalConvSnapshotRoute::BatchedSequence, masked};
     return {tokens > 1 && tokens <= 32 ? CausalConvSnapshotRoute::BatchedParallel
                                        : CausalConvSnapshotRoute::BatchedSequence,
             masked};

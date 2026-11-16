@@ -72,7 +72,8 @@ void run(const Options& options, Fixture& gu, Fixture& down) {
         "tensor_profile,tensor_peak_tflops,selected_compute_reference_us,scratch_logical_bytes,"
         "interval_capacity_bytes,bf16_compute_reference_us,mxfp8_compute_reference_us,"
         "best_allowed_roofline_us,gap_to_best_allowed_us,workspace_traffic_bytes,effective_bytes,"
-        "effective_gb_s,effective_bandwidth_reference_us");
+        "effective_gb_s,effective_bandwidth_reference_us,decode_tile_padding_flops,"
+        "decode_repeated_weight_load_bytes");
     for (int t : options.tokens) {
         Tensor x(input.span(), DType::BF16, {weight.k, t}),
             y(output.span(), DType::BF16, {weight.k, t});
@@ -90,6 +91,7 @@ void run(const Options& options, Fixture& gu, Fixture& down) {
         const double gu_flops = 2.0 * weight.n * weight.k * t, down_flops = flops - gu_flops;
         const double absent = std::numeric_limits<double>::quiet_NaN();
         double peak = absent, compute = absent, selected_compute = absent;
+        double tile_padding_flops = absent, repeated_weight_load_bytes = absent;
         const bool native_fp8 = options.format == "mxfp8" || options.format == "fp8-block-fp32";
         const double bf16_reference = flops / (kRoofline.bf16_f32_tflops * 1e6);
         const double mxfp8_reference =
@@ -119,6 +121,20 @@ void run(const Options& options, Fixture& gu, Fixture& down) {
                 peak             = kRoofline.bf16_f32_tflops;
                 compute          = flops / (peak * 1e6);
                 selected_compute = compute * plan.storage_tokens(t) / t;
+                if (plan.kernel == fp8::ScaledFp8Kernel::BlockScaledF16Decode) {
+                    const int gu_tile    = fp8::scaled_f16_decode_gate_up_tokens(t);
+                    const int down_tile  = fp8::kScaledF16DecodeDownTokens;
+                    const int gu_tiles   = (t + gu_tile - 1) / gu_tile;
+                    const int down_tiles = (t + down_tile - 1) / down_tile;
+                    const double issued =
+                        (gu_flops * (gu_tiles * gu_tile) + down_flops * (down_tiles * down_tile)) /
+                        t;
+                    tile_padding_flops = issued - flops;
+                    selected_compute   = issued / (peak * 1e6);
+                    // Algorithmic loads across token tiles; cache reuse can serve these.
+                    repeated_weight_load_bytes = double(gu_tiles - 1) * gu.model_weight_bytes() +
+                                                 double(down_tiles - 1) * down.model_weight_bytes();
+                }
             }
         } else if ((options.format == "q8" && t >= 2) || (options.format == "bf16" && t >= 17)) {
             tensor_profile = options.format == "q8" && t >= 49 ? "BF16_F32ACC_COMPENSATED_GU_DOWN"
@@ -182,7 +198,9 @@ void run(const Options& options, Fixture& gu, Fixture& down) {
                         format_metric(cache == "cold"
                                           ? effective_bytes / (kRoofline.sustained_read_gbs * 1000)
                                           : absent,
-                                      3, ""));
+                                      3, "") +
+                        ',' + format_metric(tile_padding_flops, 0, "") + ',' +
+                        format_metric(repeated_weight_load_bytes, 0, ""));
             }
     }
 }

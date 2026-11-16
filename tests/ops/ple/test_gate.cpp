@@ -191,7 +191,7 @@ int chain(DeviceContext& device) {
         upload_i32(accepted, {a});
         cuda_synchronize();
         ops::ple_state_extract(before, {f.records.tensor, f.batch_view().valid_columns}, count,
-                               destination, device.execution_view());
+                               destination, {}, device.execution_view());
         device.synchronize();
         auto expected = after.host;
         for (int j = 0; j < 9; ++j)
@@ -218,15 +218,20 @@ void add_ple_gate_cases(ninfer::test::OpSuite& suite) {
                   [=] { return run(cuda_environment().context); });
     const auto add = [&](int t, int b, GateLayout layout = GateLayout::Packed,
                          GateSignal signal = GateSignal::Random, bool graph = false) {
-        suite.add("ple_gate/t" + std::to_string(t) + "/b" + std::to_string(b) + "/layout" +
-                      std::to_string(int(layout)) + "/signal" + std::to_string(int(signal)) +
-                      (graph ? "/graph" : "/eager"),
-                  [=] { return run(cuda_environment().context, t, b, layout, signal, graph); },
-                  {{"execution", graph ? "graph" : "eager"}});
+        std::vector<std::pair<std::string, std::string>> tags{
+            {"execution", graph ? "graph" : "eager"}};
+        if (b > 8) tags.emplace_back("suite", "concurrency");
+        suite.add(
+            "ple_gate/t" + std::to_string(t) + "/b" + std::to_string(b) + "/layout" +
+                std::to_string(int(layout)) + "/signal" + std::to_string(int(signal)) +
+                (graph ? "/graph" : "/eager"),
+            [=] { return run(cuda_environment().context, t, b, layout, signal, graph); },
+            std::move(tags));
     };
     for (int b = 1; b <= 8; ++b)
         add(b % 2 ? 1 : 5, b, GateLayout::Packed, GateSignal::Random, b == 8);
     add(1, 1, GateLayout::Packed, GateSignal::Random, true);
+    add(3, 17, GateLayout::Packed, GateSignal::Random, true);
     for (auto layout : {GateLayout::Separate, GateLayout::OddStride, GateLayout::Interleaved,
                         GateLayout::PairAligned, GateLayout::PaddedColumns})
         add(9, 3, layout, GateSignal::Random, true);

@@ -12,9 +12,8 @@ bool reached_dead_end(const RowResult& row) {
     return (row.dead_positions & reached) != 0;
 }
 
-void append_identity(Sequence& s, std::span<const TokenId> tokens,
-                     std::optional<std::uint32_t> split) noexcept {
-    s.identity.append_generated(tokens, split);
+void append_identity(Sequence& s, std::span<const TokenId> tokens) noexcept {
+    s.identity.append_generated(tokens);
 }
 } // namespace
 
@@ -27,7 +26,7 @@ void SessionImpl::finish_result(ComputeResult result) {
     for (std::size_t b = 0; b < tx.members.size(); ++b) {
         const auto& row = tx.result->rows[b];
         generated |= !row.tokens.empty();
-        if (tx.kind == Kind::Mtp
+        if (tx.kind == Kind::Speculative
                 ? (row.drafts != tx.draft_extents[b] || row.processed != tx.draft_extents[b] + 1 ||
                    row.accepted_drafts > row.drafts || row.tokens.size() != row.accepted_drafts + 1)
                 : (row.processed != tx.rows[b].ids.size()))
@@ -44,6 +43,7 @@ void SessionImpl::finish_result(ComputeResult result) {
             batch.stride_ = std::max<std::uint32_t>(batch.stride_, row.tokens.size());
         batch.tokens_.resize(batch.stride_ * tx.members.size());
         batch.counts_.resize(tx.members.size());
+        batch.failed_.resize(tx.members.size());
         for (std::size_t b = 0; b < tx.members.size(); ++b) {
             const auto& row = tx.result->rows[b];
             if (row.tokens.empty()) throw std::logic_error("sampled batch has an empty row");
@@ -71,7 +71,7 @@ void SessionImpl::finish_result(ComputeResult result) {
 
     tx.completion = std::make_unique<context::ContextTransaction>(directory);
     Commit commit;
-    std::array<ContinuationMetadata, kMaximumConcurrency> completed{};
+    std::vector<ContinuationMetadata> completed(tx.members.size());
     commit.rows.reserve(tx.members.size());
     const bool retain_recovery = tx.kind == Kind::Replay;
     for (std::size_t b = 0; b < tx.members.size(); ++b) {
@@ -80,7 +80,7 @@ void SessionImpl::finish_result(ComputeResult result) {
         commit.rows.push_back({member(s), tx.rows[b].states, row.processed});
         if (tx.kind == Kind::Control) {
             const auto count = tx.rows[b].ids.size();
-            s.identity.prepare_generated(count, tx.splits[b]);
+            s.identity.prepare_generated(count);
         }
         completed[b] =
             prepare_commit(s, tx.rows[b], tx.rows[b].ids.size(), retain_recovery, *tx.completion);
@@ -122,13 +122,8 @@ void SessionImpl::finish_result(ComputeResult result) {
         if (tx.kind == Kind::Control) {
             const auto& row   = tx.rows[b];
             const auto prefix = std::span<const TokenId>(row.ids).subspan(1);
-            append_identity(s, prefix,
-                            tx.splits[b] && *tx.splits[b] <= prefix.size() ? tx.splits[b]
-                                                                           : std::nullopt);
-            const auto split = tx.splits[b] && *tx.splits[b] == row.ids.size()
-                                   ? std::optional<std::uint32_t>{1}
-                                   : std::nullopt;
-            append_identity(s, {&*row.control_last_token, 1}, split);
+            append_identity(s, prefix);
+            append_identity(s, {&*row.control_last_token, 1});
         }
         if (tx.kind == Kind::Replay && s.continuation.metadata.main_frontier == s.replay_target)
             s.phase = s.resume_phase;
@@ -137,6 +132,7 @@ void SessionImpl::finish_result(ComputeResult result) {
 
 void SessionImpl::retire_compute(const runtime::DeviceRetired& event) {
     auto& tx = *compute;
+    for (auto h : tx.members) sequence(h).computing = false;
     if (tx.vision_id) {
         const auto* window = vision_window.current();
         bool complete      = tx.discarded;
@@ -191,15 +187,12 @@ CommitResult Session::commit(PendingBatch&& batch,
                  ? (!decision.terminal || decision.accepted_tokens != 0)
                  : (!decision.accepted_tokens || decision.accepted_tokens > produced ||
                     (!decision.terminal && decision.accepted_tokens != produced) ||
-                    batch.failed_[b])) ||
-            (decision.prefix_execution_split_after &&
-             (!*decision.prefix_execution_split_after ||
-              *decision.prefix_execution_split_after > decision.accepted_tokens)))
+                    batch.failed_[b])))
             throw std::logic_error("invalid generated-prefix decision");
     }
     CommitResult result;
-    result.row_count = decisions.size();
-    std::array<ContinuationMetadata, kMaximumConcurrency> completed{};
+    result.rows.resize(decisions.size());
+    std::vector<ContinuationMetadata> completed(decisions.size());
     try {
         tx.decisions.assign(decisions.begin(), decisions.end());
         tx.completion = std::make_unique<context::ContextTransaction>(p.directory);
@@ -216,10 +209,11 @@ CommitResult Session::commit(PendingBatch&& batch,
                                      decision.terminal, decision.cancelled, decision.failed});
             if (!decision.accepted_tokens) continue;
             const auto count = decision.accepted_tokens;
-            s.identity.prepare_generated(count, decision.prefix_execution_split_after);
-            const auto inputs =
-                tx.kind == detail::ComputeTransaction::Kind::Mtp ? count : tx.rows[b].ids.size();
-            completed[b] = p.prepare_commit(s, tx.rows[b], inputs, false, *tx.completion);
+            s.identity.prepare_generated(count);
+            const auto inputs = tx.kind == detail::ComputeTransaction::Kind::Speculative
+                                    ? count
+                                    : tx.rows[b].ids.size();
+            completed[b]      = p.prepare_commit(s, tx.rows[b], inputs, false, *tx.completion);
         }
         tx.completion->prepare_actions();
         physical.actions = p.actions(*tx.completion);
@@ -261,11 +255,11 @@ CommitResult Session::commit(PendingBatch&& batch,
                     s.capture && s.captures[s.next_capture].frontier == completed[b].main_frontier;
             const auto tokens =
                 std::span<const TokenId>(tx.result->rows[b].tokens).first(decision.accepted_tokens);
-            detail::append_identity(s, tokens, decision.prefix_execution_split_after);
+            detail::append_identity(s, tokens);
             s.phase         = decision.terminal ? detail::Phase::Finished : detail::Phase::Active;
             row.disposition = decision.terminal ? runtime::CommitDisposition::Finishable
                                                 : runtime::CommitDisposition::Active;
-            result.capture_ready[b] = s.capture_pending;
+            result.rows[b].capture_ready = s.capture_pending;
         }
     }
     batch.ticket_ = {};

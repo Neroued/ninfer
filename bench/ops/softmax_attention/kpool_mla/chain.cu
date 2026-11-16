@@ -4,6 +4,8 @@
 
 #include <set>
 
+#include <climits>
+
 using namespace ninfer;
 using namespace ninfer::bench;
 namespace kp = ninfer::tool::kpool;
@@ -122,7 +124,7 @@ int main(int argc, char** argv) {
             if (flag == "--help") {
                 std::cout << "Latent composition: Prepare -> Linear W_B -> Indexer -> Sparse MLA.\n"
                              "Synthetic represented weights; no Engine/model throughput claim.\n"
-                             "  --tokens N,... --batch 1..8 --end E --layers 1|11 --ragged 0|1\n"
+                             "  --tokens N,... --batch B --end E --layers 1|11 --ragged 0|1\n"
                              "  --index-cache bf16|fp8 --latent-cache bf16|fp8\n"
                              "  --stages 0|1  event-instrumented ordered Graph diagnostics\n";
                 measurement::help();
@@ -133,7 +135,7 @@ int main(int argc, char** argv) {
             if (flag == "--tokens")
                 tokens = measurement::integers(value);
             else if (flag == "--batch")
-                B = measurement::integer(value, 1, 8);
+                B = measurement::integer(value, 1, INT_MAX);
             else if (flag == "--end")
                 E = measurement::integer(value, 1, 1048576);
             else if (flag == "--layers") {

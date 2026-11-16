@@ -16,14 +16,17 @@ template <class A16Schedule, class A8Schedule, bool Tma, bool CacheColumns = fal
           bool Packed = false, bool FastSilu = false>
 void launch_mxfp8_tiled(const Tensor& x, const Weight& w, LinearPolicy policy, const Arguments& a,
                         void* scratch, cudaStream_t stream) {
-    const auto plan = mxfp8_workspace(a.width, a.batch, a.destination != nullptr, policy, true);
+    const bool whole_windows = whole_window_tiles(a.width);
+    const auto plan =
+        mxfp8_workspace(a.width, a.batch, a.destination != nullptr, policy, !whole_windows);
     const MemorySpan storage{scratch, plan.bytes, x.device};
-    const auto convolution = plan.convolution.bind(storage);
-    auto* edges            = static_cast<float*>(convolution.data);
-    const auto layout      = tiled_workspace(a.width, a.batch, a.destination != nullptr);
-    TiledConvolution output{
-        a, edges,
-        a.destination ? reinterpret_cast<__nv_bfloat16*>(edges + layout.edge_words) : nullptr};
+    auto* edges =
+        whole_windows ? nullptr : static_cast<float*>(plan.convolution.bind(storage).data);
+    const auto layout = tiled_workspace(a.width, a.batch, a.destination != nullptr);
+    TiledConvolution output{a, edges,
+                            a.destination && !whole_windows
+                                ? reinterpret_cast<__nv_bfloat16*>(edges + layout.edge_words)
+                                : nullptr};
     Mxfp8A8Workspace quantized{};
     if (policy == LinearPolicy::AllowA8) {
         quantized = {static_cast<std::uint8_t*>(plan.codes.bind(storage).data),
@@ -39,10 +42,10 @@ void launch_mxfp8_tiled(const Tensor& x, const Weight& w, LinearPolicy policy, c
     // Keep the projection's token grid and quantizer group count representable without
     // changing request-relative convolution coordinates or the final publication boundary.
     constexpr int max_columns = 65535 * kTiledTokens;
-    const auto launch         = [&]<class Column>() {
-        using Epilogue =
-            std::conditional_t<Packed, PackedConvolutionEpilogue<Column, false, FastSilu>,
-                                       ConvolutionEpilogue<__nv_bfloat16, Column, false, CacheColumns>>;
+    const auto launch         = [&]<class Column, bool WholeWindows>() {
+        using Epilogue = std::conditional_t<
+                    Packed, PackedConvolutionEpilogue<Column, false, FastSilu, WholeWindows>,
+                    ConvolutionEpilogue<__nv_bfloat16, Column, false, CacheColumns, WholeWindows>>;
         for (std::int64_t begin = 0; begin < total_columns;) {
             const int columns =
                 static_cast<int>(std::min<std::int64_t>(max_columns, total_columns - begin));
@@ -66,13 +69,21 @@ void launch_mxfp8_tiled(const Tensor& x, const Weight& w, LinearPolicy policy, c
             }
             begin += columns;
         }
-        convolution_boundaries<kTiledTokens, __nv_bfloat16, Column>
-            <<<kProjectionFeatures / 128, 128, 0, stream>>>(output);
-        CUDA_CHECK(cudaGetLastError());
+        if constexpr (!WholeWindows) {
+            convolution_boundaries<kTiledTokens, __nv_bfloat16, Column>
+                <<<kProjectionFeatures / 128, 128, 0, stream>>>(output);
+            CUDA_CHECK(cudaGetLastError());
+        }
+    };
+    const auto columns = [&]<class Column>() {
+        if (whole_windows)
+            launch.template operator()<Column, true>();
+        else
+            launch.template operator()<Column, false>();
     };
     if (total_columns <= std::numeric_limits<int>::max())
-        launch.template operator()<int>();
+        columns.template operator()<int>();
     else
-        launch.template operator()<std::int64_t>();
+        columns.template operator()<std::int64_t>();
 }
 } // namespace ninfer::ops::detail::kda_input

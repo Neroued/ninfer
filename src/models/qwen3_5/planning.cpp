@@ -82,6 +82,11 @@ std::uint32_t SequencePlan::max_concurrency() const noexcept {
     return impl_ != nullptr ? impl_->max_concurrency : 0;
 }
 
+const BatchExecutionPlan& SequencePlan::batch_execution() const {
+    if (!impl_ || !impl_->batch_execution) throw std::logic_error("sequence batch plan is empty");
+    return *impl_->batch_execution;
+}
+
 std::size_t SequencePlan::device_reservation_bytes() const noexcept {
     return impl_ != nullptr ? impl_->device_reservation_bytes : 0;
 }
@@ -128,16 +133,21 @@ SequencePlanner make_sequence_planner(std::shared_ptr<const execution::ModelProf
     auto& metadata               = impl->capacity_plan.metadata;
     const auto checkpoints =
         std::size_t(spec.state.logical_capacity) + 2ULL * options.max_concurrency;
+    const auto recovery_concurrency = impl->minimum->causal_scoring ? 0U : options.max_concurrency;
     metadata.fixed_bytes +=
         TokenCountBuilder::capacity_bytes(
             impl->minimum->causal_scoring ? 0 : impl->minimum->profile->public_tokens) +
         detail::Checkpoints::metadata_bytes(checkpoints) +
-        context::RecoveryIndex<>::metadata_bytes(checkpoints);
+        context::RecoveryIndex<>::metadata_bytes(checkpoints) +
+        context::recovery_value_metadata_bytes(checkpoints, recovery_concurrency) +
+        detail::PreparedCaptureBacking::cache_bytes(options.max_context, recovery_concurrency);
     const auto geometry    = describe_context_pool(impl->capacity_plan.records);
     const auto state_class = geometry.spec_classes.front().index;
     metadata.bytes_per_record[state_class] +=
         detail::Checkpoints::metadata_bytes(1) - detail::Checkpoints::metadata_bytes(0) +
-        context::RecoveryIndex<>::metadata_bytes(1) - context::RecoveryIndex<>::metadata_bytes(0);
+        context::RecoveryIndex<>::metadata_bytes(1) - context::RecoveryIndex<>::metadata_bytes(0) +
+        context::recovery_value_metadata_bytes(1, recovery_concurrency) -
+        context::recovery_value_metadata_bytes(0, recovery_concurrency);
     for (const auto& pool : spec.pools)
         metadata.bytes_per_record[state_class] +=
             context::HistoryDirectory::metadata_bytes(1, 0, pool.page_capacity) -
@@ -149,6 +159,7 @@ SessionPlan plan_session(const SequencePlan& sequence) {
     if (!sequence.impl_) throw std::invalid_argument("sequence plan is empty");
     const auto& source = *sequence.impl_;
     SessionPlan out;
+    out.batch_execution     = source.batch_execution;
     out.profile             = source.profile;
     out.capacity            = source.capacity;
     out.max_concurrency     = source.max_concurrency;

@@ -22,6 +22,10 @@ inline constexpr ReductionCriterion kCoefficients{2.e-5, 2.e-6, 3.e-5, 2.e-7};
 // Fused outputs include error propagated through the residual BF16 boundary. A second
 // independent pre reference uses the published residual with the strict FP32 budget.
 inline constexpr ReductionCriterion kFusedCoefficients{1.e-3, 2.e-6, 2.e-3, 2.e-7};
+// The complete post/pre formula can cross a post rounding midpoint before the final
+// block BF16 store. Allow the propagated gross error of both represented boundaries;
+// keep the normwise budget and the published-residual pre check strict.
+inline constexpr ReductionCriterion kFusedBlock{4.e-3, 2.e-6, 1.2e-2};
 inline constexpr ReductionCriterion kFinalHidden{4.e-3, 2.e-6, 1.2e-2};
 
 struct Fixture {
@@ -40,7 +44,7 @@ struct Fixture {
     ops::MhcPreParameters parameters{1.e-5F, 1.e-5F, 1.e-6F, 1.e-6F, 2.F, 20};
     std::vector<float> x, y, f, base, scale, gamma, q, c;
     GuardedDeviceBuffer dx, dy, df, db, ds, dg, dq, dc, dr, du, dnq, dnc;
-    Tensor tx, ty, tr;
+    Tensor tx, ty, tr, mean_tap;
     ops::MhcPreWeights weights;
     ops::MhcCoefficients coefficients;
     ops::MhcPreOutputs outputs;

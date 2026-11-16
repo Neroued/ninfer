@@ -18,7 +18,7 @@ constexpr int H = 4096, I = 1024, E = 288, K = 8;
 
 struct Case {
     int m, hits = 4;
-    bool graph = false, none = false, all = false, zero_then_restore = false;
+    bool graph = false, none = false, all = false, zero_then_restore = false, padded = false;
 };
 
 void put(quantized_weight::PackedWeight& w, int row, int col, float value) {
@@ -171,8 +171,14 @@ int run(Fixture& f, const Case& c) {
         w.correction_bias = {};
         w.routed          = {};
     }
-    auto execution    = cuda_environment().context.execution_view();
-    const auto invoke = [&] { ops::topk_sigmoid_swiglu_moe(x, p, w, subset, y, ws, execution); };
+    auto execution = cuda_environment().context.execution_view();
+    std::vector<int> columns(c.padded ? c.m / 2 : 0);
+    DeviceBuffer valid(execution.device(), columns.size() * sizeof(int));
+    const ops::MoeTokenValidity validity{
+        c.padded ? Tensor(valid.span(), DType::I32, {int(columns.size())}) : Tensor{}, 2};
+    const auto invoke = [&] {
+        ops::topk_sigmoid_swiglu_moe(x, p, w, subset, y, validity, ws, execution);
+    };
     DecodeGraphDefinition def;
     DecodeGraphExecutable graph;
     cuda_synchronize();
@@ -182,6 +188,8 @@ int run(Fixture& f, const Case& c) {
     }
     int failures = 0;
     for (int phase = 0; phase < (c.graph ? 3 : 1); ++phase) {
+        for (std::size_t row = 0; row < columns.size(); ++row) columns[row] = (row + phase) % 3;
+        if (c.padded) valid.copy_from_host(columns.data(), valid.size());
         f.bank.publish(phase == 1 ? 1 : 0, phase == 2);
         const int sign = phase == 1;
         std::vector<std::uint16_t> values(std::size_t(H) * c.m);
@@ -224,9 +232,15 @@ int run(Fixture& f, const Case& c) {
             }
         }
         std::vector<double> reference(actual.size());
-        for (int t = 0; t < c.m; ++t)
-            std::copy(refs[t % 3].begin(), refs[t % 3].end(),
-                      reference.begin() + std::size_t(t) * H);
+        for (int t = 0; t < c.m; ++t) {
+            if (c.padded && t % 2 >= columns[t / 2]) {
+                for (int h = 0; h < H; ++h)
+                    if (actual[std::size_t(t) * H + h] != 0) ++failures;
+            } else {
+                std::copy(refs[t % 3].begin(), refs[t % 3].end(),
+                          reference.begin() + std::size_t(t) * H);
+            }
+        }
         const auto label = "whole/" + std::string(f.fp8 ? "fp8" : "nvfp4") + "/M" +
                            std::to_string(c.m) + "/hits" + std::to_string(c.hits) + "/recipe" +
                            std::to_string(f.recipe) + "/phase" + std::to_string(phase);
@@ -362,17 +376,17 @@ int metadata(bool fp8, bool q8 = false) {
             bad.routed.activation_calibration.down =
                 ops::ActivationCalibrationView::broadcast(ops::ActivationScaleOperation::Divide, 0);
         reject([&] {
-            ops::topk_sigmoid_swiglu_moe(x, p, bad, f.bank.subset(), y, ws,
+            ops::topk_sigmoid_swiglu_moe(x, p, bad, f.bank.subset(), y, {}, ws,
                                          cuda_environment().default_execution);
         });
     }
     reject([&] {
-        ops::topk_sigmoid_swiglu_moe(x, p, w, f.bank.subset(), x, ws,
+        ops::topk_sigmoid_swiglu_moe(x, p, w, f.bank.subset(), x, {}, ws,
                                      cuda_environment().default_execution);
     });
     MemoryArena short_ws(scratch.span().subspan(0, cap - 256));
     try {
-        ops::topk_sigmoid_swiglu_moe(x, p, w, f.bank.subset(), y, short_ws,
+        ops::topk_sigmoid_swiglu_moe(x, p, w, f.bank.subset(), y, {}, short_ws,
                                      cuda_environment().default_execution);
 
         ++failures;
@@ -398,6 +412,8 @@ int main(int argc, char** argv) {
                 std::vector<Case> cases;
                 const bool primary = placement == clamped_ep::Placement::Permuted && side == 0;
                 if (primary) {
+                    cases.push_back({.m = 18, .graph = true, .padded = true});
+                    cases.push_back({.m = 18, .graph = true, .none = true, .padded = true});
                     for (int t : {1, 2, 3, 6, 8, 16, 17, 32, 33, 64, 65, 96, 127, 128})
                         cases.push_back({t});
                     for (int t : {129, 191,  192,  193,  255,  256,  257,  384,  511,  512,
@@ -419,13 +435,15 @@ int main(int argc, char** argv) {
                         cases.push_back({t, 4, true});
                     }
                 std::vector<OpCase> catalogue;
-                for (const auto& c : cases)
+                for (const auto& c : cases) {
                     catalogue.push_back(
                         {"whole/" + format + "/place" + std::to_string(int(placement)) + "/side" +
                              std::to_string(side) + "/T" + std::to_string(c.m) + "/h" +
                              std::to_string(c.hits) + (c.none ? "/none/" : "/mask/") +
-                             (c.graph ? "graph" : "eager"),
+                             (c.graph ? "graph" : "eager") + (c.padded ? "/validity" : ""),
                          {{"format", format}, {"execution", c.graph ? "graph" : "eager"}}});
+                    if (c.padded) catalogue.back().tags.emplace_back("suite", "concurrency");
+                }
                 suite.add(std::move(catalogue), [=](auto selected) {
                     std::cerr << "Qualify whole " << format << " placement=" << int(placement)
                               << " side=" << side << " selected=" << selected.size() << "\n";
@@ -470,6 +488,7 @@ int main(int argc, char** argv) {
         for (int side : {0, 1}) {
             std::vector<Case> cases;
             if (side == 0) {
+                cases.push_back({.m = 18, .graph = true, .padded = true});
                 for (int m : {1, 2, 4, 8, 9, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096})
                     cases.push_back({m});
                 for (int m : {1, 8, 9, 128, 512, 4096}) cases.push_back({m, 4, true});
@@ -499,17 +518,20 @@ int main(int argc, char** argv) {
                 if (!fp8) cases.push_back({16, 8, true});
             }
             std::vector<OpCase> catalogue;
-            for (const auto& c : cases)
+            for (const auto& c : cases) {
                 catalogue.push_back({prefix + "/side" + std::to_string(side) + "/T" +
                                          std::to_string(c.m) + "/h" + std::to_string(c.hits) +
                                          (c.zero_then_restore ? "/zero-restore/"
                                           : c.none            ? "/none/"
                                           : c.all             ? "/all/"
                                                               : "/mask/") +
-                                         (c.graph ? "graph" : "eager"),
+                                         (c.graph ? "graph" : "eager") +
+                                         (c.padded ? "/validity" : ""),
                                      {{"suite", "q8-shared"},
                                       {"format", format},
                                       {"execution", c.graph ? "graph" : "eager"}}});
+                if (c.padded) catalogue.back().tags.emplace_back("suite", "concurrency");
+            }
             suite.add(std::move(catalogue), [=](auto selected) {
                 Fixture f(side ? ep::Placement::Interleaved : ep::Placement::Permuted, side, fp8,
                           -1, true);

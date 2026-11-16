@@ -80,6 +80,12 @@ struct Fixture {
     void reset(int phase) {
         for (int row = 0; row < b; ++row) {
             valid[row] = phase && row == b - 1 && b > 1 ? 0 : t - row % t;
+            if (!valid[row]) {
+                configs[row].temperature  = std::numeric_limits<float>::quiet_NaN();
+                configs[row].token_counts = reinterpret_cast<const int*>(std::uintptr_t(0x1000));
+                configs[row].mask.words =
+                    reinterpret_cast<const std::uint32_t*>(std::uintptr_t(0x2000));
+            }
             for (int col = 0; col < t; ++col)
                 for (int id = 0; id < domain; ++id) {
                     const auto at  = (row * t + col) * mask_stride + id / 32;
@@ -229,7 +235,7 @@ int sample_decisions(bool stochastic) {
     DecodeGraphDefinition definition;
     definition.capture(device.stream(), [&] {
         ops::sample_vocabulary_candidates(in, static_cast<const ops::SamplingConfig*>(d_cfg.data()),
-                                          pos, ops::kSamplePurposeDecode, out,
+                                          pos, ops::kSamplePurposeDecode, out, {},
                                           device.execution_view());
     });
     DecodeGraphExecutable graph;
@@ -294,12 +300,12 @@ int acceptance(bool stochastic, int d = 5) {
         ot(doo.span(), DType::I32, {d + 1, batch}), nt(dn.span(), DType::I32, {batch});
     auto& device = cuda_environment().context;
     ops::accept_vocabulary_candidates(kt, static_cast<const ops::SamplingConfig*>(dc.data()), dt,
-                                      et, lt, ot, nt, device.execution_view());
+                                      et, lt, ot, nt, {}, device.execution_view());
     device.synchronize();
     int alias_failure = 1;
     try {
         ops::accept_vocabulary_candidates(kt, static_cast<const ops::SamplingConfig*>(dc.data()),
-                                          dt, et, lt, ot, lt, device.execution_view());
+                                          dt, et, lt, ot, lt, {}, device.execution_view());
         device.synchronize();
     } catch (const std::invalid_argument&) { alias_failure = 0; }
     return alias_failure +
@@ -326,7 +332,7 @@ int merged_support() {
     DecodeGraphDefinition definition;
     definition.capture(device.stream(), [&] {
         ops::sample_vocabulary_candidates(kt, static_cast<const ops::SamplingConfig*>(dc.data()),
-                                          pt, ops::kSamplePurposeDecode, ot,
+                                          pt, ops::kSamplePurposeDecode, ot, {},
                                           device.execution_view());
     });
     DecodeGraphExecutable graph;
@@ -374,7 +380,7 @@ int acceptance_probability() {
     DecodeGraphDefinition definition;
     definition.capture(device.stream(), [&] {
         ops::accept_vocabulary_candidates(kt, static_cast<const ops::SamplingConfig*>(dc.data()),
-                                          dt, et, lt, ot, nt, device.execution_view());
+                                          dt, et, lt, ot, nt, {}, device.execution_view());
     });
     DecodeGraphExecutable graph;
     graph.instantiate(definition);
@@ -443,6 +449,156 @@ int commit_prefixes() {
     return errors + dc.verify_guards("token counts");
 }
 
+int concentrated_candidates() {
+    Fixture f(32768, 2, 17, 1, 20, false, false);
+    std::fill(f.counts.begin(), f.counts.end(), 0);
+    for (int row = 0; row < f.b; ++row) {
+        auto& cfg       = f.configs[row];
+        cfg.temperature = 1;
+        cfg.top_k       = 20;
+        if (row % 2) {
+            cfg.presence_penalty  = .25F;
+            cfg.frequency_penalty = .125F;
+        }
+        if (row % 4 >= 2) {
+            cfg.mask = {static_cast<const std::uint32_t*>(f.d_masks.data()) +
+                            row * f.t * f.mask_stride,
+                        f.mask_stride};
+            for (int col = 0; col < f.t; ++col)
+                for (int word = 0; word < f.mask_stride; ++word)
+                    f.masks[(row * f.t + col) * f.mask_stride + word] =
+                        row % 4 == 3 ? 0 : 0xeeeeeeeeU;
+        }
+        for (int col = 0; col < f.t; ++col)
+            for (int id = 0; id < f.v; ++id) {
+                const int stride = row % 2 ? 128 : 256;
+                float value      = row % 5 == 0 ? 0.F : (id % stride < 19 ? 9.F : -4.F);
+                if (row % 5 != 0 && id % stride < 19 && id / stride < 2) value = 10.F;
+                if (id >= f.domain) value = 10000.F;
+                f.logits[(std::size_t(row) * f.t + col) * f.v + id] =
+                    value == 0.F && id % 2 ? 0x8000U : f32_to_bf16(value);
+            }
+    }
+    f.d_logits.copy_from_host(f.logits.data(), f.logits.size() * 2);
+    f.d_counts.copy_from_host(f.counts.data(), f.counts.size() * 4);
+    f.d_masks.copy_from_host(f.masks.data(), f.masks.size() * 4);
+    f.d_configs.copy_from_host(f.configs.data(), f.configs.size() * sizeof(ops::SamplingConfig));
+    auto& device = cuda_environment().context;
+    DecodeGraphDefinition definition;
+    definition.capture(device.stream(), [&] { f.launch(device.execution_view()); });
+    DecodeGraphExecutable graph;
+    graph.instantiate(definition);
+    graph.launch(device.stream());
+    device.synchronize();
+    int errors =
+        verify_exact("concentrated vocabulary candidates",
+                     from_device<std::uint64_t>(f.d_keys.data(), f.k * f.t * f.b), f.oracle());
+    std::size_t previous_capacity = 0;
+    for (int columns = 1; columns <= 128; ++columns) {
+        const auto capacity =
+            ops::vocabulary_candidates_workspace_capacity_bytes(f.v, columns, f.k);
+        errors += capacity < previous_capacity;
+        previous_capacity = capacity;
+    }
+    errors += f.d_keys.verify_guards("concentrated keys");
+    errors += f.d_work.verify_guards("concentrated workspace");
+    return errors;
+}
+
+int padded_decisions() {
+    constexpr int b = 17, d = 3, w = d + 1, k = 20, r = 2;
+    std::vector<std::uint64_t> sample_keys(k * b * r), target_keys(k * w * b * r);
+    std::vector<int> live(b), positions(b), extents(b), drafts(d * b), ids(16 * d * b);
+    std::vector<float> probabilities(ids.size());
+    std::vector<ops::SamplingConfig> configs(b);
+    auto ds = to_device(sample_keys), dt = to_device(target_keys), dl = to_device(live),
+         dp = to_device(positions), de = to_device(extents), dd = to_device(drafts),
+         di = to_device(ids), dq = to_device(probabilities), dc = to_device(configs);
+    GuardedDeviceBuffer sampled(b * 4), greedy(w * b * 4), sparse(w * b * 4), greedy_counts(b * 4),
+        sparse_counts(b * 4);
+    Tensor sk(ds.span(), DType::I64, {k, 1, b, r}), tk(dt.span(), DType::I64, {k, w, b, r});
+    Tensor lv(dl.span(), DType::I32, {b}), pv(dp.span(), DType::I32, {b}),
+        ev(de.span(), DType::I32, {b}), dv(dd.span(), DType::I32, {d, b}),
+        iv(di.span(), DType::I32, {16, d, b}), qv(dq.span(), DType::FP32, {16, d, b});
+    Tensor out(sampled.span(), DType::I32, {b}), go(greedy.span(), DType::I32, {w, b}),
+        so(sparse.span(), DType::I32, {w, b}), gc(greedy_counts.span(), DType::I32, {b}),
+        sc(sparse_counts.span(), DType::I32, {b});
+    auto& device               = cuda_environment().context;
+    const auto* device_configs = static_cast<const ops::SamplingConfig*>(dc.data());
+    DecodeGraphDefinition definition;
+    definition.capture(device.stream(), [&] {
+        ops::sample_vocabulary_candidates(sk, device_configs, pv, ops::kSamplePurposeDecode, out,
+                                          lv, device.execution_view());
+        ops::accept_vocabulary_candidates(tk, device_configs, dv, ev, pv, go, gc, lv,
+                                          device.execution_view());
+        ops::accept_vocabulary_candidates_sparse(tk, device_configs, dv, iv, qv, ev, pv, so, sc, lv,
+                                                 device.execution_view());
+    });
+    DecodeGraphExecutable graph;
+    graph.instantiate(definition);
+    int errors = 0;
+    for (int phase = 0; phase < 2; ++phase) {
+        std::fill(sample_keys.begin(), sample_keys.end(), 0);
+        std::fill(target_keys.begin(), target_keys.end(), 0);
+        std::fill(drafts.begin(), drafts.end(), INT_MIN);
+        std::fill(ids.begin(), ids.end(), INT_MIN);
+        std::fill(probabilities.begin(), probabilities.end(),
+                  std::numeric_limits<float>::quiet_NaN());
+        std::vector<int> expected_sample(b), expected_tokens(w * b), expected_counts(b);
+        for (int row = 0; row < b; ++row) {
+            live[row]    = (row + phase) % 3 != 0;
+            configs[row] = {};
+            configs[row].temperature =
+                live[row] ? (row % 2 ? .75F : 0.F) : std::numeric_limits<float>::quiet_NaN();
+            configs[row].token_counts = reinterpret_cast<const int*>(std::uintptr_t(0x1000));
+            configs[row].mask = {reinterpret_cast<const std::uint32_t*>(std::uintptr_t(0x2000)), 1};
+            positions[row]    = live[row] ? 100 + row : INT_MIN;
+            extents[row]      = live[row] ? row % w : INT_MIN;
+            if (!live[row]) continue;
+            expected_sample[row]                 = 100 + row * w;
+            sample_keys[(row % r * b + row) * k] = key(0, expected_sample[row]);
+            expected_counts[row]                 = extents[row] + 1;
+            for (int col = 0; col <= extents[row]; ++col) {
+                const int token                                  = expected_sample[row] + col;
+                expected_tokens[row * w + col]                   = token;
+                target_keys[((col % r * b + row) * w + col) * k] = key(0, token);
+                if (col == extents[row]) continue;
+                drafts[row * d + col] = token;
+                const int at          = (row * d + col) * 16;
+                std::fill_n(ids.begin() + at, 16, INT_MAX);
+                std::fill_n(probabilities.begin() + at, 16, 0.F);
+                ids[at]           = token;
+                probabilities[at] = 1.F;
+            }
+        }
+        ds.copy_from_host(sample_keys.data(), sample_keys.size() * 8);
+        dt.copy_from_host(target_keys.data(), target_keys.size() * 8);
+        dl.copy_from_host(live.data(), live.size() * 4);
+        dp.copy_from_host(positions.data(), positions.size() * 4);
+        de.copy_from_host(extents.data(), extents.size() * 4);
+        dd.copy_from_host(drafts.data(), drafts.size() * 4);
+        di.copy_from_host(ids.data(), ids.size() * 4);
+        dq.copy_from_host(probabilities.data(), probabilities.size() * 4);
+        dc.copy_from_host(configs.data(), configs.size() * sizeof(configs[0]));
+        for (auto* buffer : {&sampled, &greedy, &sparse, &greedy_counts, &sparse_counts})
+            buffer->fill(0xff);
+        cuda_synchronize();
+        graph.launch(device.stream());
+        device.synchronize();
+        errors += verify_exact("padded vocabulary sample", from_device<int>(sampled.data(), b),
+                               expected_sample);
+        for (auto* buffer : {&greedy, &sparse})
+            errors += verify_exact("padded vocabulary acceptance",
+                                   from_device<int>(buffer->data(), w * b), expected_tokens);
+        for (auto* buffer : {&greedy_counts, &sparse_counts})
+            errors += verify_exact("padded vocabulary counts", from_device<int>(buffer->data(), b),
+                                   expected_counts);
+        for (auto* buffer : {&sampled, &greedy, &sparse, &greedy_counts, &sparse_counts})
+            errors += buffer->verify_guards("padded vocabulary output");
+    }
+    return errors;
+}
+
 } // namespace
 
 void add_vocabulary_cases(ninfer::test::OpSuite& suite) {
@@ -460,6 +616,14 @@ void add_vocabulary_cases(ninfer::test::OpSuite& suite) {
         suite.add("vocabulary_candidates/long_columns/k" + std::to_string(cap),
                   [=] { return long_columns(cap); });
     suite.add("vocabulary_commit/prefixes", commit_prefixes);
+    suite.add("vocabulary_candidates/padded_batch9",
+              [] { return extraction(16385, 2, 9, 2, 20, true); }, {{"suite", "concurrency"}});
+    suite.add("vocabulary_candidates/long_overlay",
+              [] { return extraction(4097, 257, 1, 1, 20, true); },
+              {{"suite", "concurrency"}, {"execution", "graph"}});
+    suite.add("vocabulary_candidates/concentrated", concentrated_candidates,
+              {{"suite", "concurrency"}, {"execution", "graph"}});
+    suite.add("vocabulary_decision/padded_batch17", padded_decisions, {{"suite", "concurrency"}});
     suite.add("vocabulary_decision/merged_support", merged_support);
     suite.add("vocabulary_decision/greedy", [] { return sample_decisions(false); });
     suite.add("vocabulary_decision/stochastic", [] { return sample_decisions(true); });

@@ -46,8 +46,17 @@ __device__ __forceinline__ void merge_ranked(RankedExpert (&run)[Count]) {
 
 template <class Shape, bool FixedIndices = false>
 __device__ __forceinline__ void select_experts(const float* scores, int* ids, float* coefficients,
-                                               float* shared, float* logits) {
+                                               float* shared, float* logits, bool live) {
     constexpr int K = Shape::top_k, E = Shape::experts;
+    if (!live) {
+        const int lane = threadIdx.x & 31;
+        if (lane < K) {
+            ids[lane]          = -1;
+            coefficients[lane] = 0;
+        }
+        if (!lane) *shared = 0;
+        return;
+    }
     constexpr int Count = [] {
         int n = 1;
         while (n < K) { n *= 2; }

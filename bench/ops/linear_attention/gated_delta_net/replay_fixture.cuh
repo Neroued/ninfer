@@ -32,7 +32,7 @@
 #include <vector>
 
 namespace ninfer::bench::gdn_replay {
-constexpr int kStateDim = 128, kRecordCapacity = 8, kStateRecords = 11;
+constexpr int kStateDim = 128;
 
 __global__ void initialize_record_gates(float* gates, std::size_t pairs) {
     const auto i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -43,12 +43,13 @@ __global__ void initialize_record_gates(float* gates, std::size_t pairs) {
 
 class FoldFixture {
 public:
-    FoldFixture(const Profile& profile, std::int32_t width)
-        : profile_(profile), width_(width),
-          record_storage_(ninfer::bench::device_context().device(), record_bytes(profile, width)),
+    FoldFixture(const Profile& profile, std::int32_t width, std::int32_t batch)
+        : profile_(profile), width_(width), batch_(batch), state_records_(std::max(11, batch + 3)),
+          record_storage_(ninfer::bench::device_context().device(),
+                          record_bytes(profile, width, batch)),
           records_(record_storage_.span(), record_layout_),
           state_storage_(ninfer::bench::device_context().device(),
-                         image_layout_.image_bytes * kStateRecords),
+                         image_layout_.image_bytes * state_records_),
           images_(state_storage_.span(), image_layout_), states_(images_, state_layout_) {
         record_storage_.fill(0); // alignment gaps only; represented planes are filled below.
         state_storage_.fill(0);
@@ -64,9 +65,9 @@ public:
         CUDA_CHECK(cudaGetLastError());
         const auto conv_bytes      = states_.conv_tensor(0, 0).bytes();
         const auto recurrent_bytes = states_.recurrent_tensor(0, 0).bytes();
-        DeviceBuffer initial_conv(bench::device_context().device(), conv_bytes * kStateRecords);
+        DeviceBuffer initial_conv(bench::device_context().device(), conv_bytes * state_records_);
         DeviceBuffer initial_recurrent(bench::device_context().device(),
-                                       recurrent_bytes * kStateRecords);
+                                       recurrent_bytes * state_records_);
         for (int layer = 0; layer < profile.layers; ++layer) {
             CUDA_CHECK(bench::fixture::fill_values(static_cast<__nv_bfloat16*>(initial_conv.data()),
                                                    initial_conv.size() / 2, 401U + layer, -.5F,
@@ -74,7 +75,7 @@ public:
             CUDA_CHECK(bench::fixture::fill_values(static_cast<float*>(initial_recurrent.data()),
                                                    initial_recurrent.size() / 4, 501U + layer,
                                                    -.02F, .02F));
-            for (int record = 0; record < kStateRecords; ++record) {
+            for (int record = 0; record < state_records_; ++record) {
                 auto conv      = states_.conv_tensor(layer, byte_offset(record));
                 auto recurrent = states_.recurrent_tensor(layer, byte_offset(record));
                 CUDA_CHECK(cudaMemcpyAsync(conv.data,
@@ -101,9 +102,9 @@ public:
 
 private:
     static GdnReplayRecordLayout make_record_layout(const Profile& profile, std::int32_t width,
-                                                    LayoutBuilder& builder) {
+                                                    std::int32_t batch, LayoutBuilder& builder) {
         return plan_gdn_replay_records(builder, {.layers          = profile.layers,
-                                                 .record_capacity = kRecordCapacity,
+                                                 .record_capacity = std::max(8, batch),
                                                  .width           = width,
                                                  .conv_channels   = profile.conv_channels,
                                                  .qk_heads        = profile.qk_heads,
@@ -124,16 +125,18 @@ private:
                                             .conv_dtype     = DType::BF16});
     }
 
-    static std::size_t record_bytes(const Profile& profile, std::int32_t width) {
+    static std::size_t record_bytes(const Profile& profile, std::int32_t width,
+                                    std::int32_t batch) {
         LayoutBuilder builder;
-        (void)make_record_layout(profile, width, builder);
+        (void)make_record_layout(profile, width, batch, builder);
         return builder.finish(256);
     }
 
     Profile profile_;
-    std::int32_t width_;
+    std::int32_t width_, batch_, state_records_;
     LayoutBuilder record_builder_;
-    GdnReplayRecordLayout record_layout_ = make_record_layout(profile_, width_, record_builder_);
+    GdnReplayRecordLayout record_layout_ =
+        make_record_layout(profile_, width_, batch_, record_builder_);
     StateImageBuilder state_builder_;
     LinearAttentionStateLayout state_layout_ = make_state_layout(profile_, state_builder_);
     StateImageLayout image_layout_           = state_builder_.finish();

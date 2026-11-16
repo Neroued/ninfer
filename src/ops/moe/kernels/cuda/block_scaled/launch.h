@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ninfer/ops/moe.h"
+#include "ops/moe/kernels/cuda/launch.h"
 #include "ops/moe/kernels/cuda/block_scaled/nvfp4/schedule.h"
 
 namespace ninfer::ops::detail::moe_cuda::block_scaled {
@@ -8,7 +9,7 @@ namespace ninfer::ops::detail::moe_cuda::block_scaled {
 inline constexpr int kHidden = 2560, kIntermediate = 640, kExperts = 512, kTopK = 10;
 inline constexpr int kScoreRows = (kExperts + 4) / 4 * 4;
 
-enum class SharedAlgorithm { Vector, Mma };
+enum class SharedAlgorithm { Vector, Mma, SplitK, Tma };
 
 struct Fp8LoadTuning {
     int maximum_small_load = 0;
@@ -79,6 +80,7 @@ struct Storage {
     float* routed_sum           = nullptr;
     void* shared_activation     = nullptr;
     Groups groups{};
+    TokenValidity token_validity;
 };
 
 struct Preparation {
@@ -96,7 +98,8 @@ void launch_shared(const Tensor& x, const ScaledSwiGLUTerm& shared, const Expert
 
 void launch_control_shared(const Tensor& x, const MoeWeights& weights, const ExpertRoutes& routes,
                            ExpertSubset subset, const Tensor& shared, float* scores,
-                           const Storage& storage, const Plan& plan, CudaExecutionView execution);
+                           const Storage& storage, const Plan& plan, TokenValidity validity,
+                           CudaExecutionView execution);
 
 // Overwrites job_experts/job_columns after GU has finished on the same stream.
 // Counts, offsets, packed assignments and all quantized payloads remain unchanged.

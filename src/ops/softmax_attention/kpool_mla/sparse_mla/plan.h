@@ -16,6 +16,7 @@ struct SparseMlaPlan {
     MlaFactorSchedule factor;
     MlaAttentionSchedule attention;
     int splits, tile;
+    int preferred_splits = 0;
     bool direct;
     bool merge_value = false;
     MlaFactorSchedule fp8_query;

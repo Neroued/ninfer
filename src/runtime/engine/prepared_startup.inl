@@ -151,7 +151,8 @@ build_prepared_local_model(const artifact::Reader& reader, EngineOptions& option
     memory.startup_retained_bytes = description.budget.retained_bytes;
     memory.rank_budgets           = {description.budget};
     auto worker   = std::make_unique<RankWorker<Types>>(std::move(device), std::move(instance));
-    auto executor = std::make_unique<LocalExecutor<Types>>(std::move(worker), next_session_epoch());
+    auto executor  = std::make_unique<LocalExecutor<Types>>(std::move(worker), next_session_epoch(),
+                                                            options.max_concurrency);
     auto inference = std::make_unique<InferenceInstance<Types>>(
         setup.definition(), std::move(frontend), std::move(executor), std::move(*session),
         std::move(memory));

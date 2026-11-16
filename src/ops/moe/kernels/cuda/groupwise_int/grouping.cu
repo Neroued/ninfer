@@ -15,8 +15,8 @@ __global__ void count_assignments(const int* ids, const int* mask, int member, i
         const int assignment = blockIdx.x * Tile + item;
         if (assignment < assignments) {
             const int expert = ids[assignment];
-            bool selected    = true;
-            if constexpr (Masked) { selected = mask[expert] == member; }
+            bool selected    = expert >= 0;
+            if constexpr (Masked) { selected = selected && mask[expert] == member; }
             ranks[assignment] = selected ? atomicAdd(counts + expert, 1) : -1;
         }
     }

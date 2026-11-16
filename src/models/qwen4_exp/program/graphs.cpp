@@ -75,11 +75,11 @@ void GraphInputs::prepare() {
         auto embedding = r.ple_upload->device_slot(slot, r.plan.ple.max_positions, 1);
         CUDA_CHECK(cudaMemsetAsync(embedding.data, 0, embedding.bytes(), owner_.cuda.stream()));
     }
-    const auto& buffers = r.plan.persistent.buffers;
+    const auto& buffers = r.buffers();
     if (buffers.mtp) {
-        for (const auto* region : {&buffers.mtp->base_conditioning, &buffers.mtp->hidden,
-                                   &buffers.mtp->tail_keys, &buffers.mtp->tail_coordinates,
-                                   &buffers.mtp->drafts, &buffers.mtp->extents, &buffers.anchors}) {
+        for (const auto* region :
+             {&buffers.mtp->base_conditioning, &buffers.mtp->hidden, &buffers.mtp->tail_keys,
+              &buffers.mtp->tail_coordinates, &buffers.mtp->drafts}) {
             const auto value = r.tensor(*region);
             CUDA_CHECK(cudaMemsetAsync(value.data, 0, value.bytes(), owner_.cuda.stream()));
         }
@@ -99,18 +99,25 @@ GraphInputs::~GraphInputs() {
 
 void GraphInputs::stage() {
     auto& r             = owner_.resources;
-    const auto& ingress = r.plan.persistent.buffers.ingress;
+    const auto& ingress = r.buffers().ingress;
     copy_bytes(r.ingress().subspan(0, ingress.bytes), ingress.bind(r.persistent()), owner_.cuda);
 }
 
 void GraphInputs::batch(execution::BatchView call, std::uint32_t visible) {
     const auto t = call.tokens, b = call.batch;
+    const auto live  = owner_.resources.plan.batches->minimum_rows(b);
     const auto valid = std::min<std::uint32_t>(t, visible);
     const auto base  = visible - valid;
     std::vector<std::int32_t> ids(t * b, owner_.parameters.profile->config.text.ple.eos);
-    std::vector<std::int32_t> positions(t * b), rope(t * b * 3), rows(b), bases(b, base);
-    for (int row = 0; row < b; ++row) {
-        rows[row] = row;
+    std::vector<std::int32_t> positions(t * b), rope(t * b * 3), rows(b, -1), bases(b);
+    std::vector<std::int64_t> state(b, -1);
+    std::vector<std::int32_t> live_rows(b), counts(b), offsets(b);
+    for (std::uint32_t row = 0; row < live; ++row) {
+        rows[row]      = row;
+        bases[row]     = base;
+        state[row]     = state_offsets_[row];
+        live_rows[row] = 1;
+        counts[row]    = valid;
         for (int j = 0; j < t; ++j) {
             const auto position    = base + std::min<std::uint32_t>(j, valid - 1);
             positions[j + t * row] = position;
@@ -120,22 +127,42 @@ void GraphInputs::batch(execution::BatchView call, std::uint32_t visible) {
     write_values<std::int32_t>(call.ids, ids, owner_.cuda);
     write_values<std::int32_t>(call.positions, positions, owner_.cuda);
     write_values<std::int32_t>(call.rope_positions, rope, owner_.cuda);
-    write_values<std::int64_t>(call.source_offsets, std::span(state_offsets_).first(b),
-                               owner_.cuda);
-    write_values<std::int64_t>(call.destination_offsets, std::span(state_offsets_).first(b),
-                               owner_.cuda);
+    write_values<std::int64_t>(call.source_offsets, state, owner_.cuda);
+    write_values<std::int64_t>(call.destination_offsets, state, owner_.cuda);
     write_values<std::int32_t>(call.table_rows, rows, owner_.cuda);
     write_values<std::int32_t>(call.base_positions, bases, owner_.cuda);
-    std::vector<std::int32_t> counts(b, valid), offsets(b, 0);
+    write_values<std::int32_t>(call.live_rows, live_rows, owner_.cuda);
     write_values<std::int32_t>(call.valid_columns, counts, owner_.cuda);
     write_values<std::int32_t>(call.record_offsets, offsets, owner_.cuda);
-    const auto& io = owner_.resources.plan.persistent.buffers.batch;
+    const auto& buffers = owner_.resources.buffers();
+    std::vector<ops::SamplingConfig> configs(b);
+    for (auto& config : configs) config.temperature = 0;
+    const auto target = owner_.resources.tensor(*buffers.sampling);
+    copy_bytes({target.data, target.bytes(), owner_.cuda.device()},
+               {configs.data(), configs.size() * sizeof(configs[0]), Device::cpu()}, owner_.cuda);
+    const auto& io = buffers.batch;
+    std::vector<std::int32_t> slots(b, -1), sampling_positions(b), extents(b);
+    for (std::uint32_t row = 0; row < live; ++row) {
+        slots[row]              = row;
+        sampling_positions[row] = base;
+        extents[row]            = std::min(owner_.shape.draft_tokens, visible - 1);
+    }
+    write_values<std::int32_t>(owner_.resources.tensor(io.count_slots).slice(0, 0, b), slots,
+                               owner_.cuda);
+    write_values<std::int32_t>(owner_.resources.tensor(io.sampling_positions).slice(0, 0, b),
+                               sampling_positions, owner_.cuda);
+    write_values<std::int32_t>(
+        owner_.resources.tensor(buffers.anchors).slice(0, 0, b),
+        std::vector<std::int32_t>(b, owner_.parameters.profile->config.text.ple.eos), owner_.cuda);
+    if (buffers.mtp)
+        write_values<std::int32_t>(owner_.resources.tensor(buffers.mtp->extents).slice(0, 0, b),
+                                   extents, owner_.cuda);
     write_values<std::int32_t>(
         owner_.resources.packed(io.raw_tail, {2, b}),
         std::vector<std::int32_t>(2 * b, owner_.parameters.profile->config.text.ple.eos),
         owner_.cuda);
-    std::vector<std::int64_t> tail_offsets(b);
-    for (int row = 0; row < b; ++row) tail_offsets[row] = row * 2 * sizeof(TokenId);
+    std::vector<std::int64_t> tail_offsets(b, -1);
+    for (std::uint32_t row = 0; row < live; ++row) tail_offsets[row] = row * 2 * sizeof(TokenId);
     write_values<std::int64_t>(owner_.resources.tensor(io.raw_tail_offsets).slice(0, 0, b),
                                tail_offsets, owner_.cuda);
 }
@@ -147,9 +174,10 @@ void Graphs::prepare_main(Batch& graph, std::uint32_t batch, bool verify,
                           GraphPreparation& preparation) {
     auto& p             = owner_;
     auto& r             = p.resources;
-    const auto& buffers = r.plan.persistent.buffers;
+    const auto& buffers = r.buffers();
     const auto tokens   = verify ? p.shape.draft_tokens + 1 : 1;
-    const auto call     = r.main_batch(tokens, batch, bounds_.back());
+    auto call           = r.main_batch(tokens, batch, bounds_.back());
+    call.active_tokens  = std::min(tokens, bounds_.back()) * r.plan.batches->minimum_rows(batch);
     const auto& c       = p.parameters.profile->config.text;
     const auto t = static_cast<std::int32_t>(tokens), b = static_cast<std::int32_t>(batch);
     execution::TextOutputs output{r.packed(buffers.pending_sample, {dimension(c.hidden), t, b}),
@@ -187,7 +215,8 @@ void Graphs::prepare_main(Batch& graph, std::uint32_t batch, bool verify,
             return;
         }
         selected.prepare(run, p.parameters, r.experts.get(), bounds_, ple, output, logits,
-                         tokens * batch, r.workspace, p.device, [&] {
+                         moe::decode_geometry(*r.plan.batches, batch, tokens), r.workspace,
+                         p.device, [&] {
                              if (!verify) p.install_decode(batch);
                          });
     }
@@ -213,9 +242,8 @@ void Graphs::prepare_drafts(Batch& graph, std::uint32_t batch, GraphInputs& inpu
         auto& call = graph.drafts[step];
         if (!preparation.capturing()) {
             for (const auto bound : bounds_) {
-                inputs.batch(p.resources.mtp_batch(
-                                 p.resources.plan.persistent.buffers.mtp->draft_steps[step], 1,
-                                 batch, bound),
+                inputs.batch(p.resources.mtp_batch(p.resources.buffers().mtp->draft_steps[step], 1,
+                                                   batch, bound),
                              bound);
                 p.draft_forward(step, batch, bound);
             }
@@ -276,9 +304,9 @@ void Graphs::prepare(GraphInputs& inputs, GraphPreparation& observation) {
     auto& r = p.resources;
     std::optional<moe::Schedule::Preparation> preparation;
     if (r.experts) preparation.emplace(*r.experts);
-    batches_.resize(p.shape.max_concurrency);
-    for (std::uint32_t batch = 1; batch <= p.shape.max_concurrency; ++batch) {
-        auto& graph = batches_[batch - 1];
+    for (auto batch : r.plan.batches->graph_rows()) {
+        r.select_batch(batch);
+        auto& graph = batches_[batch];
         inputs.batch(r.main_batch(1, batch, bounds_.back()), bounds_.back());
         inputs.stage();
         prepare_main(graph, batch, false, observation);
@@ -292,7 +320,7 @@ void Graphs::prepare(GraphInputs& inputs, GraphPreparation& observation) {
         observation.checkpoint();
         graph.sample_workspace = r.workspace.peak_used();
         if (p.parameters.mtp) {
-            const auto& frame = *r.plan.persistent.buffers.mtp;
+            const auto& frame = *r.buffers().mtp;
             for (std::uint32_t step = 0; step < p.shape.draft_tokens; ++step)
                 inputs.batch(r.mtp_batch(frame.draft_steps[step], 1, batch, bounds_.back()),
                              bounds_.back());
@@ -318,7 +346,7 @@ void Graphs::prepare(GraphInputs& inputs, GraphPreparation& observation) {
 }
 
 TextGraph& Graphs::main(std::uint32_t batch, bool verify, std::uint32_t visible, bool head) {
-    auto& group = batches_.at(batch - 1);
+    auto& group = batches_.at(batch);
     auto& graph = verify ? group.verify : group.main;
     graph.set_head(head);
     graph.select(visible);
@@ -328,7 +356,7 @@ TextGraph& Graphs::main(std::uint32_t batch, bool verify, std::uint32_t visible,
 
 void Graphs::draft(std::uint32_t batch, std::span<const execution::BatchView> calls,
                    ple::Ticket ticket, std::span<const std::uint32_t> extents) {
-    auto& group = batches_.at(batch - 1);
+    auto& group = batches_.at(batch);
     auto& chain = group.chain;
     for (std::size_t step = 0; step < calls.size(); ++step) {
         const auto& call = group.drafts[step];
@@ -352,37 +380,40 @@ void Graphs::draft(std::uint32_t batch, std::span<const execution::BatchView> ca
 }
 
 void Graphs::sample(std::uint32_t batch) {
-    workspace_peak_ = std::max(workspace_peak_, batches_.at(batch - 1).sample_workspace);
-    batches_.at(batch - 1).sample.executable.launch(owner_.cuda.stream());
+    workspace_peak_ = std::max(workspace_peak_, batches_.at(batch).sample_workspace);
+    batches_.at(batch).sample.executable.launch(owner_.cuda.stream());
 }
 
 void Graphs::accept(std::uint32_t batch) {
-    workspace_peak_ = std::max(workspace_peak_, batches_.at(batch - 1).accept_workspace);
-    batches_.at(batch - 1).accept.executable.launch(owner_.cuda.stream());
+    workspace_peak_ = std::max(workspace_peak_, batches_.at(batch).accept_workspace);
+    batches_.at(batch).accept.executable.launch(owner_.cuda.stream());
 }
 
 void MtpCommitGraphs::prepare(GraphInputs& inputs, GraphPreparation& preparation) {
     auto& p          = owner_;
     auto& r          = p.resources;
-    const auto& io   = r.plan.persistent.buffers;
+    const auto& io   = r.buffers();
     const auto width = p.shape.draft_tokens + 1;
-    batches_.resize(p.shape.max_concurrency);
-    for (std::uint32_t batch = 1; batch <= p.shape.max_concurrency; ++batch) {
+    for (auto batch : r.plan.batches->graph_rows()) {
+        r.select_batch(batch);
         inputs.batch(r.main_batch(width, batch, p.shape.max_context), p.shape.max_context);
         inputs.batch(r.mtp_batch(io.mtp->draft_steps[0], 1, batch, p.shape.max_context),
                      p.shape.max_context);
-        std::vector<std::int32_t> slots(batch);
-        for (std::uint32_t b = 0; b < batch; ++b) slots[b] = b;
-        write_values<std::int32_t>(r.tensor(io.batch.count_slots).slice(0, 0, batch), slots,
+        const auto live  = r.plan.batches->minimum_rows(batch);
+        const auto valid = std::min(width, p.shape.max_context);
+        std::vector<std::int32_t> accepted(batch), skip(batch), last(batch, -1), active(batch, -1);
+        for (std::uint32_t b = 0; b < live; ++b) {
+            accepted[b] = valid;
+            skip[b]     = 1;
+            last[b]     = valid - 1;
+            active[b]   = 0;
+        }
+        write_values<std::int32_t>(r.tensor(io.batch.accepted_columns).slice(0, 0, batch), accepted,
                                    p.cuda);
-        write_values<std::int32_t>(r.tensor(io.batch.accepted_columns).slice(0, 0, batch),
-                                   std::vector<std::int32_t>(batch, width), p.cuda);
-        write_values<std::int32_t>(r.tensor(io.mtp->skip_first).slice(0, 0, batch),
-                                   std::vector<std::int32_t>(batch, 1), p.cuda);
-        write_values<std::int32_t>(r.tensor(io.mtp->last_columns).slice(0, 0, batch),
-                                   std::vector<std::int32_t>(batch, width - 1), p.cuda);
-        write_values<std::int32_t>(r.tensor(io.mtp->active_columns).slice(0, 0, batch),
-                                   std::vector<std::int32_t>(batch, 0), p.cuda);
+        write_values<std::int32_t>(r.tensor(io.mtp->skip_first).slice(0, 0, batch), skip, p.cuda);
+        write_values<std::int32_t>(r.tensor(io.mtp->last_columns).slice(0, 0, batch), last, p.cuda);
+        write_values<std::int32_t>(r.tensor(io.mtp->active_columns).slice(0, 0, batch), active,
+                                   p.cuda);
         write_values<std::int32_t>(r.tensor(io.batch.count_columns).slice(0, 0, batch),
                                    std::vector<std::int32_t>(batch, 0), p.cuda);
         const auto destination = r.tensor(io.commit_destination_offsets).slice(0, 0, batch);
@@ -395,7 +426,7 @@ void MtpCommitGraphs::prepare(GraphInputs& inputs, GraphPreparation& preparation
             preparation.checkpoint();
             continue;
         }
-        auto& target = batches_[batch - 1];
+        auto& target = batches_[batch];
         target.graph.prepare(p.cuda, [&] {
             p.execute_mtp_commit(batch, true, true, &target.repair, &target.counts);
         });
@@ -407,7 +438,7 @@ void MtpCommitGraphs::prepare(GraphInputs& inputs, GraphPreparation& preparation
 }
 
 void MtpCommitGraphs::replay(std::uint32_t batch, bool rebuild_history, bool count_tokens) {
-    auto& target = batches_.at(batch - 1);
+    auto& target = batches_.at(batch);
     target.repair.set_enabled(target.graph.executable, rebuild_history);
     target.counts.set_enabled(target.graph.executable, count_tokens);
     workspace_peak_ = std::max(workspace_peak_, target.workspace_bytes);

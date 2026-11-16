@@ -31,7 +31,7 @@ from tools.bench import serve_measurement as observation  # noqa: E402
 SUITES = ("context-profile", "decode-saturation", "corpus-makespan")
 STATS_INTERVAL_MS = 1000
 PENDING_TIMEOUT_MS = 24 * 60 * 60 * 1000
-SATURATION_FIXTURE = "long_decode_aime26_15"
+SATURATION_FIXTURE = "scenario_structured_jsonl"
 SATURATION_SEEDS = (
     7632647173703958409,
     7968175640111700217,
@@ -174,8 +174,8 @@ def validate_args(args: argparse.Namespace) -> None:
     if len(args.concurrency) != len(set(args.concurrency)):
         raise corpus.CampaignError("duplicate --concurrency value")
     for concurrency in args.concurrency:
-        if concurrency < 1 or concurrency > 8:
-            raise corpus.CampaignError("--concurrency must be in [1, 8]")
+        if concurrency < 1:
+            raise corpus.CampaignError("--concurrency must be positive")
     if len(args.suite) != len(set(args.suite)):
         raise corpus.CampaignError("duplicate --suite value")
 
@@ -215,6 +215,18 @@ def build_points(
     return points
 
 
+def saturation_seeds(count: int) -> list[int]:
+    seeds = list(SATURATION_SEEDS[:count])
+    seen = set(seeds)
+    generator = random.Random(SATURATION_SEEDS[0])
+    while len(seeds) < count:
+        seed = generator.getrandbits(63)
+        if seed not in seen:
+            seeds.append(seed)
+            seen.add(seed)
+    return seeds
+
+
 def build_jobs(
     point: Point, fixtures: dict[str, corpus.Fixture], decode_tokens: int
 ) -> list[Job]:
@@ -234,10 +246,10 @@ def build_jobs(
                 index=index,
                 case_index=index,
                 fixture=fixture,
-                seed=SATURATION_SEEDS[index],
+                seed=seed,
                 max_tokens=decode_tokens,
             )
-            for index in range(point.concurrency)
+            for index, seed in enumerate(saturation_seeds(point.concurrency))
         ]
 
     names = corpus.block_fixture_names(point.speculative_backend)

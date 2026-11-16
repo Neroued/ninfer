@@ -8,7 +8,6 @@
 namespace ninfer::ops {
 namespace {
 using detail::gated_delta_net::kStateDim;
-using detail::gated_delta_net::kMaximumReplayRows;
 
 void validate_replay_record(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
                             const Tensor& beta, float scale, ConstStateFieldView initial_state,
@@ -22,7 +21,7 @@ void validate_replay_record(const Tensor& q, const Tensor& k, const Tensor& v, c
     const std::int32_t rows        = q.ne[3];
     const bool registered_heads    = (qk_heads == 16 && (value_heads == 48 || value_heads == 32)) ||
                                   (qk_heads == 8 && value_heads == 24);
-    if (!registered_heads || width < 2 || width > 16 || rows <= 0 || rows > kMaximumReplayRows) {
+    if (!registered_heads || width < 2 || width > 16 || rows <= 0) {
         throw std::invalid_argument(std::string(kOp) + ": unsupported geometry");
     }
 

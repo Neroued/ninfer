@@ -5,6 +5,8 @@ add_library(ninfer_model_loading STATIC
   glm5next/frontend/resources.cpp
   glm5next/frontend/processor_config.cpp
   common/bindings.cpp
+  common/dflash/config.cpp
+  common/dflash/weights.cpp
   common/parallel.cpp
   common/parallel_weights.cpp
   common/vision/resources.cpp
@@ -17,6 +19,7 @@ target_link_libraries(ninfer_model_loading PUBLIC ninfer_artifact ninfer_text ni
 
 # Coordinator-owned sessions, context directories and frontend policy.
 add_library(ninfer_model_control STATIC
+  common/batch.cpp
   common/token_input.cpp
   common/frontend/chat_template.cpp
   common/frontend/prompt.cpp

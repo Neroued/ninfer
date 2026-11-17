@@ -175,12 +175,16 @@ requested_reasoning_effort_name(RequestedReasoningEffort effort) noexcept {
     return {};
 }
 
+// Shared tool-name length contract: the OpenAI and Anthropic endpoints both validate against it,
+// and it doubles as the generation budget the engine is told not to exceed.
+constexpr std::size_t kMaxToolNameLength = 128;
+
 struct GenerationRequest {
     std::optional<OutputConstraint> constraint;
     std::string constraint_param;
     std::vector<ChatTurn> messages;
     std::vector<ToolDefinition> tools;
-    std::size_t tool_name_max_length = 64;
+    std::size_t tool_name_max_length = kMaxToolNameLength;
     ToolChoice tool_choice;
     std::vector<std::string> stop_strings;
     bool stop_strings_apply_to_reasoning = false;

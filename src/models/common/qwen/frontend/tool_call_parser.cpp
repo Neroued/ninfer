@@ -4,6 +4,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cstdio>
 #include <optional>
 #include <stdexcept>
 #include <string_view>
@@ -214,6 +215,79 @@ std::size_t suffix_prefix(std::string_view value, std::string_view marker) {
     for (auto n = std::min(value.size(), marker.size() - 1); n != 0; --n)
         if (value.substr(value.size() - n) == marker.substr(0, n)) return n;
     return 0;
+}
+
+Json schema_default_for_property(const Json& property) {
+    if (property.contains("default")) return property["default"];
+    // Extract types from the property schema to determine an appropriate default.
+    auto type_matches = [&](const char* type_name) {
+        if (!property.contains("type")) return false;
+        const auto& type = property["type"];
+        if (type.is_string()) return type == type_name;
+        if (type.is_array()) {
+            for (const auto& t : type)
+                if (t.is_string() && t.get<std::string>() == type_name) return true;
+        }
+        return false;
+    };
+    if (type_matches("null")) return Json(nullptr);
+    if (type_matches("boolean")) return Json(false);
+    if (type_matches("integer")) return Json(0);
+    if (type_matches("number")) return Json(0.0);
+    if (type_matches("string")) return Json("");
+    if (type_matches("array")) return Json(std::vector<Json>{});
+    if (type_matches("object")) return Json(std::object_t{});
+    return Json("");
+}
+
+void validate_and_fill_tool_arguments(std::vector<GeneratedToolCall>& calls, const Contract& contract) {
+    for (auto& call : calls) {
+        if (call.status != ToolCallStatus::Complete) continue;
+        const auto* tool = find_tool_contract(contract, call.name);
+        if (!tool) continue;
+
+        Json arguments;
+        try {
+            arguments = Json::parse(call.arguments_json);
+        } catch (...) {
+            std::fprintf(stderr, "[ninfer] tool '%s': arguments_json is not valid JSON; skipping validation\n",
+                         call.name.c_str());
+            continue;
+        }
+        if (!arguments.is_object()) continue;
+
+        Json schema;
+        try {
+            schema = Json::parse(tool->schema_json);
+        } catch (...) {
+            continue;
+        }
+        if (!schema.is_object()) continue;
+
+        const Json& properties = schema.value("properties", Json(std::object_t{}));
+        const Json& required   = schema.value("required", Json(std::vector<std::string>{}));
+        if (!properties.is_object() || !required.is_array()) continue;
+
+        bool filled = false;
+        for (const auto& field_name : required) {
+            if (!field_name.is_string()) continue;
+            const auto& name = field_name.get<std::string>();
+            if (arguments.contains(name)) continue;
+
+            Json default_value;
+            if (properties.contains(name)) {
+                default_value = schema_default_for_property(properties[name]);
+            } else {
+                default_value = Json("");
+            }
+            arguments[name] = default_value;
+            filled = true;
+            std::fprintf(stderr,
+                         "[ninfer] tool '%s': missing required field '%s', filled with default %s\n",
+                         call.name.c_str(), name.c_str(), default_value.dump().c_str());
+        }
+        if (filled) call.arguments_json = arguments.dump();
+    }
 }
 
 } // namespace
@@ -686,6 +760,8 @@ std::vector<OutputEvent> ToolCallOutputDecoder::finish(FinishReason reason) {
 }
 
 std::vector<GeneratedToolCall> ToolCallOutputDecoder::take_tool_calls() noexcept {
+    if (impl_->contract)
+        validate_and_fill_tool_arguments(impl_->calls, *impl_->contract);
     return std::move(impl_->calls);
 }
 

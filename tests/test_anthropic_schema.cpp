@@ -62,6 +62,17 @@ std::string api_param(const std::function<void()>& action) {
     return {};
 }
 
+std::string api_message(const std::function<void()>& action) {
+    try {
+        action();
+    } catch (const ApiException& error) { return error.error().message; } catch (...) {
+        return "wrong_exception";
+    }
+    return {};
+}
+
+GenerationOutcome sample_outcome();
+
 PromptOptionInputs semantics(const GenerationRequest& request, bool default_thinking = true) {
     ServeOptions options;
     options.launch.generation.enable_thinking = default_thinking;
@@ -515,6 +526,74 @@ int test_thinking_and_count_tokens() {
     return failures;
 }
 
+int test_thinking_display() {
+    int failures = 0;
+    Json body = base_request();
+    body["thinking"] = Json{{"type", "adaptive"}, {"display", "updates"}};
+
+    AnthropicMessagesRequest updates;
+    const std::string parse_error = api_message([&] { updates = parse(body); });
+    failures += check(parse_error.empty() && updates.generation.enable_thinking == true &&
+                          updates.thinking_display == ThinkingDisplay::Updates,
+                      "updates Thinking display was rejected or lost its display mode: " +
+                          parse_error);
+    failures += check(api_message([&] { (void)parse_anthropic_count_tokens_request(body); }).empty(),
+                      "Count Tokens rejected the display-only updates mode");
+
+    // Withheld reasoning text cannot round-trip an explicit preserve request.
+    body["preserve_thinking"] = true;
+    failures += check(api_code([&] { (void)parse(body); }) == "thinking_display_not_supported" &&
+                          api_param([&] { (void)parse(body); }) == "thinking",
+                      "updates display silently discarded preserved Thinking history");
+    (void)parse_anthropic_count_tokens_request(body); // display-only counting stays tolerated
+
+    body             = base_request();
+    body["thinking"] = Json{{"type", "adaptive"}, {"display", "highlights"}};
+    const std::string unknown = api_message([&] { (void)parse(body); });
+    failures += check(api_param([&] { (void)parse(body); }) == "thinking" &&
+                          unknown.find("updates") != std::string::npos,
+                      "unknown Thinking display did not advertise the accepted values");
+
+    // Aggregate: hidden display withholds the reasoning body but keeps the signature.
+    const AnthropicResponseIdentity identity =
+        make_anthropic_response_identity("req_display", "claude-local");
+    const Json hidden =
+        Json::parse(make_anthropic_messages_response(identity, sample_outcome(),
+                                                     ThinkingDisplay::Updates));
+    failures += check(hidden["content"][0]["type"] == "thinking" &&
+                          hidden["content"][0]["thinking"] == "" &&
+                          hidden["content"][0]["signature"] == identity.message_id &&
+                          hidden["content"][1]["text"] == "answer" &&
+                          hidden["usage"]["output_tokens_details"]["thinking_tokens"] == 5,
+                      "hidden display leaked or lost aggregate Thinking state");
+
+    // Stream: hidden display emits the Thinking block envelope without text deltas.
+    AnthropicMessagesStream stream(identity, 100, {}, ThinkingDisplay::Updates);
+    std::vector<std::string> events{stream.start()};
+    auto append_events = [&](std::vector<std::string> values) {
+        events.insert(events.end(), std::make_move_iterator(values.begin()),
+                      std::make_move_iterator(values.end()));
+    };
+    append_events(stream.reasoning_delta("thought"));
+    append_events(stream.content_delta("answer"));
+    append_events(stream.finish(sample_outcome()));
+    bool saw_signature = false;
+    for (const std::string& wire : events) {
+        const Json event = parse_event(wire);
+        failures += check(
+            !(event.at("type") == "content_block_delta" &&
+              event["delta"].at("type") == "thinking_delta" &&
+              !event["delta"].at("thinking").get<std::string>().empty()),
+            "hidden display streamed reasoning text as a Thinking delta");
+        if (event.at("type") == "content_block_delta" &&
+            event["delta"].at("type") == "signature_delta") {
+            saw_signature = event["delta"]["signature"] == identity.message_id;
+        }
+    }
+    failures += check(saw_signature, "hidden display stream lost the Thinking signature");
+    return failures;
+}
+
 int test_thinking_history_transport_metadata() {
     Json body = base_request();
     body["messages"] =
@@ -870,6 +949,7 @@ int main() {
     failures += test_tools();
     failures += test_prompt_object_order();
     failures += test_thinking_and_count_tokens();
+    failures += test_thinking_display();
     failures += test_thinking_history_transport_metadata();
     failures += test_content_and_cache_hints();
     failures += test_aggregate_and_errors();

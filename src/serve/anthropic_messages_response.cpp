@@ -190,14 +190,20 @@ std::string make_anthropic_sse_error(const ApiError& error, const std::string& r
 }
 
 std::string make_anthropic_messages_response(const AnthropicResponseIdentity& identity,
-                                             const GenerationOutcome& outcome) {
+                                             const GenerationOutcome& outcome,
+                                             ThinkingDisplay display) {
+    (void)display;
     OrderedJson content = OrderedJson::array();
     if (!outcome.reasoning.empty()) {
         // Claude clients expect a non-empty opaque value. The response identity already has the
-        // required lifetime, so Thinking introduces no independent state or credential.
-        content.push_back(OrderedJson{{"type", "thinking"},
-                                      {"thinking", outcome.reasoning},
-                                      {"signature", identity.message_id}});
+        // required lifetime, so Thinking introduces no independent state or credential. Updates
+        // display has no local progress source: the block envelope stays, the reasoning body is
+        // withheld rather than being served as fake progress.
+        content.push_back(OrderedJson{
+            {"type", "thinking"},
+            {"thinking",
+             display == ThinkingDisplay::Updates ? std::string{} : outcome.reasoning},
+            {"signature", identity.message_id}});
     }
     if (!outcome.text.empty()) {
         content.push_back(OrderedJson{{"type", "text"}, {"text", outcome.text}});
@@ -228,9 +234,9 @@ std::string make_anthropic_count_tokens_response(int input_tokens) {
 
 AnthropicMessagesStream::AnthropicMessagesStream(
     AnthropicResponseIdentity identity, int input_tokens,
-    std::unordered_map<std::string, bool> eager_tool_inputs)
+    std::unordered_map<std::string, bool> eager_tool_inputs, ThinkingDisplay display)
     : identity_(std::move(identity)), eager_tool_inputs_(std::move(eager_tool_inputs)),
-      input_tokens_(input_tokens) {}
+      display_(display), input_tokens_(input_tokens) {}
 
 std::string AnthropicMessagesStream::start() { return start_with_cache(std::nullopt); }
 
@@ -271,7 +277,7 @@ std::vector<std::string> AnthropicMessagesStream::reasoning_delta(const std::str
                         Json{{"type", "thinking"}, {"thinking", ""}, {"signature", ""}}}}));
     }
     reasoning_ += text;
-    if (!text.empty()) {
+    if (display_ != ThinkingDisplay::Updates && !text.empty()) {
         events.push_back(
             event("content_block_delta",
                   Json{{"type", "content_block_delta"},

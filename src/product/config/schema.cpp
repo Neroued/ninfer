@@ -14,6 +14,8 @@ constexpr FieldSpec kFields[] = {
     {Field::ChatTemplate, "model.chat_template", "--chat-template", "", "FILE",
      "Chat template override; empty uses the artifact."},
     {Field::Vision, "model.vision", "--vision", "--no-vision", "", "Load Vision resources."},
+    {Field::Jev, "engine.jev", "--jev", "--no-jev", "",
+     "Enable native /v1/decision and /v1/systemone decisions.", Scope::Serve},
     {Field::VisionMemoryBudget, "vision.memory_budget", "--vision-memory-budget", "", "SIZE",
      "Per-rank Vision activation and output-window budget (1GiB); excludes weights.",
      Scope::Generation, ConfigurationUnit::Bytes},
@@ -310,6 +312,7 @@ FieldValue parse_field_value(Field field, const RawValue& value, bool command_li
     }
     switch (field) {
     case Field::Vision:
+    case Field::Jev:
     case Field::GpuTiming:
     case Field::CudaGraph:
     case Field::PrefixReuse:

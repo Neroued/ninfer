@@ -26,6 +26,7 @@ RankMemoryUsage RankProgramImpl::observe_resources() const {
     a.io_pinned_bytes          = resources.frame.host_storage.size() + context_counts.size() +
                         compute_actions->pinned_bytes() + context_actions->pinned_bytes();
     a.host_context_bytes = resources.host_context.size();
+    if (branches) a.io_pinned_bytes += branches->actions.pinned_bytes();
     if (resources.moe) {
         const auto& plan      = resources.moe->description();
         a.expert_device_bytes = plan.device_bytes;

@@ -2,6 +2,7 @@
 
 #include "core/nvtx.h"
 #include "ninfer/types.h"
+#include "runtime/engine/branch_score_queue.h"
 #include "runtime/contract/execution.h"
 #include "runtime/contract/resources.h"
 #include "runtime/engine/request_record.h"
@@ -70,6 +71,7 @@ public:
                                      ? 0
                                      : options.speculative.draft_tokens),
           pending_timeout_(std::chrono::milliseconds(options.pending_timeout_ms)),
+          decisions_(options.enable_decisions, options.context_cache.enabled),
           resources_(options.context_cache.enabled, std::move(context_cost)),
           slots_(max_concurrency_), capture_decisions_(max_concurrency_),
           execution_decisions_(max_concurrency_), control_executed_(max_concurrency_),
@@ -140,6 +142,10 @@ public:
 
     EngineCore(const EngineCore&)            = delete;
     EngineCore& operator=(const EngineCore&) = delete;
+
+    BranchScoreResult score_branches(std::span<const BranchScoreRow>, const PreparationControl&,
+                                     bool reuse_prefix,
+                                     std::shared_ptr<const models::qwen::PreparedPromptData>);
 
     class Submission {
     public:
@@ -738,6 +744,7 @@ private:
     const std::size_t max_outstanding_;
     const std::uint32_t speculative_positions_;
     const std::chrono::milliseconds pending_timeout_;
+    BranchScoreQueue decisions_;
     ResourceManagement resources_;
     PlacementId next_placement_tie_;
 
@@ -745,6 +752,8 @@ private:
     mutable std::mutex stats_mutex_;
     std::condition_variable queue_cv_;
     std::deque<std::shared_ptr<Request>> pending_;
+    bool progress_branch_job();
+    bool release_branch_workspace_before_chat();
     std::unique_ptr<MeasurementRequest> measurement_;
     std::size_t preparing_requests_       = 0;
     std::size_t outstanding_              = 0;
@@ -804,3 +813,4 @@ private:
 #include "runtime/engine/engine_requests.inl"
 #include "runtime/engine/engine_schedule.inl"
 #include "runtime/engine/engine_execution.inl"
+#include "runtime/engine/engine_decisions.inl"

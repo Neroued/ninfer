@@ -1,0 +1,7 @@
+add_library(ninfer_decision_math STATIC decision.cpp)
+ninfer_internal_includes(ninfer_decision_math)
+target_link_libraries(ninfer_decision_math PUBLIC ninfer::json)
+
+add_library(ninfer_decision STATIC engine.cpp)
+ninfer_internal_includes(ninfer_decision)
+target_link_libraries(ninfer_decision PUBLIC ninfer_decision_math ninfer_engine)

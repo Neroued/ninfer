@@ -12,6 +12,7 @@ if(NINFER_BUILD_ENGINE)
 endif()
 
 if(NINFER_BUILD_PRODUCT_SUPPORT)
+  add_subdirectory(decision)
   add_subdirectory(product)
   add_subdirectory(serve)
 endif()

@@ -1,0 +1,26 @@
+{
+  "state": {
+    "message": "I was charged twice. Please refund the duplicate today.",
+    "plan": "pro"
+  },
+  "questions": {
+    "department": {
+      "type": "choice",
+      "instructions": "Which team should handle this request?",
+      "criteria": {
+        "billing": "Payments, refunds, and invoices",
+        "technical": "Software failures and outages",
+        "other": "None of these teams"
+      }
+    },
+    "urgent": {
+      "type": "noul",
+      "instructions": "Does the customer explicitly request time-sensitive handling?"
+    },
+    "frustration": {
+      "type": "score",
+      "instructions": "How frustrated does the customer sound?",
+      "criteria": ["Calm", "Frustrated", "Very angry"]
+    }
+  }
+}

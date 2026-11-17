@@ -78,6 +78,8 @@ private:
     void register_routes();
     void register_monitor_routes();
     void handle_chat_completions(const httplib::Request& req, httplib::Response& res);
+    void handle_decision(const httplib::Request& req, httplib::Response& res);
+    void handle_systemone(const httplib::Request& req, httplib::Response& res);
     void handle_messages(const httplib::Request& req, httplib::Response& res);
     void handle_count_tokens(const httplib::Request& req, httplib::Response& res);
     void handle_responses(const httplib::Request& req, httplib::Response& res);

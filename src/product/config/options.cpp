@@ -365,6 +365,9 @@ ParsedOptions parse(int argc, char** argv, EntryPoint entry,
         case Field::Vision:
             engine.enable_vision = boolean();
             break;
+        case Field::Jev:
+            engine.enable_decisions = boolean();
+            break;
         case Field::VisionMemoryBudget:
             engine.vision_memory_budget_bytes = u64();
             break;

@@ -91,6 +91,8 @@ struct ResidencyBinding {
 struct ContextWork {
     std::vector<ResidencyBinding> bindings;
     std::vector<runtime::ResidencyId> releases;
+    bool branch_tables = false;
+    std::uint64_t release_vision = 0;
 };
 
 struct ScoreWork {
@@ -101,9 +103,27 @@ struct ScoreWork {
     PhysicalBatchShape shape;
 };
 
+struct BranchRow {
+    context::StateId state;
+    context::StateSelectors offsets;
+    context::TableRow table;
+    std::uint32_t frontier = 0;
+    std::vector<TokenId> tokens;
+    std::vector<TokenId> candidates;
+    std::vector<std::int32_t> rope_positions;
+    std::int32_t rope_delta = 0;
+};
+
+struct BranchWork {
+    std::vector<BranchRow> rows;
+    bool prefill = false;
+    std::optional<qwen::VisionWork> visual;
+};
+
 struct Work {
     context::ContextActions context;
-    std::variant<ForwardWork, DecodeWork, NormalizeWork, ContextWork, ScoreWork> operation;
+    std::variant<ForwardWork, DecodeWork, NormalizeWork, ContextWork, ScoreWork, BranchWork>
+        operation;
 };
 
 struct GeneratedResult {
@@ -131,8 +151,13 @@ struct ScoreResult {
     std::vector<float> logprobs;
 };
 
+struct BranchResult {
+    std::vector<std::vector<float>> logits;
+};
+
 struct Result {
-    std::variant<ForwardResult, GeneratedResult, NormalizeResult, ContextResult, ScoreResult>
+    std::variant<ForwardResult, GeneratedResult, NormalizeResult, ContextResult, ScoreResult,
+                 BranchResult>
         output;
 };
 

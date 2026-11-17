@@ -29,7 +29,7 @@ void write_exception(httplib::Response& res, const std::exception& ex) {
 bool is_anthropic_path(std::string_view path) { return path.starts_with("/v1/messages"); }
 
 bool is_openai_path(std::string_view path) {
-    return path.starts_with("/v1/") && !is_anthropic_path(path);
+    return path == "/decision" || (path.starts_with("/v1/") && !is_anthropic_path(path));
 }
 
 void ensure_http_request_id(const httplib::Request& request, httplib::Response& response) {
@@ -198,12 +198,8 @@ HttpServer::HttpServer(product::ServeOptions options, std::shared_ptr<spdlog::lo
       request_jsonl_(observations_.instance_id(), options_.launch.logging.request_jsonl.string(),
                      options_.launch.engine.artifact_path.string(), std::move(logger)) {
     request_jsonl_.write_startup_config(options_);
-    const std::size_t queued_requests =
-        static_cast<std::size_t>(options_.launch.engine.max_concurrency) +
-        options_.launch.engine.max_pending_requests;
-    const std::size_t worker_count = queued_requests + 1 + MonitorEvents::kMaxSubscribers;
-    server_.new_task_queue         = [queued_requests, worker_count] {
-        return make_http_task_queue(worker_count, queued_requests).release();
+    server_.new_task_queue = [this] {
+        return make_http_task_queue(options_, MonitorEvents::kMaxSubscribers).release();
     };
     server_.set_socket_options(configure_http_server_socket);
     server_.set_payload_max_length(options_.max_request_bytes);
@@ -451,6 +447,17 @@ void HttpServer::register_routes() {
                  [this](const httplib::Request& req, httplib::Response& res) {
                      handle_chat_completions(req, res);
                  });
+    if (options_.launch.engine.enable_decisions) {
+        server_.Post("/v1/decision", [this](const httplib::Request& req, httplib::Response& res) {
+            handle_decision(req, res);
+        });
+        server_.Post("/decision", [this](const httplib::Request& req, httplib::Response& res) {
+            handle_decision(req, res);
+        });
+        server_.Post("/v1/systemone", [this](const httplib::Request& req, httplib::Response& res) {
+            handle_systemone(req, res);
+        });
+    }
     server_.Post("/v1/responses", [this](const httplib::Request& req, httplib::Response& res) {
         handle_responses(req, res);
     });

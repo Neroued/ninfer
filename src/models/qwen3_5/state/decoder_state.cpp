@@ -78,6 +78,13 @@ PagedKVCache::PagedKVCache(MemorySpan arena, MemorySpan backing, const PagedKVCa
     }
 }
 
+PagedKVCache::PagedKVCache(MemorySpan backing, const KVExecutionTableLayout& tables,
+                           const PagedKVCache& shared)
+    : arena_(shared.arena_), pages_(shared.pages_),
+      execution_tables_(backing, tables, shared.arena_, shared.pages_.page_bytes),
+      layers_(shared.layers_), max_context_(shared.max_context_), kv_heads_(shared.kv_heads_),
+      layer_storage_(shared.layer_storage_) {}
+
 PagedKVCacheView::PagedKVCacheView(const PagedKVCache& cache, Tensor page_offsets) noexcept
     : cache_(&cache), page_offsets_(page_offsets) {}
 

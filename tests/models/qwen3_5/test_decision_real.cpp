@@ -1,0 +1,374 @@
+#include "decision/decision.h"
+#include "ninfer/engine.h"
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cmath>
+#include <cstdlib>
+#include <iostream>
+#include <stdexcept>
+#include <string>
+
+namespace {
+
+void expect(bool condition, const char* message) {
+    if (!condition) { throw std::runtime_error(message); }
+}
+
+ninfer::PromptInput chat() {
+    ninfer::PromptInput input;
+    input.options.enable_thinking = false;
+    input.messages                = {
+        {.role = ninfer::ChatRole::User, .parts = {{.text = "Count from one to five."}}}};
+    return input;
+}
+
+struct Case {
+    std::vector<ninfer::TokenId> prefix, suffix, candidates;
+};
+
+std::vector<ninfer::BranchScoreRow> rows(const std::vector<Case>& cases, bool cache) {
+    std::vector<ninfer::BranchScoreRow> out;
+    for (const auto& c : cases) {
+        out.push_back({c.prefix, c.suffix, c.candidates,
+                       cache ? static_cast<std::uint32_t>(c.prefix.size()) : 0, cache ? 63U : 0U});
+    }
+    return out;
+}
+
+// BF16 GEMM shapes and prefill/ReplaySSM arithmetic differ. Compare conditional probabilities,
+// not raw unnormalized logits. This threshold is fixed before the artifact comparison runs.
+constexpr double kConditionalProbabilityTolerance = 0.02;
+
+double compare(const std::vector<float>& a, const std::vector<float>& b) {
+    expect(a.size() == b.size(), "candidate score shape changed");
+    const auto pa = ninfer::decision::log_softmax(a);
+    const auto pb = ninfer::decision::log_softmax(b);
+    double worst  = 0;
+    for (std::size_t i = 0; i < pa.size(); ++i) {
+        worst = std::max(worst, std::abs(std::exp(pa[i]) - std::exp(pb[i])));
+    }
+    expect(worst <= kConditionalProbabilityTolerance,
+           "branch conditional probabilities disagree with the reference");
+    return worst;
+}
+
+} // namespace
+
+int main() {
+    const char* artifact = std::getenv("NINFER_TEST_ARTIFACT");
+    if (artifact == nullptr || *artifact == '\0') {
+        std::cout << "SKIP: NINFER_TEST_ARTIFACT is not set\n";
+        return 77;
+    }
+    try {
+        ninfer::EngineOptions options;
+        options.artifact_path    = artifact;
+        options.max_context      = 4096;
+        options.context_capacity = ninfer::ContextCapacityPolicy::explicit_capacity(2ULL << 30);
+        options.max_concurrency  = 2;
+        options.enable_decisions = true;
+        options.context_cache.host_capacity_bytes = 0;
+        const auto* spec_env                      = std::getenv("NINFER_DECISION_TEST_SPEC");
+        const std::string spec                    = spec_env ? spec_env : "none";
+        if (spec == "mtp") {
+            options.speculative.backend = ninfer::SpeculativeBackend::Mtp;
+        } else if (spec == "dflash") {
+            options.speculative.backend = ninfer::SpeculativeBackend::DFlash;
+        } else if (spec == "dflash2") {
+            options.speculative.backend = ninfer::SpeculativeBackend::DFlash2;
+        } else {
+            expect(spec == "none", "unknown NINFER_DECISION_TEST_SPEC");
+        }
+        if (spec != "none") { options.speculative.draft_tokens = 3; }
+        if (const char* head = std::getenv("NINFER_DECISION_TEST_PROPOSAL_HEAD");
+            head && std::string(head) == "1") {
+            options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
+        }
+        std::vector<Case> cases;
+        ninfer::BranchScoreResult scored;
+        std::size_t decision_kv_bytes = 0;
+        double worst                  = 0;
+        ninfer::MemoryAllocations native_memory;
+        ninfer::RankMemoryBudget native_budget;
+        ninfer::RequestOptions generation;
+        generation.execution.requested_output_tokens    = 8;
+        generation.execution.allow_prefix_reuse         = false;
+        generation.execution.sampling.temperature       = 0;
+        generation.execution.sampling.presence_penalty  = 0;
+        generation.execution.sampling.frequency_penalty = 0;
+        std::vector<ninfer::TokenId> native_output;
+        {
+            auto native_options             = options;
+            native_options.enable_decisions = false;
+            ninfer::Engine native(native_options);
+            native_memory = native.snapshot().ranks.at(0).memory.allocations;
+            native_budget = native.startup_report().ranks.at(0);
+            native_output = native.generate(native.prepare(chat()), generation).generated_token_ids;
+        }
+        {
+            ninfer::Engine engine(options);
+            const auto enabled_memory = engine.snapshot().ranks.at(0).memory.allocations;
+            const auto& budget        = engine.startup_report().ranks.at(0);
+            decision_kv_bytes         = enabled_memory.context_device_bytes;
+            expect(budget.minimum_context_capacity_bytes ==
+                           native_budget.minimum_context_capacity_bytes &&
+                       budget.context_capacity_bytes == native_budget.context_capacity_bytes &&
+                       enabled_memory.context_device_bytes == native_memory.context_device_bytes &&
+                       enabled_memory.persistent_device_bytes ==
+                           native_memory.persistent_device_bytes &&
+                       enabled_memory.workspace_device_bytes ==
+                           native_memory.workspace_device_bytes &&
+                       enabled_memory.device_bytes() == native_memory.device_bytes() &&
+                       budget.graphs.has_value() == native_budget.graphs.has_value() &&
+                       (!budget.graphs || budget.graphs->rebuild_estimate_bytes ==
+                                              native_budget.graphs->rebuild_estimate_bytes),
+                   "enabling decisions changed the native startup resource plan");
+            const auto baseline = engine.generate(engine.prepare(chat()), generation);
+            expect(!baseline.generated_token_ids.empty(), "empty ordinary generation");
+            expect(baseline.generated_token_ids == native_output,
+                   "enabling decisions changed ordinary generation");
+            const auto state_occupancy  = [&] { return engine.snapshot().runtime.state_objects; };
+            const auto chat_state_slots = state_occupancy();
+
+            auto candidates = engine.tokenize_text("true false");
+            std::sort(candidates.begin(), candidates.end());
+            candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
+            expect(candidates.size() >= 2, "need two distinct candidate tokens");
+            const auto source = engine.tokenize_text("The customer asks about their account. ");
+            expect(!source.empty(), "empty source tokens");
+            std::vector<ninfer::TokenId> common;
+            // Common prefix ends inside a 64-token KV page; each context crosses that page.
+            for (std::size_t i = 0; i < 63; ++i) { common.push_back(source[i % source.size()]); }
+            for (int context = 0; context < 2; ++context) {
+                for (std::size_t length : {0, 1, 15, 16, 17, 33}) {
+                    Case c{common, {}, candidates};
+                    c.prefix.push_back(candidates[context]);
+                    c.prefix.insert(c.prefix.end(), source.begin(),
+                                    source.begin() + std::min<std::size_t>(3, source.size()));
+                    for (std::size_t i = 0; i < length; ++i) {
+                        c.suffix.push_back(source[i % source.size()]);
+                    }
+                    cases.push_back(std::move(c));
+                }
+            }
+            const auto batch = rows(cases, true);
+            scored           = engine.score_branches(batch);
+            expect(state_occupancy() == chat_state_slots + 1,
+                   "decision state was not reserved through the native pool");
+            expect(scored.largest_batch >= 1 && scored.largest_batch <= 8 &&
+                       scored.reused_tokens > 0,
+                   "branches did not share a prefix and native batch");
+            const auto cached = engine.score_branches(batch);
+            expect(cached.computed_tokens < scored.computed_tokens, "exact root was not reused");
+            const auto refreshed = engine.score_branches(batch, {}, false);
+            expect(refreshed.computed_tokens == scored.computed_tokens &&
+                       refreshed.reused_tokens == scored.reused_tokens &&
+                       refreshed.forward_batches == scored.forward_batches,
+                   "refresh changed within-request prefix sharing or reused the retained root");
+            const auto refreshed_again = engine.score_branches(batch, {}, false);
+            expect(refreshed_again.computed_tokens == refreshed.computed_tokens,
+                   "cache opt-out reused the preceding request's root");
+            const auto uncached = engine.score_branches(rows(cases, false));
+            expect(state_occupancy() == chat_state_slots,
+                   "uncached decision leaked native state reservations");
+            expect(uncached.reused_tokens == 0 && uncached.largest_batch <= 8 &&
+                       uncached.largest_batch >= scored.largest_batch,
+                   "cache opt-out or full batch width was not honored");
+            for (std::size_t i = 0; i < cases.size(); ++i) {
+                worst = std::max({worst, compare(scored.logits[i], cached.logits[i]),
+                                  compare(scored.logits[i], refreshed.logits[i]),
+                                  compare(refreshed.logits[i], refreshed_again.logits[i]),
+                                  compare(scored.logits[i], uncached.logits[i])});
+            }
+            auto root_only = rows(cases, true);
+            root_only.resize(1);
+            root_only[0].root_tokens = root_only[0].trunk_tokens;
+            const auto no_suffix     = engine.score_branches(root_only);
+            worst = std::max(worst, compare(scored.logits[0], no_suffix.logits[0]));
+
+            // Cancel after GPU work begins; cleanup must finish before borrowed inputs are
+            // released.
+            std::atomic<unsigned> polls = 0;
+            ninfer::PreparationControl mid_batch{
+                .cancellation = ninfer::CancellationView([&] { return ++polls >= 4; })};
+            bool mid_cancel = false;
+            try {
+                (void)engine.score_branches(batch, mid_batch);
+            } catch (const ninfer::RequestError& error) {
+                mid_cancel = error.kind() == ninfer::RequestErrorKind::Cancelled;
+            }
+            expect(mid_cancel && engine.is_available(), "cancelled branch poisoned the Engine");
+            expect(state_occupancy() == chat_state_slots,
+                   "cancelled decision leaked native state reservations");
+            const auto recovered = engine.score_branches(batch);
+            for (std::size_t i = 0; i < cases.size(); ++i) {
+                worst = std::max(worst, compare(scored.logits[i], recovered.logits[i]));
+            }
+
+            auto request = ninfer::decision::parse_request(ninfer::decision::Json::parse(R"({
+            "contexts":["The customer says hello.","The customer asks about a late invoice."],
+            "schema":{
+                "greeting":{"type":"boolean","description":"Is this a greeting?"},
+                "topic":{"type":"enum","choices":["billing","bill payment","other"],"description":"Topic"},
+                "priority":{"type":"integer","minimum":1,"maximum":12,"description":"Priority"}
+            },"mode":"tree"
+        })"));
+            ninfer::decision::DecisionEngine decisions(engine);
+            for (bool cache : {true, true, false}) {
+                request.cache_prompt = cache;
+                const auto response  = decisions.run(request);
+                expect(response.at("results").size() == 2, "lost decision context");
+                for (const auto& result : response.at("results")) {
+                    expect(result.at("decision").at("greeting").is_boolean(), "lost boolean type");
+                    const auto priority = result.at("decision").at("priority").get<int>();
+                    expect(priority >= 1 && priority <= 12, "integer outside its finite domain");
+                    for (const auto& detail : result.at("fields")) {
+                        const double probability = detail.at("probability").get<double>();
+                        expect(std::isfinite(probability) && probability >= 0 && probability <= 1,
+                               "invalid decision probability");
+                    }
+                }
+                if (!cache) {
+                    const auto repeated = decisions.run(request);
+                    expect(response.at("usage").at("computed_tokens") ==
+                                   repeated.at("usage").at("computed_tokens") &&
+                               response.at("usage").at("cached_tokens").get<std::uint64_t>() > 0,
+                           "cache opt-out must rebuild once while sharing current-request work");
+                }
+            }
+            (void)engine.score_branches(batch); // Retain a known root before chat reclaims it.
+            const auto after = engine.generate(engine.prepare(chat()), generation);
+            expect(after.generated_token_ids == baseline.generated_token_ids,
+                   "decision branches leaked state into ordinary generation");
+            const auto after_chat = engine.score_branches(batch);
+            expect(after_chat.computed_tokens == scored.computed_tokens,
+                   "chat did not release the optional decision root");
+            for (std::size_t i = 0; i < cases.size(); ++i) {
+                worst = std::max(worst, compare(scored.logits[i], after_chat.logits[i]));
+            }
+            ninfer::PreparationControl cancelled{.cancellation =
+                                                     ninfer::CancellationView([] { return true; })};
+            bool did_cancel = false;
+            try {
+                (void)decisions.run(request, cancelled);
+            } catch (const ninfer::RequestError& error) {
+                did_cancel = error.kind() == ninfer::RequestErrorKind::Cancelled;
+            }
+            expect(did_cancel && engine.is_available(),
+                   "cancellation did not preserve Engine availability");
+        }
+        {
+            auto no_cache_options                  = options;
+            no_cache_options.context_cache.enabled = false;
+            ninfer::Engine engine(no_cache_options);
+            const auto batch = rows(cases, true);
+            const auto first = engine.score_branches(batch);
+            const auto again = engine.score_branches(batch);
+            expect(first.computed_tokens == scored.computed_tokens &&
+                       again.computed_tokens == first.computed_tokens && first.reused_tokens > 0,
+                   "global cache opt-out disabled sharing or reused a retained root");
+            expect(engine.snapshot().runtime.state_objects == 0,
+                   "global cache opt-out retained decision state");
+            for (std::size_t i = 0; i < cases.size(); ++i) {
+                worst = std::max(worst, compare(scored.logits[i], again.logits[i]));
+            }
+        }
+        if (const auto* vision = std::getenv("NINFER_DECISION_TEST_VISION");
+            vision && std::string(vision) == "1") {
+            auto visual_options          = options;
+            visual_options.enable_vision = true;
+            ninfer::Engine engine(visual_options);
+            const auto before  = engine.generate(engine.prepare(chat()), generation);
+            const auto picture = [&](bool blue) {
+                ninfer::OwnedMedia image;
+                image.kind               = ninfer::MediaKind::Image;
+                image.media_type         = "image/x-portable-pixmap";
+                image.source_name        = "decision.ppm";
+                const std::string header = "P6\n64 64\n255\n";
+                image.bytes.assign(header.begin(), header.end());
+                for (int pixel = 0; pixel < 64 * 64; ++pixel)
+                    image.bytes.insert(image.bytes.end(),
+                                       {static_cast<std::uint8_t>(blue ? 0 : 255), 0,
+                                        static_cast<std::uint8_t>(blue ? 255 : 0)});
+                ninfer::PromptInput input;
+                input.options.enable_thinking = false;
+                input.options.continuation = ninfer::PromptContinuationMode::ContinueFinalAssistant;
+                input.messages             = {
+                    {.role  = ninfer::ChatRole::User,
+                     .parts = {{.kind = ninfer::MessagePartKind::Media, .media = std::move(image)},
+                               {.text = "Is this picture red?"}}},
+                    {.role = ninfer::ChatRole::Assistant, .parts = {{.text = "{\"answer\":"}}}};
+                return engine.prepare_branch_prompt(std::move(input));
+            };
+            auto red = picture(false), same = picture(false), blue = picture(true);
+            expect(red.tokens == blue.tokens,
+                   "picture identity fixture needs identical placeholder IDs");
+            const std::vector<ninfer::TokenId> choices{engine.tokenize_text("true").front(),
+                                                       engine.tokenize_text("false").front()};
+            const auto score = [&](const ninfer::BranchScorePrompt& prompt, bool cache) {
+                const std::array<ninfer::BranchScoreRow, 2> batch{
+                    {{prompt.tokens,
+                      {},
+                      choices,
+                      static_cast<std::uint32_t>(prompt.tokens.size()),
+                      static_cast<std::uint32_t>(prompt.tokens.size())},
+                     {prompt.tokens,
+                      {},
+                      choices,
+                      static_cast<std::uint32_t>(prompt.tokens.size()),
+                      static_cast<std::uint32_t>(prompt.tokens.size())}}};
+                return engine.score_branches(batch, {}, cache, &prompt);
+            };
+            const auto first = score(red, false);
+            expect(first.computed_tokens == red.tokens.size(),
+                   "picture root was encoded/prefilled per branch");
+            const auto cached = score(same, true);
+            expect(cached.computed_tokens == 0, "identical picture lost native prefix reuse");
+            const auto changed = score(blue, true);
+            expect(changed.computed_tokens == blue.tokens.size(),
+                   "different pixels reused stale picture state");
+            const auto rebuilt = score(red, false);
+            for (std::size_t i = 0; i < first.logits.size(); ++i) {
+                worst = std::max(worst, compare(first.logits[i], cached.logits[i]));
+                worst = std::max(worst, compare(first.logits[i], rebuilt.logits[i]));
+            }
+            const auto after = engine.generate(engine.prepare(chat()), generation);
+            expect(before.generated_token_ids == after.generated_token_ids,
+                   "picture scoring changed ordinary chat state");
+        }
+        // Independent execution route: ordinary causal prefill + full-vocabulary log-softmax.
+        // Destroy generation first so the model is never resident twice.
+        options.enable_decisions      = false;
+        options.purpose               = ninfer::EnginePurpose::CausalScoring;
+        options.speculative           = {};
+        options.max_concurrency       = 1;
+        options.context_cache.enabled = false;
+        ninfer::Engine reference(options);
+        if (spec == "none") {
+            expect(reference.snapshot().ranks.at(0).memory.allocations.context_device_bytes ==
+                       decision_kv_bytes,
+                   "decision mode reserved a duplicate KV payload");
+        }
+        for (std::size_t i = 0; i < cases.size(); ++i) {
+            std::vector<float> expected;
+            for (auto candidate : cases[i].candidates) {
+                auto tokens = cases[i].prefix;
+                tokens.insert(tokens.end(), cases[i].suffix.begin(), cases[i].suffix.end());
+                const auto first_target = static_cast<std::uint32_t>(tokens.size());
+                tokens.push_back(candidate);
+                const auto logp = reference.score_tokens(std::move(tokens), first_target);
+                expect(logp.size() == 1, "causal reference returned the wrong score count");
+                expected.push_back(logp.front());
+            }
+            worst = std::max(worst, compare(scored.logits[i], expected));
+        }
+        std::cout << "OK decision_real (spec=" << spec << ", max_probability_error=" << worst
+                  << ")\n";
+        return 0;
+    } catch (const std::exception& error) {
+        std::cerr << "decision_real failed: " << error.what() << '\n';
+        return 1;
+    }
+}

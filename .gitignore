@@ -68,3 +68,4 @@ profiles/
 *.toml
 !/ninfer.example.toml
 !/examples/configs/*.toml
+.pi/

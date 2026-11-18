@@ -57,3 +57,5 @@ Published artifact downloads are listed in the [project README](../README.md).
 Qwen4-27B 的[架构与量化](designs/qwen4-27b-rtx5090.md)保留独立预研的几何假设与表示选择。
 
 Qwen3.8-Flash-Next 使用 Qwen4Exp；Qwen3.8-27B 使用 Qwen3.5。
+
+动态投机解码的[设计](designs/dynamic-speculative-verification.md)定义逐请求验证长度、执行布局与状态提交，[实施计划](designs/dynamic-speculative-verification-implementation.md)列出各组件的切换顺序和验收方法。

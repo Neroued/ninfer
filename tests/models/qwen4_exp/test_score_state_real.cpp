@@ -1,4 +1,4 @@
-#include "models/qwen4_exp/load.h"
+#include "rank_fixture.h"
 #include "models/qwen4_exp/program/internal.h"
 #include "models/qwen4_exp/session/session.h"
 #include "runtime/executor/local_executor.h"
@@ -58,13 +58,8 @@ public:
                     "fresh scoring inherited a prior history frontier");
             require(!row.mtp_frontier && !row.mtp_table.valid(),
                     "scoring unexpectedly uses an MTP history");
-            require(row.rope_positions.size() == 3 * row.ids.size(),
-                    "fresh scoring omitted its three RoPE axes");
-            for (unsigned axis = 0; axis < 3; ++axis)
-                for (std::size_t t = 0; t < row.ids.size(); ++t)
-                    require(row.rope_positions[axis * row.ids.size() + t] ==
-                                static_cast<std::int32_t>(t),
-                            "fresh scoring inherited RoPE positions");
+            require(row.rope_positions.empty(),
+                    "fresh linear-coordinate scoring did not use implicit RoPE");
             const auto eos = implementation.parameters.profile->config.text.ple.eos;
             require(row.ple_raw_tail == std::array<TokenId, 2>{eos, eos},
                     "fresh scoring inherited the previous PLE raw tail");
@@ -120,6 +115,12 @@ public:
             for (std::size_t t = 0; t < positions.size(); ++t)
                 require(positions[t] == static_cast<std::int32_t>(t),
                         "fresh scoring device positions do not start at zero");
+            const auto rope = read_tensor<std::int32_t>(frame.batch.rope_positions);
+            require(rope.size() == 3 * row.ids.size(), "scoring omitted a device RoPE axis");
+            for (std::size_t axis = 0; axis < 3; ++axis)
+                for (std::size_t t = 0; t < row.ids.size(); ++t)
+                    require(rope[axis * row.ids.size() + t] == static_cast<std::int32_t>(t),
+                            "fresh scoring inherited RoPE positions");
             if (!results) {
                 const auto image    = read_state(row.states.at(0).destination);
                 first_state_written = std::any_of(image.begin(), image.end(), [](std::byte value) {
@@ -192,35 +193,26 @@ int main() {
         CUDA_CHECK(error);
         auto device = std::make_unique<DeviceContext>();
         EngineOptions options;
-        options.purpose          = EnginePurpose::CausalScoring;
-        options.use_cuda_graph   = false;
-        options.enable_vision    = false;
-        options.max_context      = 128;
-        options.prefill_chunk    = 128;
-        options.max_concurrency  = 1;
-        options.context_capacity = ContextCapacityPolicy::explicit_capacity(256ULL << 20);
-        options.context_cache    = {.enabled = false, .host_capacity_bytes = 0};
+        options.purpose         = EnginePurpose::CausalScoring;
+        options.use_cuda_graph  = false;
+        options.enable_vision   = false;
+        options.max_context     = 128;
+        options.prefill_chunk   = 128;
+        options.max_concurrency = 1;
+        options.context_cache   = {.enabled = false, .host_capacity_bytes = 0};
         artifact::Reader reader(path);
-        auto definition = q4::read_definition(reader, models::load_options(options));
-        auto profile    = q4::execution::describe_model(*definition);
-        auto load       = q4::resolve_load(reader, definition, device->device(), device->device());
-        const auto geometry = load.ple_table().geometry();
-        auto model          = q4::materialize_model(std::move(load), *device);
-        auto execution      = q4::plan_execution(
-            profile, geometry, options,
-            std::make_shared<const models::BatchExecutionPlan>(models::make_batch_execution_spec(
-                options.max_concurrency, 1,
-                options.use_cuda_graph && options.purpose == EnginePurpose::Generation)),
-            *device, device_memory_snapshot(device->device()).available_bytes());
-        require(execution.has_value(), "fresh scoring execution resources do not fit");
-        auto plan = q4::plan_session(*execution);
-        auto instance =
-            std::make_unique<runtime::RankModelInstance<ObservedTypes>>(std::move(model), profile);
-        instance->program =
-            std::make_unique<ObservedRank>(instance->parameters, std::move(*execution), *device);
-        auto& rank  = *instance->program;
-        auto worker = std::make_unique<runtime::RankWorker<ObservedTypes>>(std::move(device),
-                                                                           std::move(instance));
+        q4::Startup startup(reader, reader, options, device->device());
+        auto selected          = test::flash_next::plan_rank(startup, *device, options);
+        const auto& definition = startup.definition();
+        auto plan              = q4::plan_session(selected.sequence);
+        auto model             = startup.materialize(*device, selected.placement, {});
+        auto instance          = std::make_unique<runtime::RankModelInstance<ObservedTypes>>(
+            std::move(model), startup.profile);
+        instance->program = std::make_unique<ObservedRank>(instance->parameters,
+                                                           std::move(selected.sequence), *device);
+        auto& rank        = *instance->program;
+        auto worker       = std::make_unique<runtime::RankWorker<ObservedTypes>>(std::move(device),
+                                                                                 std::move(instance));
         runtime::LocalExecutor<ObservedTypes> executor(std::move(worker), {1},
                                                        options.max_concurrency);
         q4::Session session(q4::prepare_session(definition, std::move(plan)), executor);

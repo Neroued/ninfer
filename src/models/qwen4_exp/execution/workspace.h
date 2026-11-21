@@ -82,7 +82,7 @@ struct QsaBuffers {
 };
 
 template <class Arena>
-QsaBuffers qsa(Arena& a, const QsaConfig& c, std::int32_t m, bool prefill) {
+QsaBuffers qsa(Arena& a, const QsaConfig& c, std::int32_t m, bool allocate_records) {
     const auto d = dimension(c.head_dim), qh = dimension(c.query_heads), kh = dimension(c.kv_heads);
     const auto id = dimension(c.index_dim), ih = dimension(c.index_heads);
     const auto ik = dimension(c.index_key_width());
@@ -95,8 +95,8 @@ QsaBuffers qsa(Arena& a, const QsaConfig& c, std::int32_t m, bool prefill) {
             a.alloc(DType::I32, {dimension(c.block_budget), m}),
             a.alloc(DType::I32, {m}),
             a.alloc(DType::BF16, {d, qh, m}),
-            prefill ? a.alloc(DType::BF16, {ik, m}) : Tensor{},
-            prefill ? a.alloc(DType::I32, {3, m}) : Tensor{}};
+            allocate_records ? a.alloc(DType::BF16, {ik, m}) : Tensor{},
+            allocate_records ? a.alloc(DType::I32, {3, m}) : Tensor{}};
 }
 
 struct QsaHistoryBuffers {

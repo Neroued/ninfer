@@ -6,14 +6,35 @@
 
 namespace ninfer::models::qwen4_exp {
 
+void QsaGraphReadout::prepare(execution::QsaRun run, std::span<const std::uint32_t> bounds,
+                              CudaExecutionView cuda) {
+    const auto call = run.readout(bounds);
+    query_          = call.query;
+    output_         = call.output;
+    for (const auto visible : bounds)
+        profiles_.emplace_back().capture(cuda.stream(), [&] { call.execute(visible, cuda); });
+}
+
+DecodeGraphChild QsaGraphReadout::append(const execution::QsaReadout& call,
+                                         cudaStream_t stream) const {
+    if (call.query.data != query_.data || call.output.data != output_.data)
+        throw std::logic_error("QSA graph readout binding differs from execution layout");
+    return profiles_.front().append_to(stream);
+}
+
 void TextGraph::prepare(execution::TextRun& run, const execution::Parameters& parameters,
                         moe::Schedule* experts, std::span<const std::uint32_t> bounds,
                         std::array<ple::DeviceEmbedding, 2> ple, execution::TextOutputs output,
                         Tensor logits, moe::TokenGeometry geometry, MemoryArena& workspace,
                         DeviceContext& device, const std::function<void()>& install_inputs) {
     bounds_.assign(bounds.begin(), bounds.end());
-    workspace_bytes_.resize(bounds.size());
     const auto cuda = device.execution_view();
+    workspace.reset_peak();
+    readouts_.resize(parameters.text.layers.size());
+    for (std::size_t i = 0; i < readouts_.size(); ++i)
+        if (std::holds_alternative<execution::QsaParameters>(parameters.text.layers[i].mixer))
+            readouts_[i].emplace().prepare(run.local_qsa(i), bounds, cuda);
+    workspace_bytes_ = workspace.peak_used();
     if (experts)
         prepare_offloaded(run, parameters, *experts, ple, output, logits, geometry, workspace, cuda,
                           install_inputs);
@@ -39,16 +60,6 @@ void TextGraph::prepare_resident(execution::TextRun& run, const execution::Param
                                  MemoryArena& workspace, CudaExecutionView cuda,
                                  const std::function<void()>& install_inputs) {
     auto& graph = implementation_.emplace<Resident>();
-    for (const auto bound : bounds_) {
-        run.set_visible_tokens(bound);
-        workspace.reset_peak();
-        auto& profile = graph.profiles.emplace_back();
-        for (std::uint32_t i = 0; i < p.text.layers.size(); ++i) {
-            if (!std::holds_alternative<execution::QsaParameters>(p.text.layers[i].mixer)) continue;
-            profile.emplace_back().capture(cuda.stream(), [&] { run.local_mixer(i); });
-        }
-        workspace_bytes_[graph.profiles.size() - 1] = workspace.peak_used();
-    }
     workspace.reset_peak();
     for (std::size_t slot = 0; slot < inputs.size(); ++slot) {
         graph.ple[slot].capture(cuda.stream(), [&] {
@@ -61,21 +72,19 @@ void TextGraph::prepare_resident(execution::TextRun& run, const execution::Param
     graph.main.prepare(cuda, [&] {
         install_inputs();
         run.stem();
-        std::size_t mixer = 0;
+        graph.mixers.resize(readouts_.size());
         for (std::uint32_t i = 0; i < p.text.layers.size(); ++i) {
             if (i == p.profile->config.text.ple.layer)
                 graph.ple_node = graph.ple[0].append_to(cuda.stream());
-            if (std::holds_alternative<execution::QsaParameters>(p.text.layers[i].mixer)) {
-                graph.mixers.push_back(graph.profiles.front()[mixer++].append_to(cuda.stream()));
-                run.finish_mixer(i);
-            } else
-                run.mixer(i);
+            run.mixer(i, [&](const execution::QsaReadout& call) {
+                graph.mixers[i] = readouts_[i]->append(call, cuda.stream());
+            });
             run.resident_moe(i);
             run.combine(i);
         }
         capture_finish(run, p, output, logits, workspace, cuda);
     });
-    for (auto& bytes : workspace_bytes_) bytes = std::max(bytes, workspace.peak_used());
+    workspace_bytes_ = std::max(workspace_bytes_, workspace.peak_used());
 }
 
 void TextGraph::prepare_offloaded(execution::TextRun& run, const execution::Parameters& p,
@@ -101,27 +110,19 @@ void TextGraph::prepare_offloaded(execution::TextRun& run, const execution::Para
         });
     }
     graph.finish.prepare(cuda, [&] { capture_finish(run, p, output, logits, workspace, cuda); });
-    const auto fixed_workspace = workspace.peak_used();
-    for (const auto bound : bounds_) {
-        run.set_visible_tokens(bound);
-        workspace.reset_peak();
-        auto& profile = graph.profiles.emplace_back();
-        for (std::uint32_t i = 0; i < p.text.layers.size(); ++i) {
-            const auto* shared = graph.profiles.size() == 1 ? nullptr : &graph.profiles.front()[i];
-            if (shared &&
-                std::holds_alternative<execution::GdnParameters>(p.text.layers[i].mixer)) {
-                profile.push_back(*shared);
-            } else {
-                profile.push_back(experts.capture_layer(
-                    p.text.layers[i].moe.bank, cuda, geometry, [&] { run.mixer(i); },
-                    [&](const moe::GpuCall& call) { run.gpu_moe(call); }, [&] { run.combine(i); },
-                    shared ? *shared : nullptr));
-            }
-        }
-        workspace_bytes_[graph.profiles.size() - 1] =
-            std::max({fixed_workspace, workspace.peak_used(), workspace_bytes_.front()});
+    for (std::uint32_t i = 0; i < p.text.layers.size(); ++i) {
+        auto definition = experts.capture_layer(
+            p.text.layers[i].moe.bank, cuda, geometry,
+            [&](DecodeGraphChild& child) {
+                run.mixer(i, [&](const execution::QsaReadout& call) {
+                    child = readouts_[i]->append(call, cuda.stream());
+                });
+            },
+            [&](const moe::GpuCall& call) { run.gpu_moe(call); }, [&] { run.combine(i); }, nullptr);
+        graph.layers.push_back(definition->instantiate());
+        graph.definitions.push_back(std::move(definition));
     }
-    for (const auto& layer : graph.profiles.front()) graph.layers.push_back(layer->instantiate());
+    workspace_bytes_ = std::max(workspace_bytes_, workspace.peak_used());
 }
 
 void TextGraph::capture_finish(execution::TextRun& run, const execution::Parameters& p,
@@ -151,13 +152,13 @@ void TextGraph::select(std::uint32_t visible) {
     if (next == installed_) return;
     if (resident()) {
         auto& graph = std::get<Resident>(implementation_);
-        for (std::size_t i = 0; i < graph.mixers.size(); ++i)
-            graph.main.executable.update_child(graph.mixers[i], graph.profiles[next][i]);
+        for (std::size_t i = 0; i < readouts_.size(); ++i)
+            if (readouts_[i])
+                graph.main.executable.update_child(graph.mixers[i], readouts_[i]->at(next));
     } else {
         auto& graph = std::get<Offloaded>(implementation_);
-        for (std::size_t i = 0; i < graph.layers.size(); ++i)
-            if (graph.profiles[next][i] != graph.profiles[installed_][i])
-                graph.layers[i]->update(*graph.profiles[next][i]);
+        for (std::size_t i = 0; i < readouts_.size(); ++i)
+            if (readouts_[i]) graph.layers[i]->update_mixer_child(readouts_[i]->at(next));
     }
     installed_ = next;
 }

@@ -14,6 +14,10 @@ std::uint32_t count(std::uint64_t value) {
 
 SessionPlan plan_session(const ExecutionPlan& execution) {
     SessionPlan plan{execution.shape, execution.batches};
+    plan.decode_routes       = execution.decode_routes;
+    plan.decode_path         = execution.batches->graph_rows().empty() ? ExecutionPath::Eager
+                               : execution.moe                         ? ExecutionPath::Mixed
+                                                                       : ExecutionPath::Graph;
     plan.checkpoint_interval = execution.checkpoint_interval;
     const auto rank          = execution.profile->local.rank;
     const auto& image        = execution.persistent.state.images;

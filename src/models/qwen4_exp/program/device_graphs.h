@@ -12,8 +12,9 @@ class DeviceGraphs {
 public:
     explicit DeviceGraphs(RankProgramImpl&);
     void prepare(GraphInputs&, GraphPreparation&);
-    void replay(std::uint32_t batch, std::span<const std::uint32_t> draft_visible,
-                std::uint32_t main_visible, bool head, bool read_drafts);
+    void replay(std::uint32_t batch, std::uint32_t depth,
+                std::span<const std::uint32_t> draft_visible, std::uint32_t main_visible, bool head,
+                bool read_drafts);
     void decide(std::uint32_t batch, bool verify);
 
     [[nodiscard]] std::size_t workspace_peak() const { return workspace_peak_; }
@@ -21,28 +22,39 @@ public:
     void reset_workspace_peak() { workspace_peak_ = 0; }
 
 private:
-    using MainProfiles = std::vector<std::vector<DecodeGraphDefinition>>;
+    struct DraftSites {
+        std::vector<DecodeGraphChild> nodes;
+        std::vector<std::size_t> installed;
+    };
+    struct Proposal {
+        GraphSegment graph;
+        DraftSites sites;
+    };
 
     struct Round {
         GraphSegment graph;
+        MtpGraphSteps gates;
+        DraftSites draft;
         DecodeGraphSection head, readback;
-        std::vector<DecodeGraphChild> main, draft;
-        std::size_t installed_main = 0;
-        std::vector<std::size_t> installed_draft;
+        std::vector<DecodeGraphChild> main;
+        std::size_t installed = 0;
     };
-
     struct Batch {
-        std::array<MainProfiles, 2> main;
-        std::vector<std::vector<DecodeGraphDefinition>> drafts;
+        std::array<std::vector<QsaGraphReadout>, 2> main;
+        std::vector<QsaGraphReadout> drafts;
+        std::vector<Proposal> proposals;
         std::array<Round, 2> rounds;
         std::array<GraphSegment, 2> decisions;
     };
 
     [[nodiscard]] execution::TextRun main_run(std::uint32_t batch, bool verify,
                                               std::uint32_t visible);
-    void body(Batch&, Round*, std::uint32_t batch, bool verify);
+    void proposal(Batch&, DraftSites*, std::uint32_t batch, std::uint32_t depth,
+                  MtpGraphSteps* = nullptr);
+    void target(Batch&, Round*, std::uint32_t batch, bool verify);
     [[nodiscard]] std::size_t bound(std::uint32_t visible) const;
     RankProgramImpl& owner_;
+    bool fused_;
     std::vector<std::uint32_t> bounds_;
     std::map<std::uint32_t, Batch> batches_;
     std::size_t workspace_peak_ = 0;

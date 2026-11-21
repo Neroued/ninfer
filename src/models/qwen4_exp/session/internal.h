@@ -1,6 +1,7 @@
 #pragma once
 
 #include "models/qwen4_exp/session/session.h"
+#include "models/common/speculative/round_plan.h"
 #include "models/qwen4_exp/state/continuation.h"
 #include "models/qwen4_exp/definition.h"
 #include "models/common/context/snapshot.h"
@@ -219,7 +220,7 @@ struct ComputeTransaction {
     std::uint64_t vision_id = 0;
     std::vector<SequenceHandle> members;
     std::vector<WorkRow> rows;
-    std::vector<std::uint32_t> extents;
+    std::optional<speculative::DecodeRoundPlan> round;
     std::optional<ComputeResult> result;
     ExecutionSample observed_result;
     std::vector<runtime::CommitDecision> decisions;

@@ -18,6 +18,7 @@ public:
     void prepare();
     void batch(execution::BatchView, std::uint32_t visible);
     void stage();
+    void stage_proposal(std::uint32_t rows, std::uint32_t depth, std::uint32_t visible);
 
 private:
     RankProgramImpl& owner_;
@@ -44,8 +45,8 @@ public:
 
 private:
     struct DraftStep {
-        std::vector<DecodeGraphDefinition> definitions;
-        std::vector<std::size_t> workspace_bytes;
+        QsaGraphReadout readout;
+        std::size_t workspace_bytes = 0;
         std::array<DecodeGraphDefinition, 2> handoffs;
     };
 
@@ -60,7 +61,7 @@ private:
         TextGraph main, verify;
         GraphSegment sample, accept;
         std::vector<DraftStep> drafts;
-        DraftChain chain;
+        std::vector<DraftChain> chains;
         std::size_t sample_workspace = 0, accept_workspace = 0;
     };
 
@@ -77,7 +78,7 @@ public:
     explicit MtpCommitGraphs(RankProgramImpl& owner) : owner_(owner) {}
 
     void prepare(GraphInputs&, GraphPreparation&);
-    void replay(std::uint32_t batch, bool rebuild_history, bool count_tokens);
+    void replay(std::uint32_t batch, std::uint32_t width, bool rebuild_history, bool count_tokens);
 
     [[nodiscard]] std::size_t workspace_peak() const { return workspace_peak_; }
 
@@ -91,7 +92,7 @@ private:
     };
 
     RankProgramImpl& owner_;
-    std::map<std::uint32_t, Batch> batches_;
+    std::map<std::pair<std::uint32_t, std::uint32_t>, Batch> batches_;
     std::size_t workspace_peak_ = 0;
 };
 

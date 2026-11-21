@@ -11,6 +11,7 @@
 #include "models/common/graph_preparation.h"
 #include "models/common/moe/schedule.h"
 #include "models/common/batch.h"
+#include "models/common/speculative/round_plan.h"
 
 namespace ninfer::models::qwen4_exp {
 struct PersistentLayout {
@@ -25,6 +26,7 @@ struct ExecutionPlan {
     std::shared_ptr<const execution::ModelProfile> profile;
     ExecutionShape shape;
     std::shared_ptr<const BatchExecutionPlan> batches;
+    std::shared_ptr<const speculative::DecodeGraphRoutes> decode_routes;
     PersistentLayout persistent;
     execution::WorkspacePlan workspace;
     std::shared_ptr<const moe::Plan> moe;

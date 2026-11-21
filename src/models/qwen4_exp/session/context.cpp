@@ -180,12 +180,9 @@ detail::SessionImpl::plan_binding(const RequestBasePlan& base, runtime::LaneId l
                        !states.source_pins(image);
     const auto target = resume ? resume->frontier() : frontier;
     const auto requested_peak =
-        resume
-            ? std::uint64_t(target) + (resume_kind == ExecutionUnitKind::Decode
-                                           ? std::min(shape.draft_tokens + 1, std::max(tokens, 1U))
-                                           : tokens)
-            : std::min<std::uint64_t>(base.summary().prompt_tokens,
-                                      std::uint64_t(frontier) + shape.prefill_chunk);
+        resume ? std::uint64_t(target) + (resume_kind == ExecutionUnitKind::Decode ? 1U : tokens)
+               : std::min<std::uint64_t>(base.summary().prompt_tokens,
+                                         std::uint64_t(frontier) + shape.prefill_chunk);
     auto peak =
         static_cast<std::uint32_t>(std::min<std::uint64_t>(requested_peak, shape.max_context));
     if (resume && resume_kind == ExecutionUnitKind::Prefill)

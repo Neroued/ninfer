@@ -32,7 +32,7 @@ struct MtpBufferLayout {
     TensorRegion base_conditioning, alignment_conditioning, hidden, sample;
     TensorRegion tail_keys, tail_coordinates, tail_key_offsets, tail_coordinate_offsets;
     TensorRegion drafts, extents, verify_ids, target_tokens;
-    TensorRegion last_columns, active_columns, skip_first;
+    TensorRegion last_columns, active_columns, skip_first, previous_rope, history_base_positions;
 };
 
 struct BufferLayout {

@@ -213,8 +213,9 @@ void RankProgramImpl::commit(runtime::ExecutionTicket ticket, runtime::CommandSe
         throw std::logic_error("Qwen4Exp commit refers to an inactive execution");
     auto& f = *compute;
     gpu_timer.resolve();
-    if (f.verify)
-        commit_verify(commit);
+    const auto* forward = std::get_if<ForwardWork>(&f.request.work.operation);
+    if (f.verify || (parameters.mtp && forward && forward->kind == ForwardKind::Ordinary))
+        commit_mtp(commit);
     else if (const auto* work = std::get_if<ForwardWork>(&f.request.work.operation);
              work && work->sample != SampleKind::None) {
         const auto& io  = resources.buffers();

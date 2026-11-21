@@ -87,42 +87,40 @@ bool TextRun::advance_layer(std::uint32_t i) {
     return true;
 }
 
-void TextRun::mixer(std::uint32_t i) {
-    local_mixer(i);
-    finish_mixer(i);
+QsaRun TextRun::local_qsa(std::uint32_t i) {
+    const auto& state = parameters_.profile->config.text.layers[i];
+    const auto& p     = parameters_.text.layers[i];
+    auto& arena       = execution_.workspace;
+    ops::QsaRawRecordWriteView records;
+    if (!std::holds_alternative<SequenceState>(update_)) {
+        records = {
+            execution_.qsa_raw_records.slice(3, state.state_index, 1).slice(2, 0, batch_.batch),
+            execution_.qsa_coordinate_records.slice(3, state.state_index, 1)
+                .slice(2, 0, batch_.batch),
+            batch_.record_offsets};
+    }
+    const auto after = std::holds_alternative<VerifyRecords>(update_)
+                           ? std::nullopt
+                           : std::optional{execution_.states.main_tail(state.state_index,
+                                                                       batch_.destination_offsets)};
+    return QsaRun(roots_.input, parameters_.profile->local.qsa, std::get<QsaParameters>(p.mixer),
+                  batch_, execution_.states.main_tail(state.state_index, batch_.source_offsets),
+                  after, execution_.cache.layer(state.state_index), records, roots_.output, arena,
+                  cuda_);
 }
 
-void TextRun::local_mixer(std::uint32_t i) {
+void TextRun::mixer(std::uint32_t i, const QsaSubmit& submit) {
     const auto& config = parameters_.profile->config.text;
     const auto& p      = parameters_.text.layers[i];
     const auto& state  = config.layers[i];
-    auto& arena        = execution_.workspace;
     mix(p.attention_hc);
     if (const auto* g = std::get_if<GdnParameters>(&p.mixer)) {
         gdn(roots_.input, parameters_.profile->local.gdn, *g, batch_, execution_.states.gdn(),
-            state.state_index, update_, config.norm_epsilon, roots_.output, arena, cuda_);
+            state.state_index, update_, config.norm_epsilon, roots_.output, execution_.workspace,
+            cuda_);
     } else {
-        ops::QsaRawRecordWriteView records;
-        if (!std::holds_alternative<SequenceState>(update_)) {
-            records = {
-                execution_.qsa_raw_records.slice(3, state.state_index, 1).slice(2, 0, batch_.batch),
-                execution_.qsa_coordinate_records.slice(3, state.state_index, 1)
-                    .slice(2, 0, batch_.batch),
-                batch_.record_offsets};
-        }
-        const auto after = std::holds_alternative<VerifyRecords>(update_)
-                               ? std::nullopt
-                               : std::optional{execution_.states.main_tail(
-                                     state.state_index, batch_.destination_offsets)};
-        qsa(roots_.input, parameters_.profile->local.qsa, std::get<QsaParameters>(p.mixer), batch_,
-            execution_.states.main_tail(state.state_index, batch_.source_offsets), after,
-            execution_.cache.layer(state.state_index), records, roots_.output, arena, cuda_);
+        local_qsa(i).execute(submit);
     }
-}
-
-void TextRun::finish_mixer(std::uint32_t i) {
-    const auto& config = parameters_.profile->config.text;
-    const auto& p      = parameters_.text.layers[i];
     if (i == 0 && execution_.first_collective_ready)
         execution_.first_collective_ready->wait(cuda_.stream());
     const auto output = reduce_output();

@@ -86,6 +86,9 @@ ExecutionPlan physical_plan(std::shared_ptr<const execution::ModelProfile> profi
     out.batches           = std::move(batches);
     out.profile           = std::move(profile);
     out.shape             = describe_execution_shape(*out.profile, o);
+    if (out.shape.cuda_graph)
+        out.decode_routes = std::make_shared<const speculative::DecodeGraphRoutes>(
+            *out.batches, o.speculative.backend, out.shape.draft_tokens);
     out.persistent        = persistent(*out.profile, o);
     out.workspace         = execution::plan_workspace(*out.profile, o, o.prefill_chunk,
                                                       device.multiprocessor_count(), schedule);

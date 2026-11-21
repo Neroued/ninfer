@@ -81,11 +81,11 @@ BufferLayout plan_buffers(LayoutBuilder& b, const Config& c, const EngineOptions
     if (c.mtp) {
         auto& mtp      = out.mtp.emplace();
         mtp.extents    = rows();
-        mtp.skip_first = rows();
+        mtp.previous_rope = tensor(DType::I32, {3, batch}, "previous anchor coordinates");
         for (int step = 0; step < width - 1; ++step)
             mtp.draft_steps.push_back(metadata(batch, {}, false));
         last_ingress =
-            mtp.draft_steps.empty() ? mtp.skip_first : mtp.draft_steps.back().record_offsets;
+            mtp.draft_steps.empty() ? mtp.previous_rope : mtp.draft_steps.back().record_offsets;
     }
     out.ingress = {
         out.anchors.region.offset,
@@ -97,7 +97,9 @@ BufferLayout plan_buffers(LayoutBuilder& b, const Config& c, const EngineOptions
     if (out.mtp) {
         out.mtp->last_columns   = rows();
         out.mtp->active_columns = rows();
-        last_commit             = out.mtp->active_columns;
+        out.mtp->skip_first             = rows();
+        out.mtp->history_base_positions = rows();
+        last_commit                     = out.mtp->history_base_positions;
     }
     out.commit_ingress        = {out.commit_destination_offsets.region.offset,
                                  last_commit.region.offset + last_commit.region.bytes -
@@ -255,7 +257,7 @@ void select_buffer_rows(BufferLayout& out, const BufferLayout& backing, std::uin
         out.sampling = plane(DType::I32, {static_cast<int>(sizeof(ops::SamplingConfig) / 4), n});
     if (out.mtp) {
         out.mtp->extents    = row();
-        out.mtp->skip_first = row();
+        out.mtp->previous_rope = plane(DType::I32, {3, n});
         for (std::size_t step = 0; step < out.mtp->draft_steps.size(); ++step) {
             auto& draft               = out.mtp->draft_steps[step];
             draft.positions           = row();
@@ -280,6 +282,8 @@ void select_buffer_rows(BufferLayout& out, const BufferLayout& backing, std::uin
     if (out.mtp) {
         out.mtp->last_columns   = row();
         out.mtp->active_columns = row();
+        out.mtp->skip_first             = row();
+        out.mtp->history_base_positions = row();
     }
     out.commit_ingress = {commit_begin, layout.end() - commit_begin, alignof(void*)};
     if (layout.end() > backing.commit_ingress.offset + backing.commit_ingress.bytes)

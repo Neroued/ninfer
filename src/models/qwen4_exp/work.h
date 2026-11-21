@@ -2,6 +2,7 @@
 
 #include "models/common/token_input.h"
 #include "models/common/batch.h"
+#include "models/common/speculative/round_plan.h"
 
 #include "models/common/context/contract.h"
 #include "models/common/context/directory/state.h"
@@ -66,12 +67,14 @@ struct ForwardWork {
     std::optional<PlePrefetch> prefetch;
     std::optional<qwen::VisionWork> visual;
     PhysicalBatchShape shape;
+    std::shared_ptr<const SpeculativeExecutionGeometry> speculative;
 };
 
 struct MtpWork {
     std::vector<WorkRow> rows;
     std::vector<std::uint32_t> draft_extents;
     PhysicalBatchShape shape;
+    std::shared_ptr<const SpeculativeExecutionGeometry> speculative;
 };
 
 struct ResidencyBinding {
@@ -150,6 +153,7 @@ struct WorkContract {
     std::uint32_t control_token_limit = 0;
     std::shared_ptr<const BatchExecutionPlan> batches;
 
+    std::shared_ptr<const speculative::DecodeGraphRoutes> decode_routes;
     [[nodiscard]] runtime::WorkPayloadCapacity payload_capacity(std::uint32_t rank_count) const;
     void validate(const Work&, runtime::FrameKind) const;
     void validate(const Work&, const Result&, const Commit&) const;

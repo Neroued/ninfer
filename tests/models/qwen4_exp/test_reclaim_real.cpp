@@ -1,4 +1,4 @@
-#include "models/qwen4_exp/load.h"
+#include "rank_fixture.h"
 #include "models/qwen4_exp/runtime_types.h"
 #include "models/qwen4_exp/session/internal.h"
 #include "runtime/executor/local_executor.h"
@@ -142,26 +142,15 @@ void reclaim(q4::detail::SessionImpl& p, Executor& executor) {
     for (auto& owner : owners) owner.reset();
     context::ContextDemand demand;
     demand.add_state({.count = 1});
-    require(!p.plan_reclaim(all, {}, {}).demotions.empty(),
-            "unrestricted reclamation omitted available Host migrations");
     const auto plan = p.plan_reclaim(all, {}, demand);
-    const auto tail =
-        std::find_if(plan.demotions.begin(), plan.demotions.end(),
-                     [&](const auto& quote) { return quote.sources == std::vector{deep}; });
-    const auto family =
-        std::find_if(plan.demotions.begin(), plan.demotions.end(),
-                     [&](const auto& quote) { return quote.sources.size() == all.size(); });
     const auto tail_release =
         std::find_if(plan.releases.begin(), plan.releases.end(),
                      [&](const auto& quote) { return quote.sources == std::vector{deep}; });
     const auto family_release =
         std::find_if(plan.releases.begin(), plan.releases.end(),
                      [&](const auto& quote) { return quote.sources.size() == all.size(); });
-    require(tail != plan.demotions.end() && family != plan.demotions.end() &&
-                tail_release != plan.releases.end() && family_release != plan.releases.end(),
-            "complete physical holder cohorts missing");
-    require(tail->released.records.size() < tail_release->released.records.size(),
-            "partial physical move was confused with deletion of its checkpoint");
+    require(tail_release != plan.releases.end() && family_release != plan.releases.end(),
+            "complete physical release cohorts missing");
     auto selection = plan.inventory->select();
     {
         auto probe = selection.probe({&shallow, 1});
@@ -174,6 +163,31 @@ void reclaim(q4::detail::SessionImpl& p, Executor& executor) {
         require(selection.released() == p.footprint(all, true),
                 "co-holder inventory differs from actual complete release proof");
     }
+    const bool has_host = std::ranges::any_of(
+        p.directory.records().ranks(), [](const auto& rank) { return rank.host_bytes != 0; });
+    if (!has_host) {
+        require(plan.demotions.empty(),
+                "Device-only reclamation quoted an unavailable Host migration");
+        const auto quoted   = p.directory.released_bytes(family_release->released);
+        const auto occupied = live_bytes(ContextMemoryDomain::Device);
+        p.checkpoints.clear();
+        require(occupied - live_bytes(ContextMemoryDomain::Device) == quoted &&
+                    live_bytes(ContextMemoryDomain::Device) == empty_device,
+                "Device-only State/KV release differs from the inventory quote");
+        return;
+    }
+    require(!p.plan_reclaim(all, {}, {}).demotions.empty(),
+            "unrestricted reclamation omitted available Host migrations");
+    const auto tail =
+        std::find_if(plan.demotions.begin(), plan.demotions.end(),
+                     [&](const auto& quote) { return quote.sources == std::vector{deep}; });
+    const auto family =
+        std::find_if(plan.demotions.begin(), plan.demotions.end(),
+                     [&](const auto& quote) { return quote.sources.size() == all.size(); });
+    require(tail != plan.demotions.end() && family != plan.demotions.end(),
+            "complete physical migration cohorts missing");
+    require(tail->released.records.size() < tail_release->released.records.size(),
+            "partial physical move was confused with deletion of its checkpoint");
     const auto extra = *p.checkpoints.reserve();
     p.checkpoints.publish(extra, p.checkpoints.at(deep));
     require(p.start_demote(*tail, {}) != runtime::ContextStart::Started,
@@ -263,24 +277,18 @@ int main() {
         options.speculative.backend      = SpeculativeBackend::Mtp;
         options.speculative.draft_tokens = 1;
         // Two State records and the Main/MTP record classes need four Context blocks.
-        options.context_cache.host_capacity_bytes = 512ULL * 1024 * 1024;
+        options.context_cache.host_capacity_bytes =
+            device_memory_snapshot(device->device()).shared_physical_memory ? 0 : 512ULL << 20;
         artifact::Reader reader(path);
-        auto definition = q4::read_definition(reader, models::load_options(options));
-        auto profile    = q4::execution::describe_model(*definition);
-        auto load       = q4::resolve_load(reader, definition, device->device(), Device::cpu());
-        auto execution  = q4::plan_execution(
-            profile, load.ple_table().geometry(), options,
-            std::make_shared<const models::BatchExecutionPlan>(models::make_batch_execution_spec(
-                options.max_concurrency, 1,
-                options.use_cuda_graph && options.purpose == EnginePurpose::Generation)),
-            *device, 8ULL * 1024 * 1024 * 1024, q4::describe_moe_plan(*profile, options.moe));
-        require(execution.has_value(), "reclaim test execution plan does not fit");
-        auto session_plan = q4::plan_session(*execution);
-        auto model        = q4::materialize_model(std::move(load), *device);
-        auto instance     = std::make_unique<runtime::RankModelInstance<q4::RuntimeTypes>>(
-            std::move(model), profile);
-        instance->program =
-            std::make_unique<q4::RankProgram>(instance->parameters, std::move(*execution), *device);
+        q4::Startup startup(reader, reader, options, device->device());
+        auto selected          = test::flash_next::plan_rank(startup, *device, options);
+        const auto& definition = startup.definition();
+        auto session_plan      = q4::plan_session(selected.sequence);
+        auto model             = startup.materialize(*device, selected.placement, {});
+        auto instance          = std::make_unique<runtime::RankModelInstance<q4::RuntimeTypes>>(
+            std::move(model), startup.profile);
+        instance->program = std::make_unique<q4::RankProgram>(
+            instance->parameters, std::move(selected.sequence), *device);
         auto worker = std::make_unique<runtime::RankWorker<q4::RuntimeTypes>>(std::move(device),
                                                                               std::move(instance));
         Executor executor(std::move(worker), {1}, options.max_concurrency);

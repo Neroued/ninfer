@@ -6,6 +6,20 @@
 
 namespace ninfer::models::qwen4_exp {
 
+// One site has fixed operands and a bounded scratch span for every context envelope.
+class QsaGraphReadout {
+public:
+    void prepare(execution::QsaRun, std::span<const std::uint32_t> bounds, CudaExecutionView);
+    [[nodiscard]] DecodeGraphChild append(const execution::QsaReadout&, cudaStream_t) const;
+
+    [[nodiscard]] const DecodeGraphDefinition& at(std::size_t index) const {
+        return profiles_.at(index);
+    }
+private:
+    Tensor query_, output_;
+    std::vector<DecodeGraphDefinition> profiles_;
+};
+
 // One exact T/B traversal. Resident execution submits one graph, with replaceable QSA
 // mixers and PLE input. Expert offload retains its Host handoffs between layer segments.
 class TextGraph {
@@ -24,7 +38,7 @@ public:
     [[nodiscard]] bool advance_suffix(CudaExecutionView);
     void cancel();
 
-    [[nodiscard]] std::size_t workspace_bytes() const { return workspace_bytes_[installed_]; }
+    [[nodiscard]] std::size_t workspace_bytes() const { return workspace_bytes_; }
 
 private:
     struct Resident {
@@ -32,13 +46,13 @@ private:
         std::array<DecodeGraphDefinition, 2> ple;
         DecodeGraphChild ple_node;
         std::vector<DecodeGraphChild> mixers;
-        std::vector<std::vector<DecodeGraphDefinition>> profiles;
+
         std::uint32_t slot = 0;
     };
 
     struct Offloaded {
         GraphSegment stem, ple[2], finish;
-        std::vector<std::vector<std::shared_ptr<const moe::LayerGraphDefinition>>> profiles;
+        std::vector<std::shared_ptr<const moe::LayerGraphDefinition>> definitions;
         std::vector<std::unique_ptr<moe::LayerGraphExecutable>> layers;
         Tensor block_output;
         std::uint32_t ple_layer = 0;
@@ -61,7 +75,8 @@ private:
     DecodeGraphSection head_;
     std::variant<std::monostate, Resident, Offloaded> implementation_;
     std::vector<std::uint32_t> bounds_;
-    std::vector<std::size_t> workspace_bytes_;
+    std::size_t workspace_bytes_ = 0;
+    std::vector<std::optional<QsaGraphReadout>> readouts_;
     std::size_t installed_ = 0;
 };
 

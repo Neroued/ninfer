@@ -51,8 +51,13 @@ Resources::Resources(const execution::Parameters& p, ExecutionPlan input, Device
     context_actions =
         std::make_unique<context::ContextMigration>(device, *context, mapping_elements);
     if (plan.persistent.buffers.gdn_records) {
-        gdn_records.emplace(backing, *plan.persistent.buffers.gdn_records);
-        gdn_fold.emplace(*gdn_records, states->gdn().all_layers_view({}));
+        const auto& layout = *plan.persistent.buffers.gdn_records;
+        replay_widths_.reserve(layout.spec.width - 1);
+        for (int w = 2; w <= layout.spec.width; ++w) {
+            GdnReplayRecords records(backing, layout.with_width(w));
+            replay_widths_.push_back(
+                {records, ops::GdnReplayFoldPlan(records, states->gdn().all_layers_view({}))});
+        }
     }
     if (plan.moe) {
         std::vector<const moe::Parameters*> layers;
@@ -151,6 +156,14 @@ Tensor Resources::packed(const TensorRegion& region, std::initializer_list<std::
     if (bytes > region.region.bytes)
         throw std::invalid_argument("Qwen4Exp packed tensor exceeds frame capacity");
     return Tensor(region.region.bind(persistent()).subspan(0, bytes), region.dtype, shape);
+}
+
+Resources::MainRecords Resources::main_records(std::int32_t width, std::int32_t batch) {
+    const auto& qsa   = buffers_.main_qsa;
+    const auto layers = dimension(qsa.layers);
+    return {packed(qsa.keys, {qsa.keys.shape[0], width, batch, layers}),
+            packed(qsa.coordinates, {3, width, batch, layers}),
+            packed(buffers_.ple_records, {buffers_.ple_records.shape[0], width, batch})};
 }
 
 void Resources::select_batch(std::uint32_t rows) {

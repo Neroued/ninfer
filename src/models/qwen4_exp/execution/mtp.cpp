@@ -61,13 +61,14 @@ void MtpRun::stem() {
              arena_, cuda_);
 }
 
-void MtpRun::local_mixer() {
-    mix(roots_.normalized, parameters_.layer.attention_hc, roots_, arena_, cuda_);
-    qsa(roots_.input, qsa_, std::get<QsaParameters>(parameters_.layer.mixer), batch_, before_,
-        after_, cache_, {}, roots_.output, arena_, cuda_);
+QsaRun MtpRun::local_qsa() {
+    return QsaRun(roots_.input, qsa_, std::get<QsaParameters>(parameters_.layer.mixer), batch_,
+                  before_, after_, cache_, {}, roots_.output, arena_, cuda_);
 }
 
-void MtpRun::finish_mixer() {
+void MtpRun::mixer(const QsaSubmit& submit) {
+    mix(roots_.normalized, parameters_.layer.attention_hc, roots_, arena_, cuda_);
+    local_qsa().execute(submit);
     if (parallel_) parallel_->sum(roots_.output, cuda_);
     ops::hc_combine_norm(roots_.residual, roots_.output, roots_.injection,
                          parameters_.layer.moe_hc.norm, config_.norm_epsilon, roots_.residual,
@@ -102,8 +103,7 @@ void mtp_forward(const TextConfig& c, const QsaConfig& qsa_config, const MtpPara
                  CudaExecutionView cuda, ParallelExecution* parallel) {
     MtpRun run(c, qsa_config, p, conditioning, batch, before, after, cache, arena, cuda, parallel);
     run.stem();
-    run.local_mixer();
-    run.finish_mixer();
+    run.mixer();
     run.feed_forward();
     run.finish(output);
 }

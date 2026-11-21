@@ -58,10 +58,25 @@ public:
                                                  std::int32_t batch, std::uint32_t visible);
     [[nodiscard]] ops::QsaTailStateView mtp_working_tail(std::uint32_t slot, std::int32_t batch);
 
+    struct Replay {
+        GdnReplayRecords records;
+        ops::GdnReplayFoldPlan fold;
+    };
+
+    [[nodiscard]] const Replay& replay(std::int32_t width) const {
+        return replay_widths_.at(width - 2);
+    }
+
+    struct MainRecords {
+        Tensor keys, coordinates, ple;
+    };
+
+    [[nodiscard]] MainRecords main_records(std::int32_t width, std::int32_t batch);
     const ExecutionPlan plan;
 private:
     DeviceContext& device_;
     BufferLayout buffers_;
+    std::vector<Replay> replay_widths_;
     std::uint32_t selected_rows_ = 0;
     DeviceBuffer context_, persistent_, workspace_;
     PinnedHostBuffer ingress_, egress_, sampling_, ple_handoff_, compute_aux_, context_counts_;
@@ -75,8 +90,6 @@ public:
     std::unique_ptr<QsaCache> main, mtp;
     std::unique_ptr<context::ContextStorage> context;
     std::unique_ptr<context::ContextMigration> compute_actions, context_actions;
-    std::optional<GdnReplayRecords> gdn_records;
-    std::optional<ops::GdnReplayFoldPlan> gdn_fold;
     std::unique_ptr<moe::Schedule> experts;
     std::unique_ptr<ple::UploadSlots> ple_upload;
     std::unique_ptr<ple::disk::PrepareService> ple_prepare;

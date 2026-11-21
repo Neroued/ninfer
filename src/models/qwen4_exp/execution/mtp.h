@@ -1,5 +1,7 @@
 #pragma once
 
+#include "models/qwen4_exp/execution/qsa.h"
+
 #include "models/qwen4_exp/execution/batch.h"
 #include "models/qwen4_exp/execution/parameters.h"
 #include "models/common/parallel_execution.h"
@@ -13,8 +15,8 @@ public:
            BatchView, ops::QsaTailStateView before, ops::QsaTailStateView after, ops::QsaCacheView,
            MemoryArena&, CudaExecutionView, ParallelExecution* = nullptr);
     void stem();
-    void local_mixer();
-    void finish_mixer();
+    void mixer(const QsaSubmit& = {});
+    [[nodiscard]] QsaRun local_qsa();
     void feed_forward();
     void finish(TextOutputs);
 

@@ -7,7 +7,8 @@ Tensor RankProgramImpl::device_embedding(std::int32_t tokens, std::int32_t batch
                          {dimension(parameters.profile->config.text.ple.embedding), tokens, batch});
 }
 
-void RankProgramImpl::prepare_device_ple(const execution::BatchView& batch) {
+void RankProgramImpl::prepare_device_ple(const execution::BatchView& batch, bool read_drafts,
+                                         DecodeGraphSection* readback) {
     const auto& table    = std::get<DevicePleTable>(parameters.model.ple_table());
     const auto& controls = parameters.model.definition().ple_parameters().hash;
     ops::NgramHashParameters hash;
@@ -29,6 +30,7 @@ void RankProgramImpl::prepare_device_ple(const execution::BatchView& batch) {
     const auto producer = resources.ple_transfer();
     ple_inputs.record(cuda.stream());
     ple_inputs.wait(producer.stream());
+    if (read_drafts) copy_verify_inputs(batch.batch, batch.tokens, readback);
     ops::ngram_embedding_lookup(batch.ids, batch.valid_columns, {tail_field}, hash,
                                 parameters.profile->config.text.ple.eos, table.shards, embedding,
                                 producer);

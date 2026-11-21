@@ -43,10 +43,9 @@ void RankProgramImpl::vocabulary_sample(std::int32_t batch, bool first_token) {
                         first_token ? ops::kSamplePurposePrefill : ops::kSamplePurposeDecode, ids);
 }
 
-void RankProgramImpl::vocabulary_accept(std::int32_t batch) {
+void RankProgramImpl::vocabulary_accept(std::int32_t batch, std::int32_t width) {
     const auto& io  = resources.buffers();
     const auto& mtp = *io.mtp;
-    const int width = shape.draft_tokens + 1;
     auto logits =
         packed_tensor(*io.logits, {dimension(parameters.profile->local.vocabulary), width, batch});
     auto drafts        = draft_proposals(batch);

@@ -66,7 +66,8 @@ void RankProgramImpl::validate_work(const Work& work, runtime::FrameKind kind) c
                  bool(parameters.mtp),
                  bool(parameters.vision),
                  parameters.profile->control_token_limit,
-                 resources.plan.batches}
+                 resources.plan.batches,
+                 resources.plan.decode_routes}
         .validate(work, kind);
     const auto check_resident = [&](const runtime::ExecutionMember& member) {
         const auto& resident = bindings[member.residency.lane.value];
@@ -149,7 +150,8 @@ void RankProgramImpl::prepare_commit(runtime::ExecutionTicket ticket, const Comm
                  bool(parameters.mtp),
                  bool(parameters.vision),
                  parameters.profile->control_token_limit,
-                 resources.plan.batches}
+                 resources.plan.batches,
+                 resources.plan.decode_routes}
         .validate_commit(frame.request.work, frame.result.rows, commit);
     for (const auto& row : commit.rows)
         check_selectors(row.states.at(parameters.profile->local.rank), resources.states->storage());

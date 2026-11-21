@@ -20,7 +20,8 @@ runtime::protocol::ControlBudget control_budget(const ModelDefinition& definitio
         definition.options().mtp(),
         definition.options().vision,
         static_cast<std::uint32_t>(definition.resources().text.control_tokens->size()),
-        p.batches};
+        p.batches,
+        p.decode_routes};
     const auto payloads = contract.payload_capacity(scope.owners.size());
     // Generated tokens are bounded by speculative positions. Scoring emits
     // at most one prefill chunk; context observations are coalesced by resource/direction.
@@ -57,6 +58,8 @@ GroupExecutionPlan plan_group_execution(const ParallelPlan& parallel,
             session.vision_max_features != plan.session.vision_max_features ||
             session.context.pools.size() != plan.session.context.pools.size())
             throw std::invalid_argument("Qwen4Exp rank execution semantics differ");
+        if (session.decode_path == ExecutionPath::Mixed)
+            plan.session.decode_path = ExecutionPath::Mixed;
         auto& context = plan.session.context;
         context.ranks.insert(context.ranks.end(), session.context.ranks.begin(),
                              session.context.ranks.end());
@@ -98,7 +101,8 @@ ExecutionCodec::ExecutionCodec(const ModelDefinition& definition,
                 definition.options().mtp(),
                 definition.options().vision,
                 static_cast<std::uint32_t>(definition.resources().text.control_tokens->size()),
-                rank.session.batches} {
+                rank.session.batches,
+                rank.session.decode_routes} {
     rank_               = rank.observation.rank;
     ranks_              = topology.ranks.size();
     max_features_       = rank.session.vision_max_features;

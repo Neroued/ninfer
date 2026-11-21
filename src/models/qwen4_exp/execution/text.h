@@ -1,5 +1,7 @@
 #pragma once
 
+#include "models/qwen4_exp/execution/qsa.h"
+
 #include "models/qwen4_exp/execution/batch.h"
 #include "models/qwen4_exp/execution/workspace.h"
 #include "models/qwen4_exp/execution/parameters.h"
@@ -31,9 +33,8 @@ public:
     // GPU bodies share the same activation frame in eager execution and graph capture.
     void stem(std::optional<models::vision::EmbeddingView> = {});
     [[nodiscard]] bool advance_layer(std::uint32_t layer);
-    void mixer(std::uint32_t layer);
-    void local_mixer(std::uint32_t layer);
-    void finish_mixer(std::uint32_t layer);
+    void mixer(std::uint32_t layer, const QsaSubmit& = {});
+    [[nodiscard]] QsaRun local_qsa(std::uint32_t layer);
     void resident_moe(std::uint32_t layer);
     void gpu_moe(const moe::GpuCall&);
     void combine(std::uint32_t layer);

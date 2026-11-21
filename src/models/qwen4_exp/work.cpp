@@ -15,6 +15,7 @@ ExecutionWork ExecutionTypes::describe_work(const Work& work) {
         [&](const auto& op) {
             using T = std::decay_t<decltype(op)>;
             if constexpr (std::is_same_v<T, ForwardWork>) {
+                result.speculative = op.speculative;
                 result.kind = op.kind == ForwardKind::Prefill   ? ExecutionKind::Prefill
                               : op.kind == ForwardKind::Replay  ? ExecutionKind::Replay
                               : op.kind == ForwardKind::Control ? ExecutionKind::Control
@@ -23,6 +24,7 @@ ExecutionWork ExecutionTypes::describe_work(const Work& work) {
                 for (const auto& row : op.rows) result.input_tokens += row.ids.size();
                 result.scheduled_positions = result.input_tokens;
             } else if constexpr (std::is_same_v<T, MtpWork>) {
+                result.speculative = op.speculative;
                 result.kind = ExecutionKind::Decode;
                 result.rows = result.input_tokens = op.rows.size();
                 for (const auto extent : op.draft_extents) result.scheduled_positions += extent + 1;
@@ -91,6 +93,13 @@ void plan_work_batch(Work& work, const BatchExecutionPlan& plan) {
                 bool decode = std::is_same_v<T, MtpWork>;
                 if constexpr (std::is_same_v<T, ForwardWork>)
                     decode = operation.kind == ForwardKind::Ordinary;
+                if constexpr (std::is_same_v<T, MtpWork> || std::is_same_v<T, ForwardWork>) {
+                    if (operation.speculative) {
+                        operation.shape = {operation.speculative->physical_rows,
+                                           operation.speculative->owner_rows};
+                        return;
+                    }
+                }
                 const auto rows = static_cast<std::uint32_t>(count);
                 operation.shape = decode ? plan.decode(rows, rows) : plan.exact(rows, rows);
             }
@@ -115,8 +124,11 @@ runtime::WorkPayloadCapacity WorkContract::payload_capacity(std::uint32_t rank_c
         return header + actions(rows, span) + 136 + rows * (204 + token_bytes);
     };
     const std::size_t width = shape.draft_tokens + 1;
-    const auto work         = std::max({payload(1, chunk, 20 * chunk), payload(batch, width, 16),
-                                        payload(batch, control_token_limit, 8ULL * control_token_limit)});
+    // Presence, physical width, proposal depth, path and optional graph entry.
+    constexpr std::size_t route_bytes = 1 + 4 + 4 + 1 + 1 + 4;
+    const auto work =
+        std::max({payload(1, chunk, 20 * chunk), payload(batch, width, 16) + route_bytes,
+                  payload(batch, control_token_limit, 8ULL * control_token_limit)});
     const auto context      = header + context::action_batch_capacity() + 128 + 88 +
                          TokenCounts::encoded_capacity(public_tokens) + 16 * batch;
     const auto decision = header + 12 + batch * (20 + 4 * width * ((public_tokens + 31ULL) / 32));
@@ -149,6 +161,40 @@ void WorkContract::validate(const Work& work, runtime::FrameKind kind) const {
         const auto expected = decode ? batches->decode(count, count) : batches->exact(count, count);
         if (work_shape(work) != expected)
             throw std::invalid_argument("Qwen4Exp physical shape differs from prepared batch plan");
+        const auto described = ExecutionTypes::describe_work(work);
+        const auto& geometry = described.speculative;
+        if (static_cast<bool>(geometry) != (decode && mtp && shape.draft_tokens))
+            throw std::invalid_argument("Qwen4Exp speculative route does not match decode work");
+        if (geometry) {
+            const auto* proposal = std::get_if<MtpWork>(&work.operation);
+            const auto& g        = *geometry;
+            const auto depth     = proposal && !proposal->draft_extents.empty()
+                                       ? *std::max_element(proposal->draft_extents.begin(),
+                                                           proposal->draft_extents.end())
+                                       : 0U;
+            const speculative::RoundRoute route{{g.physical_rows, g.owner_rows},
+                                                g.verify_width,
+                                                g.mtp_steps,
+                                                g.head_columns,
+                                                g.graph_entry};
+            route.validate(SpeculativeBackend::Mtp, shape.draft_tokens);
+            const auto target = described.scheduled_positions;
+            if ((proposal != nullptr) != (depth != 0) ||
+                !route.covers(SpeculativeBackend::Mtp, depth) || route.shape != expected ||
+                g.valid_target_tokens != target || g.owner_target_tokens.size() != 1 ||
+                g.owner_target_tokens.front() != target ||
+                shape.cuda_graph != route.graph_entry.has_value() ||
+                (shape.cuda_graph
+                     ? (g.path != ExecutionPath::Graph && g.path != ExecutionPath::Mixed)
+                     : g.path != ExecutionPath::Eager))
+                throw std::invalid_argument("invalid Qwen4Exp speculative decode geometry");
+            if (shape.cuda_graph) {
+                if (!decode_routes) throw std::logic_error("Qwen4Exp Graph directory is missing");
+                const auto ready = decode_routes->at(expected);
+                if (std::ranges::find(ready, route) == ready.end())
+                    throw std::invalid_argument("Qwen4Exp speculative Graph route is not prepared");
+            }
+        }
         std::set<std::pair<std::uint64_t, std::uint64_t>> sequences;
         std::unordered_set<std::uint32_t> lanes, main_tables, mtp_tables;
         for (std::size_t b = 0; b < rows.size(); ++b) {
@@ -259,7 +305,7 @@ void WorkContract::validate(const Work& work, runtime::FrameKind kind) const {
                 bool any = false;
                 for (std::size_t i = 0; i < rows.size(); ++i) {
                     const auto extent = operation.draft_extents[i];
-                    if (rows[i].ids.size() != 1 || !rows[i].main_frontier ||
+                    if (rows[i].ids.size() != 1 || (extent && !rows[i].main_frontier) ||
                         extent > shape.draft_tokens ||
                         extent >= shape.max_context - rows[i].main_frontier)
                         throw std::invalid_argument("invalid Qwen4Exp MTP input extent");
@@ -331,12 +377,17 @@ void WorkContract::validate(const Work& work, const runtime::DecisionRequest& re
                             const runtime::DecisionInput& input) const {
     const auto rows = work_rows(work);
     std::vector<std::uint32_t> positions(rows.size());
+    const auto* mtp_work = std::get_if<MtpWork>(&work.operation);
     if (request.vocabulary != public_tokens)
         throw std::invalid_argument("Qwen4Exp decision request differs from its work");
     for (const auto& row : request.rows) {
         if (row.member >= rows.size() || !rows[row.member].constrained || positions[row.member])
             throw std::invalid_argument("Qwen4Exp decision request has an unexpected member");
-        positions[row.member] = row.drafts.size() + 1;
+        const auto verified = mtp_work ? mtp_work->draft_extents.at(row.member) : 0U;
+        if (row.drafts.size() != verified)
+            throw std::invalid_argument(
+                "Qwen4Exp grammar request differs from its verified prefix");
+        positions[row.member] = verified + 1;
     }
     for (std::size_t i = 0; i < rows.size(); ++i)
         if (rows[i].constrained != bool(positions[i]))
@@ -358,9 +409,9 @@ void WorkContract::validate_commit(const Work& work, std::span<const RowResult> 
                                    const Commit& commit) const {
     const auto rows     = work_rows(work);
     const auto* forward = std::get_if<ForwardWork>(&work.operation);
-    const bool verify   = std::holds_alternative<MtpWork>(work.operation);
+    const auto* mtp_work = std::get_if<MtpWork>(&work.operation);
     const bool scoring  = std::holds_alternative<ScoreWork>(work.operation);
-    const bool sampled  = verify || (forward && forward->sample != SampleKind::None);
+    const bool sampled   = mtp_work || (forward && forward->sample != SampleKind::None);
     if (commit.rows.size() != rows.size() || (!scoring && results.size() != rows.size()))
         throw std::logic_error("Qwen4Exp commit rows differ from its result");
     std::unordered_map<std::uint32_t, std::unordered_set<std::int64_t>> reads, writes;
@@ -372,9 +423,14 @@ void WorkContract::validate_commit(const Work& work, std::span<const RowResult> 
         for (const auto& [rank, offsets] : row.states) {
             const auto previous = source.states.at(rank);
             if (offsets.source != previous.source ||
-                (!verify && offsets.destination != previous.destination))
+                (!mtp_work && offsets.destination != previous.destination))
                 throw std::logic_error("Qwen4Exp commit changes its prepared State binding");
         }
+        if (mtp_work && (results[b].drafts != mtp_work->draft_extents[b] ||
+                         results[b].accepted_drafts > results[b].drafts ||
+                         results[b].tokens.size() != std::uint64_t(results[b].accepted_drafts) + 1))
+            throw std::invalid_argument(
+                "Qwen4Exp acceptance result differs from its verified prefix");
         if (sampled) {
             const auto& output  = results[b];
             const auto produced = output.tokens.size();

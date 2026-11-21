@@ -69,6 +69,7 @@ void encode(Encoder& out, const RankExecutionDescription& r) {
     out.boolean(s.context_cache);
     out.boolean(s.cuda_graph);
     out.boolean(s.gpu_timing);
+    out.u8(static_cast<std::uint8_t>(p.decode_path));
     encode_batch_execution_spec(out, p.batches->spec());
     context::encode_directory(out, p.context);
     out.u32(p.vision_max_features);
@@ -91,7 +92,12 @@ RankExecutionDescription decode_rank_execution(Decoder& in) {
                  in.boolean(),
                  in.boolean(),
                  in.boolean()};
+    p.decode_path = static_cast<ExecutionPath>(in.u8());
     p.batches = std::make_shared<const BatchExecutionPlan>(decode_batch_execution_spec(in));
+    if (p.shape.cuda_graph)
+        p.decode_routes = std::make_shared<const speculative::DecodeGraphRoutes>(
+            *p.batches, p.shape.draft_tokens ? SpeculativeBackend::Mtp : SpeculativeBackend::None,
+            p.shape.draft_tokens);
     p.context = context::decode_directory(in);
     p.vision_max_features = in.u32();
     p.checkpoint_interval = in.u32();

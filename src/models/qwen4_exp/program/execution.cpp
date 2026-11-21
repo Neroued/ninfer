@@ -68,9 +68,11 @@ void RankProgramImpl::prepare_main_inputs(std::span<const WorkRow> rows, std::ui
         host(io.record_offsets)[b]     = 0;
         host(io.sampling_positions)[b] = row.sampling_position;
         if (!frame.sequence) host(buffers.anchors)[b] = row.ids.front();
-        if (buffers.mtp && frame.verify) {
-            host(buffers.mtp->extents)[b]    = frame.verify->extents[b];
-            host(buffers.mtp->skip_first)[b] = 1;
+        if (buffers.mtp && !frame.sequence) {
+            host(buffers.mtp->extents)[b] = frame.verify ? frame.verify->extents[b] : 0;
+            host(buffers.mtp->draft_steps.front().table_rows)[b] = row.mtp_table.index;
+            std::copy(row.previous_rope.begin(), row.previous_rope.end(),
+                      host(buffers.mtp->previous_rope) + 3 * b);
         }
         host(io.raw_tail)[2 * b]        = row.ple_raw_tail[0];
         host(io.raw_tail)[2 * b + 1]    = row.ple_raw_tail[1];
@@ -212,25 +214,28 @@ void RankProgramImpl::prepare_main() {
         const bool control     = forward && forward->sample == SampleKind::None;
         const bool constrained = std::any_of(f.rows.begin(), f.rows.end(),
                                              [](const auto& row) { return row.constrained; });
-        device_graphs->replay(batch, f.draft_visible, f.visible, !control, constrained);
+        const auto depth =
+            f.verify ? std::get<MtpWork>(f.request.work.operation).speculative->mtp_steps : 0;
+        device_graphs->replay(batch, depth, f.draft_visible, f.visible, !control, constrained);
         request_decision();
         f.graph_main = true;
         f.phase      = ComputePhase::AfterMain;
         return;
     }
     if (!f.sequence) gpu_timer.begin_target();
+    const auto records = f.sequence ? Resources::MainRecords{} : resources.main_records(t, batch);
     const execution::TextExecution execution{resources.workspace,
                                              *resources.states,
                                              *resources.main,
                                              resources.experts.get(),
-                                             device_tensor(layout.main_qsa.keys),
-                                             device_tensor(layout.main_qsa.coordinates),
-                                             device_tensor(layout.ple_records),
+                                             records.keys,
+                                             records.coordinates,
+                                             records.ple,
                                              parallel ? &*parallel : nullptr,
                                              parallel && !host_ple ? &ple_ready : nullptr};
     execution::StateUpdate update = execution::StepUpdate{};
     if (f.verify)
-        update.emplace<execution::VerifyRecords>(*resources.gdn_records);
+        update.emplace<execution::VerifyRecords>(resources.replay(t).records);
     else if (f.sequence)
         update = execution::SequenceState{
             f.rows[0].states.at(parameters.profile->local.rank).source,
@@ -264,7 +269,9 @@ void RankProgramImpl::after_main() {
     auto& f = *compute;
     if (!f.sequence && !f.graph_main) gpu_timer.end_target();
     f.run.reset();
-    if (!f.verify) {
+    const auto* source    = std::get_if<ForwardWork>(&f.request.work.operation);
+    const bool mtp_decode = parameters.mtp && source && source->kind == ForwardKind::Ordinary;
+    if (!f.verify && !mtp_decode) {
         if (parameters.mtp)
             align_mtp(f.rows, f.tokens, f.previous_conditioning, f.conditioning, f.visual);
         if (f.sequence) {
@@ -433,7 +440,7 @@ void RankProgramImpl::prepare_decision() {
         if (graphs && host_ple)
             graphs->accept(batch);
         else
-            accept_forward(batch);
+            accept_forward(batch, f.verify->width);
         const auto begin = buffers.sampled_ids->region.offset;
         const auto bytes =
             buffers.output_counts->region.offset + buffers.output_counts->region.bytes - begin;
@@ -469,11 +476,10 @@ void RankProgramImpl::copy_sample_result(std::int32_t batch, bool verify) {
                      resources.persistent().subspan(begin, bytes), cuda);
 }
 
-void RankProgramImpl::copy_verify_inputs(std::int32_t batch, DecodeGraphSection* section) {
-    const auto ids      = resources.main_batch(shape.draft_tokens + 1, batch, 1).ids;
+void RankProgramImpl::copy_verify_inputs(std::int32_t batch, std::int32_t width,
+                                         DecodeGraphSection* section) {
+    const auto ids      = resources.main_batch(width, batch, 1).ids;
     const auto transfer = resources.ple_transfer();
-    ple_inputs.record(cuda.stream());
-    ple_inputs.wait(transfer.stream());
     const auto copy = [&] {
         copy_bytes_async(draft_output.span().subspan(0, ids.bytes()),
                          {ids.data, ids.bytes(), cuda.device()}, transfer);

@@ -43,7 +43,7 @@ set_tests_properties(ninfer_device_sync_invalid_test PROPERTIES
 set_tests_properties(ninfer_device_sync_empty_test PROPERTIES
   ENVIRONMENT "NINFER_CUDA_SYNC=")
 
-ninfer_add_test(ninfer_decode_graph_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_decode_graph.cpp"
+ninfer_add_test(ninfer_decode_graph_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_decode_graph.cu"
   LIBRARIES ninfer_core)
 
 ninfer_add_test(ninfer_tensor_test       SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_tensor.cpp"
@@ -83,10 +83,6 @@ set_tests_properties(
   ninfer_arena_test
   ninfer_state_store_test
   PROPERTIES SKIP_RETURN_CODE 77)
-
-ninfer_add_test(ninfer_host_timing_test
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_host_timing.cpp"
-  LIBRARIES ninfer_runtime_support)
 
 ninfer_add_test(ninfer_weight_bank_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_weight_bank.cpp"
   LIBRARIES ninfer_core)

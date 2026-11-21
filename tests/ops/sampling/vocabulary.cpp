@@ -20,7 +20,7 @@ std::uint64_t key(float score, int id) {
 }
 
 struct Fixture {
-    int v, t, b, r, k, domain, mask_stride;
+    int v, t, b, r, k, domain, mask_stride, steps;
     std::vector<std::uint16_t> logits;
     std::vector<int> counts, valid, drafts;
     std::vector<std::uint32_t> masks;
@@ -29,19 +29,20 @@ struct Fixture {
     Tensor keys, valid_view, draft_view;
     MemoryArena workspace;
 
-    Fixture(int rows, int tokens, int batch, int ranks, int cap, bool penalties, bool masked)
+    Fixture(int rows, int tokens, int batch, int ranks, int cap, bool penalties, bool masked,
+            int proposal_columns = -1)
         : v(rows), t(tokens), b(batch), r(ranks), k(cap), domain(v * r - 3),
-          mask_stride((domain + 31) / 32), logits(std::size_t(v) * t * b * r),
-          counts(std::size_t(domain) * b), valid(b, t), drafts(std::max(1, t - 1) * b),
-          masks(std::size_t(mask_stride) * t * b, UINT32_MAX), configs(b),
-          d_logits(logits.size() * 2), d_counts(counts.size() * 4), d_valid(b * 4),
+          mask_stride((domain + 31) / 32), steps(proposal_columns < 0 ? t - 1 : proposal_columns),
+          logits(std::size_t(v) * t * b * r), counts(std::size_t(domain) * b), valid(b, t),
+          drafts(std::max(1, steps) * b), masks(std::size_t(mask_stride) * t * b, UINT32_MAX),
+          configs(b), d_logits(logits.size() * 2), d_counts(counts.size() * 4), d_valid(b * 4),
           d_drafts(drafts.size() * 4), d_masks(masks.size() * 4),
           d_configs(b * sizeof(ops::SamplingConfig)), d_keys(std::size_t(k) * t * b * r * 8),
           d_work(std::max<std::size_t>(
               256, ops::vocabulary_candidates_workspace_capacity_bytes(v, t * b, k))),
           keys(d_keys.span(), DType::I64, {k, t, b, r}),
           valid_view(d_valid.span(), DType::I32, {b}), workspace(d_work.span()) {
-        if (t > 1) draft_view = Tensor(d_drafts.span(), DType::I32, {t - 1, b});
+        if (steps) draft_view = Tensor(d_drafts.span(), DType::I32, {steps, b});
         for (int row = 0; row < b; ++row) {
             auto& c             = configs[row];
             c.temperature       = k == 1 || row % 3 == 1 ? 0 : 0.75F;
@@ -53,8 +54,8 @@ struct Fixture {
                 c.mask = {static_cast<const std::uint32_t*>(d_masks.data()) + row * t * mask_stride,
                           mask_stride};
             for (int id = 0; id < domain; ++id) counts[row * domain + id] = (id * 7 + row) % 4;
-            for (int col = 0; col < t - 1; ++col)
-                drafts[row * (t - 1) + col] = (col * 3 + row) % domain;
+            for (int col = 0; col < steps; ++col)
+                drafts[row * steps + col] = (col * 3 + row) % domain;
         }
         for (int rank = 0; rank < r; ++rank)
             for (int row = 0; row < b; ++row)
@@ -79,7 +80,8 @@ struct Fixture {
 
     void reset(int phase) {
         for (int row = 0; row < b; ++row) {
-            valid[row] = phase && row == b - 1 && b > 1 ? 0 : t - row % t;
+            const int limit = std::min(t, steps + 1);
+            valid[row]      = phase && row == b - 1 && b > 1 ? 0 : limit - row % limit;
             if (!valid[row]) {
                 configs[row].temperature  = std::numeric_limits<float>::quiet_NaN();
                 configs[row].token_counts = reinterpret_cast<const int*>(std::uintptr_t(0x1000));
@@ -134,7 +136,7 @@ struct Fixture {
                             !(masks[(row * t + col) * mask_stride + id / 32] & (1U << (id % 32))))
                             continue;
                         int count = counts[row * domain + id];
-                        for (int j = 0; j < col; ++j) count += drafts[row * (t - 1) + j] == id;
+                        for (int j = 0; j < col; ++j) count += drafts[row * steps + j] == id;
                         double score = bf16_to_f32(
                             logits[((std::size_t(rank) * b + row) * t + col) * v + local]);
                         score -= double(c.presence_penalty) * (count > 0) +
@@ -157,8 +159,8 @@ struct Fixture {
     }
 };
 
-int extraction(int rows, int tokens, int batch, int ranks, int cap, bool controls) {
-    Fixture f(rows, tokens, batch, ranks, cap, controls, controls);
+int extraction(int rows, int tokens, int batch, int ranks, int cap, bool controls, int steps = -1) {
+    Fixture f(rows, tokens, batch, ranks, cap, controls, controls, steps);
     auto& device = cuda_environment().context;
     DecodeGraphDefinition definition;
     definition.capture(device.stream(), [&] { f.launch(device.execution_view()); });
@@ -615,6 +617,12 @@ void add_vocabulary_cases(ninfer::test::OpSuite& suite) {
     for (int cap : {1, 20})
         suite.add("vocabulary_candidates/long_columns/k" + std::to_string(cap),
                   [=] { return long_columns(cap); });
+    suite.add("vocabulary_candidates/proposal7_width4",
+              [] { return extraction(257, 4, 5, 2, 20, true, 7); });
+    suite.add("vocabulary_candidates/proposal2_width8",
+              [] { return extraction(257, 8, 5, 2, 20, true, 2); });
+    suite.add("vocabulary_candidates/anchor_with_proposals",
+              [] { return extraction(257, 1, 2, 1, 20, true, 2); });
     suite.add("vocabulary_commit/prefixes", commit_prefixes);
     suite.add("vocabulary_candidates/padded_batch9",
               [] { return extraction(16385, 2, 9, 2, 20, true); }, {{"suite", "concurrency"}});

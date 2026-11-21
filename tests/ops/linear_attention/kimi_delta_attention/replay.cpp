@@ -36,13 +36,14 @@ std::vector<float> values(std::size_t n, unsigned seed, float amplitude = 1) {
     return out;
 }
 
-int replay_case(int layers, int heads, int width, int batch, bool alias_records, bool in_place,
-                bool graph, int qheads = 0, bool projected = false, bool inactive = false) {
+int check_replay(const KdaReplayRecordLayout& rl, DeviceBuffer& record_buffer, int batch,
+                 bool alias_records, bool in_place, bool graph, bool projected, bool inactive) {
     auto& context = cuda_environment().context;
     CudaStream stream(context);
     const auto cuda = context.execution_view(stream.stream());
-    if (!qheads) qheads = heads;
-    const int channels = (2 * qheads + heads) * 128, capacity = batch > 8 ? batch + 3 : 8;
+    const auto& spec = rl.spec;
+    const int layers = spec.layers, heads = spec.value_heads, qheads = spec.qk_heads,
+              width = spec.width, channels = spec.conv_channels;
     StateImageBuilder sb;
     const auto guard        = sb.add(DType::I32, {64}, 1, "unrelated field");
     const auto state_layout = plan_linear_attention_state(
@@ -76,10 +77,6 @@ int replay_case(int layers, int heads, int width, int batch, bool alias_records,
     auto valid_buffer = to_device(valid), accepted_buffer = to_device(accepted);
     Tensor valid_table(valid_buffer.span(), DType::I32, {batch});
     Tensor accepted_table(accepted_buffer.span(), DType::I32, {batch});
-    LayoutBuilder rb;
-    const auto rl =
-        plan_kda_replay_records(rb, {layers, capacity, width, channels, qheads, heads, 128, 128});
-    DeviceBuffer record_buffer(cuda.device(), rb.finish(256));
     CUDA_CHECK(cudaMemsetAsync(record_buffer.data(), 0x35, record_buffer.size(), cuda.stream()));
     KdaReplayRecords records(record_buffer.span(), rl);
     std::vector<std::vector<float>> expected(layers * batch);
@@ -411,10 +408,35 @@ int replay_case(int layers, int heads, int width, int batch, bool alias_records,
     }
     return failures;
 }
+
+int replay_case(int layers, int heads, int width, int batch, bool alias_records, bool in_place,
+                bool graph, int qheads = 0, bool projected = false, bool inactive = false) {
+    if (!qheads) qheads = heads;
+    LayoutBuilder builder;
+    const auto layout =
+        plan_kda_replay_records(builder, {layers, batch > 8 ? batch + 3 : 8, width,
+                                          (2 * qheads + heads) * 128, qheads, heads, 128, 128});
+    DeviceBuffer storage(cuda_environment().context.device(), builder.finish(256));
+    return check_replay(layout, storage, batch, alias_records, in_place, graph, projected,
+                        inactive);
+}
+
+int switching_widths() {
+    LayoutBuilder builder;
+    const auto maximum = plan_kda_replay_records(builder, {3, 8, 8, 5 * 128, 1, 3, 128, 128});
+    DeviceBuffer storage(cuda_environment().context.device(), builder.finish(256));
+    int failures = 0;
+    for (int width : {8, 5, 2, 8}) {
+        const auto layout = maximum.with_width(width);
+        failures += check_replay(layout, storage, 5, true, false, false, false, true);
+    }
+    return failures;
+}
 } // namespace
 
 int main(int argc, char** argv) {
     OpSuite suite;
+    suite.add("kda/replay/switch_widths", switching_widths);
     suite.add("kda/replay/mixed", [] { return replay_case(2, 3, 7, 8, false, false, false, 1); });
     suite.add("kda/replay/alias", [] { return replay_case(8, 32, 4, 2, true, true, false); });
     suite.add("kda/replay/graph", [] { return replay_case(2, 32, 17, 8, true, false, true); });

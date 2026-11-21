@@ -25,11 +25,18 @@ public:
     DecodeGraphSection(DecodeGraphSection&&) noexcept            = default;
     DecodeGraphSection& operator=(DecodeGraphSection&&) noexcept = default;
 
+    void begin(cudaStream_t);
+    void end(cudaStream_t);
     void capture(cudaStream_t, const std::function<void()>&);
     void set_enabled(const DecodeGraphExecutable&, bool);
 
 private:
+    struct CooperativeKernel {
+        cudaGraphNode_t node;
+        cudaKernelNodeParams original;
+    };
     std::vector<cudaGraphNode_t> nodes_;
+    std::vector<CooperativeKernel> cooperative_;
     bool enabled_ = true;
 };
 

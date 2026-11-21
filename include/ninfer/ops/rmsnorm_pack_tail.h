@@ -6,11 +6,11 @@
 namespace ninfer::ops {
 
 /**
- * output[d,(W-1)*b+i-1] = input[d,i,b] * weight[d]
- *                        / sqrt(sum_j input[j,i,b]^2 / D + epsilon), for 1 <= i < W.
+ * output[d,g*b+i-1] = input[d,i,b] * weight[d]
+ *                        / sqrt(sum_j input[j,i,b]^2 / D + epsilon), for 1 <= i <= g.
  *
- * Input is BF16 [D,W,B], weight is BF16 [D], and output is BF16 [D,(W-1)*B], with
- * D=4096 or 5120, W=2..16 and B>=1. Epsilon is positive and finite.
+ * Input is BF16 [D,W,B], weight is BF16 [D], and output is BF16 [D,g*B], with
+ * D=4096 or 5120, W=2..16, 1<=g<W and B>=1. Epsilon is positive and finite.
  * All tensors are contiguous, non-null, 16-byte aligned and
  * pairwise disjoint. Uses plain multiplicative gain. Anchor columns input[:,0,b] are not read.
  * Writes all of output and preserves inputs. All operands belong to execution.device().

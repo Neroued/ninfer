@@ -1,5 +1,6 @@
 ninfer_add_op_test(ninfer_sampling_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/main.cpp"
+          "${CMAKE_CURRENT_LIST_DIR}/verification_width.cpp"
           "${CMAKE_CURRENT_LIST_DIR}/vocabulary.cpp"
           "${CMAKE_CURRENT_LIST_DIR}/vocabulary_sparse.cpp"
           "${CMAKE_CURRENT_LIST_DIR}/sampling.cpp"

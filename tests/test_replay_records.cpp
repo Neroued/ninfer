@@ -49,6 +49,47 @@ int expect_throw(Fn&& fn, const char* label) {
     return 1;
 }
 
+template <class Layout>
+int compact_widths(const Layout& maximum,
+                   std::initializer_list<std::pair<ninfer::TensorRegion Layout::*, int>> planes) {
+    int failures = 0;
+    for (int invalid : {-1, 0, maximum.spec.width + 1})
+        failures +=
+            expect_throw([&] { (void)maximum.with_width(invalid); }, "outside parent width");
+    auto malformed = maximum;
+    malformed.conv.region.bytes -= 2;
+    failures += expect_throw([&] { (void)malformed.with_width(2); }, "malformed parent layout");
+    for (int width = 1; width <= maximum.spec.width; ++width) {
+        const auto child = maximum.with_width(width);
+        failures += expect(child.spec.width == width &&
+                               child.spec.record_capacity == maximum.spec.record_capacity,
+                           "compact record geometry");
+        for (auto [plane, width_axis] : planes) {
+            const auto& a = maximum.*plane;
+            const auto& b = child.*plane;
+            failures += expect(b.region.offset == a.region.offset && b.region.alignment == 256 &&
+                                   b.region.bytes == a.region.bytes / maximum.spec.width * width,
+                               "compact plane range");
+            auto expected        = a.shape;
+            expected[width_axis] = width;
+            failures += expect(b.shape == expected && b.dtype == a.dtype, "compact plane shape");
+        }
+    }
+    return failures;
+}
+
+int derived_record_layouts() {
+    ninfer::LayoutBuilder builder;
+    (void)builder.add(73, 1, "preceding field");
+    using G      = ninfer::GdnReplayRecordLayout;
+    using K      = ninfer::KdaReplayRecordLayout;
+    const auto g = ninfer::plan_gdn_replay_records(builder, {3, 5, 8, 64, 2, 4, 16, 16});
+    const auto k = ninfer::plan_kda_replay_records(builder, {3, 5, 8, 64, 2, 4, 16, 16});
+    return compact_widths(g, {{&G::conv, 1}, {&G::key, 2}, {&G::value, 2}, {&G::gate, 2}}) +
+           compact_widths(
+               k, {{&K::conv, 1}, {&K::key, 2}, {&K::value, 2}, {&K::log_decay, 2}, {&K::beta, 1}});
+}
+
 std::size_t record_bytes(const ninfer::GdnReplayRecordSpec& spec) {
     ninfer::LayoutBuilder builder;
     (void)ninfer::plan_gdn_replay_records(builder, spec);
@@ -96,6 +137,7 @@ int large_record_capacity() {
 } // namespace
 
 int main() {
+    if (derived_record_layouts()) return 1;
     int failures = large_record_capacity();
 
     const ninfer::GdnReplayRecordSpec spec{

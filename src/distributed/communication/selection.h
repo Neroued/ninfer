@@ -14,4 +14,6 @@ select_collectives(std::span<const CollectiveRoute> preferences,
                                           CommunicationPolicy, std::span<Backend* const> candidates,
                                           bool peer_work);
 
+[[nodiscard]] bool supports_graph_gating(const GroupRouting&, std::span<Backend* const>) noexcept;
+
 } // namespace ninfer::distributed::detail

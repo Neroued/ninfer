@@ -14,14 +14,13 @@ template <class S>
 __launch_bounds__(S::kSamplerBlock) __global__ void speculative_sampling_partial_topk_kernel(
     const __nv_bfloat16* logits, TokenRows drafts, const std::int32_t* current_extents,
     const SamplingConfig* configs, std::int32_t token_domain, std::int32_t physical_rows,
-    std::int32_t cols, std::int32_t k, Workspace workspace, std::size_t workspace_row_stride,
+    std::int32_t cols, Workspace workspace, std::size_t workspace_row_stride,
     const std::int32_t* live, std::int32_t row_begin) {
     const int row = row_begin + static_cast<int>(blockIdx.z);
     if (live && !live[row]) return;
     const int col     = static_cast<int>(blockIdx.y);
     const int partial = static_cast<int>(blockIdx.x);
-    int extent        = current_extents[row];
-    extent            = extent < 0 ? 0 : (extent > k ? k : extent);
+    const int extent  = drafts.extent(current_extents[row], cols - 1);
     if (col > extent) { return; }
     const SamplingConfig cfg = configs[row];
     const bool greedy        = !(cfg.temperature > 0.0f);
@@ -92,11 +91,11 @@ template <int Threads, int Items>
 __launch_bounds__(Threads, 3) __global__ void speculative_sampling_threshold_topk_kernel(
     const __nv_bfloat16* logits, TokenRows drafts, const std::int32_t* current_extents,
     const SamplingConfig* configs, std::int32_t token_domain, std::int32_t physical_rows,
-    std::int32_t cols, std::int32_t k, Workspace workspace, std::size_t workspace_row_stride,
+    std::int32_t cols, Workspace workspace, std::size_t workspace_row_stride,
     const std::int32_t* live, std::int32_t row_begin) {
     const int row = row_begin + int(blockIdx.z), col = blockIdx.y;
     if (live && !live[row]) return;
-    const int extent = min(k, max(0, current_extents[row]));
+    const int extent = drafts.extent(current_extents[row], cols - 1);
     if (col > extent) return;
     const SamplingConfig cfg = configs[row];
     const bool greedy        = !(cfg.temperature > 0.F);
@@ -190,14 +189,14 @@ void launch_speculative_selection(const SpeculativeSelectionInput& input, std::i
     if (tile == 4096)
         speculative_sampling_threshold_topk_kernel<256, 16><<<grid, 256, 0, stream>>>(
             input.logits, input.drafts, input.current_extents, input.configs, input.token_domain,
-            input.physical_rows, input.columns, input.draft_count, input.workspace,
-            input.row_stride, input.live_rows, input.first_row);
+            input.physical_rows, input.columns, input.workspace, input.row_stride, input.live_rows,
+            input.first_row);
     else
         speculative_sampling_partial_topk_kernel<Schedule>
             <<<grid, Schedule::kSamplerBlock, 0, stream>>>(
                 input.logits, input.drafts, input.current_extents, input.configs,
-                input.token_domain, input.physical_rows, input.columns, input.draft_count,
-                input.workspace, input.row_stride, input.live_rows, input.first_row);
+                input.token_domain, input.physical_rows, input.columns, input.workspace,
+                input.row_stride, input.live_rows, input.first_row);
     CUDA_CHECK(cudaGetLastError());
 }
 

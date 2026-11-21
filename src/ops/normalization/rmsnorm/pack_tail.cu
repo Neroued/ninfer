@@ -6,7 +6,6 @@
 #include <cmath>
 #include <cuda_bf16.h>
 #include <cstdint>
-#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -44,7 +43,7 @@ __global__ __launch_bounds__(kBlock) void rmsnorm_pack_tail_kernel(
     const std::int64_t input_base =
         (static_cast<std::int64_t>(batch) * width + tail + 1) * (Hidden / 2);
     const std::int64_t output_base =
-        (static_cast<std::int64_t>(batch) * (width - 1) + tail) * (Hidden / 2);
+        (static_cast<std::int64_t>(batch) * gridDim.x + tail) * (Hidden / 2);
 
     __nv_bfloat162 values[kPairsPerThread];
     __nv_bfloat162 weights[kPairsPerThread];
@@ -75,10 +74,11 @@ __global__ __launch_bounds__(kBlock) void rmsnorm_pack_tail_kernel(
 template <int Hidden, int Threads>
 void launch_rmsnorm_pack_tail(const Tensor& input, const Tensor& weight, float epsilon,
                               Tensor& output, cudaStream_t stream) {
+    const int columns = output.ne[1] / input.ne[2];
     common::for_each_token_slice(input.ne[2], 1, [&](int offset, int count) {
         const auto input_offset  = std::int64_t(offset) * input.ne[1] * (Hidden / 2);
-        const auto output_offset = std::int64_t(offset) * (input.ne[1] - 1) * (Hidden / 2);
-        const dim3 grid(input.ne[1] - 1, count);
+        const auto output_offset = std::int64_t(offset) * columns * (Hidden / 2);
+        const dim3 grid(columns, count);
         rmsnorm_pack_tail_kernel<Hidden, Threads><<<grid, Threads, 0, stream>>>(
             static_cast<const __nv_bfloat162*>(input.data) + input_offset,
             static_cast<const __nv_bfloat162*>(weight.data),
@@ -114,16 +114,17 @@ void rmsnorm_pack_tail(const Tensor& input, const Tensor& weight, float epsilon,
     const std::int32_t width = input.ne[1];
     const int hidden         = input.ne[0];
     if ((hidden != 4096 && hidden != 5120) || (width < 2 || width > 16) || batch < 1 ||
-        std::int64_t(width - 1) * batch > std::numeric_limits<int>::max() || input.ne[3] != 1) {
+        input.ne[3] != 1) {
         throw std::invalid_argument(
             "rmsnorm_pack_tail: invalid [H,W,B] geometry or flattened output extent");
     }
     if (weight.ne[0] != hidden || weight.ne[1] != 1 || weight.ne[2] != 1 || weight.ne[3] != 1) {
         throw std::invalid_argument("rmsnorm_pack_tail: weight must have shape [H]");
     }
-    if (output.ne[0] != hidden || output.ne[1] != (width - 1) * batch || output.ne[2] != 1 ||
-        output.ne[3] != 1) {
-        throw std::invalid_argument("rmsnorm_pack_tail: output must have shape [H,(W-1)B]");
+    if (output.ne[0] != hidden || output.ne[1] < batch || output.ne[1] % batch ||
+        output.ne[1] / batch >= width || output.ne[2] != 1 || output.ne[3] != 1) {
+        throw std::invalid_argument(
+            "rmsnorm_pack_tail: output must have shape [H,g*B] with 1 <= g < W");
     }
     const common::operand::Range ranges[]{
         common::operand::range(input.data, input.bytes(), "rmsnorm_pack_tail"),
@@ -133,7 +134,7 @@ void rmsnorm_pack_tail(const Tensor& input, const Tensor& weight, float epsilon,
     common::operand::disjoint(ranges, "rmsnorm_pack_tail");
 
     if (hidden == 4096) {
-        if ((width - 1) * batch <= 32)
+        if (output.ne[1] <= 32)
             launch_rmsnorm_pack_tail<4096, 128>(input, weight, epsilon, output, stream);
         else
             launch_rmsnorm_pack_tail<4096, 256>(input, weight, epsilon, output, stream);

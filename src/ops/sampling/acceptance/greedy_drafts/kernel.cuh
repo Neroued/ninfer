@@ -20,8 +20,7 @@ __launch_bounds__(S::kSamplerBlock) __global__ void speculative_accept_greedy_dr
         if (tid == 0) licensed_counts[row] = 0;
         return;
     }
-    int extent                      = current_extents[row];
-    extent                          = extent < 0 ? 0 : (extent > k ? k : extent);
+    const int extent                = drafts.extent(current_extents[row], k);
     const SamplingConfig cfg        = configs[row];
     const std::int32_t* row_targets = target_tokens + std::int64_t(row) * cols;
     const auto row_drafts           = drafts[row];

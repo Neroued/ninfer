@@ -35,13 +35,20 @@ struct TokenRows {
     const std::int32_t* data   = nullptr;
     std::int64_t column_stride = 1, row_stride = 0;
 
+    int columns = 0;
+
+    __device__ int extent(int requested, int verify_drafts) const {
+        return min(max(requested, 0), min(columns, verify_drafts));
+    }
+
     __device__ TokenRow operator[](int row) const {
         return {data ? data + row * row_stride : nullptr, column_stride};
     }
 };
 
 inline TokenRows token_rows(const Tensor& tensor) {
-    return {static_cast<const std::int32_t*>(tensor.data), tensor.nb[0] / 4, tensor.nb[1] / 4};
+    return {static_cast<const std::int32_t*>(tensor.data), tensor.nb[0] / 4, tensor.nb[1] / 4,
+            tensor.ne[0]};
 }
 
 template <class S>

@@ -14,7 +14,8 @@ struct SpeculativeAcceptExecutionEnvelope {
     bool all_rows_greedy_without_penalties = false;
 };
 
-// Caller-owned transient capacity over the inclusive draft-count and batch-size intervals.
+// Caller-owned transient capacity over the inclusive verification-draft (W-1) and batch-size
+// intervals.
 [[nodiscard]] std::size_t speculative_accept_greedy_drafts_workspace_capacity_bytes(
     std::int32_t token_domain, std::int32_t min_drafts, std::int32_t max_drafts,
     std::int32_t min_batch, std::int32_t max_batch);
@@ -30,10 +31,11 @@ struct SpeculativeAcceptExecutionEnvelope {
  * drafts[0:i,b]. RNG uses the request seed, base_positions[b]+i+1 and the speculative
  * accept/correction/bonus purpose. There is no mutable RNG or committed-state update.
  *
- * target_tokens and licensed_tokens are contiguous I32 [K+1,B], logits is contiguous BF16
- * [physical_rows,K+1,B]. drafts is I32 [K,B] with positive, naturally aligned, non-overlapping
+ * target_tokens and licensed_tokens are contiguous I32 [W,B], logits is contiguous BF16
+ * [physical_rows,W,B]. drafts is I32 [D,B] with positive, naturally aligned, non-overlapping
  * strides. current_extents/base_positions/licensed_counts are contiguous I32 [B]; configs is
- * Device SamplingConfig[B]. K,B>=1, token_domain in [1,physical_rows], extents in [0,K], and
+ * Device SamplingConfig[B]. W>=2, D,B>=1, token_domain in [1,physical_rows], live extents in
+ * [0,min(D,W-1)], and
  * base_positions+i+1 fits nonnegative I32. Raw target_tokens are exact argmax over token_domain,
  * with lower IDs winning ties; only raw greedy rows without penalties/masks consume them.
  *
@@ -55,7 +57,7 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
                                       const SamplingConfig* configs, const Tensor& live_rows,
                                       MemoryArena& workspace, CudaExecutionView execution);
 
-// The raw-greedy envelope requires no workspace.
+// The inclusive draft interval describes W-1. The raw-greedy envelope requires no workspace.
 [[nodiscard]] std::size_t speculative_accept_sparse_drafts_workspace_capacity_bytes(
     std::int32_t token_domain, SpeculativeAcceptExecutionEnvelope envelope, std::int32_t min_drafts,
     std::int32_t max_drafts, std::int32_t min_batch, std::int32_t max_batch);
@@ -69,12 +71,14 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
  * acceptance samples the target bonus column. Target filtering, prefix penalties and RNG
  * positions/purposes follow speculative_accept_greedy_drafts.
  *
- * Registered profile: token_domain=248077, K=1..15, B>=1, BF16 logits [248320,K+1,B],
- * I32 target_tokens/licensed_tokens [K+1,B], I32 drafts [K,B], I32 candidate_ids [16,K,B],
- * FP32 proposal_q [16,K,B], I32 current_extents/base_positions/licensed_counts [B]. Everything
- * is contiguous except drafts, which permits positive, naturally aligned, non-overlapping
- * strides. Extents lie in [0,K]. Each live candidate list has distinct global IDs in the domain;
- * q is normalized and is the represented distribution used to generate that draft, with positive
+ * Registered profile: token_domain=248077, W=2..16, D=1..15, B>=1.
+ * BF16 logits [248320,W,B], I32 target_tokens/licensed_tokens [W,B], I32 drafts [D,B],
+ * I32 candidate_ids and FP32 proposal_q [16,D,B], I32
+ * current_extents/base_positions/licensed_counts [B]. drafts permits positive, naturally aligned,
+ * non-overlapping strides. IDs and q each have a contiguous candidate axis and independent
+ * positive, aligned, non-overlapping outer strides. Other tensors are contiguous. Live extents lie
+ * in [0,min(D,W-1)]. Each live candidate list has distinct global IDs in the domain; q is
+ * normalized and is the represented distribution used to generate that draft, with positive
  * probability at the chosen ID. q is consumed directly, without reconstructing a dense proposal.
  *
  * Writes the accepted prefix, one correction/bonus token and zero physical suffix; counts=A+1.

@@ -126,6 +126,22 @@ void ParallelExecution::exchange(std::span<const distributed::PeerTransfer> tran
 #endif
 }
 
+bool ParallelExecution::supports_graph_gating() const noexcept {
+#if NINFER_ENABLE_DISTRIBUTED
+    return binding_.group->supports_graph_gating();
+#else
+    return true;
+#endif
+}
+
+CommunicationGraphWork ParallelExecution::captured_work() const {
+#if NINFER_ENABLE_DISTRIBUTED
+    return binding_.group->captured_work();
+#else
+    throw std::logic_error("no distributed graph capture");
+#endif
+}
+
 void ParallelExecution::record_graph(CommunicationGraphWork& work,
                                      const std::function<void()>& body) {
 #if NINFER_ENABLE_DISTRIBUTED

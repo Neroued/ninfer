@@ -26,13 +26,13 @@ constexpr ReductionCriterion kCriterion{/*relative_l2*/ 1.85e-3,
                                         /*gross_relative_to_max_reference*/ 3.4e-3};
 
 std::vector<double> oracle(const std::vector<float>& input, const std::vector<float>& weight,
-                           std::int32_t width, std::int32_t batch, float epsilon) {
+                           std::int32_t width, std::int32_t batch, int columns, float epsilon) {
     const int rows = weight.size();
-    std::vector<double> output(static_cast<std::size_t>(rows) * (width - 1) * batch);
+    std::vector<double> output(static_cast<std::size_t>(rows) * columns * batch);
     for (std::int32_t b = 0; b < batch; ++b) {
-        for (std::int32_t tail = 0; tail < (width - 1); ++tail) {
+        for (std::int32_t tail = 0; tail < columns; ++tail) {
             const std::int32_t input_row  = b * width + tail + 1;
-            const std::int32_t output_row = b * (width - 1) + tail;
+            const std::int32_t output_row = b * columns + tail;
             const std::size_t input_base  = static_cast<std::size_t>(input_row) * rows;
             const std::size_t output_base = static_cast<std::size_t>(output_row) * rows;
             double sum_squares            = 0.0;
@@ -52,9 +52,10 @@ std::vector<double> oracle(const std::vector<float>& input, const std::vector<fl
 }
 
 int run_case(std::int32_t width, std::int32_t batch, std::uint32_t seed, bool graph = false,
-             int rows = 5120, float epsilon = 1.e-6F, float magnitude = 2.F) {
+             int rows = 5120, float epsilon = 1.e-6F, float magnitude = 2.F, int columns = 0) {
+    if (!columns) columns = width - 1;
     const std::size_t input_count  = static_cast<std::size_t>(rows) * width * batch;
-    const std::size_t output_count = static_cast<std::size_t>(rows) * (width - 1) * batch;
+    const std::size_t output_count = static_cast<std::size_t>(rows) * columns * batch;
     std::vector<float> input(input_count);
     std::vector<float> weight(rows);
     fill_uniform(input, seed, -magnitude, magnitude);
@@ -74,13 +75,13 @@ int run_case(std::int32_t width, std::int32_t batch, std::uint32_t seed, bool gr
 
     Tensor input_tensor(device_input.memory, DType::BF16, {rows, width, batch});
     Tensor weight_tensor(device_weight.memory, DType::BF16, {rows});
-    Tensor output_tensor(output.span(), DType::BF16, {rows, (width - 1) * batch});
+    Tensor output_tensor(output.span(), DType::BF16, {rows, columns * batch});
     int failures            = 0;
     const std::string label = "rmsnorm_pack_tail H=" + std::to_string(rows) +
                               " W=" + std::to_string(width) + " B=" + std::to_string(batch);
     const auto check = [&] {
         return verify_reduction(label, from_device_bf16(output.data(), output_count),
-                                oracle(input, weight, width, batch, epsilon), kCriterion);
+                                oracle(input, weight, width, batch, columns, epsilon), kCriterion);
     };
     if (graph) {
         cuda_check(cudaStreamSynchronize(nullptr), "finish fixture initialization");
@@ -150,6 +151,15 @@ int contract() {
     y.ne[0] = 4096;
     y.data  = x.data;
     reject(1.e-5F);
+    constexpr int row_bytes = 4096 * sizeof(std::uint16_t);
+    DeviceBuffer batch_storage(e.device(), 13 * row_bytes);
+    x = Tensor(batch_storage.span().subspan(0, 6 * row_bytes), DType::BF16, {4096, 3, 2});
+    w = Tensor(batch_storage.span().subspan(6 * row_bytes, row_bytes), DType::BF16, {4096});
+    for (int columns : {1, 3, 6}) {
+        y = Tensor(batch_storage.span().subspan(7 * row_bytes, columns * row_bytes), DType::BF16,
+                   {4096, columns});
+        reject(1.e-5F);
+    }
     return failures;
 }
 
@@ -177,6 +187,10 @@ void add_rmsnorm_pack_tail_cases(ninfer::test::OpSuite& suite) {
               {{"execution", "graph"}, {"suite", "concurrency"}});
     suite.add("rmsnorm_pack_tail/glm/graph",
               [] { return run_case(8, 8, 1801U, true, 4096, 1.e-5F); }, {{"execution", "graph"}});
+    suite.add("rmsnorm_pack_tail/glm/prefix3",
+              [] { return run_case(8, 4, 1820, true, 4096, 1.e-5F, 2.F, 3); });
+    suite.add("rmsnorm_pack_tail/prefix1",
+              [] { return run_case(16, 3, 1821, false, 5120, 1.e-6F, 2.F, 1); });
     suite.add("rmsnorm_pack_tail/glm/epsilon",
               [] { return run_case(2, 1, 1802U, false, 4096, 1.e-5F, 1.e-4F); });
     suite.add("rmsnorm_pack_tail/epsilon",

@@ -38,6 +38,7 @@ add_library(ninfer_core SHARED
   weight_bank.cpp
   expert_cache.cpp
   decode_graph.cpp
+  decode_graph.cu
 )
 ninfer_internal_includes(ninfer_core)
 ninfer_cuda_library(ninfer_core)

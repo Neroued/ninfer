@@ -46,9 +46,7 @@ void discard_capture(cudaStream_t stream) noexcept {
     destroy_graph(discard);
 }
 
-} // namespace
-
-void DecodeGraphSection::capture(cudaStream_t stream, const std::function<void()>& body) {
+std::vector<cudaGraphNode_t> captured_nodes(cudaStream_t stream) {
     cudaStreamCaptureStatus status;
     cudaGraph_t graph = nullptr;
     check_graph(
@@ -56,36 +54,53 @@ void DecodeGraphSection::capture(cudaStream_t stream, const std::function<void()
         "cudaStreamGetCaptureInfo");
     if (status != cudaStreamCaptureStatusActive)
         throw std::logic_error("a graph section requires an active parent capture");
-    const auto nodes = [&] {
-        std::size_t count = 0;
-        check_graph(cudaGraphGetNodes(graph, nullptr, &count), "cudaGraphGetNodes");
-        std::vector<cudaGraphNode_t> result(count);
-        check_graph(cudaGraphGetNodes(graph, result.data(), &count), "cudaGraphGetNodes");
-        return result;
-    };
-    const auto before = nodes();
-    nodes_.clear();
+    std::size_t count = 0;
+    check_graph(cudaGraphGetNodes(graph, nullptr, &count), "cudaGraphGetNodes");
+    std::vector<cudaGraphNode_t> nodes(count);
+    check_graph(cudaGraphGetNodes(graph, nodes.data(), &count), "cudaGraphGetNodes");
+    return nodes;
+}
+
+} // namespace
+
+void DecodeGraphSection::begin(cudaStream_t stream) {
+    nodes_   = captured_nodes(stream);
     enabled_ = true;
-    body();
-    for (auto node : nodes()) {
-        if (std::find(before.begin(), before.end(), node) != before.end()) continue;
+}
+
+void DecodeGraphSection::end(cudaStream_t stream) {
+    auto before = std::move(nodes_);
+    std::ranges::sort(before);
+    nodes_.clear();
+    cooperative_.clear();
+    for (const auto node : captured_nodes(stream)) {
+        if (std::ranges::binary_search(before, node)) continue;
         cudaGraphNodeType type;
         check_graph(cudaGraphNodeGetType(node, &type), "cudaGraphNodeGetType");
         if (type != cudaGraphNodeTypeKernel && type != cudaGraphNodeTypeMemcpy &&
             type != cudaGraphNodeTypeMemset)
             throw std::logic_error(
                 "a switchable graph section must contain only kernels or copies");
+        if (type == cudaGraphNodeTypeKernel) {
+            cudaKernelNodeAttrValue attribute{};
+            check_graph(cudaGraphKernelNodeGetAttribute(node, cudaKernelNodeAttributeCooperative,
+                                                        &attribute),
+                        "cudaGraphKernelNodeGetAttribute");
+            if (attribute.cooperative) {
+                auto& saved = cooperative_.emplace_back(node, cudaKernelNodeParams{});
+                check_graph(cudaGraphKernelNodeGetParams(node, &saved.original),
+                            "cudaGraphKernelNodeGetParams");
+                continue;
+            }
+        }
         nodes_.push_back(node);
     }
 }
 
-void DecodeGraphSection::set_enabled(const DecodeGraphExecutable& executable, bool enabled) {
-    if (!executable.ready()) throw std::logic_error("graph section has no executable");
-    if (enabled == enabled_) return;
-    for (auto node : nodes_)
-        check_graph(cudaGraphNodeSetEnabled(executable.exec_, node, enabled),
-                    "cudaGraphNodeSetEnabled");
-    enabled_ = enabled;
+void DecodeGraphSection::capture(cudaStream_t stream, const std::function<void()>& body) {
+    begin(stream);
+    body();
+    end(stream);
 }
 
 DecodeGraphDefinition::~DecodeGraphDefinition() { reset(); }

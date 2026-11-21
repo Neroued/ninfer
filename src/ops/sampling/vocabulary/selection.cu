@@ -287,8 +287,7 @@ void vocabulary_candidates(const Tensor& logits, int token_begin, int token_doma
     operand::tensor(valid_columns, DType::I32, {batch}, 4, kOp, "valid columns",
                     execution.device());
     if (drafts.data) {
-        if (tokens < 2) throw std::invalid_argument("vocabulary_candidates: drafts require T>=2");
-        operand::strided_tensor(drafts, DType::I32, {tokens - 1, batch}, 4, kOp, "drafts",
+        operand::strided_tensor(drafts, DType::I32, {drafts.ne[0], batch}, 4, kOp, "drafts",
                                 execution.device());
     }
     if (!configs || !operand::aligned(configs, alignof(SamplingConfig)))

@@ -43,7 +43,8 @@ void validate_spec(const GdnReplayRecordSpec& spec) {
 void require_region(const TensorRegion& region, DType dtype,
                     const std::array<std::int32_t, 4>& shape, const char* label) {
     if (region.dtype != dtype || region.shape != shape ||
-        region.region.alignment != kRecordAlignment) {
+        region.region.alignment != kRecordAlignment ||
+        region.region.offset % kRecordAlignment != 0) {
         throw std::logic_error(std::string("GDN replay ") + label +
                                " layout does not match its spec");
     }
@@ -110,6 +111,21 @@ GdnReplayRecordLayout plan_gdn_replay_records(LayoutBuilder& builder,
 
 std::size_t GdnReplayRecordLayout::payload_bytes() const noexcept {
     return conv.region.bytes + key.region.bytes + value.region.bytes + gate.region.bytes;
+}
+
+GdnReplayRecordLayout GdnReplayRecordLayout::with_width(std::int32_t width) const {
+    validate_layout(*this);
+    if (width < 1 || width > spec.width)
+        throw std::invalid_argument("GDN replay: requested width exceeds record layout");
+    auto narrowed  = spec;
+    narrowed.width = width;
+    LayoutBuilder builder;
+    auto result                = plan_gdn_replay_records(builder, narrowed);
+    result.conv.region.offset  = conv.region.offset;
+    result.key.region.offset   = key.region.offset;
+    result.value.region.offset = value.region.offset;
+    result.gate.region.offset  = gate.region.offset;
+    return result;
 }
 
 GdnReplayRecords::GdnReplayRecords(MemorySpan backing, const GdnReplayRecordLayout& layout)

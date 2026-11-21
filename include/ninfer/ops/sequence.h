@@ -39,7 +39,7 @@ void prepare_causal_pairs(const CausalPairInputs& input, const CausalPairOutputs
                           CudaExecutionView execution);
 
 /**
- *   For row b and 0<=j<=K:
+ *   For row b and 0<=j<W:
  *     verify_ids[j,b] = anchors[b]                         when j=0
  *                       drafts[j-1,b]                     when 0<j<=Pcur[b]
  *                       anchors[b]                        otherwise;
@@ -47,8 +47,8 @@ void prepare_causal_pairs(const CausalPairInputs& input, const CausalPairOutputs
  *
  *   All tensors are I32, contiguous except drafts, which permits positive, naturally aligned,
  *   non-overlapping strides. anchors/base_positions/current_extents are [B], drafts is
- *   [K,B] with K>=1 and B>=1, and verify_ids/positions are [K+1,B]. Each current extent is in
- *   [0,K]. Inputs and outputs do not overlap.
+ *   [D,B] with D,B>=1, and verify_ids/positions are [W,B] with W>=2. The caller provides
+ *   current_extents[b] in [0,min(D,W-1)]. Inputs and outputs do not overlap.
  *
  *   Writes every physical output element, including safe invalid-tail values. Inputs remain
  *   unchanged.

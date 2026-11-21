@@ -85,11 +85,12 @@ std::vector<std::int32_t> selected_slots(std::int32_t rows) {
     return slots;
 }
 
-int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
-             const std::vector<std::int32_t>& commits, std::uint32_t seed,
-             bool distinct_destination = false, bool captured = false, bool device_rows = false,
-             std::int32_t record_capacity = kRecordCapacity) {
-    const int kQkHeads = profile.value_heads == 24 ? 8 : 16;
+int check_fold(const GdnReplayRecordLayout& record_layout, DeviceBuffer& record_storage, int rows,
+               const std::vector<std::int32_t>& commits, std::uint32_t seed,
+               bool distinct_destination, bool captured, bool device_rows) {
+    const auto& spec = record_layout.spec;
+    const FoldProfile profile{spec.layers, spec.value_heads, spec.conv_channels};
+    const int width = spec.width, record_capacity = spec.record_capacity, kQkHeads = spec.qk_heads;
     const bool compact = rows > 8;
     std::vector<int> reference_indices(rows);
     std::iota(reference_indices.begin(), reference_indices.end(), 0);
@@ -123,22 +124,7 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
     const std::size_t conv_slot_elements   = static_cast<std::size_t>(profile.conv_channels) * 3;
     const std::size_t conv_slot_bytes      = conv_slot_elements * sizeof(std::uint16_t);
 
-    const GdnReplayRecordSpec record_spec{
-        .layers          = profile.layers,
-        .record_capacity = record_capacity,
-        .width           = width,
-        .conv_channels   = profile.conv_channels,
-        .qk_heads        = kQkHeads,
-        .value_heads     = profile.value_heads,
-        .key_dim         = kStateDim,
-        .value_dim       = kStateDim,
-    };
-    LayoutBuilder record_builder;
-    const GdnReplayRecordLayout record_layout =
-        plan_gdn_replay_records(record_builder, record_spec);
-    const std::size_t record_bytes = record_builder.finish(256);
-    DeviceBuffer record_storage(ninfer::test::cuda_environment().context.device(),
-                                record_bytes + 2 * kGuardBytes);
+    const auto record_bytes = record_storage.size() - 2 * kGuardBytes;
     record_storage.fill(0xa5);
     void* record_base = offset_pointer(record_storage.data(), kGuardBytes);
     cuda_check(cudaMemset(record_base, 0xff, record_bytes), "initialize replay records");
@@ -595,6 +581,40 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
     return failures;
 }
 
+GdnReplayRecordLayout fold_layout(LayoutBuilder& builder, FoldProfile profile, int width,
+                                  int capacity) {
+    return plan_gdn_replay_records(builder, {profile.layers, capacity, width, profile.conv_channels,
+                                             profile.value_heads == 24 ? 8 : 16,
+                                             profile.value_heads, kStateDim, kStateDim});
+}
+
+int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
+             const std::vector<std::int32_t>& commits, std::uint32_t seed,
+             bool distinct_destination = false, bool captured = false, bool device_rows = false,
+             std::int32_t record_capacity = kRecordCapacity) {
+    LayoutBuilder builder;
+    const auto layout = fold_layout(builder, profile, width, record_capacity);
+    DeviceBuffer storage(cuda_environment().context.device(),
+                         builder.finish(256) + 2 * kGuardBytes);
+    return check_fold(layout, storage, rows, commits, seed, distinct_destination, captured,
+                      device_rows);
+}
+
+int switching_widths() {
+    LayoutBuilder builder;
+    const auto maximum = fold_layout(builder, {36, 24, 5120}, 8, 4);
+    DeviceBuffer storage(cuda_environment().context.device(),
+                         builder.finish(256) + 2 * kGuardBytes);
+    int failures  = 0;
+    unsigned seed = 191;
+    for (int width : {8, 5, 2, 8}) {
+        const auto layout = maximum.with_width(width);
+        failures +=
+            check_fold(layout, storage, 3, {1, 0, layout.spec.width}, seed++, false, false, true);
+    }
+    return failures;
+}
+
 int run_record_fold_rounds(bool q8 = false, bool local = false) {
     using ninfer::test::input_projection::DevicePackedWeight;
     using ninfer::test::input_projection::make_bf16_activation;
@@ -904,6 +924,7 @@ int run_record_fold_rounds(bool q8 = false, bool local = false) {
 
 int main(int argc, char** argv) {
     OpSuite suite;
+    suite.add("gdn/fold/switch_widths", switching_widths);
     for (int prefix : {3, 11})
         suite.add("gdn_fold/device/l36/h24/w16/a" + std::to_string(prefix), [=] {
             return run_case({36, 24, 5120}, 16, 1, {prefix}, 5101U, true, true, true);

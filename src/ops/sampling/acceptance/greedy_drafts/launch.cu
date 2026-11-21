@@ -13,7 +13,7 @@ void launch(const Tensor& target_tokens, const Tensor& logits, const Tensor& dra
             CudaExecutionView execution) {
     const auto stream                = execution.stream();
     const std::int32_t physical_rows = logits.ne[0];
-    const std::int32_t cols          = drafts.ne[0] + 1;
+    const std::int32_t cols          = licensed_tokens.ne[0];
     const std::int32_t batch         = drafts.ne[1];
     const auto* live                 = static_cast<const std::int32_t*>(live_rows.data);
     const auto& layout               = plan.workspace;
@@ -26,7 +26,7 @@ void launch(const Tensor& target_tokens, const Tensor& logits, const Tensor& dra
                 static_cast<const std::int32_t*>(base_positions.data),
                 static_cast<std::int32_t*>(licensed_tokens.data),
                 static_cast<std::int32_t*>(licensed_counts.data), configs, token_domain,
-                physical_rows, drafts.ne[0], live);
+                physical_rows, cols - 1, live);
         CUDA_CHECK(cudaGetLastError());
         return;
     }
@@ -44,7 +44,6 @@ void launch(const Tensor& target_tokens, const Tensor& logits, const Tensor& dra
             .token_domain    = token_domain,
             .physical_rows   = physical_rows,
             .columns         = cols,
-            .draft_count     = drafts.ne[0],
             .workspace       = scratch,
             .row_stride      = layout.bytes,
             .first_row       = begin};
@@ -54,8 +53,8 @@ void launch(const Tensor& target_tokens, const Tensor& logits, const Tensor& dra
                                       static_cast<unsigned int>(rows));
         speculative_sampling_group_finalize_kernel<ParallelSchedule, false>
             <<<batched_group_grid, ParallelSchedule::kSamplerGroupBlock, 0, stream>>>(
-                static_cast<const std::int32_t*>(target_tokens.data), token_rows(drafts), nullptr,
-                nullptr, static_cast<const std::int32_t*>(current_extents.data),
+                static_cast<const std::int32_t*>(target_tokens.data), token_rows(drafts), {},
+                static_cast<const std::int32_t*>(current_extents.data),
                 static_cast<const std::int32_t*>(base_positions.data),
                 static_cast<std::int32_t*>(licensed_tokens.data),
                 static_cast<std::int32_t*>(licensed_counts.data), configs, token_domain, cols,

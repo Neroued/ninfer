@@ -276,7 +276,7 @@ int main() {
                 "cold constraint observation");
         const auto initial_positions = observed->observation().mask_positions;
         std::vector<std::uint32_t> lookahead(2 * observed->mask_words());
-        observed->masks(std::array<std::int32_t, 1>{'a'}, lookahead);
+        (void)observed->masks(std::array<std::int32_t, 1>{'a'}, lookahead);
         require(!observed->observation().complete &&
                     observed->observation().mask_positions == initial_positions + 2,
                 "lookahead completion escaped rollback or lost real work");

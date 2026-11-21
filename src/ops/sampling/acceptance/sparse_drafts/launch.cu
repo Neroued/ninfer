@@ -18,7 +18,7 @@ __global__ __launch_bounds__(256) void speculative_accept_sparse_warp_greedy_ker
         if (lane == 0) licensed_counts[row] = 0;
         return;
     }
-    const int extent = min(k, max(0, current_extents[row]));
+    const int extent = drafts.extent(current_extents[row], k);
     speculative_sparse_warp_greedy(target_tokens, drafts, licensed_tokens, licensed_counts, row,
                                    extent, k);
 }
@@ -31,7 +31,7 @@ void launch(const Tensor& target_tokens, const Tensor& logits, const Tensor& dra
             const Plan& plan, MemorySpan workspace, CudaExecutionView execution) {
     const auto stream        = execution.stream();
     const std::int32_t batch = drafts.ne[1];
-    const std::int32_t k     = drafts.ne[0];
+    const std::int32_t k     = licensed_tokens.ne[0] - 1;
     const std::int32_t cols  = k + 1;
     const auto* live         = static_cast<const std::int32_t*>(live_rows.data);
     if (plan.raw_greedy) {
@@ -60,7 +60,6 @@ void launch(const Tensor& target_tokens, const Tensor& logits, const Tensor& dra
             .token_domain    = token_domain,
             .physical_rows   = logits.ne[0],
             .columns         = cols,
-            .draft_count     = k,
             .workspace       = scratch,
             .row_stride      = layout.bytes,
             .first_row       = begin};
@@ -72,8 +71,7 @@ void launch(const Tensor& target_tokens, const Tensor& logits, const Tensor& dra
         speculative_sampling_group_finalize_kernel<Schedule, true>
             <<<group_grid, Schedule::kSamplerGroupBlock, 0, stream>>>(
                 static_cast<const std::int32_t*>(target_tokens.data), token_rows(drafts),
-                static_cast<const std::int32_t*>(candidate_ids.data),
-                static_cast<const float*>(proposal_q.data),
+                sparse_proposal(candidate_ids, proposal_q),
                 static_cast<const std::int32_t*>(current_extents.data),
                 static_cast<const std::int32_t*>(base_positions.data),
                 static_cast<std::int32_t*>(licensed_tokens.data),

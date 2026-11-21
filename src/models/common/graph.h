@@ -12,7 +12,31 @@ struct GraphSegment {
     DecodeGraphExecutable executable;
 
     void prepare(CudaExecutionView, const std::function<void()>&, ParallelExecution* = nullptr);
-    void launch(CudaExecutionView, ParallelExecution* = nullptr);
+    void launch(CudaExecutionView, ParallelExecution* = nullptr,
+                const CommunicationGraphWork* replay_work = nullptr);
+};
+
+// One prefix of serial MTP steps in a fused Round. The readout child stays in the DAG.
+class MtpGraphSteps {
+public:
+    struct Step {
+        void readout(cudaStream_t, const std::function<void()>&);
+    private:
+        friend class MtpGraphSteps;
+        DecodeGraphSection before, after;
+    };
+
+    void capture_step(cudaStream_t, ParallelExecution*, const std::function<void(Step*)>&);
+    void finish(const CommunicationGraphWork& full);
+
+    [[nodiscard]] bool empty() const noexcept { return work_.empty(); }
+
+    [[nodiscard]] const CommunicationGraphWork& set_depth(const DecodeGraphExecutable&, unsigned);
+
+private:
+    std::vector<Step> steps_;
+    std::vector<CommunicationGraphWork> work_;
+    unsigned installed_depth_ = 0;
 };
 
 } // namespace ninfer::models

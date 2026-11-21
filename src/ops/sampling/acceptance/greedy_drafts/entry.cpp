@@ -1,6 +1,6 @@
 #include "ninfer/ops/speculative_accept.h"
 #include "ops/sampling/acceptance/greedy_drafts/plan.h"
-#include "ops/common/host/operands.h"
+#include "ops/sampling/acceptance/operands.h"
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
@@ -36,33 +36,35 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
             "speculative_accept_greedy_drafts: workspace belongs to another device");
     }
     constexpr const char* op = "speculative_accept_greedy_drafts";
-    const std::int32_t k     = drafts.ne[0];
-    const std::int32_t batch = drafts.ne[1];
-    if (k < 1 || k == std::numeric_limits<std::int32_t>::max()) {
-        throw std::invalid_argument("speculative_accept_greedy_drafts: K must be >=1");
-    }
+    const int steps          = drafts.ne[0];
+    const int columns        = licensed_tokens.ne[0];
+    const int batch          = licensed_tokens.ne[1];
+    if (steps < 1 || columns < 2)
+        throw std::invalid_argument(
+            "speculative_accept_greedy_drafts: invalid proposal or verification width");
     if (batch < 1) {
         throw std::invalid_argument("speculative_accept_greedy_drafts: B must be >=1");
     }
-    common::operand::tensor(target_tokens, DType::I32, {k + 1, batch}, 1, op, "target_tokens",
+    common::operand::tensor(target_tokens, DType::I32, {columns, batch}, 1, op, "target_tokens",
                             execution.device());
     common::operand::dtype(logits, DType::BF16, op, "logits");
     common::operand::contiguous_nonnull(logits, op, "logits", execution.device());
-    if (logits.ne[0] <= 0 || logits.ne[1] != k + 1 || logits.ne[2] != batch || logits.ne[3] != 1) {
+    if (logits.ne[0] <= 0 || logits.ne[1] != columns || logits.ne[2] != batch ||
+        logits.ne[3] != 1) {
         throw std::invalid_argument(
-            "speculative_accept_greedy_drafts: logits must be [physical_rows,K+1,B]");
+            "speculative_accept_greedy_drafts: logits must be [physical_rows,W,B]");
     }
     if (token_domain <= 0 || token_domain > logits.ne[0]) {
         throw std::invalid_argument(
             "speculative_accept_greedy_drafts: token_domain must be in [1, logits.ne[0]]");
     }
-    common::operand::strided_tensor(drafts, DType::I32, {k, batch}, 1, op, "drafts",
+    common::operand::strided_tensor(drafts, DType::I32, {steps, batch}, 4, op, "drafts",
                                     execution.device());
     common::operand::tensor(current_extents, DType::I32, {batch}, 1, op, "current_extents",
                             execution.device());
     common::operand::tensor(base_positions, DType::I32, {batch}, 1, op, "base_positions",
                             execution.device());
-    common::operand::tensor(licensed_tokens, DType::I32, {k + 1, batch}, 1, op, "licensed_tokens",
+    common::operand::tensor(licensed_tokens, DType::I32, {columns, batch}, 1, op, "licensed_tokens",
                             execution.device());
     common::operand::tensor(licensed_counts, DType::I32, {batch}, 1, op, "licensed_counts",
                             execution.device());
@@ -72,19 +74,15 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
     if (live_rows.data) {
         common::operand::tensor(live_rows, DType::I32, {batch}, 4, op, "live rows",
                                 execution.device());
-        for (const auto* output : {&licensed_tokens, &licensed_counts})
-            common::operand::disjoint(common::operand::range(live_rows, op),
-                                      common::operand::range(*output, op), op);
     }
     auto scratch_scope       = workspace.scope();
-    const auto plan          = greedy_drafts_detail::select_plan(token_domain, k + 1);
+    const auto plan          = greedy_drafts_detail::select_plan(token_domain, columns);
     const std::size_t bytes  = plan.workspace.bytes * static_cast<std::size_t>(batch);
     const MemorySpan scratch = bytes == 0 ? MemorySpan{} : workspace.alloc_bytes(bytes);
-    if (live_rows.data && scratch.data)
-        common::operand::disjoint(
-            common::operand::range(live_rows, "speculative_accept_greedy_drafts"),
-            common::operand::range(scratch.data, scratch.bytes, "speculative_accept_greedy_drafts"),
-            "speculative_accept_greedy_drafts");
+    sampling_detail::check_outputs(
+        {&licensed_tokens, &licensed_counts},
+        {&target_tokens, &logits, &drafts, &current_extents, &base_positions, &live_rows}, configs,
+        batch, op, scratch);
     greedy_drafts_detail::launch(target_tokens, logits, drafts, current_extents, base_positions,
                                  licensed_tokens, licensed_counts, token_domain, configs, live_rows,
                                  plan, scratch, execution);

@@ -15,6 +15,25 @@ int outer_extent(const KdaReplayRecordSpec& s) {
         throw std::overflow_error("KDA replay: layer/row extent exceeds int32");
     return s.layers * s.record_capacity;
 }
+
+void validate_layout(const KdaReplayRecordLayout& layout) {
+    LayoutBuilder builder;
+    const auto expected = plan_kda_replay_records(builder, layout.spec);
+    const std::array actual{&layout.conv, &layout.key, &layout.value, &layout.log_decay,
+                            &layout.beta};
+    const std::array schema{&expected.conv, &expected.key, &expected.value, &expected.log_decay,
+                            &expected.beta};
+    std::size_t end = 0;
+    for (std::size_t i = 0; i < actual.size(); ++i) {
+        const auto& a = *actual[i];
+        const auto& e = *schema[i];
+        if (a.dtype != e.dtype || a.shape != e.shape || a.region.bytes != e.region.bytes ||
+            a.region.alignment != 256 || a.region.offset % 256 != 0 || a.region.offset < end ||
+            a.region.bytes > std::numeric_limits<std::size_t>::max() - a.region.offset)
+            throw std::invalid_argument("KDA replay: inconsistent or overlapping record layout");
+        end = a.region.offset + a.region.bytes;
+    }
+}
 } // namespace
 
 KdaReplayRecordLayout plan_kda_replay_records(LayoutBuilder& b, const KdaReplayRecordSpec& s) {
@@ -33,24 +52,25 @@ std::size_t KdaReplayRecordLayout::payload_bytes() const noexcept {
            beta.region.bytes;
 }
 
+KdaReplayRecordLayout KdaReplayRecordLayout::with_width(std::int32_t width) const {
+    validate_layout(*this);
+    if (width < 1 || width > spec.width)
+        throw std::invalid_argument("KDA replay: requested width exceeds record layout");
+    auto narrowed  = spec;
+    narrowed.width = width;
+    LayoutBuilder builder;
+    auto result                    = plan_kda_replay_records(builder, narrowed);
+    result.conv.region.offset      = conv.region.offset;
+    result.key.region.offset       = key.region.offset;
+    result.value.region.offset     = value.region.offset;
+    result.log_decay.region.offset = log_decay.region.offset;
+    result.beta.region.offset      = beta.region.offset;
+    return result;
+}
+
 KdaReplayRecords::KdaReplayRecords(MemorySpan backing, const KdaReplayRecordLayout& layout)
     : spec(layout.spec) {
-    LayoutBuilder builder;
-    const auto expected = plan_kda_replay_records(builder, spec);
-    const std::array actual{&layout.conv, &layout.key, &layout.value, &layout.log_decay,
-                            &layout.beta};
-    const std::array schema{&expected.conv, &expected.key, &expected.value, &expected.log_decay,
-                            &expected.beta};
-    std::size_t end = 0;
-    for (std::size_t i = 0; i < actual.size(); ++i) {
-        const auto& a = *actual[i];
-        const auto& e = *schema[i];
-        if (a.dtype != e.dtype || a.shape != e.shape || a.region.bytes != e.region.bytes ||
-            a.region.alignment != 256 || a.region.offset < end)
-            throw std::invalid_argument("KDA replay: inconsistent or overlapping record layout");
-        (void)a.bind(backing);
-        end = a.region.offset + a.region.bytes;
-    }
+    validate_layout(layout);
     conv      = layout.conv.bind(backing);
     key       = layout.key.bind(backing);
     value     = layout.value.bind(backing);

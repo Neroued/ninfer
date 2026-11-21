@@ -15,6 +15,8 @@ struct KdaReplayRecordLayout {
     TensorRegion conv, key, value, log_decay, beta;
 
     [[nodiscard]] std::size_t payload_bytes() const noexcept;
+    // Compact rows within each existing plane. Plane bases and record capacity are preserved.
+    [[nodiscard]] KdaReplayRecordLayout with_width(std::int32_t width) const;
 };
 
 [[nodiscard]] KdaReplayRecordLayout plan_kda_replay_records(LayoutBuilder& builder,

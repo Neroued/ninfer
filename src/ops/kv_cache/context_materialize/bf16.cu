@@ -6,7 +6,7 @@ namespace ninfer::ops::detail::context_kv::bf16 {
 namespace {
 
 struct Epilogue {
-    static constexpr bool kTmaCollective = true;
+    enum { kTmaCollective = true };
     template <class S>
     static constexpr int kSharedBytes = (S::kBlockRows < 128 ? S::kBlockRows : 128) *
                                         (S::kBlockTokens < 128 ? S::kBlockTokens : 128) * 4;

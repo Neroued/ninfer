@@ -321,8 +321,8 @@ int capacity_contract() {
     return failures;
 }
 
-int padded_accept_contract(int domain) {
-    constexpr int batch = 17, k = 3, width = k + 1;
+int padded_accept_contract(int domain, int k = 3, int width = 4) {
+    constexpr int batch = 17;
     const auto cuda = cuda_environment().context.execution_view();
     std::vector<int> targets(width * batch), drafts(k * batch), extents(batch), live(batch),
         expected(width * batch), expected_counts(batch), positions(batch, 123);
@@ -349,7 +349,7 @@ int padded_accept_contract(int domain) {
     DeviceBuffer storage(
         cuda.device(),
         std::max<std::size_t>(256, ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
-                                       domain, k, k, batch, batch)));
+                                       domain, width - 1, width - 1, batch, batch)));
     MemoryArena workspace(storage.span());
     DecodeGraphDefinition definition;
     definition.capture(cuda.stream(), [&] {
@@ -364,7 +364,8 @@ int padded_accept_contract(int domain) {
         std::fill(expected.begin(), expected.end(), 0);
         for (int b = 0; b < batch; ++b) {
             live[b]    = (b + replay) % 3 != 1;
-            extents[b] = live[b] ? b % (k + 1) : std::numeric_limits<int>::min();
+            extents[b] =
+                live[b] ? b % (std::min(k, width - 1) + 1) : std::numeric_limits<int>::min();
             configs[b] = {.temperature = b % 2 ? 1.F : 0.F, .top_k = 1};
             if (!live[b]) {
                 configs[b].presence_penalty = 1;
@@ -408,6 +409,10 @@ int padded_accept_contract(int domain) {
 } // namespace
 
 void add_greedy_accept_cases(ninfer::test::OpSuite& suite) {
+    suite.add("accept_greedy/small_vocab/proposal7_width4",
+              [] { return padded_accept_contract(64, 7, 4); });
+    suite.add("accept_greedy/small_vocab/proposal2_width8",
+              [] { return padded_accept_contract(64, 2, 8); });
     suite.add("accept_greedy/capacity", capacity_contract);
     for (auto [k, accepted, domain] : {std::array{1, 0, 64}, {5, 2, 64}, {5, 5, 64}, {15, 7, 257}})
         suite.add("accept_greedy/k" + std::to_string(k) + "/accepted" + std::to_string(accepted),

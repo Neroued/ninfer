@@ -73,6 +73,17 @@ std::vector<CollectiveRoute> select_collectives(std::span<const CollectiveRoute>
     return result;
 }
 
+bool supports_graph_gating(const GroupRouting& routing,
+                           std::span<Backend* const> candidates) noexcept {
+    const auto supports = [&](CommunicationBackend kind) {
+        const auto* backend = candidate(candidates, kind);
+        return backend && backend->supports_graph_gating();
+    };
+    return (!routing.peers || supports(*routing.peers)) &&
+           std::ranges::all_of(routing.collectives,
+                               [&](const auto& r) { return supports(r.backend); });
+}
+
 GroupRouting select_routing(const GroupRequirements& requirements, const GroupDescription& group,
                             CommunicationPolicy policy, std::span<Backend* const> candidates,
                             bool peer_work) {

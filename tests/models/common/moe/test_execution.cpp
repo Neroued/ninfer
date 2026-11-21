@@ -616,7 +616,7 @@ int qualify_schedule(const DeviceContext& device, const CpuTopology& topology,
                     definition.validity = call.validity;
                     offload::capture_layer(
                         definition, resources, order[i], device.execution_view(),
-                        {tokens, tokens == 9 ? 8 : tokens}, [] {},
+                        {tokens, tokens == 9 ? 8 : tokens}, [](DecodeGraphChild&) {},
                         [&](const offload::PreparedExecution& prepared) {
                             offload::enqueue_gpu(call.device.x, prepared, call.destination,
                                                  call.validity, workspace,

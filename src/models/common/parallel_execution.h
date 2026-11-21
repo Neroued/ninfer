@@ -57,6 +57,8 @@ public:
     void broadcast(Tensor&, CudaExecutionView);
     void broadcast(Tensor&, std::uint32_t owner, CudaExecutionView);
     void exchange(std::span<const distributed::PeerTransfer>, CudaExecutionView);
+    [[nodiscard]] bool supports_graph_gating() const noexcept;
+    [[nodiscard]] CommunicationGraphWork captured_work() const;
     void record_graph(CommunicationGraphWork&, const std::function<void()>&);
     void replayed(const CommunicationGraphWork&) const;
 

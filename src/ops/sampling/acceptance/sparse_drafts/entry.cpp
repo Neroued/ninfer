@@ -1,6 +1,6 @@
 #include "ninfer/ops/speculative_accept.h"
 #include "ops/sampling/acceptance/sparse_drafts/plan.h"
-#include "ops/common/host/operands.h"
+#include "ops/sampling/acceptance/operands.h"
 #include <algorithm>
 #include <stdexcept>
 
@@ -8,7 +8,6 @@ namespace ninfer::ops {
 namespace {
 
 constexpr std::int32_t kSparseMaxDrafts    = 15;
-constexpr std::int32_t kSparseCandidates   = 16;
 constexpr std::int32_t kSparsePhysicalRows = 248320;
 constexpr std::int32_t kSparseTokenDomain  = 248077;
 
@@ -44,11 +43,12 @@ void speculative_accept_sparse_drafts(const Tensor& target_tokens, const Tensor&
         throw std::invalid_argument(
             "speculative_accept_sparse_drafts: token_domain must be 248077");
     }
-    const std::int32_t k = drafts.ne[0];
-    if (k < 1 || k > kSparseMaxDrafts)
-        throw std::invalid_argument("speculative_accept_sparse_drafts: K must be 1..15");
-    const std::int32_t columns = k + 1;
-    const std::int32_t batch   = drafts.ne[1];
+    const int steps   = drafts.ne[0];
+    const int columns = licensed_tokens.ne[0];
+    const int batch   = licensed_tokens.ne[1];
+    if (steps < 1 || steps > kSparseMaxDrafts || columns < 2 || columns > kSparseMaxDrafts + 1)
+        throw std::invalid_argument(
+            "speculative_accept_sparse_drafts: invalid proposal or verification width");
     if (batch < 1) {
         throw std::invalid_argument("speculative_accept_sparse_drafts: B must be positive");
     }
@@ -56,12 +56,12 @@ void speculative_accept_sparse_drafts(const Tensor& target_tokens, const Tensor&
                             execution.device());
     common::operand::tensor(logits, DType::BF16, {kSparsePhysicalRows, columns, batch}, 1, op,
                             "logits", execution.device());
-    common::operand::strided_tensor(drafts, DType::I32, {k, batch}, 1, op, "drafts",
+    common::operand::strided_tensor(drafts, DType::I32, {steps, batch}, 4, op, "drafts",
                                     execution.device());
-    common::operand::tensor(candidate_ids, DType::I32, {kSparseCandidates, k, batch}, 1, op,
-                            "candidate_ids", execution.device());
-    common::operand::tensor(proposal_q, DType::FP32, {kSparseCandidates, k, batch}, 1, op,
-                            "proposal_q", execution.device());
+    sampling_detail::sparse_candidate_plane(candidate_ids, DType::I32, steps, batch, op,
+                                            "candidate_ids", execution.device());
+    sampling_detail::sparse_candidate_plane(proposal_q, DType::FP32, steps, batch, op, "proposal_q",
+                                            execution.device());
     common::operand::tensor(current_extents, DType::I32, {batch}, 1, op, "current_extents",
                             execution.device());
     common::operand::tensor(base_positions, DType::I32, {batch}, 1, op, "base_positions",
@@ -76,21 +76,17 @@ void speculative_accept_sparse_drafts(const Tensor& target_tokens, const Tensor&
     if (live_rows.data) {
         common::operand::tensor(live_rows, DType::I32, {batch}, 4, op, "live rows",
                                 execution.device());
-        for (const auto* output : {&licensed_tokens, &licensed_counts})
-            common::operand::disjoint(common::operand::range(live_rows, op),
-                                      common::operand::range(*output, op), op);
     }
 
     auto scratch_scope       = workspace.scope();
-    const auto plan          = sparse_drafts_detail::select_plan(token_domain, k + 1,
+    const auto plan          = sparse_drafts_detail::select_plan(token_domain, columns,
                                                                  envelope.all_rows_greedy_without_penalties);
     const std::size_t bytes  = plan.workspace.bytes * static_cast<std::size_t>(batch);
     const MemorySpan scratch = bytes == 0 ? MemorySpan{} : workspace.alloc_bytes(bytes);
-    if (live_rows.data && scratch.data)
-        common::operand::disjoint(
-            common::operand::range(live_rows, "speculative_accept_sparse_drafts"),
-            common::operand::range(scratch.data, scratch.bytes, "speculative_accept_sparse_drafts"),
-            "speculative_accept_sparse_drafts");
+    sampling_detail::check_outputs({&licensed_tokens, &licensed_counts},
+                                   {&target_tokens, &logits, &drafts, &candidate_ids, &proposal_q,
+                                    &current_extents, &base_positions, &live_rows},
+                                   configs, batch, op, scratch);
     sparse_drafts_detail::launch(target_tokens, logits, drafts, candidate_ids, proposal_q,
                                  current_extents, base_positions, licensed_tokens, licensed_counts,
                                  token_domain, configs, live_rows, plan, scratch, execution);

@@ -37,6 +37,8 @@ public:
             }
     }
 
+    bool supports_graph_gating() const noexcept override { return true; }
+
     CommunicationBackend kind() const noexcept override { return CommunicationBackend::Native; }
 
     BackendConnection prepare(const GroupRequirements& requirements) override {

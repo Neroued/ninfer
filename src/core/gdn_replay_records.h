@@ -27,6 +27,8 @@ struct GdnReplayRecordLayout {
     TensorRegion gate;
 
     [[nodiscard]] std::size_t payload_bytes() const noexcept;
+    // Compact rows within each existing plane. Plane bases and record capacity are preserved.
+    [[nodiscard]] GdnReplayRecordLayout with_width(std::int32_t width) const;
 };
 
 [[nodiscard]] GdnReplayRecordLayout plan_gdn_replay_records(LayoutBuilder& builder,

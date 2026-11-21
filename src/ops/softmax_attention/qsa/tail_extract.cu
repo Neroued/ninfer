@@ -38,7 +38,8 @@ template <class T, class FieldView>
 StateColumns<T> state_columns(const FieldView& view) {
     return {common::operand::state_field_base<T>(view),
             static_cast<const std::int64_t*>(view.records.byte_offsets.data),
-            view.field.tensor.shape[0], view.field.layer_stride / std::int64_t(sizeof(T))};
+            view.field.tensor.shape[0],
+            static_cast<std::int64_t>(view.field.layer_stride / sizeof(T))};
 }
 
 struct TailArguments {

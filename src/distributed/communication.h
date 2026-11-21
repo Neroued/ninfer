@@ -114,6 +114,8 @@ public:
     [[nodiscard]] std::uint32_t size() const noexcept;
     [[nodiscard]] Device device() const noexcept;
     [[nodiscard]] CommunicationStatistics statistics() const;
+    [[nodiscard]] bool supports_graph_gating() const noexcept;
+    [[nodiscard]] CommunicationGraphWork captured_work() const;
     void record_graph(CommunicationGraphWork&, const std::function<void()>&) const;
     void replayed(const CommunicationGraphWork&) const noexcept;
     // All mutually dependent sends/receives are enqueued together, with one entry per peer.

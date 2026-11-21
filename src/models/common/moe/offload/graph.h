@@ -21,11 +21,12 @@ struct LayerGraphDefinition {
     GraphPlan plan;
     ops::MoeTokenValidity validity;
     DecodeGraphDefinition mixer, steady, feature;
+    DecodeGraphChild mixer_child, steady_child;
     std::shared_ptr<SubsetGraphDefinitions> moe;
 };
 
 void capture_layer(LayerGraphDefinition&, Resources&, ExpertBankId, CudaExecutionView,
-                   TokenGeometry, const std::function<void()>& mixer,
+                   TokenGeometry, const MixerBody& mixer,
                    const std::function<void(const PreparedExecution&)>& gpu_moe,
                    const std::function<void()>& feature = {});
 
@@ -34,6 +35,7 @@ class LayerGraphExecutable {
 public:
     explicit LayerGraphExecutable(const LayerGraphDefinition&);
     void update(const LayerGraphDefinition&);
+    void update_mixer_child(const DecodeGraphDefinition&);
     void upload(cudaStream_t);
     [[nodiscard]] bool start(Resources&, ExpertBankId, Tensor& output, CudaExecutionView,
                              std::function<void()> after_gpu_submit = {});
@@ -56,6 +58,7 @@ private:
 
     [[nodiscard]] bool advance();
     std::optional<Invocation> pending_;
+    DecodeGraphChild mixer_child_, steady_child_;
     GraphPlan plan_;
     ops::MoeTokenValidity validity_;
     DecodeGraphExecutable mixer_, steady_, feature_;

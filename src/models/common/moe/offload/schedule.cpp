@@ -30,6 +30,10 @@ public:
     explicit Executable(const Definition&);
     void update(const moe::LayerGraphDefinition&) override;
 
+    void update_mixer_child(const DecodeGraphDefinition& next) override {
+        executable_.update_mixer_child(next);
+    }
+
     void upload(cudaStream_t stream) override { executable_.upload(stream); }
 
     bool start(Tensor& output, CudaExecutionView cuda,
@@ -91,8 +95,7 @@ public:
 
     std::shared_ptr<const moe::LayerGraphDefinition>
     capture_layer(ExpertBankId bank, CudaExecutionView cuda, TokenGeometry geometry,
-                  const std::function<void()>& mixer, const GpuBody& body,
-                  const std::function<void()>& feature,
+                  const MixerBody& mixer, const GpuBody& body, const std::function<void()>& feature,
                   const std::shared_ptr<const moe::LayerGraphDefinition>& shared) override {
         auto out = std::make_shared<Definition>(resources_, bank);
         if (shared) {

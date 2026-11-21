@@ -1,5 +1,5 @@
 #include "ninfer/ops/vocabulary.h"
-#include "ops/common/host/operands.h"
+#include "ops/sampling/acceptance/operands.h"
 #include "ops/sampling/acceptance/kernel.cuh"
 
 namespace ninfer::ops {
@@ -107,7 +107,7 @@ __global__ void accept_kernel(const unsigned long long* keys, int cap, int draft
         if (!threadIdx.x) counts[row] = 0;
         return;
     }
-    const int extent = extents[row], old_length = positions[row];
+    const int extent = drafts.extent(extents[row], drafts_count), old_length = positions[row];
     const auto cfg = configs[row];
     __shared__ Support support[16];
     __shared__ int terminals[16];
@@ -165,7 +165,7 @@ __device__ float cumulative_weight(float weight) {
 // the critical path by a single Top-K merge instead of D serial distribution builds.
 __global__ void accept_sparse_kernel(const unsigned long long* keys, int cap, int d, int batch,
                                      int ranks, const SamplingConfig* configs, TokenRows drafts,
-                                     const int* ids, const float* q, const int* extents,
+                                     SparseProposalView proposal, const int* extents,
                                      const int* positions, int* licensed, int* counts,
                                      const int* live) {
     const int row = blockIdx.x, col = threadIdx.x / 32, lane = threadIdx.x & 31;
@@ -175,7 +175,7 @@ __global__ void accept_sparse_kernel(const unsigned long long* keys, int cap, in
         if (!threadIdx.x) counts[row] = 0;
         return;
     }
-    const int extent = extents[row], position = positions[row];
+    const int extent = drafts.extent(extents[row], d), position = positions[row];
     const auto cfg = configs[row];
     __shared__ Support supports[16];
     __shared__ int rejected[16], terminal[16];
@@ -192,9 +192,8 @@ __global__ void accept_sparse_kernel(const unsigned long long* keys, int cap, in
             const int token = lane < s.size ? s.ids[lane] : INT_MAX;
             float weight    = lane < s.size ? s.probabilities[lane] : 0.0F;
             if (col < extent) {
-                const auto at     = (std::int64_t(row) * d + col) * 16 + lane;
-                const float own_q = lane < 16 ? q[at] : 0.0F;
-                const int own_id  = own_q > 0 ? ids[at] : INT_MAX;
+                const float own_q = lane < 16 ? proposal.q.at(row, col)[lane] : 0.0F;
+                const int own_id  = own_q > 0 ? proposal.ids.at(row, col)[lane] : INT_MAX;
                 const float pd    = warp_sum(token == draft ? weight : 0.0F);
                 const float qd    = warp_sum(own_id == draft ? own_q : 0.0F);
                 const float u     = sampling_uniform(cfg.seed, position + col + 1,
@@ -258,18 +257,6 @@ void check_live(const Tensor& live, int batch, const char* op, Device device) {
     if (live.data) operand::tensor(live, DType::I32, {batch}, 4, op, "live rows", device);
 }
 
-void check_outputs(std::initializer_list<Tensor*> outputs,
-                   std::initializer_list<const Tensor*> inputs, const SamplingConfig* configs,
-                   int batch, const char* op) {
-    for (auto current = outputs.begin(); current != outputs.end(); ++current) {
-        const auto range = operand::range(**current, op);
-        for (const auto* input : inputs)
-            if (input->data) operand::disjoint(range, operand::strided_range(*input, op), op);
-        operand::disjoint(range, operand::range(configs, sizeof(SamplingConfig) * batch, op), op);
-        for (auto earlier = outputs.begin(); earlier != current; ++earlier)
-            operand::disjoint(range, operand::range(**earlier, op), op);
-    }
-}
 } // namespace
 
 void sample_vocabulary_candidates(const Tensor& keys, const SamplingConfig* configs,
@@ -300,7 +287,8 @@ void accept_vocabulary_candidates(const Tensor& keys, const SamplingConfig* conf
     const int d = keys.ne[1] - 1, batch = keys.ne[2];
     check_live(live_rows, batch, op, execution.device());
     if (d < 1) throw std::invalid_argument("accept_vocabulary_candidates: expected D>=1");
-    operand::strided_tensor(drafts, DType::I32, {d, batch}, 4, op, "drafts", execution.device());
+    operand::strided_tensor(drafts, DType::I32, {drafts.ne[0], batch}, 4, op, "drafts",
+                            execution.device());
     operand::tensor(current_extents, DType::I32, {batch}, 4, op, "extents", execution.device());
     operand::tensor(base_positions, DType::I32, {batch}, 4, op, "base positions",
                     execution.device());
@@ -329,11 +317,14 @@ void accept_vocabulary_candidates_sparse(const Tensor& keys, const SamplingConfi
     const int d = keys.ne[1] - 1, batch = keys.ne[2];
     check_live(live_rows, batch, op, execution.device());
     if (d < 1) throw std::invalid_argument(std::string(op) + ": expected D>=1");
-    operand::strided_tensor(drafts, DType::I32, {d, batch}, 4, op, "drafts", execution.device());
-    operand::tensor(candidate_ids, DType::I32, {16, d, batch}, 4, op, "candidate IDs",
-                    execution.device());
-    operand::tensor(proposal_q, DType::FP32, {16, d, batch}, 4, op, "proposal q",
-                    execution.device());
+    operand::strided_tensor(drafts, DType::I32, {drafts.ne[0], batch}, 4, op, "drafts",
+                            execution.device());
+    if (drafts.ne[0] > 15)
+        throw std::invalid_argument(std::string(op) + ": proposal width exceeds 15");
+    sparse_candidate_plane(candidate_ids, DType::I32, drafts.ne[0], batch, op, "candidate IDs",
+                           execution.device());
+    sparse_candidate_plane(proposal_q, DType::FP32, drafts.ne[0], batch, op, "proposal q",
+                           execution.device());
     operand::tensor(current_extents, DType::I32, {batch}, 4, op, "extents", execution.device());
     operand::tensor(base_positions, DType::I32, {batch}, 4, op, "positions", execution.device());
     operand::tensor(licensed_tokens, DType::I32, {d + 1, batch}, 4, op, "tokens",
@@ -345,10 +336,10 @@ void accept_vocabulary_candidates_sparse(const Tensor& keys, const SamplingConfi
                   configs, batch, op);
     accept_sparse_kernel<<<batch, (d + 1) * 32, 0, execution.stream()>>>(
         static_cast<const unsigned long long*>(keys.data), keys.ne[0], d, batch, keys.ne[3],
-        configs, token_rows(drafts), static_cast<const int*>(candidate_ids.data),
-        static_cast<const float*>(proposal_q.data), static_cast<const int*>(current_extents.data),
-        static_cast<const int*>(base_positions.data), static_cast<int*>(licensed_tokens.data),
-        static_cast<int*>(licensed_counts.data), static_cast<const int*>(live_rows.data));
+        configs, token_rows(drafts), sparse_proposal(candidate_ids, proposal_q),
+        static_cast<const int*>(current_extents.data), static_cast<const int*>(base_positions.data),
+        static_cast<int*>(licensed_tokens.data), static_cast<int*>(licensed_counts.data),
+        static_cast<const int*>(live_rows.data));
     CUDA_CHECK(cudaGetLastError());
 }
 } // namespace ninfer::ops

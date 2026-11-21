@@ -25,8 +25,8 @@ using namespace ninfer::test;
 
 namespace {
 
-int prepare_verify_case(int k, int batch) {
-    const int width = k + 1;
+int prepare_verify_case(int k, int width, int batch) {
+    const int limit = std::min(k, width - 1);
     std::vector<std::int32_t> anchors(batch), lengths(batch), extents(batch), drafts(k * batch);
     for (int b = 0; b < batch; ++b) {
         anchors[b] = 70000 + 11 * b;
@@ -62,8 +62,12 @@ int prepare_verify_case(int k, int batch) {
         graph.instantiate(definition);
     }
     int failures = 0;
-    for (int phase = 0; phase <= k; ++phase) {
-        for (int b = 0; b < batch; ++b) extents[b] = (phase + 3 * b) % width;
+    for (int phase = 0; phase <= limit; ++phase) {
+        for (int b = 0; b < batch; ++b) extents[b] = (phase + b) % (limit + 1);
+        if (width != k + 1 && phase == limit) {
+            extents.front() = -1;
+            extents.back()  = limit + 3;
+        }
         CUDA_CHECK(cudaMemcpyAsync(d_extents.data(), extents.data(), d_extents.size(),
                                    cudaMemcpyHostToDevice, context.stream()));
         if (graph.ready())
@@ -74,9 +78,11 @@ int prepare_verify_case(int k, int batch) {
         std::vector<std::int32_t> expected_ids(width * batch), expected_positions(width * batch);
         for (int b = 0; b < batch; ++b)
             for (int j = 0; j < width; ++j) {
-                expected_ids[b * width + j] =
-                    j > 0 && j <= extents[b] ? drafts[b * k + j - 1] : anchors[b];
-                expected_positions[b * width + j] = lengths[b] + std::min(j, extents[b]);
+                expected_ids[b * width + j] = j > 0 && j <= std::clamp(extents[b], 0, limit)
+                                                  ? drafts[b * k + j - 1]
+                                                  : anchors[b];
+                expected_positions[b * width + j] =
+                    lengths[b] + std::min(j, std::clamp(extents[b], 0, limit));
             }
         failures +=
             verify_exact("verify ids", from_device<std::int32_t>(d_ids.data(), expected_ids.size()),
@@ -97,6 +103,17 @@ int prepare_verify_case(int k, int batch) {
         verify_exact("lengths unchanged", from_device<std::int32_t>(d_lengths, batch), lengths);
     failures += verify_exact("drafts unchanged", from_device<std::int32_t>(d_drafts, stored.size()),
                              stored);
+    if (width != k + 1) {
+        auto one_column = Tensor(d_ids.span(), DType::I32, {1, batch});
+        try {
+            ops::prepare_verify_ids(a, d, e, one_column, context.execution_view());
+            ++failures;
+        } catch (const std::invalid_argument&) {}
+        try {
+            ops::prepare_verify_inputs(a, d, l, e, ids, one_column, context.execution_view());
+            ++failures;
+        } catch (const std::invalid_argument&) {}
+    }
     failures += d_full.verify_guards("verify full ids");
     failures += d_ids.verify_guards("verify ids");
     failures += d_positions.verify_guards("verify positions");
@@ -109,6 +126,8 @@ void add_verify_cases(ninfer::test::OpSuite& suite) {
     for (int k = 1; k <= 15; ++k)
         for (int batch : {1, 8})
             suite.add("prepare_verify/k" + std::to_string(k) + "/b" + std::to_string(batch),
-                      [=] { return prepare_verify_case(k, batch); },
+                      [=] { return prepare_verify_case(k, k + 1, batch); },
                       {{"execution", k == 15 && batch == 8 ? "graph" : "eager"}});
+    suite.add("prepare_verify/proposal7_width4", [] { return prepare_verify_case(7, 4, 4); });
+    suite.add("prepare_verify/proposal2_width8", [] { return prepare_verify_case(2, 8, 4); });
 }

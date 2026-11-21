@@ -64,6 +64,37 @@ int check_external_event(ninfer::DeviceContext& device) {
     return failures;
 }
 
+__global__ void add_one(unsigned* sum) {
+    if (threadIdx.x == 0) atomicAdd(sum, 1U);
+}
+
+int check_cooperative_section(ninfer::DeviceContext& device) {
+    ninfer::DeviceBuffer storage(device.device(), sizeof(unsigned));
+    auto* sum = static_cast<unsigned*>(storage.data());
+    CUDA_CHECK(cudaMemsetAsync(sum, 0, storage.size(), device.stream()));
+    ninfer::DecodeGraphSection optional;
+    ninfer::DecodeGraphDefinition round;
+    round.capture(device.stream(), [&] {
+        optional.capture(device.stream(), [&] {
+            void* args[]{&sum};
+            CUDA_CHECK(cudaLaunchCooperativeKernel(reinterpret_cast<const void*>(add_one), dim3(2),
+                                                   dim3(512), args, 0, device.stream()));
+        });
+    });
+    ninfer::DecodeGraphExecutable graph;
+    graph.instantiate(round);
+    int failures      = 0;
+    unsigned expected = 0;
+    for (bool active : {true, false, false, true}) {
+        optional.set_enabled(graph, active);
+        graph.launch(device.stream());
+        device.synchronize();
+        if (active) expected += 2;
+        failures += expect_value(sum, expected, "cooperative graph section");
+    }
+    return failures;
+}
+
 int check_child_graph(ninfer::DeviceContext& device) {
     ninfer::DeviceBuffer source(device.device(), sizeof(std::uint32_t));
     ninfer::DeviceBuffer destination(device.device(), sizeof(std::uint32_t));
@@ -168,6 +199,7 @@ int main() {
         failures += expect_value(storage.data(), 0x55555555U, "capture after failed preparation");
         failures += check_external_event(device);
         failures += check_child_graph(device);
+        failures += check_cooperative_section(device);
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {
         std::cerr << "decode graph test failed: " << error.what() << '\n';

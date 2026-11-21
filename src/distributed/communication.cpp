@@ -171,6 +171,7 @@ struct Group::Impl {
     State state = State::Created;
     GroupRequirements requirements;
     GroupRouting routing;
+    bool graph_gating = false;
     std::vector<BackendState> backends;
     CommunicationGraphWork* capture = nullptr;
 };
@@ -249,6 +250,13 @@ void Group::exchange(std::span<const PeerTransfer> transfers, CudaExecutionView 
         if (item.send.bytes) p.observe(route, 4, item.send.bytes);
         if (item.receive.bytes) p.observe(route, 5, item.receive.bytes);
     }
+}
+
+bool Group::supports_graph_gating() const noexcept { return size() <= 1 || impl_->graph_gating; }
+
+CommunicationGraphWork Group::captured_work() const {
+    if (!impl_->capture) throw std::logic_error("no active communication graph capture");
+    return *impl_->capture;
 }
 
 void Group::record_graph(CommunicationGraphWork& into, const std::function<void()>& body) const {
@@ -390,6 +398,7 @@ CommunicationContext::select(std::span<const CommunicationPreparation> peers,
         for (const auto& route : p.backends) candidates.push_back(route.implementation.get());
         p.routing =
             detail::select_routing(p.requirements, p.description, policy_, candidates, peer_work);
+        p.graph_gating = detail::supports_graph_gating(p.routing, candidates);
         auto& description =
             selected.groups.emplace_back(GroupPreparation{p.requirements, {}, p.routing});
         std::vector<Group::Impl::BackendState> used;

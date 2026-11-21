@@ -28,11 +28,15 @@ public:
     virtual void exchange(std::span<const PeerTransfer>, CudaExecutionView)            = 0;
     virtual void check()                                                               = 0;
 
+    // Skipping an entire captured call on all participants preserves transport ordering.
+    [[nodiscard]] virtual bool supports_graph_gating() const noexcept { return false; }
+
     virtual void wake() noexcept {}
 
     virtual void abort() noexcept                                      = 0;
     virtual void close(std::chrono::steady_clock::time_point deadline) = 0;
     [[nodiscard]] virtual CommunicationMemory memory() const           = 0;
+
 };
 
 [[nodiscard]] std::unique_ptr<Backend> make_nccl_backend(const GroupDescription&,

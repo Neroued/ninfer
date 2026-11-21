@@ -241,7 +241,21 @@ public:
                                        cudaMemcpyHostToDevice, device_.stream()));
             if (w.graph) {
                 group_.record_graph(f.communication, [&] {
+                    const auto before = group_.captured_work();
                     f.definition.capture(device_.stream(), [&] { collective(f); });
+                    const auto after    = group_.captured_work();
+                    std::uint64_t calls = 0, bytes = 0;
+                    for (std::size_t i = 0; i < after.size(); ++i) {
+                        require(before.at(i).backend == after[i].backend,
+                                "capture snapshot backend");
+                        for (std::size_t op = 0; op < after[i].work.calls.size(); ++op) {
+                            calls += after[i].work.calls[op] - before[i].work.calls[op];
+                            bytes +=
+                                after[i].work.payload_bytes[op] - before[i].work.payload_bytes[op];
+                        }
+                    }
+                    require(calls == (w.operation == Operation::Exchange ? 2U : 1U) && bytes > 0,
+                            "captured collective work delta");
                 });
                 f.graph.instantiate(f.definition);
                 for (int i = 0; i < 4; ++i) {

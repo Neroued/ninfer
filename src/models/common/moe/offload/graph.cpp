@@ -56,7 +56,8 @@ GraphPlan graph_plan(const Plan& schedule, ExpertBankId bank, TokenGeometry geom
 }
 
 LayerGraphExecutable::LayerGraphExecutable(const LayerGraphDefinition& source)
-    : plan_(source.plan), validity_(source.validity) {
+    : mixer_child_(source.mixer_child), steady_child_(source.steady_child), plan_(source.plan),
+      validity_(source.validity) {
     instantiate(mixer_, source.mixer);
     instantiate(steady_, source.steady);
     instantiate(feature_, source.feature);
@@ -73,6 +74,12 @@ void LayerGraphExecutable::update(const LayerGraphDefinition& source) {
     validity_ = source.validity;
 }
 
+void LayerGraphExecutable::update_mixer_child(const DecodeGraphDefinition& next) {
+    if (pending_) throw std::logic_error("cannot update an active MoE layer graph");
+    mixer_.update_child(mixer_child_, next);
+    if (steady_.ready()) steady_.update_child(steady_child_, next);
+}
+
 void LayerGraphExecutable::upload(cudaStream_t stream) {
     if (pending_) throw std::logic_error("cannot upload an active MoE layer graph");
     offload::upload(mixer_, stream);
@@ -82,13 +89,12 @@ void LayerGraphExecutable::upload(cudaStream_t stream) {
 }
 
 void capture_layer(LayerGraphDefinition& definition, Resources& resources, ExpertBankId bank,
-                   CudaExecutionView cuda, TokenGeometry geometry,
-                   const std::function<void()>& mixer,
+                   CudaExecutionView cuda, TokenGeometry geometry, const MixerBody& mixer,
                    const std::function<void(const PreparedExecution&)>& gpu_moe,
                    const std::function<void()>& feature) {
     definition.plan   = graph_plan(resources.plan(), bank, geometry);
     const auto tokens = geometry.physical_tokens;
-    definition.mixer.capture(cuda.stream(), mixer);
+    definition.mixer.capture(cuda.stream(), [&] { mixer(definition.mixer_child); });
     using Kind = ops::ExpertSubsetKind;
     for (auto kind : {Kind::All, Kind::None, Kind::MaskOnes}) {
         auto& part = definition.moe->subsets[moe_graph_index(kind)];
@@ -100,7 +106,7 @@ void capture_layer(LayerGraphDefinition& definition, Resources& resources, Exper
         const auto kind = *definition.plan.steady;
         const auto call = resources.describe_layer(bank, tokens, kind);
         definition.steady.capture(cuda.stream(), [&] {
-            mixer();
+            mixer(definition.steady_child);
             gpu_moe(call);
         });
     }

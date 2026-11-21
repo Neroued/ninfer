@@ -221,7 +221,7 @@ void capacity_views() {
     const auto records         = view.main_records;
     const auto backing         = view.host_ingress;
     const auto initial_ingress = view.ingress.bytes;
-    glm::reshape_frame_controls(view, {20, 6}, p.shape.draft_tokens + 1);
+    glm::reshape_frame_controls(view, {20, 6});
     require(view.rows.live_rows.shape[0] == 20 && view.decode.valid_columns.shape[0] == 20 &&
                 view.attention.live_rows.shape[0] == 6 && view.attention.from_gather.shape[0] == 20,
             "physical frame confused global and attention capacities");
@@ -231,7 +231,7 @@ void capacity_views() {
     const auto sampling = view.sampling->region;
     const auto extents  = view.speculative->extents.region;
     const auto output   = view.result_egress;
-    glm::reshape_frame_controls(view, {20, 20}, p.shape.draft_tokens + 1);
+    glm::reshape_frame_controls(view, {20, 20});
     require(view.sampling->region == sampling && view.speculative->extents.region == extents &&
                 view.result_egress == output,
             "attention geometry changed global decision addresses");
@@ -305,7 +305,7 @@ void gpu() {
     CUDA_CHECK(cudaMemcpy(tails.data(), tail.raw_keys.records.byte_offsets.data, sizeof(tails),
                           cudaMemcpyDeviceToHost));
     const auto bytes = r.plan.frame.mtp->tail_keys.shape[0] * 3ULL * sizeof(std::uint16_t);
-    require(tails[0] == 6 * bytes && tails[1] == 7 * bytes && r.kda_fold.has_value(),
+    require(tails[0] == 6 * bytes && tails[1] == 7 * bytes && r.replay(2).records.spec.width == 2,
             "MTP tail slots overlap or KDA fold was not prepared");
     r.synchronize();
 }

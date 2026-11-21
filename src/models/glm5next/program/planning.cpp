@@ -1,6 +1,7 @@
 #include "models/glm5next/program/planning.h"
 
 #include "core/platform.h"
+#include "models/glm5next/work.h"
 #include "models/glm5next/session/planning.h"
 
 #include <algorithm>
@@ -105,6 +106,7 @@ ExecutionPlan plan_execution(std::shared_ptr<const execution::ModelProfile> prof
     if (out.batches->resident_capacity() != out.shape.max_concurrency ||
         out.batches->attention_owners() != out.profile->local.size)
         throw std::invalid_argument("GLM batch plan differs from its execution resources");
+    out.decode_routes             = make_decode_routes(out.shape, *out.batches);
     out.use_cuda_graph = !out.batches->graph_rows().empty();
     out.state          = plan_state(*out.profile);
     out.workspace =

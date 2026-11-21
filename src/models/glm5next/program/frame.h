@@ -39,7 +39,7 @@ struct SpeculativeFrameLayout {
 };
 
 struct DFlashFrameLayout {
-    TensorRegion features, ids, positions, valid_columns, window_count;
+    TensorRegion features, ids, positions, valid_columns, proposal_rows, window_count;
     TensorRegion candidate_ids, proposal_q;
 };
 
@@ -71,7 +71,7 @@ struct FrameLayout {
     std::optional<TensorRegion> visual_indices;
 };
 
-void reshape_frame_controls(FrameLayout&, PhysicalBatchShape, std::uint32_t width);
+void reshape_frame_controls(FrameLayout&, PhysicalBatchShape);
 
 [[nodiscard]] FrameLayout plan_frame(LayoutBuilder&, const execution::ModelProfile&,
                                      const ExecutionShape&);

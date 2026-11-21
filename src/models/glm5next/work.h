@@ -2,6 +2,7 @@
 
 #include "models/common/token_input.h"
 #include "models/common/batch.h"
+#include "models/common/speculative/round_plan.h"
 
 #include "models/common/context/contract.h"
 #include "models/common/context/directory/history.h"
@@ -43,6 +44,9 @@ struct BatchPlan {
 [[nodiscard]] BatchPlan plan_batch(std::span<const WorkRow>, const BatchExecutionPlan&,
                                    bool decode);
 
+[[nodiscard]] std::shared_ptr<const speculative::DecodeGraphRoutes>
+make_decode_routes(const ExecutionShape&, const BatchExecutionPlan&);
+
 enum class ForwardKind : std::uint8_t { Prefill, Replay, Ordinary, Control };
 enum class SampleKind : std::uint8_t { None, FirstToken, NextToken };
 
@@ -52,12 +56,14 @@ struct ForwardWork {
     std::vector<WorkRow> rows;
     std::optional<vision::Work> visual;
     BatchPlan batch;
+    std::shared_ptr<const SpeculativeExecutionGeometry> speculative;
 };
 
 struct SpeculativeWork {
     std::vector<WorkRow> rows;
     std::vector<std::uint32_t> draft_extents;
     BatchPlan batch;
+    std::shared_ptr<const SpeculativeExecutionGeometry> speculative;
 };
 
 struct ResidencyBinding {
@@ -128,6 +134,7 @@ struct WorkContract {
     std::uint32_t vocabulary, public_tokens, ranks;
     std::uint32_t vision_max_features = 0;
     std::uint32_t control_token_limit = 0;
+    std::shared_ptr<const speculative::DecodeGraphRoutes> decode_routes;
     [[nodiscard]] runtime::WorkPayloadCapacity payload_capacity(std::uint32_t rank_count) const;
     void validate(const Work&, runtime::FrameKind) const;
     void validate(const Work&, const Result&, const Commit&) const;

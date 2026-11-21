@@ -42,7 +42,8 @@ WorkContract RankProgramImpl::contract() const {
             parameters.profile->public_tokens,
             parameters.profile->local.size,
             resources.vision ? resources.vision->capacity().max_features : 0,
-            parameters.profile->control_token_limit};
+            parameters.profile->control_token_limit,
+            resources.plan.decode_routes};
 }
 
 void RankProgramImpl::validate_work(const Work& work, runtime::FrameKind kind) const {

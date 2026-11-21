@@ -16,10 +16,6 @@ SessionImpl::SessionImpl(std::shared_ptr<const ModelDefinition> model, SessionPl
     sequences.resize(shape.max_concurrency);
     resident_sequences.reserve(shape.max_concurrency);
     epochs.resize(shape.max_concurrency);
-    if (!plan.batches || plan.batches->resident_capacity() != shape.max_concurrency ||
-        plan.batches->attention_owners() != plan.states.size())
-        throw std::invalid_argument("GLM Session batch plan differs from prepared state");
-    if (!definition) throw std::invalid_argument("invalid GLM5Next session definition");
     if (shape.purpose == EnginePurpose::Generation) {
         count_storage.acquire(
             TokenCountBuilder::capacity_bytes(definition->resources().text.public_token_count));
@@ -182,7 +178,12 @@ PreparedSession& PreparedSession::operator=(PreparedSession&&) noexcept = defaul
 
 PreparedSession prepare_session(std::shared_ptr<const ModelDefinition> definition, SessionPlan plan,
                                 std::unique_ptr<context::ContextDirectory> directory) {
+    if (!definition) throw std::invalid_argument("invalid GLM5Next session definition");
     if (!directory) throw std::invalid_argument("GLM Session requires its prepared directory");
+    if (!plan.batches || plan.batches->resident_capacity() != plan.shape.max_concurrency ||
+        plan.batches->attention_owners() != plan.states.size())
+        throw std::invalid_argument("GLM Session batch plan differs from prepared state");
+    plan.decode_routes  = make_decode_routes(plan.shape, *plan.batches);
     return PreparedSession(std::make_unique<detail::SessionImpl>(
         std::move(definition), std::move(plan), std::move(directory)));
 }

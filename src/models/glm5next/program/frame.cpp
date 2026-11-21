@@ -40,12 +40,14 @@ void control_layout(LayoutBuilder& b, FrameLayout& out, PhysicalBatchShape shape
                                       global.live_rows.region.offset,
                                   256};
     if (out.speculative) out.speculative->extents = rows();
-    if (out.dflash) out.dflash->valid_columns = rows();
+    if (out.dflash) {
+        out.dflash->valid_columns = rows();
+        out.dflash->proposal_rows = rows();
+    }
     if (out.mtp) {
         auto& m = *out.mtp;
         m.draft_steps.resize(width - 1);
         for (auto& step : m.draft_steps) step = metadata(global_rows);
-        m.skip_first = rows();
     }
     if (out.sampling)
         out.sampling =
@@ -76,6 +78,7 @@ void control_layout(LayoutBuilder& b, FrameLayout& out, PhysicalBatchShape shape
     out.ingress = {global.anchors.region.offset, ingress_end - global.anchors.region.offset, 256};
     global.accepted_columns = rows();
     global.count_columns    = rows();
+    if (out.mtp) out.mtp->skip_first = rows();
     local.accepted_columns  = locals();
     local.active_columns    = locals();
     if (out.speculative) out.speculative->last_columns = rows();
@@ -97,10 +100,11 @@ void draft_ids(FrameLayout& out, int rows) {
 }
 } // namespace
 
-void reshape_frame_controls(FrameLayout& out, PhysicalBatchShape shape, std::uint32_t width) {
+void reshape_frame_controls(FrameLayout& out, PhysicalBatchShape shape) {
+    const auto width    = std::uint32_t(out.pending_hidden.shape[1]);
     const auto capacity = std::uint32_t(out.pending_hidden.shape[2]);
     if (!shape.rows || !shape.attention_rows || shape.rows > capacity ||
-        shape.attention_rows > capacity || width != std::uint32_t(out.pending_hidden.shape[1]))
+        shape.attention_rows > shape.rows)
         throw std::invalid_argument("GLM frame controls exceed their physical capacity");
     LayoutBuilder b;
     if (out.ingress.offset) (void)b.add(out.ingress.offset, 1, "frame prefix");

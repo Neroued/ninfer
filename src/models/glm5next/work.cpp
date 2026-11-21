@@ -61,6 +61,13 @@ BatchPlan plan_batch(std::span<const WorkRow> rows, const BatchExecutionPlan& pl
     return result;
 }
 
+std::shared_ptr<const speculative::DecodeGraphRoutes>
+make_decode_routes(const ExecutionShape& shape, const BatchExecutionPlan& batches) {
+    if (batches.graph_shapes().empty()) return {};
+    return std::make_shared<const speculative::DecodeGraphRoutes>(
+        batches, shape.speculative, shape.draft_tokens);
+}
+
 const BatchPlan& work_batch(const Work& work) {
     return std::visit(
         [](const auto& operation) -> const BatchPlan& {
@@ -97,10 +104,11 @@ const context::ContextActions& local_actions(const ContextActions& actions, std:
 ExecutionWork ExecutionTypes::describe_work(const Work& work) {
     ExecutionWork out;
     if (const auto* f = std::get_if<ForwardWork>(&work.operation)) {
-        out.kind = f->kind == ForwardKind::Prefill   ? ExecutionKind::Prefill
-                   : f->kind == ForwardKind::Replay  ? ExecutionKind::Replay
-                   : f->kind == ForwardKind::Control ? ExecutionKind::Control
-                                                     : ExecutionKind::Decode;
+        out.speculative = f->speculative;
+        out.kind        = f->kind == ForwardKind::Prefill   ? ExecutionKind::Prefill
+                          : f->kind == ForwardKind::Replay  ? ExecutionKind::Replay
+                          : f->kind == ForwardKind::Control ? ExecutionKind::Control
+                                                            : ExecutionKind::Decode;
     } else if (std::holds_alternative<ScoreWork>(work.operation))
         out.kind = ExecutionKind::Score;
     const auto rows = work_rows(work);
@@ -108,7 +116,8 @@ ExecutionWork ExecutionTypes::describe_work(const Work& work) {
     for (const auto& row : rows) out.input_tokens += row.ids.size();
     out.scheduled_positions = out.input_tokens;
     if (const auto* m = std::get_if<SpeculativeWork>(&work.operation)) {
-        out.kind = ExecutionKind::Decode;
+        out.speculative = m->speculative;
+        out.kind        = ExecutionKind::Decode;
         for (auto n : m->draft_extents) out.scheduled_positions += n;
     }
     return out;
@@ -124,11 +133,13 @@ runtime::WorkPayloadCapacity WorkContract::payload_capacity(std::uint32_t rank_c
     const auto payload = [&](std::size_t rows, std::size_t span, std::size_t token_bytes) {
         return header + actions(rows, span) + 128 + rows * (192 + 20 * rank_count + token_bytes);
     };
-    const std::size_t width = shape.draft_tokens + 1;
+    // Optional geometry tag, W/d/g, path, graph tag and entry ID.
+    constexpr std::size_t route_bytes = 3 + 4 * sizeof(std::uint32_t);
+    const std::size_t width           = shape.draft_tokens + 1;
     const auto work =
         shape.purpose == EnginePurpose::CausalScoring
             ? payload(1, chunk, 8 * chunk)
-            : std::max({payload(1, chunk, 4 * chunk), payload(batch, width, 4),
+            : std::max({payload(1, chunk, 4 * chunk), payload(batch, width, 4) + route_bytes,
                         payload(batch, control_token_limit, 8ULL * control_token_limit)});
     const auto context = header + context::action_batch_capacity() + 128 + 88 +
                          TokenCounts::encoded_capacity(public_tokens) + 16 * batch;
@@ -185,6 +196,44 @@ void WorkContract::validate(const Work& work, runtime::FrameKind kind) const {
                         (forward && forward->kind == ForwardKind::Ordinary);
     require(work_batch(work) == plan_batch(rows, *batches, decode),
             "physical row plan differs from membership");
+    const auto* verification = std::get_if<SpeculativeWork>(&work.operation);
+    const auto geometry =
+        verification ? verification->speculative : (forward ? forward->speculative : nullptr);
+    require(bool(geometry) == (decode && shape.draft_tokens),
+            "missing or unexpected decode geometry");
+    if (geometry) {
+        const auto& g     = *geometry;
+        const auto& batch = work_batch(work);
+        const speculative::RoundRoute route{batch.shape, g.verify_width, g.mtp_steps,
+                                            g.head_columns, g.graph_entry};
+        route.validate(shape.speculative, shape.draft_tokens);
+        require(!verification || verification->draft_extents.size() == rows.size(),
+                "draft extents");
+        std::vector<std::uint64_t> counts(ranks);
+        std::uint64_t total = 0;
+        std::uint32_t depth = 0;
+        for (std::size_t i = 0; i < rows.size(); ++i) {
+            const auto v = verification ? verification->draft_extents[i] : 0U;
+            counts[rows[i].attention_rank] += 1ULL + v;
+            total += 1ULL + v;
+            depth = std::max(v, depth);
+        }
+        require(route.covers(shape.speculative, depth) && bool(verification) == bool(depth) &&
+                    g.physical_rows == batch.shape.rows &&
+                    g.owner_rows == batch.shape.attention_rows && g.valid_target_tokens == total &&
+                    g.owner_target_tokens == counts,
+                "decode route differs from its members");
+        const bool graph = !batches->graph_rows().empty();
+        require(graph == g.graph_entry.has_value() &&
+                    g.path == (graph ? ExecutionPath::Graph : ExecutionPath::Eager),
+                "decode route differs from execution mode");
+        if (graph) {
+            require(bool(decode_routes), "decode graph catalog missing");
+            const auto ready = decode_routes->at(batch.shape);
+            require(std::ranges::find(ready, route) != ready.end(),
+                    "decode graph route unavailable");
+        }
+    }
     std::set<std::pair<std::uint64_t, std::uint64_t>> sequences;
     std::unordered_set<std::uint32_t> lanes, main_tables, mtp_tables;
     std::vector<std::unordered_set<std::int64_t>> state_reads(ranks), state_writes(ranks);
@@ -272,7 +321,11 @@ void WorkContract::validate(const Work& work, runtime::FrameKind kind) const {
         bool live = false;
         for (std::size_t b = 0; b < rows.size(); ++b) {
             const auto k = m->draft_extents[b];
-            require(rows[b].ids.size() == 1 && rows[b].main_frontier && k <= shape.draft_tokens &&
+            require(rows[b].ids.size() == 1 && k <= shape.draft_tokens &&
+                        (!k ||
+                         (shape.speculative == SpeculativeBackend::Mtp
+                              ? rows[b].main_frontier > 0
+                              : shape.draft_tokens < shape.max_context - rows[b].main_frontier)) &&
                         k < shape.max_context - rows[b].main_frontier,
                     "speculative verify window");
             live |= k != 0;

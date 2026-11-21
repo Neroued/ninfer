@@ -7,7 +7,7 @@
 
 namespace ninfer::models::glm5next::detail {
 void RankProgramImpl::select_frame(PhysicalBatchShape shape) {
-    reshape_frame_controls(frame, shape, this->shape.draft_tokens + 1);
+    reshape_frame_controls(frame, shape);
 }
 
 Tensor RankProgramImpl::row(const TensorRegion& region, int rows) {
@@ -95,10 +95,14 @@ void RankProgramImpl::prepare_inputs(std::span<const WorkRow> rows, const BatchP
                 row.main_frontier + std::min<std::size_t>(t, valid ? valid - 1 : 0);
         }
     }
-    if (frame.dflash)
-        for (int j = 0; j < physical_rows; ++j)
-            i32(frame.dflash->valid_columns)[j] =
-                j < int(plan.members.size()) ? shape.draft_tokens + 1 : 0;
+    if (frame.dflash) {
+        for (int j = 0; j < physical_rows; ++j) {
+            const bool active = j < int(plan.members.size()) && !valid_columns.empty() &&
+                                valid_columns[plan.members[j]] > 1;
+            i32(frame.dflash->proposal_rows)[j] = active;
+            i32(frame.dflash->valid_columns)[j] = active ? shape.draft_tokens + 1 : 0;
+        }
+    }
     const int t = width, b = physical_rows;
     const auto c      = plan.shape.attention_rows;
     const auto& local = frame.attention;
@@ -239,7 +243,9 @@ void RankProgramImpl::request_decision() {
         if (speculative) {
             const auto* drafts =
                 static_cast<const TokenId*>(output(frame.speculative->drafts).data);
-            const auto view = draft_proposals(f.batch.rows);
+            const auto& route = *speculative->speculative;
+            const auto view   = draft_proposals(f.batch.rows, parameters.mtp ? shape.draft_tokens
+                                                                             : route.head_columns);
             for (std::uint32_t step = 0; step < speculative->draft_extents[i]; ++step)
                 input.drafts.push_back(
                     drafts[(step * view.nb[0] + physical * view.nb[1]) / sizeof(TokenId)]);

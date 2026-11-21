@@ -56,8 +56,18 @@ public:
     std::unique_ptr<CacheViews> mtp;
     std::unique_ptr<context::ContextStorage> context;
     std::unique_ptr<context::ContextMigration> compute_actions, context_actions;
-    std::optional<KdaReplayRecords> kda_records;
-    std::optional<ops::KdaReplayFoldPlan> kda_fold;
+
+    struct Replay {
+        KdaReplayRecords records;
+        ops::KdaReplayFoldPlan fold;
+    };
+
+    [[nodiscard]] const Replay& replay(int width) const { return replay_.at(width - 2); }
+
+    // Both the Target writer and Commit reader use the ticket's compact owner-local geometry.
+    [[nodiscard]] Tensor raw_record(const TensorRegion&, int width, int local_rows);
+private:
+    std::vector<Replay> replay_;
 };
 
 } // namespace ninfer::models::glm5next

@@ -1,5 +1,7 @@
 #include "models/glm5next/session/internal.h"
 
+#include "models/common/speculative/growth.h"
+
 #include <algorithm>
 
 namespace ninfer::models::glm5next {
@@ -8,7 +10,7 @@ using Kind = detail::ComputeTransaction::Kind;
 
 void submit(detail::SessionImpl& session, runtime::ExecutionReservation reservation, Work work) {
     auto& tx = *session.compute;
-    prepare_batch(work, *session.plan.batches);
+    if (work_batch(work).members.empty()) prepare_batch(work, *session.plan.batches);
     tx.context.prepare_actions();
     work.actions = session.actions(tx.context);
     tx.ticket    = session.executor->submit(std::move(reservation), std::move(work));
@@ -96,47 +98,74 @@ Session::start_decode(std::span<const SequenceHandle> members,
         budgets.size() != members.size() ||
         (!constrained.empty() && constrained.size() != members.size()))
         throw std::logic_error("invalid decode members");
-    const auto mark = p.next_membership_mark();
-    for (std::size_t b = 0; b < members.size(); ++b) {
-        auto& s      = p.sequence(members[b]);
-        const auto f = s.continuation.metadata.main_frontier;
-        if (s.phase != detail::Phase::Active || !s.permit ||
-            !budgets[b].generated_tokens_remaining || s.ledger.size() != f + 1 ||
-            s.membership_mark == mark)
-            throw std::logic_error("decode row is not executable");
-        s.membership_mark = mark;
-    }
-    std::vector<std::uint32_t> extents(members.size());
-    bool speculative = false;
-    for (std::size_t b = 0; b < members.size(); ++b) {
-        const auto& s = p.sequence(members[b]);
-        extents[b]    = std::min({p.shape.draft_tokens, budgets[b].generated_tokens_remaining - 1,
-                                  p.shape.max_context - s.continuation.metadata.main_frontier - 1});
-        speculative |= extents[b] != 0;
-    }
     auto reservation = p.executor->try_reserve(runtime::FrameKind::Compute);
     if (!reservation) return {};
-    p.compute = std::make_unique<detail::ComputeTransaction>(
-        speculative ? Kind::Speculative : Kind::Ordinary, p.directory);
+    p.compute = std::make_unique<detail::ComputeTransaction>(Kind::Ordinary, p.directory);
     auto& tx = *p.compute;
     tx.members.assign(members.begin(), members.end());
     try {
+        const auto& options = p.definition->options();
+        std::vector<speculative::RoundMember> limits;
+        limits.reserve(members.size());
+        std::vector<speculative::RowGrowth> growth(members.size());
+        const auto mark = p.next_membership_mark();
         for (std::size_t b = 0; b < members.size(); ++b) {
-            auto& s        = p.sequence(members[b]);
-            const auto end = s.continuation.metadata.main_frontier + extents[b] + 1;
-            if (end > s.permitted_frontier)
-                throw std::logic_error("decode exceeds its reservation");
-            p.prepare_write(s, end, tx.context);
+            auto& s      = p.sequence(members[b]);
+            const auto f = s.continuation.metadata.main_frontier;
+            if (s.phase != detail::Phase::Active || !s.permit ||
+                s.permit->kind != ExecutionUnitKind::Decode ||
+                !budgets[b].generated_tokens_remaining || f >= p.shape.max_context ||
+                s.permitted_frontier < f + 1 || s.ledger.size() != f + 1 ||
+                s.membership_mark == mark)
+                throw std::logic_error("decode row is not executable");
+            s.membership_mark      = mark;
+            const auto room        = p.shape.max_context - f - 1;
+            const bool can_propose = options.mtp() ? f != 0 : p.shape.draft_tokens <= room;
+            const auto hard        = can_propose ? std::min({p.shape.draft_tokens, room,
+                                                             budgets[b].generated_tokens_remaining - 1})
+                                                 : 0U;
+            limits.push_back({s.continuation.metadata.placement.value, hard, hard});
+            if (hard) {
+                growth[b].text.emplace(p.directory.pool(0).histories(), s.histories[0].handle(), f,
+                                       f + 1);
+                if (options.mtp())
+                    growth[b].backend.emplace(
+                        p.directory.pool(1).histories(), s.histories[1].handle(),
+                        *s.continuation.metadata.mtp_frontier, mtp_history_frontier(f + 1));
+            }
+        }
+        speculative::grant_windows(p.directory, growth, limits);
+        for (std::size_t b = 0; b < members.size(); ++b) {
+            auto& s = p.sequence(members[b]);
             auto row        = p.work_row(s, 1);
             row.constrained = !constrained.empty() && constrained[b];
             tx.rows.push_back(std::move(row));
         }
+        auto batch       = plan_batch(tx.rows, *p.plan.batches, true);
+        const auto path  = p.plan.decode_routes ? ExecutionPath::Graph : ExecutionPath::Eager;
+        tx.round = speculative::DecodeRoundPlan::select(
+            p.shape.speculative, p.shape.draft_tokens, p.plan.batches->attention_owners(),
+            batch.shape, path, p.plan.decode_routes.get(), limits);
+        const auto extents = tx.round->verify_drafts();
+        for (std::size_t b = 0; b < members.size(); ++b) growth[b].prepare(extents[b]);
+        for (auto& row : growth) row.adopt();
+        for (std::size_t b = 0; b < members.size(); ++b) {
+            auto& s = p.sequence(members[b]);
+            p.prepare_write(s, s.continuation.metadata.main_frontier + 1 + extents[b], tx.context);
+        }
+        auto geometry =
+            p.shape.draft_tokens
+                ? std::make_shared<const SpeculativeExecutionGeometry>(tx.round->geometry(path))
+                : nullptr;
         Work work;
-        if (speculative) {
-            tx.draft_extents = extents;
-            work.operation   = SpeculativeWork{tx.rows, std::move(extents)};
-        } else
-            work.operation = ForwardWork{ForwardKind::Ordinary, SampleKind::NextToken, tx.rows};
+        if (tx.round->route().width > 1) {
+            tx.kind        = Kind::Speculative;
+            work.operation = SpeculativeWork{
+                tx.rows, {extents.begin(), extents.end()}, std::move(batch), std::move(geometry)};
+        } else {
+            work.operation = ForwardWork{ForwardKind::Ordinary, SampleKind::NextToken, tx.rows, {},
+                                         std::move(batch),      std::move(geometry)};
+        }
         submit(p, std::move(*reservation), std::move(work));
         return tx.ticket;
     } catch (const std::exception& error) {

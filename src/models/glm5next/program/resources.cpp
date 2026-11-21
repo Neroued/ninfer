@@ -42,8 +42,13 @@ Resources::Resources(ExecutionPlan input, DeviceContext& device, ContextCommunic
     context_actions = std::make_unique<context::ContextMigration>(
         device, *context, device.transfer_view(), plan.mapping_elements, 0, binding(1));
     if (plan.frame.kda_records) {
-        kda_records.emplace(fixed_.span(), *plan.frame.kda_records);
-        kda_fold.emplace(*kda_records, states.kda().all_layers_view());
+        const auto& layout = *plan.frame.kda_records;
+        replay_.reserve(layout.spec.width - 1);
+        for (int w = 2; w <= layout.spec.width; ++w) {
+            KdaReplayRecords records(fixed_.span(), layout.with_width(w));
+            replay_.push_back(
+                {records, ops::KdaReplayFoldPlan(records, states.kda().all_layers_view())});
+        }
     }
     if (plan.frame.dflash) {
         const auto count = plan.profile->draft->context.capacity;
@@ -119,6 +124,10 @@ Tensor Resources::packed(const TensorRegion& region, std::initializer_list<std::
     for (const auto n : shape) elements *= dimension(n);
     auto value = tensor(region);
     return value.view({dimension(value.numel())}).slice(0, 0, dimension(elements)).view(shape);
+}
+
+Tensor Resources::raw_record(const TensorRegion& plane, int width, int local_rows) {
+    return packed(plane, {plane.shape[0], width, local_rows, plane.shape[3]});
 }
 
 ops::KpoolTailStateView Resources::mtp_tail(std::uint32_t slot, int rows) {

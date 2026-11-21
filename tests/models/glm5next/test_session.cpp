@@ -13,6 +13,7 @@
 #include <iostream>
 #include <fstream>
 #include <map>
+#include <numeric>
 #include <sstream>
 #include <thread>
 
@@ -182,13 +183,13 @@ public:
 };
 
 glm::SessionPlan plan(const glm::ModelDefinition& definition, bool pressure = false,
-                      std::uint32_t concurrency = 3) {
+                      std::uint32_t concurrency = 3, std::uint32_t drafts = 3) {
     glm::SessionPlan p;
     p.shape   = {.max_context     = 256,
                  .max_concurrency = concurrency,
                  .prefill_chunk   = 64,
                  .draft_tokens =
-                   definition.options().speculative != SpeculativeBackend::None ? 3U : 0U,
+                   definition.options().speculative != SpeculativeBackend::None ? drafts : 0U,
                  .kv_storage    = KvCacheStorage::BFloat16,
                  .index_format  = KvCacheVectorFormat::BFloat16,
                  .purpose       = EnginePurpose::Generation,
@@ -339,7 +340,8 @@ struct Fixture {
     Fixture(std::shared_ptr<const glm::ModelDefinition> d, glm::SessionPlan p)
         : definition(d), frontend(make_frontend()), layout(std::move(p)),
           executor({layout.shape, layout.batches, d->config().text.vocabulary,
-                    d->resources().text.public_token_count, 2}),
+                    d->resources().text.public_token_count, 2, 0, 0,
+                    glm::make_decode_routes(layout.shape, *layout.batches)}),
           session(glm::prepare_session(d, layout, make_directory()), executor) {}
 
     std::unique_ptr<ctx::ContextDirectory> make_directory() {
@@ -408,34 +410,54 @@ struct Fixture {
 };
 
 void expanded_membership(std::shared_ptr<const glm::ModelDefinition> definition) {
-    Fixture f(definition, plan(*definition, false, 17));
+    constexpr unsigned k = 5;
+    Fixture f(definition, plan(*definition, false, 17, k));
     const auto input = f.request(4);
     std::vector<glm::SequenceHandle> members;
     for (std::uint32_t lane = 0; lane < 17; ++lane) {
         members.push_back(f.bind(input, lane, 0));
         f.commit(f.prefill(members.back()));
     }
-    for (const auto count : {10U, 9U, 17U}) {
+    std::size_t round = 0;
+    for (const auto count : {12U, 11U, 17U, 12U, 12U}) {
+        const auto depth = std::array{3U, 1U, 2U, 0U, k}[round++];
         f.executor.accept.resize(count);
         std::vector<glm::ExecutionUnit> units;
         std::vector<rt::RoundBudget> budgets;
         std::vector<glm::SequenceHandle> ordered;
+        std::vector<unsigned> drafts;
         for (std::uint32_t i = 0; i < count; ++i) {
             f.executor.accept[i] = i % 2;
             const auto h         = members[(i + 5) % members.size()];
-            const auto budget    = 1U + i % 4;
+            const auto width = i == 0 ? depth : std::min(i % 4, depth);
+            const auto budget = width + 1;
+            drafts.push_back(width);
             ordered.push_back(h);
-            units.push_back({h, glm::ExecutionUnitKind::Decode, budget});
+            units.push_back({h, glm::ExecutionUnitKind::Decode, 1});
             budgets.push_back({budget});
         }
         require(bool(f.session.reserve_units(units)), "expanded decode reservation failed");
         require(f.session.start_decode(ordered, budgets).has_value(),
                 "expanded decode not started");
         const auto& physical = glm::work_batch(f.executor.last);
-        require(physical.shape.rows == (count == 17 ? 17 : 10) &&
+        require(physical.shape == f.layout.batches->decode(count, count) &&
                     physical.owners[0].size == count && physical.owners[1].size == 0 &&
                     physical.members.size() == count,
                 "expanded work lost real membership or invented empty-rank rows");
+        const auto described = glm::ExecutionTypes::describe_work(f.executor.last);
+        const auto& geometry = described.speculative;
+        const auto target = std::accumulate(drafts.begin(), drafts.end(), std::uint64_t(count));
+        require(geometry && geometry->mtp_steps == depth &&
+                    geometry->verify_width == (depth ? k + 1 : 1) &&
+                    geometry->owner_target_tokens == std::vector<std::uint64_t>{target, 0} &&
+                    geometry->valid_target_tokens == target,
+                "heterogeneous budgets changed the physical route or owner token count");
+        if (depth)
+            require(std::get<glm::SpeculativeWork>(f.executor.last.operation).draft_extents == drafts,
+                    "GLM Session lost a heterogeneous verification extent");
+        else
+            require(std::holds_alternative<glm::ForwardWork>(f.executor.last.operation),
+                    "an anchor-only round used the verification graph");
         auto pending = f.event<glm::PendingBatch>();
         std::vector<rt::CommitDecision> decisions(count);
         for (std::uint32_t i = 0; i < count; ++i) {
@@ -989,6 +1011,63 @@ void capture_replacement_and_retry(std::shared_ptr<const glm::ModelDefinition> d
             "shared capture leaked its complete snapshot");
 }
 
+void owner_window_grants(std::shared_ptr<const glm::ModelDefinition> definition) {
+    Fixture f(definition);
+    const auto request = f.request(63);
+    const std::array members{f.bind(request, 0, 1), f.bind(request, 1, 0)};
+    for (auto h : members) f.commit(f.prefill(h));
+    const std::array anchors{glm::ExecutionUnit{members[0], glm::ExecutionUnitKind::Decode, 1},
+                             glm::ExecutionUnit{members[1], glm::ExecutionUnitKind::Decode, 1}};
+    require(bool(f.session.reserve_units(anchors)), "private tails did not admit both anchors");
+    // Fill only owner 1 after mandatory admission. Each additional Target window crosses page 64.
+    auto& records     = f.directory->records();
+    const auto layout = f.directory->pool(0).pages().layout().id;
+    std::vector<ctx::RecordLease> held;
+    for (;;) {
+        auto reserve =
+            records.reserve(ctx::RecordDemand{layout, ctx::ContextMemory::Device, 1, {1}});
+        if (!reserve || !reserve->ready()) break;
+        held.push_back(reserve->materialize(1));
+    }
+    const std::array budgets{rt::RoundBudget{4}, rt::RoundBudget{4}};
+    require(f.session.start_decode(members, budgets).has_value(),
+            "optional growth blocked the batch");
+    const auto& work = std::get<glm::SpeculativeWork>(f.executor.last.operation);
+    require(work.draft_extents == std::vector<unsigned>{0, 3} &&
+                work.speculative->owner_target_tokens == std::vector<std::uint64_t>{4, 1},
+            "capacity pressure on one attention owner clipped the other");
+    auto pending = f.event<glm::PendingBatch>();
+    const std::array adopt{rt::CommitDecision{.accepted_tokens = 1},
+                           rt::CommitDecision{.accepted_tokens = 4}};
+    const auto result = f.session.commit(std::move(pending), adopt);
+    require(result.rows[0].speculative.fallback_steps == 1 &&
+                result.rows[0].speculative.drafted_tokens == 0 &&
+                result.rows[1].speculative.drafted_tokens == 3,
+            "owner-specific grant accounting");
+    f.idle();
+    held.clear();
+    for (auto h : members)
+        require(f.session.abort(h).status == rt::ConsumeStatus::Consumed, "grant cleanup");
+    f.idle();
+}
+
+void masked_block_at_context_boundary(std::shared_ptr<const glm::ModelDefinition> definition) {
+    Fixture f(definition);
+    auto h = f.bind(f.request(f.layout.shape.max_context - 2), 0, 1);
+    f.commit(f.prefill(h));
+    const glm::ExecutionUnit anchor{h, glm::ExecutionUnitKind::Decode, 1};
+    require(bool(f.session.reserve_units({&anchor, 1})), "last private anchor not admitted");
+    const rt::RoundBudget budget{2};
+    require(bool(f.session.start_decode({&h, 1}, {&budget, 1})),
+            "short context round did not start");
+    const auto& ordinary = std::get<glm::ForwardWork>(f.executor.last.operation);
+    require(ordinary.speculative && ordinary.speculative->verify_width == 1 &&
+                !ordinary.speculative->head_columns,
+            "partial noncausal block executed past context");
+    f.commit(f.event<glm::PendingBatch>());
+    require(f.session.abort(h).status == rt::ConsumeStatus::Consumed, "context edge cleanup");
+}
+
 void mtp_transactions(std::shared_ptr<const glm::ModelDefinition> definition) {
     for (const auto accepted : {0U, 1U, 3U}) {
         Fixture f(definition);
@@ -997,7 +1076,7 @@ void mtp_transactions(std::shared_ptr<const glm::ModelDefinition> definition) {
         f.commit(f.prefill(a));
         f.commit(f.prefill(b));
         const std::array members{a, b};
-        const std::array units{glm::ExecutionUnit{a, glm::ExecutionUnitKind::Decode, 4},
+        const std::array units{glm::ExecutionUnit{a, glm::ExecutionUnitKind::Decode, 1},
                                glm::ExecutionUnit{b, glm::ExecutionUnitKind::Decode, 1}};
         require(bool(f.session.reserve_units(units)), "MTP capacity not reserved");
         std::array<rt::RoundBudget, 2> budgets;
@@ -1009,6 +1088,11 @@ void mtp_transactions(std::shared_ptr<const glm::ModelDefinition> definition) {
         require(work.draft_extents == std::vector<std::uint32_t>{3, 0} &&
                     glm::work_batch(f.executor.last).members == std::vector<std::uint32_t>{1, 0},
                 "mixed MTP rows lost extents or ownership");
+        const auto& geometry = work.speculative;
+        require(geometry && geometry->mtp_steps == 3 && geometry->verify_width == 4 &&
+                    geometry->owner_target_tokens == std::vector<std::uint64_t>{1, 4} &&
+                    geometry->valid_target_tokens == 5 && geometry->path == ExecutionPath::Graph,
+                "MTP geometry disagrees with the ADP owner ordering");
         require(work.rows[0].mtp_frontier == 62 && work.rows[1].mtp_frontier == 3,
                 "MTP canonical frontier is not Main minus one");
         auto result = f.event<glm::PendingBatch>();
@@ -1481,6 +1565,9 @@ int main(int argc, char** argv) {
         engine_pressure(glm::read_definition(reader, {}), false, true);
         auto mtp = glm::read_definition(reader, {.speculative = SpeculativeBackend::Mtp});
         expanded_membership(mtp);
+        owner_window_grants(mtp);
+        masked_block_at_context_boundary(
+            glm::read_definition(reader, {.speculative = SpeculativeBackend::DFlash2}));
         mtp_transactions(std::move(mtp));
         std::cout << "PASS GLM ADP binding, continuation, conversion, relocation and retirement\n";
     } catch (const std::exception& e) {

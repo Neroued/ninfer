@@ -233,11 +233,10 @@ std::size_t draft_workspace_capacity(const ModelProfile& p, int width, int max_b
             (void)workspace::draft_finish(a, p, width - 1, b);
             const auto& head = p.draft->head;
             scratch(a, ops::linear_topk_workspace_capacity_bytes(head.qtype, head.n, head.k,
-                                                                 head.policy, (width - 1) * b,
-                                                                 (width - 1) * b));
-            scratch(a, linear(p.draft->selector, (width - 1) * b, (width - 1) * b));
+                                                                 head.policy, b, (width - 1) * b));
+            scratch(a, linear(p.draft->selector, b, (width - 1) * b));
             scratch(a, ops::candidate_selector_path_workspace_capacity_bytes(
-                           ops::CandidateSelectorInput::GatheredKeys, width - 1, width - 1, b, b));
+                           ops::CandidateSelectorInput::GatheredKeys, 1, width - 1, b, b));
         }
     }
     return a.peak_bytes();

@@ -40,8 +40,7 @@ std::uint32_t SessionImpl::unit_end(const Sequence& s, ExecutionUnitKind kind,
     case ExecutionUnitKind::Replay:
         return window_end(s, frontier, s.replay_target);
     case ExecutionUnitKind::Decode:
-        return frontier + std::min({shape.draft_tokens + 1, std::max(tokens, 1U),
-                                    shape.max_context - frontier});
+        return frontier + (frontier < shape.max_context ? 1U : 0U);
     case ExecutionUnitKind::Control:
         return std::min(shape.max_context, frontier + tokens);
     }

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "models/common/context/directory.h"
+#include "models/common/speculative/round_plan.h"
 #include "models/glm5next/execution/workspace.h"
 #include "models/glm5next/program/frame.h"
 #include "models/glm5next/state/context.h"
@@ -12,6 +13,7 @@ struct ExecutionPlan {
     std::shared_ptr<const execution::ModelProfile> profile;
     ExecutionShape shape;
     std::shared_ptr<const BatchExecutionPlan> batches;
+    std::shared_ptr<const speculative::DecodeGraphRoutes> decode_routes;
     StateLayout state;
     CacheLayout main;
     std::optional<CacheLayout> mtp;

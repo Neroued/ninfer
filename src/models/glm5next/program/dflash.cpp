@@ -11,16 +11,16 @@ Tensor RankProgramImpl::draft_features(const execution::BatchView& call) {
     return resources.packed(field, {field.shape[0], columns.count / call.rows, call.rows});
 }
 
-execution::DFlashRun RankProgramImpl::dflash_run(int b, std::uint32_t bound) {
+execution::DFlashRun RankProgramImpl::dflash_run(int b, std::uint32_t bound, int steps) {
     const auto& io  = frame;
     const auto& d   = *io.dflash;
     const auto& s   = *io.speculative;
-    const int steps = dimension(shape.draft_tokens), w = steps + 1;
+    const int w     = dimension(shape.draft_tokens + 1);
     const int k = dimension(parameters.profile->config.draft->dflash2->selector_top_k);
     return execution::DFlashRun(
         parameters, {resources.workspace, resources.states, *parallel},
         {row(io.rows.anchors, b), row(io.rows.base_positions, b), row(d.valid_columns, b),
-         row(io.rows.source_offsets, b), row(io.rows.live_rows, b),
+         row(io.rows.source_offsets, b), row(d.proposal_rows, b),
          static_cast<const ops::SamplingConfig*>(resources.tensor(*io.sampling).data), bound},
         {resources.packed(d.ids, {w, b}), resources.packed(d.positions, {w, b}),
          resources.packed(s.drafts, {steps, b}), resources.packed(d.candidate_ids, {k, steps, b}),
@@ -74,10 +74,9 @@ void RankProgramImpl::append_dflash_context(const execution::BatchView& call, co
                                     cuda);
 }
 
-void RankProgramImpl::accept_dflash(int b) {
+void RankProgramImpl::accept_dflash(int b, int w, int steps) {
     const auto& io  = frame;
     const auto& d   = *io.dflash;
-    const int steps = dimension(shape.draft_tokens), w = steps + 1;
     const int k = dimension(parameters.profile->config.draft->dflash2->selector_top_k);
     auto logits =
         resources.packed(*io.logits, {dimension(parameters.profile->local.vocabulary.size), w, b});
@@ -87,7 +86,7 @@ void RankProgramImpl::accept_dflash(int b) {
         static_cast<const ops::SamplingConfig*>(resources.tensor(*io.sampling).data);
     vocabulary().accept_sparse(
         logits, configs, row(io.decode.valid_columns, b), row(io.rows.live_rows, b),
-        draft_proposals(b), resources.packed(d.candidate_ids, {k, steps, b}),
+        draft_proposals(b, steps), resources.packed(d.candidate_ids, {k, steps, b}),
         resources.packed(d.proposal_q, {k, steps, b}), row(io.speculative->extents, b),
         row(io.rows.sampling_positions, b), licensed, counts);
 }

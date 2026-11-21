@@ -13,7 +13,7 @@ public:
     explicit GraphInputs(RankProgramImpl&);
     ~GraphInputs();
     void prepare();
-    void set(int global, int local, int depth);
+    void set(int global, int local, int width, int depth);
 private:
     RankProgramImpl& owner_;
     std::unique_ptr<ContextPool> records_;

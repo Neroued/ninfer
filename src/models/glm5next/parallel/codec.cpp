@@ -15,7 +15,9 @@ ExecutionCodec::ExecutionCodec(const ModelDefinition& definition,
                 definition.resources().text.public_token_count,
                 ranks_,
                 rank.vision_max_features,
-                static_cast<std::uint32_t>(definition.resources().text.control_tokens->size())} {
+                static_cast<std::uint32_t>(definition.resources().text.control_tokens->size()),
+                {}} {
+    contract_.decode_routes = make_decode_routes(rank.shape, *contract_.batches);
     scope_.result_owner = topology.output_rank;
     for (const auto& r : topology.ranks) scope_.owners.push_back(r.rank);
     scope_.validate(topology);

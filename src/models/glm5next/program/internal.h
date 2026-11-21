@@ -73,9 +73,12 @@ public:
     void forward();
     GraphPreparationSample prepare_graphs(GraphPreparationMode);
     void release_graphs();
-    void execute_round(const execution::BatchView&, std::span<const std::uint32_t> draft_bounds,
-                       bool head, bool read_drafts, const execution::MlaSubmit& = {},
-                       RoundSections* = nullptr, const execution::DraftSubmit& = {});
+    void execute_proposal(const execution::BatchView&, std::span<const std::uint32_t> draft_bounds,
+                          int head_columns, bool read_drafts, const execution::MlaSubmit& = {},
+                          RoundSections* = nullptr, const execution::DraftSubmit& = {},
+                          MtpGraphSteps* = nullptr);
+    void execute_target(const execution::BatchView&, bool head, bool forced_control = false,
+                        const execution::MlaSubmit& = {}, RoundSections* = nullptr);
     [[nodiscard]] execution::TextRun text_run(const execution::BatchView&, execution::StateUpdate);
     [[nodiscard]] execution::MtpRun mtp_run(std::uint32_t step, const execution::BatchView&);
     [[nodiscard]] execution::MlaSelection mtp_selection(std::uint32_t step, int local);
@@ -87,10 +90,10 @@ public:
                       std::optional<models::vision::EmbeddingView> = {},
                       const execution::MlaSubmit&                  = {});
     void project_head(Tensor hidden);
-    void accept_mtp(std::int32_t rows);
-    void accept_dflash(std::int32_t rows);
-    void accept_speculative(std::int32_t rows);
-    [[nodiscard]] execution::DFlashRun dflash_run(int rows, std::uint32_t bound);
+    void accept_mtp(int rows, int width);
+    void accept_dflash(int rows, int width, int head_columns);
+    void accept_speculative(int rows, int width, int head_columns);
+    [[nodiscard]] execution::DFlashRun dflash_run(int rows, std::uint32_t bound, int head_columns);
     [[nodiscard]] Tensor draft_features(const execution::BatchView&);
     void append_dflash_context(const execution::BatchView&, const Tensor& counts,
                                ops::ContextKVMaterializeExecutionEnvelope);
@@ -105,11 +108,10 @@ public:
     void gather_decode_state(const execution::BatchView&);
     execution::BatchView decode_batch(int tokens, int rows, int local_rows, std::uint32_t visible);
     void fill_local_metadata(const BatchLayout&, int tokens, int rows);
-    [[nodiscard]] Tensor draft_proposals(int batch);
+    [[nodiscard]] Tensor draft_proposals(int batch, int columns);
     [[nodiscard]] Tensor mtp_output_ids(int step, int batch);
     void align_history(const execution::BatchView&, Tensor hidden, std::int32_t width);
-    void prepare_history_metadata(std::span<const WorkRow>,
-                                  std::span<const std::uint32_t> skip_first = {});
+    void prepare_history_metadata(std::span<const WorkRow>);
     [[nodiscard]] execution::BatchView batch(const BatchLayout&, int tokens, int rows,
                                              int attention_rows, std::uint32_t visible,
                                              std::optional<std::uint32_t> sequence_owner = {});

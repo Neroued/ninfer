@@ -197,7 +197,7 @@ struct ComputeTransaction {
     runtime::ExecutionTicket ticket;
     std::vector<SequenceHandle> members;
     std::vector<WorkRow> rows;
-    std::vector<std::uint32_t> draft_extents;
+    std::optional<speculative::DecodeRoundPlan> round;
     std::optional<ComputeResult> result;
     ExecutionSample observed_result;
     std::vector<runtime::CommitDecision> decisions;

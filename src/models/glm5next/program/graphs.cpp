@@ -7,7 +7,13 @@
 #include <algorithm>
 
 namespace ninfer::models::glm5next::detail {
-void Graphs::bind_sites(Round& round, int g, int c, int depth) {
+Graphs::Graphs(RankProgramImpl& owner)
+    : owner_(owner), gated_mtp_(owner.parameters.mtp &&
+                                (!owner.parallel || owner.parallel->supports_graph_gating())) {}
+
+void Graphs::bind_sites(Round& round, Body body, const execution::BatchView& main, int depth,
+                        int head_columns) {
+    const int g = main.rows, c = main.attention.rows;
     auto& p        = owner_;
     const auto& io = p.frame;
     const auto add = [&](execution::MlaReadout call, int step) {
@@ -22,15 +28,15 @@ void Graphs::bind_sites(Round& round, int g, int c, int depth) {
         site.attention.capture(p.cuda.stream(), [&] { call.attention(visible, p.cuda); });
         round.sites.push_back(std::move(site));
     };
-    if (p.parameters.mtp)
+    if (body == Body::Proposal || body == Body::MtpRound)
         for (int step = 0; step < depth; ++step) {
             auto call  = p.batch(io.mtp->draft_steps[step], 1, g, c, p.shape.max_context);
             auto run   = p.mtp_run(step, call);
             auto local = run.local_mla(p.mtp_selection(step, c));
             add(local.readout(), step);
         }
-    if (p.parameters.draft && depth) {
-        auto run = p.dflash_run(g, p.shape.max_context);
+    if (body == Body::BlockRound) {
+        auto run = p.dflash_run(g, p.shape.max_context, head_columns);
         for (std::uint32_t i = 0; i < p.parameters.draft->layers.size(); ++i) {
             auto layer = run.attention(i);
             DraftSite site{.call = layer.readout()};
@@ -40,10 +46,11 @@ void Graphs::bind_sites(Round& round, int g, int c, int depth) {
             round.draft_sites.push_back(std::move(site));
         }
     }
-    const int t                   = depth ? p.shape.draft_tokens + 1 : 1;
+    if (body == Body::Proposal) return;
     execution::StateUpdate update = execution::StepUpdate{};
-    if (depth) update.emplace<execution::RecordWindow>(*p.resources.kda_records);
-    auto run = p.text_run(p.decode_batch(t, g, c, p.shape.max_context), update);
+    if (main.tokens > 1)
+        update.emplace<execution::RecordWindow>(p.resources.replay(main.tokens).records);
+    auto run = p.text_run(main, update);
     for (std::uint32_t i = 0; i < p.parameters.text.layers.size(); ++i) {
         if (!std::holds_alternative<execution::MlaParameters>(p.parameters.text.layers[i].mixer))
             continue;
@@ -52,12 +59,11 @@ void Graphs::bind_sites(Round& round, int g, int c, int depth) {
     }
 }
 
-void Graphs::prepare_round(int g, int c, bool verify) {
-    const int depth = verify ? owner_.shape.draft_tokens : 0;
-    auto& p         = owner_;
-    auto& round     = rounds_[{g, c, verify}];
+void Graphs::capture(Round& round, Body body, const execution::BatchView& main,
+                     std::span<const std::uint32_t> bounds, int head_columns) {
+    auto& p = owner_;
     p.resources.workspace.reset_peak();
-    bind_sites(round, g, c, depth);
+    bind_sites(round, body, main, bounds.size(), head_columns);
     std::size_t cursor = 0;
     const auto emit    = [&](const execution::MlaReadout& call) {
         auto& site = round.sites.at(cursor++);
@@ -73,104 +79,123 @@ void Graphs::prepare_round(int g, int c, bool verify) {
             throw std::logic_error("DFlash Graph readout binding differs from execution layout");
         site.node = site.attention.append_to(p.cuda.stream());
     };
-    const int t     = depth ? p.shape.draft_tokens + 1 : 1;
-    const auto main = p.decode_batch(t, g, c, p.shape.max_context);
-    const std::vector<std::uint32_t> draft(depth && p.parameters.draft ? 1 : depth,
-                                           p.shape.max_context);
     round.graph.prepare(
         p.cuda,
-        [&] { p.execute_round(main, draft, true, true, emit, &round.sections, draft_emit); },
+        [&] {
+            if (body != Body::Target)
+                p.execute_proposal(main, bounds, head_columns, true, emit, &round.sections,
+                                   draft_emit, body == Body::MtpRound ? &round.gates : nullptr);
+            if (body != Body::Proposal) p.execute_target(main, true, false, emit, &round.sections);
+        },
         p.parallel ? &*p.parallel : nullptr);
+    if (body == Body::MtpRound) round.gates.finish(round.graph.communication);
     if (cursor != round.sites.size() || draft_cursor != round.draft_sites.size())
         throw std::logic_error("GLM Graph readouts were not consumed");
     round.workspace_bytes = p.resources.workspace.peak_used();
 }
 
-void Graphs::prepare(GraphInputs& inputs, GraphPreparation& preparation) {
-    auto& p           = owner_;
-    const int maximum = p.shape.draft_tokens;
-    for (const auto shape : p.resources.plan.batches->graph_shapes()) {
-        const int g = dimension(shape.rows), c = dimension(shape.attention_rows);
-        for (bool verify : {false, true}) {
-            if (verify && !maximum) continue;
-            const int depth = verify ? maximum : 0;
-            inputs.set(g, c, depth);
-            const auto main = p.decode_batch(verify ? maximum + 1 : 1, g, c, p.shape.max_context);
-            const std::vector<std::uint32_t> draft(depth && p.parameters.draft ? 1 : depth,
-                                                   p.shape.max_context);
-            const auto decide = [&] {
-                if (verify)
-                    p.accept_speculative(g);
-                else
-                    p.sample(g, SampleKind::NextToken);
-            };
+void Graphs::prepare_route(GraphInputs& inputs, GraphPreparation& preparation,
+                           const speculative::RoundRoute& route) {
+    auto& p     = owner_;
+    auto* comm  = p.parallel ? &*p.parallel : nullptr;
+    const int b = dimension(route.shape.rows), l = dimension(route.shape.attention_rows);
+    const int w = route.width, d = route.mtp_steps, g = route.head_columns;
+    const bool fused = d && gated_mtp_;
+    if (fused && d != dimension(p.shape.draft_tokens)) return;
+    const int depth = route.verification_limit(p.shape.speculative);
+    inputs.set(b, l, w, depth);
+    const auto main = p.decode_batch(w, b, l, p.shape.max_context);
+    const std::vector<std::uint32_t> bounds(g ? 1 : d, p.shape.max_context);
+    if (d && !fused) {
+        if (preparation.capturing()) {
+            auto& proposal = proposals_[{b, l, d}];
+            capture(proposal, Body::Proposal, main, bounds, 0);
+            launch(proposal, main, bounds, d, false, false);
+        } else {
+            p.execute_proposal(main, bounds, 0, false);
+        }
+    }
+    // Target, sampling and retirement have separate sharing domains. Warm up and
+    // capture each once, including when multiple MTP depths feed the same verifier.
+    auto [target, new_target] = targets_.try_emplace({b, l, w, g});
+    if (new_target) {
+        if (preparation.capturing()) {
+            capture(target->second,
+                    fused ? Body::MtpRound
+                    : g   ? Body::BlockRound
+                          : Body::Target,
+                    main, bounds, g);
+            launch(target->second, main, bounds, d, true, false);
+        } else {
+            if (g || fused) p.execute_proposal(main, bounds, g, false);
+            p.execute_target(main, true);
+        }
+    }
+    auto [decision, new_decision] = decisions_.try_emplace({b, w, g});
+    if (new_decision) {
+        const auto dispatch = [&] {
+            if (w > 1)
+                p.accept_speculative(b, w, g);
+            else
+                p.sample(b, SampleKind::NextToken);
+            p.copy_result(b, w > 1);
+        };
+        if (preparation.capturing()) {
+            auto& graph = decision->second;
+            p.resources.workspace.reset_peak();
+            graph.graph.prepare(p.cuda, dispatch, comm);
+            graph.workspace_bytes = p.resources.workspace.peak_used();
+            decide(b, w, g);
+        } else
+            dispatch();
+    }
+    if (p.shape.draft_tokens) {
+        auto [it, inserted] = commits_.try_emplace({b, l, w});
+        if (inserted) {
             if (preparation.capturing()) {
-                prepare_round(g, c, verify);
-                replay(main, draft, true, false);
-            } else {
-                p.execute_round(main, draft, true, false);
-            }
-            decide();
-            preparation.checkpoint();
-        }
-        if (maximum) {
-            inputs.set(g, c, maximum);
-            const auto main = p.decode_batch(maximum + 1, g, c, p.shape.max_context);
-            if (!preparation.capturing()) {
+                auto& graph = it->second;
+                p.resources.workspace.reset_peak();
+                graph.graph.prepare(
+                    p.cuda,
+                    [&] {
+                        p.execute_speculative_commit(main, true, true, &graph.repair,
+                                                     &graph.counts);
+                    },
+                    comm);
+                graph.workspace_bytes = p.resources.workspace.peak_used();
+                commit(b, l, w, true, true);
+            } else
                 p.execute_speculative_commit(main, true, true);
-                preparation.checkpoint();
-                continue;
-            }
-            auto& commit = commits_[{g, c}];
-            p.resources.workspace.reset_peak();
-            commit.graph.prepare(
-                p.cuda,
-                [&] {
-                    p.execute_speculative_commit(main, true, true, &commit.repair, &commit.counts);
-                },
-                p.parallel ? &*p.parallel : nullptr);
-            commit.workspace_bytes = p.resources.workspace.peak_used();
-            workspace_peak_        = std::max(workspace_peak_, commit.workspace_bytes);
-            commit.graph.launch(p.cuda, p.parallel ? &*p.parallel : nullptr);
-            preparation.checkpoint();
         }
     }
-    for (const auto g : p.resources.plan.batches->graph_rows()) {
-        const auto representative = std::find_if(p.resources.plan.batches->graph_shapes().begin(),
-                                                 p.resources.plan.batches->graph_shapes().end(),
-                                                 [&](auto shape) { return shape.rows == g; });
-        for (bool verify : {false, true}) {
-            if (verify && !maximum) continue;
-            if (!preparation.capturing()) continue;
-            inputs.set(g, representative->attention_rows, verify ? maximum : 0);
-            auto& decision = decisions_[{g, verify}];
-            p.resources.workspace.reset_peak();
-            decision.graph.prepare(
-                p.cuda,
-                [&] {
-                    if (verify)
-                        p.accept_speculative(g);
-                    else
-                        p.sample(g, SampleKind::NextToken);
-                    p.copy_result(g, verify);
-                },
-                p.parallel ? &*p.parallel : nullptr);
-            decision.workspace_bytes = p.resources.workspace.peak_used();
-            workspace_peak_          = std::max(workspace_peak_, decision.workspace_bytes);
-            decision.graph.launch(p.cuda, p.parallel ? &*p.parallel : nullptr);
-            preparation.checkpoint();
-        }
-    }
+    preparation.checkpoint();
 }
 
-void Graphs::replay(const execution::BatchView& main, std::span<const std::uint32_t> draft,
-                    bool head, bool read_drafts) {
+void Graphs::prepare(GraphInputs& inputs, GraphPreparation& preparation) {
+    auto& p = owner_;
+    for (const auto shape : p.resources.plan.batches->graph_shapes())
+        for (const auto& route : p.resources.plan.decode_routes->at(shape))
+            prepare_route(inputs, preparation, route);
+}
+
+void Graphs::replay(const execution::BatchView& main, std::span<const std::uint32_t> bounds,
+                    int depth, int head_columns, bool head, bool read_drafts) {
+    if (depth && !gated_mtp_) {
+        launch(proposals_.at({main.rows, main.attention.rows, depth}), main, bounds, depth, false,
+               read_drafts);
+        read_drafts = false;
+    }
+    launch(targets_.at({main.rows, main.attention.rows, main.tokens, head_columns}), main, bounds,
+           depth, head, read_drafts);
+}
+
+void Graphs::launch(Round& round, const execution::BatchView& main,
+                    std::span<const std::uint32_t> draft, int depth, bool head, bool read_drafts) {
     auto& p       = owner_;
-    auto& round   = rounds_.at({main.rows, main.attention.rows, !draft.empty()});
     const int sms = p.cuda.multiprocessor_count();
     for (auto& site : round.sites) {
-        const auto bound =
-            site.draft_step < 0 ? main.attention.max_visible_tokens : draft[site.draft_step];
+        auto bound = main.attention.max_visible_tokens;
+        if (site.draft_step >= 0) bound = site.draft_step < depth ? draft[site.draft_step] : 0U;
         if (site.call.index) {
             const auto profile = site.call.index_profile(bound, sms);
             if (profile != site.index_profile) {
@@ -197,18 +222,20 @@ void Graphs::replay(const execution::BatchView& main, std::span<const std::uint3
     }
     round.sections.head.set_enabled(round.graph.executable, head);
     round.sections.drafts.set_enabled(round.graph.executable, read_drafts);
-    round.graph.launch(p.cuda, p.parallel ? &*p.parallel : nullptr);
+    const auto* work =
+        round.gates.empty() ? nullptr : &round.gates.set_depth(round.graph.executable, depth);
+    round.graph.launch(p.cuda, p.parallel ? &*p.parallel : nullptr, work);
     workspace_peak_ = std::max(workspace_peak_, round.workspace_bytes);
 }
 
-void Graphs::decide(int g, bool verify) {
-    auto& decision = decisions_.at({g, verify});
+void Graphs::decide(int g, int width, int head_columns) {
+    auto& decision = decisions_.at({g, width, head_columns});
     decision.graph.launch(owner_.cuda, owner_.parallel ? &*owner_.parallel : nullptr);
     workspace_peak_ = std::max(workspace_peak_, decision.workspace_bytes);
 }
 
-void Graphs::commit(int g, int c, bool repair, bool count_tokens) {
-    auto& commit = commits_.at({g, c});
+void Graphs::commit(int g, int c, int width, bool repair, bool count_tokens) {
+    auto& commit = commits_.at({g, c, width});
     if (owner_.parameters.mtp) commit.repair.set_enabled(commit.graph.executable, repair);
     commit.counts.set_enabled(commit.graph.executable, count_tokens);
     commit.graph.launch(owner_.cuda, owner_.parallel ? &*owner_.parallel : nullptr);

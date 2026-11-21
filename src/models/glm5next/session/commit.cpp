@@ -23,7 +23,8 @@ void SessionImpl::finish_result(ComputeResult result) {
         const auto& row = tx.result->rows[b];
         generated |= !row.tokens.empty();
         if (tx.kind == Kind::Speculative
-                ? (row.drafts != tx.draft_extents[b] || row.processed != tx.draft_extents[b] + 1 ||
+                ? (row.drafts != tx.round->verify_drafts()[b] ||
+                   row.processed != tx.round->verify_drafts()[b] + 1 ||
                    row.accepted_drafts > row.drafts || row.tokens.size() != row.accepted_drafts + 1)
                 : (row.processed != tx.rows[b].ids.size()))
             throw std::logic_error("GLM5Next result changed its input extent");

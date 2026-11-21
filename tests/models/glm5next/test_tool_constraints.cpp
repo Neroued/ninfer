@@ -140,12 +140,12 @@ void parameter_names(text::GrammarCompiler& compiler) {
     auto session = glm::compile_tool_grammar(tokens, bound, {}, "<tool_call>call<arg_key>");
     std::vector<std::uint32_t> masks(session->mask_words() * 2);
     const TokenId proposed = 2;
-    session->masks(std::span(&proposed, 1), masks);
+    (void)session->masks(std::span(&proposed, 1), masks);
     require(masks[0] == ((1u << 1) | (1u << 2) | (1u << 3) | (1u << 5)),
             "name/value boundary token mask differs from encoding contract");
     session->accept(1);
     session->discard();
-    session->masks({}, std::span(masks).first(session->mask_words()));
+    (void)session->masks({}, std::span(masks).first(session->mask_words()));
     require(masks[0] == ((1u << 1) | (1u << 2) | (1u << 3) | (1u << 5)),
             "name dispatch rollback changed token masks");
 }

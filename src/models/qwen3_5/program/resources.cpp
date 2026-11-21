@@ -133,8 +133,14 @@ Resources::Resources(DeviceContext& device, const ResourceLayout& layout,
     if (workspace.vision) vision.emplace(device, *workspace.vision);
     const auto backing = persistent.span();
     if (layout.replay_records) {
-        replay_records.emplace(backing, *layout.replay_records);
-        replay_fold.emplace(*replay_records, state_images.linear().all_layers_view());
+        const auto& max = *layout.replay_records;
+        replay_widths.reserve(max.spec.width - 1);
+        for (int w = 2; w <= max.spec.width; ++w) {
+            GdnReplayRecords records(backing, max.with_width(w));
+            replay_widths.push_back(
+                {records,
+                 ops::GdnReplayFoldPlan(records, state_images.linear().all_layers_view())});
+        }
     }
     if (layout.dflash) {
         auto* local = state_images.dflash_local();

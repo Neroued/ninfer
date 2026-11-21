@@ -202,13 +202,13 @@ void finish_dynamic_branch(DraftExecutionView& execution, const Tensor& input,
 }
 
 void propose_dflash2_batch(DraftExecutionView& execution, const DraftInputs& inputs,
-                           DraftOutputs& outputs, int batch, int k, DraftEnvelopes envelopes) {
+                           DraftOutputs& outputs, int batch, int width, int g,
+                           DraftEnvelopes envelopes) {
     if (execution.parameters.profile->config.draft->dflash2) {
         const auto& target             = execution.parameters.profile->config.text;
         const auto& config             = *execution.parameters.profile->config.draft;
-        const int width                = k + 1;
         const int columns              = width * batch;
-        const int mask_columns         = k * batch;
+        const int mask_columns         = g * batch;
         auto& work                     = execution.work;
         const auto cuda                = execution.cuda;
         const DraftParameters& weights = *execution.parameters.draft;
@@ -312,8 +312,8 @@ void propose_dflash2_batch(DraftExecutionView& execution, const DraftInputs& inp
         Tensor drafts     = outputs.drafts;
         Tensor proposal_q = outputs.proposal_q;
         ops::candidate_selector_path(
-            candidates, scores.view({dimension(config.dflash2->selector_top_k), k, batch}),
-            projected.view({dimension(config.dflash2->selector_rank), k, batch}), anchors,
+            candidates, scores.view({dimension(config.dflash2->selector_top_k), g, batch}),
+            projected.view({dimension(config.dflash2->selector_rank), g, batch}), anchors,
             weights.selector->predecessor_codebook, weights.selector->successor_codebook,
             dimension(execution.parameters.profile->public_tokens), frontiers, inputs.sampling,
             drafts, proposal_q, inputs.live_rows, work, cuda);
@@ -322,16 +322,15 @@ void propose_dflash2_batch(DraftExecutionView& execution, const DraftInputs& inp
 }
 
 void propose_batch_impl(DraftExecutionView& execution, const DraftInputs& inputs,
-                        DraftOutputs& outputs, std::int32_t batch_size, std::uint32_t k,
+                        DraftOutputs& outputs, std::int32_t batch_size, int width, int g,
                         DraftEnvelopes envelopes) {
     if (execution.parameters.profile->config.draft->dflash2) {
         nvtx::ScopedRange proposal_range(nvtx::Name::DFlashProposal, nvtx::Category::DFlash,
-                                         static_cast<std::uint64_t>(k + 1U) * batch_size);
-        propose_dflash2_batch(execution, inputs, outputs, batch_size, k, envelopes);
+                                         static_cast<std::uint64_t>(width) * batch_size);
+        propose_dflash2_batch(execution, inputs, outputs, batch_size, width, g, envelopes);
     } else {
         const auto& target         = execution.parameters.profile->config.text;
         const auto& config         = *execution.parameters.profile->config.draft;
-        const std::int32_t width   = static_cast<std::int32_t>(k) + 1;
         const std::int32_t columns = width * batch_size;
         nvtx::ScopedRange proposal_range(nvtx::Name::DFlashProposal, nvtx::Category::DFlash,
                                          static_cast<std::uint64_t>(columns));
@@ -445,11 +444,10 @@ void propose_batch_impl(DraftExecutionView& execution, const DraftInputs& inputs
         }
 
         Tensor packed =
-            execution.work.alloc(DType::BF16, {dimension(target.hidden_size),
-                                               static_cast<std::int32_t>(k) * batch_size});
+            execution.work.alloc(DType::BF16, {dimension(target.hidden_size), g * batch_size});
         const std::size_t element_bytes = dtype_size(DType::BF16);
         const std::size_t row_bytes     = static_cast<std::size_t>(dimension(target.hidden_size)) *
-                                      static_cast<std::size_t>(k) * element_bytes;
+                                      static_cast<std::size_t>(g) * element_bytes;
         const std::size_t source_pitch =
             static_cast<std::size_t>(dimension(target.hidden_size)) * width * element_bytes;
         const auto* source =
@@ -459,15 +457,13 @@ void propose_batch_impl(DraftExecutionView& execution, const DraftInputs& inputs
                                      static_cast<std::size_t>(batch_size), cudaMemcpyDeviceToDevice,
                                      execution.cuda.stream()));
         Tensor proposal_hidden =
-            execution.work.alloc(DType::BF16, {dimension(target.hidden_size),
-                                               static_cast<std::int32_t>(k) * batch_size});
+            execution.work.alloc(DType::BF16, {dimension(target.hidden_size), g * batch_size});
         ops::rmsnorm(packed, execution.parameters.draft->final_norm, config.rms_norm_eps, false,
                      proposal_hidden, execution.cuda);
-        Tensor flat_drafts = drafts.view({static_cast<std::int32_t>(k) * batch_size});
+        Tensor flat_drafts = drafts.view({g * batch_size});
         if (execution.proposal_head == ProposalHead::Full) {
             Tensor logits =
-                execution.work.alloc(DType::BF16, {dimension(target.vocab_size),
-                                                   static_cast<std::int32_t>(k) * batch_size});
+                execution.work.alloc(DType::BF16, {dimension(target.vocab_size), g * batch_size});
             project(proposal_hidden, execution.parameters.draft->output_head, logits,
                     execution.work, execution.cuda);
             ops::argmax(logits, flat_drafts, dimension(execution.parameters.profile->public_tokens),
@@ -477,8 +473,8 @@ void propose_batch_impl(DraftExecutionView& execution, const DraftInputs& inputs
                 throw std::logic_error("optimized DFlash proposal head is unavailable");
             }
             const auto& proposal = *execution.parameters.proposal;
-            Tensor logits        = execution.work.alloc(
-                DType::BF16, {dimension(proposal.rows), static_cast<std::int32_t>(k) * batch_size});
+            Tensor logits =
+                execution.work.alloc(DType::BF16, {dimension(proposal.rows), g * batch_size});
             project(proposal_hidden, proposal.head, logits, execution.work, execution.cuda);
             ops::argmax(logits, flat_drafts,
                         proposal.token_ids ? dimension(proposal.rows)
@@ -519,11 +515,12 @@ void draft_propose(DraftExecutionView execution, const DraftInputs& inputs, Draf
                    DraftEnvelopes envelopes) {
     if (!execution.parameters.draft) throw std::logic_error("draft parameters are unavailable");
     const auto width = outputs.ids.ne[0], batch = outputs.ids.ne[1];
-    if (width < 2 || width > 16 || batch < 1 || outputs.drafts.ne[0] != width - 1 ||
+    const auto g = outputs.drafts.ne[0];
+    if (width < 2 || width > 16 || batch < 1 || g < 1 || g >= width ||
         outputs.drafts.ne[1] != batch) {
         throw std::invalid_argument("draft proposal has invalid geometry");
     }
-    propose_batch_impl(execution, inputs, outputs, batch, width - 1, envelopes);
+    propose_batch_impl(execution, inputs, outputs, batch, width, g, envelopes);
 }
 
 } // namespace ninfer::models::qwen3_5::execution

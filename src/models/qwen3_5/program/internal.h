@@ -48,18 +48,17 @@ struct ComputeOperation {
     std::vector<SamplingInput> sampling;
     std::uint32_t width          = 0;
     std::uint32_t batch          = 0;
-    std::uint32_t drafts         = 0;
     std::uint32_t forward_row    = 0;
     std::uint32_t forward_offset = 0;
     std::uint32_t score_cursor   = 0;
     std::uint32_t score_count    = 0;
     ComputeStage stage           = ComputeStage::Inputs;
     std::uint32_t decision_stage = 0;
+    bool read_drafts_for_masks   = false;
     bool decision_requested      = false;
     bool decision_supplied       = false;
     bool result_published        = false;
     bool cancelled               = false;
-    bool speculative             = false;
     bool row_finished            = false;
     bool graph_started           = false;
     bool projected               = false;
@@ -73,6 +72,14 @@ struct ComputeOperation {
     AttentionWorkCounters attention;
     std::optional<Tensor> input_embeddings;
     std::unique_ptr<execution::TextRun> text;
+
+    [[nodiscard]] bool verifies_drafts() const noexcept {
+        return width > 1 && std::holds_alternative<DecodeWork>(request.work.operation);
+    }
+
+    [[nodiscard]] const speculative::RoundRoute& decode_route() const {
+        return std::get<DecodeWork>(request.work.operation).plan->route();
+    }
 
     ComputeOperation(runtime::ExecutionRequest<ExecutionTypes>&&);
     ~ComputeOperation();
@@ -115,12 +122,14 @@ public:
     void begin_target(ComputeOperation&);
     bool advance_target(ComputeOperation&);
     void begin_draft(ComputeOperation&);
-    void begin_mtp_draft(ComputeOperation&);
+    Tensor draft_tokens(const speculative::RoundRoute&) const;
+    void prepare_verification(const speculative::RoundRoute&);
     void prepare_mtp_draft(ComputeOperation&);
     void run_mtp_draft(std::uint32_t batch, std::uint32_t steps, std::uint32_t frontier);
-    void run_dflash_draft(std::uint32_t batch, std::uint32_t minimum, std::uint32_t maximum);
+    void run_dflash_draft(const speculative::RoundRoute&, std::uint32_t minimum,
+                          std::uint32_t maximum);
     void project_decode(std::uint32_t batch, std::uint32_t width);
-    void decide_decode(std::uint32_t batch, std::uint32_t width);
+    void decide_decode(const speculative::RoundRoute&);
     void readback_decode(std::uint32_t batch, bool speculative);
     GraphPreparationSample initialize_graphs(GraphPreparationMode = GraphPreparationMode::Complete);
     void release_graphs();
@@ -128,8 +137,8 @@ public:
     void append_draft_history(std::uint32_t batch, ops::KVCacheAppendPrefixExecutionEnvelope);
     void commit_draft_history(ComputeOperation&);
     void align_mtp_history(ComputeOperation&);
-    void rebuild_mtp_history(std::uint32_t batch);
-    void execute_mtp_commit(std::uint32_t batch, bool repair, bool counts,
+    void rebuild_mtp_history(std::uint32_t batch, std::uint32_t width);
+    void execute_mtp_commit(std::uint32_t batch, std::uint32_t width, bool repair, bool counts,
                             DecodeGraphSection* repair_section = nullptr,
                             DecodeGraphSection* counts_section = nullptr);
     void request_decision(ComputeOperation&);
@@ -149,6 +158,7 @@ public:
     const std::uint32_t capacity;
     const std::uint32_t max_concurrency;
     const std::shared_ptr<const BatchExecutionPlan> batch_execution;
+    const std::shared_ptr<const speculative::DecodeGraphRoutes> decode_routes;
     const std::uint32_t prefill_chunk;
     const std::uint32_t draft_window;
     const SpeculativeBackend backend;

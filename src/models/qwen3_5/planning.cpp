@@ -179,6 +179,10 @@ SessionPlan plan_session(const SequencePlan& sequence) {
     const auto& source = *sequence.impl_;
     SessionPlan out;
     out.batch_execution     = source.batch_execution;
+    out.decode_routes       = source.decode_routes;
+    out.decode_path         = source.batch_execution->graph_rows().empty() ? ExecutionPath::Eager
+                              : source.moe                                 ? ExecutionPath::Mixed
+                                                                           : ExecutionPath::Graph;
     out.profile             = source.profile;
     out.capacity            = source.capacity;
     out.max_concurrency     = source.max_concurrency;

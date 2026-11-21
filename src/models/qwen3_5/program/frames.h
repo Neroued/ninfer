@@ -31,8 +31,7 @@ struct FrameIngressLayout {
     TensorRegion backend_frontiers;
     TensorRegion extents;
     TensorRegion valid_columns;
-    TensorRegion proposal_valid_columns;
-    TensorRegion budgets;
+    TensorRegion proposal_valid_columns, proposal_live_rows;
     TensorRegion main_table_rows;
     TensorRegion backend_table_rows;
     TensorRegion residency_slots;
@@ -79,8 +78,7 @@ struct FrameIngressView {
     std::span<std::int32_t> backend_frontiers;
     std::span<std::int32_t> extents;
     std::span<std::int32_t> valid_columns;
-    std::span<std::int32_t> proposal_valid_columns;
-    std::span<std::int32_t> budgets;
+    std::span<std::int32_t> proposal_valid_columns, proposal_live_rows;
     std::span<std::int32_t> main_table_rows;
     std::span<std::int32_t> backend_table_rows;
     std::span<std::int32_t> residency_slots;
@@ -192,11 +190,16 @@ struct MtpFrame {
     [[nodiscard]] Tensor proposals(std::int32_t batch) const;
 };
 
+namespace execution {
+struct DraftOutputs;
+}
+
 struct DFlashFrame {
     Tensor proposal_ids, proposal_positions, append_positions, append_counts, drafts;
     Tensor candidate_ids, proposal_q;
 
     DFlashFrame(MemorySpan backing, const DFlashFrameLayout& layout);
+    [[nodiscard]] execution::DraftOutputs proposal(std::int32_t batch, std::int32_t columns) const;
 };
 
 struct FrameInputView {
@@ -238,7 +241,7 @@ public:
     Tensor host_step_positions, host_step_rope_positions, host_step_valid_columns;
     MemorySpan ingress, commit, egress;
     Tensor live_rows, anchors, frontiers, backend_frontiers, extents, valid_columns;
-    Tensor proposal_valid_columns, budgets, main_table_rows, backend_table_rows;
+    Tensor proposal_valid_columns, proposal_live_rows, main_table_rows, backend_table_rows;
     Tensor state_source_offsets, state_destination_offsets, residency_slots, rope_deltas;
     const ops::SamplingConfig* sampling = nullptr;
     Tensor sampling_positions, history_skip, previous_rope;

@@ -43,8 +43,8 @@ void RankProgramImpl::progress() {
                 break;
             }
             if (std::holds_alternative<DecodeWork>(operation.request.work.operation)) {
-                if (!operation.speculative || !graphs) append_draft_history(operation);
-                if (operation.speculative) begin_draft(operation);
+                if (!operation.verifies_drafts() || !graphs) append_draft_history(operation);
+                if (operation.verifies_drafts()) begin_draft(operation);
             }
             if (std::holds_alternative<ForwardWork>(operation.request.work.operation))
                 append_draft_history(operation);
@@ -58,8 +58,6 @@ void RankProgramImpl::progress() {
                 return;
             }
             if (std::holds_alternative<DecodeWork>(operation.request.work.operation)) {
-                if (backend == SpeculativeBackend::Mtp && !operation.speculative)
-                    align_mtp_history(operation);
                 if (!operation.projected) {
                     resources.work.reset();
                     project_decode(operation.shape.rows, operation.width);

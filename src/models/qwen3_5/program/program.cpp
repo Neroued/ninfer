@@ -160,14 +160,22 @@ void RankProgramImpl::validate_work(const Work& work, runtime::FrameKind kind) c
                     else
                         return op.rows.size();
                 }();
+                const auto shape = [&] {
+                    if constexpr (std::is_same_v<T, DecodeWork>) {
+                        if (!op.plan || op.plan->verify_drafts().size() != members)
+                            throw std::invalid_argument(
+                                "Qwen3.5 decode plan differs from membership");
+                        return op.plan->route().shape;
+                    } else
+                        return op.shape;
+                }();
                 const bool bucketed =
                     std::is_same_v<T, DecodeWork> && !batch_execution->graph_rows().empty();
-                if (!members || members > op.shape.rows || op.shape.rows > max_concurrency ||
-                    op.shape.attention_rows != op.shape.rows ||
-                    (!bucketed && op.shape.rows != members) ||
+                if (!members || members > shape.rows || shape.rows > max_concurrency ||
+                    shape.attention_rows != shape.rows || (!bucketed && shape.rows != members) ||
                     (bucketed &&
                      !std::binary_search(batch_execution->graph_rows().begin(),
-                                         batch_execution->graph_rows().end(), op.shape.rows)))
+                                         batch_execution->graph_rows().end(), shape.rows)))
                     throw std::invalid_argument(
                         "Qwen3.5 work is outside its prepared batch geometry");
             }
@@ -218,14 +226,21 @@ void RankProgramImpl::validate_work(const Work& work, runtime::FrameKind kind) c
             } else if constexpr (std::is_same_v<T, DecodeWork>) {
                 validate_members(
                     op.rows, [](const auto& row) -> const ExecutionRow& { return row.binding; });
-                for (const auto& row : op.rows) {
-                    if (!row.binding.main_frontier || row.draft_extent > draft_window ||
-                        row.binding.main_frontier + row.draft_extent + 1 > capacity ||
+                const auto& route = op.plan->route();
+                route.validate(backend, draft_window);
+                if (graphs && !graphs->contains(route))
+                    throw std::invalid_argument("Qwen3.5 graph route is unprepared");
+                if (route.graph_entry.has_value() != graphs.has_value())
+                    throw std::invalid_argument(
+                        "Qwen3.5 decode route differs from the prepared path");
+                for (std::size_t i = 0; i < op.rows.size(); ++i) {
+                    const auto& row   = op.rows[i];
+                    const auto extent = op.plan->verify_drafts()[i];
+                    if ((!row.binding.main_frontier && extent &&
+                         backend == SpeculativeBackend::Mtp) ||
+                        std::uint64_t(row.binding.main_frontier) + extent + 1 > capacity ||
                         row.anchor < 0 ||
-                        static_cast<std::uint32_t>(row.anchor) >=
-                            parameters.profile->public_tokens ||
-                        !row.output_tokens_remaining ||
-                        row.draft_extent >= row.output_tokens_remaining)
+                        static_cast<std::uint32_t>(row.anchor) >= parameters.profile->public_tokens)
                         throw std::invalid_argument(
                             "Qwen3.5 decode extent exceeds its execution permit");
                 }

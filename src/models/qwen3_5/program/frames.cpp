@@ -1,3 +1,4 @@
+#include "models/qwen3_5/execution/draft.h"
 #include "models/qwen3_5/program/frames.h"
 
 #include "models/load_options.h"
@@ -70,7 +71,7 @@ FrameControlLayout plan_frame_controls(const FrameSpec& spec, std::uint32_t row_
     result.ingress.extents                   = row(DType::I32);
     result.ingress.valid_columns             = row(DType::I32);
     result.ingress.proposal_valid_columns    = row(DType::I32);
-    result.ingress.budgets                   = row(DType::I32);
+    result.ingress.proposal_live_rows        = row(DType::I32);
     result.ingress.main_table_rows           = row(DType::I32);
     result.ingress.backend_table_rows        = row(DType::I32);
     result.ingress.residency_slots           = row(DType::I32);
@@ -245,6 +246,17 @@ DFlashFrame::DFlashFrame(MemorySpan backing, const DFlashFrameLayout& layout)
     if (layout.proposal_q) proposal_q = layout.proposal_q->bind(backing);
 }
 
+execution::DraftOutputs DFlashFrame::proposal(std::int32_t batch, std::int32_t columns) const {
+    const auto packed = [](const Tensor& backing, std::initializer_list<int> shape) {
+        return Tensor({backing.data, backing.bytes(), backing.device}, backing.dtype, shape);
+    };
+    return {proposal_ids.slice(1, 0, batch), proposal_positions.slice(1, 0, batch),
+            packed(drafts, {columns, batch}),
+            candidate_ids.data ? packed(candidate_ids, {candidate_ids.ne[0], columns, batch})
+                               : Tensor{},
+            proposal_q.data ? packed(proposal_q, {proposal_q.ne[0], columns, batch}) : Tensor{}};
+}
+
 ExecutionFrame::ExecutionFrame(MemorySpan backing, const FrameLayout& layout)
     : spec(layout.spec), input_capacity(layout.input_capacity), host_storage(layout.host.bytes),
       input_ids(layout.input_ids.bind(backing)),
@@ -301,7 +313,7 @@ void ExecutionFrame::bind_rows(std::uint32_t rows) {
     extents                   = layout.ingress.extents.bind(ingress);
     valid_columns             = layout.ingress.valid_columns.bind(ingress);
     proposal_valid_columns    = layout.ingress.proposal_valid_columns.bind(ingress);
-    budgets                   = layout.ingress.budgets.bind(ingress);
+    proposal_live_rows        = layout.ingress.proposal_live_rows.bind(ingress);
     main_table_rows           = layout.ingress.main_table_rows.bind(ingress);
     backend_table_rows        = layout.ingress.backend_table_rows.bind(ingress);
     residency_slots           = layout.ingress.residency_slots.bind(ingress);
@@ -328,8 +340,8 @@ void ExecutionFrame::bind_rows(std::uint32_t rows) {
         span.template operator()<std::int32_t>(layout.ingress.valid_columns, host_ingress_bytes);
     host_ingress.proposal_valid_columns = span.template operator()<std::int32_t>(
         layout.ingress.proposal_valid_columns, host_ingress_bytes);
-    host_ingress.budgets =
-        span.template operator()<std::int32_t>(layout.ingress.budgets, host_ingress_bytes);
+    host_ingress.proposal_live_rows = span.template operator()<std::int32_t>(
+        layout.ingress.proposal_live_rows, host_ingress_bytes);
     host_ingress.main_table_rows =
         span.template operator()<std::int32_t>(layout.ingress.main_table_rows, host_ingress_bytes);
     host_ingress.backend_table_rows = span.template operator()<std::int32_t>(

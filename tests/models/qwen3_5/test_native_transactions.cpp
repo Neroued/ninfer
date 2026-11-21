@@ -86,7 +86,7 @@ class Fixture {
 public:
     Fixture(native::NativeRankFixture& rank, q35::detail::SessionImpl& program,
             ninfer::models::qwen::Frontend& frontend)
-        : program_(program), frontend_(frontend), empty_(program.physical_usage()),
+        : program_(program), frontend_(frontend), empty_(program.physical_usage()), rank_(rank),
           driver_(program, rank) {}
 
     q35::RequestBasePlan request(std::uint32_t tokens, bool history = false,
@@ -104,7 +104,7 @@ public:
             options);
     }
 
-    void synchronize() { driver_.synchronize(); }
+    void synchronize() { rank_.synchronize(); }
 
     q35::ContextProgress settle(bool cancelled = false) {
         auto progress = driver_.settle(cancelled);
@@ -240,7 +240,7 @@ public:
         auto base           = request(64);
         const auto sequence = bind(base);
         finish_prefill(sequence, 64, false);
-        reserve(sequence, q35::ExecutionUnitKind::Decode, 8);
+        reserve(sequence, q35::ExecutionUnitKind::Decode, 1);
         const std::array<q35::SequenceHandle, 1> members{sequence};
         const std::array<runtime::RoundBudget, 1> budget{{{.generated_tokens_remaining = 8}}};
         auto pending = driver_.decode(members, budget);
@@ -1733,6 +1733,7 @@ private:
     q35::detail::SessionImpl& program_;
     ninfer::models::qwen::Frontend& frontend_;
     q35::PhysicalUsageSnapshot empty_;
+    native::NativeRankFixture& rank_;
     native::EventDriver<q35::detail::SessionImpl> driver_;
     std::optional<runtime::ResidencyId> last_binding_;
 };

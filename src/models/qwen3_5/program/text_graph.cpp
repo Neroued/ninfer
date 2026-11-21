@@ -203,7 +203,7 @@ void TextGraph::prepare(TextRun& run, const Parameters& parameters, moe::Schedul
                 if (routed) {
                     const auto prior = profile ? graph.profiles.front()[layer].offloaded : nullptr;
                     definition.offloaded = schedule->capture_layer(
-                        routed->bank, cuda, geometry, [&] { run.mixer(layer); },
+                        routed->bank, cuda, geometry, [&](DecodeGraphChild&) { run.mixer(layer); },
                         [&](const moe::GpuCall& call) { run.post_mixer(layer, &call); },
                         [&] { run.capture_features(layer); }, prior);
                 } else {

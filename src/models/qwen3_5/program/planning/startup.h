@@ -44,6 +44,7 @@ struct SequencePlanningInputs {
 };
 
 struct SequencePlanImpl {
+    std::shared_ptr<const speculative::DecodeGraphRoutes> decode_routes;
     std::shared_ptr<const BatchExecutionPlan> batch_execution;
     std::shared_ptr<const execution::ModelProfile> profile;
     std::shared_ptr<const moe::Plan> moe;

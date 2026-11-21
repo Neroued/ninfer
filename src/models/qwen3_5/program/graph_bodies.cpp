@@ -14,7 +14,7 @@ GraphPreparationSample RankProgramImpl::initialize_graphs(GraphPreparationMode m
         return initialize_graphs(GraphPreparationMode::Capture);
     }
     GraphPreparation observation(device, mode);
-    graphs.emplace(GraphSpec{capacity, batch_execution, draft_window, backend});
+    graphs.emplace(GraphSpec{capacity, batch_execution, draft_window, backend, decode_routes});
     GraphBodies bodies;
     bodies.prologue = [this, capture = observation.capturing()](const GraphInvocation& call) {
         gpu_timer.begin_target(capture);
@@ -35,7 +35,8 @@ GraphPreparationSample RankProgramImpl::initialize_graphs(GraphPreparationMode m
         for (int row = 0; row < batch; ++row)
             inputs.active_tokens += frame.host_ingress.valid_columns[row];
         execution::TextStateUpdate update = execution::StepUpdate{};
-        if (call.width > 1) update.emplace<execution::ReplayRecords>(*resources.replay_records);
+        if (call.width > 1)
+            update.emplace<execution::ReplayRecords>(resources.replay(width).records);
         std::optional<execution::DFlashFeatureSink> feature;
         if (resources.dflash) {
             feature.emplace();
@@ -57,20 +58,19 @@ GraphPreparationSample RankProgramImpl::initialize_graphs(GraphPreparationMode m
         gpu_timer.begin_draft(capture);
         if (backend == SpeculativeBackend::Mtp) {
             upload_ingress();
-            run_mtp_draft(call.batch, draft_window, std::max(1U, call.profile.max));
+            run_mtp_draft(call.batch, call.route->mtp_steps, std::max(1U, call.profile.max));
         } else {
             append_draft_history(call.batch, {0, draft_window + 1});
-            run_dflash_draft(call.batch, 0, call.profile.max);
+            run_dflash_draft(*call.route, 0, call.profile.max);
         }
+        prepare_verification(*call.route);
         gpu_timer.end_draft(capture);
     };
-    bodies.decision = [this](const GraphInvocation& call) {
-        decide_decode(call.batch, call.width);
-    };
+    bodies.decision = [this](const GraphInvocation& call) { decide_decode(*call.route); };
     if (backend == SpeculativeBackend::Mtp)
-        bodies.mtp_commit = [this](std::uint32_t batch, DecodeGraphSection* repair,
-                                   DecodeGraphSection* counts) {
-            execute_mtp_commit(batch, true, true, repair, counts);
+        bodies.mtp_commit = [this](std::uint32_t batch, std::uint32_t width,
+                                   DecodeGraphSection* repair, DecodeGraphSection* counts) {
+            execute_mtp_commit(batch, width, true, true, repair, counts);
         };
     bodies.readback = [this](const GraphInvocation& call) {
         readback_decode(call.batch, call.width > 1);

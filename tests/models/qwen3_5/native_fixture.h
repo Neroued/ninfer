@@ -134,6 +134,15 @@ public:
             options.max_concurrency);
     }
 
+    std::unique_ptr<runtime::Executor<q35::ExecutionTypes>> take_executor() {
+        return std::move(executor_);
+    }
+
+    void synchronize() {
+        device_->synchronize();
+        CUDA_CHECK(cudaStreamSynchronize(device_->transfer_stream()));
+    }
+
     [[nodiscard]] DeviceContext& device() noexcept { return *device_; }
 
     [[nodiscard]] runtime::Executor<q35::ExecutionTypes>& executor() noexcept { return *executor_; }
@@ -161,12 +170,11 @@ class EventDriver {
 public:
     using DecisionHandler = std::function<runtime::DecisionInput(const runtime::DecisionRequest&)>;
 
-    EventDriver(Session& session, NativeRankFixture& rank) : session_(session), rank_(rank) {}
+    EventDriver(Session& session, NativeRankFixture& rank)
+        : EventDriver(session, rank.executor()) {}
 
-    void synchronize() {
-        rank_.device().synchronize();
-        CUDA_CHECK(cudaStreamSynchronize(rank_.device().transfer_stream()));
-    }
+    EventDriver(Session& session, runtime::Executor<q35::ExecutionTypes>& executor)
+        : session_(session), executor_(executor) {}
 
     template <class Result>
     Result wait(std::optional<runtime::ExecutionTicket> ticket = {},
@@ -202,7 +210,7 @@ public:
 
     void idle() {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes(2);
-        while (rank_.executor().has_pending_work() || session_.has_context_operation()) {
+        while (executor_.has_pending_work() || session_.has_context_operation()) {
             pump({});
             if (std::chrono::steady_clock::now() > deadline)
                 throw std::runtime_error("native worker did not become idle");
@@ -286,13 +294,13 @@ private:
                 events_.push_back(std::move(*event));
             }
         } else {
-            rank_.executor().flush();
+            executor_.flush();
             std::this_thread::yield();
         }
     }
 
     Session& session_;
-    NativeRankFixture& rank_;
+    runtime::Executor<q35::ExecutionTypes>& executor_;
     std::deque<q35::SessionEvent> events_;
     std::map<std::uint64_t, std::vector<q35::SequenceHandle>> members_;
 };

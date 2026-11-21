@@ -1,5 +1,5 @@
-#include "models/common/qwen/vision/control.h"
 #include "models/qwen3_5/session/internal.h"
+#include "models/common/qwen/vision/control.h"
 #include "models/common/context/work.h"
 
 #include <algorithm>
@@ -190,12 +190,12 @@ BindingReservation SessionImpl::start_binding(const RequestBasePlan& base, runti
         prepared_state.ledger.reserve_output(base.summary().effective_output_tokens);
         prepared.publish_continuation = base.summary().publish_continuation;
         prepared.sampling_host        = base.impl_->sampling;
-        prepared.speculative_stats    = {
-               .backend                = speculative_backend,
-               .enabled                = speculative_backend != SpeculativeBackend::None,
-               .draft_window           = draft_window,
-               .attempted_per_position = std::vector<std::uint64_t>(draft_window, 0),
-               .accepted_per_position  = std::vector<std::uint64_t>(draft_window, 0),
+        prepared.speculative_stats = {
+            .backend                = speculative_backend,
+            .enabled                = speculative_backend != SpeculativeBackend::None,
+            .draft_window           = draft_window,
+            .attempted_per_position = std::vector<std::uint64_t>(draft_window, 0),
+            .accepted_per_position  = std::vector<std::uint64_t>(draft_window, 0),
         };
     }
     prepared_state.prefix = context::PrefixBuilder(

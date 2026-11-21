@@ -2,7 +2,7 @@
 
 #include "core/decode_graph.h"
 #include "models/common/graph_preparation.h"
-#include "models/common/batch.h"
+#include "models/qwen3_5/work.h"
 #include "models/qwen3_5/program/resources.h"
 #include "models/qwen3_5/program/text_graph.h"
 
@@ -29,6 +29,7 @@ struct GraphInvocation {
     std::uint32_t width;
     GraphProfile profile;
     ops::CausalAttentionExecutionEnvelope envelope;
+    const speculative::RoundRoute* route = nullptr;
 };
 
 struct GraphSpec {
@@ -36,6 +37,7 @@ struct GraphSpec {
     std::shared_ptr<const BatchExecutionPlan> batch_execution;
     std::uint32_t draft_window = 0;
     SpeculativeBackend backend = SpeculativeBackend::None;
+    std::shared_ptr<const speculative::DecodeGraphRoutes> routes;
 };
 
 // Borrowed only during preparation. Bodies operate on the fixed execution frame;
@@ -47,7 +49,8 @@ struct GraphBodies {
     std::function<void(const GraphInvocation&)> draft;
     std::function<void(const GraphInvocation&)> decision;
     std::function<void(const GraphInvocation&)> readback;
-    std::function<void(std::uint32_t, DecodeGraphSection*, DecodeGraphSection*)> mtp_commit;
+    std::function<void(std::uint32_t, std::uint32_t, DecodeGraphSection*, DecodeGraphSection*)>
+        mtp_commit;
 };
 
 class Graphs {
@@ -55,12 +58,14 @@ public:
     explicit Graphs(GraphSpec spec);
     void prepare(Resources&, const execution::Parameters&, DeviceContext&, const GraphBodies&,
                  GraphPreparation&);
-    [[nodiscard]] bool start(GraphPhase, std::uint32_t batch, std::uint32_t frontier,
+    [[nodiscard]] bool start(GraphPhase, const speculative::RoundRoute&, std::uint32_t frontier,
                              std::uint32_t target_tokens, CudaExecutionView);
+    [[nodiscard]] bool contains(const speculative::RoundRoute&) const;
     [[nodiscard]] bool poll();
     void cancel();
     void clear();
-    void commit_mtp(std::uint32_t batch, bool repair, bool counts, CudaExecutionView);
+    void commit_mtp(std::uint32_t batch, std::uint32_t width, bool repair, bool counts,
+                    CudaExecutionView);
 
     [[nodiscard]] std::size_t workspace_peak() const noexcept { return workspace_peak_; }
 
@@ -84,8 +89,11 @@ private:
     };
 
     struct Batch {
-        execution::TextGraph main, verify;
-        SegmentFamily draft, sample, accept;
+        execution::TextGraph main;
+        std::map<std::uint32_t, execution::TextGraph> verify;
+        std::map<std::uint32_t, SegmentFamily> proposals;
+        SegmentFamily sample;
+        std::map<std::pair<std::uint32_t, std::uint32_t>, SegmentFamily> accept;
 
         struct MtpCommit {
             DecodeGraphDefinition definition;
@@ -93,7 +101,7 @@ private:
             DecodeGraphSection repair, counts;
         };
 
-        MtpCommit mtp_commit;
+        MtpCommit ordinary_commit, verify_commit;
     };
 
     GraphSpec spec_;

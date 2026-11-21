@@ -62,70 +62,70 @@ void RankProgramImpl::append_draft_history(std::uint32_t batch_size,
                                     frame.backend_table_rows.slice(0, 0, batch), envelope);
 }
 
-void RankProgramImpl::run_dflash_draft(std::uint32_t batch_value, std::uint32_t minimum,
+void RankProgramImpl::run_dflash_draft(const speculative::RoundRoute& route, std::uint32_t minimum,
                                        std::uint32_t maximum) {
-    auto& frame      = resources.frame;
-    auto& draft      = *frame.dflash;
-    const int batch  = static_cast<int>(batch_value);
-    const int drafts = static_cast<int>(draft_window), width = drafts + 1;
+    auto& frame     = resources.frame;
+    auto& draft     = *frame.dflash;
+    const int batch = static_cast<int>(route.shape.rows);
     execution::DraftInputs inputs{frame.anchors.slice(0, 0, batch),
                                   frame.frontiers.slice(0, 0, batch),
-                                  (backend == SpeculativeBackend::DFlash2
-                                       ? frame.proposal_valid_columns
-                                       : frame.valid_columns)
-                                      .slice(0, 0, batch),
+                                  frame.proposal_valid_columns.slice(0, 0, batch),
                                   frame.state_destination_offsets.slice(0, 0, batch),
                                   frame.backend_table_rows.slice(0, 0, batch),
-                                  frame.live_rows.slice(0, 0, batch),
+                                  frame.proposal_live_rows.slice(0, 0, batch),
                                   frame.sampling};
-    execution::DraftOutputs outputs{
-        dense_prefix(draft.proposal_ids, {width, batch}),
-        dense_prefix(draft.proposal_positions, {width, batch}),
-        dense_prefix(draft.drafts, {drafts, batch}),
-        draft.candidate_ids.data
-            ? dense_prefix(draft.candidate_ids, {draft.candidate_ids.ne[0], drafts, batch})
-            : Tensor{},
-        draft.proposal_q.data
-            ? dense_prefix(draft.proposal_q, {draft.proposal_q.ne[0], drafts, batch})
-            : Tensor{}};
+    auto outputs = draft.proposal(batch, static_cast<int>(route.head_columns));
     execution::DraftEnvelopes envelopes{{minimum, maximum}, {minimum, maximum}};
     execution::draft_propose(draft_view(*this), inputs, outputs, envelopes);
+}
+
+Tensor RankProgramImpl::draft_tokens(const speculative::RoundRoute& route) const {
+    const auto& frame = resources.frame;
+    const auto batch  = static_cast<int>(route.shape.rows);
+    if (frame.mtp) return frame.mtp->proposals(batch);
+    return frame.dflash->proposal(batch, static_cast<int>(route.head_columns)).drafts;
+}
+
+void RankProgramImpl::prepare_verification(const speculative::RoundRoute& route) {
+    auto& frame          = resources.frame;
+    const auto batch     = static_cast<int>(route.shape.rows);
+    const auto produced  = frame.mtp ? route.mtp_steps : route.head_columns;
+    const auto proposals = draft_tokens(route).slice(0, 0, produced);
+    auto ids             = frame.decode_view(route.width, batch).ids;
+    ops::prepare_verify_ids(frame.anchors.slice(0, 0, batch), proposals,
+                            frame.extents.slice(0, 0, batch), ids, device.execution_view());
 }
 
 void RankProgramImpl::begin_draft(ComputeOperation& operation) {
     auto& frame           = resources.frame;
     const int batch       = static_cast<int>(operation.shape.rows);
-    const int drafts      = static_cast<int>(draft_window);
-    const int width       = drafts + 1;
     std::uint32_t minimum = capacity, maximum = 0;
-    for (const auto& row : operation.rows) {
-        minimum = std::min(minimum, row.main_frontier);
-        maximum = std::max(maximum, row.main_frontier);
+    for (std::size_t i = 0; i < operation.rows.size(); ++i) {
+        if (!frame.host_ingress.extents[i]) continue;
+        minimum = std::min(minimum, operation.rows[i].main_frontier);
+        maximum = std::max(maximum, operation.rows[i].main_frontier);
     }
     if (!graphs) gpu_timer.begin_draft();
     if (graphs) {
-        (void)graphs->start(GraphPhase::Draft, operation.shape.rows, maximum, 0,
+        (void)graphs->start(GraphPhase::Draft, operation.decode_route(), maximum, 0,
                             device.execution_view());
     } else if (backend == SpeculativeBackend::Mtp) {
-        begin_mtp_draft(operation);
+        run_mtp_draft(batch, operation.decode_route().mtp_steps, maximum);
     } else {
-        run_dflash_draft(operation.shape.rows, minimum, maximum);
+        run_dflash_draft(operation.decode_route(), minimum, maximum);
     }
-    if (!graphs) gpu_timer.end_draft();
-    Tensor proposals = backend == SpeculativeBackend::Mtp
-                           ? frame.mtp->proposals(batch)
-                           : dense_prefix(frame.dflash->drafts, {drafts, batch});
-    auto input       = frame.decode_view(width, batch);
-    ops::prepare_verify_ids(frame.anchors.slice(0, 0, batch), proposals,
-                            frame.extents.slice(0, 0, batch), input.ids, device.execution_view());
-    const bool constrained = std::any_of(operation.sampling.begin(), operation.sampling.end(),
-                                         [](const auto& row) { return row.constrained; });
-    if (constrained) {
+    if (!graphs) {
+        gpu_timer.end_draft();
+        prepare_verification(operation.decode_route());
+    }
+    if (operation.read_drafts_for_masks) {
+        const Tensor proposals = draft_tokens(operation.decode_route());
         if (backend == SpeculativeBackend::Mtp) {
             const auto row_bytes = std::size_t(batch) * sizeof(TokenId);
             CUDA_CHECK(cudaMemcpy2DAsync(frame.host_drafts.data, row_bytes, proposals.data,
-                                         frame.mtp->drafts.nb[1], row_bytes, operation.drafts,
-                                         cudaMemcpyDeviceToHost, device.stream()));
+                                         frame.mtp->drafts.nb[1], row_bytes,
+                                         operation.decode_route().mtp_steps, cudaMemcpyDeviceToHost,
+                                         device.stream()));
         } else {
             CUDA_CHECK(cudaMemcpyAsync(frame.host_drafts.data, proposals.data, proposals.bytes(),
                                        cudaMemcpyDeviceToHost, device.stream()));
@@ -152,13 +152,13 @@ void RankProgramImpl::begin_target(ComputeOperation& operation) {
     operation.attention.valid_positions += active_tokens;
     auto input = forward ? frame.input_view(width, batch) : frame.decode_view(width, batch);
     if (!forward && graphs) {
-        const auto phase       = operation.speculative ? GraphPhase::Verify : GraphPhase::Main;
+        const auto phase = operation.verifies_drafts() ? GraphPhase::Verify : GraphPhase::Main;
         std::uint32_t frontier = 0;
         for (const auto& row : operation.rows) frontier = std::max(frontier, row.main_frontier);
         operation.graph_started = true;
         operation.projected     = true;
-        operation.row_finished = graphs->start(phase, operation.shape.rows, frontier, active_tokens,
-                                               device.execution_view());
+        operation.row_finished  = graphs->start(phase, operation.decode_route(), frontier,
+                                                active_tokens, device.execution_view());
         return;
     }
     execution::TextInputs inputs{input.ids,
@@ -174,8 +174,8 @@ void RankProgramImpl::begin_target(ComputeOperation& operation) {
     if (forward) {
         const auto& row = operation.rows[operation.forward_row];
         update = execution::SequenceUpdate{row.state_offsets.source, row.state_offsets.destination};
-    } else if (operation.speculative) {
-        update.emplace<execution::ReplayRecords>(*resources.replay_records);
+    } else if (operation.verifies_drafts()) {
+        update.emplace<execution::ReplayRecords>(resources.replay(width).records);
     }
     std::uint32_t minimum = capacity, maximum = 0;
     for (std::uint32_t row = 0; row < (forward ? 1 : operation.batch); ++row) {

@@ -192,8 +192,8 @@ void test_frame_layout() {
             };
             for (const auto* field :
                  {&in.live_rows, &in.anchors, &in.frontiers, &in.backend_frontiers, &in.extents,
-                  &in.valid_columns, &in.proposal_valid_columns, &in.budgets, &in.main_table_rows,
-                  &in.backend_table_rows, &in.residency_slots, &in.rope_deltas,
+                  &in.valid_columns, &in.proposal_valid_columns, &in.proposal_live_rows,
+                  &in.main_table_rows, &in.backend_table_rows, &in.residency_slots, &in.rope_deltas,
                   &in.sampling_positions, &in.history_skip})
                 tensor(input_regions, *field, ninfer::DType::I32, count);
             for (const auto* field : {&in.state_source_offsets, &in.state_destination_offsets})

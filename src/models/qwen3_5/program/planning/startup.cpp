@@ -6,6 +6,7 @@
 #include "models/qwen3_5/execution/mtp.h"
 #include "models/qwen3_5/planning.h"
 #include "models/qwen3_5/program/planning/startup.h"
+#include "models/qwen3_5/work.h"
 #include "models/common/qwen/vision/vision.h"
 #include "models/qwen3_5/execution/workspace.h"
 #include "core/device.h"
@@ -230,6 +231,18 @@ WorkspaceSpec build_workspace_plan(const SequencePlanImpl& plan) {
         }
         if (!plan.causal_scoring) { linear_scratch(layout, profile.text.output_head, first, last); }
     };
+    const auto verify_workspace = [&](std::int32_t batch) {
+        std::size_t peak = 0;
+        for (std::int32_t width = 2; width <= verify; ++width) {
+            const auto columns = batch * width;
+            WorkspaceLayoutBuilder target;
+            matrix(target, DType::BF16, dimension(config.hidden_size), columns);
+            target_body(target, columns, columns, TextPhase::Verify, GdnWorkspacePath::ReplayRecord,
+                        batch, width, width, text_envelope);
+            peak = std::max(peak, finish(target));
+        }
+        return peak;
+    };
     const auto mtp_post_mixer = [&](WorkspaceLayoutBuilder& layout, int first, int last) {
         linear_scratch(layout, profile.mtp->output, first, last);
         if (const auto* dense = std::get_if<execution::DenseProfile>(&profile.mtp->ffn)) {
@@ -322,12 +335,6 @@ WorkspaceSpec build_workspace_plan(const SequencePlanImpl& plan) {
         // conditioning, and outputs live in the execution frame.
         out.mtp_prefill = std::max(out.text_prefill, mtp_history(1, chunk));
         for (std::int32_t batch = 1; batch <= dimension(plan.max_concurrency); ++batch) {
-            const std::int32_t aggregate = batch * verify;
-            WorkspaceLayoutBuilder target;
-            matrix(target, DType::BF16, dimension(config.hidden_size), aggregate);
-            target_body(target, aggregate, aggregate, qwen3_5::TextPhase::Verify,
-                        GdnWorkspacePath::ReplayRecord, batch, verify, verify, text_envelope);
-
             out.ordinary_round = std::max(out.ordinary_round, mtp_history(batch, batch));
             for (std::int32_t width = 1; width <= drafts; ++width) {
                 const auto columns = batch * width;
@@ -336,9 +343,9 @@ WorkspaceSpec build_workspace_plan(const SequencePlanImpl& plan) {
             WorkspaceLayoutBuilder proposal;
             proposal_scratch(proposal, batch);
             const auto accept = ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
-                dimension(profile.public_tokens), drafts, drafts, batch, batch);
-            out.mtp_round = std::max(
-                {out.mtp_round, finish(target), mtp_draft(batch), finish(proposal), accept});
+                dimension(profile.public_tokens), 1, drafts, batch, batch);
+            out.mtp_round = std::max({out.mtp_round, verify_workspace(batch), mtp_draft(batch),
+                                      finish(proposal), accept});
         }
     }
 
@@ -488,24 +495,20 @@ WorkspaceSpec build_workspace_plan(const SequencePlanImpl& plan) {
 
             out.dflash_context = dflash_context_capacity(chunk, 1, false);
             for (std::int32_t batch = 1; batch <= dimension(plan.max_concurrency); ++batch) {
-                const std::int32_t aggregate = verify * batch;
-                WorkspaceLayoutBuilder target;
-                matrix(target, DType::BF16, dimension(config.hidden_size), aggregate);
-                target_body(target, aggregate, aggregate, qwen3_5::TextPhase::Verify,
-                            GdnWorkspacePath::ReplayRecord, batch, verify, verify, text_envelope);
                 const std::size_t accept =
                     draft->dflash2.has_value()
                         ? ops::speculative_accept_sparse_drafts_workspace_capacity_bytes(
-                              dimension(profile.public_tokens), {false}, drafts, drafts, batch,
-                              batch)
+                              dimension(profile.public_tokens), {false}, 1, drafts, batch, batch)
                         : ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
-                              dimension(profile.public_tokens), drafts, drafts, batch, batch);
+                              dimension(profile.public_tokens), 1, drafts, batch, batch);
                 const std::size_t proposal = dflash_proposal_capacity(verify, batch);
                 WorkspaceLayoutBuilder accepted_hidden;
                 matrix(accepted_hidden, DType::BF16, dimension(config.hidden_size), batch);
-                out.dflash_round =
-                    std::max({out.dflash_round, finish(target), accept, finish(accepted_hidden),
-                              dflash_context_capacity(verify, batch, true), proposal});
+                out.dflash_round = std::max({out.dflash_round, verify_workspace(batch), accept,
+                                             finish(accepted_hidden), proposal});
+                for (int w = 1; w <= verify; ++w)
+                    out.dflash_round =
+                        std::max(out.dflash_round, dflash_context_capacity(w, batch, true));
             }
         }
     }
@@ -591,6 +594,8 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->prefill_chunk                     = inputs.prefill_chunk;
     impl->draft_window                      = inputs.draft_window;
     impl->speculative_backend               = inputs.speculative_backend;
+    impl->decode_routes = std::make_shared<const speculative::DecodeGraphRoutes>(
+        *impl->batch_execution, impl->speculative_backend, impl->draft_window);
     impl->proposal_head                     = inputs.proposal_head;
     impl->features                          = inputs.features;
     impl->gpu_timing                        = inputs.gpu_timing;

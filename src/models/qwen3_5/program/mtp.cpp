@@ -51,7 +51,7 @@ void RankProgramImpl::prepare_mtp_draft(ComputeOperation& operation) {
     const auto& work = std::get<DecodeWork>(operation.request.work.operation);
     auto& frame      = resources.frame;
     const auto batch = static_cast<std::int32_t>(operation.shape.rows);
-    for (std::uint32_t step = 0; step < draft_window; ++step) {
+    for (std::uint32_t step = 0; step < operation.decode_route().mtp_steps; ++step) {
         auto host_positions = host_step(frame.host_step_positions, step, batch);
         auto host_rope      = host_step(frame.host_step_rope_positions, step, 3 * batch);
         auto host_valid     = host_step(frame.host_step_valid_columns, step, batch);
@@ -60,10 +60,10 @@ void RankProgramImpl::prepare_mtp_draft(ComputeOperation& operation) {
         auto* valid         = static_cast<std::int32_t*>(host_valid.data);
         for (std::uint32_t row = 0; row < operation.batch; ++row) {
             const auto& binding = operation.rows[row];
-            if (binding.main_frontier == 0) {
+            valid[row]          = step < work.plan->verify_drafts()[row];
+            if (valid[row] && binding.main_frontier == 0) {
                 throw std::logic_error("MTP draft has no target conditioning");
             }
-            valid[row] = step == 0 || step < work.rows[row].draft_extent;
             positions[row] =
                 valid[row] ? static_cast<std::int32_t>(binding.main_frontier - 1 + step) : 0;
             for (int axis = 0; axis < 3; ++axis)
@@ -109,35 +109,20 @@ void RankProgramImpl::run_mtp_draft(std::uint32_t batch_size, std::uint32_t step
     }
 }
 
-void RankProgramImpl::begin_mtp_draft(ComputeOperation& operation) {
-    if (operation.drafts == 0) return;
-    std::uint32_t maximum = 1;
-    for (const auto& row : operation.rows) maximum = std::max(maximum, row.main_frontier);
-    run_mtp_draft(operation.shape.rows, operation.drafts, maximum);
-}
-
 void RankProgramImpl::align_mtp_history(ComputeOperation& operation) {
     if (backend != SpeculativeBackend::Mtp || operation.width == 0) return;
-    const auto* forward = std::get_if<ForwardWork>(&operation.request.work.operation);
-    const auto* decode  = std::get_if<DecodeWork>(&operation.request.work.operation);
-    if (!forward && !decode) return;
-    if (operation.speculative) return;
-
     auto& frame              = resources.frame;
     auto& mtp                = *frame.mtp;
     const auto cuda          = device.execution_view();
     const auto mtp_execution = mtp_view(parameters, resources, cuda, proposal_head);
-    const auto batch         = forward ? 1 : static_cast<std::int32_t>(operation.shape.rows);
+    const auto batch         = 1;
     const auto width         = static_cast<std::int32_t>(operation.width);
     const auto hidden        = execution::dimension(parameters.profile->config.text.hidden_size);
-    const auto row_begin     = forward ? operation.forward_row : 0;
-    const auto rows          = std::span<const ExecutionRow>(operation.rows)
-                          .subspan(row_begin, forward ? 1 : operation.batch);
-    const auto skip    = forward && rows.front().main_frontier == 0 ? 1 : 0;
+    const auto skip          = operation.rows[operation.forward_row].main_frontier == 0 ? 1 : 0;
     auto history_width = width - skip;
     if (history_width == 0) return;
 
-    const auto main   = forward ? frame.input_view(width, batch) : frame.decode_view(width, batch);
+    const auto main   = frame.input_view(width, batch);
     auto conditioning = packed(mtp.history_conditioning, {hidden, history_width, batch});
     auto ids          = packed(mtp.history_ids, {history_width, batch});
     auto positions    = packed(mtp.history_positions, {history_width, batch});
@@ -170,13 +155,14 @@ void RankProgramImpl::align_mtp_history(ComputeOperation& operation) {
     execution::mtp_history(mtp_execution, inputs, {0, static_cast<std::uint32_t>(history_width)});
 }
 
-void RankProgramImpl::rebuild_mtp_history(std::uint32_t batch_size) {
+void RankProgramImpl::rebuild_mtp_history(std::uint32_t batch_size, std::uint32_t verify_width) {
     auto& frame       = resources.frame;
     auto& mtp         = *frame.mtp;
     const auto cuda   = device.execution_view();
     const auto batch  = static_cast<std::int32_t>(batch_size);
-    const auto width  = static_cast<std::int32_t>(draft_window + 1);
-    const auto count  = static_cast<std::int32_t>(draft_window);
+    const auto width  = static_cast<std::int32_t>(verify_width);
+    const auto count  = std::max(1, width - 1);
+    if (width == 1) gather_conditioning(resources, batch, cuda);
     const auto hidden = execution::dimension(parameters.profile->config.text.hidden_size);
     const auto main   = frame.decode_view(width, batch);
     auto conditioning = packed(mtp.history_conditioning, {hidden, count, batch});
@@ -204,7 +190,7 @@ void RankProgramImpl::rebuild_mtp_history(std::uint32_t batch_size) {
         .kv_table_rows   = frame.backend_table_rows.slice(0, 0, batch),
     };
     execution::mtp_history(mtp_view(parameters, resources, cuda, proposal_head), inputs,
-                           {0, draft_window});
+                           {0, static_cast<std::uint32_t>(count)});
 }
 
 } // namespace ninfer::models::qwen3_5::detail

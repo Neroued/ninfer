@@ -667,8 +667,32 @@ int exercise_semantic_captures(const char* artifact) {
     return 0;
 }
 
+// A checkpoint at P and an independent root prefill at P+6 need two State records.
+// For page-aligned P each of the text and MTP pools needs 2*(P/page_size)+1 pages.
+std::uint32_t configure_host_restore_pressure(ninfer::EngineOptions& options) {
+    constexpr auto page_size = static_cast<std::uint32_t>(ninfer::kPagedKVPageSize);
+    for (; options.max_context <= 65536; options.max_context *= 2) {
+        const auto plan     = ninfer::test::qwen3_5::context_capacity_plan(options);
+        const auto geometry = ninfer::describe_context_pool(plan.records);
+        const auto capacity = plan.minimum_capacity().device_bytes;
+        for (std::uint32_t pages = 1; pages < options.max_context / page_size; ++pages) {
+            std::vector<ninfer::RecordRequest> demand{{geometry.spec_classes.front(), 2}};
+            for (std::size_t i = 1; i < geometry.spec_classes.size(); ++i)
+                demand.push_back({geometry.spec_classes[i], 2 * pages + 1});
+            if (geometry.required_bytes(demand) <= capacity) continue;
+            options.context_capacity = ninfer::ContextCapacityPolicy::explicit_capacity(capacity);
+            options.context_cache.host_capacity_bytes =
+                ninfer::test::qwen3_5::checkpoint_capacity_bytes(plan, 1, options.max_context);
+            return pages * page_size;
+        }
+    }
+    throw std::runtime_error("could not form a checkpoint and root prefill requiring Host storage");
+}
+
 int exercise_host_restore(const char* artifact) {
-    ninfer::Engine engine(host_restore_engine_options(artifact));
+    auto configured            = host_restore_engine_options(artifact);
+    const auto retained_tokens = configure_host_restore_pressure(configured);
+    ninfer::Engine engine(std::move(configured));
     auto options = [](std::uint32_t outputs, bool reuse) {
         ninfer::RequestOptions request;
         request.execution.requested_output_tokens = outputs;
@@ -678,13 +702,14 @@ int exercise_host_restore(const char* artifact) {
         return request;
     };
 
-    // One full prefill chunk leaves a prompt and a later generation checkpoint on Device.
+    // Retain the prompt and the later generation endpoint before introducing the root writer.
     // A token branch isolates typed Host restore from template rewriting and
     // the retention of a shorter, optional chat rewrite anchor.
-    const std::vector<ninfer::TokenId> retained_input(256, 5834);
+    const std::vector<ninfer::TokenId> retained_input(retained_tokens, 5834);
     const ninfer::GenerationResult retained =
         engine.generate(engine.prepare_tokens(retained_input), options(5, true));
-    if (retained.prompt.prompt_tokens != 256 || retained.generated_token_ids.size() != 5) {
+    if (retained.prompt.prompt_tokens != retained_tokens ||
+        retained.generated_token_ids.size() != 5) {
         std::cerr << "Host-restore source request did not complete\n";
         return 1;
     }
@@ -844,6 +869,7 @@ int exercise_nested_tool_markers(const char* artifact) {
     request.execution.sampling.temperature    = 0.0F;
     request.execution.allow_prefix_reuse      = true;
     request.stop.include_model_defaults       = false;
+    request.tool_choice.constraints           = ninfer::ToolConstraintMode::Automatic;
 
     // A single source creates both markers. Each probe changes the user suffix so the
     // private response/endpoint cannot satisfy the shared-prefix conformance check.
@@ -973,7 +999,8 @@ int exercise_anthropic_prefix_regression(const char* artifact) {
         return input;
     };
 
-    const ninfer::RequestOptions one_token = generation_options(1, false);
+    auto one_token                         = generation_options(1, false);
+    one_token.tool_choice.constraints      = ninfer::ToolConstraintMode::Automatic;
     const ninfer::GenerationResult seed    = engine.generate(
         engine.prepare(nested_tool_prompt({alpha, bravo}, "Use one listed function.")), one_token);
     const ninfer::GenerationResult first_filler = engine.generate(
@@ -1319,6 +1346,7 @@ int exercise_rewrite_checkpoints(ninfer::Engine& engine) {
         result.execution.sampling.temperature    = 0.0F;
         result.execution.allow_prefix_reuse      = reuse;
         result.stop.include_model_defaults       = false;
+        result.tool_choice.constraints           = ninfer::ToolConstraintMode::Automatic;
         return result;
     };
 
@@ -1423,6 +1451,7 @@ int exercise_agent_continuation(const char* artifact) {
     request.execution.sampling.temperature    = 0.0F;
     request.execution.allow_prefix_reuse      = true;
     request.stop.include_model_defaults       = false;
+    request.tool_choice.constraints           = ninfer::ToolConstraintMode::Automatic;
     const auto opener_tokens =
         static_cast<std::uint32_t>(engine.tokenize_text("<|im_start|>assistant\n<think>\n").size());
     const auto closing_tokens =
@@ -1580,6 +1609,7 @@ int exercise_rewrite_branch(const char* artifact) {
         value.execution.sampling.temperature    = 0.0F;
         value.execution.allow_prefix_reuse      = reuse;
         value.stop.include_model_defaults       = false;
+        value.tool_choice.constraints           = ninfer::ToolConstraintMode::Automatic;
         return value;
     };
 

@@ -181,12 +181,9 @@ UnitDemand SessionImpl::next_unit(const SequenceState& state, const RequestContr
                                        vision::Window{});
         break;
     case ExecutionUnitKind::Decode:
-        if (request.lifecycle != Lifecycle::Active || !tokens || f >= capacity)
-            throw std::logic_error("decode demand requires an active token and output budget");
-        out.main_frontier = f + 1 +
-                            (speculative_backend == SpeculativeBackend::None
-                                 ? 0
-                                 : std::min({tokens - 1, capacity - f - 1, draft_window}));
+        if (request.lifecycle != Lifecycle::Active || tokens != 1 || f >= capacity)
+            throw std::logic_error("decode requires one active anchor within context");
+        out.main_frontier = f + 1;
         break;
     case ExecutionUnitKind::Control:
         if (request.lifecycle != Lifecycle::Active || !tokens || tokens > capacity - f)

@@ -20,6 +20,10 @@ namespace ninfer {
 struct DeviceContext;
 }
 
+namespace ninfer::models::speculative {
+class DecodeGraphRoutes;
+}
+
 namespace ninfer::models::moe {
 struct Plan;
 }
@@ -62,6 +66,8 @@ class RankProgram;
 enum class TextPhase { Prefill, Verify };
 
 struct SessionPlan {
+    std::shared_ptr<const speculative::DecodeGraphRoutes> decode_routes;
+    ExecutionPath decode_path             = ExecutionPath::Eager;
     std::shared_ptr<const BatchExecutionPlan> batch_execution;
     std::shared_ptr<const execution::ModelProfile> profile;
     context::ContextDirectorySpec context;

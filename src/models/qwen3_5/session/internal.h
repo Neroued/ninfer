@@ -1,6 +1,7 @@
 #pragma once
 
 #include "models/qwen3_5/session/session.h"
+#include "models/common/speculative/round_plan.h"
 #include "models/qwen3_5/state/continuation.h"
 #include "models/common/context/snapshot.h"
 #include "models/common/context/prefix.h"
@@ -470,6 +471,7 @@ public:
         std::vector<std::vector<TokenId>> inputs;
         std::unique_ptr<context::ContextTransaction> preparation;
         std::unique_ptr<context::ContextTransaction> settlement;
+        std::shared_ptr<const speculative::DecodeRoundPlan> round;
         std::optional<GeneratedResult> generated;
         ExecutionSample observed_result;
         std::optional<SessionEvent> completion;

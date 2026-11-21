@@ -8,6 +8,10 @@ namespace ninfer::models::qwen {
 
 class FrontendTestAccess {
 public:
+    [[nodiscard]] static PreparedPrompt from_data(PreparedPromptData data) {
+        return PreparedPrompt(std::make_unique<PreparedPromptData>(std::move(data)));
+    }
+
     [[nodiscard]] static const PreparedPromptData& inspect(const PreparedPrompt& prompt);
 };
 

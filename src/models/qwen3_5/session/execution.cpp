@@ -116,62 +116,6 @@ std::optional<runtime::ExecutionTicket> SessionImpl::start_replay(SequenceHandle
 }
 
 std::optional<runtime::ExecutionTicket>
-SessionImpl::start_decode(std::span<const SequenceHandle> members,
-                          std::span<const runtime::RoundBudget> budgets,
-                          std::span<const std::uint8_t> constrained) {
-    if (execution) return {};
-    if (members.empty() || members.size() > max_concurrency || budgets.size() != members.size() ||
-        (!constrained.empty() && constrained.size() != members.size()))
-        throw std::invalid_argument("decode membership is invalid");
-    auto reservation = executor().try_reserve(runtime::FrameKind::Compute);
-    if (!reservation) return {};
-    try {
-        Execution pending{.kind = OperationKind::Decode};
-        pending.members.assign(members.begin(), members.end());
-        pending.preparation = std::make_unique<context::ContextTransaction>(directory);
-        DecodeWork decode;
-        decode.rows.reserve(members.size());
-        pending.bases.reserve(members.size());
-        pending.columns.reserve(members.size());
-        const auto mark = next_lane_mark();
-        for (std::size_t b = 0; b < members.size(); ++b) {
-            const auto l = lane(members[b]);
-            if (lane_marks[l] == mark) throw std::logic_error("duplicate sequence in decode");
-            lane_marks[l] = mark;
-            auto& state   = sequences[l];
-            auto& request = requests[l];
-            const auto f  = state.continuation.metadata.execution_frontier;
-            if (request.lifecycle != Lifecycle::Active || state.ledger.size() != f + 1 ||
-                !budgets[b].generated_tokens_remaining)
-                throw std::logic_error("sequence is not decode ready");
-            require_unit(l, ExecutionUnitKind::Decode, budgets[b].generated_tokens_remaining);
-            const auto k = speculative_backend == SpeculativeBackend::None
-                               ? 0U
-                               : std::min({draft_window, budgets[b].generated_tokens_remaining - 1,
-                                           capacity - f - 1});
-            pending.bases.push_back(state.continuation);
-            pending.columns.push_back(k + 1);
-            ensure_sequence_kv_mapped(state, f + k + 1,
-                                      speculative_backend == SpeculativeBackend::Mtp ? f + k
-                                      : has_backend_pool()                           ? f + k + 1
-                                                                                     : 0,
-                                      *pending.preparation);
-            decode.rows.push_back(
-                {execution_row(state),
-                 state.ledger.back(),
-                 k,
-                 budgets[b].generated_tokens_remaining,
-                 {request.sampling_host, !constrained.empty() && constrained[b]}});
-        }
-        return submit_execution(std::move(pending), std::move(*reservation),
-                                Work{.operation = std::move(decode)});
-    } catch (const std::exception& error) {
-        executor().fail(error.what());
-        throw;
-    }
-}
-
-std::optional<runtime::ExecutionTicket>
 SessionImpl::start_control(std::span<const SequenceHandle> members, std::span<const TokenId> tokens,
                            std::uint32_t stride) {
     if (execution) return {};

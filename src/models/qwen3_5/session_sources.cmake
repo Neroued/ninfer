@@ -1,8 +1,10 @@
 target_sources(ninfer_model_control PRIVATE
+  "${CMAKE_CURRENT_LIST_DIR}/work.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/session/session.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/session/request.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/session/sequence.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/session/execution.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/session/decode.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/session/commit.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/session/scoring.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/session/source.cpp"

@@ -175,7 +175,10 @@ void RankProgramImpl::initialize_forward(ComputeOperation& operation, const Forw
 void RankProgramImpl::initialize_decode(ComputeOperation& operation, const DecodeWork& work) {
     auto& frame     = resources.frame;
     operation.batch = static_cast<std::uint32_t>(work.rows.size());
-    operation.shape = work.shape;
+    const auto& route  = work.plan->route();
+    const auto extents = work.plan->verify_drafts();
+    operation.shape    = route.shape;
+    operation.width    = route.width;
     operation.dead_positions.resize(operation.batch);
     operation.rows.reserve(operation.batch);
     operation.sampling.reserve(operation.batch);
@@ -185,17 +188,16 @@ void RankProgramImpl::initialize_decode(ComputeOperation& operation, const Decod
         const auto& row = work.rows[i];
         operation.rows.push_back(row.binding);
         operation.sampling.push_back(row.sampling);
-        operation.drafts = std::max(operation.drafts, row.draft_extent);
+        operation.read_drafts_for_masks |= row.sampling.constrained && extents[i] != 0;
         bind_row(frame.host_ingress, i, row.binding);
         frame.host_ingress.anchors[i]                = row.anchor;
-        frame.host_ingress.extents[i]                = static_cast<int>(row.draft_extent);
-        frame.host_ingress.valid_columns[i]          = static_cast<int>(row.draft_extent + 1);
-        frame.host_ingress.proposal_valid_columns[i] = static_cast<int>(draft_window + 1);
-        frame.host_ingress.budgets[i]  = static_cast<int>(row.output_tokens_remaining);
+        frame.host_ingress.extents[i]                = static_cast<int>(extents[i]);
+        frame.host_ingress.valid_columns[i]          = static_cast<int>(extents[i] + 1);
+        frame.host_ingress.proposal_valid_columns[i] =
+            extents[i] ? static_cast<int>(draft_window + 1) : 0;
+        frame.host_ingress.proposal_live_rows[i] = extents[i] != 0;
         frame.host_ingress.sampling[i] = sampling_config(row.binding, row.sampling, i);
     }
-    operation.speculative = operation.drafts != 0;
-    operation.width       = operation.speculative ? draft_window + 1 : 1;
     auto host             = frame.host_decode_view(static_cast<int>(operation.width),
                                                    static_cast<int>(operation.shape.rows));
     auto* positions       = static_cast<std::int32_t*>(host.cache_positions.data);
@@ -205,19 +207,21 @@ void RankProgramImpl::initialize_decode(ComputeOperation& operation, const Decod
         for (std::uint32_t column = 0; column < operation.width; ++column) {
             const auto offset = row * operation.width + column;
             positions[offset] = static_cast<int>(work.rows[row].binding.main_frontier +
-                                                 std::min(column, work.rows[row].draft_extent));
+                                                 std::min(column, extents[row]));
             for (int axis = 0; axis < 3; ++axis)
                 rope[axis * columns + offset] =
                     positions[offset] + work.rows[row].binding.rope_delta;
         }
     }
     for (std::size_t row = 0; row < work.rows.size(); ++row) {
-        frame.host_ingress.history_skip[row] = operation.speculative ? 1 : 0;
+        frame.host_ingress.history_skip[row] =
+            work.rows[row].binding.main_frontier == 0 || extents[row] > 0;
         for (int axis = 0; axis < 3; ++axis)
             frame.host_ingress.previous_rope[axis * operation.shape.rows + row] =
                 work.rows[row].binding.tail_rope_position[axis];
     }
-    if (operation.speculative && backend == SpeculativeBackend::Mtp) prepare_mtp_draft(operation);
+    if (operation.verifies_drafts() && backend == SpeculativeBackend::Mtp)
+        prepare_mtp_draft(operation);
     if (!graphs || resources.dflash) upload_ingress();
 }
 
@@ -245,7 +249,6 @@ void RankProgramImpl::initialize_inputs(ComputeOperation& operation) {
     else if (const auto* work = std::get_if<NormalizeWork>(&operation.request.work.operation)) {
         operation.rows  = work->rows;
         operation.batch = static_cast<std::uint32_t>(work->rows.size());
-        operation.width = draft_window + 1;
         operation.shape = work->shape;
         resources.frame.bind_rows(operation.shape.rows);
         resources.frame.clear_ingress();

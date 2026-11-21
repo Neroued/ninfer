@@ -28,10 +28,11 @@ std::vector<GraphProfile> profiles_through(std::uint32_t capacity,
 }
 
 GraphInvocation invocation(GraphPhase phase, std::uint32_t batch, std::uint32_t width,
-                           GraphProfile profile, std::uint32_t capacity) {
+                           GraphProfile profile, std::uint32_t capacity,
+                           const speculative::RoundRoute* route = nullptr) {
     const auto visible = static_cast<std::uint32_t>(
         std::min<std::uint64_t>(capacity, std::uint64_t(profile.max) + width));
-    return {phase, batch, width, profile, {1, visible}};
+    return {phase, batch, width, profile, {1, visible}, route};
 }
 
 class PreparationInputs {
@@ -67,7 +68,11 @@ public:
         const auto live     = plan_.representative_owners({call.batch, call.batch}).front();
         const auto maximum  = resources_.decoder.text_kv.max_context() - 1;
         const auto frontier = std::min(maximum, std::max(1U, call.profile.min));
-        const auto extent   = std::min(frame.spec.draft_window, maximum - frontier);
+        const auto room     = maximum - frontier;
+        const auto extent =
+            resources_.dflash && room < frame.spec.draft_window
+                ? 0U
+                : std::min(call.route && frame.mtp ? call.route->mtp_steps : call.width - 1, room);
         const auto input    = frame.host_decode_view(call.width, call.batch);
         auto* positions     = static_cast<std::int32_t*>(input.cache_positions.data);
         auto* rope          = static_cast<std::int32_t*>(input.rope_positions.data);
@@ -76,15 +81,15 @@ public:
             host.live_rows[row]                     = 1;
             host.frontiers[row]                     = frontier;
             host.sampling_positions[row]            = frontier;
-            host.history_skip[row]                  = 1;
+            host.history_skip[row]                  = frontier == 0 || extent > 0;
             frame.host_commit.accepted_columns[row] = extent + 1;
             host.backend_frontiers[row]             = frame.spec.backend == SpeculativeBackend::Mtp
                                                           ? (frontier ? frontier - 1 : 0)
                                                           : frontier;
             host.extents[row]                       = extent;
             host.valid_columns[row]                 = std::min(call.width, extent + 1);
-            host.proposal_valid_columns[row]        = frame.spec.draft_window + 1;
-            host.budgets[row]                       = frame.spec.draft_window + 1;
+            host.proposal_valid_columns[row]        = extent ? frame.spec.draft_window + 1 : 0;
+            host.proposal_live_rows[row]            = extent != 0;
             host.main_table_rows[row]               = row;
             host.backend_table_rows[row]            = row;
             host.state_source_offsets[row]          = state_offsets_[row];
@@ -125,7 +130,7 @@ public:
                 for (std::uint32_t row = 0; row < stride; ++row) {
                     const auto p = std::min(maximum, (frontier ? frontier - 1 : 0) + step);
                     cache[step * stride + row] = row < live ? p : 0;
-                    valid[step * stride + row] = row < live && (step == 0 || step < extent);
+                    valid[step * stride + row] = row < live && step < extent;
                 }
                 for (std::uint32_t axis = 0; axis < 3; ++axis) {
                     for (std::uint32_t row = 0; row < live; ++row) {
@@ -229,7 +234,8 @@ std::vector<GraphProfile> draft_graph_profiles(const GraphSpec& spec) {
 }
 
 Graphs::Graphs(GraphSpec spec) : spec_(spec) {
-    if (!spec.capacity || !spec.batch_execution || spec.batch_execution->attention_owners() != 1 ||
+    if (!spec.routes || !spec.capacity || !spec.batch_execution ||
+        spec.batch_execution->attention_owners() != 1 ||
         spec.batch_execution->graph_rows().empty() || spec.draft_window > 15 ||
         (spec.backend == SpeculativeBackend::None) != (spec.draft_window == 0)) {
         throw std::invalid_argument("Qwen3.5 graph geometry is invalid");
@@ -295,9 +301,8 @@ void Graphs::prepare(Resources& resources, const execution::Parameters& paramete
     if (resources.moe) preparation.emplace(*resources.moe);
     PreparationInputs inputs(resources, device, *spec_.batch_execution);
     const auto ordinary_profiles = target_graph_profiles(spec_.capacity, 1);
-    const auto verify_profiles   = target_graph_profiles(spec_.capacity, spec_.draft_window + 1);
     const auto draft_profiles    = draft_graph_profiles(spec_);
-    for (const auto batch : spec_.batch_execution->graph_rows()) {
+    const auto prepare_batch = [&](std::uint32_t batch) {
         auto& target            = batches_[batch];
         const auto prepare_main = [&](GraphPhase phase, execution::TextGraph& graph,
                                       std::uint32_t width, const auto& profiles) {
@@ -327,15 +332,19 @@ void Graphs::prepare(Resources& resources, const execution::Parameters& paramete
             }
         };
         prepare_main(GraphPhase::Main, target.main, 1, ordinary_profiles);
-        if (spec_.draft_window) {
-            prepare_main(GraphPhase::Verify, target.verify, spec_.draft_window + 1,
-                         verify_profiles);
+        const auto routes = spec_.routes->at({batch, batch});
+        for (const auto& route : routes.subspan(1)) {
+            auto [entry, inserted] = target.verify.try_emplace(route.width);
+            if (inserted)
+                prepare_main(GraphPhase::Verify, entry->second, route.width,
+                             target_graph_profiles(spec_.capacity, route.width));
         }
         const auto prepare_segment = [&](SegmentFamily& family, GraphPhase phase,
-                                         const auto& profiles, std::uint32_t width) {
+                                         const auto& profiles, std::uint32_t width,
+                                         const speculative::RoundRoute* route = nullptr) {
             family.profiles.reserve(profiles.size());
             for (const auto profile : profiles) {
-                const auto call = invocation(phase, batch, width, profile, spec_.capacity);
+                const auto call = invocation(phase, batch, width, profile, spec_.capacity, route);
                 inputs.prepare(call);
                 resources.work.reset();
                 resources.work.reset_peak();
@@ -362,52 +371,57 @@ void Graphs::prepare(Resources& resources, const execution::Parameters& paramete
                 family.instantiate(device.execution_view());
                 for (const auto& topology : family.topologies) {
                     const auto profile = family.profiles[topology.installed].profile;
-                    inputs.prepare(invocation(phase, batch, width, profile, spec_.capacity));
+                    inputs.prepare(invocation(phase, batch, width, profile, spec_.capacity, route));
                     family.launch(profile.min, device.execution_view());
                     observation.checkpoint();
                 }
             }
         };
-        if (spec_.draft_window) {
-            prepare_segment(target.draft, GraphPhase::Draft, draft_profiles,
-                            spec_.draft_window + 1);
-        }
+        for (const auto& route : routes.subspan(1))
+            prepare_segment(target.proposals[*route.graph_entry], GraphPhase::Draft,
+                            draft_profiles, route.width, &route);
         const std::array decision_profiles{GraphProfile{0, spec_.capacity - 1, 0}};
-        prepare_segment(target.sample, GraphPhase::Sample, decision_profiles, 1);
-        if (spec_.draft_window) {
-            prepare_segment(target.accept, GraphPhase::Accept, decision_profiles,
-                            spec_.draft_window + 1);
+        prepare_segment(target.sample, GraphPhase::Sample, decision_profiles, 1, &routes.front());
+        for (const auto& route : routes.subspan(1)) {
+            auto [entry, inserted] =
+                target.accept.try_emplace(std::pair{route.width, route.head_columns});
+            if (inserted)
+                prepare_segment(entry->second, GraphPhase::Accept, decision_profiles, route.width,
+                                &route);
         }
-        if (bodies.mtp_commit && spec_.draft_window) {
-            inputs.prepare(invocation(GraphPhase::Verify, batch, spec_.draft_window + 1,
-                                      {0, spec_.capacity - 1, 0}, spec_.capacity));
-            resources.work.reset_peak();
-            if (!observation.capturing()) {
-                bodies.mtp_commit(batch, nullptr, nullptr);
+        if (bodies.mtp_commit) {
+            for (const auto width : {1U, spec_.draft_window + 1}) {
+                inputs.prepare(invocation(GraphPhase::Verify, batch, width,
+                                          {0, spec_.capacity - 1, 0}, spec_.capacity));
+                resources.work.reset_peak();
+                if (!observation.capturing()) {
+                    bodies.mtp_commit(batch, width, nullptr, nullptr);
+                    observation.checkpoint();
+                    continue;
+                }
+                auto& history = width == 1 ? target.ordinary_commit : target.verify_commit;
+                history.definition.capture(device.stream(), [&] {
+                    bodies.mtp_commit(batch, width, &history.repair, &history.counts);
+                });
+                history.executable.instantiate(history.definition);
+                history.executable.upload(device.stream());
+                history.executable.launch(device.stream());
+                workspace_peak_ = std::max(workspace_peak_, resources.work.peak_used());
                 observation.checkpoint();
-                continue;
             }
-            auto& history = target.mtp_commit;
-            history.definition.capture(device.stream(), [&] {
-                bodies.mtp_commit(batch, &history.repair, &history.counts);
-            });
-            history.executable.instantiate(history.definition);
-            history.executable.upload(device.stream());
-            history.executable.launch(device.stream());
-            workspace_peak_ = std::max(workspace_peak_, resources.work.peak_used());
-            observation.checkpoint();
         }
-    }
+    };
+    for (const auto batch : spec_.batch_execution->graph_rows()) prepare_batch(batch);
     if (resources.moe) resources.moe->restore_cache_after_preparation();
     observation.checkpoint();
     inputs.finish();
     resources.work.reset();
 }
 
-bool Graphs::start(GraphPhase phase, std::uint32_t batch, std::uint32_t frontier,
+bool Graphs::start(GraphPhase phase, const speculative::RoundRoute& route, std::uint32_t frontier,
                    std::uint32_t target_tokens, CudaExecutionView cuda) {
     if (pending_) throw std::logic_error("a Qwen3.5 graph phase is already pending");
-    const auto found = batches_.find(batch);
+    const auto found = batches_.find(route.shape.rows);
     if (found == batches_.end()) throw std::out_of_range("graph batch is unprepared");
     auto& family               = found->second;
     execution::TextGraph* text = nullptr;
@@ -416,16 +430,16 @@ bool Graphs::start(GraphPhase phase, std::uint32_t batch, std::uint32_t frontier
         text = &family.main;
         break;
     case GraphPhase::Verify:
-        text = &family.verify;
+        text = &family.verify.at(route.width);
         break;
     case GraphPhase::Draft:
-        family.draft.launch(frontier, cuda);
+        family.proposals.at(route.graph_entry.value()).launch(frontier, cuda);
         return true;
     case GraphPhase::Sample:
         family.sample.launch(frontier, cuda);
         return true;
     case GraphPhase::Accept:
-        family.accept.launch(frontier, cuda);
+        family.accept.at({route.width, route.head_columns}).launch(frontier, cuda);
         return true;
     }
     text->select(frontier);
@@ -440,6 +454,12 @@ bool Graphs::start(GraphPhase phase, std::uint32_t batch, std::uint32_t frontier
     }
 }
 
+bool Graphs::contains(const speculative::RoundRoute& route) const {
+    if (!batches_.contains(route.shape.rows)) return false;
+    const auto ready = spec_.routes->at(route.shape);
+    return std::ranges::find(ready, route) != ready.end();
+}
+
 bool Graphs::poll() {
     if (!pending_) return true;
     if (!pending_->poll()) return false;
@@ -447,9 +467,11 @@ bool Graphs::poll() {
     return true;
 }
 
-void Graphs::commit_mtp(std::uint32_t batch, bool repair, bool counts, CudaExecutionView cuda) {
+void Graphs::commit_mtp(std::uint32_t batch, std::uint32_t width, bool repair, bool counts,
+                        CudaExecutionView cuda) {
     if (pending_) throw std::logic_error("MTP history cannot precede its completed target");
-    auto& commit = batches_.at(batch).mtp_commit;
+    auto& entries = batches_.at(batch);
+    auto& commit  = width == 1 ? entries.ordinary_commit : entries.verify_commit;
     commit.repair.set_enabled(commit.executable, repair);
     commit.counts.set_enabled(commit.executable, counts);
     commit.executable.launch(cuda.stream());

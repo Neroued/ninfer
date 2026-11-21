@@ -97,6 +97,15 @@ public:
     [[nodiscard]] PagedKVCache* backend_kv() noexcept;
     [[nodiscard]] const PagedKVCache* backend_kv() const noexcept;
 
+    struct Replay {
+        GdnReplayRecords records;
+        ops::GdnReplayFoldPlan fold;
+    };
+
+    [[nodiscard]] const Replay& replay(std::uint32_t width) const {
+        return replay_widths.at(width - 2);
+    }
+
     const std::vector<RecordSpec> context_records;
     DeviceBuffer context;
     DeviceBuffer persistent;
@@ -105,13 +114,13 @@ public:
     MemoryArena work;
     DecoderState decoder;
     StateImageViews state_images;
-    std::optional<GdnReplayRecords> replay_records;
-    std::optional<ops::GdnReplayFoldPlan> replay_fold;
     std::optional<DFlashPersistentState> dflash;
     Tensor token_counts;
     std::optional<vision::Storage> vision;
     ExecutionFrame frame;
     std::unique_ptr<moe::Schedule> moe;
+private:
+    std::vector<Replay> replay_widths;
 };
 
 } // namespace ninfer::models::qwen3_5

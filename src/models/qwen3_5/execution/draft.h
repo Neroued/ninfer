@@ -53,8 +53,9 @@ void draft_append_context(DraftExecutionView, const Tensor& features, const Tens
                           const Tensor& counts, const Tensor& offsets, const Tensor& table_rows,
                           ops::KVCacheAppendPrefixExecutionEnvelope);
 
-// Produces this round's proposal for each row. ids/positions are [K+1,B], drafts [K,B].
-// DFlash2 additionally writes its sparse proposal distribution; ordinary DFlash leaves it absent.
+// Produces this round's proposal for each row. ids/positions are [K+1,B], drafts [g,B] for the
+// first 1 <= g <= K mask columns. DFlash2 additionally writes its sparse proposal distribution;
+// ordinary DFlash leaves it absent.
 void draft_propose(DraftExecutionView, const DraftInputs&, DraftOutputs&, DraftEnvelopes);
 
 } // namespace ninfer::models::qwen3_5::execution

@@ -11,9 +11,8 @@ PendingBatch SessionImpl::generated_pending(const GeneratedResult& generated) {
     if (!generated.row_stride || generated.tokens.size() != batch * generated.row_stride ||
         generated.counts.size() != batch || generated.dead_positions.size() != batch)
         throw std::logic_error("generated result has an invalid shape");
-    if (current.kind == OperationKind::Decode &&
-        (generated.draft_extents.size() != batch || generated.accepted_drafts.size() != batch))
-        throw std::logic_error("decode result omitted its proposal extents");
+    if (current.round && generated.row_stride != current.round->route().width)
+        throw std::logic_error("decode result differs from its frozen width");
     PendingBatch out;
     out.ticket_    = current.ticket;
     out.members_   = current.members;
@@ -22,7 +21,8 @@ PendingBatch SessionImpl::generated_pending(const GeneratedResult& generated) {
     out.execution_ = current.observed_result;
     for (std::size_t b = 0; b < batch; ++b) {
         const auto count = generated.counts[b];
-        if (!count || count > generated.row_stride || count > 16)
+        if (!count || count > generated.row_stride || count > 16 ||
+            (current.round && count - 1 > current.round->verify_drafts()[b]))
             throw std::logic_error("generated result has an invalid licensed prefix");
         out.counts_.push_back(static_cast<std::int32_t>(count));
         out.failed_.push_back((generated.dead_positions[b] & ((1U << count) - 1)) != 0);
@@ -294,8 +294,8 @@ CommitResult SessionImpl::commit(PendingBatch&& pending,
         auto& stats = request.speculative_stats;
         if (current.kind == OperationKind::Decode &&
             speculative_backend != SpeculativeBackend::None) {
-            const auto drafted  = current.generated->draft_extents.at(b);
-            const auto accepted = current.generated->accepted_drafts.at(b);
+            const auto drafted  = current.round->verify_drafts()[b];
+            const auto accepted = current.generated->counts[b] - 1;
             stats.committed_draft_tokens += std::min(d.accepted_tokens, accepted);
             if (drafted)
                 ++stats.rounds;

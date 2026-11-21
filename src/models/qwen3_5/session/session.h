@@ -186,7 +186,7 @@ enum class ExecutionUnitKind : std::uint8_t { Prefill, Replay, Decode, Control, 
 struct ExecutionUnit {
     SequenceHandle sequence;
     ExecutionUnitKind kind = ExecutionUnitKind::Decode;
-    // Decode: remaining output budget. Control: exact forced span. Other kinds: zero.
+    // Decode: one anchor. Control: exact forced span. Other kinds: zero.
     std::uint32_t tokens = 0;
 };
 

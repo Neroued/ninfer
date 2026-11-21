@@ -445,7 +445,7 @@ runtime::ContextMetadataPlan ContextDirectory::metadata_plan(const ContextDirect
             if (part.rank != rank) continue;
             const auto copies = kv_parts ? kv_parts : history.parts.size();
             layouts.push_back(part.record);
-            costs.push_back(share(PageDirectory::metadata_bytes(1, copies) - sizeof(PageDirectory) +
+            costs.push_back(share(PageDirectory::descriptor_bytes(copies) +
                                       HistoryDirectory::page_metadata_bytes(),
                                   copies));
         }
@@ -474,8 +474,8 @@ runtime::ContextMetadataPlan ContextDirectory::metadata_plan(const ContextDirect
         spec.pools.size() *
         (PageDirectory::metadata_bytes(255, kv_parts ? kv_parts : spec.ranks.size()) -
          sizeof(PageDirectory));
-    result.bytes_per_block +=
-        (geometry.record_limit(geometry.block_bytes) + 255) / 256 * sizeof(void*);
+    result.bytes_per_block += (geometry.record_limit(geometry.block_bytes) + 255) / 256 *
+                              (sizeof(void*) + ReclaimableSlots<std::byte>::segment_entry_bytes());
     return result;
 }
 
@@ -501,7 +501,15 @@ std::vector<RecordDemand> ContextDirectory::record_demand(const ContextDemand& d
 
 ContextAssessment ContextDirectory::assess(const ContextDemand& demand,
                                            const ContextReleaseSet& released) const {
-    ContextAssessment result{demand};
+    return assess_impl(demand, released, nullptr);
+}
+
+ContextAssessment ContextDirectory::assess_impl(const ContextDemand& demand,
+                                                const ContextReleaseSet& released,
+                                                OptionalAdmissionWork* immediate,
+                                                ProtectedMetadataSegments* pins) const {
+    ContextAssessment result;
+    if (!immediate) result.demand = demand;
     if (failed_) {
         result.status = ContextAvailability::Impossible;
         return result;
@@ -516,8 +524,13 @@ ContextAssessment ContextDirectory::assess(const ContextDemand& demand,
     }
     const auto requests = record_demand(demand);
     const auto releases = normalized_releases(released.records);
-    result.placement    = records_.assess(requests, releases);
-    result.status       = ContextAvailability::Ready;
+    result.placement = immediate ? records_.assess_immediate(requests, immediate->physical_classes)
+                                 : records_.assess(requests, releases);
+    if (immediate && !result.placement.ready()) {
+        result.status = ContextAvailability::NeedsReclaim;
+        return result;
+    }
+    result.status = ContextAvailability::Ready;
     for (const auto& domain : result.placement.domains) {
         if (domain.minimum_bytes > records_.pool(domain.domain).capacity_bytes()) {
             result.status = ContextAvailability::Impossible;
@@ -544,7 +557,7 @@ ContextAssessment ContextDirectory::assess(const ContextDemand& demand,
         result.status            = ContextAvailability::NeedsReclaim;
         return result;
     }
-    result.metadata_required_bytes = states_.metadata_requirement(state_count) +
+    result.metadata_required_bytes = states_.metadata_requirement(state_count, pins) +
                                      page_allocations_.metadata_requirement(requests);
     const auto& page_counts = metadata.pages;
     for (std::size_t i = 0; i < page_counts.size(); ++i) {
@@ -566,9 +579,9 @@ ContextAssessment ContextDirectory::assess(const ContextDemand& demand,
             if (const auto* history = std::get_if<HistoryDemand>(&item);
                 history && history->pool_id == i && history->logical_pages)
                 parts = std::max(parts, page_parts(*history, pages));
-        result.metadata_required_bytes += pages.metadata_requirement(count, parts);
+        result.metadata_required_bytes += pages.metadata_requirement(count, parts, pins);
         const auto bytes = pools_[i]->histories().metadata_requirement(metadata.histories[i],
-                                                                       released_histories[i]);
+                                                                       released_histories[i], pins);
         if (!bytes) {
             result.metadata_shortage = true;
             result.status            = ContextAvailability::NeedsReclaim;
@@ -584,6 +597,11 @@ ContextAssessment ContextDirectory::assess(const ContextDemand& demand,
             catalog_bytes += value.catalog->released_metadata(released.catalog);
         }
     if (result.metadata_required_bytes > metadata_.available() + catalog_bytes) {
+        if (immediate) {
+            result.status           = ContextAvailability::NeedsReclaim;
+            result.reclaim_metadata = true;
+            return result;
+        }
         std::size_t reclaimable =
             logical_states == 0 ? states_.reclaimable_metadata(released_states) : 0;
         for (std::size_t i = 0; i < pools_.size(); ++i) {
@@ -632,47 +650,70 @@ ContextReserveResult ContextDirectory::reserve(const ContextDemand& demand) {
         result.assessment = assess(demand);
         if (!result.assessment.feasible()) return result;
     }
-    std::vector<MetadataReservation> descriptors;
-    std::vector<MetadataReservation> controls;
-    descriptors.reserve(demand.items.size());
-    controls.reserve(demand.items.size());
-    page_allocations_.prepare(record_demand(demand));
-    for (const auto& item : demand.items) {
-        if (const auto* state = std::get_if<StateDemand>(&item)) {
-            descriptors.push_back(states_.reserve_descriptors(logical_states(*state)));
-            controls.emplace_back();
-        } else {
-            const auto& history = std::get<HistoryDemand>(item);
-            auto& owner         = pool(history.pool_id);
-            descriptors.push_back(owner.pages().reserve_descriptors(
-                history.logical_pages, page_parts(history, owner.pages())));
-            controls.push_back(history.metadata
-                                   ? owner.histories().reserve_control(*history.metadata)
-                                   : MetadataReservation{});
+    result.reservation = reserve_assessed(demand);
+    if (!result.reservation) result.assessment = assess(demand);
+    return result;
+}
+
+std::optional<ContextReservation>
+ContextDirectory::try_reserve_optional(const ContextDemand& demand, OptionalAdmissionWork* work) {
+    OptionalAdmissionWork local;
+    auto& examined = work ? *work : local;
+    examined       = {};
+    auto quote     = assess_impl(demand, {}, &examined);
+    if (!quote.ready()) {
+        if (!quote.reclaim_metadata) return std::nullopt;
+        // Protect the exact free slots priced by this quote. Empty segments from the same
+        // directory can donate capacity without making the granted layout buy them back.
+        ProtectedMetadataSegments pins;
+        quote = assess_impl(demand, {}, &examined, &pins);
+        pins.finish();
+        const auto deficit = quote.metadata_required_bytes - metadata_.available();
+        auto reclaimed     = states_.return_empty_segments(deficit, &pins);
+        for (auto& pool : pools_) {
+            if (reclaimed.bytes >= deficit) break;
+            reclaimed.add(pool->pages().return_empty_segments(deficit - reclaimed.bytes, &pins));
+            if (reclaimed.bytes >= deficit) break;
+            reclaimed.add(
+                pool->histories().return_empty_segments(deficit - reclaimed.bytes, &pins));
         }
+        examined.metadata = reclaimed;
+        if (metadata_.available() < quote.metadata_required_bytes) return std::nullopt;
     }
-    auto reserved = records_.reserve(record_demand(demand));
-    if (!reserved.reservations) {
-        descriptors.clear();
-        controls.clear();
-        result.assessment = assess(demand);
-        return result;
-    }
+    try {
+        return reserve_assessed(demand, &examined);
+    } catch (const MetadataExhausted&) { return std::nullopt; }
+}
+
+std::optional<ContextReservation>
+ContextDirectory::reserve_assessed(const ContextDemand& demand, OptionalAdmissionWork* immediate) {
+    const auto requests = record_demand(demand);
+    page_allocations_.prepare(requests);
+    auto physical = immediate ? records_.reserve_immediate(requests, immediate->physical_classes)
+                              : records_.reserve(requests);
+    if (!physical.reservations) return std::nullopt;
+    // All rights, including the unadopted history control storage, belong to this bundle.
+    // Any later failure destroys the already prepared items and unused per-rank reservations.
     ContextReservation reservation;
     reservation.items_.reserve(demand.items.size());
     std::size_t record_index = 0;
-    for (std::size_t i = 0; i < demand.items.size(); ++i) {
-        const auto* history = std::get_if<HistoryDemand>(&demand.items[i]);
-        const auto count    = history ? history->records.size() : 1;
+    for (const auto& item : demand.items) {
         RecordReservation records;
-        for (std::size_t j = 0; j < count; ++j)
-            records.merge(std::move(reserved.reservations->at(record_index++)));
-        records.attach_metadata(std::move(descriptors[i]));
-        if (controls[i].remaining()) records.attach_metadata(std::move(controls[i]));
+        if (const auto* state = std::get_if<StateDemand>(&item)) {
+            records = std::move(physical.reservations->at(record_index++));
+            records.attach_metadata(states_.reserve_descriptors(logical_states(*state)));
+        } else {
+            const auto& history = std::get<HistoryDemand>(item);
+            auto& owner         = pool(history.pool_id);
+            for (std::size_t j = 0; j < history.records.size(); ++j)
+                records.merge(std::move(physical.reservations->at(record_index++)));
+            records.attach_metadata(owner.pages().reserve_descriptors(
+                history.logical_pages, page_parts(history, owner.pages())));
+            if (history.metadata) owner.histories().reserve_control(*history.metadata, records);
+        }
         reservation.items_.emplace_back(std::move(records));
     }
-    result.reservation.emplace(std::move(reservation));
-    return result;
+    return reservation;
 }
 
 std::size_t ContextDirectory::released_bytes(const ContextReleaseSet& release) const {

@@ -172,7 +172,10 @@ public:
     [[nodiscard]] static std::size_t object_metadata_bytes(std::size_t parts);
     [[nodiscard]] std::size_t allocated_metadata_bytes() const;
     [[nodiscard]] bool reserve_metadata(std::uint32_t count);
-    [[nodiscard]] std::size_t metadata_requirement(std::uint32_t count) const;
+    [[nodiscard]] std::size_t metadata_requirement(std::uint32_t count,
+                                                   ProtectedMetadataSegments* pins = nullptr) const;
+    MetadataReclaim return_empty_segments(std::size_t needed,
+                                          const ProtectedMetadataSegments* keep = nullptr) noexcept;
     [[nodiscard]] std::uint32_t available_descriptors() const noexcept;
     [[nodiscard]] MetadataReservation reserve_descriptors(std::uint32_t count);
     void release_metadata(std::span<const std::uint32_t> ids) noexcept override;
@@ -316,7 +319,7 @@ private:
     MetadataAccount metadata_account_;
     MetadataBudget* metadata_budget_;
     std::size_t max_parts_ = 0;
-    DirectorySlots<Object> objects_;
+    ReclaimableSlots<Object> objects_;
     std::uint32_t initialized_objects_ = 0;
 
     std::vector<std::uint32_t> free_objects_;

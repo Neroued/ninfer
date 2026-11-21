@@ -140,6 +140,11 @@ private:
     friend class ContextDirectory;
 };
 
+struct OptionalAdmissionWork {
+    std::size_t physical_classes = 0;
+    MetadataReclaim metadata;
+};
+
 struct ContextReserveResult {
     ContextAssessment assessment;
     std::optional<ContextReservation> reservation;
@@ -208,6 +213,8 @@ public:
     [[nodiscard]] ContextAssessment assess(const ContextDemand&,
                                            const ContextReleaseSet& = {}) const;
     [[nodiscard]] ContextReserveResult reserve(const ContextDemand&);
+    [[nodiscard]] std::optional<ContextReservation>
+    try_reserve_optional(const ContextDemand&, OptionalAdmissionWork* work = nullptr);
     [[nodiscard]] std::size_t released_bytes(const ContextReleaseSet&) const;
     [[nodiscard]] std::vector<std::uint64_t> release_limits(const ContextAssessment&) const;
     [[nodiscard]] runtime::ContextReleaseMeasure release_measure(const ContextReleaseSet&,
@@ -237,6 +244,11 @@ public:
     [[nodiscard]] ContextUsage usage() const;
 
 private:
+    ContextAssessment assess_impl(const ContextDemand&, const ContextReleaseSet&,
+                                  OptionalAdmissionWork*,
+                                  ProtectedMetadataSegments* = nullptr) const;
+    std::optional<ContextReservation> reserve_assessed(const ContextDemand&,
+                                                       OptionalAdmissionWork* = nullptr);
     [[nodiscard]] std::vector<RecordDemand> record_demand(const ContextDemand&) const;
     ContextDirectorySpec spec_;
     std::size_t core_metadata_budget_ = 0;

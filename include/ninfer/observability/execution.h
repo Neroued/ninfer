@@ -4,6 +4,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -16,11 +17,21 @@ enum class ExecutionPath : std::uint8_t { Eager, Graph, Mixed };
 
 enum class ExecutionStage : std::uint8_t { Submitted, Decision, ResultReady, Retiring, Discarding };
 
+struct SpeculativeExecutionGeometry {
+    std::uint32_t physical_rows = 0, owner_rows = 0, verify_width = 0;
+    std::uint32_t mtp_steps = 0, head_columns = 0;
+    std::uint64_t valid_target_tokens = 0;
+    ExecutionPath path                = ExecutionPath::Eager;
+    std::optional<std::uint32_t> graph_entry;
+    std::vector<std::uint64_t> owner_target_tokens;
+};
+
 struct ExecutionWork {
     ExecutionKind kind                = ExecutionKind::Context;
     std::uint32_t rows                = 0;
     std::uint64_t input_tokens        = 0;
     std::uint64_t scheduled_positions = 0;
+    std::shared_ptr<const SpeculativeExecutionGeometry> speculative = {};
 };
 
 struct ExecutionProgress {

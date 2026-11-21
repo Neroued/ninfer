@@ -7,6 +7,7 @@
 #include <memory>
 #include <stdexcept>
 #include <span>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -347,10 +348,54 @@ private:
     std::vector<std::uint32_t> ids_;
 };
 
+// Only the shortage path collects segments the quote expects to reuse. Pricing never
+// changes the directory's occupancy or the order of its free lists.
+class ProtectedMetadataSegments {
+public:
+    void add(const void* directory, std::uint32_t segment) {
+        const Key key{reinterpret_cast<std::uintptr_t>(directory), segment};
+        if (entries_.empty() || entries_.back() != key) entries_.push_back(key);
+    }
+
+    void finish() {
+        std::sort(entries_.begin(), entries_.end());
+        entries_.erase(std::unique(entries_.begin(), entries_.end()), entries_.end());
+    }
+
+    [[nodiscard]] bool contains(const void* directory, std::uint32_t segment) const noexcept {
+        return std::binary_search(entries_.begin(), entries_.end(),
+                                  Key{reinterpret_cast<std::uintptr_t>(directory), segment});
+    }
+private:
+    using Key = std::pair<std::uintptr_t, std::uint32_t>;
+    std::vector<Key> entries_;
+};
+
+struct MetadataReclaim {
+    std::size_t bytes    = 0;
+    std::size_t segments = 0, examined = 0;
+
+    void add(MetadataReclaim other) noexcept {
+        bytes += other.bytes;
+        segments += other.segments;
+        examined += other.examined;
+    }
+};
+
 // Stable indices and addresses. Payload segments are materialized during admission, within the
 // shared metadata budget; publication never grows this store.
-template <class T, std::uint32_t SegmentSize = 256>
+template <class T, std::uint32_t SegmentSize = 256, bool TrackOccupancy = false>
 class DirectorySlots {
+    struct Untracked {};
+
+    struct Links {
+        std::uint32_t occupied = 0, prev = UINT32_MAX, next = UINT32_MAX;
+    };
+
+    struct Segment {
+        std::unique_ptr<T[]> data;
+        [[no_unique_address]] std::conditional_t<TrackOccupancy, Links, Untracked> links;
+    };
 public:
     DirectorySlots(std::uint32_t limit, MetadataBudget& budget) : limit_(limit), budget_(&budget) {}
 
@@ -364,7 +409,7 @@ public:
     [[nodiscard]] std::uint32_t size() const noexcept { return size_; }
 
     [[nodiscard]] std::size_t storage_bytes() const noexcept {
-        return payload_bytes_ + segments_.capacity() * sizeof(std::unique_ptr<T[]>);
+        return payload_bytes_ + segments_.capacity() * sizeof(Segment);
     }
 
     [[nodiscard]] std::size_t growth_bytes(std::uint32_t minimum_size) const {
@@ -373,7 +418,7 @@ public:
         const auto segments = (std::uint64_t(minimum_size) + SegmentSize - 1) / SegmentSize;
         const auto target   = std::min<std::uint64_t>(limit_, segments * SegmentSize);
         return (target - size_) * sizeof(T) +
-               (segments > segments_.capacity() ? segments : 0) * sizeof(std::unique_ptr<T[]>);
+               (segments > segments_.capacity() ? segments : 0) * sizeof(Segment);
     }
 
     [[nodiscard]] std::size_t ensure_bytes(std::uint32_t index) const {
@@ -387,8 +432,8 @@ public:
         if (minimum_size > limit_) throw std::runtime_error("Context metadata budget exhausted");
         const auto segments = (std::uint64_t(minimum_size) + SegmentSize - 1) / SegmentSize;
         if (segments > segments_.capacity()) {
-            const auto before = segments_.capacity() * sizeof(std::unique_ptr<T[]>);
-            const auto bytes  = segments * sizeof(std::unique_ptr<T[]>);
+            const auto before = segments_.capacity() * sizeof(Segment);
+            const auto bytes  = segments * sizeof(Segment);
             budget_->acquire(bytes);
             try {
                 segments_.reserve(segments);
@@ -403,7 +448,8 @@ public:
             const auto bytes = std::size_t(count) * sizeof(T);
             budget_->acquire(bytes);
             try {
-                segments_.push_back(std::make_unique<T[]>(count));
+                segments_.push_back({std::make_unique<T[]>(count), {}});
+                if constexpr (TrackOccupancy) link(size_ / SegmentSize, empty_);
             } catch (...) {
                 budget_->release(bytes);
                 throw;
@@ -414,7 +460,7 @@ public:
     }
 
     [[nodiscard]] bool is_allocated(std::uint32_t index) const noexcept {
-        return index < size_ && segments_[index / SegmentSize] != nullptr;
+        return index < size_ && segments_[index / SegmentSize].data != nullptr;
     }
 
     void ensure(std::uint32_t index) {
@@ -423,36 +469,136 @@ public:
             return;
         }
         auto& segment = segments_[index / SegmentSize];
-        if (segment) return;
+        if (segment.data) return;
         const auto count = std::min(SegmentSize, limit_ - index / SegmentSize * SegmentSize);
         const auto bytes = std::size_t(count) * sizeof(T);
         budget_->acquire(bytes);
         try {
-            segment = std::make_unique<T[]>(count);
+            segment.data = std::make_unique<T[]>(count);
         } catch (...) {
             budget_->release(bytes);
             throw;
         }
+        if constexpr (TrackOccupancy) {
+            unlink(index / SegmentSize, missing_);
+            link(index / SegmentSize, empty_);
+        }
         payload_bytes_ += bytes;
+    }
+
+    static constexpr std::size_t segment_entry_bytes() noexcept { return sizeof(Segment); }
+
+    [[nodiscard]] bool idle(std::uint32_t index) const noexcept
+        requires(TrackOccupancy)
+    {
+        return is_allocated(index) && !segments_[index / SegmentSize].links.occupied;
+    }
+
+    void occupy(std::uint32_t index) noexcept
+        requires(TrackOccupancy)
+    {
+        const auto s = index / SegmentSize;
+        if (segments_[s].links.occupied++ == 0) unlink(s, empty_);
+    }
+
+    void vacate(std::uint32_t index) noexcept
+        requires(TrackOccupancy)
+    {
+        const auto s = index / SegmentSize;
+        if (!segments_[s].links.occupied) std::terminate();
+        if (!--segments_[s].links.occupied) link(s, empty_);
+    }
+
+    void protect(std::uint32_t index, ProtectedMetadataSegments* pins) const
+        requires(TrackOccupancy)
+    {
+        if (pins && idle(index)) pins->add(this, index / SegmentSize);
+    }
+
+    template <class ReleaseTail>
+    MetadataReclaim reclaim(std::size_t needed, const ProtectedMetadataSegments* keep,
+                            ReleaseTail release_tail) noexcept
+        requires(TrackOccupancy)
+    {
+        MetadataReclaim result;
+        for (auto s = empty_; s != UINT32_MAX && result.bytes < needed;) {
+            const auto next = segments_[s].links.next;
+            ++result.examined;
+            if (!keep || !keep->contains(this, s)) {
+                const auto before = budget_->available();
+                const auto first  = s * SegmentSize;
+                const auto count  = std::min(SegmentSize, size_ - first);
+                for (std::uint32_t i = 0; i < count; ++i) release_tail((*this)[first + i]);
+                release_segment(first);
+                result.bytes += budget_->available() - before;
+                ++result.segments;
+            }
+            s = next;
+        }
+        return result;
+    }
+
+    // Count only idle segments and segments explicitly named by projected releases.
+    template <class TailBytes>
+    [[nodiscard]] std::size_t reclaimable_bytes(std::vector<std::uint32_t> released,
+                                                TailBytes tail_bytes) const
+        requires(TrackOccupancy)
+    {
+        const auto bytes = [&](std::uint32_t s) {
+            const auto first  = s * SegmentSize;
+            const auto count  = std::min(SegmentSize, size_ - first);
+            std::size_t total = count * sizeof(T);
+            for (std::uint32_t i = 0; i < count; ++i) total += tail_bytes((*this)[first + i]);
+            return total;
+        };
+        std::size_t total = 0;
+        for (auto s = empty_; s != UINT32_MAX; s = segments_[s].links.next) total += bytes(s);
+        std::sort(released.begin(), released.end());
+        released.erase(std::unique(released.begin(), released.end()), released.end());
+        for (std::size_t i = 0; i < released.size();) {
+            const auto s     = released[i] / SegmentSize;
+            const auto begin = i++;
+            while (i < released.size() && released[i] / SegmentSize == s) ++i;
+            if (segments_[s].links.occupied == i - begin) total += bytes(s);
+        }
+        return total;
+    }
+
+    [[nodiscard]] std::uint32_t first_missing() const noexcept
+        requires(TrackOccupancy)
+    {
+        return missing_ == UINT32_MAX ? size_ : missing_ * SegmentSize;
+    }
+
+    [[nodiscard]] std::uint32_t next_missing(std::uint32_t first) const noexcept
+        requires(TrackOccupancy)
+    {
+        const auto next = segments_[first / SegmentSize].links.next;
+        return next == UINT32_MAX ? size_ : next * SegmentSize;
     }
 
     void release_segment(std::uint32_t first_index) noexcept {
         if (first_index % SegmentSize || first_index >= size_) std::terminate();
         auto& segment = segments_[first_index / SegmentSize];
-        if (!segment) return;
+        if (!segment.data) return;
         const auto count = std::min(SegmentSize, limit_ - first_index);
         const auto bytes = std::size_t(count) * sizeof(T);
-        segment.reset();
+        if constexpr (TrackOccupancy) {
+            if (!idle(first_index)) std::terminate();
+            unlink(first_index / SegmentSize, empty_);
+            link(first_index / SegmentSize, missing_);
+        }
+        segment.data.reset();
         payload_bytes_ -= bytes;
         budget_->release(bytes);
     }
 
     [[nodiscard]] T& operator[](std::uint32_t index) noexcept {
-        return segments_[index / SegmentSize][index % SegmentSize];
+        return segments_[index / SegmentSize].data[index % SegmentSize];
     }
 
     [[nodiscard]] const T& operator[](std::uint32_t index) const noexcept {
-        return segments_[index / SegmentSize][index % SegmentSize];
+        return segments_[index / SegmentSize].data[index % SegmentSize];
     }
 
 private:
@@ -460,7 +606,32 @@ private:
     std::uint32_t size_        = 0;
     std::size_t payload_bytes_ = 0;
     MetadataBudget* budget_;
-    std::vector<std::unique_ptr<T[]>> segments_;
+    std::vector<Segment> segments_;
+    std::uint32_t empty_ = UINT32_MAX, missing_ = UINT32_MAX;
+
+    void link(std::uint32_t index, std::uint32_t& head) noexcept
+        requires(TrackOccupancy)
+    {
+        auto& node = segments_[index].links;
+        node.prev  = UINT32_MAX;
+        node.next  = head;
+        if (head != UINT32_MAX) segments_[head].links.prev = index;
+        head = index;
+    }
+
+    void unlink(std::uint32_t index, std::uint32_t& head) noexcept
+        requires(TrackOccupancy)
+    {
+        const auto& node = segments_[index].links;
+        if (node.prev == UINT32_MAX)
+            head = node.next;
+        else
+            segments_[node.prev].links.next = node.next;
+        if (node.next != UINT32_MAX) segments_[node.next].links.prev = node.prev;
+    }
 };
+
+template <class T>
+using ReclaimableSlots = DirectorySlots<T, 256, true>;
 
 } // namespace ninfer::models::context

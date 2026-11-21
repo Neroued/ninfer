@@ -224,10 +224,13 @@ public:
     void release_metadata(std::span<const std::uint32_t>) noexcept override;
     [[nodiscard]] std::size_t reclaimable_metadata(std::span<const HistoryId> released = {}) const;
     void reclaim_metadata() noexcept;
+    MetadataReclaim return_empty_segments(std::size_t needed,
+                                          const ProtectedMetadataSegments* keep = nullptr) noexcept;
     [[nodiscard]] std::optional<std::size_t>
     metadata_requirement(std::span<const HistoryMetadataDemand>,
-                         std::span<const HistoryId> released = {}) const;
-    [[nodiscard]] MetadataReservation reserve_control(const HistoryMetadataDemand&);
+                         std::span<const HistoryId> released = {},
+                         ProtectedMetadataSegments* pins     = nullptr) const;
+    void reserve_control(const HistoryMetadataDemand&, RecordReservation&);
     [[nodiscard]] HistoryPrefix retain_prefix(HistoryId history, std::uint32_t frontier);
     [[nodiscard]] bool valid(HistoryId history) const noexcept;
     [[nodiscard]] bool valid(TableRow row) const noexcept;
@@ -353,7 +356,12 @@ private:
 
     struct Chunk {
         std::array<LocalPage, kChunkPages> pages{};
-        HistoryDirectory* owner  = nullptr;
+        HistoryDirectory* owner = nullptr;
+
+        union {
+            std::uint32_t free_position = UINT32_MAX; // index in free_chunks_ while free
+            std::uint32_t next_granted;               // next private chunk in an outstanding grant
+        };
         std::uint32_t references = 0;
         std::uint32_t index      = 0;
         bool reserved            = false;
@@ -416,14 +424,17 @@ private:
     std::uint32_t page_capacity_;
     std::vector<std::uint32_t> row_generations_;
     std::vector<bool> row_active_;
-    DirectorySlots<Chunk> chunks_;
+    ReclaimableSlots<Chunk> chunks_;
     std::vector<Chunk*> free_chunks_;
-    DirectorySlots<History> histories_;
+    ReclaimableSlots<History> histories_;
     std::uint32_t initialized_     = 0;
     std::uint32_t occupied_        = 0;
     std::uint32_t next_generation_ = 1;
-    void reserve_chunks(History&, std::size_t count);
-    void reserve_branch(History&);
+    friend class HistoryControl;
+    void prepare_free_chunks(std::size_t count);
+    void add_free_chunk(Chunk*) noexcept;
+    void remove_free_chunk(Chunk*) noexcept;
+    void return_chunk(Chunk*) noexcept;
     void release_spares(History&) noexcept;
     void trim_prepared_metadata(History&, std::uint32_t records) noexcept;
     [[nodiscard]] ChunkRef allocate_chunk(History&, const Chunk* source = nullptr);
@@ -449,4 +460,29 @@ private:
     friend class RowLease;
 };
 
+// An issued grant owns its writer metadata until binding or adoption. Dropping it returns
+// the new chunk/branch claims, including after the physical record bundle has been taken.
+class HistoryControl {
+public:
+    ~HistoryControl();
+    HistoryControl(const HistoryControl&)            = delete;
+    HistoryControl& operator=(const HistoryControl&) = delete;
+private:
+    friend class HistoryDirectory;
+    friend class RecordReservation;
+
+    explicit HistoryControl(HistoryDirectory& store) : store_(&store) {}
+
+    void publish(HistoryDirectory&, std::uint32_t index);
+    HistoryDirectory* store_;
+    std::uint32_t index_ = 0;
+    HistoryId writer_;
+    MetadataReservation branch_;
+    std::uint32_t first_spare_  = UINT32_MAX;
+    std::size_t desired_spares_ = 0, held_spares_ = 0;
+    void shrink_growth(std::uint32_t count);
+    std::vector<HistoryDirectory::ChunkRef> directory_, branch_directory_;
+    std::vector<HistoryDirectory::Chunk*> spares_;
+    std::vector<HistoryDirectory::PrefixReferences> prefixes_;
+};
 } // namespace ninfer::models::context

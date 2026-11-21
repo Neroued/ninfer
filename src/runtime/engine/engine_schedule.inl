@@ -914,11 +914,8 @@ EngineCore<Instance>::execution_unit(const Request& request) const {
                                         : UnitKind::Prefill,
             request.is_control_ready()
                 ? static_cast<std::uint32_t>(request.output.pending_control_tokens().size())
-            : request.is_decode_ready()
-                ? (request.recovery_pending
-                       ? 1U
-                       : request.output.model_token_budget_remaining(request.budget->remaining()))
-                : 0U};
+            : request.is_decode_ready() ? 1U
+                                        : 0U};
 }
 
 template <class Instance>

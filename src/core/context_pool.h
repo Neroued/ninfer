@@ -187,7 +187,12 @@ public:
 
     [[nodiscard]] PoolAssessment assess(std::span<const RecordRequest> demand,
                                         std::span<const AllocationId> releases = {}) const;
+    // Current class/free-block counters only. No relocation or retirement plan is constructed.
+    [[nodiscard]] PoolAssessment assess_immediate(std::span<const RecordRequest>,
+                                                  std::size_t& examined_classes) const;
     [[nodiscard]] PoolReserveResult reserve(std::span<const RecordRequest> demand);
+    [[nodiscard]] PoolReserveResult reserve_immediate(std::span<const RecordRequest> demand,
+                                                      std::size_t& examined_classes);
     // On failure the original reservation is unchanged. On success it is replaced atomically.
     [[nodiscard]] PoolAssessment resize(PoolReservation& reservation,
                                         std::span<const RecordRequest> demand);
@@ -214,6 +219,7 @@ public:
     void abandon_maintenance_after_failure();
 
 private:
+    PoolReserveResult reserve_impl(std::span<const RecordRequest>, std::size_t* immediate_classes);
     friend class PoolReservation;
     friend struct ContextPoolGeometry;
     struct Impl;

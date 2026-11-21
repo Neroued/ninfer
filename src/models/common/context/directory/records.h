@@ -129,7 +129,7 @@ struct RecordAssessment {
 // control object does not release positions to the public pool.
 class RecordReservation {
 public:
-    RecordReservation() noexcept = default;
+    RecordReservation() noexcept;
     ~RecordReservation();
     RecordReservation(RecordReservation&&) noexcept;
     RecordReservation& operator=(RecordReservation&&) noexcept;
@@ -170,6 +170,9 @@ private:
         std::uint32_t count = 0;
     };
 
+    friend class HistoryDirectory;
+    void merge_prepared(RecordReservation&&) noexcept;
+    std::unique_ptr<class HistoryControl> control_;
     std::vector<MetadataReservation> metadata_;
     std::vector<Claim> claims_;
     std::vector<std::uint32_t> ranks_;
@@ -201,12 +204,19 @@ public:
     [[nodiscard]] const RecordUsage& usage(ContextDomainId, std::uint32_t layout) const;
     [[nodiscard]] RecordAssessment assess(std::span<const RecordDemand>,
                                           std::span<const RecordRelease> = {}) const;
+    [[nodiscard]] RecordAssessment assess_immediate(std::span<const RecordDemand>,
+                                                    std::size_t& examined_classes) const;
     [[nodiscard]] RecordReserveResult reserve(std::span<const RecordDemand>);
+    [[nodiscard]] RecordReserveResult reserve_immediate(std::span<const RecordDemand>,
+                                                        std::size_t& examined_classes);
     [[nodiscard]] std::optional<RecordReservation> reserve(const RecordDemand&);
     void prepare_returns(RecordReservation&, const RecordDemand&);
     [[nodiscard]] std::size_t metadata_bytes() const;
 
 private:
+    RecordReserveResult reserve_impl(std::span<const RecordDemand>, std::size_t* immediate_classes);
+    RecordAssessment assess_impl(std::span<const RecordDemand>, std::span<const RecordRelease>,
+                                 std::size_t* immediate_classes) const;
     struct Domain;
     std::vector<ContextRankSpec> ranks_;
     std::vector<ContextRecordLayout> layouts_;

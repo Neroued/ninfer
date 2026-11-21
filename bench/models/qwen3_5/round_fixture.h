@@ -94,7 +94,7 @@ public:
         std::vector<runtime::CommitDecision> decisions(batch);
         for (std::size_t row = 0; row < batch; ++row) {
             budgets[row] = {draft_tokens + 1};
-            units[row]   = {sequences[row], model::ExecutionUnitKind::Decode, draft_tokens + 1};
+            units[row]   = {sequences[row], model::ExecutionUnitKind::Decode, 1};
         }
         // Capacity policy is outside the complete execution interval.
         if (!session.reserve_units({units.data(), batch})) {

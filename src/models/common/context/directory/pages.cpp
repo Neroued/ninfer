@@ -40,7 +40,7 @@ std::size_t PageAllocationIndex::extent(const Domain& domain,
                         [&](const auto& part) { return part.rank == domain.id.rank; }))
             count += request.count;
     }
-    return domain.pool->allocation_extent(count);
+    return count ? domain.pool->allocation_extent(count) : 0;
 }
 
 std::size_t
@@ -297,20 +297,23 @@ std::uint32_t PageDirectory::capacity() const noexcept { return pages_.limit(); 
 std::uint32_t PageDirectory::occupied() const noexcept { return occupied_; }
 
 std::size_t PageDirectory::metadata_bytes(std::uint32_t logical, std::uint32_t ranks) {
-    return sizeof(PageDirectory) +
-           std::size_t(logical) * (sizeof(Page) + sizeof(std::uint32_t) + ranks * sizeof(Part));
+    return sizeof(PageDirectory) + std::size_t(logical) * descriptor_bytes(ranks) +
+           ((std::size_t(logical) + 255) / 256) * ReclaimableSlots<Page>::segment_entry_bytes();
 }
 
-std::size_t PageDirectory::metadata_requirement(std::uint32_t count,
-                                                std::uint32_t part_count) const {
+std::size_t PageDirectory::descriptor_bytes(std::uint32_t ranks) {
+    return sizeof(Page) + sizeof(std::uint32_t) + ranks * sizeof(Part);
+}
+
+std::size_t PageDirectory::metadata_requirement(std::uint32_t count, std::uint32_t part_count,
+                                                ProtectedMetadataSegments* pins) const {
     if (!count) return 0;
     if (count > available_descriptors())
         throw std::runtime_error("Logical KV page metadata exhausted");
     const auto needed =
         std::uint64_t(initialized_) + (count > free_count_ ? count - free_count_ : 0);
-    const auto target = count > free_count_
-                            ? std::min<std::uint64_t>(pages_.limit(), (needed + 255) / 256 * 256)
-                            : pages_.size();
+    const auto target = std::max<std::uint64_t>(pages_.size(),
+        std::min<std::uint64_t>(pages_.limit(), (needed + 255) / 256 * 256));
     const auto free_bytes =
         target > free_.capacity() ? (target - free_.capacity()) * sizeof(std::uint32_t) : 0;
     std::size_t payload      = pages_.growth_bytes(needed);
@@ -319,6 +322,7 @@ std::size_t PageDirectory::metadata_requirement(std::uint32_t count,
     const auto free_after = free_count_ + target - initialized_;
     for (auto i = free_after - count; i < free_after; ++i) {
         const auto index = i < free_count_ ? free_[i] : initialized_ + i - free_count_;
+        pages_.protect(index, pins);
         if (index < pages_.size() && !pages_.is_allocated(index) &&
             std::find(holes.begin(), holes.end(), index / 256) == holes.end()) {
             holes.push_back(index / 256);
@@ -326,7 +330,10 @@ std::size_t PageDirectory::metadata_requirement(std::uint32_t count,
         }
         const bool allocated = pages_.is_allocated(index);
         const auto parts     = allocated ? pages_[index].parts.capacity() : 0;
-        if (parts < part_count) payload += (part_count - parts) * sizeof(Part);
+        if (parts < part_count) {
+            payload += (part_count - parts) * sizeof(Part);
+            reallocation = std::max(reallocation, parts * sizeof(Part));
+        }
     }
     return free_bytes + payload + reallocation;
 }
@@ -356,6 +363,7 @@ MetadataReservation PageDirectory::reserve_descriptors(std::uint32_t count, std:
     for (std::uint32_t i = 0; i < count; ++i) {
         const auto index = free_[--free_count_];
         if (pages_[index].occupied || pages_[index].reserved) std::terminate();
+        pages_.occupy(index);
         pages_[index].reserved = true;
         ids.push_back(index);
     }
@@ -371,6 +379,7 @@ void PageDirectory::release_metadata(std::span<const std::uint32_t> ids) noexcep
             continue;
         }
         if (!pages_[index].reserved || pages_[index].occupied) std::terminate();
+        pages_.vacate(index);
         pages_[index].reserved = false;
         --reserved_;
         free_[free_count_++] = index;
@@ -378,41 +387,23 @@ void PageDirectory::release_metadata(std::span<const std::uint32_t> ids) noexcep
 }
 
 std::size_t PageDirectory::reclaimable_metadata(std::span<const PageId> released) const {
-    std::size_t bytes = 0;
-    for (std::uint32_t first = 0; first < pages_.size(); first += 256) {
-        if (!pages_.is_allocated(first)) continue;
-        const auto end      = first + std::min(256U, pages_.size() - first);
-        std::size_t segment = 0;
-        for (auto i = first; i < end; ++i) {
-            const auto& page = pages_[i];
-            if (page.reserved ||
-                (page.occupied &&
-                 std::find(released.begin(), released.end(),
-                           PageId{pool_id_, i, page.generation}) == released.end())) {
-                segment = 0;
-                break;
-            }
-            segment += sizeof(Page) + page.parts.capacity() * sizeof(Part);
-        }
-        bytes += segment;
-    }
-    return bytes;
+    std::vector<std::uint32_t> slots;
+    slots.reserve(released.size());
+    for (const auto id : released)
+        if (valid(id) && !pages_[id.index].reserved) slots.push_back(id.index);
+    return pages_.reclaimable_bytes(std::move(slots), [](const auto& object) {
+        return object.parts.capacity() * sizeof(Part);
+    });
 }
 
-void PageDirectory::reclaim_metadata() noexcept {
-    for (std::uint32_t first = 0; first < pages_.size(); first += 256) {
-        if (!pages_.is_allocated(first)) continue;
-        const auto end = std::min<std::uint64_t>(pages_.size(), std::uint64_t(first) + 256);
-        bool empty     = true;
-        for (auto index = first; index < end; ++index)
-            empty &= !pages_[index].occupied && !pages_[index].reserved;
-        if (!empty) continue;
-        for (auto index = first; index < end; ++index) {
-            metadata_.release(pages_[index].parts.capacity() * sizeof(Part));
-        }
-        pages_.release_segment(first);
-    }
+MetadataReclaim
+PageDirectory::return_empty_segments(std::size_t needed,
+                                     const ProtectedMetadataSegments* keep) noexcept {
+    return pages_.reclaim(
+        needed, keep, [&](Page& page) { metadata_.release(page.parts.capacity() * sizeof(Part)); });
 }
+
+void PageDirectory::reclaim_metadata() noexcept { return_empty_segments(SIZE_MAX); }
 
 void PageDirectory::configure_histories(std::uint32_t rows, std::uint32_t page_capacity,
                                         std::uint32_t histories) {
@@ -1087,6 +1078,7 @@ void PageDirectory::release_descriptor(PageId handle, RecordReservation* reserva
             reservation->restore_metadata(*this, handle.index);
         } catch (...) { std::terminate(); }
     } else {
+        pages_.vacate(handle.index);
         free_[free_count_++] = handle.index;
     }
 }

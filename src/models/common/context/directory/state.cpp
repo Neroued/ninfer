@@ -214,7 +214,7 @@ std::size_t StateDirectory::metadata_bytes(const StateDirectorySpec& spec) {
     }
     const auto object   = object_metadata_bytes(parts);
     const auto segments = (static_cast<std::size_t>(spec.logical_capacity) + 255) / 256;
-    fixed += segments * sizeof(std::unique_ptr<Object[]>);
+    fixed += segments * ReclaimableSlots<Object>::segment_entry_bytes();
     if (spec.logical_capacity > (SIZE_MAX - fixed) / object) {
         throw std::overflow_error("StateDirectory metadata overflows size_t");
     }
@@ -229,7 +229,8 @@ std::uint32_t StateDirectory::available_descriptors() const noexcept {
     return capacity() - occupied();
 }
 
-std::size_t StateDirectory::metadata_requirement(std::uint32_t count) const {
+std::size_t StateDirectory::metadata_requirement(std::uint32_t count,
+                                                 ProtectedMetadataSegments* pins) const {
     if (count > available_descriptors()) return SIZE_MAX;
     std::uint32_t highwater = initialized_objects_;
     std::size_t bytes = 0, reallocation = 0;
@@ -249,6 +250,7 @@ std::size_t StateDirectory::metadata_requirement(std::uint32_t count) const {
     for (std::uint32_t i = 0; i < count; ++i) {
         const auto index =
             i < added ? highwater - 1 - i : free_objects_[free_object_count_ - 1 - (i - added)];
+        objects_.protect(index, pins);
         const bool present = objects_.is_allocated(index);
         if (!present && index < objects_.size()) {
             const auto segment = index / 256;
@@ -294,6 +296,7 @@ MetadataReservation StateDirectory::reserve_descriptors(std::uint32_t count) {
     ids.reserve(count);
     for (std::uint32_t i = 0; i < count; ++i) {
         const auto index  = free_objects_[--free_object_count_];
+        objects_.occupy(index);
         auto& object      = objects_[index];
         object.role       = StateRole::ReservedDestination;
         object.generation = 0;
@@ -308,54 +311,31 @@ void StateDirectory::release_metadata(std::span<const std::uint32_t> ids) noexce
         auto& object = objects_[index];
         if (object.role != StateRole::ReservedDestination || object.generation != 0)
             std::terminate();
+        objects_.vacate(index);
         object.role                         = StateRole::Free;
         free_objects_[free_object_count_++] = index;
     }
 }
 
 std::size_t StateDirectory::reclaimable_metadata(std::span<const StateId> released) const {
-    std::size_t bytes = 0;
-    for (std::uint32_t first = 0; first < objects_.size(); first += 256) {
-        if (!objects_.is_allocated(first)) continue;
-        const auto end      = first + std::min(256U, objects_.size() - first);
-        std::size_t segment = 0;
-        for (auto i = first; i < end; ++i) {
-            const auto& object = objects_[i];
-            if (object.role != StateRole::Free &&
-                std::find(released.begin(), released.end(), StateId{i, object.generation}) ==
-                    released.end()) {
-                segment = 0;
-                break;
-            }
-            segment += sizeof(Object) + object.parts.capacity() * sizeof(Object::Part);
-        }
-        bytes += segment;
-    }
-    return bytes;
+    std::vector<std::uint32_t> slots;
+    slots.reserve(released.size());
+    for (const auto id : released)
+        if (valid(id)) slots.push_back(id.index);
+    return objects_.reclaimable_bytes(std::move(slots), [](const auto& object) {
+        return object.parts.capacity() * sizeof(Object::Part);
+    });
 }
 
-std::size_t StateDirectory::reclaim_metadata() {
-    const auto before = allocated_metadata_bytes();
-    for (std::uint32_t first = 0; first < objects_.size(); first += 256) {
-        if (!objects_.is_allocated(first)) continue;
-        const auto end = first + std::min<std::uint32_t>(256, objects_.size() - first);
-        bool empty     = true;
-        for (auto index = first; index < end; ++index) {
-            if (objects_[index].role != StateRole::Free) {
-                empty = false;
-                break;
-            }
-        }
-        if (!empty) continue;
-        std::size_t parts = 0;
-        for (auto index = first; index < end; ++index) {
-            parts += objects_[index].parts.capacity() * sizeof(Object::Part);
-        }
-        metadata_account_.release(parts);
-        objects_.release_segment(first);
-    }
-    return before - allocated_metadata_bytes();
+MetadataReclaim
+StateDirectory::return_empty_segments(std::size_t needed,
+                                      const ProtectedMetadataSegments* keep) noexcept {
+    return objects_.reclaim(needed, keep, [&](Object& object) {
+        metadata_account_.release(object.parts.capacity() * sizeof(Object::Part));
+    });
 }
+
+std::size_t StateDirectory::reclaim_metadata() { return return_empty_segments(SIZE_MAX).bytes; }
 
 std::size_t StateDirectory::image_bytes(std::uint32_t rank, std::uint32_t variant) const {
     const auto& parts = layout_spec(variant).parts;
@@ -919,6 +899,7 @@ bool StateDirectory::release(StateId handle) noexcept {
     object.content_epoch   = 0;
     object.release_pending = false;
 
+    objects_.vacate(handle.index);
     free_objects_[free_object_count_++] = handle.index;
     return true;
 }

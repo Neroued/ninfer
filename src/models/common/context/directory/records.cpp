@@ -1,4 +1,5 @@
 #include "models/common/context/directory/records.h"
+#include "models/common/context/directory/history.h"
 
 #include <algorithm>
 #include <limits>
@@ -103,11 +104,13 @@ bool RecordAssessment::feasible() const noexcept {
                        [](const auto& value) { return value.placement.feasible(); });
 }
 
+RecordReservation::RecordReservation() noexcept = default;
+
 RecordReservation::~RecordReservation() { clear(); }
 
 RecordReservation::RecordReservation(RecordReservation&& other) noexcept
-    : metadata_(std::move(other.metadata_)), claims_(std::move(other.claims_)),
-      ranks_(std::move(other.ranks_)) {
+    : control_(std::move(other.control_)), metadata_(std::move(other.metadata_)),
+      claims_(std::move(other.claims_)), ranks_(std::move(other.ranks_)) {
     other.claims_.clear();
     other.ranks_.clear();
 }
@@ -115,6 +118,7 @@ RecordReservation::RecordReservation(RecordReservation&& other) noexcept
 RecordReservation& RecordReservation::operator=(RecordReservation&& other) noexcept {
     if (this != &other) {
         clear();
+        control_  = std::move(other.control_);
         metadata_ = std::move(other.metadata_);
         claims_   = std::move(other.claims_);
         ranks_    = std::move(other.ranks_);
@@ -131,14 +135,16 @@ bool RecordReservation::ready() const noexcept {
 }
 
 bool RecordReservation::empty() const noexcept {
-    return std::all_of(claims_.begin(), claims_.end(),
-                       [](const auto& claim) { return claim.count == 0; }) &&
-           std::all_of(metadata_.begin(), metadata_.end(),
-                       [](const auto& metadata) { return metadata.remaining() == 0; });
+    return !control_ && std::all_of(claims_.begin(), claims_.end(), [](const auto& claim) {
+        return claim.count == 0;
+    }) && std::all_of(metadata_.begin(), metadata_.end(), [](const auto& metadata) {
+        return metadata.remaining() == 0;
+    });
 }
 
 bool RecordReservation::contributes_to(const RecordAssessment& pressure,
                                        bool metadata_pressure) const noexcept {
+    if (metadata_pressure && control_) return true;
     if (metadata_pressure && std::any_of(metadata_.begin(), metadata_.end(),
                                          [](const auto& item) { return item.remaining() != 0; }))
         return true;
@@ -267,6 +273,14 @@ RecordReservation RecordReservation::split(std::uint32_t count) {
             }
         }
     }
+    // Pure page splits leave the writer grant with the original owner. A new history's
+    // private control claim follows its descriptor if the split transferred that descriptor.
+    if (control_ && !control_->writer_.valid())
+        for (const auto& m : result.metadata_)
+            if (m.owner() == control_->store_ && m.remaining()) {
+                result.control_ = std::move(control_);
+                break;
+            }
     return result;
 }
 
@@ -300,7 +314,14 @@ void RecordReservation::reserve_merge(const RecordReservation& other) {
 }
 
 void RecordReservation::merge(RecordReservation&& other) {
+    if (control_ && other.control_)
+        throw std::logic_error("cannot merge separate history control grants");
     reserve_merge(other);
+    merge_prepared(std::move(other));
+}
+
+void RecordReservation::merge_prepared(RecordReservation&& other) noexcept {
+    if (other.control_) control_ = std::move(other.control_);
     for (auto& metadata : other.metadata_) metadata_.push_back(std::move(metadata));
     other.metadata_.clear();
     for (const auto rank : other.ranks_)
@@ -311,6 +332,10 @@ void RecordReservation::merge(RecordReservation&& other) {
 }
 
 void RecordReservation::shrink(std::uint32_t count) {
+    if (!count)
+        control_.reset();
+    else if (control_)
+        control_->shrink_growth(count);
     auto keep = count;
     for (auto& metadata : metadata_) {
         const auto retained = std::min<std::size_t>(keep, metadata.remaining());
@@ -331,6 +356,7 @@ void RecordReservation::shrink(std::uint32_t count) {
 }
 
 void RecordReservation::clear() noexcept {
+    control_.reset();
     for (auto& claim : claims_) {
         if (!claim.count || !claim.reservation->valid()) continue;
         const auto current = claim.reservation->remaining(claim.record_class);
@@ -463,6 +489,17 @@ bool selected_rank(const RecordDemand& demand, std::uint32_t rank) {
 
 RecordAssessment RecordDomains::assess(std::span<const RecordDemand> demands,
                                        std::span<const RecordRelease> releases) const {
+    return assess_impl(demands, releases, nullptr);
+}
+
+RecordAssessment RecordDomains::assess_immediate(std::span<const RecordDemand> demands,
+                                                 std::size_t& examined_classes) const {
+    return assess_impl(demands, {}, &examined_classes);
+}
+
+RecordAssessment RecordDomains::assess_impl(std::span<const RecordDemand> demands,
+                                            std::span<const RecordRelease> releases,
+                                            std::size_t* immediate_classes) const {
     RecordAssessment result;
     for (const auto& demand : demands) {
         const auto& spec = layout(demand.layout);
@@ -488,14 +525,30 @@ RecordAssessment RecordDomains::assess(std::span<const RecordDemand> demands,
         std::vector<AllocationId> freed;
         for (const auto& release : releases)
             if (release.domain == value->id) freed.push_back(release.allocation);
-        result.domains.push_back({value->id, value->pool->assess(requests, freed),
+        result.domains.push_back({value->id,
+                                  immediate_classes
+                                      ? value->pool->assess_immediate(requests, *immediate_classes)
+                                      : value->pool->assess(requests, freed),
                                   value->pool->required_bytes(requests)});
     }
     return result;
 }
 
 RecordReserveResult RecordDomains::reserve(std::span<const RecordDemand> demands) {
-    RecordReserveResult result{assess(demands), std::nullopt};
+    return reserve_impl(demands, nullptr);
+}
+
+RecordReserveResult RecordDomains::reserve_immediate(std::span<const RecordDemand> demands,
+                                                     std::size_t& examined_classes) {
+    return reserve_impl(demands, &examined_classes);
+}
+
+RecordReserveResult RecordDomains::reserve_impl(std::span<const RecordDemand> demands,
+                                                std::size_t* immediate_classes) {
+    const auto quote = [&] {
+        return immediate_classes ? assess_immediate(demands, *immediate_classes) : assess(demands);
+    };
+    RecordReserveResult result{quote(), std::nullopt};
     if (!result.assessment.feasible()) return result;
     std::vector<RecordReservation> reservations(demands.size());
     for (const auto& value : domains_) {
@@ -514,10 +567,12 @@ RecordReserveResult RecordDomains::reserve(std::span<const RecordDemand> demands
             indices.push_back(i);
         }
         if (requests.empty()) continue;
-        auto reserved = value->pool->reserve(requests);
+        auto reserved = immediate_classes
+                            ? value->pool->reserve_immediate(requests, *immediate_classes)
+                            : value->pool->reserve(requests);
         if (!reserved.reservation) {
             reservations.clear();
-            result.assessment = assess(demands);
+            result.assessment = quote();
             return result;
         }
         auto owner = std::make_shared<PoolReservation>(std::move(*reserved.reservation));

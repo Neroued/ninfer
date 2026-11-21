@@ -183,13 +183,16 @@ public:
     [[nodiscard]] std::uint32_t capacity() const noexcept;
     [[nodiscard]] std::uint32_t occupied() const noexcept;
     [[nodiscard]] static std::size_t metadata_bytes(std::uint32_t logical, std::uint32_t ranks);
+    [[nodiscard]] static std::size_t descriptor_bytes(std::uint32_t ranks);
 
     [[nodiscard]] std::uint32_t available_descriptors() const noexcept {
         return capacity() - occupied_ - reserved_;
     }
 
-    [[nodiscard]] std::size_t metadata_requirement(std::uint32_t records,
-                                                   std::uint32_t parts) const;
+    [[nodiscard]] std::size_t metadata_requirement(std::uint32_t records, std::uint32_t parts,
+                                                   ProtectedMetadataSegments* pins = nullptr) const;
+    MetadataReclaim return_empty_segments(std::size_t needed,
+                                          const ProtectedMetadataSegments* keep = nullptr) noexcept;
     void reserve_metadata(std::uint32_t records, std::uint32_t parts);
     [[nodiscard]] MetadataReservation reserve_descriptors(std::uint32_t records,
                                                           std::uint32_t parts);
@@ -375,7 +378,7 @@ private:
     RecordDomains* domains_;
     std::uint32_t pool_id_;
     std::uint32_t layout_id_;
-    DirectorySlots<Page> pages_;
+    ReclaimableSlots<Page> pages_;
     std::uint32_t table_page_capacity_ = 0;
     std::vector<TableLink> table_links_;
     std::unique_ptr<DirectorySlots<PartialCoverage>> partial_coverage_;

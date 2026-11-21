@@ -176,6 +176,12 @@ void test_capture_host_fallback_after_device_compaction() {
     demand.add_state({.count = 1});
     expect(directory.assess(demand).requires_maintenance(),
            "capture fallback fixture must require device compaction");
+    store::OptionalAdmissionWork optional_work;
+    expect(
+        !directory.try_reserve_optional(demand, &optional_work) &&
+            optional_work.metadata.examined == 0 &&
+            !directory.records().pool({0, store::ContextMemory::Device}).has_maintenance(),
+        "optional trial started compaction or reclaimed metadata for a fragmented physical pool");
     std::optional<store::RecordReservation> backing;
     const auto destination = store::reserve_capture_destination(directory, backing);
     expect(destination && backing && backing->ready(),

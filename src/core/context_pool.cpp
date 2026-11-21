@@ -418,13 +418,15 @@ struct ContextPool::Impl {
         recycle_entry(index);
     }
 
-    PoolAssessment direct_assessment(std::span<const std::size_t> counts) const {
+    PoolAssessment direct_assessment(std::span<const std::size_t> counts,
+                                     std::size_t* examined = nullptr) const {
         PoolAssessment result{PoolAvailability::Ready, revision};
         if (maintenance) {
             result.status = PoolAvailability::MaintenanceInProgress;
             return result;
         }
         std::size_t needed = 0;
+        if (examined) *examined += counts.size();
         for (std::size_t i = 0; i < counts.size(); ++i) {
             const auto additional =
                 counts[i] > classes[i].free_records ? counts[i] - classes[i].free_records : 0;
@@ -869,10 +871,28 @@ PoolAssessment ContextPool::assess(std::span<const RecordRequest> demand,
     return result;
 }
 
+PoolAssessment ContextPool::assess_immediate(std::span<const RecordRequest> demand,
+                                             std::size_t& examined_classes) const {
+    return impl_->direct_assessment(count_requests(demand, impl_->classes.size()),
+                                    &examined_classes);
+}
+
 PoolReserveResult ContextPool::reserve(std::span<const RecordRequest> demand) {
+    return reserve_impl(demand, nullptr);
+}
+
+PoolReserveResult ContextPool::reserve_immediate(std::span<const RecordRequest> demand,
+                                                 std::size_t& examined_classes) {
+    return reserve_impl(demand, &examined_classes);
+}
+
+PoolReserveResult ContextPool::reserve_impl(std::span<const RecordRequest> demand,
+                                            std::size_t* immediate_classes) {
     auto& p           = *impl_;
     const auto counts = count_requests(demand, p.classes.size());
-    auto assessment   = p.direct_assessment(counts);
+    auto assessment   = p.direct_assessment(counts, immediate_classes);
+    if (immediate_classes && assessment.status != PoolAvailability::Ready)
+        return {assessment, std::nullopt};
     std::unique_ptr<Impl::Plan> plan;
     if (assessment.status == PoolAvailability::MaintenanceInProgress)
         return {assessment, std::nullopt};

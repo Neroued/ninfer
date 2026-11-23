@@ -3,6 +3,15 @@ ninfer_test_includes(ninfer_op_test_support)
 ninfer_op_oracle_options(ninfer_op_test_support)
 target_link_libraries(ninfer_op_test_support PUBLIC ninfer_cpu CUDA::cudart)
 
+ninfer_add_test(ninfer_context_bucket_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/context_bucket.cpp")
+target_include_directories(ninfer_context_bucket_test PRIVATE ${PROJECT_SOURCE_DIR}/bench/ops)
+set_tests_properties(ninfer_context_bucket_test PROPERTIES LABELS "ops")
+
+ninfer_add_test(ninfer_graph_patch_check_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/graph_patch_check.cu"
+  LIBRARIES ninfer_core)
+set_tests_properties(ninfer_graph_patch_check_test PROPERTIES LABELS "ops" SKIP_RETURN_CODE 77)
+
 include("${CMAKE_CURRENT_LIST_DIR}/elementwise/tests.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/embedding/tests.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/indexing/tests.cmake")

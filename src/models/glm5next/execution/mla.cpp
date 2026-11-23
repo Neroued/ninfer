@@ -114,7 +114,11 @@ MlaReadout MlaRun::readout(ops::ContextBucketRange buckets) {
 void MlaRun::execute(const MlaSubmit& submit) {
     prepare();
     if (submit) {
-        submit(readout(ops::ContextBucketRange::through(config_.max_context)));
+        const auto& records = cache_.latent.data.records;
+        const auto capacity = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+            config_.max_context,
+            std::uint64_t(records.page_offsets.ne[0]) * records.page_tokens));
+        submit(readout(ops::ContextBucketRange::through(capacity)));
     } else {
         const auto call = readout(bucket_);
         if (call.index) call.indexer(bucket_, cuda_);

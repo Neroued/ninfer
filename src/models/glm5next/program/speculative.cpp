@@ -33,7 +33,7 @@ void RankProgramImpl::prepare_speculative() {
             std::fill_n(i32(step.positions), physical_rows, 0);
             std::fill_n(i32(step.valid_columns), physical_rows, 0);
         }
-    f.draft_visible.assign(parameters.mtp ? d : 1, 0);
+    f.draft_visible.assign(parameters.mtp ? d : int(route.head_columns != 0), 0);
     for (int i = 0; i < b; ++i) {
         const auto logical              = f.physical.members[i];
         const auto& r                   = work.rows[logical];
@@ -57,14 +57,28 @@ void RankProgramImpl::prepare_speculative() {
     if (parameters.mtp)
         for (const auto& step : io.mtp->draft_steps)
             fill_local_metadata(step, 1, f.batch.attention.rows);
-    f.hidden =
-        resources.packed(io.pending_hidden,
-                         {dimension(parameters.profile->config.text.hidden), width, physical_rows});
+    f.hidden               = target_hidden(f.batch);
     const bool read_drafts = !f.decision;
-    f.graph_round          = graphs != nullptr;
-    if (graphs)
-        graphs->replay(f.batch, f.draft_visible, d, route.head_columns, true, read_drafts);
-    else {
+    if (graphs) {
+        const auto& graph_route =
+            f.graph_route.emplace(f.physical.shape, route.verify_width, route.mtp_steps,
+                                  route.head_columns, route.graph_entry);
+        std::vector<ops::ContextBucket> draft_buckets;
+        draft_buckets.reserve(f.draft_visible.size());
+        for (const auto bound : f.draft_visible)
+            draft_buckets.push_back(ops::select_context_bucket(std::max(1U, bound)));
+        const auto main_bucket =
+            ops::select_context_bucket(std::max(1U, f.batch.attention.max_visible_tokens));
+        const ProposalReplay proposal{.buckets = draft_buckets, .readback = read_drafts};
+        if (graph_route.width > 1 &&
+            graphs->topology() == models::ProposalTopology::SplitProposal) {
+            graphs->launch_proposal(graph_route, proposal);
+            (void)graphs->start_target(graph_route, {.bucket = main_bucket, .head = true});
+        } else {
+            (void)graphs->start_target(graph_route,
+                                       {.bucket = main_bucket, .head = true, .proposal = proposal});
+        }
+    } else {
         execute_proposal(f.batch, f.draft_visible, route.head_columns, read_drafts);
         execute_target(f.batch, true);
     }

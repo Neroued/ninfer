@@ -1,9 +1,9 @@
 #pragma once
+#include "models/common/graph/suite.h"
 #include "models/common/vocabulary.h"
 #include "models/glm5next/execution/mtp.h"
 #include "models/glm5next/execution/dflash.h"
 #include "models/glm5next/execution/text.h"
-#include "models/glm5next/program/graphs.h"
 #include "models/glm5next/program/program.h"
 #include "ninfer/ops/sampling.h"
 #include "runtime/observability/gpu_timing.h"
@@ -11,6 +11,8 @@
 #include <deque>
 
 namespace ninfer::models::glm5next::detail {
+class GraphInputs;
+
 enum class ComputePhase {
     Forward,
     AwaitForward,
@@ -31,6 +33,7 @@ struct ComputeFrame {
     std::optional<runtime::DecisionInput> decision;
     std::optional<WorkRow> window;
     BatchPlan physical;
+    std::optional<speculative::RoundRoute> graph_route;
     std::vector<std::uint32_t> draft_visible;
     std::uint32_t control_row = 0, control_offset = 0, tokens = 0;
     std::uint32_t score_at = 0, score_count = 0;
@@ -40,7 +43,7 @@ struct ComputeFrame {
     GpuExecutionObservation gpu;
     AttentionWorkCounters attention;
     bool sequence = false, timed_prefill = false, counts_pending = false;
-    bool head_ready = false, graph_round = false;
+    bool head_ready     = false;
     bool release_vision = false;
 };
 
@@ -74,11 +77,16 @@ public:
     GraphPreparationSample prepare_graphs(GraphPreparationMode);
     void release_graphs();
     void execute_proposal(const execution::BatchView&, std::span<const std::uint32_t> draft_bounds,
-                          int head_columns, bool read_drafts, const execution::MlaSubmit& = {},
-                          RoundSections* = nullptr, const execution::DraftSubmit& = {},
-                          MtpGraphSteps* = nullptr);
-    void execute_target(const execution::BatchView&, bool head, bool forced_control = false,
-                        const execution::MlaSubmit& = {}, RoundSections* = nullptr);
+                          int head_columns, bool read_drafts);
+    void begin_proposal(const execution::BatchView&, bool capture);
+    void readback_drafts(const Tensor& drafts);
+    void prepare_verify_inputs(const execution::BatchView&, const Tensor& drafts);
+    void execute_target(const execution::BatchView&, bool head, bool forced_control = false);
+    void begin_target(const execution::BatchView&, bool capture);
+    [[nodiscard]] Tensor target_hidden(const execution::BatchView&);
+    [[nodiscard]] execution::StateUpdate target_update(int width);
+    void target_forward(const execution::BatchView&, Tensor hidden, bool forced_control,
+                        const execution::MlaSubmit& = {});
     [[nodiscard]] execution::TextRun text_run(const execution::BatchView&, execution::StateUpdate);
     [[nodiscard]] execution::MtpRun mtp_run(std::uint32_t step, const execution::BatchView&);
     [[nodiscard]] execution::MlaSelection mtp_selection(std::uint32_t step, int local);
@@ -94,16 +102,18 @@ public:
     void accept_dflash(int rows, int width, int head_columns);
     void accept_speculative(int rows, int width, int head_columns);
     [[nodiscard]] execution::DFlashRun dflash_run(int rows, ops::ContextBucket, int head_columns);
+    void dflash_forward(int rows, ops::ContextBucket, int head_columns,
+                        const execution::DraftSubmit& = {});
     [[nodiscard]] Tensor draft_features(const execution::BatchView&);
     void append_dflash_context(const execution::BatchView&, const Tensor& counts,
                                ops::ContextKVMaterializeExecutionEnvelope);
     void execute_speculative_commit(const execution::BatchView&, bool repair_history,
-                                    bool count_tokens, DecodeGraphSection* repair = nullptr,
-                                    DecodeGraphSection* counts = nullptr);
+                                    bool count_tokens, const SectionRecorder& repair = {},
+                                    const SectionRecorder& counts = {});
     [[nodiscard]] DistributedVocabulary vocabulary();
     void commit_speculative(const Commit&);
     void repair_mtp_history(const execution::BatchView&, bool repair,
-                            DecodeGraphSection* captured_repair = nullptr);
+                            const SectionRecorder& record_repair = {});
     void stage_conditioning(std::int32_t rows);
     void gather_decode_state(const execution::BatchView&);
     execution::BatchView decode_batch(int tokens, int rows, int local_rows, std::uint32_t visible);
@@ -146,7 +156,7 @@ public:
     FrameLayout frame;
     std::optional<ParallelExecution> parallel;
     std::unique_ptr<GraphInputs> graph_inputs;
-    std::unique_ptr<Graphs> graphs;
+    std::unique_ptr<models::DecodeGraphSuite> graphs;
     GraphMemorySummary graph_memory;
     std::unique_ptr<ComputeFrame> compute;
     std::unique_ptr<ContextFrame> context;

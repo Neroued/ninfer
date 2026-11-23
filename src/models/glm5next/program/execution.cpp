@@ -11,101 +11,95 @@
 namespace ninfer::models::glm5next::detail {
 void RankProgramImpl::execute_proposal(const execution::BatchView& main,
                                        std::span<const std::uint32_t> draft_bounds,
-                                       int head_columns, bool read_drafts,
-                                       const execution::MlaSubmit& submit, RoundSections* sections,
-                                       const execution::DraftSubmit& draft_submit,
-                                       MtpGraphSteps* gates) {
-    const auto& io = frame;
+                                       int head_columns, bool read_drafts) {
     const int rows = main.rows, local_rows = main.attention.rows;
-    upload_region(io.ingress, io.ingress.bytes);
-    if (parameters.mtp) gather_decode_state(main);
-    timer.begin_draft(sections != nullptr);
-    const auto& speculative = *io.speculative;
-    auto drafts =
+    begin_proposal(main, false);
+    const auto drafts =
         draft_proposals(rows, parameters.mtp ? dimension(shape.draft_tokens) : head_columns);
     if (parameters.mtp) {
         nvtx::ScopedRange range(nvtx::Name::DecodeMtpDraft, nvtx::Category::Mtp);
         for (std::uint32_t step = 0; step < draft_bounds.size(); ++step) {
             const auto call =
-                batch(io.mtp->draft_steps[step], 1, rows, local_rows, draft_bounds[step]);
-            if (gates) {
-                gates->capture_step(
-                    cuda.stream(), parallel ? &*parallel : nullptr, [&](MtpGraphSteps::Step* gate) {
-                        if (gate)
-                            mtp_forward(step, call, [&](const execution::MlaReadout& readout) {
-                                gate->readout(cuda.stream(), [&] { submit(readout); });
-                            });
-                        else
-                            mtp_forward(step, call, submit);
-                    });
-            } else
-                mtp_forward(step, call, submit);
+                batch(frame.mtp->draft_steps[step], 1, rows, local_rows, draft_bounds[step]);
+            mtp_forward(step, call);
         }
     } else {
-        nvtx::ScopedRange range(nvtx::Name::DFlashProposal, nvtx::Category::DFlash);
         const auto bucket = ops::select_context_bucket(std::max(1U, draft_bounds.front()));
-        auto run = dflash_run(rows, bucket, head_columns);
-        run.stem();
-        for (std::uint32_t layer = 0; layer < parameters.draft->layers.size(); ++layer) {
-            {
-                auto attention = run.attention(layer);
-                attention.execute(draft_submit);
-            }
-            run.mlp(layer);
-        }
-        run.finish();
+        dflash_forward(rows, bucket, head_columns);
     }
-    const auto readback = [&] {
-        const auto bytes = drafts.numel() * sizeof(TokenId);
-        copy_bytes_async(output(speculative.drafts).subspan(0, bytes),
-                         speculative.drafts.region.bind(resources.fixed()).subspan(0, bytes), cuda);
-    };
-    timer.end_draft(sections != nullptr);
-    if (sections) {
-        sections->drafts.capture(cuda.stream(), readback);
-        drafts_done.record_external(cuda.stream());
-    } else if (read_drafts) {
-        readback();
+    timer.end_draft();
+    if (read_drafts) {
+        readback_drafts(drafts);
         drafts_done.record(cuda.stream());
     }
+    prepare_verify_inputs(main, drafts);
+}
+
+void RankProgramImpl::begin_proposal(const execution::BatchView& main, bool capture) {
+    upload_region(frame.ingress, frame.ingress.bytes);
+    if (parameters.mtp) gather_decode_state(main);
+    timer.begin_draft(capture);
+}
+
+void RankProgramImpl::readback_drafts(const Tensor& drafts) {
+    const auto& region = frame.speculative->drafts;
+    const auto bytes   = drafts.numel() * sizeof(TokenId);
+    copy_bytes_async(output(region).subspan(0, bytes),
+                     region.region.bind(resources.fixed()).subspan(0, bytes), cuda);
+}
+
+void RankProgramImpl::prepare_verify_inputs(const execution::BatchView& main,
+                                            const Tensor& drafts) {
     auto ids = main.ids;
-    ops::prepare_verify_ids(row(io.rows.anchors, rows), drafts, row(io.speculative->extents, rows),
-                            ids, cuda);
+    ops::prepare_verify_ids(row(frame.rows.anchors, main.rows), drafts,
+                            row(frame.speculative->extents, main.rows), ids, cuda);
 }
 
 void RankProgramImpl::execute_target(const execution::BatchView& main, bool head,
-                                     bool forced_control, const execution::MlaSubmit& submit,
-                                     RoundSections* sections) {
-    const auto& io = frame;
-    const int h = dimension(parameters.profile->config.text.hidden), rows = main.rows;
-    const int w = main.tokens;
-    auto hidden = resources.packed(io.pending_hidden, {h, w, rows});
-    if (w == 1) {
-        upload_region(io.ingress, io.ingress.bytes);
+                                     bool forced_control) {
+    auto hidden = target_hidden(main);
+    begin_target(main, false);
+    target_forward(main, hidden, forced_control);
+    if (head) project_head(hidden.view({hidden.ne[0], main.tokens * main.rows}));
+    timer.end_target();
+}
+
+void RankProgramImpl::begin_target(const execution::BatchView& main, bool capture) {
+    if (main.tokens == 1) {
+        upload_region(frame.ingress, frame.ingress.bytes);
         if (parameters.mtp) gather_decode_state(main);
     }
-    timer.begin_target(sections != nullptr);
+    timer.begin_target(capture);
+}
+
+Tensor RankProgramImpl::target_hidden(const execution::BatchView& main) {
+    const auto hidden = dimension(parameters.profile->config.text.hidden);
+    return resources.packed(frame.pending_hidden, {hidden, main.tokens, main.rows});
+}
+
+execution::StateUpdate RankProgramImpl::target_update(int width) {
+    if (width > 1) return execution::RecordWindow{resources.replay(width).records};
+    return execution::StepUpdate{};
+}
+
+void RankProgramImpl::target_forward(const execution::BatchView& main, Tensor hidden,
+                                     bool forced_control, const execution::MlaSubmit& submit) {
+    const auto w      = main.tokens;
+    const auto update = target_update(w);
     if (w > 1) {
         nvtx::ScopedRange range(parameters.mtp ? nvtx::Name::DecodeMtpTarget
                                                : nvtx::Name::DecodeDFlashTarget,
                                 parameters.mtp ? nvtx::Category::Mtp : nvtx::Category::DFlash);
-        main_forward(main, execution::RecordWindow{resources.replay(w).records}, hidden, {},
-                     submit);
+        main_forward(main, update, hidden, {}, submit);
     } else {
-        main_forward(main, execution::StepUpdate{}, hidden, {}, submit);
-        if (forced_control || !io.speculative) {
+        main_forward(main, update, hidden, {}, submit);
+        if (forced_control || !frame.speculative) {
             if (parameters.mtp) align_history(main, hidden, 1);
             if (parameters.draft) append_dflash_context(main, main.valid_columns, {0, 1});
-            ops::scatter(hidden.view({h, rows}), resources.states.hidden(main.destination_offsets),
-                         main.live_rows, cuda);
+            ops::scatter(hidden.view({hidden.ne[0], main.rows}),
+                         resources.states.hidden(main.destination_offsets), main.live_rows, cuda);
         }
     }
-    const auto project = [&] { project_head(hidden.view({h, main.tokens * rows})); };
-    if (sections)
-        sections->head.capture(cuda.stream(), project);
-    else if (head)
-        project();
-    timer.end_target(sections != nullptr);
 }
 
 void RankProgramImpl::forward() {
@@ -149,11 +143,15 @@ void RankProgramImpl::forward() {
         f.result.rows[control ? f.control_row : i].processed += rows[i].ids.size();
     if (!f.sequence && f.tokens == 1) {
         const bool sample = forward && forward->sample != SampleKind::None;
-        f.graph_round     = graphs && forward && forward->kind == ForwardKind::Ordinary;
-        if (f.graph_round)
-            graphs->replay(f.batch, {}, 0, 0, sample, false);
-        else
+        if (graphs && forward && forward->kind == ForwardKind::Ordinary) {
+            f.graph_route =
+                resources.plan.decode_routes->select_route(f.physical.shape, shape.speculative, 0);
+            const auto bucket =
+                ops::select_context_bucket(std::max(1U, f.batch.attention.max_visible_tokens));
+            (void)graphs->start_target(*f.graph_route, {.bucket = bucket, .head = sample});
+        } else {
             execute_target(f.batch, sample, forward && forward->kind == ForwardKind::Control);
+        }
         f.head_ready = sample;
         if (sample) {
             f.phase = ComputePhase::Decision;
@@ -309,12 +307,11 @@ void RankProgramImpl::decide() {
     if (!f.decision) return;
     upload_sampling();
     const int b = f.batch.rows;
-    const int g =
-        verify ? std::get<SpeculativeWork>(f.request.work.operation).speculative->head_columns : 0;
-    if (f.graph_round) {
-        graphs->decide(b, f.batch.tokens, g);
+    if (f.graph_route) {
+        graphs->decide(*f.graph_route);
     } else if (verify) {
-        accept_speculative(b, f.batch.tokens, g);
+        const auto& geometry = *std::get<SpeculativeWork>(f.request.work.operation).speculative;
+        accept_speculative(b, f.batch.tokens, static_cast<int>(geometry.head_columns));
         copy_result(b, true);
     } else {
         if (!f.head_ready) {
@@ -417,7 +414,7 @@ void RankProgramImpl::advance_compute() {
                     resources.vision->release(use.id);
             }
             auto observed = observation();
-            observed.path = f.graph_round ? ExecutionPath::Graph : ExecutionPath::Eager;
+            observed.path = f.graph_route ? ExecutionPath::Graph : ExecutionPath::Eager;
             timer.observe_retirement(f.gpu);
             observed.gpu       = f.gpu;
             observed.attention = {ExecutionTypes::describe_work(f.request.work).kind, f.attention};

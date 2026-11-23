@@ -1,5 +1,7 @@
 #include "models/glm5next/program/internal.h"
 
+#include "core/nvtx.h"
+
 namespace ninfer::models::glm5next::detail {
 Tensor RankProgramImpl::draft_features(const execution::BatchView& call) {
     const auto& field = frame.dflash->features;
@@ -26,6 +28,18 @@ execution::DFlashRun RankProgramImpl::dflash_run(int b, ops::ContextBucket bucke
          resources.packed(s.drafts, {steps, b}), resources.packed(d.candidate_ids, {k, steps, b}),
          resources.packed(d.proposal_q, {k, steps, b})},
         cuda);
+}
+
+void RankProgramImpl::dflash_forward(int rows, ops::ContextBucket bucket, int head_columns,
+                                     const execution::DraftSubmit& submit) {
+    nvtx::ScopedRange range(nvtx::Name::DFlashProposal, nvtx::Category::DFlash);
+    auto run = dflash_run(rows, bucket, head_columns);
+    run.stem();
+    for (std::uint32_t layer = 0; layer < parameters.draft->layers.size(); ++layer) {
+        run.attention(layer).execute(submit);
+        run.mlp(layer);
+    }
+    run.finish();
 }
 
 void RankProgramImpl::append_dflash_context(const execution::BatchView& call, const Tensor& counts,

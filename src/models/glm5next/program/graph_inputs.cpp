@@ -52,15 +52,16 @@ void GraphInputs::prepare() {
     for (std::uint32_t row = 0; row < p.shape.max_concurrency; ++row)
         states_.push_back(allocate(0));
     for (int pool = 0; pool < (r.mtp ? 2 : 1); ++pool) {
-        auto& tables    = (pool ? *r.mtp : r.main).tables();
-        mappings_[pool] = PinnedHostBuffer(p.shape.max_concurrency * sizeof(std::int64_t));
-        auto* offsets   = static_cast<std::int64_t*>(mappings_[pool].data());
+        auto& tables         = (pool ? *r.mtp : r.main).tables();
+        const auto capacity  = tables.logical_page_capacity();
+        const auto row_bytes = std::size_t(capacity) * sizeof(std::int64_t);
+        mappings_[pool]      = PinnedHostBuffer(p.shape.max_concurrency * row_bytes);
         for (std::uint32_t row = 0; row < p.shape.max_concurrency; ++row) {
-            offsets[row] = allocate(pool + 1);
-            tables.publish(
-                row, 0, {offsets + row, 1},
-                mappings_[pool].span().subspan(row * sizeof(std::int64_t), sizeof(std::int64_t)),
-                p.cuda);
+            const auto page_offset = allocate(pool + 1);
+            const auto staging     = mappings_[pool].span().subspan(row * row_bytes, row_bytes);
+            auto* offsets          = static_cast<std::int64_t*>(staging.data);
+            std::fill_n(offsets, capacity, page_offset);
+            tables.publish(row, 0, {offsets, capacity}, staging, p.cuda);
         }
     }
     p.device.synchronize();

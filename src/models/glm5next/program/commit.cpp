@@ -92,16 +92,16 @@ void RankProgramImpl::commit_speculative(const Commit& commit) {
         local_active[j] = local_counts[j] ? 0 : -1;
     }
     upload_region(io.commit_ingress, io.commit_ingress.bytes);
-    if (f.graph_round)
-        graphs->commit(b, f.batch.attention.rows, f.batch.tokens, repair, count_tokens);
+    if (f.graph_route)
+        graphs->commit(*f.graph_route, parameters.mtp && repair, count_tokens);
     else
         execute_speculative_commit(f.batch, repair, count_tokens);
 }
 
 void RankProgramImpl::execute_speculative_commit(const execution::BatchView& call, bool repair,
                                                  bool count_tokens,
-                                                 DecodeGraphSection* captured_repair,
-                                                 DecodeGraphSection* captured_counts) {
+                                                 const SectionRecorder& record_repair,
+                                                 const SectionRecorder& record_counts) {
     const auto& io = frame;
     const int b = call.rows, w = call.tokens, c = call.attention.rows;
     const int h   = dimension(parameters.profile->config.text.hidden);
@@ -118,7 +118,7 @@ void RankProgramImpl::execute_speculative_commit(const execution::BatchView& cal
                                 resources.states.main_tail(local.destination_offsets), cuda);
     }
     if (parameters.mtp) {
-        repair_mtp_history(call, repair, captured_repair);
+        repair_mtp_history(call, repair, record_repair);
     } else {
         append_dflash_context(call, accepted, {0, std::uint32_t(w)});
         const std::array fields{ops::StateColumnScatter{
@@ -132,8 +132,8 @@ void RankProgramImpl::execute_speculative_commit(const execution::BatchView& cal
                                           row(io.rows.count_columns, b),
                                           row(io.rows.count_slots, b), counts, cuda);
     };
-    if (captured_counts)
-        captured_counts->capture(cuda.stream(), update_counts);
+    if (record_counts)
+        record_counts(update_counts);
     else if (count_tokens)
         update_counts();
 }

@@ -176,7 +176,7 @@ void RankProgramImpl::accept_mtp(int b, int w) {
 }
 
 void RankProgramImpl::repair_mtp_history(const execution::BatchView& call, bool repair,
-                                         DecodeGraphSection* captured_repair) {
+                                         const SectionRecorder& record_repair) {
     const auto& io = frame;
     const auto& m  = *io.mtp;
     const int b = call.rows, w = call.tokens, c = call.attention.rows,
@@ -203,8 +203,8 @@ void RankProgramImpl::repair_mtp_history(const execution::BatchView& call, bool 
         execution::mtp_history(parameters, {resources.workspace, *resources.mtp, tail, tail},
                                history, conditioning.view({h, pairs * c}), cuda);
     };
-    if (captured_repair)
-        captured_repair->capture(cuda.stream(), history_update);
+    if (record_repair)
+        record_repair(history_update);
     else if (repair)
         history_update();
     auto tail                        = resources.states.mtp_tail(local.destination_offsets);

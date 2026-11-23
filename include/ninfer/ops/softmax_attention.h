@@ -8,18 +8,13 @@
 #include "core/paged_kv_cache.h"
 #include "core/tensor.h"
 
-
 #include <cstddef>
 #include <cstdint>
 
 namespace ninfer::ops {
 
-inline constexpr std::uint32_t kCausalAttentionMaximumVisibleKeys = 262144;
-
-struct CausalAttentionExecutionEnvelope {
-    std::uint32_t min_visible_keys = 0;
-    std::uint32_t max_visible_keys = 0;
-};
+inline constexpr std::uint32_t kCausalAttentionMaximumVisibleKeys =
+    context_bucket_tokens(ContextBucket::K256);
 
 /**
  * Scaled dot-product attention over each entry's visible key set J:
@@ -104,49 +99,53 @@ void packed_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
  * Caller-owned transient storage is bounded by the capacity query below; implementations that
  * need no partial state return zero capacity.
  *
- * The caller guarantees that the maximum p+1 over live rows lies within envelope. The envelope is
- * a host launch/workspace resource promise over that batch maximum, not a mask and not persistent
- * state. A masked physical width may exceed max_visible_keys when its live prefix is shorter.
- * With fixed tensor views, geometry and cache storage, calls with W<=16 remain CUDA Graph
- * update-compatible across valid envelopes. Live row lengths determine the KV work partition within
- * each capture. Inputs, output, addressed cache fields, the offset table, and live workspace
- * suballocations are pairwise non-overlapping. The Op overwrites every addressed cache row but owns
- * no cache allocation, frontier, request identity, or commit authority. `execution` supplies the
- * stream and positive physical SM count used for launch and workspace planning; capacity queries
- * must use the same count as execution.
+ * Buckets K2 through K256 bound launch and workspace capacity. The caller guarantees
+ * 0 <= p < min(context_bucket_tokens(bucket), logical_pages * 64) for every live column and
+ * materialized page-table entries covering [0,p]. The page table can be smaller than the bucket.
+ * Dense W must fit in the bucket. With a validity tensor only the live prefixes need to fit.
+ * With fixed geometry, storage, B, W<=16, and mask presence, bucket updates preserve the graph's
+ * node topology. Live device positions and validity determine the KV partitions on each replay.
+ * Inputs, output, addressed cache fields, the offset table, and live workspace suballocations
+ * are pairwise non-overlapping. The Op overwrites addressed cache rows. The caller owns cache
+ * allocation and commit. Pass the same positive physical SM count from `execution` to the
+ * workspace and graph-profile queries.
  */
 void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                               const Tensor& positions, const Tensor& valid_columns,
                               const Tensor& kv_table_rows, AttentionHeadGeometry geometry,
-                              float scale, PagedKVBatchLayerView cache,
-                              CausalAttentionExecutionEnvelope envelope, MemoryArena& workspace,
-                              Tensor& out, CudaExecutionView execution);
+                              float scale, PagedKVBatchLayerView cache, ContextBucket bucket,
+                              MemoryArena& workspace, Tensor& out, CudaExecutionView execution);
 
 /**
  * Read-only single-sequence causal attention over an already populated cache.
  *
  * q/out are contiguous BF16 [256,24|16,T], positions is contiguous sequential device I32 [T],
- * and cache geometry, visible rows, scale, numerical semantics, envelope, alias, and workspace
+ * and cache geometry, visible rows, scale, numerical semantics, bucket, alias, and workspace
  * rules are the same as causal_softmax_attention. The Op accepts no new K/V and leaves every cache
  * byte unchanged; out is completely overwritten.
  */
 void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
                                      AttentionHeadGeometry geometry, float scale,
-                                     const ConstPagedKVLayerView& cache,
-                                     CausalAttentionExecutionEnvelope envelope,
+                                     const ConstPagedKVLayerView& cache, ContextBucket bucket,
                                      MemoryArena& workspace, Tensor& out,
                                      CudaExecutionView execution);
 
 /**
- * Return transient capacity for every W in the inclusive interval at one exact batch size. The
- * head geometry, cache dtype, execution envelope and device SM count are fixed
- * implementation-profile inputs.
- * Invalid profiles or intervals throw. The returned capacity may be zero.
+ * Return transient capacity for legal calls at the exact batch size across both inclusive
+ * ranges of buckets and widths. Invalid profiles or ranges throw. The capacity may be zero.
  */
 [[nodiscard]] std::size_t causal_softmax_attention_workspace_capacity_bytes(
-    AttentionHeadGeometry geometry, KvCacheStorage cache_storage,
-    CausalAttentionExecutionEnvelope envelope, std::int32_t batch_size, std::int32_t min_tokens,
-    std::int32_t max_tokens, std::int32_t multiprocessor_count);
+    AttentionHeadGeometry geometry, KvCacheStorage cache_storage, ContextBucketRange buckets,
+    std::int32_t batch_size, std::int32_t min_tokens, std::int32_t max_tokens,
+    std::int32_t multiprocessor_count);
+
+// Equal profiles permit capture reuse at fixed tensor views, scale, and workspace base.
+// Positions, valid columns, table rows, and page offsets are replay inputs.
+[[nodiscard]] OpGraphProfile
+causal_softmax_attention_graph_profile(AttentionHeadGeometry geometry, KvCacheStorage cache_storage,
+                                       ContextBucket bucket, std::int32_t batch_size,
+                                       std::int32_t tokens, std::int32_t multiprocessor_count,
+                                       bool append = true, bool masked = false);
 
 // Equal profiles permit capture reuse at fixed operands and workspace. Device metadata and
 // page offsets remain replay inputs.

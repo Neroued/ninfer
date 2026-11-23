@@ -58,6 +58,17 @@ int verify_record_guards(const std::string& label, const tool::PackedKVFixture& 
     return 1;
 }
 
+int batch_table_pages(std::span<const HostCache> rows, int table_capacity) {
+    for (const auto& row : rows) table_capacity = std::max(table_capacity, row.logical_capacity);
+    return align_up_page(table_capacity) / kPagedKVPageSize;
+}
+
+int batch_physical_pages(std::span<const HostCache> rows, MappingPattern mapping) {
+    int pages = 0;
+    for (const auto& row : rows) pages += row.logical_capacity / kPagedKVPageSize;
+    return mapping == MappingPattern::Fragmented ? 2 * pages + 1 : pages;
+}
+
 } // namespace
 
 DeviceCache::DeviceCache(const HostCache& cache, MappingPattern mapping,
@@ -240,12 +251,8 @@ BatchDeviceCache::BatchDeviceCache(std::span<const HostCache> rows, MappingPatte
                                    std::int32_t table_capacity)
     : geometry_(rows.front().geometry), storage_(rows.front().storage),
       layout_(test_cache_layout(storage_)), rows_(rows.size()),
-      logical_capacity_(rows.front().logical_capacity),
-      logical_pages_(align_up_page(std::max(logical_capacity_, table_capacity)) / kPagedKVPageSize),
-      physical_pages_(
-          mapping == MappingPattern::Fragmented
-              ? 2 * static_cast<std::int32_t>(rows_) * (logical_capacity_ / kPagedKVPageSize) + 1
-              : static_cast<std::int32_t>(rows_) * (logical_capacity_ / kPagedKVPageSize)),
+      logical_pages_(batch_table_pages(rows, table_capacity)),
+      physical_pages_(batch_physical_pages(rows, mapping)),
       block_tables_host_(rows_ * static_cast<std::size_t>(logical_pages_), -1),
       k_code_elements_(
           physical_plane_elements(layout_.key.code_extent, geometry_, physical_pages_)),
@@ -258,18 +265,17 @@ BatchDeviceCache::BatchDeviceCache(std::span<const HostCache> rows, MappingPatte
       packed_(cuda_environment().context.device(), cache_geometry(layout_, geometry_),
               physical_pages_),
       block_tables_(block_tables_host_.size() * sizeof(std::int64_t)) {
+    int linear = 0;
     for (std::size_t row = 0; row < rows_; ++row) {
         const HostCache& cache = rows[row];
         if (cache.geometry.q_heads != geometry_.q_heads ||
-            cache.geometry.kv_heads != geometry_.kv_heads || cache.storage != storage_ ||
-            cache.logical_capacity != logical_capacity_) {
+            cache.geometry.kv_heads != geometry_.kv_heads || cache.storage != storage_) {
             throw std::invalid_argument("batch cache rows must share one physical geometry");
         }
-        for (std::int32_t logical = 0; logical < logical_capacity_ / kPagedKVPageSize; ++logical) {
-            const std::int32_t linear =
-                static_cast<std::int32_t>(row) * (logical_capacity_ / kPagedKVPageSize) + logical;
+        for (int logical = 0; logical < cache.logical_capacity / kPagedKVPageSize; ++logical) {
             block_tables_host_[row * static_cast<std::size_t>(logical_pages_) + logical] =
                 mapping == MappingPattern::Fragmented ? 2 * linear + 1 : linear;
+            ++linear;
         }
     }
     const auto offsets = packed_.table_offsets(block_tables_host_);
@@ -373,14 +379,14 @@ int BatchDeviceCache::verify(const std::string& label, std::span<const HostCache
         std::vector<std::uint16_t> expected_vs(v_scale_elements_, 0);
         for (std::size_t row = 0; row < rows_; ++row) {
             const std::span<const std::int32_t> table = row_table(row);
-            scatter_paged_into(expected[row].k_i8, kHeadDim, geometry_, logical_capacity_, table,
-                               expected_k);
-            scatter_paged_into(expected[row].v_i8, kHeadDim, geometry_, logical_capacity_, table,
-                               expected_v);
-            scatter_paged_into(expected[row].k_scale, kQuantGroups, geometry_, logical_capacity_,
-                               table, expected_ks);
-            scatter_paged_into(expected[row].v_scale, kQuantGroups, geometry_, logical_capacity_,
-                               table, expected_vs);
+            scatter_paged_into(expected[row].k_i8, kHeadDim, geometry_,
+                               expected[row].logical_capacity, table, expected_k);
+            scatter_paged_into(expected[row].v_i8, kHeadDim, geometry_,
+                               expected[row].logical_capacity, table, expected_v);
+            scatter_paged_into(expected[row].k_scale, kQuantGroups, geometry_,
+                               expected[row].logical_capacity, table, expected_ks);
+            scatter_paged_into(expected[row].v_scale, kQuantGroups, geometry_,
+                               expected[row].logical_capacity, table, expected_vs);
         }
         failures +=
             verify_exact((label + " cache-k-code").c_str(),
@@ -401,14 +407,14 @@ int BatchDeviceCache::verify(const std::string& label, std::span<const HostCache
         std::vector<std::uint8_t> expected_vs(v_scale_elements_, 0);
         for (std::size_t row = 0; row < rows_; ++row) {
             const std::span<const std::int32_t> table = row_table(row);
-            scatter_paged_into(expected[row].k_fp8, kHeadDim, geometry_, logical_capacity_, table,
-                               expected_k);
-            scatter_paged_into(expected[row].v_fp8, kHeadDim, geometry_, logical_capacity_, table,
-                               expected_v);
+            scatter_paged_into(expected[row].k_fp8, kHeadDim, geometry_,
+                               expected[row].logical_capacity, table, expected_k);
+            scatter_paged_into(expected[row].v_fp8, kHeadDim, geometry_,
+                               expected[row].logical_capacity, table, expected_v);
             scatter_paged_into(expected[row].k_fp8_scale, kFp8QuantGroups, geometry_,
-                               logical_capacity_, table, expected_ks);
+                               expected[row].logical_capacity, table, expected_ks);
             scatter_paged_into(expected[row].v_fp8_scale, kFp8QuantGroups, geometry_,
-                               logical_capacity_, table, expected_vs);
+                               expected[row].logical_capacity, table, expected_vs);
         }
         failures +=
             verify_exact((label + " cache-k-code").c_str(),
@@ -429,14 +435,14 @@ int BatchDeviceCache::verify(const std::string& label, std::span<const HostCache
         std::vector<std::uint8_t> expected_vs(v_scale_elements_, 0);
         for (std::size_t row = 0; row < rows_; ++row) {
             const std::span<const std::int32_t> table = row_table(row);
-            scatter_paged_into(expected[row].k_fp8, kHeadDim, geometry_, logical_capacity_, table,
-                               expected_k);
-            scatter_paged_into(expected[row].v_nvfp4, kNvfp4CodeBytes, geometry_, logical_capacity_,
-                               table, expected_v);
+            scatter_paged_into(expected[row].k_fp8, kHeadDim, geometry_,
+                               expected[row].logical_capacity, table, expected_k);
+            scatter_paged_into(expected[row].v_nvfp4, kNvfp4CodeBytes, geometry_,
+                               expected[row].logical_capacity, table, expected_v);
             scatter_paged_into(expected[row].k_fp8_scale, kFp8QuantGroups, geometry_,
-                               logical_capacity_, table, expected_ks);
+                               expected[row].logical_capacity, table, expected_ks);
             scatter_paged_into(expected[row].v_nvfp4_scale, kNvfp4QuantGroups, geometry_,
-                               logical_capacity_, table, expected_vs);
+                               expected[row].logical_capacity, table, expected_vs);
         }
         failures +=
             verify_exact((label + " cache-k-code").c_str(),
@@ -457,14 +463,14 @@ int BatchDeviceCache::verify(const std::string& label, std::span<const HostCache
         std::vector<std::uint8_t> expected_vs(v_scale_elements_, 0);
         for (std::size_t row = 0; row < rows_; ++row) {
             const std::span<const std::int32_t> table = row_table(row);
-            scatter_paged_into(expected[row].k_nvfp4, kNvfp4CodeBytes, geometry_, logical_capacity_,
-                               table, expected_k);
-            scatter_paged_into(expected[row].v_nvfp4, kNvfp4CodeBytes, geometry_, logical_capacity_,
-                               table, expected_v);
+            scatter_paged_into(expected[row].k_nvfp4, kNvfp4CodeBytes, geometry_,
+                               expected[row].logical_capacity, table, expected_k);
+            scatter_paged_into(expected[row].v_nvfp4, kNvfp4CodeBytes, geometry_,
+                               expected[row].logical_capacity, table, expected_v);
             scatter_paged_into(expected[row].k_nvfp4_scale, kNvfp4QuantGroups, geometry_,
-                               logical_capacity_, table, expected_ks);
+                               expected[row].logical_capacity, table, expected_ks);
             scatter_paged_into(expected[row].v_nvfp4_scale, kNvfp4QuantGroups, geometry_,
-                               logical_capacity_, table, expected_vs);
+                               expected[row].logical_capacity, table, expected_vs);
         }
         failures +=
             verify_exact((label + " cache-k-code").c_str(),
@@ -499,8 +505,10 @@ void BatchDeviceCache::scatter_bf16_rows(std::span<const HostCache> rows,
                                          std::vector<std::uint16_t>& v) const {
     for (std::size_t row = 0; row < rows_; ++row) {
         const std::span<const std::int32_t> table = row_table(row);
-        scatter_paged_into(rows[row].k_bf16, kHeadDim, geometry_, logical_capacity_, table, k);
-        scatter_paged_into(rows[row].v_fp16, kHeadDim, geometry_, logical_capacity_, table, v);
+        scatter_paged_into(rows[row].k_bf16, kHeadDim, geometry_, rows[row].logical_capacity, table,
+                           k);
+        scatter_paged_into(rows[row].v_fp16, kHeadDim, geometry_, rows[row].logical_capacity, table,
+                           v);
     }
 }
 
@@ -520,14 +528,14 @@ void BatchDeviceCache::upload_rows(std::span<const HostCache> rows) {
         std::vector<std::uint16_t> physical_vs(v_scale_elements_, 0);
         for (std::size_t row = 0; row < rows_; ++row) {
             const std::span<const std::int32_t> table = row_table(row);
-            scatter_paged_into(rows[row].k_i8, kHeadDim, geometry_, logical_capacity_, table,
-                               physical_k);
-            scatter_paged_into(rows[row].v_i8, kHeadDim, geometry_, logical_capacity_, table,
-                               physical_v);
-            scatter_paged_into(rows[row].k_scale, kQuantGroups, geometry_, logical_capacity_, table,
-                               physical_ks);
-            scatter_paged_into(rows[row].v_scale, kQuantGroups, geometry_, logical_capacity_, table,
-                               physical_vs);
+            scatter_paged_into(rows[row].k_i8, kHeadDim, geometry_, rows[row].logical_capacity,
+                               table, physical_k);
+            scatter_paged_into(rows[row].v_i8, kHeadDim, geometry_, rows[row].logical_capacity,
+                               table, physical_v);
+            scatter_paged_into(rows[row].k_scale, kQuantGroups, geometry_,
+                               rows[row].logical_capacity, table, physical_ks);
+            scatter_paged_into(rows[row].v_scale, kQuantGroups, geometry_,
+                               rows[row].logical_capacity, table, physical_vs);
         }
         upload_plane(packed_, 0, physical_k.data(), physical_k.size() * sizeof(std::int8_t));
         upload_plane(packed_, 1, physical_v.data(), physical_v.size() * sizeof(std::int8_t));
@@ -542,14 +550,14 @@ void BatchDeviceCache::upload_rows(std::span<const HostCache> rows) {
         std::vector<std::uint8_t> physical_vs(v_scale_elements_, 0);
         for (std::size_t row = 0; row < rows_; ++row) {
             const std::span<const std::int32_t> table = row_table(row);
-            scatter_paged_into(rows[row].k_fp8, kHeadDim, geometry_, logical_capacity_, table,
-                               physical_k);
-            scatter_paged_into(rows[row].v_fp8, kHeadDim, geometry_, logical_capacity_, table,
-                               physical_v);
-            scatter_paged_into(rows[row].k_fp8_scale, kFp8QuantGroups, geometry_, logical_capacity_,
-                               table, physical_ks);
-            scatter_paged_into(rows[row].v_fp8_scale, kFp8QuantGroups, geometry_, logical_capacity_,
-                               table, physical_vs);
+            scatter_paged_into(rows[row].k_fp8, kHeadDim, geometry_, rows[row].logical_capacity,
+                               table, physical_k);
+            scatter_paged_into(rows[row].v_fp8, kHeadDim, geometry_, rows[row].logical_capacity,
+                               table, physical_v);
+            scatter_paged_into(rows[row].k_fp8_scale, kFp8QuantGroups, geometry_,
+                               rows[row].logical_capacity, table, physical_ks);
+            scatter_paged_into(rows[row].v_fp8_scale, kFp8QuantGroups, geometry_,
+                               rows[row].logical_capacity, table, physical_vs);
         }
         upload_plane(packed_, 0, physical_k.data(), physical_k.size());
         upload_plane(packed_, 1, physical_v.data(), physical_v.size());
@@ -564,14 +572,14 @@ void BatchDeviceCache::upload_rows(std::span<const HostCache> rows) {
         std::vector<std::uint8_t> physical_vs(v_scale_elements_, 0);
         for (std::size_t row = 0; row < rows_; ++row) {
             const std::span<const std::int32_t> table = row_table(row);
-            scatter_paged_into(rows[row].k_fp8, kHeadDim, geometry_, logical_capacity_, table,
-                               physical_k);
-            scatter_paged_into(rows[row].v_nvfp4, kNvfp4CodeBytes, geometry_, logical_capacity_,
-                               table, physical_v);
-            scatter_paged_into(rows[row].k_fp8_scale, kFp8QuantGroups, geometry_, logical_capacity_,
-                               table, physical_ks);
+            scatter_paged_into(rows[row].k_fp8, kHeadDim, geometry_, rows[row].logical_capacity,
+                               table, physical_k);
+            scatter_paged_into(rows[row].v_nvfp4, kNvfp4CodeBytes, geometry_,
+                               rows[row].logical_capacity, table, physical_v);
+            scatter_paged_into(rows[row].k_fp8_scale, kFp8QuantGroups, geometry_,
+                               rows[row].logical_capacity, table, physical_ks);
             scatter_paged_into(rows[row].v_nvfp4_scale, kNvfp4QuantGroups, geometry_,
-                               logical_capacity_, table, physical_vs);
+                               rows[row].logical_capacity, table, physical_vs);
         }
         upload_plane(packed_, 0, physical_k.data(), physical_k.size());
         upload_plane(packed_, 1, physical_v.data(), physical_v.size());
@@ -585,14 +593,14 @@ void BatchDeviceCache::upload_rows(std::span<const HostCache> rows) {
     std::vector<std::uint8_t> physical_vs(v_scale_elements_, 0);
     for (std::size_t row = 0; row < rows_; ++row) {
         const std::span<const std::int32_t> table = row_table(row);
-        scatter_paged_into(rows[row].k_nvfp4, kNvfp4CodeBytes, geometry_, logical_capacity_, table,
-                           physical_k);
-        scatter_paged_into(rows[row].v_nvfp4, kNvfp4CodeBytes, geometry_, logical_capacity_, table,
-                           physical_v);
-        scatter_paged_into(rows[row].k_nvfp4_scale, kNvfp4QuantGroups, geometry_, logical_capacity_,
-                           table, physical_ks);
-        scatter_paged_into(rows[row].v_nvfp4_scale, kNvfp4QuantGroups, geometry_, logical_capacity_,
-                           table, physical_vs);
+        scatter_paged_into(rows[row].k_nvfp4, kNvfp4CodeBytes, geometry_,
+                           rows[row].logical_capacity, table, physical_k);
+        scatter_paged_into(rows[row].v_nvfp4, kNvfp4CodeBytes, geometry_,
+                           rows[row].logical_capacity, table, physical_v);
+        scatter_paged_into(rows[row].k_nvfp4_scale, kNvfp4QuantGroups, geometry_,
+                           rows[row].logical_capacity, table, physical_ks);
+        scatter_paged_into(rows[row].v_nvfp4_scale, kNvfp4QuantGroups, geometry_,
+                           rows[row].logical_capacity, table, physical_vs);
     }
     upload_plane(packed_, 0, physical_k.data(), physical_k.size());
     upload_plane(packed_, 1, physical_v.data(), physical_v.size());

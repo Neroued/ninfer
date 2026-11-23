@@ -638,7 +638,7 @@ std::string case_label(const char* entry, const Geometry& geometry, KvCacheStora
     return std::string(entry) + " " + geometry.name + " " + cache_name(storage) +
            " mapping=" + mapping_name(mapping) + " T=" + std::to_string(test_case.tokens) +
            " keys=" + std::to_string(test_case.base + test_case.tokens) +
-           " envelope_max=" + std::to_string(test_case.envelope_max) +
+           " bucket=" + std::string(ops::context_bucket_name(test_case.bucket)) +
            " qk_amplitude=" + std::to_string(test_case.qk_amplitude) +
            (test_case.graph_replay ? " graph-replay" : "");
 }

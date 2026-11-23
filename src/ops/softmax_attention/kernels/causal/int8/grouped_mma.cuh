@@ -47,6 +47,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     constexpr int PVKs                 = Bc / 16;
     constexpr int ProducerThreads      = RowTiles * 32;
     constexpr int VLoaderThreads       = Threads - ProducerThreads;
+    constexpr bool ReloadQueryScales   = RowTiles <= 2 || (Bc == 64 && RowTiles == 4);
+    constexpr int QueryGroupUnroll     = ReloadQueryScales ? 1 : Groups;
     constexpr float Log2E              = common::kLog2E;
     constexpr unsigned FullMask        = 0xffffffffu;
 
@@ -62,11 +64,12 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     // registers across the whole kernel. The main arena holds K i8, V i8, and
     // V FP16 during the key loop.
     __shared__ __align__(16) std::int8_t q_s[Br * D];
+    __shared__ float q_scales[ReloadQueryScales ? Br * Groups : 1];
     __shared__ __align__(16) std::int8_t static_r_s[DynamicArena ? 16 : 4 * Bc * D];
     extern __shared__ __align__(16) std::int8_t dynamic_r_s[];
     std::int8_t* r_s     = DynamicArena ? dynamic_r_s : static_r_s;
     std::int8_t* q_i8    = q_s;
-    float* q_scale_tmp   = reinterpret_cast<float*>(r_s);
+    float* q_scale_tmp   = ReloadQueryScales ? q_scales : reinterpret_cast<float*>(r_s);
     std::int8_t* k_i8    = r_s;
     __nv_bfloat16* q_b16 = reinterpret_cast<__nv_bfloat16*>(q_i8);
     __nv_bfloat16* k_b16 = reinterpret_cast<__nv_bfloat16*>(k_i8);
@@ -83,12 +86,19 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     const int tile_tokens = ParallelQueries ? min(TokenTile, full_width - column_begin) : TokenTile;
     const int partial_width = full_width;
     const int partial_begin = column_begin;
-    const int split         = static_cast<int>(blockIdx.y);
-    const int batch         = MultiBatch ? static_cast<int>(blockIdx.z) : 0;
-    const int split_count   = static_cast<int>(gridDim.y);
-    const int tid           = static_cast<int>(threadIdx.x);
-    const int warp          = tid >> 5;
-    const int lane          = tid & 31;
+    CausalProducerSplit assignment{MultiBatch ? static_cast<int>(blockIdx.z) : 0,
+                                   static_cast<int>(blockIdx.y),
+                                   {0, -1, 0}};
+    if constexpr (MultiBatch && !Direct) {
+        assignment = causal_producer_split<MultiBatch, Masked, Direct>(
+            partition, pos, valid_columns, full_width, logical_capacity);
+        if (assignment.batch < 0) return;
+    }
+    const int batch = MultiBatch ? assignment.batch : 0;
+    const int split = (MultiBatch && !Direct) ? assignment.split : static_cast<int>(blockIdx.y);
+    const int tid   = static_cast<int>(threadIdx.x);
+    const int warp  = tid >> 5;
+    const int lane  = tid & 31;
 
     int valid_tokens = tile_tokens;
     if constexpr (Masked) {
@@ -103,35 +113,43 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     }
     std::int64_t column_base = column_begin;
     if constexpr (MultiBatch) { column_base += static_cast<std::int64_t>(batch) * full_width; }
+    int window             = 0;
+    int active_split_count = -1;
+    if constexpr (MultiBatch && !Direct) {
+        window             = assignment.slots.window;
+        active_split_count = assignment.slots.count;
+    }
+    if (active_split_count < 0) {
+        const int last_pos = pos[(MultiBatch ? batch * full_width : 0) + full_width - 1];
+        if (pos[column_base] < 0 || last_pos < 0 || last_pos >= logical_capacity) return;
+        window             = last_pos + 1;
+        active_split_count = partition.active(window);
+    }
+
     if constexpr (Direct) out += std::int64_t(D) * Geometry::QHeads * column_base;
-    q += static_cast<std::int64_t>(256) * Geometry::QHeads * column_base;
-    const int last_pos = pos[(MultiBatch ? batch * full_width : 0) + full_width - 1];
+    q += std::int64_t(D) * Geometry::QHeads * column_base;
     pos += column_base;
     if constexpr (CacheInput::writes_cache) {
-        input.k += static_cast<std::int64_t>(256) * Geometry::KVHeads * column_base;
-        input.v += static_cast<std::int64_t>(256) * Geometry::KVHeads * column_base;
+        input.k += std::int64_t(D) * Geometry::KVHeads * column_base;
+        input.v += std::int64_t(D) * Geometry::KVHeads * column_base;
     }
     const int table_row = table_rows == nullptr ? 0 : table_rows[batch];
     const std::int64_t* block_table =
         block_tables + static_cast<std::int64_t>(table_row) * table_stride;
     if constexpr (MultiBatch && !Direct) {
-        partial_acc +=
-            static_cast<std::int64_t>(batch) * 256 * Geometry::QHeads * partial_width * split_count;
-        partial_m +=
-            static_cast<std::int64_t>(batch) * Geometry::QHeads * partial_width * split_count;
-        partial_l +=
-            static_cast<std::int64_t>(batch) * Geometry::QHeads * partial_width * split_count;
+        const auto stat =
+            static_cast<std::int64_t>(assignment.slots.offset) * Geometry::QHeads * partial_width;
+        partial_acc += stat * D;
+        partial_m += stat;
+        partial_l += stat;
     }
 
-    if (pos[0] < 0 || last_pos < 0 || last_pos >= logical_capacity) return;
-    const int window             = last_pos + 1;
-    const int active_split_count = partition.active(window);
     if (split >= active_split_count) return;
     const int logical_tiles    = common::div_up(window, Bc);
     const int first_owned_tile = split * logical_tiles / active_split_count;
     const int end_owned_tile   = (split + 1) * logical_tiles / active_split_count;
-    const int split_start      = first_owned_tile * Bc;
-    const int split_end        = min(end_owned_tile * Bc, window);
+    const int split_start      = Direct ? 0 : first_owned_tile * Bc;
+    const int split_end        = Direct ? window : min(end_owned_tile * Bc, window);
     const int first_tile       = split_start;
     const int key_blocks       = common::div_up(split_end - first_tile, Bc);
 
@@ -211,7 +229,9 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     }
 
     for (int i = tid; i < Br * D; i += Threads) { q_i8[i] = 0; }
-    for (int i = tid; i < RowCount * Groups; i += Threads) { q_scale_tmp[i] = 0.0f; }
+    for (int i = tid; i < (ReloadQueryScales ? Br : RowCount) * Groups; i += Threads) {
+        q_scale_tmp[i] = 0.0f;
+    }
     __syncthreads();
 
     for (int row = warp; row < RowCount; row += Wc) {
@@ -257,7 +277,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
 
     float q_scale_r0[Groups];
     float q_scale_r1[Groups];
-    if (warp < RowTiles) {
+    if (!ReloadQueryScales && warp < RowTiles) {
         const int producer_row0 = warp * 16 + gid;
 #pragma unroll
         for (int g = 0; g < Groups; ++g) {
@@ -271,7 +291,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
             q_scale_r1[g] = __shfl_sync(FullMask, qs1, gid * 4);
         }
     }
-    __syncthreads();
+    if constexpr (!ReloadQueryScales) __syncthreads();
 
     float acc[PVNtPerWarp][4];
 #pragma unroll
@@ -286,7 +306,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     auto issue_kv_tile = [&](int tile_k0, std::int64_t record_offset) {
         for (int key_l = tid; key_l < Bc; key_l += Threads) {
             const int key = tile_k0 + key_l;
-            if (key >= split_start && key < split_end) {
+            if (key < split_end) {
                 const std::int64_t off =
                     kv::Int8G64Layout::scale_offset(record_offset, kv_head, 0, key & kv::kPageMask);
                 common::cp_async<8>(&k_scale_s[key_l * Groups], &cache_k_scale[off]);
@@ -302,7 +322,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
             const int dc    = chunk - key_l * (D / 16);
             const int d     = dc * 16;
             const int key   = tile_k0 + key_l;
-            if (key >= split_start && key < split_end) {
+            if (key < split_end) {
                 const std::int64_t off =
                     kv::Int8G64Layout::code_offset(record_offset, kv_head, d, key & kv::kPageMask);
                 std::int8_t* dst = &k_i8[key_l * D + common::swizzle_xor_64(key_l, dc * 8) * 2];
@@ -339,8 +359,15 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                 score[nt][3] = 0.0f;
             }
 
-#pragma unroll
+#pragma unroll QueryGroupUnroll
             for (int g = 0; g < Groups; ++g) {
+                // The wide QK/PV tile reloads one group at a time, freeing the
+                // scale registers while the value accumulators are live.
+                const int query_row = producer_row_base + gid;
+                const float qs0 =
+                    ReloadQueryScales ? q_scale_tmp[query_row * Groups + g] : q_scale_r0[g];
+                const float qs1 =
+                    ReloadQueryScales ? q_scale_tmp[(query_row + 8) * Groups + g] : q_scale_r1[g];
                 unsigned af[GroupKc][4];
 #pragma unroll
                 for (int kk = 0; kk < GroupKc; ++kk) {
@@ -379,10 +406,10 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                     }
                     ka  = __shfl_sync(FullMask, ka, lid);
                     kb2 = __shfl_sync(FullMask, kb2, lid);
-                    score[nt][0] += q_scale_r0[g] * ka * static_cast<float>(c0);
-                    score[nt][1] += q_scale_r0[g] * kb2 * static_cast<float>(c1);
-                    score[nt][2] += q_scale_r1[g] * ka * static_cast<float>(c2);
-                    score[nt][3] += q_scale_r1[g] * kb2 * static_cast<float>(c3);
+                    score[nt][0] += qs0 * ka * static_cast<float>(c0);
+                    score[nt][1] += qs0 * kb2 * static_cast<float>(c1);
+                    score[nt][2] += qs1 * ka * static_cast<float>(c2);
+                    score[nt][3] += qs1 * kb2 * static_cast<float>(c3);
                 }
             }
 
@@ -391,8 +418,10 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
             int q_head0 = 0, token0 = 0, q_head1 = 0, token1 = 0;
             causal_row_to_qt<Geometry>(row0, kv_head, q_head0, token0);
             causal_row_to_qt<Geometry>(row1, kv_head, q_head1, token1);
-            const int qabs0 = (row0 < tile_tokens * Geometry::GroupSize) ? pos[token0] : -1;
-            const int qabs1 = (row1 < tile_tokens * Geometry::GroupSize) ? pos[token1] : -1;
+            const int qabs0 =
+                row0 < tile_tokens * Geometry::GroupSize ? min(pos[token0], split_end - 1) : -1;
+            const int qabs1 =
+                row1 < tile_tokens * Geometry::GroupSize ? min(pos[token1], split_end - 1) : -1;
             float bm0 = -CUDART_INF_F, bm1 = -CUDART_INF_F;
 #pragma unroll
             for (int nt = 0; nt < QKNt; ++nt) {
@@ -400,22 +429,10 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                 const int col1 = col0 + 1;
                 const int key0 = k0 + col0;
                 const int key1 = k0 + col1;
-                score[nt][0]   = (row0 < tile_tokens * Geometry::GroupSize && key0 >= split_start &&
-                                key0 < split_end && key0 <= qabs0)
-                                     ? score[nt][0] * scale
-                                     : -CUDART_INF_F;
-                score[nt][1]   = (row0 < tile_tokens * Geometry::GroupSize && key1 >= split_start &&
-                                key1 < split_end && key1 <= qabs0)
-                                     ? score[nt][1] * scale
-                                     : -CUDART_INF_F;
-                score[nt][2]   = (row1 < tile_tokens * Geometry::GroupSize && key0 >= split_start &&
-                                key0 < split_end && key0 <= qabs1)
-                                     ? score[nt][2] * scale
-                                     : -CUDART_INF_F;
-                score[nt][3]   = (row1 < tile_tokens * Geometry::GroupSize && key1 >= split_start &&
-                                key1 < split_end && key1 <= qabs1)
-                                     ? score[nt][3] * scale
-                                     : -CUDART_INF_F;
+                score[nt][0]   = key0 <= qabs0 ? score[nt][0] * scale : -CUDART_INF_F;
+                score[nt][1]   = key1 <= qabs0 ? score[nt][1] * scale : -CUDART_INF_F;
+                score[nt][2]   = key0 <= qabs1 ? score[nt][2] * scale : -CUDART_INF_F;
+                score[nt][3]   = key1 <= qabs1 ? score[nt][3] * scale : -CUDART_INF_F;
                 bm0            = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));
                 bm1            = fmaxf(bm1, fmaxf(score[nt][2], score[nt][3]));
             }
@@ -475,7 +492,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                 const int d     = dc * 8;
                 const int key   = k0 + key_l;
                 __half* dst     = &v_f16[key_l * D + common::swizzle_xor_64(key_l, d)];
-                if (key >= split_start && key < split_end) {
+                if (key < split_end) {
                     const int grp = d >> 6;
                     float vs      = 0.0f;
                     if ((lane & 7) == 0) { vs = __half2float(v_scale_s[key_l * Groups + grp]); }
@@ -522,25 +539,51 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
             acc[n][3] *= alpha1;
         }
 
-#pragma unroll
-        for (int n = 0; n < PVNtPerWarp; ++n) {
-            const int global_n = consumer_slice * PVNtPerWarp + n;
+        if constexpr (Bc == 64) {
+            // Use one probability fragment across D before loading the next key tile fragment.
 #pragma unroll
             for (int k = 0; k < PVKs; ++k) {
                 unsigned pf[4];
                 const int pcol = k * 16 + a_coloff;
-                common::ldmatrix_x4(
-                    pf[0], pf[1], pf[2], pf[3],
-                    common::smem_addr(&p_consumer[a_rowoff * Bc +
-                                                  causal_probability_swizzle<Bc>(a_rowoff, pcol)]));
-                unsigned vf[2];
-                const int vrow = k * 16 + b_koff + b_rin;
-                const int vcol = global_n * 8;
-                common::ldmatrix_x2_t(
-                    vf[0], vf[1],
-                    common::smem_addr(&v_f16[vrow * D + common::swizzle_xor_64(vrow, vcol)]));
-                common::mma_f16(acc[n][0], acc[n][1], acc[n][2], acc[n][3], pf[0], pf[1], pf[2],
-                                pf[3], vf[0], vf[1]);
+                common::ldmatrix_x4(pf[0], pf[1], pf[2], pf[3],
+                                    common::smem_addr(&p_consumer[a_rowoff * Bc +
+                                                                  causal_probability_swizzle<Bc>(
+                                                                      a_rowoff, pcol)]));
+#pragma unroll
+                for (int n = 0; n < PVNtPerWarp; ++n) {
+                    const int global_n = consumer_slice * PVNtPerWarp + n;
+                    unsigned vf[2];
+                    const int vrow = k * 16 + b_koff + b_rin;
+                    const int vcol = global_n * 8;
+                    common::ldmatrix_x2_t(
+                        vf[0], vf[1],
+                        common::smem_addr(&v_f16[vrow * D + common::swizzle_xor_64(vrow, vcol)]));
+                    common::mma_f16(acc[n][0], acc[n][1], acc[n][2], acc[n][3], pf[0], pf[1], pf[2],
+                                    pf[3], vf[0], vf[1]);
+                }
+            }
+        } else {
+#pragma unroll
+            for (int n = 0; n < PVNtPerWarp; ++n) {
+                const int global_n = consumer_slice * PVNtPerWarp + n;
+#pragma unroll
+                for (int k = 0; k < PVKs; ++k) {
+                    unsigned pf[4];
+                    const int pcol = k * 16 + a_coloff;
+                    common::ldmatrix_x4(
+                        pf[0], pf[1], pf[2], pf[3],
+                        common::smem_addr(
+                            &p_consumer[a_rowoff * Bc +
+                                        causal_probability_swizzle<Bc>(a_rowoff, pcol)]));
+                    unsigned vf[2];
+                    const int vrow = k * 16 + b_koff + b_rin;
+                    const int vcol = global_n * 8;
+                    common::ldmatrix_x2_t(
+                        vf[0], vf[1],
+                        common::smem_addr(&v_f16[vrow * D + common::swizzle_xor_64(vrow, vcol)]));
+                    common::mma_f16(acc[n][0], acc[n][1], acc[n][2], acc[n][3], pf[0], pf[1], pf[2],
+                                    pf[3], vf[0], vf[1]);
+                }
             }
         }
         if (has_next) { common::cp_wait<0>(); }

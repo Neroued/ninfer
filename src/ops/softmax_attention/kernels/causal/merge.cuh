@@ -44,8 +44,8 @@ __launch_bounds__(256) __global__
     void causal_natural_merge_kernel(const float* partial_acc, const float* partial_m,
                                      const float* partial_l, const std::int32_t* positions,
                                      const std::int32_t* valid_columns, std::int32_t tokens,
-                                     std::int32_t batch_size, CausalKvPartition partition,
-                                     __nv_bfloat16* out) {
+                                     std::int32_t batch_size, std::int32_t logical_capacity,
+                                     CausalKvPartition partition, __nv_bfloat16* out) {
     static_assert(Geometry::kHeadDim == kCausalHeadDim);
     static_assert(DChunk > 0 && DChunk <= kCausalHeadDim);
     static_assert(!InverseRotation || DChunk == kCausalHeadDim);
@@ -58,17 +58,16 @@ __launch_bounds__(256) __global__
         batch = flat_column / tokens;
         token = flat_column - batch * tokens;
     }
-    const int tid         = static_cast<int>(threadIdx.x);
-    const int split_count = partition.capacity;
+    const int tid = static_cast<int>(threadIdx.x);
     if (q_head >= Geometry::QHeads || token >= tokens) return;
     if constexpr (MultiBatch) {
         if (batch >= batch_size) return;
     }
     int output_column = token;
     if constexpr (MultiBatch) output_column += batch * tokens;
+    const int live_columns = Masked ? valid_columns[batch] : tokens;
     if constexpr (Masked) {
-        const int absolute_column = token;
-        if (absolute_column >= valid_columns[batch]) {
+        if (token >= live_columns) {
             if (tid < DChunk && d_start + tid < 256)
                 out[causal_q_index<Geometry>(q_head, d_start + tid, output_column)] =
                     __float2bfloat16(0.0f);
@@ -76,15 +75,16 @@ __launch_bounds__(256) __global__
         }
     }
 
+    const auto slots =
+        causal_merge_splits<MultiBatch, Masked>(partition, positions, valid_columns, tokens,
+                                                live_columns, batch, batch_size, logical_capacity);
     if constexpr (MultiBatch) {
-        partial_acc +=
-            static_cast<std::int64_t>(batch) * 256 * Geometry::QHeads * tokens * split_count;
-        partial_m += static_cast<std::int64_t>(batch) * Geometry::QHeads * tokens * split_count;
-        partial_l += static_cast<std::int64_t>(batch) * Geometry::QHeads * tokens * split_count;
+        const auto stat = static_cast<std::int64_t>(slots.offset) * Geometry::QHeads * tokens;
+        partial_acc += stat * Geometry::kHeadDim;
+        partial_m += stat;
+        partial_l += stat;
     }
-    if constexpr (MultiBatch) positions += static_cast<std::int64_t>(batch) * tokens;
-    const int window        = positions[tokens - 1] + 1;
-    const int active_splits = partition.active(window);
+    const int active_splits = slots.count < 0 ? partition.active(slots.window) : slots.count;
     __shared__ float weights[256], warp_sums[8], scalars[2];
     const float head_l = causal_merge_natural_statistics<Geometry>(
         partial_m, partial_l, q_head, token, tokens, active_splits, weights, warp_sums, scalars);
@@ -123,7 +123,8 @@ void launch_causal_natural_merge(const CausalAttentionOperands& p,
     const dim3 grid(G::QHeads, common::div_up(G::kHeadDim, S::kDChunk), p.width * p.batch);
     causal_natural_merge_kernel<G, S::kDChunk, MultiBatch, Masked, InverseRotation>
         <<<grid, S::kThreads, 0, stream>>>(partial.acc, partial.maximum, partial.sum, p.positions,
-                                           valid_columns, p.width, p.batch, partition, p.out);
+                                           valid_columns, p.width, p.batch, p.visible_capacity,
+                                           partition, p.out);
     CUDA_CHECK(cudaGetLastError());
 }
 

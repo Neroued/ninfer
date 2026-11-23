@@ -12,16 +12,14 @@ struct K8V4KvCausalPlan {
     static constexpr int kTokenTile = 8;
     K8V4KvFamily family;
     int query_heads, width, batch, query_tile;
-    CausalAttentionExecutionEnvelope envelope;
+    ContextBucket bucket;
     CausalKvPartition partition;
 };
 
-K8V4KvCausalPlan select_k8v4_kv_causal_plan(int heads, int width, int batch,
-                                            CausalAttentionExecutionEnvelope envelope,
+K8V4KvCausalPlan select_k8v4_kv_causal_plan(int heads, int width, int batch, ContextBucket bucket,
                                             int multiprocessor_count);
 std::size_t k8v4_kv_workspace_bytes(int heads, int batch, int min_width, int max_width,
-                                    CausalAttentionExecutionEnvelope envelope,
-                                    int multiprocessor_count);
+                                    ContextBucket bucket, int multiprocessor_count);
 
 kv::PagedWriteInstance select_k8v4_kv_write(int heads, int width, int batch);
 

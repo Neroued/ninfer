@@ -12,16 +12,14 @@ struct Nvfp4KvCausalPlan {
     static constexpr int kTokenTile = 8;
     Nvfp4KvFamily family;
     int query_heads, width, batch, query_tile;
-    CausalAttentionExecutionEnvelope envelope;
+    ContextBucket bucket;
     CausalKvPartition partition;
 };
 
-Nvfp4KvCausalPlan select_nvfp4_kv_causal_plan(int heads, int width, int batch,
-                                              CausalAttentionExecutionEnvelope envelope,
+Nvfp4KvCausalPlan select_nvfp4_kv_causal_plan(int heads, int width, int batch, ContextBucket bucket,
                                               int multiprocessor_count);
 std::size_t nvfp4_kv_workspace_bytes(int heads, int batch, int min_width, int max_width,
-                                     CausalAttentionExecutionEnvelope envelope,
-                                     int multiprocessor_count);
+                                     ContextBucket bucket, int multiprocessor_count);
 
 kv::PagedWriteInstance select_nvfp4_kv_write(int heads, int width, int batch);
 

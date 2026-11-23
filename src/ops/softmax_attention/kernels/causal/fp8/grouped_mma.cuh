@@ -80,9 +80,10 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     const int live_row_tiles = (tile_tokens * Geometry::GroupSize + 15) / 16;
     const int partial_width  = ParallelQueries ? full_width : TokenTile;
     const int partial_begin  = ParallelQueries ? column_begin : 0;
-    const int split          = static_cast<int>(blockIdx.y);
-    const int batch          = MultiBatch ? static_cast<int>(blockIdx.z) : 0;
-    const int split_count    = static_cast<int>(gridDim.y);
+    const auto assignment    = causal_producer_split<MultiBatch, Masked, Direct>(
+        partition, positions, valid_columns, full_width, logical_capacity);
+    if (assignment.batch < 0) return;
+    const int batch = assignment.batch, split = assignment.split;
     const int tid            = static_cast<int>(threadIdx.x);
     const int warp           = tid >> 5;
     const int lane           = tid & 31;
@@ -98,36 +99,35 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                 out, kv_head, std::int64_t(batch) * full_width + column_begin, tile_tokens);
         return;
     }
-    std::int64_t column_base = column_begin;
-    if constexpr (MultiBatch) { column_base += static_cast<std::int64_t>(batch) * full_width; }
+    const int row_begin            = batch * full_width;
+    const std::int64_t column_base = row_begin + column_begin;
+    int window                     = assignment.slots.window;
+    int active_split_count         = assignment.slots.count;
+    if (active_split_count < 0) {
+        const int last_pos = positions[row_begin + full_width - 1];
+        if (positions[column_base] < 0 || last_pos < 0 || last_pos >= logical_capacity) return;
+        window             = last_pos + 1;
+        active_split_count = partition.active(window);
+    }
+
     if constexpr (Direct) out += std::int64_t(D) * Geometry::QHeads * column_base;
-    q += static_cast<std::int64_t>(D) * Geometry::QHeads * column_base;
-    const int global_last_pos = positions[(MultiBatch ? batch * full_width : 0) + full_width - 1];
+    q += std::int64_t(D) * Geometry::QHeads * column_base;
     positions += column_base;
     if constexpr (CacheInput::writes_cache) {
-        input.k += static_cast<std::int64_t>(D) * Geometry::KVHeads * column_base;
-        input.v += static_cast<std::int64_t>(D) * Geometry::KVHeads * column_base;
+        input.k += std::int64_t(D) * Geometry::KVHeads * column_base;
+        input.v += std::int64_t(D) * Geometry::KVHeads * column_base;
     }
     const int table_row = table_rows == nullptr ? 0 : table_rows[batch];
     const std::int64_t* block_table =
         block_tables + static_cast<std::int64_t>(table_row) * table_stride;
     if constexpr (MultiBatch && !Direct) {
-        partial_acc +=
-            static_cast<std::int64_t>(batch) * D * Geometry::QHeads * partial_width * split_count;
-        partial_m +=
-            static_cast<std::int64_t>(batch) * Geometry::QHeads * partial_width * split_count;
-        partial_l +=
-            static_cast<std::int64_t>(batch) * Geometry::QHeads * partial_width * split_count;
+        const auto stat =
+            static_cast<std::int64_t>(assignment.slots.offset) * Geometry::QHeads * partial_width;
+        partial_acc += stat * D;
+        partial_m += stat;
+        partial_l += stat;
     }
 
-    if (kv_head < 0 || kv_head >= Geometry::KVHeads || split_count <= 0) return;
-
-    const std::int32_t first_pos = positions[0];
-    const std::int32_t last_pos  = ParallelQueries ? global_last_pos : positions[TokenTile - 1];
-    if (first_pos < 0 || last_pos < 0 || last_pos >= logical_capacity) return;
-
-    const int window             = last_pos + 1;
-    const int active_split_count = partition.active(window);
     if (split >= active_split_count) return;
 
     const int logical_tiles    = common::div_up(window, Bc);

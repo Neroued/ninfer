@@ -4,6 +4,7 @@
 #include "ops/softmax_attention/kernels/causal/bf16/epilogue.cuh"
 #include "ops/softmax_attention/kernels/softmax.cuh"
 #include "ops/softmax_attention/kernels/causal/bf16/partition.h"
+#include "ops/softmax_attention/kernels/causal/partition.h"
 
 namespace ninfer::ops::detail {
 
@@ -53,10 +54,16 @@ __launch_bounds__(S::kLaunchBoundThreads, S::kMinBlocks) __global__
                                     float scale, Bf16KvPartition partition,
                                     CausalPartialView partial, __nv_bfloat16* out) {
     const int width = S::kFixedWidth ? S::kFixedWidth : runtime_width;
+    const auto assignment =
+        causal_producer_split<MultiBatch, Masked, Direct>(partition, positions, validity, width);
+    if (assignment.batch < 0) return;
+    const int batch = assignment.batch, split = assignment.split;
     constexpr int D = G::kHeadDim, M = S::kQueryRows, N = S::kKeyRows;
     constexpr int NK = N / S::kWarpsKV, QKNt = NK / 8, QKKs = D / 16;
     constexpr int PVNt = D / 8, PVKs = NK / 16;
-    using Storage = Bf16KvGroupedStorage<G, S>;
+    using Storage                      = Bf16KvGroupedStorage<G, S>;
+    constexpr int SharedQueryColumns   = Storage::kSharedQueryColumns;
+    constexpr int RegisterQueryColumns = D - SharedQueryColumns;
     static_assert(sizeof(Storage) <= 99 * 1024);
     Storage* storage;
     if constexpr (sizeof(Storage) <= 48 * 1024) {
@@ -68,11 +75,11 @@ __launch_bounds__(S::kLaunchBoundThreads, S::kMinBlocks) __global__
     }
     auto* k_s     = reinterpret_cast<__nv_bfloat16*>(storage->qkv);
     auto* v_s     = reinterpret_cast<__half*>(storage->qkv + N * D);
+    auto* q_tail  = k_s + 2 * N * D;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int warp_q = warp % S::kWarpsQ, warp_kv = warp / S::kWarpsQ;
-    const int head  = S::kFixedWidth ? blockIdx.x : blockIdx.x % G::KVHeads;
-    const int tile  = S::kFixedWidth ? 0 : blockIdx.x / G::KVHeads;
-    const int split = blockIdx.y, batch = MultiBatch ? blockIdx.z : 0;
+    const int head      = S::kFixedWidth ? blockIdx.x : blockIdx.x % G::KVHeads;
+    const int tile      = S::kFixedWidth ? 0 : blockIdx.x / G::KVHeads;
     const int row_begin = tile * M, packed_rows = width * G::GroupSize;
     const int live = Masked ? validity[batch] : width;
     q += static_cast<std::int64_t>(batch) * width * D * G::QHeads;
@@ -83,11 +90,10 @@ __launch_bounds__(S::kLaunchBoundThreads, S::kMinBlocks) __global__
         input.v += static_cast<std::int64_t>(batch) * width * D * G::KVHeads;
     }
     if constexpr (!Direct) {
-        partial.acc +=
-            static_cast<std::int64_t>(batch) * width * G::QHeads * D * partition.capacity;
-        partial.maximum +=
-            static_cast<std::int64_t>(batch) * width * G::QHeads * partition.capacity;
-        partial.sum += static_cast<std::int64_t>(batch) * width * G::QHeads * partition.capacity;
+        const auto stat = static_cast<std::int64_t>(assignment.slots.offset) * width * G::QHeads;
+        partial.acc += stat * D;
+        partial.maximum += stat;
+        partial.sum += stat;
     }
     const auto neutral = [&]() {
         for (int i = tid; i < M * (D / 2); i += S::kThreads) {
@@ -104,8 +110,11 @@ __launch_bounds__(S::kLaunchBoundThreads, S::kMinBlocks) __global__
         if constexpr (Direct) neutral();
         return;
     }
-    const int first = positions[0], window = positions[live - 1] + 1;
-    const auto work = partition.live(window);
+    const int first = positions[0];
+    const int window =
+        assignment.slots.count < 0 ? positions[live - 1] + 1 : assignment.slots.window;
+    const auto work = assignment.slots.count < 0 ? partition.live(window)
+                                                 : partition.live(window, assignment.slots.count);
     if (split >= work.splits) return;
     const int start           = split * work.keys_per_split;
     const int stop            = min(window, start + work.keys_per_split);
@@ -136,6 +145,11 @@ __launch_bounds__(S::kLaunchBoundThreads, S::kMinBlocks) __global__
         const int row = i / (D / 8), d = i % (D / 8) * 8, packed = row_begin + row;
         const int token = packed / G::GroupSize, h = head * G::GroupSize + packed % G::GroupSize;
         auto* dst = k_s + row * D + common::swizzle_xor_64(row, d);
+        if constexpr (SharedQueryColumns > 0) {
+            if (d >= RegisterQueryColumns)
+                dst = q_tail + row * SharedQueryColumns +
+                      common::swizzle_xor_64(row, d - RegisterQueryColumns);
+        }
         if (token < live)
             common::cp_async<16>(dst, q + causal_q_index<G>(h, d, token));
         else
@@ -144,10 +158,10 @@ __launch_bounds__(S::kLaunchBoundThreads, S::kMinBlocks) __global__
     common::cp_commit();
     common::cp_wait<0>();
     __syncthreads();
-    unsigned q_frag[QKKs][4];
+    unsigned q_frag[RegisterQueryColumns / 16][4];
     const int a_row = warp_q * 16 + (lane & 7) + ((lane >> 3) & 1) * 8;
 #pragma unroll
-    for (int k = 0; k < QKKs; ++k) {
+    for (int k = 0; k < RegisterQueryColumns / 16; ++k) {
         const int d = k * 16 + (lane >> 4) * 8;
         common::ldmatrix_x4(q_frag[k][0], q_frag[k][1], q_frag[k][2], q_frag[k][3],
                             common::smem_addr(k_s + a_row * D + common::swizzle_xor_64(a_row, d)));
@@ -178,21 +192,37 @@ __launch_bounds__(S::kLaunchBoundThreads, S::kMinBlocks) __global__
         common::cp_commit();
         common::cp_wait<0>();
         __syncthreads();
-        float score[QKNt][4] = {};
-        // Q and O already occupy 192 registers per lane at D=256. Keep one
-        // K fragment live at a time; double buffering all N fragments spills.
+        float score[QKNt][4]      = {};
+        const auto score_fragment = [&](int n, int k, const unsigned(&af)[4]) {
+            unsigned bf[2];
+            const int row = warp_kv * NK + n * 8 + (lane & 7);
+            const int d   = k * 16 + ((lane >> 3) & 1) * 8;
+            common::ldmatrix_x2(bf[0], bf[1],
+                                common::smem_addr(k_s + row * D + common::swizzle_xor_64(row, d)));
+            common::mma_bf16(score[n][0], score[n][1], score[n][2], score[n][3], af[0], af[1],
+                             af[2], af[3], bf[0], bf[1]);
+        };
+        if constexpr (SharedQueryColumns == 0) {
 #pragma unroll
-        for (int n = 0; n < QKNt; ++n) {
+            for (int n = 0; n < QKNt; ++n) {
 #pragma unroll
-            for (int k = 0; k < QKKs; ++k) {
-                unsigned bf[2];
-                const int row = warp_kv * NK + n * 8 + (lane & 7);
-                const int d   = k * 16 + ((lane >> 3) & 1) * 8;
-                common::ldmatrix_x2(
-                    bf[0], bf[1],
-                    common::smem_addr(k_s + row * D + common::swizzle_xor_64(row, d)));
-                common::mma_bf16(score[n][0], score[n][1], score[n][2], score[n][3], q_frag[k][0],
-                                 q_frag[k][1], q_frag[k][2], q_frag[k][3], bf[0], bf[1]);
+                for (int k = 0; k < QKKs; ++k) score_fragment(n, k, q_frag[k]);
+            }
+        } else {
+#pragma unroll
+            for (int k = 0; k < RegisterQueryColumns / 16; ++k) {
+#pragma unroll
+                for (int n = 0; n < QKNt; ++n) score_fragment(n, k, q_frag[k]);
+            }
+#pragma unroll
+            for (int k = RegisterQueryColumns / 16; k < QKKs; ++k) {
+                unsigned af[4];
+                const int d = k * 16 - RegisterQueryColumns + (lane >> 4) * 8;
+                common::ldmatrix_x4(af[0], af[1], af[2], af[3],
+                                    common::smem_addr(q_tail + a_row * SharedQueryColumns +
+                                                      common::swizzle_xor_64(a_row, d)));
+#pragma unroll
+                for (int n = 0; n < QKNt; ++n) score_fragment(n, k, af);
             }
         }
         float maximum[2] = {-CUDART_INF_F, -CUDART_INF_F};

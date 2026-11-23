@@ -5,19 +5,20 @@ namespace ninfer::test::causal_attention {
 namespace {
 void add_append_case(OpSuite& suite, Geometry geometry, KvCacheStorage storage, AttentionCase c,
                      MappingPattern mapping, std::span<const int> queries = {},
-                     std::span<const std::uint32_t> limits = {}) {
+                     std::span<const ContextBucket> buckets = {}) {
     const std::vector<int> selected(queries.begin(), queries.end());
-    const std::vector<std::uint32_t> bounds(limits.begin(), limits.end());
-    const bool graph = c.graph_replay || !bounds.empty();
+    const std::vector<ContextBucket> sequence(buckets.begin(), buckets.end());
+    const bool graph = c.graph_replay || !sequence.empty();
     const auto id    = std::string("causal_append/") + cache_name(storage) + "/" + geometry.name +
-                    "/t" + std::to_string(c.tokens) + "/base" + std::to_string(c.base) + "/bound" +
-                    std::to_string(c.envelope_max) + "/seed" + std::to_string(c.seed) + "/" +
-                    mapping_name(mapping) + (bounds.empty() ? "" : "/envelope_updates");
+                    "/t" + std::to_string(c.tokens) + "/base" + std::to_string(c.base) + "/bucket" +
+                    std::string(ops::context_bucket_name(c.bucket)) + "/seed" +
+                    std::to_string(c.seed) + "/" + mapping_name(mapping) +
+                    (sequence.empty() ? "" : "/bucket_updates");
     suite.add(
         id,
         [=] {
             return run_append_case(cuda_environment().context.execution_view(), geometry, storage,
-                                   c, mapping, selected, bounds);
+                                   c, mapping, selected, sequence);
         },
         {{"format", kv_cache_storage_name(storage)}, {"execution", graph ? "graph" : "eager"}});
 }
@@ -26,9 +27,9 @@ void add_cached_case(OpSuite& suite, Geometry geometry, KvCacheStorage storage, 
                      MappingPattern mapping, std::span<const int> queries = {}) {
     const std::vector<int> selected(queries.begin(), queries.end());
     const auto id = std::string("causal_cached/") + cache_name(storage) + "/" + geometry.name +
-                    "/t" + std::to_string(c.tokens) + "/base" + std::to_string(c.base) + "/bound" +
-                    std::to_string(c.envelope_max) + "/seed" + std::to_string(c.seed) + "/" +
-                    mapping_name(mapping);
+                    "/t" + std::to_string(c.tokens) + "/base" + std::to_string(c.base) + "/bucket" +
+                    std::string(ops::context_bucket_name(c.bucket)) + "/seed" +
+                    std::to_string(c.seed) + "/" + mapping_name(mapping);
     suite.add(id,
               [=] {
                   return run_cached_case(cuda_environment().context.execution_view(), geometry,
@@ -39,17 +40,18 @@ void add_cached_case(OpSuite& suite, Geometry geometry, KvCacheStorage storage, 
 }
 
 void add_batch_case(OpSuite& suite, Geometry geometry, KvCacheStorage storage, BatchAttentionCase c,
-                    int envelope = 0, std::span<const std::uint32_t> limits = {}) {
-    const std::vector<std::uint32_t> bounds(limits.begin(), limits.end());
+                    std::optional<ContextBucket> bucket    = {},
+                    std::span<const ContextBucket> buckets = {}) {
+    const std::vector<ContextBucket> sequence(buckets.begin(), buckets.end());
     std::string id = std::string("causal_batch/") + cache_name(storage) + "/" + geometry.name +
                      "/w" + std::to_string(c.width) + "/b" + std::to_string(c.contexts.size()) +
                      "/seed" + std::to_string(c.seed) + "/contexts";
     for (int context : c.contexts) id += "_" + std::to_string(context);
-    if (!bounds.empty()) id += "/envelope_updates";
+    if (!sequence.empty()) id += "/bucket_updates";
     suite.add(id,
               [=] {
                   return run_batch_case(cuda_environment().context.execution_view(), geometry,
-                                        storage, c, envelope, bounds);
+                                        storage, c, bucket, sequence);
               },
               {{"suite", c.contexts.size() > 8 ? "concurrency" : "causal_batch"},
                {"format", kv_cache_storage_name(storage)},
@@ -112,10 +114,10 @@ void add_verify_width_cases(OpSuite& suite, KvCacheStorage storage) {
     run(16, 8, 2048, true);
     for (int width : {8, 9, 16}) {
         add_append_case(suite, kGeometries[0], storage,
-                        {width, 2048, static_cast<unsigned>(2048 + width), 1801u, false, true},
+                        {width, 2048, select_context_bucket(2048 + width), 1801u, false, true},
                         MappingPattern::Fragmented);
         add_cached_case(suite, kGeometries[0], storage,
-                        {width, 8192, static_cast<unsigned>(8192 + width), 1802u, false, true},
+                        {width, 8192, select_context_bucket(8192 + width), 1802u, false, true},
                         MappingPattern::Fragmented);
     }
 }
@@ -163,47 +165,53 @@ void add_batch_cases(OpSuite& suite, KvCacheStorage storage) {
 void add_geometry(OpSuite& suite, const Geometry& geometry, KvCacheStorage storage) {
     for (const MappingPattern mapping :
          {MappingPattern::Identity, MappingPattern::Offset, MappingPattern::Fragmented}) {
-        add_append_case(suite, geometry, storage, {6, 61, 67, 190u}, mapping);
-        add_cached_case(suite, geometry, storage, {1, 128, 129, 191u}, mapping);
+        add_append_case(suite, geometry, storage, {6, 61, select_context_bucket(67), 190u},
+                        mapping);
+        add_cached_case(suite, geometry, storage, {1, 128, select_context_bucket(129), 191u},
+                        mapping);
     }
 
     const AttentionCase a1_cases[] = {
-        {1, 0, 1, 201u},    {6, 17, 23, 202u},   {7, 17, 512, 203u},
-        {17, 31, 48, 204u}, {66, 63, 129, 205u},
+        {1, 0, select_context_bucket(1), 201u},     {6, 17, select_context_bucket(23), 202u},
+        {7, 17, select_context_bucket(512), 203u},  {17, 31, select_context_bucket(48), 204u},
+        {66, 63, select_context_bucket(129), 205u},
     };
     for (const AttentionCase& test_case : a1_cases) {
         add_append_case(suite, geometry, storage, test_case, MappingPattern::Identity);
     }
 
     const AttentionCase a3_cases[] = {
-        {1, 31, 32, 301u},
-        {7, 17, 512, 302u},
-        {17, 31, 48, 303u},
+        {1, 31, select_context_bucket(32), 301u},
+        {7, 17, select_context_bucket(512), 302u},
+        {17, 31, select_context_bucket(48), 303u},
     };
     for (const AttentionCase& test_case : a3_cases) {
         add_cached_case(suite, geometry, storage, test_case, MappingPattern::Identity);
     }
 
     if (geometry.q_heads == 16) {
-        // Wider resource bounds must not change the positions-based mathematical result.
-        add_append_case(suite, geometry, storage, {7, 17, 513, 401u}, MappingPattern::Identity);
-        add_cached_case(suite, geometry, storage, {7, 17, 513, 402u}, MappingPattern::Identity);
-        add_cached_case(suite, geometry, storage, {16, 17, 1024, 403u}, MappingPattern::Identity);
-        add_cached_case(suite, geometry, storage, {16, 17, 1025, 404u}, MappingPattern::Identity);
+        // Wider resource sequence must not change the positions-based mathematical result.
+        add_append_case(suite, geometry, storage, {7, 17, select_context_bucket(513), 401u},
+                        MappingPattern::Identity);
+        add_cached_case(suite, geometry, storage, {7, 17, select_context_bucket(513), 402u},
+                        MappingPattern::Identity);
+        add_cached_case(suite, geometry, storage, {16, 17, select_context_bucket(1024), 403u},
+                        MappingPattern::Identity);
+        add_cached_case(suite, geometry, storage, {16, 17, select_context_bucket(1025), 404u},
+                        MappingPattern::Identity);
     }
 }
 
-// A fixed-width call keeps update-compatible execution across short and
-// long envelopes. Verify each replay against the independent oracle.
-void add_graph_envelope_cases(OpSuite& suite, KvCacheStorage storage) {
-    constexpr std::array<std::uint32_t, 5> short_limits{64, 128, 2048, 64, 2048};
-    constexpr std::array<std::uint32_t, 4> long_limits{32769, 65536, 131072, 32769};
+void add_graph_bucket_cases(OpSuite& suite, KvCacheStorage storage) {
+    constexpr std::array short_buckets{ContextBucket::K2, ContextBucket::K8, ContextBucket::K2};
+    constexpr std::array long_buckets{ContextBucket::K64, ContextBucket::K128, ContextBucket::K64};
     for (const auto& geometry : kGeometries) {
         for (int width : {1, 4, 8, 16})
-            add_append_case(suite, geometry, storage, {width, 17, 2048, 965u},
-                            MappingPattern::Fragmented, {}, short_limits);
-        add_append_case(suite, geometry, storage, {1, 32768, 131072, 966u},
-                        MappingPattern::Fragmented, {}, long_limits);
+            add_append_case(suite, geometry, storage,
+                            {width, 17, select_context_bucket(2048), 965u},
+                            MappingPattern::Fragmented, {}, short_buckets);
+        add_append_case(suite, geometry, storage, {1, 32768, select_context_bucket(131072), 966u},
+                        MappingPattern::Fragmented, {}, long_buckets);
         BatchAttentionCase replay{16,
                                   {17, 31, 0},
                                   {7, 16, 0},
@@ -212,9 +220,77 @@ void add_graph_envelope_cases(OpSuite& suite, KvCacheStorage storage) {
                                   967u,
                                   true,
                                   {{17, 31, 0}, {32764, 8192, 127}, {127, 17, 0}}};
-        add_batch_case(suite, geometry, storage, replay, 65536);
-        constexpr std::array<std::uint32_t, 3> batch_limits{64, 65536, 256};
-        add_batch_case(suite, geometry, storage, replay, 65536, batch_limits);
+        add_batch_case(suite, geometry, storage, replay, ContextBucket::K64);
+        constexpr std::array batch_buckets{ContextBucket::K2, ContextBucket::K64,
+                                           ContextBucket::K2};
+        add_batch_case(suite, geometry, storage, replay, {}, batch_buckets);
+    }
+
+    constexpr std::array sequence{ContextBucket::K2,  ContextBucket::K8,   ContextBucket::K32,
+                                  ContextBucket::K64, ContextBucket::K256, ContextBucket::K2};
+    add_batch_case(suite, kGeometries[0], storage,
+                   {1,
+                    {1980, 120, 0, 512, 0, 63, 0, 61},
+                    {1, 1, 0, 1, 0, 1, 0, 1},
+                    {7, 0, 5, 2, 6, 1, 4, 3},
+                    MappingPattern::Identity,
+                    968u,
+                    true,
+                    {{1980, 120, 0, 512, 0, 63, 0, 61},
+                     {0, 0, 127, 0, 64, 0, 8159, 0},
+                     {32000, 63, 0, 65, 0, 120, 0, 512},
+                     {0, 0, 65500, 0, 17, 0, 120, 0},
+                     {65567, 17, 0, 65, 0, 512, 0, 61},
+                     {0, 0, 63, 0, 17, 0, 120, 0}}},
+                   {}, sequence);
+    add_batch_case(suite, kGeometries[1], storage,
+                   {12,
+                    {1980, 127, 512, 0},
+                    {1, 12, 11, 0},
+                    {2, 0, 3, 1},
+                    MappingPattern::Identity,
+                    969u,
+                    true,
+                    {{1980, 127, 512, 0},
+                     {120, 0, 17, 8159},
+                     {65, 32000, 0, 512},
+                     {61, 120, 65500, 512},
+                     {65, 17, 65567, 512},
+                     {127, 17, 65, 0}}},
+                   {}, sequence);
+}
+
+void add_split_pool_cases(OpSuite& suite, KvCacheStorage storage) {
+    const AttentionCase small_table{4, 60, ContextBucket::K2, 1950u, false, false, 0.25f, 128};
+    add_append_case(suite, kGeometries[0], storage, small_table, MappingPattern::Fragmented);
+    add_cached_case(suite, kGeometries[0], storage, small_table, MappingPattern::Fragmented);
+    add_batch_case(suite, kGeometries[0], storage,
+                   {4,
+                    {65500, 120, 512, 0, 63, 31, 256, 0},
+                    {4, 2, 1, 0, 4, 3, 2, 0},
+                    {7, 0, 5, 2, 6, 1, 4, 3},
+                    MappingPattern::Identity,
+                    1951u});
+    add_batch_case(suite, kGeometries[0], storage,
+                   {1,
+                    {65500, 120, 512, 0, 63, 31, 256, 0, 0, 63, 64, 65, 4095, 120, 512, 0},
+                    {1, 1, 1, 0, 1, 1, 1, 0, 0, 1, 1, 1, 1, 0, 1, 0},
+                    {0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15},
+                    MappingPattern::Identity,
+                    1952u});
+    for (const int batch : {64, 65}) {
+        BatchAttentionCase c{1,
+                             std::vector<int>(batch),
+                             std::vector<int>(batch),
+                             std::vector<int>(batch),
+                             MappingPattern::Identity,
+                             1953u};
+        for (int row = 0; row < batch; ++row) c.table_rows[row] = row;
+        for (const int row : {0, 31, 32, batch - 1}) {
+            c.contexts[row]      = row == batch - 1 ? 8100 : 512 + row;
+            c.valid_columns[row] = 1;
+        }
+        add_batch_case(suite, kGeometries[1], storage, c);
     }
 }
 
@@ -224,31 +300,39 @@ void add_quantized_causal_cases(OpSuite& suite, KvCacheStorage storage) {
         // of context length, for both public entries.
         constexpr int grouped_limit = 8;
         for (int width : {grouped_limit - 1, grouped_limit, grouped_limit + 1, 15, 16, 17}) {
-            add_append_case(suite, geometry, storage, {width, 17, 64, 600u},
+            add_append_case(suite, geometry, storage, {width, 17, select_context_bucket(64), 600u},
                             MappingPattern::Fragmented);
-            add_cached_case(suite, geometry, storage, {width, 17, 64, 600u},
+            add_cached_case(suite, geometry, storage, {width, 17, select_context_bucket(64), 600u},
                             MappingPattern::Fragmented);
         }
-        add_append_case(suite, geometry, storage, {65, 63, 192, 601u}, MappingPattern::Fragmented);
-        add_cached_case(suite, geometry, storage, {65, 63, 192, 602u}, MappingPattern::Fragmented);
-        add_append_case(suite, geometry, storage, {1, 128, 192, 603u}, MappingPattern::Fragmented);
-        add_cached_case(suite, geometry, storage, {1, 128, 192, 604u}, MappingPattern::Offset);
-        add_append_case(suite, geometry, storage, {6, 61, 192, 605u}, MappingPattern::Fragmented);
+        add_append_case(suite, geometry, storage, {65, 63, select_context_bucket(192), 601u},
+                        MappingPattern::Fragmented);
+        add_cached_case(suite, geometry, storage, {65, 63, select_context_bucket(192), 602u},
+                        MappingPattern::Fragmented);
+        add_append_case(suite, geometry, storage, {1, 128, select_context_bucket(192), 603u},
+                        MappingPattern::Fragmented);
+        add_cached_case(suite, geometry, storage, {1, 128, select_context_bucket(192), 604u},
+                        MappingPattern::Offset);
+        add_append_case(suite, geometry, storage, {6, 61, select_context_bucket(192), 605u},
+                        MappingPattern::Fragmented);
     }
-    add_cached_case(suite, kGeometries[0], storage, {3, 63, 192, 606u}, MappingPattern::Identity);
-    add_append_case(suite, kGeometries[0], storage, {1, 16384, 16385, 607u},
+    add_cached_case(suite, kGeometries[0], storage, {3, 63, select_context_bucket(192), 606u},
+                    MappingPattern::Identity);
+    add_append_case(suite, kGeometries[0], storage, {1, 16384, select_context_bucket(16385), 607u},
                     MappingPattern::Fragmented);
     // Partial query tiles, device metadata updates and large production prefill rows.
     for (const auto& geometry : kGeometries) {
-        add_append_case(suite, geometry, storage, {16, 1024, 4096, 608u, false, true},
+        add_append_case(suite, geometry, storage,
+                        {16, 1024, select_context_bucket(4096), 608u, false, true},
                         MappingPattern::Fragmented);
-        add_cached_case(suite, geometry, storage, {13, 513, 8192, 609u, false, true},
+        add_cached_case(suite, geometry, storage,
+                        {13, 513, select_context_bucket(8192), 609u, false, true},
                         MappingPattern::Fragmented);
         add_batch_case(
             suite, geometry, storage,
             {16, {17, 1025, 64}, {0, 7, 16}, {2, 0, 1}, MappingPattern::Fragmented, 610u, true});
         const std::array<int, 4> queries{0, 63, 64, 1023};
-        add_append_case(suite, geometry, storage, {1024, 8192, 9216, 611u},
+        add_append_case(suite, geometry, storage, {1024, 8192, select_context_bucket(9216), 611u},
                         MappingPattern::Fragmented, queries);
         if (storage == KvCacheStorage::Fp8E4m3fnGroup128Ue8m0 ||
             storage == KvCacheStorage::Fp8KeyNvfp4Value) {
@@ -262,20 +346,24 @@ void add_quantized_causal_cases(OpSuite& suite, KvCacheStorage storage) {
                             619u,
                             true,
                             {{17}, {1025}, {63}}},
-                           2048);
+                           ContextBucket::K2);
             const std::array<int, 3> tail_queries{0, 127, 128};
-            add_cached_case(suite, geometry, storage, {129, 8192, 8321, 620u},
+            add_cached_case(suite, geometry, storage,
+                            {129, 8192, select_context_bucket(8321), 620u},
                             MappingPattern::Fragmented, tail_queries);
         }
-        add_append_case(suite, geometry, storage, {1, 63, 64, 612u, false, true},
+        add_append_case(suite, geometry, storage,
+                        {1, 63, select_context_bucket(64), 612u, false, true},
                         MappingPattern::Fragmented);
-        add_cached_case(suite, geometry, storage, {1, 0, 1, 613u, false, true},
+        add_cached_case(suite, geometry, storage,
+                        {1, 0, select_context_bucket(1), 613u, false, true},
                         MappingPattern::Fragmented);
         add_batch_case(
             suite, geometry, storage,
             {1, {0, 31, 63}, {0, 1, 1}, {2, 0, 1}, MappingPattern::Fragmented, 614u, true});
     }
-    add_cached_case(suite, kGeometries[1], storage, {7, 511, 8192, 615u, false, true},
+    add_cached_case(suite, kGeometries[1], storage,
+                    {7, 511, select_context_bucket(8192), 615u, false, true},
                     MappingPattern::Fragmented);
     add_batch_case(
         suite, kGeometries[1], storage,
@@ -302,78 +390,82 @@ void add_quantized_causal_cases(OpSuite& suite, KvCacheStorage storage) {
 
 void add_nvfp4_cases(OpSuite& suite) {
     for (const Geometry& geometry : kGeometries) {
-        add_append_case(suite, geometry, KvCacheStorage::Nvfp4Group16, {1, 0, 1, 701u},
-                        MappingPattern::Identity);
-        add_cached_case(suite, geometry, KvCacheStorage::Nvfp4Group16, {1, 64, 65, 702u},
-                        MappingPattern::Fragmented);
-        add_cached_case(suite, geometry, KvCacheStorage::Nvfp4Group16, {1, 32, 33, 707u, true},
-                        MappingPattern::Identity);
-        add_cached_case(suite, geometry, KvCacheStorage::Nvfp4Group16, {1, 1, 2, 708u, true},
-                        MappingPattern::Identity);
-        add_cached_case(suite, geometry, KvCacheStorage::Nvfp4Group16, {1, 7, 8, 709u, true},
-                        MappingPattern::Identity);
-        add_cached_case(suite, geometry, KvCacheStorage::Nvfp4Group16, {1, 15, 16, 710u, true},
-                        MappingPattern::Identity);
-        add_cached_case(suite, geometry, KvCacheStorage::Nvfp4Group16, {1, 31, 32, 711u, true},
-                        MappingPattern::Identity);
-        add_append_case(suite, geometry, KvCacheStorage::Nvfp4Group16, {6, 61, 192, 703u},
-                        MappingPattern::Fragmented);
-        add_append_case(suite, geometry, KvCacheStorage::Nvfp4Group16, {64, 0, 128, 704u},
-                        MappingPattern::Fragmented);
-        add_cached_case(suite, geometry, KvCacheStorage::Nvfp4Group16, {65, 63, 192, 705u},
-                        MappingPattern::Offset);
-        add_cached_case(suite, geometry, KvCacheStorage::Nvfp4Group16, {1, 2048, 2049, 706u},
-                        MappingPattern::Fragmented);
+        add_append_case(suite, geometry, KvCacheStorage::Nvfp4Group16,
+                        {1, 0, select_context_bucket(1), 701u}, MappingPattern::Identity);
+        add_cached_case(suite, geometry, KvCacheStorage::Nvfp4Group16,
+                        {1, 64, select_context_bucket(65), 702u}, MappingPattern::Fragmented);
+        add_cached_case(suite, geometry, KvCacheStorage::Nvfp4Group16,
+                        {1, 32, select_context_bucket(33), 707u, true}, MappingPattern::Identity);
+        add_cached_case(suite, geometry, KvCacheStorage::Nvfp4Group16,
+                        {1, 1, select_context_bucket(2), 708u, true}, MappingPattern::Identity);
+        add_cached_case(suite, geometry, KvCacheStorage::Nvfp4Group16,
+                        {1, 7, select_context_bucket(8), 709u, true}, MappingPattern::Identity);
+        add_cached_case(suite, geometry, KvCacheStorage::Nvfp4Group16,
+                        {1, 15, select_context_bucket(16), 710u, true}, MappingPattern::Identity);
+        add_cached_case(suite, geometry, KvCacheStorage::Nvfp4Group16,
+                        {1, 31, select_context_bucket(32), 711u, true}, MappingPattern::Identity);
+        add_append_case(suite, geometry, KvCacheStorage::Nvfp4Group16,
+                        {6, 61, select_context_bucket(192), 703u}, MappingPattern::Fragmented);
+        add_append_case(suite, geometry, KvCacheStorage::Nvfp4Group16,
+                        {64, 0, select_context_bucket(128), 704u}, MappingPattern::Fragmented);
+        add_cached_case(suite, geometry, KvCacheStorage::Nvfp4Group16,
+                        {65, 63, select_context_bucket(192), 705u}, MappingPattern::Offset);
+        add_cached_case(suite, geometry, KvCacheStorage::Nvfp4Group16,
+                        {1, 2048, select_context_bucket(2049), 706u}, MappingPattern::Fragmented);
     }
     add_append_case(suite, kGeometries[0], KvCacheStorage::Nvfp4Group16,
-                    {1, 64, 65, 712u, false, true}, MappingPattern::Fragmented);
+                    {1, 64, select_context_bucket(65), 712u, false, true},
+                    MappingPattern::Fragmented);
     add_cached_case(suite, kGeometries[0], KvCacheStorage::Nvfp4Group16,
-                    {1, 64, 65, 713u, false, true}, MappingPattern::Fragmented);
-    add_append_case(suite, kGeometries[1], KvCacheStorage::Nvfp4Group16, {5, 17, 22, 714u},
-                    MappingPattern::Identity);
-    add_append_case(suite, kGeometries[1], KvCacheStorage::Nvfp4Group16, {7, 17, 24, 715u},
-                    MappingPattern::Identity);
-    add_append_case(suite, kGeometries[1], KvCacheStorage::Nvfp4Group16, {7, 511, 518, 716u},
+                    {1, 64, select_context_bucket(65), 713u, false, true},
                     MappingPattern::Fragmented);
-    add_cached_case(suite, kGeometries[1], KvCacheStorage::Nvfp4Group16, {1, 8191, 8192, 717u},
-                    MappingPattern::Fragmented);
-    add_cached_case(suite, kGeometries[1], KvCacheStorage::Nvfp4Group16, {1, 16383, 16384, 718u},
-                    MappingPattern::Fragmented);
-    add_cached_case(suite, kGeometries[1], KvCacheStorage::Nvfp4Group16, {1, 65535, 65536, 719u},
-                    MappingPattern::Fragmented);
+    add_append_case(suite, kGeometries[1], KvCacheStorage::Nvfp4Group16,
+                    {5, 17, select_context_bucket(22), 714u}, MappingPattern::Identity);
+    add_append_case(suite, kGeometries[1], KvCacheStorage::Nvfp4Group16,
+                    {7, 17, select_context_bucket(24), 715u}, MappingPattern::Identity);
+    add_append_case(suite, kGeometries[1], KvCacheStorage::Nvfp4Group16,
+                    {7, 511, select_context_bucket(518), 716u}, MappingPattern::Fragmented);
+    add_cached_case(suite, kGeometries[1], KvCacheStorage::Nvfp4Group16,
+                    {1, 8191, select_context_bucket(8192), 717u}, MappingPattern::Fragmented);
+    add_cached_case(suite, kGeometries[1], KvCacheStorage::Nvfp4Group16,
+                    {1, 16383, select_context_bucket(16384), 718u}, MappingPattern::Fragmented);
+    add_cached_case(suite, kGeometries[1], KvCacheStorage::Nvfp4Group16,
+                    {1, 65535, select_context_bucket(65536), 719u}, MappingPattern::Fragmented);
 }
 
 void add_k8v4_cases(OpSuite& suite) {
     for (const Geometry& geometry : kGeometries) {
-        add_append_case(suite, geometry, KvCacheStorage::Fp8KeyNvfp4Value, {1, 0, 1, 801u},
-                        MappingPattern::Identity);
-        add_cached_case(suite, geometry, KvCacheStorage::Fp8KeyNvfp4Value, {1, 64, 65, 802u},
-                        MappingPattern::Fragmented);
-        add_append_case(suite, geometry, KvCacheStorage::Fp8KeyNvfp4Value, {6, 61, 192, 803u},
-                        MappingPattern::Fragmented);
-        add_append_case(suite, geometry, KvCacheStorage::Fp8KeyNvfp4Value, {64, 0, 128, 804u},
-                        MappingPattern::Fragmented);
-        add_cached_case(suite, geometry, KvCacheStorage::Fp8KeyNvfp4Value, {65, 63, 192, 805u},
-                        MappingPattern::Offset);
-        add_cached_case(suite, geometry, KvCacheStorage::Fp8KeyNvfp4Value, {1, 2048, 2049, 806u},
-                        MappingPattern::Fragmented);
+        add_append_case(suite, geometry, KvCacheStorage::Fp8KeyNvfp4Value,
+                        {1, 0, select_context_bucket(1), 801u}, MappingPattern::Identity);
+        add_cached_case(suite, geometry, KvCacheStorage::Fp8KeyNvfp4Value,
+                        {1, 64, select_context_bucket(65), 802u}, MappingPattern::Fragmented);
+        add_append_case(suite, geometry, KvCacheStorage::Fp8KeyNvfp4Value,
+                        {6, 61, select_context_bucket(192), 803u}, MappingPattern::Fragmented);
+        add_append_case(suite, geometry, KvCacheStorage::Fp8KeyNvfp4Value,
+                        {64, 0, select_context_bucket(128), 804u}, MappingPattern::Fragmented);
+        add_cached_case(suite, geometry, KvCacheStorage::Fp8KeyNvfp4Value,
+                        {65, 63, select_context_bucket(192), 805u}, MappingPattern::Offset);
+        add_cached_case(suite, geometry, KvCacheStorage::Fp8KeyNvfp4Value,
+                        {1, 2048, select_context_bucket(2049), 806u}, MappingPattern::Fragmented);
     }
     add_append_case(suite, kGeometries[0], KvCacheStorage::Fp8KeyNvfp4Value,
-                    {1, 64, 65, 807u, false, true}, MappingPattern::Fragmented);
+                    {1, 64, select_context_bucket(65), 807u, false, true},
+                    MappingPattern::Fragmented);
     add_cached_case(suite, kGeometries[0], KvCacheStorage::Fp8KeyNvfp4Value,
-                    {1, 64, 65, 808u, false, true}, MappingPattern::Fragmented);
-    add_append_case(suite, kGeometries[1], KvCacheStorage::Fp8KeyNvfp4Value, {5, 17, 22, 809u},
-                    MappingPattern::Identity);
-    add_append_case(suite, kGeometries[1], KvCacheStorage::Fp8KeyNvfp4Value, {7, 17, 24, 810u},
-                    MappingPattern::Identity);
-    add_append_case(suite, kGeometries[1], KvCacheStorage::Fp8KeyNvfp4Value, {7, 511, 518, 811u},
+                    {1, 64, select_context_bucket(65), 808u, false, true},
                     MappingPattern::Fragmented);
-    add_cached_case(suite, kGeometries[1], KvCacheStorage::Fp8KeyNvfp4Value, {1, 8191, 8192, 812u},
-                    MappingPattern::Fragmented);
+    add_append_case(suite, kGeometries[1], KvCacheStorage::Fp8KeyNvfp4Value,
+                    {5, 17, select_context_bucket(22), 809u}, MappingPattern::Identity);
+    add_append_case(suite, kGeometries[1], KvCacheStorage::Fp8KeyNvfp4Value,
+                    {7, 17, select_context_bucket(24), 810u}, MappingPattern::Identity);
+    add_append_case(suite, kGeometries[1], KvCacheStorage::Fp8KeyNvfp4Value,
+                    {7, 511, select_context_bucket(518), 811u}, MappingPattern::Fragmented);
     add_cached_case(suite, kGeometries[1], KvCacheStorage::Fp8KeyNvfp4Value,
-                    {1, 16383, 16384, 813u}, MappingPattern::Fragmented);
+                    {1, 8191, select_context_bucket(8192), 812u}, MappingPattern::Fragmented);
     add_cached_case(suite, kGeometries[1], KvCacheStorage::Fp8KeyNvfp4Value,
-                    {1, 65535, 65536, 814u}, MappingPattern::Fragmented);
+                    {1, 16383, select_context_bucket(16384), 813u}, MappingPattern::Fragmented);
+    add_cached_case(suite, kGeometries[1], KvCacheStorage::Fp8KeyNvfp4Value,
+                    {1, 65535, select_context_bucket(65536), 814u}, MappingPattern::Fragmented);
 }
 
 void add_numerical_profile_cases(OpSuite& suite, KvCacheStorage storage) {
@@ -383,14 +475,15 @@ void add_numerical_profile_cases(OpSuite& suite, KvCacheStorage storage) {
             const float amplitude = (width == 1 ? 1.0f : 1.8f) * std::sqrt(3.0f);
             add_append_case(
                 suite, geometry, storage,
-                {width, 8192, static_cast<unsigned>(8192 + width), 1201u, false, false, amplitude},
+                {width, 8192, select_context_bucket(8192 + width), 1201u, false, false, amplitude},
                 MappingPattern::Fragmented,
                 width == 1024 ? std::span<const int>(queries) : std::span<const int>{});
         }
     }
-    add_cached_case(suite, kGeometries[1], storage,
-                    {1, 8192, 8193, 1202u, false, false, 1.8f * std::sqrt(3.0f)},
-                    MappingPattern::Fragmented);
+    add_cached_case(
+        suite, kGeometries[1], storage,
+        {1, 8192, select_context_bucket(8193), 1202u, false, false, 1.8f * std::sqrt(3.0f)},
+        MappingPattern::Fragmented);
 }
 
 void add_small_prefill_cases(OpSuite& suite, KvCacheStorage storage) {
@@ -398,19 +491,23 @@ void add_small_prefill_cases(OpSuite& suite, KvCacheStorage storage) {
     const std::array<int, 4> cached_queries{0, 63, 64, 128};
     const std::array<int, 3> boundary_queries{0, 127, 256};
     for (const auto& geometry : kGeometries) {
-        add_append_case(suite, geometry, storage, {34, 8191, 32768, 1301u, false, true},
+        add_append_case(suite, geometry, storage,
+                        {34, 8191, select_context_bucket(32768), 1301u, false, true},
                         MappingPattern::Fragmented, append_queries);
         add_cached_case(suite, geometry, storage,
-                        {129, 32768, 131072, 1302u, false, false, 1.8f * std::sqrt(3.0f)},
+                        {129, 32768, select_context_bucket(131072), 1302u, false, false,
+                         1.8f * std::sqrt(3.0f)},
                         MappingPattern::Fragmented, cached_queries);
-        add_cached_case(suite, geometry, storage, {257, 8192, 16384, 1303u}, MappingPattern::Offset,
-                        boundary_queries);
+        add_cached_case(suite, geometry, storage, {257, 8192, select_context_bucket(16384), 1303u},
+                        MappingPattern::Offset, boundary_queries);
         add_batch_case(suite, geometry, storage,
-                       {65, {8191}, {17}, {0}, MappingPattern::Fragmented, 1304u}, 32768);
+                       {65, {8191}, {17}, {0}, MappingPattern::Fragmented, 1304u},
+                       ContextBucket::K32);
         if (storage == KvCacheStorage::Fp8E4m3fnGroup128Ue8m0 ||
             storage == KvCacheStorage::Fp8KeyNvfp4Value) {
             add_cached_case(suite, geometry, storage,
-                            {34, 8192, 32768, 1305u, false, false, 1.8f * std::sqrt(3.0f)},
+                            {34, 8192, select_context_bucket(32768), 1305u, false, false,
+                             1.8f * std::sqrt(3.0f)},
                             MappingPattern::Fragmented, append_queries);
         }
     }
@@ -437,15 +534,19 @@ void add_storage_cases(OpSuite& suite, KvCacheStorage storage) {
     } else {
         const std::array<int, 7> queries{0, 63, 64, 127, 128, 511, 1023};
         for (const auto& geometry : kGeometries)
-            add_append_case(suite, geometry, storage, {1024, 8192, 9216, 951u},
+            add_append_case(suite, geometry, storage,
+                            {1024, 8192, select_context_bucket(9216), 951u},
                             MappingPattern::Fragmented, queries);
-        add_cached_case(suite, kGeometries[1], storage, {1024, 8192, 9216, 952u},
-                        MappingPattern::Fragmented, queries);
-        add_cached_case(suite, kGeometries[0], storage, {1, 131072, 262144, 953u},
+        add_cached_case(suite, kGeometries[1], storage,
+                        {1024, 8192, select_context_bucket(9216), 952u}, MappingPattern::Fragmented,
+                        queries);
+        add_cached_case(suite, kGeometries[0], storage,
+                        {1, 131072, select_context_bucket(262144), 953u},
                         MappingPattern::Fragmented);
     }
     add_batch_cases(suite, storage);
-    add_graph_envelope_cases(suite, storage);
+    add_graph_bucket_cases(suite, storage);
+    add_split_pool_cases(suite, storage);
     add_verify_width_cases(suite, storage);
     add_numerical_profile_cases(suite, storage);
     add_small_prefill_cases(suite, storage);

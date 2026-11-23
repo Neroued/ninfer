@@ -52,9 +52,11 @@ struct Bf16KvMergeSchedule {
 template <class G, class S>
 struct alignas(16) Bf16KvGroupedStorage {
     static constexpr int kStateRows = S::kWarpsKV > 1 ? S::kWarpsKV* S::kQueryRows : 1;
+    // Keep the wider schedules' last Q fragments alongside the KV tile.
+    static constexpr int kSharedQueryColumns = S::kFixedWidth ? 0 : G::kHeadDim / 2;
 
     union {
-        std::uint16_t qkv[2 * S::kKeyRows * G::kHeadDim];
+        std::uint16_t qkv[2 * S::kKeyRows * G::kHeadDim + S::kQueryRows * kSharedQueryColumns];
         float reduction[S::kWarpsKV > 1 ? kStateRows* G::kHeadDim : 1];
     };
 

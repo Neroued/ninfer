@@ -2,6 +2,7 @@
 
 #include "ops/softmax_attention/kernels/causal/bf16/tile_io.cuh"
 #include "ops/softmax_attention/kernels/causal/bf16/partition.h"
+#include "ops/softmax_attention/kernels/causal/partition.h"
 #include "ops/softmax_attention/kernels/softmax.cuh"
 
 namespace ninfer::ops::detail {
@@ -44,8 +45,7 @@ __launch_bounds__(Schedule::kThreads) __global__
                               const std::int32_t* valid_columns, std::int32_t tokens,
                               std::int32_t batch_size, Bf16KvPartition partition,
                               __nv_bfloat16* out) {
-    const int split_count = partition.capacity;
-    constexpr int DChunk  = Schedule::kDChunk;
+    constexpr int DChunk = Schedule::kDChunk;
     static_assert(DChunk <= Geometry::kHeadDim);
 
     const int q_head      = static_cast<int>(blockIdx.x);
@@ -63,7 +63,6 @@ __launch_bounds__(Schedule::kThreads) __global__
         if (batch >= batch_size) { return; }
     }
 
-    if constexpr (MultiBatch) { positions += batch * tokens; }
     const int live_columns = Masked ? valid_columns[batch] : tokens;
     int output_column      = token;
     if constexpr (MultiBatch) { output_column += batch * tokens; }
@@ -77,18 +76,17 @@ __launch_bounds__(Schedule::kThreads) __global__
         }
     }
 
+    const auto slots = causal_merge_splits<MultiBatch, Masked>(
+        partition, positions, valid_columns, tokens, live_columns, batch, batch_size);
     if constexpr (MultiBatch) {
-        const std::int64_t partial_acc_row = static_cast<std::int64_t>(batch) * Geometry::kHeadDim *
-                                             Geometry::QHeads * tokens * split_count;
-        const std::int64_t partial_stat_row =
-            static_cast<std::int64_t>(batch) * Geometry::QHeads * tokens * split_count;
-        partial_acc += partial_acc_row;
-        partial_m += partial_stat_row;
-        partial_l += partial_stat_row;
+        const auto stat = static_cast<std::int64_t>(slots.offset) * Geometry::QHeads * tokens;
+        partial_acc += stat * Geometry::kHeadDim;
+        partial_m += stat;
+        partial_l += stat;
     }
-
-    const int window             = positions[live_columns - 1] + 1;
-    const int active_split_count = partition.live(window).splits;
+    const int active_split_count =
+        slots.count < 0 ? partition.live(slots.window).splits
+                        : (slots.count == 0 ? 0 : partition.live(slots.window, slots.count).splits);
 
     __shared__ float weights[Schedule::kThreads], warp_sums[Schedule::kWarps], scalars[2];
     const float head_l = bf16_kv_merge_statistics<Geometry, Schedule>(

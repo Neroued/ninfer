@@ -12,15 +12,24 @@ struct Bf16KvLivePartition {
 // Capture fixes capacity; producer and merge derive the same partition from
 // the live row length, including ragged batches and Graph replay.
 struct Bf16KvPartition {
-    int capacity      = 1;
-    int normal_target = 1;
-    int long_target   = 1;
-    int key_rows      = 32;
+    int capacity             = 1;
+    int normal_target        = 1;
+    int long_target          = 1;
+    int key_rows             = 32;
+    int single_normal_target = 1;
+    int single_long_target   = 1;
 
     __host__ __device__ static int ceil_div(int n, int d) { return (n + d - 1) / d; }
 
     __host__ __device__ Bf16KvLivePartition live(int visible) const {
-        const int target  = visible >= 32768 ? long_target : normal_target;
+        return live(visible, visible >= 32768 ? long_target : normal_target);
+    }
+
+    __device__ int single_live_splits(int visible) const {
+        return live(visible, visible >= 32768 ? single_long_target : single_normal_target).splits;
+    }
+
+    __host__ __device__ Bf16KvLivePartition live(int visible, int target) const {
         const int rounded = ceil_div(ceil_div(visible, target), key_rows) * key_rows;
         const int keys    = rounded < 64 ? 64 : rounded;
         return {ceil_div(visible, keys), keys};

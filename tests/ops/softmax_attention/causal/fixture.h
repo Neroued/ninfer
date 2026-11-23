@@ -31,6 +31,9 @@
 
 namespace ninfer::test::causal_attention {
 using namespace float_codec;
+using ops::ContextBucket;
+using ops::ContextBucketRange;
+using ops::select_context_bucket;
 
 constexpr std::int32_t kHeadDim          = 256;
 constexpr std::int32_t kQuantGroup       = 64;
@@ -44,7 +47,7 @@ constexpr float kAttentionScale          = 0.0625f;
 constexpr std::uint16_t kOutputCanary    = 0x7fc1u;
 
 // Append and cached entries use one fixed criterion for each registered storage profile; token
-// count, geometry, execution envelope, and private launch route do not select or relax it. Native
+// count, geometry, context bucket, and private launch route do not select or relax it. Native
 // INT8-G64 / FP8 Q quantization is an accepted production approximation. The unchanged FP64 oracle
 // includes its error. Small, unit-RMS and RMS1.8 Q/K fixtures qualify that budget. These are
 // conformance-domain budgets, not bounds for arbitrary BF16 inputs or KV quality scores.
@@ -110,11 +113,12 @@ ops::AttentionHeadGeometry op_geometry(const Geometry& geometry);
 struct AttentionCase {
     std::int32_t tokens;
     std::int32_t base;
-    std::uint32_t envelope_max;
+    ContextBucket bucket;
     std::uint32_t seed;
-    bool zero_q        = false;
-    bool graph_replay  = false;
-    float qk_amplitude = 0.25f;
+    bool zero_q                 = false;
+    bool graph_replay           = false;
+    float qk_amplitude          = 0.25f;
+    std::int32_t table_capacity = 0;
 };
 
 enum class MappingPattern { Identity, Offset, Fragmented };
@@ -304,7 +308,7 @@ std::vector<T> copy_from_guarded(const GuardedDeviceBuffer& buffer, std::size_t 
 
 class DeviceCache {
 public:
-    // The table reserves the execution envelope; only the populated prefix owns physical pages.
+    // The table can reserve more logical pages than the populated prefix.
     // Future entries remain invalid, just as in a growing paged cache.
     DeviceCache(const HostCache& cache, MappingPattern mapping, std::int32_t table_capacity);
 
@@ -366,7 +370,6 @@ private:
     KvCacheStorage storage_;
     TestCacheLayout layout_;
     std::size_t rows_;
-    std::int32_t logical_capacity_;
     std::int32_t logical_pages_;
     std::int32_t physical_pages_;
     std::vector<std::int32_t> block_tables_host_;
@@ -413,14 +416,14 @@ struct BatchAttentionCase {
 
 int run_append_case(CudaExecutionView execution, const Geometry& geometry, KvCacheStorage storage,
                     const AttentionCase& test_case, MappingPattern mapping,
-                    std::span<const int> oracle_queries         = {},
-                    std::span<const std::uint32_t> graph_limits = {});
+                    std::span<const int> oracle_queries          = {},
+                    std::span<const ContextBucket> graph_buckets = {});
 int run_cached_case(CudaExecutionView execution, const Geometry& geometry, KvCacheStorage storage,
                     const AttentionCase& test_case, MappingPattern mapping,
                     std::span<const int> oracle_queries = {});
 int run_batch_case(CudaExecutionView execution, const Geometry& geometry, KvCacheStorage storage,
-                   const BatchAttentionCase& test_case, int envelope_max = 0,
-                   std::span<const std::uint32_t> graph_limits = {});
+                   const BatchAttentionCase& test_case, std::optional<ContextBucket> bucket = {},
+                   std::span<const ContextBucket> graph_buckets = {});
 int verify_workspace_capacity_contract(CudaExecutionView, KvCacheStorage);
 void add_cases(OpSuite&);
 

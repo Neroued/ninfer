@@ -6,12 +6,12 @@
 
 namespace ninfer::ops::detail::kv {
 
-inline constexpr int kPageShift   = 6;
-inline constexpr int kPageMask    = kPagedKVPageSize - 1;
-inline constexpr int kHeadDim     = 256;
+inline constexpr int kPageShift = 6;
+inline constexpr int kPageMask  = kPagedKVPageSize - 1;
+inline constexpr int kHeadDim   = 256;
 inline constexpr int kInt8Group =
     kv_cache_format_info(KvCacheVectorFormat::Int8Group64F16).group_size;
-inline constexpr int kInt8Groups  = kHeadDim / kInt8Group;
+inline constexpr int kInt8Groups = kHeadDim / kInt8Group;
 inline constexpr int kNvfp4Group =
     kv_cache_format_info(KvCacheVectorFormat::Nvfp4Group16Ue4m3).group_size;
 inline constexpr int kNvfp4Groups = kHeadDim / kNvfp4Group;
@@ -39,6 +39,7 @@ struct BatchMetadata {
     const std::int32_t* valid_columns;
     const std::int32_t* table_rows;
     std::int32_t table_stride;
+    std::int32_t reserved = 0; // Keep every captured argument byte defined.
 
     __device__ __forceinline__ int valid_tokens(int width) const {
         if constexpr (Masked) {

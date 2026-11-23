@@ -21,8 +21,6 @@ void validate_bf16_kv_operands(const CausalAttentionOperands& p,
         !common::operand::aligned(cache.keys, 16) || !common::operand::aligned(cache.values, 16) ||
         !p.positions || !cache.tables || p.width <= 0 || p.batch < 1 || p.batch > 65535 ||
         cache.table_stride <= 0 || p.visible_capacity <= 0 ||
-        static_cast<std::int64_t>(p.visible_capacity) >
-            static_cast<std::int64_t>(cache.table_stride) * kPagedKVPageSize ||
         (cache.valid_columns && !cache.table_rows))
         throw std::invalid_argument("BF16 KV template operands do not match its geometry/layout");
 }

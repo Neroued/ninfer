@@ -28,6 +28,7 @@ struct CausalAppendInput {
 
 struct CausalCachedInput {
     static constexpr bool writes_cache = false;
+    std::uint8_t reserved              = 0; // Empty struct padding varies across graph captures.
 };
 
 // Unnormalized FP32 numerator and sum. Maximum units belong to the owning
@@ -103,8 +104,7 @@ void validate_quantized_causal_operands(const CausalAttentionOperands& p, View c
     if (p.query_heads != G::QHeads || cache.kv_heads != G::KVHeads || !p.q || !p.positions ||
         !p.out || !cache.keys || !cache.values || !cache.key_scales || !cache.value_scales ||
         !cache.tables || p.width < 1 || p.batch < 1 || p.visible_capacity < 1 ||
-        static_cast<std::int64_t>(p.visible_capacity) >
-            static_cast<std::int64_t>(cache.table_stride) * kPagedKVPageSize)
+        cache.table_stride < 1)
         throw std::invalid_argument("quantized causal attention: invalid operands");
 }
 
@@ -153,6 +153,6 @@ using Nvfp4KvReadView = Nvfp4KvCacheView<false>;
 template <bool Writable>
 using K8V4KvCacheView =
     QuantizedCausalCacheView<std::uint8_t, std::uint8_t, std::uint8_t, Writable>;
-using K8V4KvReadView  = K8V4KvCacheView<false>;
+using K8V4KvReadView = K8V4KvCacheView<false>;
 
 } // namespace ninfer::ops::detail

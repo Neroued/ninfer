@@ -34,6 +34,12 @@ public:
         executable_.update_mixer_child(next);
     }
 
+    void update_mixer_slice(std::size_t index, const DecodeGraphKernelPatch& patch) override {
+        executable_.update_mixer_slice(index, patch);
+    }
+
+    void upload_mixer(cudaStream_t stream) override { executable_.upload_mixer(stream); }
+
     void upload(cudaStream_t stream) override { executable_.upload(stream); }
 
     bool start(Tensor& output, CudaExecutionView cuda,
@@ -60,6 +66,10 @@ public:
 
     std::unique_ptr<moe::LayerGraphExecutable> instantiate() const override {
         return std::make_unique<Executable>(*this);
+    }
+
+    std::size_t mixer_slice_count() const noexcept override {
+        return definition.mixer_slices.size();
     }
 };
 
@@ -97,6 +107,34 @@ public:
     capture_layer(ExpertBankId bank, CudaExecutionView cuda, TokenGeometry geometry,
                   const MixerBody& mixer, const GpuBody& body, const std::function<void()>& feature,
                   const std::shared_ptr<const moe::LayerGraphDefinition>& shared) override {
+        return capture(bank, cuda, geometry, mixer, body, feature, shared);
+    }
+
+    std::shared_ptr<const moe::LayerGraphDefinition>
+    capture_layer(ExpertBankId bank, CudaExecutionView cuda, TokenGeometry geometry,
+                  const FlatMixerBody& mixer, const GpuBody& body,
+                  const std::function<void()>& feature) override {
+        return capture(bank, cuda, geometry, mixer, body, feature, {});
+    }
+
+    void restore_cache_after_preparation() override {
+        resources_.restore_cache_after_preparation();
+    }
+
+    void synchronize() const override { resources_.synchronize(); }
+
+    std::uint64_t uploaded_bytes() const noexcept override { return resources_.uploaded_bytes(); }
+
+    ExpertCacheUsage cache_usage() const override { return resources_.cache_usage(); }
+
+    const ScheduleDescription& description() const noexcept override { return description_; }
+
+private:
+    template <class Mixer>
+    std::shared_ptr<const moe::LayerGraphDefinition>
+    capture(ExpertBankId bank, CudaExecutionView cuda, TokenGeometry geometry, const Mixer& mixer,
+            const GpuBody& body, const std::function<void()>& feature,
+            const std::shared_ptr<const moe::LayerGraphDefinition>& shared) {
         auto out = std::make_shared<Definition>(resources_, bank);
         if (shared) {
             const auto& existing = dynamic_cast<const Definition&>(*shared);
@@ -121,19 +159,6 @@ public:
         return out;
     }
 
-    void restore_cache_after_preparation() override {
-        resources_.restore_cache_after_preparation();
-    }
-
-    void synchronize() const override { resources_.synchronize(); }
-
-    std::uint64_t uploaded_bytes() const noexcept override { return resources_.uploaded_bytes(); }
-
-    ExpertCacheUsage cache_usage() const override { return resources_.cache_usage(); }
-
-    const ScheduleDescription& description() const noexcept override { return description_; }
-
-private:
     void begin_activity(std::int32_t physical_tokens, std::int32_t active_tokens) override {
         if (active_) throw std::logic_error("MoE traversal is already active");
         if (auto activity = resources_.begin(physical_tokens, active_tokens))

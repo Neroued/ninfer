@@ -2,6 +2,7 @@
 #include "models/common/moe/offload/graph.h"
 #include "core/decode_graph.h"
 #include "models/common/moe/offload/plan.h"
+#include "ninfer/ops/scalar.h"
 #include "ops/moe/fixture.h"
 
 #include <atomic>
@@ -499,6 +500,58 @@ void qualify_allocation() {
     }
 }
 
+void qualify_flat_mixers(const DeviceContext& device, offload::Resources& resources,
+                         ExpertBankId bank, moe::Fixture& fixture, Epilogue epilogue,
+                         MemoryArena& workspace) {
+    const auto cuda = device.execution_view();
+    GuardedDeviceBuffer marker_storage(5 * sizeof(std::int32_t));
+    const auto marker = [&](std::size_t index) {
+        return Tensor(
+            marker_storage.span().subspan(index * sizeof(std::int32_t), sizeof(std::int32_t)),
+            DType::I32, {1});
+    };
+    const auto increment = [&](std::size_t index) {
+        auto value = marker(index);
+        ops::increment_i32_scalar(value, cuda);
+    };
+    std::array<DecodeGraphKernelPatch, 2> patches;
+    for (std::size_t i = 0; i < patches.size(); ++i)
+        patches[i].capture(cuda.stream(), [&] { increment(3 + i); });
+    Call call(fixture, 1, 0, epilogue);
+    const auto activity = resources.begin(1, 1);
+    for (std::size_t count = 0; count <= patches.size(); ++count) {
+        offload::LayerGraphDefinition definition;
+        definition.moe      = std::make_shared<offload::SubsetGraphDefinitions>();
+        definition.validity = call.validity;
+        offload::capture_layer(
+            definition, resources, bank, cuda, {1, 1},
+            [&](const model_moe::MixerSliceRecorder& record) {
+                increment(0);
+                for (std::size_t i = 0; i < count; ++i) record([&] { increment(1 + i); });
+            },
+            [&](const offload::PreparedExecution& prepared) {
+                offload::enqueue_gpu(call.device.x, prepared, call.destination, call.validity,
+                                     workspace, offload::GpuSubmission::Capture);
+            });
+        require(definition.plan.steady.has_value(), "flat mixer fixture requires a steady graph");
+        offload::LayerGraphExecutable graph(definition);
+        graph.upload(cuda.stream());
+        // Calibration executes both the standalone mixer and the steady graph.
+        for (std::size_t installed = 0; installed <= count; ++installed) {
+            if (installed) graph.update_mixer_slice(installed - 1, patches[installed - 1]);
+            CUDA_CHECK(
+                cudaMemsetAsync(marker_storage.data(), 0, marker_storage.bytes(), cuda.stream()));
+            if (!graph.start(resources, bank, call.destination, cuda))
+                while (!graph.poll()) std::this_thread::yield();
+            resources.synchronize();
+            std::vector<std::int32_t> expected{2, 0, 0, 0, 0};
+            for (std::size_t i = 0; i < count; ++i) expected[(i < installed ? 3 : 1) + i] = 2;
+            require(from_device<std::int32_t>(marker_storage.data(), expected.size()) == expected,
+                    "slice patch did not update both mixers independently");
+        }
+    }
+}
+
 int qualify_schedule(const DeviceContext& device, const CpuTopology& topology,
                      std::uint32_t bank_capacity, bool one_large_layer = false, bool graph = false,
                      bool calibration = false) {
@@ -567,6 +620,9 @@ int qualify_schedule(const DeviceContext& device, const CpuTopology& topology,
             "startup returned before the initial expert cache became ready");
     GuardedDeviceBuffer storage(plan->bridge.gpu_workspace_bytes);
     MemoryArena workspace(storage.span());
+    if (graph && calibration)
+        qualify_flat_mixers(device, resources, order[0], a, plan->layers[0].spec.epilogue,
+                            workspace);
     int failures      = 0;
     bool check_cancel = !graph && bank_capacity == 1 && !one_large_layer;
     for (const auto [tokens, active] : std::array<std::pair<int, int>, 14>{{{1, 1},

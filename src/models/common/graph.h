@@ -4,6 +4,8 @@
 #include "models/common/parallel_execution.h"
 #include "models/common/graph_preparation.h"
 
+#include <optional>
+
 namespace ninfer::models {
 
 struct GraphSegment {
@@ -16,17 +18,19 @@ struct GraphSegment {
                 const CommunicationGraphWork* replay_work = nullptr);
 };
 
-// One prefix of serial MTP steps in a fused Round. The readout child stays in the DAG.
+// One active prefix of serial MTP steps in a fused round.
 class MtpGraphSteps {
 public:
     struct Step {
         void readout(cudaStream_t, const std::function<void()>&);
     private:
         friend class MtpGraphSteps;
-        DecodeGraphSection before, after;
+        DecodeGraphSection first;
+        std::optional<DecodeGraphSection> after_readout;
     };
 
     void capture_step(cudaStream_t, ParallelExecution*, const std::function<void(Step*)>&);
+    void capture_step(cudaStream_t, ParallelExecution*, const std::function<void()>&);
     void finish(const CommunicationGraphWork& full);
 
     [[nodiscard]] bool empty() const noexcept { return work_.empty(); }

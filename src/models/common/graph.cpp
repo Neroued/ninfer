@@ -22,9 +22,9 @@ void GraphSegment::launch(CudaExecutionView cuda, ParallelExecution* parallel,
 }
 
 void MtpGraphSteps::Step::readout(cudaStream_t stream, const std::function<void()>& body) {
-    before.end(stream);
+    first.end(stream);
     body();
-    after.begin(stream);
+    after_readout.emplace().begin(stream);
 }
 
 void MtpGraphSteps::capture_step(cudaStream_t stream, ParallelExecution* parallel,
@@ -33,10 +33,22 @@ void MtpGraphSteps::capture_step(cudaStream_t stream, ParallelExecution* paralle
         body(nullptr);
     } else {
         auto& step = steps_.emplace_back();
-        step.before.begin(stream);
+        step.first.begin(stream);
         body(&step);
-        step.after.end(stream);
+        if (step.after_readout)
+            step.after_readout->end(stream);
+        else
+            step.first.end(stream);
     }
+    work_.push_back(parallel ? parallel->captured_work() : CommunicationGraphWork{});
+}
+
+void MtpGraphSteps::capture_step(cudaStream_t stream, ParallelExecution* parallel,
+                                 const std::function<void()>& body) {
+    if (work_.empty())
+        body();
+    else
+        steps_.emplace_back().first.capture(stream, body);
     work_.push_back(parallel ? parallel->captured_work() : CommunicationGraphWork{});
 }
 
@@ -66,8 +78,8 @@ const CommunicationGraphWork& MtpGraphSteps::set_depth(const DecodeGraphExecutab
     for (unsigned i = std::min(depth, installed_depth_); i < std::max(depth, installed_depth_);
          ++i) {
         auto& step = steps_[i - 1];
-        step.before.set_enabled(exec, i < depth);
-        step.after.set_enabled(exec, i < depth);
+        step.first.set_enabled(exec, i < depth);
+        if (step.after_readout) step.after_readout->set_enabled(exec, i < depth);
     }
     installed_depth_ = depth;
     return work_[depth - 1];

@@ -22,11 +22,16 @@ struct LayerGraphDefinition {
     ops::MoeTokenValidity validity;
     DecodeGraphDefinition mixer, steady, feature;
     DecodeGraphChild mixer_child, steady_child;
+    std::vector<DecodeGraphKernelSlice> mixer_slices, steady_slices;
     std::shared_ptr<SubsetGraphDefinitions> moe;
 };
 
 void capture_layer(LayerGraphDefinition&, Resources&, ExpertBankId, CudaExecutionView,
                    TokenGeometry, const MixerBody& mixer,
+                   const std::function<void(const PreparedExecution&)>& gpu_moe,
+                   const std::function<void()>& feature = {});
+void capture_layer(LayerGraphDefinition&, Resources&, ExpertBankId, CudaExecutionView,
+                   TokenGeometry, const FlatMixerBody& mixer,
                    const std::function<void(const PreparedExecution&)>& gpu_moe,
                    const std::function<void()>& feature = {});
 
@@ -36,6 +41,8 @@ public:
     explicit LayerGraphExecutable(const LayerGraphDefinition&);
     void update(const LayerGraphDefinition&);
     void update_mixer_child(const DecodeGraphDefinition&);
+    void update_mixer_slice(std::size_t, const DecodeGraphKernelPatch&);
+    void upload_mixer(cudaStream_t);
     void upload(cudaStream_t);
     [[nodiscard]] bool start(Resources&, ExpertBankId, Tensor& output, CudaExecutionView,
                              std::function<void()> after_gpu_submit = {});
@@ -59,6 +66,7 @@ private:
     [[nodiscard]] bool advance();
     std::optional<Invocation> pending_;
     DecodeGraphChild mixer_child_, steady_child_;
+    std::span<const DecodeGraphKernelSlice> mixer_slices_, steady_slices_;
     GraphPlan plan_;
     ops::MoeTokenValidity validity_;
     DecodeGraphExecutable mixer_, steady_, feature_;

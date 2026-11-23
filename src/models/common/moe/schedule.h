@@ -15,6 +15,7 @@
 namespace ninfer {
 struct DecodeGraphChild;
 class DecodeGraphDefinition;
+class DecodeGraphKernelPatch;
 } // namespace ninfer
 
 namespace ninfer::models::moe {
@@ -64,19 +65,26 @@ struct GraphPlan {
 
 // Borrowed synchronous capture call. The model supplies its normalization/input preparation;
 // the schedule supplies the GPU body without exposing CPU or cache handoff resources.
-using GpuCall = std::function<void(const Tensor&, Tensor&, ops::MoeTokenValidity, MemoryArena&,
+using GpuCall   = std::function<void(const Tensor&, Tensor&, ops::MoeTokenValidity, MemoryArena&,
                                    const ops::MoeExecutionHints&)>;
 using MixerBody = std::function<void(DecodeGraphChild&)>;
-using GpuBody = std::function<void(const GpuCall&)>;
+// The mixer calls the recorder synchronously for each readout, in the same order
+// in its standalone and steady captures. Mixers without readouts make no calls.
+// The recorder returns the number of recorded kernels.
+using MixerSliceRecorder = std::function<std::size_t(const std::function<void()>&)>;
+using FlatMixerBody      = std::function<void(const MixerSliceRecorder&)>;
+using GpuBody            = std::function<void(const GpuCall&)>;
 
 class LayerGraphDefinition;
 
 class LayerGraphExecutable {
 public:
-    virtual ~LayerGraphExecutable()                  = default;
-    virtual void update(const LayerGraphDefinition&) = 0;
-    virtual void update_mixer_child(const DecodeGraphDefinition&) = 0;
-    virtual void upload(cudaStream_t)                = 0;
+    virtual ~LayerGraphExecutable()                                             = default;
+    virtual void update(const LayerGraphDefinition&)                            = 0;
+    virtual void update_mixer_child(const DecodeGraphDefinition&)               = 0;
+    virtual void update_mixer_slice(std::size_t, const DecodeGraphKernelPatch&) = 0;
+    virtual void upload_mixer(cudaStream_t)                                     = 0;
+    virtual void upload(cudaStream_t)                                           = 0;
     // start accepts one invocation. True means its complete output chain was submitted;
     // false retains it until poll succeeds. Tensor backing and callback captures stay live.
     [[nodiscard]] virtual bool start(Tensor&, CudaExecutionView,
@@ -87,8 +95,10 @@ public:
 
 class LayerGraphDefinition {
 public:
-    virtual ~LayerGraphDefinition()                                                 = default;
+    virtual ~LayerGraphDefinition() = default;
+    // Keep the definition alive while patching the executable's original nodes.
     [[nodiscard]] virtual std::unique_ptr<LayerGraphExecutable> instantiate() const = 0;
+    [[nodiscard]] virtual std::size_t mixer_slice_count() const noexcept            = 0;
 };
 
 enum class ResourcePurpose { Execution, GraphCalibration };
@@ -170,7 +180,10 @@ public:
     [[nodiscard]] virtual std::shared_ptr<const LayerGraphDefinition>
     capture_layer(ExpertBankId, CudaExecutionView, TokenGeometry, const MixerBody& mixer,
                   const GpuBody&, const std::function<void()>& feature,
-                  const std::shared_ptr<const LayerGraphDefinition>& shared)      = 0;
+                  const std::shared_ptr<const LayerGraphDefinition>& shared) = 0;
+    [[nodiscard]] virtual std::shared_ptr<const LayerGraphDefinition>
+    capture_layer(ExpertBankId, CudaExecutionView, TokenGeometry, const FlatMixerBody& mixer,
+                  const GpuBody&, const std::function<void()>& feature)           = 0;
     virtual void restore_cache_after_preparation()                                = 0;
     virtual void synchronize() const                                              = 0;
     [[nodiscard]] virtual std::uint64_t uploaded_bytes() const noexcept           = 0;

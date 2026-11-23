@@ -1,6 +1,7 @@
 #include "models/common/moe/offload/graph.h"
 #include "models/common/moe/offload/plan.h"
 
+#include <algorithm>
 #include <stdexcept>
 
 namespace ninfer::models::moe::offload {
@@ -56,7 +57,8 @@ GraphPlan graph_plan(const Plan& schedule, ExpertBankId bank, TokenGeometry geom
 }
 
 LayerGraphExecutable::LayerGraphExecutable(const LayerGraphDefinition& source)
-    : mixer_child_(source.mixer_child), steady_child_(source.steady_child), plan_(source.plan),
+    : mixer_child_(source.mixer_child), steady_child_(source.steady_child),
+      mixer_slices_(source.mixer_slices), steady_slices_(source.steady_slices), plan_(source.plan),
       validity_(source.validity) {
     instantiate(mixer_, source.mixer);
     instantiate(steady_, source.steady);
@@ -80,21 +82,36 @@ void LayerGraphExecutable::update_mixer_child(const DecodeGraphDefinition& next)
     if (steady_.ready()) steady_.update_child(steady_child_, next);
 }
 
-void LayerGraphExecutable::upload(cudaStream_t stream) {
+void LayerGraphExecutable::update_mixer_slice(std::size_t index,
+                                              const DecodeGraphKernelPatch& patch) {
+    if (pending_) throw std::logic_error("cannot update an active MoE layer graph");
+    if (index >= mixer_slices_.size()) throw std::out_of_range("MoE mixer slice index");
+    mixer_.update_slice(mixer_slices_[index], patch);
+    if (steady_.ready()) steady_.update_slice(steady_slices_[index], patch);
+}
+
+void LayerGraphExecutable::upload_mixer(cudaStream_t stream) {
     if (pending_) throw std::logic_error("cannot upload an active MoE layer graph");
     offload::upload(mixer_, stream);
     offload::upload(steady_, stream);
+}
+
+void LayerGraphExecutable::upload(cudaStream_t stream) {
+    upload_mixer(stream);
     offload::upload(feature_, stream);
     for (auto& subset : subsets_) offload::upload(subset, stream);
 }
 
-void capture_layer(LayerGraphDefinition& definition, Resources& resources, ExpertBankId bank,
-                   CudaExecutionView cuda, TokenGeometry geometry, const MixerBody& mixer,
-                   const std::function<void(const PreparedExecution&)>& gpu_moe,
-                   const std::function<void()>& feature) {
+namespace {
+
+void capture_layer_bodies(LayerGraphDefinition& definition, Resources& resources, ExpertBankId bank,
+                          CudaExecutionView cuda, TokenGeometry geometry,
+                          const std::function<void(bool steady)>& mixer,
+                          const std::function<void(const PreparedExecution&)>& gpu_moe,
+                          const std::function<void()>& feature) {
     definition.plan   = graph_plan(resources.plan(), bank, geometry);
     const auto tokens = geometry.physical_tokens;
-    definition.mixer.capture(cuda.stream(), [&] { mixer(definition.mixer_child); });
+    definition.mixer.capture(cuda.stream(), [&] { mixer(false); });
     using Kind = ops::ExpertSubsetKind;
     for (auto kind : {Kind::All, Kind::None, Kind::MaskOnes}) {
         auto& part = definition.moe->subsets[moe_graph_index(kind)];
@@ -106,11 +123,44 @@ void capture_layer(LayerGraphDefinition& definition, Resources& resources, Exper
         const auto kind = *definition.plan.steady;
         const auto call = resources.describe_layer(bank, tokens, kind);
         definition.steady.capture(cuda.stream(), [&] {
-            mixer(definition.steady_child);
+            mixer(true);
             gpu_moe(call);
         });
     }
     if (feature) definition.feature.capture(cuda.stream(), feature);
+}
+
+} // namespace
+
+void capture_layer(LayerGraphDefinition& definition, Resources& resources, ExpertBankId bank,
+                   CudaExecutionView cuda, TokenGeometry geometry, const MixerBody& mixer,
+                   const std::function<void(const PreparedExecution&)>& gpu_moe,
+                   const std::function<void()>& feature) {
+    capture_layer_bodies(
+        definition, resources, bank, cuda, geometry,
+        [&](bool steady) { mixer(steady ? definition.steady_child : definition.mixer_child); },
+        gpu_moe, feature);
+}
+
+void capture_layer(LayerGraphDefinition& definition, Resources& resources, ExpertBankId bank,
+                   CudaExecutionView cuda, TokenGeometry geometry, const FlatMixerBody& mixer,
+                   const std::function<void(const PreparedExecution&)>& gpu_moe,
+                   const std::function<void()>& feature) {
+    capture_layer_bodies(
+        definition, resources, bank, cuda, geometry,
+        [&](bool steady) {
+            auto& slices = steady ? definition.steady_slices : definition.mixer_slices;
+            mixer([&](const std::function<void()>& readout) {
+                auto& slice = slices.emplace_back();
+                slice.capture(cuda.stream(), readout);
+                return slice.size();
+            });
+            if (steady &&
+                !std::ranges::equal(slices, definition.mixer_slices, {},
+                                    &DecodeGraphKernelSlice::size, &DecodeGraphKernelSlice::size))
+                throw std::logic_error("MoE mixer slice topology differs in the steady graph");
+        },
+        gpu_moe, feature);
 }
 
 bool LayerGraphExecutable::start(Resources& resources, ExpertBankId bank, Tensor& output,

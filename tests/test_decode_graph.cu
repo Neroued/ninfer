@@ -5,6 +5,7 @@
 
 #include <cuda_runtime.h>
 
+#include <array>
 #include <cstdint>
 #include <exception>
 #include <iostream>
@@ -68,10 +69,104 @@ __global__ void add_one(unsigned* sum) {
     if (threadIdx.x == 0) atomicAdd(sum, 1U);
 }
 
-int check_cooperative_section(ninfer::DeviceContext& device) {
+__global__ void append_digit(unsigned* value, unsigned digit) {
+    if (blockIdx.x == 0) *value = *value * 10 + digit;
+    atomicAdd(value + 1, 1U);
+}
+
+int check_kernel_slice(ninfer::DeviceContext& device, unsigned count) {
+    const auto stream    = device.stream();
+    const auto secondary = device.transfer_stream();
+    ninfer::DeviceBuffer storage(device.device(), 4 * sizeof(unsigned));
+    auto* values = static_cast<unsigned*>(storage.data());
+    ninfer::CudaCompletionEvent fork(device), join(device), external(device);
+    external.record(secondary);
+    ninfer::DecodeGraphKernelPatch patch;
+    patch.capture(stream, [&] {
+        for (unsigned i = 0; i < count; ++i) append_digit<<<i + 2, 1, 0, stream>>>(values, 7 + i);
+    });
+    ninfer::DecodeGraphKernelSlice slice;
+    ninfer::DecodeGraphDefinition parent;
+    parent.capture(stream, [&] {
+        if (count > 1) {
+            fork.record(stream);
+            fork.wait(secondary);
+            add_one<<<1, 1, 0, secondary>>>(values + 2);
+            join.record(secondary);
+            external.wait_external(stream);
+            add_one<<<1, 1, 0, stream>>>(values + 3);
+            join.wait(stream);
+            cudaStreamCaptureStatus status;
+            cudaGraph_t graph        = nullptr;
+            std::size_t dependencies = 0, roots = 0;
+            CUDA_CHECK(cudaStreamGetCaptureInfo(stream, &status, nullptr, &graph, nullptr, nullptr,
+                                                &dependencies));
+            CUDA_CHECK(cudaGraphGetRootNodes(graph, nullptr, &roots));
+            if (status != cudaStreamCaptureStatusActive || dependencies != 2 || roots != 2)
+                throw std::runtime_error("expected a capture with two joined root branches");
+        }
+        slice.capture(stream, [&] {
+            for (unsigned i = 0; i < count; ++i) append_digit<<<1, 1, 0, stream>>>(values, i + 1);
+        });
+    });
+    if (slice.size() != count || patch.params().size() != count)
+        throw std::runtime_error("kernel chain length changed");
+    ninfer::DecodeGraphExecutable executable;
+    executable.instantiate(parent);
+    int failures = 0;
+    for (bool updated : {false, true}) {
+        CUDA_CHECK(cudaMemsetAsync(values, 0, storage.size(), stream));
+        if (updated) executable.update_slice(slice, patch);
+        executable.launch(stream);
+        device.synchronize();
+        unsigned digits = 0, blocks = 0;
+        for (unsigned i = 0; i < count; ++i) {
+            digits = digits * 10 + (updated ? 7 + i : i + 1);
+            blocks += updated ? i + 2 : 1;
+        }
+        failures += expect_value(values, digits, "patched launch order and scalar arguments");
+        failures += expect_value(values + 1, blocks, "patched launch grid");
+        if (count > 1) {
+            failures += expect_value(values + 2, 1U, "secondary branch survives slice patch");
+            failures += expect_value(values + 3, 1U, "primary branch survives slice patch");
+        }
+    }
+    return failures;
+}
+
+int check_invalid_kernel_patch(ninfer::DeviceContext& device) {
+    const auto stream = device.stream();
     ninfer::DeviceBuffer storage(device.device(), sizeof(unsigned));
+    auto* value = static_cast<unsigned*>(storage.data());
+    ninfer::DecodeGraphKernelPatch patch;
+    patch.capture(stream, [&] { add_one<<<1, 1, 0, stream>>>(value); });
+    for (const std::function<void()>& body : std::array<std::function<void()>, 3>{
+             [] {}, [&] { CUDA_CHECK(cudaMemsetAsync(value, 0, storage.size(), stream)); },
+             [&] {
+                 void* args[]{&value};
+                 CUDA_CHECK(cudaLaunchCooperativeKernel(reinterpret_cast<const void*>(add_one),
+                                                        dim3(1), dim3(1), args, 0, stream));
+             }}) {
+        try {
+            patch.capture(stream, body);
+        } catch (const std::logic_error&) {
+            if (!patch.ready() && patch.params().empty()) continue;
+        }
+        std::cerr << "invalid kernel patch survived capture validation\n";
+        return 1;
+    }
+    return 0;
+}
+
+int check_cooperative_section(ninfer::DeviceContext& device) {
+    ninfer::DeviceBuffer storage(device.device(), 3 * sizeof(unsigned));
     auto* sum = static_cast<unsigned*>(storage.data());
     CUDA_CHECK(cudaMemsetAsync(sum, 0, storage.size(), device.stream()));
+    const auto stream = device.stream();
+    ninfer::DecodeGraphKernelPatch one, two;
+    one.capture(stream, [&] { append_digit<<<2, 1, 0, stream>>>(sum + 1, 3U); });
+    two.capture(stream, [&] { append_digit<<<4, 1, 0, stream>>>(sum + 1, 5U); });
+    ninfer::DecodeGraphKernelSlice slice;
     ninfer::DecodeGraphSection optional;
     ninfer::DecodeGraphDefinition round;
     round.capture(device.stream(), [&] {
@@ -79,18 +174,21 @@ int check_cooperative_section(ninfer::DeviceContext& device) {
             void* args[]{&sum};
             CUDA_CHECK(cudaLaunchCooperativeKernel(reinterpret_cast<const void*>(add_one), dim3(2),
                                                    dim3(512), args, 0, device.stream()));
+            slice.capture(stream, [&] { append_digit<<<1, 1, 0, stream>>>(sum + 1, 1U); });
         });
     });
     ninfer::DecodeGraphExecutable graph;
     graph.instantiate(round);
-    int failures      = 0;
-    unsigned expected = 0;
-    for (bool active : {true, false, false, true}) {
+    int failures = 0;
+    for (unsigned i = 0; i < 4; ++i) {
+        const bool active = i == 0 || i == 3;
         optional.set_enabled(graph, active);
+        if (active) graph.update_slice(slice, i ? two : one);
         graph.launch(device.stream());
         device.synchronize();
-        if (active) expected += 2;
-        failures += expect_value(sum, expected, "cooperative graph section");
+        failures += expect_value(sum, i == 3 ? 4U : 2U, "cooperative graph section");
+        failures += expect_value(sum + 1, i == 3 ? 35U : 3U, "gated graph slice parameters");
+        failures += expect_value(sum + 2, i == 3 ? 6U : 2U, "gated graph slice grid");
     }
     return failures;
 }
@@ -199,6 +297,9 @@ int main() {
         failures += expect_value(storage.data(), 0x55555555U, "capture after failed preparation");
         failures += check_external_event(device);
         failures += check_child_graph(device);
+        failures += check_kernel_slice(device, 1);
+        failures += check_kernel_slice(device, 3);
+        failures += check_invalid_kernel_patch(device);
         failures += check_cooperative_section(device);
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

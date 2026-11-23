@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace ninfer {
 namespace {
@@ -46,14 +47,18 @@ void discard_capture(cudaStream_t stream) noexcept {
     destroy_graph(discard);
 }
 
-std::vector<cudaGraphNode_t> captured_nodes(cudaStream_t stream) {
+cudaGraph_t active_capture(cudaStream_t stream) {
     cudaStreamCaptureStatus status;
     cudaGraph_t graph = nullptr;
     check_graph(
         cudaStreamGetCaptureInfo(stream, &status, nullptr, &graph, nullptr, nullptr, nullptr),
         "cudaStreamGetCaptureInfo");
     if (status != cudaStreamCaptureStatusActive)
-        throw std::logic_error("a graph section requires an active parent capture");
+        throw std::logic_error("inline graph recording requires an active parent capture");
+    return graph;
+}
+
+std::vector<cudaGraphNode_t> captured_nodes(cudaGraph_t graph) {
     std::size_t count = 0;
     check_graph(cudaGraphGetNodes(graph, nullptr, &count), "cudaGraphGetNodes");
     std::vector<cudaGraphNode_t> nodes(count);
@@ -61,37 +66,82 @@ std::vector<cudaGraphNode_t> captured_nodes(cudaStream_t stream) {
     return nodes;
 }
 
+std::vector<cudaGraphNode_t> added_nodes(cudaGraph_t graph, std::vector<cudaGraphNode_t> before) {
+    std::ranges::sort(before);
+    auto nodes = captured_nodes(graph);
+    std::erase_if(nodes, [&](auto node) { return std::ranges::binary_search(before, node); });
+    return nodes;
+}
+
+bool cooperative_kernel(cudaGraphNode_t node) {
+    cudaKernelNodeAttrValue attribute{};
+    check_graph(
+        cudaGraphKernelNodeGetAttribute(node, cudaKernelNodeAttributeCooperative, &attribute),
+        "cudaGraphKernelNodeGetAttribute");
+    return attribute.cooperative;
+}
+
+std::vector<cudaGraphNode_t> dependent_nodes(cudaGraphNode_t node) {
+    std::size_t count = 0;
+    check_graph(cudaGraphNodeGetDependentNodes(node, nullptr, nullptr, &count),
+                "cudaGraphNodeGetDependentNodes");
+    std::vector<cudaGraphNode_t> nodes(count);
+    if (count)
+        check_graph(cudaGraphNodeGetDependentNodes(node, nodes.data(), nullptr, &count),
+                    "cudaGraphNodeGetDependentNodes");
+    return nodes;
+}
+
+[[noreturn]] void invalid_kernel_chain() {
+    throw std::logic_error("graph kernel slice requires a non-empty single dependency chain");
+}
+
+template <class Contains>
+std::vector<cudaGraphNode_t> kernel_chain(cudaGraphNode_t root, std::size_t size,
+                                          Contains contains) {
+    std::vector<cudaGraphNode_t> nodes;
+    nodes.reserve(size);
+    for (auto node = root; node;) {
+        cudaGraphNodeType type;
+        check_graph(cudaGraphNodeGetType(node, &type), "cudaGraphNodeGetType");
+        if (type != cudaGraphNodeTypeKernel || cooperative_kernel(node))
+            throw std::logic_error("graph kernel slice requires ordinary kernel nodes");
+        nodes.push_back(node);
+        cudaGraphNode_t next = nullptr;
+        for (auto dependent : dependent_nodes(node)) {
+            if (!contains(dependent)) continue;
+            if (next) invalid_kernel_chain();
+            next = dependent;
+        }
+        node = next;
+    }
+    if (nodes.empty() || nodes.size() != size) invalid_kernel_chain();
+    return nodes;
+}
+
 } // namespace
 
 void DecodeGraphSection::begin(cudaStream_t stream) {
-    nodes_   = captured_nodes(stream);
+    nodes_   = captured_nodes(active_capture(stream));
     enabled_ = true;
 }
 
 void DecodeGraphSection::end(cudaStream_t stream) {
-    auto before = std::move(nodes_);
-    std::ranges::sort(before);
+    auto added = added_nodes(active_capture(stream), std::move(nodes_));
     nodes_.clear();
     cooperative_.clear();
-    for (const auto node : captured_nodes(stream)) {
-        if (std::ranges::binary_search(before, node)) continue;
+    for (const auto node : added) {
         cudaGraphNodeType type;
         check_graph(cudaGraphNodeGetType(node, &type), "cudaGraphNodeGetType");
         if (type != cudaGraphNodeTypeKernel && type != cudaGraphNodeTypeMemcpy &&
             type != cudaGraphNodeTypeMemset)
             throw std::logic_error(
                 "a switchable graph section must contain only kernels or copies");
-        if (type == cudaGraphNodeTypeKernel) {
-            cudaKernelNodeAttrValue attribute{};
-            check_graph(cudaGraphKernelNodeGetAttribute(node, cudaKernelNodeAttributeCooperative,
-                                                        &attribute),
-                        "cudaGraphKernelNodeGetAttribute");
-            if (attribute.cooperative) {
-                auto& saved = cooperative_.emplace_back(node, cudaKernelNodeParams{});
-                check_graph(cudaGraphKernelNodeGetParams(node, &saved.original),
-                            "cudaGraphKernelNodeGetParams");
-                continue;
-            }
+        if (type == cudaGraphNodeTypeKernel && cooperative_kernel(node)) {
+            auto& saved = cooperative_.emplace_back(node, cudaKernelNodeParams{});
+            check_graph(cudaGraphKernelNodeGetParams(node, &saved.original),
+                        "cudaGraphKernelNodeGetParams");
+            continue;
         }
         nodes_.push_back(node);
     }
@@ -170,6 +220,72 @@ bool DecodeGraphDefinition::ready() const noexcept { return graph_ != nullptr; }
 
 void DecodeGraphDefinition::reset() noexcept { destroy_graph(graph_); }
 
+void DecodeGraphKernelPatch::capture(cudaStream_t stream, const std::function<void()>& body) {
+    reset();
+    DecodeGraphDefinition definition;
+    definition.capture(stream, body);
+    std::size_t size = 0, roots = 0;
+    check_graph(cudaGraphGetNodes(definition.graph_, nullptr, &size), "cudaGraphGetNodes");
+    check_graph(cudaGraphGetRootNodes(definition.graph_, nullptr, &roots), "cudaGraphGetRootNodes");
+    if (roots != 1) invalid_kernel_chain();
+    cudaGraphNode_t root = nullptr;
+    check_graph(cudaGraphGetRootNodes(definition.graph_, &root, &roots), "cudaGraphGetRootNodes");
+    const auto nodes = kernel_chain(root, size, [](auto) { return true; });
+    std::vector<cudaKernelNodeParams> params;
+    params.reserve(size);
+    for (auto node : nodes)
+        check_graph(cudaGraphKernelNodeGetParams(node, &params.emplace_back()),
+                    "cudaGraphKernelNodeGetParams");
+    definition_ = std::move(definition);
+    params_     = std::move(params);
+}
+
+void DecodeGraphKernelPatch::reset() noexcept {
+    params_.clear();
+    definition_.reset();
+}
+
+void DecodeGraphKernelSlice::begin(cudaStream_t stream) {
+    if (capture_) throw std::logic_error("a graph kernel slice is already recording");
+    const auto graph = active_capture(stream);
+    before_          = captured_nodes(graph);
+    nodes_.clear();
+    capture_ = graph;
+}
+
+void DecodeGraphKernelSlice::end(cudaStream_t stream) {
+    const auto graph = std::exchange(capture_, nullptr);
+    auto before      = std::move(before_);
+    if (!graph || graph != active_capture(stream))
+        throw std::logic_error("a graph kernel slice must end in its parent capture");
+    auto added = added_nodes(graph, std::move(before));
+    if (added.empty()) invalid_kernel_chain();
+    std::ranges::sort(added);
+    const auto contains = [&](auto node) { return std::ranges::binary_search(added, node); };
+    // External incoming edges are irrelevant. The root has no predecessor in the slice.
+    auto roots = added;
+    for (auto node : added)
+        for (auto dependent : dependent_nodes(node))
+            if (const auto it = std::ranges::lower_bound(added, dependent);
+                it != added.end() && *it == dependent)
+                roots[it - added.begin()] = nullptr;
+    std::erase(roots, nullptr);
+    if (roots.size() != 1) invalid_kernel_chain();
+    nodes_ = kernel_chain(roots.front(), added.size(), contains);
+}
+
+void DecodeGraphKernelSlice::capture(cudaStream_t stream, const std::function<void()>& body) {
+    begin(stream);
+    try {
+        body();
+    } catch (...) {
+        capture_ = nullptr;
+        before_.clear();
+        throw;
+    }
+    end(stream);
+}
+
 DecodeGraphExecutable::~DecodeGraphExecutable() { reset(); }
 
 DecodeGraphExecutable::DecodeGraphExecutable(DecodeGraphExecutable&& other) noexcept
@@ -225,6 +341,17 @@ void DecodeGraphExecutable::update_child(DecodeGraphChild child,
         throw std::logic_error("CUDA Graph child update requires a node and definition");
     check_graph(cudaGraphExecChildGraphNodeSetParams(exec_, child.node, definition.graph_),
                 "cudaGraphExecChildGraphNodeSetParams");
+}
+
+void DecodeGraphExecutable::update_slice(const DecodeGraphKernelSlice& slice,
+                                         const DecodeGraphKernelPatch& patch) {
+    if (!ready() || !patch.ready() || slice.size() != patch.params().size())
+        throw std::logic_error("CUDA Graph kernel update requires a matching slice and patch");
+    nvtx::ScopedRange update_range(nvtx::Name::CudaGraphUpdate, nvtx::Category::Graph);
+    const auto params = patch.params();
+    for (std::size_t i = 0; i < params.size(); ++i)
+        check_graph(cudaGraphExecKernelNodeSetParams(exec_, slice.nodes_[i], &params[i]),
+                    "cudaGraphExecKernelNodeSetParams");
 }
 
 void DecodeGraphExecutable::upload(cudaStream_t stream) {

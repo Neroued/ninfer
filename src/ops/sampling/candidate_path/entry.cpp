@@ -44,7 +44,8 @@ void execute(CandidateSelectorInput input, const Tensor& ids, const Tensor& unar
              const Tensor& keys, const Tensor& hidden, const Tensor& anchors,
              const Tensor& predecessor, const Tensor& successor, int token_domain,
              const Tensor& positions, const SamplingConfig* configs, Tensor& drafts, Tensor& q,
-             const Tensor& live_rows, MemoryArena& workspace, CudaExecutionView execution) {
+             const Tensor& confidence, const Tensor& live_rows, MemoryArena& workspace,
+             CudaExecutionView execution) {
     const int steps = ids.ne[1], batch = ids.ne[2];
     validate_common(steps, batch, hidden, anchors, predecessor, successor, token_domain, positions,
                     configs, drafts, q, live_rows, workspace, execution);
@@ -68,12 +69,20 @@ void execute(CandidateSelectorInput input, const Tensor& ids, const Tensor& unar
         common::operand::range(q, kOp),
         common::operand::range(configs, batch * sizeof(SamplingConfig), kOp)};
     common::operand::disjoint(ranges, kOp);
+    if (confidence.data) {
+        common::operand::tensor(confidence, DType::FP32, {steps, batch}, 4, kOp, "confidence",
+                                execution.device());
+        const auto output = common::operand::range(confidence, kOp);
+        for (const auto range : ranges) common::operand::disjoint(output, range, kOp);
+        if (live_rows.data)
+            common::operand::disjoint(output, common::operand::range(live_rows, kOp), kOp);
+    }
     if (live_rows.data)
         for (const auto range : ranges)
             common::operand::disjoint(range, common::operand::range(live_rows, kOp), kOp);
     candidate_path_detail::execute_candidate_path(
         input, ids, unary, keys, hidden, anchors, predecessor, successor, positions, configs,
-        drafts, q, live_rows, workspace, execution.stream());
+        drafts, q, confidence, live_rows, workspace, execution.stream());
 }
 } // namespace
 
@@ -104,7 +113,7 @@ void candidate_selector_path(const Tensor& ids, const Tensor& unary, const Tenso
                              const Tensor& live_rows, MemoryArena& workspace,
                              CudaExecutionView execution) {
     execute(CandidateSelectorInput::Candidates, ids, unary, {}, hidden, anchors, predecessor,
-            successor, token_domain, positions, configs, drafts, q, live_rows, workspace,
+            successor, token_domain, positions, configs, drafts, q, {}, live_rows, workspace,
             execution);
 }
 
@@ -114,7 +123,30 @@ void candidate_selector_path(const Tensor& keys, const Tensor& hidden, const Ten
                              Tensor& drafts, Tensor& q, const Tensor& live_rows,
                              MemoryArena& workspace, CudaExecutionView execution) {
     execute(CandidateSelectorInput::GatheredKeys, ids, {}, keys, hidden, anchors, predecessor,
-            successor, token_domain, positions, configs, drafts, q, live_rows, workspace,
+            successor, token_domain, positions, configs, drafts, q, {}, live_rows, workspace,
             execution);
+}
+
+void candidate_selector_path(const Tensor& ids, const Tensor& unary, const Tensor& hidden,
+                             const Tensor& anchors, const Tensor& predecessor,
+                             const Tensor& successor, int token_domain, const Tensor& positions,
+                             const SamplingConfig* configs, Tensor& drafts, Tensor& q,
+                             Tensor& confidence, const Tensor& live_rows, MemoryArena& workspace,
+                             CudaExecutionView execution) {
+    common::operand::contiguous_nonnull(confidence, kOp, "confidence", execution.device());
+    execute(CandidateSelectorInput::Candidates, ids, unary, {}, hidden, anchors, predecessor,
+            successor, token_domain, positions, configs, drafts, q, confidence, live_rows,
+            workspace, execution);
+}
+
+void candidate_selector_path(const Tensor& keys, const Tensor& hidden, const Tensor& anchors,
+                             const Tensor& predecessor, const Tensor& successor, int token_domain,
+                             const Tensor& positions, const SamplingConfig* configs, Tensor& ids,
+                             Tensor& drafts, Tensor& q, Tensor& confidence, const Tensor& live_rows,
+                             MemoryArena& workspace, CudaExecutionView execution) {
+    common::operand::contiguous_nonnull(confidence, kOp, "confidence", execution.device());
+    execute(CandidateSelectorInput::GatheredKeys, ids, {}, keys, hidden, anchors, predecessor,
+            successor, token_domain, positions, configs, drafts, q, confidence, live_rows,
+            workspace, execution);
 }
 } // namespace ninfer::ops

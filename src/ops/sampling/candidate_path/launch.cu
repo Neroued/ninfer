@@ -3,6 +3,7 @@
 #include "ops/common/cuda/pipeline.cuh"
 #include <math_constants.h>
 #include "ops/common/cuda/reduce.cuh"
+#include "ops/reduction/online_softmax.cuh"
 #include "ops/sampling/kernels/random.cuh"
 #include <cuda_bf16.h>
 #include <stdexcept>
@@ -25,6 +26,7 @@ struct DeviceArgs {
     const SamplingConfig* configs;
     std::int32_t* drafts;
     float* q;
+    float* confidence;
     int steps;
     int batch;
     const unsigned long long* keys;
@@ -37,7 +39,10 @@ __device__ void clear_row(const DeviceArgs& a, int batch) {
     for (int i = threadIdx.x; i < a.steps * kCandidates; i += blockDim.x) {
         a.q[first * kCandidates + i] = 0.0F;
         if (a.merged_ids) a.merged_ids[first * kCandidates + i] = 0;
-        if (i < a.steps) a.drafts[first + i] = 0;
+        if (i < a.steps) {
+            a.drafts[first + i] = 0;
+            if (a.confidence) a.confidence[first + i] = 0.0f;
+        }
     }
 }
 
@@ -79,18 +84,26 @@ __device__ void merge_current(const DeviceArgs& a, std::int64_t column, Selector
 
 // The probabilities written here are the same FP32 values consumed by the draw.
 __device__ int draw_rank(float edge, float temperature, unsigned long long seed, int position,
-                         float* q) {
+                         float* q, float* confidence) {
     const int lane      = threadIdx.x & 31;
     const float maximum = warp_max(edge);
     if (temperature <= 0.0F) {
+        if (confidence) {
+            const float weight = isfinite(edge) ? __expf(edge - maximum) : 0.0f;
+            const float mass   = warp_sum(weight);
+            if (lane == 0) *confidence = 1.0f / mass;
+        }
         const unsigned winners =
             __ballot_sync(kFullWarpMask, lane < kCandidates && edge == maximum);
         const int selected = winners == 0 ? 0 : __ffs(winners) - 1;
         if (lane < kCandidates) q[lane] = lane == selected ? 1.0F : 0.0F;
         return selected;
     }
-    const float weight      = lane < kCandidates ? __expf((edge - maximum) / temperature) : 0.0F;
-    const float probability = weight / warp_sum(weight);
+    const float weight =
+        lane < kCandidates ? __expf(scaled_score_difference(edge, maximum, temperature)) : 0.0f;
+    const float mass = warp_sum(weight);
+    if (confidence && lane == 0) *confidence = 1.0f / mass;
+    const float probability = weight / mass;
     if (lane < kCandidates) q[lane] = probability;
     float uniform =
         lane == 0 ? sampling_uniform(seed, position, kSamplePurposeDFlash2Proposal, 0U) : 0.0F;
@@ -164,7 +177,8 @@ __device__ void walk_path(const DeviceArgs& a, SelectorShared& shared, const int
         if (warp == 0) {
             const float edge   = lane < kCandidates ? shared.edge[lane] : -CUDART_INF_F;
             const int selected = draw_rank(edge, shared.temperature, shared.seed,
-                                           shared.base_position + step, a.q + column * kCandidates);
+                                           shared.base_position + step, a.q + column * kCandidates,
+                                           a.confidence ? a.confidence + column : nullptr);
             if (lane == 0) {
                 shared.predecessor = ids[selected];
                 a.drafts[column]   = shared.predecessor;
@@ -254,7 +268,8 @@ __launch_bounds__(32) void selector_lattice_walk_kernel(const __grid_constant__ 
                         lane]
                 : -CUDART_INF_F;
         int selected =
-            draw_rank(edge, temperature, seed, position + step, a.q + column * kCandidates);
+            draw_rank(edge, temperature, seed, position + step, a.q + column * kCandidates,
+                      a.confidence ? a.confidence + column : nullptr);
         predecessor_rank = selected;
         if (lane == 0) a.drafts[column] = a.ids[column * kCandidates + selected];
     }
@@ -268,8 +283,8 @@ void launch_candidate_path(SelectorPlan plan, CandidateSelectorInput input,
                            const Tensor& anchors, const Tensor& predecessor_codebook,
                            const Tensor& successor_codebook, const Tensor& base_positions,
                            const SamplingConfig* configs, Tensor& drafts, Tensor& proposal_q,
-                           const Tensor& live_rows, const SelectorWorkspace& workspace,
-                           cudaStream_t stream) {
+                           const Tensor& confidence, const Tensor& live_rows,
+                           const SelectorWorkspace& workspace, cudaStream_t stream) {
     const DeviceArgs args{static_cast<const std::int32_t*>(candidate_ids.data),
                           static_cast<const float*>(unary_scores.data),
                           static_cast<const __nv_bfloat16*>(projected_hidden.data),
@@ -280,6 +295,7 @@ void launch_candidate_path(SelectorPlan plan, CandidateSelectorInput input,
                           configs,
                           static_cast<std::int32_t*>(drafts.data),
                           static_cast<float*>(proposal_q.data),
+                          static_cast<float*>(confidence.data),
                           candidate_ids.ne[1],
                           candidate_ids.ne[2],
                           static_cast<const unsigned long long*>(keys.data),

@@ -8,15 +8,25 @@
 namespace ninfer::ops::sampling_detail {
 using namespace common;
 
-template <class S>
+template <int Threads>
+__device__ void store_sample_partial_mass(SoftmaxMass mass, float temperature, float* sums) {
+    mass = block_softmax_mass<Threads>(mass, temperature);
+    if (threadIdx.x == 0) sums[std::int64_t(blockIdx.y) * gridDim.x + blockIdx.x] = mass.sum;
+}
+
+template <class S, bool Probability>
 __launch_bounds__(S::kSamplerBlock) __global__
     void sample_row_kernel(const __nv_bfloat16* logits, std::int32_t* out,
                            const SamplingConfig* configs, const std::int32_t* logical_positions,
                            std::int32_t purpose, std::int32_t token_domain,
-                           std::int32_t physical_rows, const std::int32_t* live) {
+                           std::int32_t physical_rows, const std::int32_t* live,
+                           float* probabilities) {
     const int row = static_cast<int>(blockIdx.x);
     if (live && !live[row]) {
-        if (threadIdx.x == 0) out[row] = 0;
+        if (threadIdx.x == 0) {
+            out[row] = 0;
+            if constexpr (Probability) probabilities[row] = 0.0f;
+        }
         return;
     }
     const std::int64_t base  = static_cast<std::int64_t>(row) * physical_rows;
@@ -31,9 +41,11 @@ __launch_bounds__(S::kSamplerBlock) __global__
         float bv             = -CUDART_INF_F;
         int bi               = INT_MAX;
         const bool penalties = cfg.presence_penalty != 0.0f || cfg.frequency_penalty != 0.0f;
+        SoftmaxMass mass;
         if (!penalties && cfg.mask.words == nullptr) {
             for (int v = tid; v < token_domain; v += blockDim.x) {
                 const float x = __bfloat162float(logits[base + v]);
+                if constexpr (Probability) mass.add(x, 1.0f);
                 if (score_id_better(x, v, bv, bi)) {
                     bv = x;
                     bi = v;
@@ -42,11 +54,16 @@ __launch_bounds__(S::kSamplerBlock) __global__
         } else {
             for (int v = tid; v < token_domain; v += blockDim.x) {
                 const float x = sampling_adjusted_logit(__bfloat162float(logits[base + v]), v, cfg);
+                if constexpr (Probability) mass.add(x, 1.0f);
                 if (score_id_better(x, v, bv, bi)) {
                     bv = x;
                     bi = v;
                 }
             }
+        }
+        if constexpr (Probability) {
+            mass = block_softmax_mass<S::kSamplerBlock>(mass, 1.0f);
+            if (tid == 0) probabilities[row] = 1.0f / mass.sum;
         }
         red_val[tid] = bv;
         red_idx[tid] = bi;
@@ -74,11 +91,13 @@ __launch_bounds__(S::kSamplerBlock) __global__
     __shared__ int merge_idx[S::kSamplerBlock * kSamplerFastCandidates];
 
     if (token_domain <= S::kSamplerTileItems) {
-        sampling_build_truncated_small<S>(logits, base, token_domain, cfg, red_val, red_idx,
-                                          cand_val, cand_idx, prob, &n_support);
+        sampling_build_truncated_small<S, Probability>(
+            logits, base, token_domain, cfg, red_val, red_idx, cand_val, cand_idx, prob, &n_support,
+            {}, 0, Probability ? probabilities + row : nullptr);
     } else {
-        sampling_build_truncated_block_fast(logits, base, token_domain, cfg, merge_val, merge_idx,
-                                            cand_val, cand_idx, prob, &n_support);
+        sampling_build_truncated_block_fast<Probability ? S::kSamplerBlock : 0>(
+            logits, base, token_domain, cfg, merge_val, merge_idx, cand_val, cand_idx, prob,
+            &n_support, {}, 0, Probability ? probabilities + row : nullptr);
     }
 
     if (tid != 0) { return; }
@@ -96,11 +115,11 @@ __launch_bounds__(S::kSamplerBlock) __global__
     out[row] = picked;
 }
 
-template <class S, bool WarpTiles = false>
+template <class S, bool WarpTiles, bool Probability>
 __launch_bounds__(S::kSamplerBlock) __global__
     void sampling_partial_topk_kernel(const __nv_bfloat16* logits, const SamplingConfig* cfg_ptr,
                                       std::int32_t token_domain, std::int32_t physical_rows,
-                                      Workspace workspace, const std::int32_t* live) {
+                                      Workspace workspace, const std::int32_t* live, float* sums) {
     const int col = static_cast<int>(blockIdx.y);
     if (live && !live[col]) return;
     const int partial        = static_cast<int>(blockIdx.x);
@@ -118,17 +137,24 @@ __launch_bounds__(S::kSamplerBlock) __global__
     const int cap           = greedy ? 1 : sampling_candidate_cap(cfg, token_domain);
     const std::int64_t base = static_cast<std::int64_t>(col) * physical_rows;
     const int tile_start    = partial * S::kSamplerPartialTileItems;
+    const float temperature = greedy ? 1.0f : cfg.temperature;
+    SoftmaxMass mass;
     if constexpr (WarpTiles) {
         if (!greedy && !penalties) {
             unsigned int raw_keys[S::kSamplerItemsPerThread];
 #pragma unroll
             for (int item = 0; item < S::kSamplerItemsPerThread; ++item) {
                 const int local = item * blockDim.x + threadIdx.x, v = tile_start + local;
-                raw_keys[item] = (v < token_domain &&
-                                  (!cfg.mask.words || (cfg.mask.words[v / 32] & (1u << (v % 32)))))
-                                     ? sampling_bf16_tile_sort_key<S>(logits[base + v], local)
-                                     : 0;
+                raw_keys[item] = 0;
+                if (v < token_domain &&
+                    (!cfg.mask.words || (cfg.mask.words[v / 32] & (1u << (v % 32))))) {
+                    const auto raw = logits[base + v];
+                    raw_keys[item] = sampling_bf16_tile_sort_key<S>(raw, local);
+                    if constexpr (Probability) mass.add(__bfloat162float(raw), temperature);
+                }
             }
+            if constexpr (Probability)
+                store_sample_partial_mass<S::kSamplerBlock>(mass, temperature, sums);
             sampling_store_bf16_tile_topk<S>(raw_keys, cap, tile_start, workspace, col, partial,
                                              sort_storage.bf16);
             return;
@@ -143,10 +169,12 @@ __launch_bounds__(S::kSamplerBlock) __global__
             const float x =
                 (penalties || cfg.mask.words) ? sampling_adjusted_logit(raw, v, cfg) : raw;
             keys[item] = score_id_order_key(x, v);
+            if constexpr (Probability) mass.add(x, temperature);
         } else {
             keys[item] = 0ull;
         }
     }
+    if constexpr (Probability) store_sample_partial_mass<S::kSamplerBlock>(mass, temperature, sums);
     if (greedy) {
         unsigned long long best = keys[0];
 #pragma unroll
@@ -176,11 +204,11 @@ __launch_bounds__(S::kSamplerBlock) __global__
     }
 }
 
-template <int Tile>
+template <int Tile, bool Probability>
 __launch_bounds__(256) __global__
     void sampling_greedy_partial_kernel(const __nv_bfloat16* logits, const SamplingConfig* configs,
                                         int token_domain, int physical_rows, Workspace workspace,
-                                        const int* live) {
+                                        const int* live, float* sums) {
     const int row = blockIdx.y, partial = blockIdx.x, tid = threadIdx.x;
     if (live && !live[row]) return;
     const SamplingConfig cfg = configs[row];
@@ -188,6 +216,7 @@ __launch_bounds__(256) __global__
     if (partial == 0 && tid == 0) workspace.group_done[row] = 0;
     const int start = partial * Tile;
     const auto base = std::int64_t(row) * physical_rows;
+    SoftmaxMass mass;
     if (cfg.presence_penalty == 0.F && cfg.frequency_penalty == 0.F) {
         using TileKey = ThresholdSelection<256, Tile / 256>;
         __shared__ unsigned int warp_maxima[8];
@@ -196,9 +225,13 @@ __launch_bounds__(256) __global__
         for (int i = 0; i < Tile / 256; ++i) {
             const int local = i * 256 + tid, token = start + local;
             if (token < token_domain &&
-                (!cfg.mask.words || (cfg.mask.words[token / 32] & (1U << (token % 32)))))
-                best = max(best, sampling_bf16_tile_sort_key<TileKey>(logits[base + token], local));
+                (!cfg.mask.words || (cfg.mask.words[token / 32] & (1U << (token % 32))))) {
+                const auto raw = logits[base + token];
+                best           = max(best, sampling_bf16_tile_sort_key<TileKey>(raw, local));
+                if constexpr (Probability) mass.add(__bfloat162float(raw), 1.0f);
+            }
         }
+        if constexpr (Probability) store_sample_partial_mass<256>(mass, 1.0f, sums);
         best = __reduce_max_sync(0xffffffffU, best);
         if ((tid & 31) == 0) warp_maxima[tid / 32] = best;
         __syncthreads();
@@ -219,18 +252,20 @@ __launch_bounds__(256) __global__
             const float score =
                 sampling_adjusted_logit(__bfloat162float(logits[base + token]), token, cfg);
             best = max(best, static_cast<unsigned long long>(score_id_order_key(score, token)));
+            if constexpr (Probability) mass.add(score, 1.0f);
         }
     }
+    if constexpr (Probability) store_sample_partial_mass<256>(mass, 1.0f, sums);
     best = block_reduce_max_key(best, warp_keys);
     if (tid == 0)
         workspace.partial_keys[sampling_partial_offset(workspace, row, partial, 0)] = best;
 }
 
-template <int Threads, int Items>
+template <int Threads, int Items, bool Probability>
 __launch_bounds__(Threads) __global__
     void sampling_threshold_topk_kernel(const __nv_bfloat16* logits, const SamplingConfig* configs,
                                         int token_domain, int physical_rows, Workspace workspace,
-                                        const int* live) {
+                                        const int* live, float* sums) {
     const int row = blockIdx.y, partial = blockIdx.x;
     if (live && !live[row]) return;
     const SamplingConfig cfg = configs[row];
@@ -257,17 +292,21 @@ __launch_bounds__(Threads) __global__
     __syncthreads();
     const int cap = sampling_candidate_cap(cfg, token_domain);
     auto* result  = workspace.partial_keys + sampling_partial_offset(workspace, row, partial, 0);
+    SoftmaxMass mass;
     if (!penalties) {
         unsigned int keys[Items];
 #pragma unroll
         for (int i = 0; i < Items; ++i) {
             const int local = threadIdx.x + i * Threads, token = start + local;
-            keys[i] =
-                token < token_domain &&
-                        (!cfg.mask.words || (cfg.mask.words[token / 32] & (1U << (token % 32))))
-                    ? sampling_bf16_tile_sort_key<Compact>(storage.inputs.logits[local], local)
-                    : 0;
+            keys[i] = 0;
+            if (token < token_domain &&
+                (!cfg.mask.words || (cfg.mask.words[token / 32] & (1U << (token % 32))))) {
+                const auto raw = storage.inputs.logits[local];
+                keys[i]        = sampling_bf16_tile_sort_key<Compact>(raw, local);
+                if constexpr (Probability) mass.add(__bfloat162float(raw), cfg.temperature);
+            }
         }
+        if constexpr (Probability) store_sample_partial_mass<Threads>(mass, cfg.temperature, sums);
         __syncthreads();
         Compact::select_values(keys, cap, compact_keys, storage.compact);
         __syncthreads();
@@ -288,26 +327,32 @@ __launch_bounds__(Threads) __global__
                                                      cfg, storage.inputs.counts[local])
                           : -CUDART_INF_F;
                 keys[i] = score_id_order_key(score, token);
+                if constexpr (Probability) mass.add(score, cfg.temperature);
             }
         }
+        if constexpr (Probability) store_sample_partial_mass<Threads>(mass, cfg.temperature, sums);
         __syncthreads();
         Selector::select_values(keys, cap, result, storage.wide);
     }
 }
 
-template <class S, bool DirectGreedy = false>
+template <class S, bool DirectGreedy, bool Probability>
 __launch_bounds__(S::kSamplerGroupBlock) __global__
     void sampling_group_finalize_sample_kernel(std::int32_t* out, const SamplingConfig* cfg_ptr,
                                                const std::int32_t* logical_positions,
                                                std::int32_t purpose, std::int32_t token_domain,
                                                std::int32_t partial_blocks,
                                                std::int32_t group_count, Workspace workspace,
-                                               const std::int32_t* live) {
+                                               const std::int32_t* live, const float* partial_sums,
+                                               float* probabilities) {
     const int group = static_cast<int>(blockIdx.x);
     const int col   = static_cast<int>(blockIdx.y);
     const int tid   = threadIdx.x;
     if (live && !live[col]) {
-        if (group == 0 && tid == 0) out[col] = 0;
+        if (group == 0 && tid == 0) {
+            out[col] = 0;
+            if constexpr (Probability) probabilities[col] = 0.0f;
+        }
         return;
     }
     const SamplingConfig cfg = cfg_ptr[col];
@@ -322,6 +367,22 @@ __launch_bounds__(S::kSamplerGroupBlock) __global__
 
     const bool greedy = !(cfg.temperature > 0.0f);
     const int cap     = greedy ? 1 : sampling_candidate_cap(cfg, token_domain);
+    if constexpr (Probability) {
+        if (group == 0) {
+            const float temperature = greedy ? 1.0f : cfg.temperature;
+            SoftmaxMass mass;
+            for (int p = tid; p < partial_blocks; p += blockDim.x) {
+                const float sum = partial_sums[std::int64_t(col) * partial_blocks + p];
+                if (sum != 0.0f) {
+                    const auto key =
+                        workspace.partial_keys[sampling_partial_offset(workspace, col, p, 0)];
+                    mass.merge({score_from_order_key(key), sum}, temperature);
+                }
+            }
+            mass = block_softmax_mass<S::kSamplerGroupBlock>(mass, temperature);
+            if (tid == 0) probabilities[col] = 1.0f / mass.sum;
+        }
+    }
     // The preceding partial launch initializes group_done[col], so caller-owned
     // workspace does not rely on prior contents or a separate memset launch.
 

@@ -4,6 +4,7 @@
 #include "../../../tools/support/gathered_selector_fixture.h"
 
 #include <numeric>
+#include <bit>
 #include <array>
 #include <limits>
 #include <span>
@@ -30,8 +31,9 @@ double uniform(std::uint64_t seed, int position) {
 }
 
 int verify_math(const F& f, const std::vector<int>& drafts, const std::vector<float>& q,
-                std::span<const int> live_rows = {}) {
+                std::span<const float> confidence, std::span<const int> live_rows = {}) {
     std::vector<double> reference(q.size());
+    std::vector<double> confidence_reference(confidence.size());
     int failures = 0;
     for (int b = 0; b < f.batch; ++b) {
         if (!live_rows.empty() && !live_rows[b]) {
@@ -59,6 +61,11 @@ int verify_math(const F& f, const std::vector<int>& drafts, const std::vector<fl
             }
             const int maximum = int(std::max_element(edge.begin(), edge.end()) - edge.begin());
             const double temperature = f.sampling[b].temperature;
+            double full_mass         = 0;
+            for (int c = 0; c < live; ++c)
+                full_mass +=
+                    std::exp((edge[c] - edge[maximum]) / (temperature > 0 ? temperature : 1.0));
+            confidence_reference[col] = 1.0 / full_mass;
             if (temperature <= 0)
                 reference[col * 16 + maximum] = 1;
             else {
@@ -95,9 +102,12 @@ int verify_math(const F& f, const std::vector<int>& drafts, const std::vector<fl
             predecessor = drafts[col];
         }
     }
-    return failures + verify_pointwise("gathered selector independent conditional q",
-                                       std::vector<double>(q.begin(), q.end()), reference,
-                                       kQCriterion);
+    return failures +
+           verify_pointwise("gathered selector independent conditional q",
+                            std::vector<double>(q.begin(), q.end()), reference, kQCriterion) +
+           verify_pointwise("selector independent conditional confidence",
+                            std::vector<double>(confidence.begin(), confidence.end()),
+                            confidence_reference, kQCriterion);
 }
 
 int masked_rows(ops::CandidateSelectorInput input, int steps, int batch) {
@@ -106,10 +116,11 @@ int masked_rows(ops::CandidateSelectorInput input, int steps, int batch) {
     auto candidate_input = to_device(f.ids), unary = to_device(f.unary);
     GuardedDeviceBuffer ids_buffer(f.ids.size() * sizeof(int)),
         drafts_buffer(std::size_t(steps) * batch * sizeof(int)),
-        q_buffer(f.ids.size() * sizeof(float));
+        q_buffer(f.ids.size() * sizeof(float)), confidence_buffer(steps * batch * sizeof(float));
     Tensor ids(ids_buffer.span(), DType::I32, {16, steps, batch}),
         drafts(drafts_buffer.span(), DType::I32, {steps, batch}),
-        q(q_buffer.span(), DType::FP32, {16, steps, batch});
+        q(q_buffer.span(), DType::FP32, {16, steps, batch}),
+        confidence(confidence_buffer.span(), DType::FP32, {steps, batch});
     std::vector<int> live(batch, 1);
     auto device_live = to_device(live);
     Tensor validity(device_live.span(), DType::I32, {batch});
@@ -117,15 +128,26 @@ int masked_rows(ops::CandidateSelectorInput input, int steps, int batch) {
         ops::candidate_selector_path_workspace_capacity_bytes(input, steps, steps, batch, batch);
     GuardedDeviceBuffer scratch(std::max<std::size_t>(1, capacity));
     MemoryArena arena(scratch.span());
-    const auto launch = [&] {
+    const auto launch = [&](bool with_confidence) {
         const auto* configs = static_cast<const ops::SamplingConfig*>(f.configs.data());
         if (input == ops::CandidateSelectorInput::Candidates) {
             const Tensor candidates(candidate_input.span(), DType::I32, {16, steps, batch}),
                 scores(unary.span(), DType::FP32, {16, steps, batch});
-            ops::candidate_selector_path(candidates, scores, f.hidden_tensor(), f.anchor_tensor(),
+            if (with_confidence)
+                ops::candidate_selector_path(candidates, scores, f.hidden_tensor(),
+                                             f.anchor_tensor(), f.predecessor_tensor(),
+                                             f.successor_tensor(), F::Domain, f.position_tensor(),
+                                             configs, drafts, q, confidence, validity, arena, e);
+            else
+                ops::candidate_selector_path(candidates, scores, f.hidden_tensor(),
+                                             f.anchor_tensor(), f.predecessor_tensor(),
+                                             f.successor_tensor(), F::Domain, f.position_tensor(),
+                                             configs, drafts, q, validity, arena, e);
+        } else if (with_confidence) {
+            ops::candidate_selector_path(f.key_tensor(), f.hidden_tensor(), f.anchor_tensor(),
                                          f.predecessor_tensor(), f.successor_tensor(), F::Domain,
-                                         f.position_tensor(), configs, drafts, q, validity, arena,
-                                         e);
+                                         f.position_tensor(), configs, ids, drafts, q, confidence,
+                                         validity, arena, e);
         } else {
             ops::candidate_selector_path(f.key_tensor(), f.hidden_tensor(), f.anchor_tensor(),
                                          f.predecessor_tensor(), f.successor_tensor(), F::Domain,
@@ -136,7 +158,7 @@ int masked_rows(ops::CandidateSelectorInput input, int steps, int batch) {
     DecodeGraphDefinition definition;
     DecodeGraphExecutable executable;
     cuda_synchronize();
-    definition.capture(e.stream(), launch);
+    definition.capture(e.stream(), [&] { launch(true); });
     executable.instantiate(definition);
     int failures = 0;
     for (int replay = 0; replay < 3; ++replay) {
@@ -174,11 +196,26 @@ int masked_rows(ops::CandidateSelectorInput input, int steps, int batch) {
         ids_buffer.fill(0xff);
         drafts_buffer.fill(0xff);
         q_buffer.fill(0xff);
+        confidence_buffer.fill(0xff);
         cuda_synchronize();
         executable.launch(e.stream());
         cuda_synchronize(e.stream());
-        failures += verify_math(f, from_device<int>(drafts_buffer.data(), steps * batch),
-                                from_device<float>(q_buffer.data(), f.ids.size()), live);
+        const auto actual_drafts     = from_device<int>(drafts_buffer.data(), steps * batch);
+        const auto q_bits            = from_device<std::uint32_t>(q_buffer.data(), f.ids.size());
+        const auto actual_confidence = from_device<float>(confidence_buffer.data(), steps * batch);
+        failures += verify_math(f, actual_drafts, from_device<float>(q_buffer.data(), f.ids.size()),
+                                actual_confidence, live);
+        for (int b = 0; b < batch; ++b)
+            if (!live[b])
+                for (int step = 0; step < steps; ++step)
+                    failures +=
+                        std::bit_cast<std::uint32_t>(actual_confidence[b * steps + step]) != 0;
+        launch(false);
+        cuda_synchronize(e.stream());
+        failures += verify_exact("masked confidence draft parity", actual_drafts,
+                                 from_device<int>(drafts_buffer.data(), steps * batch));
+        failures += verify_exact("masked confidence q parity", q_bits,
+                                 from_device<std::uint32_t>(q_buffer.data(), f.ids.size()));
         if (input == ops::CandidateSelectorInput::GatheredKeys)
             failures +=
                 verify_exact("masked merged IDs", from_device<int>(ids_buffer.data(), f.ids.size()),
@@ -189,9 +226,11 @@ int masked_rows(ops::CandidateSelectorInput input, int steps, int batch) {
                              from_device<int>(candidate_input, candidates.size()), candidates);
         failures += verify_exact("selector validity preserved",
                                  from_device<int>(device_live, live.size()), live);
-        failures +=
-            ids_buffer.verify_guards("masked IDs") + drafts_buffer.verify_guards("masked drafts") +
-            q_buffer.verify_guards("masked q") + scratch.verify_guards("masked selector workspace");
+        failures += ids_buffer.verify_guards("masked IDs") +
+                    drafts_buffer.verify_guards("masked drafts") +
+                    q_buffer.verify_guards("masked q") +
+                    confidence_buffer.verify_guards("masked confidence") +
+                    scratch.verify_guards("masked selector workspace");
         failures += arena.used() != 0 || arena.peak_used() > capacity;
     }
     return failures;
@@ -201,10 +240,11 @@ int run(int steps, int batch, F::Pattern pattern, bool graph) {
     const auto e = cuda_environment().context.execution_view();
     F f(e.device(), steps, batch, pattern);
     GuardedDeviceBuffer id_buffer(16ULL * steps * batch * 4), draft_buffer(steps * batch * 4),
-        q_buffer(16ULL * steps * batch * 4);
+        q_buffer(16ULL * steps * batch * 4), confidence_buffer(steps * batch * 4);
     Tensor ids(id_buffer.span(), DType::I32, {16, steps, batch}),
         drafts(draft_buffer.span(), DType::I32, {steps, batch}),
-        q(q_buffer.span(), DType::FP32, {16, steps, batch});
+        q(q_buffer.span(), DType::FP32, {16, steps, batch}),
+        confidence(confidence_buffer.span(), DType::FP32, {steps, batch});
     const auto capacity = ops::candidate_selector_path_workspace_capacity_bytes(
         ops::CandidateSelectorInput::GatheredKeys, steps, steps, batch, batch);
     GuardedDeviceBuffer scratch(std::max<std::size_t>(capacity, 1));
@@ -214,7 +254,7 @@ int run(int steps, int batch, F::Pattern pattern, bool graph) {
                                      f.predecessor_tensor(), f.successor_tensor(), F::Domain,
                                      f.position_tensor(),
                                      static_cast<const ops::SamplingConfig*>(f.configs.data()), ids,
-                                     drafts, q, {}, arena, e);
+                                     drafts, q, confidence, {}, arena, e);
     };
     DecodeGraphDefinition definition;
     DecodeGraphExecutable executable;
@@ -243,9 +283,11 @@ int run(int steps, int batch, F::Pattern pattern, bool graph) {
             const auto actual_drafts = from_device<int>(draft_buffer.data(), steps * batch);
             const auto actual_q      = from_device<float>(q_buffer.data(), f.ids.size());
             failures += verify_exact("lossless gathered top16 IDs", actual_ids, f.ids);
-            failures += verify_math(f, actual_drafts, actual_q);
+            failures += verify_math(f, actual_drafts, actual_q,
+                                    from_device<float>(confidence_buffer.data(), steps * batch));
             failures += id_buffer.verify_guards("merged IDs") +
                         draft_buffer.verify_guards("drafts") + q_buffer.verify_guards("q") +
+                        confidence_buffer.verify_guards("confidence") +
                         scratch.verify_guards("selector workspace");
             failures += arena.used() != 0 || arena.peak_used() > capacity;
             // Swapping rank lists preserves the global input set and all RNG inputs.
@@ -294,6 +336,7 @@ int run(int steps, int batch, F::Pattern pattern, bool graph) {
 void add_gathered_selector_cases(OpSuite& suite) {
     for (auto [input, steps, batch] :
          {std::tuple{ops::CandidateSelectorInput::Candidates, 3, 9},
+          std::tuple{ops::CandidateSelectorInput::Candidates, 7, 3},
           std::tuple{ops::CandidateSelectorInput::Candidates, 7, 17},
           std::tuple{ops::CandidateSelectorInput::GatheredKeys, 7, 2},
           std::tuple{ops::CandidateSelectorInput::GatheredKeys, 7, 17}}) {

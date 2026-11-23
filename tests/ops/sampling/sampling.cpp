@@ -705,6 +705,120 @@ int padded_batch_contract(int batch, int domain) {
     return failures;
 }
 
+int probability_contract(int batch, int domain) {
+    const auto cuda    = cuda_environment().context.execution_view();
+    const int physical = domain + 3, stride = (domain + 31) / 32;
+    std::vector<std::uint16_t> logits(std::size_t(physical) * batch);
+    std::vector<int> counts(domain), live(batch), positions(batch);
+    std::vector<std::uint32_t> mask(stride);
+    std::vector<ops::SamplingConfig> configs(batch);
+    auto input = to_device(logits), enabled = to_device(live), pos = to_device(positions);
+    auto params = to_device(configs), count_buffer = to_device(counts),
+         mask_buffer = to_device(mask);
+    GuardedDeviceBuffer output(batch * 4), legacy(batch * 4), probabilities(batch * 4);
+    Tensor x(input.span(), DType::BF16, {physical, batch});
+    Tensor y(output.span(), DType::I32, {batch}), old(legacy.span(), DType::I32, {batch});
+    Tensor p(probabilities.span(), DType::FP32, {batch});
+    Tensor use(enabled.span(), DType::I32, {batch}), logical(pos.span(), DType::I32, {batch});
+    const auto* cfg  = static_cast<const ops::SamplingConfig*>(params.data());
+    const auto bytes = ops::sampling_with_probability_workspace_capacity_bytes(domain, 1, batch);
+    GuardedDeviceBuffer scratch(std::max<std::size_t>(bytes, 1));
+    MemoryArena workspace(scratch.span());
+    DecodeGraphDefinition definition;
+    definition.capture(cuda.stream(), [&] {
+        ops::sample(x, y, p, domain, cfg, logical, ops::kSamplePurposeDecode, use, workspace, cuda);
+    });
+    DecodeGraphExecutable graph;
+    graph.instantiate(definition);
+
+    int failures = 0;
+    for (int phase = 0; phase < 2; ++phase) {
+        std::fill(mask.begin(), mask.end(), 0);
+        for (int v = 0; v < domain; ++v) {
+            counts[v] = (v * 11 + phase) % 7;
+            // Leave an entire tile empty when there are enough rows to do so.
+            if (v < 7 || (v >= 4096 && (v + phase) % 5 != 0)) mask[v / 32] |= 1U << (v % 32);
+        }
+        for (int b = 0; b < batch; ++b) {
+            const auto first = std::size_t(b) * physical;
+            for (int v = 0; v < domain; ++v)
+                logits[first + v] = f32_to_bf16(float((13 * v + b + 9 * phase) % 191 - 95) / 16);
+            std::fill_n(logits.begin() + first + domain, 3, f32_to_bf16(0x1p125f));
+            const int mode = b % 5;
+            live[b]        = (b + phase) % 7 != 4;
+            positions[b]   = 13 * b + phase;
+            configs[b]     = {.temperature = mode == 0   ? 0.0f
+                                             : mode == 2 ? 1e-6f
+                                                         : .875f,
+                              .top_k       = mode == 1 || mode == 2 ? 1 : 20,
+                              .top_p       = .8f,
+                              .min_p       = .3f,
+                              .seed        = static_cast<unsigned long long>(59 * b + phase)};
+            if (mode == 2) {
+                logits[first] = logits[first + domain - 1 - phase] = f32_to_bf16(0x1p120f);
+                logits[first + 1]                                  = f32_to_bf16(-0x1p120f);
+            } else if (mode == 1 && phase) {
+                configs[b].temperature = 0x1p127f;
+                logits[first]          = f32_to_bf16(0x1.fep127f);
+                logits[first + 1]      = f32_to_bf16(-0x1.fep127f);
+            } else if (mode != 1) {
+                configs[b].presence_penalty  = .25f;
+                configs[b].frequency_penalty = phase ? .25f : .125f;
+                configs[b].token_counts      = static_cast<const int*>(count_buffer.data());
+                configs[b].mask = {static_cast<const std::uint32_t*>(mask_buffer.data()), stride};
+            }
+            if (!live[b]) {
+                configs[b].mask.words   = reinterpret_cast<const std::uint32_t*>(std::uintptr_t{4});
+                configs[b].token_counts = reinterpret_cast<const int*>(std::uintptr_t{4});
+            }
+        }
+        input.copy_from_host(logits.data(), logits.size() * 2);
+        params.copy_from_host(configs.data(), configs.size() * sizeof(configs[0]));
+        count_buffer.copy_from_host(counts.data(), counts.size() * 4);
+        mask_buffer.copy_from_host(mask.data(), mask.size() * 4);
+        enabled.copy_from_host(live.data(), live.size() * 4);
+        pos.copy_from_host(positions.data(), positions.size() * 4);
+        graph.launch(cuda.stream());
+        ops::sample(x, old, domain, cfg, logical, ops::kSamplePurposeDecode, use, workspace, cuda);
+        cuda_synchronize(cuda.stream());
+        failures += verify_exact("probability sample IDs", from_device<int>(output.data(), batch),
+                                 from_device<int>(legacy.data(), batch));
+        const auto got = from_device<float>(probabilities.data(), batch);
+        for (int b = 0; b < batch; ++b) {
+            double expected = 0.0;
+            if (live[b]) {
+                const auto& c = configs[b];
+                std::vector<double> adjusted;
+                for (int v = 0; v < domain; ++v) {
+                    if (c.mask.words && !(mask[v / 32] & (1U << (v % 32)))) continue;
+                    double score = bf16_to_f32(logits[std::size_t(b) * physical + v]);
+                    if (c.token_counts) {
+                        score -= double(c.presence_penalty) * (counts[v] > 0);
+                        score -= double(c.frequency_penalty) * counts[v];
+                    }
+                    adjusted.push_back(score);
+                }
+                const auto maximum = *std::max_element(adjusted.begin(), adjusted.end());
+                const double tau   = c.temperature > 0.0f ? c.temperature : 1.0;
+                double sum         = 0.0;
+                for (const double score : adjusted) sum += std::exp((score - maximum) / tau);
+                expected = 1.0 / sum;
+            }
+            if (!(got[b] >= 0.0f && got[b] <= 1.0f &&
+                  std::abs(got[b] - expected) <= 5e-6 * expected)) {
+                std::cerr << "sample confidence row " << b << " is " << got[b] << ", expected "
+                          << expected << '\n';
+                ++failures;
+            }
+        }
+    }
+    if (domain <= 256) failures += bytes != 0;
+    failures += workspace.used() != 0 || workspace.peak_used() > bytes;
+    return failures + output.verify_guards("sample with probability IDs") +
+           probabilities.verify_guards("sample with probability values") +
+           scratch.verify_guards("sample with probability scratch");
+}
+
 int large_alignment_contract() {
     constexpr int rows = 16387, domain = 16381, batch = 17, width = 2;
     constexpr int words = (domain + 31) / 32;
@@ -831,6 +945,9 @@ int capacity_contract() {
 } // namespace
 
 void add_sampling_cases(ninfer::test::OpSuite& suite) {
+    for (auto [batch, domain] : {std::pair{9, 73}, {7, 2053}, {9, 16381}, {5, 327681}})
+        suite.add("sample/probability/v" + std::to_string(domain),
+                  [=] { return probability_contract(batch, domain); }, {{"execution", "graph"}});
     suite.add("sample/capacity", capacity_contract);
     suite.add("sample/greedy", greedy_contract);
     suite.add("sample/deterministic_stochastic", deterministic_stochastic_contract);

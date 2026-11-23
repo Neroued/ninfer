@@ -78,4 +78,24 @@ void candidate_selector_path(const Tensor& keys, const Tensor& projected_hidden,
                              const Tensor& live_rows, MemoryArena& workspace,
                              CudaExecutionView execution);
 
+// Both forms can also write contiguous Device FP32 confidence [K,B], disjoint from all
+// operands and scratch. For each step, before drawing, it is the maximum softmax probability
+// of the finite reranked edges conditioned on the realized prefix. The scale is the configured
+// positive temperature or unit temperature for greedy rows. Inactive rows write zero.
+void candidate_selector_path(const Tensor& candidate_ids, const Tensor& unary_scores,
+                             const Tensor& projected_hidden, const Tensor& anchors,
+                             const Tensor& predecessor_codebook, const Tensor& successor_codebook,
+                             std::int32_t token_domain, const Tensor& base_positions,
+                             const SamplingConfig* configs, Tensor& drafts, Tensor& proposal_q,
+                             Tensor& confidence, const Tensor& live_rows, MemoryArena& workspace,
+                             CudaExecutionView execution);
+
+void candidate_selector_path(const Tensor& keys, const Tensor& projected_hidden,
+                             const Tensor& anchors, const Tensor& predecessor_codebook,
+                             const Tensor& successor_codebook, std::int32_t token_domain,
+                             const Tensor& base_positions, const SamplingConfig* configs,
+                             Tensor& candidate_ids, Tensor& drafts, Tensor& proposal_q,
+                             Tensor& confidence, const Tensor& live_rows, MemoryArena& workspace,
+                             CudaExecutionView execution);
+
 } // namespace ninfer::ops

@@ -41,6 +41,20 @@ void vocabulary_candidates(const Tensor& logits, std::int32_t token_begin,
                            const Tensor& valid_columns, const Tensor& drafts, Tensor& keys,
                            MemoryArena& workspace, CudaExecutionView execution);
 
+[[nodiscard]] std::size_t vocabulary_candidates_with_lse_workspace_capacity_bytes(
+    std::int32_t physical_rows, std::int64_t max_columns, std::int32_t candidates);
+
+// Same candidate keys in contiguous I64 records [K+1,T,B]. Word K holds the FP32 bits
+// of log(sum exp((adjusted_score - shard_max) / tau)) in its low 32 bits, with the high bits
+// zero. The sum includes all allowed local scores. shard_max is the score in word 0, and
+// tau is the positive configured temperature or one. Inactive and empty columns write zero
+// to all words. Scratch follows the with_lse capacity query (candidates = K).
+void vocabulary_candidates_with_lse(const Tensor& logits, std::int32_t token_begin,
+                                    std::int32_t token_domain, const SamplingConfig* configs,
+                                    const Tensor& valid_columns, const Tensor& drafts,
+                                    Tensor& records, MemoryArena& workspace,
+                                    CudaExecutionView execution);
+
 /**
  * Sample from gathered disjoint vocabulary candidates, keys I64 [K,1,B,R], K=1 or 20,
  * R=1..16, B>=1. Each rank list is descending and zero-padded. K=1 promises greedy configs;
@@ -57,6 +71,15 @@ void sample_vocabulary_candidates(const Tensor& keys, const SamplingConfig* conf
                                   const Tensor& logical_positions, std::int32_t purpose,
                                   Tensor& output, const Tensor& live_rows,
                                   CudaExecutionView execution);
+
+// Same draw from gathered I64 records [K+1,1,B,R]. The disjoint contiguous Device FP32 [B]
+// output is the full-domain top-1 probability, or zero for inactive rows or empty global
+// support. Each nonempty rank contributes exp((shard_max - global_max) / tau + local_rel_lse)
+// to the denominator; ranks with word 0 equal to zero contribute nothing.
+void sample_vocabulary_candidates(const Tensor& records, const SamplingConfig* configs,
+                                  const Tensor& logical_positions, std::int32_t purpose,
+                                  Tensor& output, Tensor& top1_probabilities,
+                                  const Tensor& live_rows, CudaExecutionView execution);
 
 /**
  * Greedy-draft speculative acceptance from gathered keys I64 [K,W,B,R]. W=2..16; K/B/R,

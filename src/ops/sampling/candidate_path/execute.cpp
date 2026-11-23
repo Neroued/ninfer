@@ -31,28 +31,26 @@ void execute_candidate_path(CandidateSelectorInput input, const Tensor& candidat
                             const Tensor& projected_hidden, const Tensor& anchors,
                             const Tensor& predecessor_codebook, const Tensor& successor_codebook,
                             const Tensor& base_positions, const SamplingConfig* configs,
-                            Tensor& drafts, Tensor& proposal_q, const Tensor& live_rows,
-                            MemoryArena& workspace, cudaStream_t stream) {
+                            Tensor& drafts, Tensor& proposal_q, const Tensor& confidence,
+                            const Tensor& live_rows, MemoryArena& workspace, cudaStream_t stream) {
     const auto plan = select_candidate_path(input, candidate_ids.ne[1], candidate_ids.ne[2]);
     auto scope      = workspace.scope();
     const auto scratch =
         allocate_selector_workspace(workspace, plan, candidate_ids.ne[1], candidate_ids.ne[2]);
-    const Tensor* live[]{&candidate_ids,
-                         input == CandidateSelectorInput::Candidates ? &unary_scores : &keys,
-                         &projected_hidden,
-                         &anchors,
-                         &predecessor_codebook,
-                         &successor_codebook,
-                         &base_positions,
-                         &drafts,
-                         &proposal_q};
+    const Tensor* live[]{
+        &candidate_ids,        input == CandidateSelectorInput::Candidates ? &unary_scores : &keys,
+        &projected_hidden,     &anchors,
+        &predecessor_codebook, &successor_codebook,
+        &base_positions,       &drafts,
+        &proposal_q,           &confidence};
     for (const auto* work : {&scratch.edges}) {
         if (!work->data) continue;
         const auto range = common::operand::range(*work, "candidate_selector_path workspace");
         for (const auto* tensor : live)
-            common::operand::disjoint(range,
-                                      common::operand::range(*tensor, "candidate_selector_path"),
-                                      "candidate_selector_path workspace");
+            if (tensor->data)
+                common::operand::disjoint(
+                    range, common::operand::range(*tensor, "candidate_selector_path"),
+                    "candidate_selector_path workspace");
         if (live_rows.data)
             common::operand::disjoint(range,
                                       common::operand::range(live_rows, "candidate_selector_path"),
@@ -65,6 +63,6 @@ void execute_candidate_path(CandidateSelectorInput input, const Tensor& candidat
     }
     launch_candidate_path(plan, input, candidate_ids, unary_scores, keys, projected_hidden, anchors,
                           predecessor_codebook, successor_codebook, base_positions, configs, drafts,
-                          proposal_q, live_rows, scratch, stream);
+                          proposal_q, confidence, live_rows, scratch, stream);
 }
 } // namespace ninfer::ops::candidate_path_detail

@@ -2,10 +2,12 @@
 #include "ninfer/ops/argmax.h"
 #include "cuda_fixture.h"
 #include "core/device.h"
+#include "core/decode_graph.h"
 #include <algorithm>
 #include "ops/op_tester.h"
 
 #include <cstddef>
+#include <cmath>
 #include <cstdint>
 #include <iostream>
 #include <string>
@@ -136,9 +138,88 @@ int run_case(std::int32_t physical_rows, std::int32_t valid_rows, std::int32_t t
     return failures;
 }
 
+int probability_case(int physical_rows, int valid_rows) {
+    constexpr int columns = 32;
+    auto& device          = cuda_environment().context;
+    const auto cuda       = device.execution_view();
+    auto logits           = make_logits(physical_rows, columns, valid_rows);
+    // Force a cross-tile tie whose denominator would be lost by absolute FP32 LSE.
+    const auto last = std::size_t(columns - 1) * physical_rows;
+    logits[last] = logits[last + valid_rows - 1] = f32_to_bf16(0x1p120f);
+    GuardedDeviceBuffer input(logits.size() * 2 + 2), indices(columns * 4),
+        probabilities(columns * 4);
+    auto staging = input.span().subspan(2);
+    Tensor x(staging, DType::BF16, {physical_rows, columns});
+    Tensor ids(indices.span(), DType::I32, {columns});
+    Tensor p(probabilities.span(), DType::FP32, {columns});
+    const auto bytes = ops::argmax_with_probability_workspace_capacity_bytes(valid_rows, columns);
+    GuardedDeviceBuffer storage(std::max<std::size_t>(bytes, 1));
+    MemoryArena workspace(storage.span());
+    DecodeGraphDefinition definition;
+    definition.capture(cuda.stream(), [&] {
+        ops::argmax_with_probability(x, ids, p, valid_rows, workspace, cuda);
+    });
+    DecodeGraphExecutable graph;
+    graph.instantiate(definition);
+
+    int failures = 0;
+    for (int phase = 0; phase < 2; ++phase) {
+        if (phase) {
+            logits[last]           = f32_to_bf16(-0x1p120f);
+            logits[valid_rows - 1] = f32_to_bf16(-3.0f);
+        }
+        CUDA_CHECK(cudaMemcpy(x.data, logits.data(), logits.size() * 2, cudaMemcpyHostToDevice));
+        const auto expected = argmax_oracle(logits, physical_rows, columns, valid_rows);
+        std::vector<double> reference(columns);
+        for (int t = 0; t < columns; ++t) {
+            const auto base      = std::size_t(t) * physical_rows;
+            const double maximum = bf16_to_f32(logits[base + expected[t]]);
+            double sum           = 0.0;
+            for (int v = 0; v < valid_rows; ++v)
+                sum += std::exp(double(bf16_to_f32(logits[base + v])) - maximum);
+            reference[t] = 1.0 / sum;
+        }
+        auto check = [&](int t) {
+            device.synchronize();
+            const auto actual = from_device<float>(probabilities.data(), t);
+            failures += verify_exact("argmax probability IDs", from_device<int>(indices.data(), t),
+                                     std::vector<int>(expected.begin(), expected.begin() + t));
+            for (int i = 0; i < t; ++i)
+                if (!(actual[i] > 0.0f && actual[i] <= 1.0f &&
+                      std::abs(actual[i] - reference[i]) <= 3e-6 * reference[i])) {
+                    std::cerr << "argmax confidence at " << i << " is " << actual[i]
+                              << ", expected " << reference[i] << '\n';
+                    ++failures;
+                }
+        };
+        graph.launch(cuda.stream());
+        check(columns);
+        if (phase == 0) {
+            for (int t = 1; t < columns; ++t) {
+                auto short_ids = ids.slice(0, 0, t), short_p = p.slice(0, 0, t);
+                ops::argmax_with_probability(x.slice(1, 0, t), short_ids, short_p, valid_rows,
+                                             workspace, cuda);
+                check(t);
+            }
+        }
+    }
+    auto empty_x = x, empty_ids = ids, empty_p = p;
+    empty_x.ne[1] = empty_ids.ne[0] = empty_p.ne[0] = 0;
+    ops::argmax_with_probability(empty_x, empty_ids, empty_p, valid_rows, workspace, cuda);
+    failures += workspace.used() != 0 || workspace.peak_used() != bytes;
+    return failures + input.verify_guards("argmax probability logits") +
+           indices.verify_guards("argmax probability IDs") +
+           probabilities.verify_guards("argmax probabilities") +
+           storage.verify_guards("argmax probability workspace");
+}
+
 } // namespace
 
 void add_argmax_cases(ninfer::test::OpSuite& suite) {
+    for (auto [physical, valid] :
+         {std::pair{509, 509}, {4096, 4096}, {131072, 131072}, {248320, 248077}})
+        suite.add("argmax/probability/v" + std::to_string(valid),
+                  [=] { return probability_case(physical, valid); }, {{"execution", "graph"}});
     suite.add("argmax/unaligned/full", [] { return run_case(248320, 248077, 3, 2); });
     for (int tokens : {1, 2, 8, 9, 64, 15, 128})
         suite.add("argmax/padded/t" + std::to_string(tokens),

@@ -2,10 +2,12 @@
 #include "ops/op_tester.h"
 #include "cuda_fixture.h"
 #include "core/decode_graph.h"
+#include "ninfer/ops/argmax.h"
 #include "ninfer/ops/vocabulary.h"
 
 #include <algorithm>
 #include <bit>
+#include <cmath>
 #include <numeric>
 
 namespace {
@@ -109,22 +111,26 @@ struct Fixture {
         CUDA_CHECK(cudaStreamSynchronize(nullptr));
     }
 
-    void launch(CudaExecutionView cuda) {
+    void launch(CudaExecutionView cuda, Tensor* records = nullptr,
+                MemoryArena* confidence_workspace = nullptr) {
         for (int rank = 0; rank < r; ++rank) {
             Tensor input(d_logits.span().subspan(std::size_t(rank) * v * t * b * 2,
                                                  std::size_t(v) * t * b * 2),
                          DType::BF16, {v, t, b});
-            Tensor out(d_keys.span().subspan(std::size_t(rank) * k * t * b * 8,
-                                             std::size_t(k) * t * b * 8),
-                       DType::I64, {k, t, b});
-            ops::vocabulary_candidates(input, rank * v, domain,
-                                       static_cast<const ops::SamplingConfig*>(d_configs.data()),
-                                       valid_view, draft_view, out, workspace, cuda);
+            auto out        = (records ? *records : keys).slice(3, rank, 1);
+            const auto* cfg = static_cast<const ops::SamplingConfig*>(d_configs.data());
+            if (records)
+                ops::vocabulary_candidates_with_lse(input, rank * v, domain, cfg, valid_view,
+                                                    draft_view, out, *confidence_workspace, cuda);
+            else
+                ops::vocabulary_candidates(input, rank * v, domain, cfg, valid_view, draft_view,
+                                           out, workspace, cuda);
         }
     }
 
-    std::vector<std::uint64_t> oracle() const {
+    std::vector<std::uint64_t> oracle(std::vector<double>* relative_lse = nullptr) const {
         std::vector<std::uint64_t> result(std::size_t(k) * t * b * r);
+        if (relative_lse) relative_lse->assign(std::size_t(t) * b * r, 0.0);
         for (int rank = 0; rank < r; ++rank)
             for (int row = 0; row < b; ++row)
                 for (int col = 0; col < valid[row]; ++col) {
@@ -151,13 +157,181 @@ struct Fixture {
                                           return a.first > b.first ||
                                                  (a.first == b.first && a.second < b.second);
                                       });
+                    const auto index = (std::size_t(rank) * b + row) * t + col;
                     for (int i = 0; i < n; ++i)
-                        result[((std::size_t(rank) * b + row) * t + col) * k + i] =
+                        result[index * k + i] =
                             key(float(candidates[i].first), candidates[i].second);
+                    if (relative_lse && n) {
+                        double mass      = 0.0;
+                        const double tau = c.temperature > 0.0f ? c.temperature : 1.0;
+                        for (const auto& [score, id] : candidates)
+                            mass += std::exp((score - candidates.front().first) / tau);
+                        (*relative_lse)[index] = std::log(mass);
+                    }
                 }
         return result;
     }
 };
+
+int check_records(Fixture& f, const GuardedDeviceBuffer& records) {
+    std::vector<double> lse;
+    const auto reference = f.oracle(&lse);
+    const auto ordinary  = from_device<std::uint64_t>(f.d_keys.data(), reference.size());
+    const auto actual    = from_device<std::uint64_t>(records.data(), lse.size() * (f.k + 1));
+    std::vector<std::uint64_t> keys;
+    int failures = 0;
+    for (std::size_t i = 0; i < lse.size(); ++i) {
+        const auto start = i * (f.k + 1);
+        keys.insert(keys.end(), actual.begin() + start, actual.begin() + start + f.k);
+        const auto word      = actual[start + f.k];
+        const float log_mass = std::bit_cast<float>(static_cast<std::uint32_t>(word));
+        if (!(word <= UINT32_MAX && (reference[i * f.k] != 0 || word == 0) && log_mass >= 0.0f &&
+              std::abs(log_mass - lse[i]) <= 3e-6)) {
+            std::cerr << "vocabulary relative LSE at column " << i << " is " << log_mass
+                      << ", expected " << lse[i] << '\n';
+            ++failures;
+        }
+    }
+    return failures + verify_exact("confidence record keys", keys, reference) +
+           verify_exact("ordinary vocabulary keys", keys, ordinary) +
+           records.verify_guards("vocabulary LSE records");
+}
+
+int relative_lse_overlay() {
+    Fixture f(4097, 4, 3, 2, 20, true, true);
+    const auto e = cuda_environment().context.execution_view();
+    GuardedDeviceBuffer records(std::size_t(21) * f.t * f.b * f.r * 8);
+    Tensor output(records.span(), DType::I64, {21, f.t, f.b, f.r});
+    GuardedDeviceBuffer scratch(
+        ops::vocabulary_candidates_with_lse_workspace_capacity_bytes(f.v, f.t * f.b, f.k));
+    MemoryArena arena(scratch.span());
+    f.launch(e);
+    f.launch(e, &output, &arena);
+    cuda_synchronize(e.stream());
+    return check_records(f, records) + scratch.verify_guards("vocabulary overlay scratch");
+}
+
+int probability_readout(int rows, int ranks, int cap, int batch) {
+    Fixture f(rows, 1, batch, ranks, cap, true, true);
+    auto& device       = cuda_environment().context;
+    const auto e       = device.execution_view();
+    const int physical = rows * ranks;
+    GuardedDeviceBuffer records(std::size_t(cap + 1) * batch * ranks * 8);
+    Tensor gathered(records.span(), DType::I64, {cap + 1, 1, batch, ranks});
+    const auto bytes =
+        ops::vocabulary_candidates_with_lse_workspace_capacity_bytes(rows, batch, cap);
+    GuardedDeviceBuffer scratch(std::max<std::size_t>(1, bytes));
+    MemoryArena arena(scratch.span());
+    std::vector<int> live(batch, 1), positions(batch);
+    std::iota(positions.begin(), positions.end(), 17);
+    auto enabled = to_device(live), position_buffer = to_device(positions);
+    const Tensor live_rows(enabled.span(), DType::I32, {batch});
+    const Tensor pos(position_buffer.span(), DType::I32, {batch});
+    const auto* cfg = static_cast<const ops::SamplingConfig*>(f.d_configs.data());
+    GuardedDeviceBuffer sampled(batch * 4), legacy(batch * 4), confidence(batch * 4),
+        single_ids(batch * 4), single_p(batch * 4), unsharded(std::size_t(physical) * batch * 2);
+    Tensor y(sampled.span(), DType::I32, {batch}), old(legacy.span(), DType::I32, {batch}),
+        p(confidence.span(), DType::FP32, {batch}), local_y(single_ids.span(), DType::I32, {batch}),
+        local_p(single_p.span(), DType::FP32, {batch}),
+        local_x(unsharded.span(), DType::BF16, {physical, batch});
+    GuardedDeviceBuffer single_work(
+        std::max({std::size_t(1),
+                  ops::sampling_with_probability_workspace_capacity_bytes(f.domain, 1, batch),
+                  ops::argmax_with_probability_workspace_capacity_bytes(f.domain, 1)}));
+    MemoryArena local_arena(single_work.span());
+    DecodeGraphDefinition definition;
+    definition.capture(e.stream(), [&] {
+        f.launch(e, &gathered, &arena);
+        ops::sample_vocabulary_candidates(gathered, cfg, pos, ops::kSamplePurposeDecode, y, p,
+                                          live_rows, e);
+    });
+    DecodeGraphExecutable graph;
+    graph.instantiate(definition);
+    int failures = 0;
+    for (int phase = 0; phase < 2; ++phase) {
+        f.reset(phase);
+        f.configs[0] = {.temperature = cap == 1 ? 0.0f : 1e-6f, .top_k = 1};
+        // A tied, large shift that cannot be represented in an absolute LSE.
+        f.logits[0] = f.logits[1] = f32_to_bf16(0x1p120f);
+        if (ranks > 1) f.logits[std::size_t(ranks - 1) * batch * rows] = f32_to_bf16(0x1p120f);
+        if (phase) f.logits[1] = f32_to_bf16(-0x1p120f);
+        if (cap == 20) {
+            f.configs[2].top_p = .8f;
+            f.configs[2].min_p = .25f;
+        }
+        const int empty = batch - 2, inactive = batch - 1;
+        std::fill_n(f.masks.begin() + empty * f.mask_stride, f.mask_stride, 0);
+        f.valid[inactive] = 0;
+        live[inactive]    = 0;
+        f.d_masks.copy_from_host(f.masks.data(), f.masks.size() * 4);
+        f.d_valid.copy_from_host(f.valid.data(), batch * 4);
+        f.d_logits.copy_from_host(f.logits.data(), f.logits.size() * 2);
+        f.d_configs.copy_from_host(f.configs.data(), f.d_configs.bytes());
+        enabled.copy_from_host(live.data(), batch * 4);
+        std::vector<std::uint16_t> logits(f.logits.size());
+        for (int rank = 0; rank < ranks; ++rank)
+            for (int b = 0; b < batch; ++b)
+                std::copy_n(f.logits.begin() + (rank * batch + b) * rows, rows,
+                            logits.begin() + b * physical + rank * rows);
+        CUDA_CHECK(
+            cudaMemcpy(unsharded.data(), logits.data(), logits.size() * 2, cudaMemcpyHostToDevice));
+
+        graph.launch(e.stream());
+        f.launch(e);
+        ops::sample_vocabulary_candidates(f.keys, cfg, pos, ops::kSamplePurposeDecode, old,
+                                          live_rows, e);
+        device.synchronize();
+        failures += check_records(f, records);
+        const auto ids = from_device<int>(sampled.data(), batch);
+        const auto got = from_device<float>(confidence.data(), batch);
+        failures +=
+            verify_exact("vocabulary confidence draw", ids, from_device<int>(legacy.data(), batch));
+        failures += ids[inactive] != 0 || got[inactive] != 0.0f;
+        failures += ids[empty] != -1 || got[empty] != 0.0f;
+
+        live[empty] = 0;
+        enabled.copy_from_host(live.data(), batch * 4);
+        ops::sample(local_x, local_y, local_p, f.domain, cfg, pos, ops::kSamplePurposeDecode,
+                    live_rows, local_arena, e);
+        device.synchronize();
+        const auto local_ids        = from_device<int>(single_ids.data(), batch);
+        const auto local_confidence = from_device<float>(single_p.data(), batch);
+        for (int b = 0; b < empty; ++b) {
+            const auto& c = f.configs[b];
+            std::vector<double> scores;
+            for (int v = 0; v < f.domain; ++v) {
+                if (c.mask.words && !(f.masks[b * f.mask_stride + v / 32] & (1U << (v % 32))))
+                    continue;
+                const int count = f.counts[b * f.domain + v];
+                scores.push_back(double(bf16_to_f32(logits[b * physical + v])) -
+                                 double(c.presence_penalty) * (count > 0) -
+                                 double(c.frequency_penalty) * count);
+            }
+            const double max = *std::max_element(scores.begin(), scores.end());
+            const double tau = c.temperature > 0.0f ? c.temperature : 1.0;
+            double mass      = 0.0;
+            for (const double score : scores) mass += std::exp((score - max) / tau);
+            if (ids[b] != local_ids[b] ||
+                !(got[b] > 0.0f && got[b] <= 1.0f && std::abs(got[b] * mass - 1.0) <= 5e-6 &&
+                  std::abs(got[b] - local_confidence[b]) <= 5e-6 / mass)) {
+                std::cerr << "vocabulary confidence b=" << b << " got " << got[b] << " expected "
+                          << 1.0 / mass << '\n';
+                ++failures;
+            }
+        }
+        live[empty] = 1;
+        if (cap == 1) {
+            auto x  = local_x.slice(1, 0, 1);
+            auto y0 = local_y.slice(0, 0, 1), p0 = local_p.slice(0, 0, 1);
+            ops::argmax_with_probability(x, y0, p0, f.domain, local_arena, e);
+            device.synchronize();
+            failures += from_device<int>(y0.data, 1)[0] != ids[0];
+            failures += !(std::abs(from_device<float>(p0.data, 1)[0] - got[0]) <= 2e-6);
+        }
+    }
+    return failures + scratch.verify_guards("vocabulary confidence workspace") +
+           confidence.verify_guards("vocabulary confidence output");
+}
 
 int extraction(int rows, int tokens, int batch, int ranks, int cap, bool controls, int steps = -1) {
     Fixture f(rows, tokens, batch, ranks, cap, controls, controls, steps);
@@ -604,6 +778,12 @@ int padded_decisions() {
 } // namespace
 
 void add_vocabulary_cases(ninfer::test::OpSuite& suite) {
+    suite.add("vocabulary_candidates/relative_lse_overlay", relative_lse_overlay);
+    for (auto [v, r, b] : {std::array{257, 1, 6}, std::array{13313, 2, 6}, std::array{4097, 4, 9}})
+        for (int cap : {1, 20})
+            suite.add("vocabulary_decision/probability/r" + std::to_string(r) + "/k" +
+                          std::to_string(cap),
+                      [=] { return probability_readout(v, r, cap, b); }, {{"execution", "graph"}});
     for (auto [v, t, b, r] :
          {std::array{7, 1, 1, 4}, std::array{513, 6, 4, 4}, std::array{124160, 1, 8, 2},
           std::array{124160, 6, 1, 2}, std::array{1025, 16, 8, 2}})

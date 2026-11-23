@@ -35,6 +35,6 @@ void execute_candidate_path(CandidateSelectorInput input, const Tensor& candidat
                             const Tensor& projected_hidden, const Tensor& anchors,
                             const Tensor& predecessor_codebook, const Tensor& successor_codebook,
                             const Tensor& base_positions, const SamplingConfig* configs,
-                            Tensor& drafts, Tensor& proposal_q, const Tensor& live_rows,
-                            MemoryArena& workspace, cudaStream_t stream);
+                            Tensor& drafts, Tensor& proposal_q, const Tensor& confidence,
+                            const Tensor& live_rows, MemoryArena& workspace, cudaStream_t stream);
 } // namespace ninfer::ops::candidate_path_detail

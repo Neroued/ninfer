@@ -7,18 +7,18 @@
 #include <stdexcept>
 
 namespace ninfer::ops {
+namespace {
 
-std::size_t sampling_workspace_capacity_bytes(std::int32_t token_domain, std::int32_t min_lanes,
-                                              std::int32_t max_lanes) {
+std::size_t sample_capacity(int token_domain, int min_lanes, int max_lanes, bool probability) {
     if (token_domain <= 0 || min_lanes <= 0 || max_lanes < min_lanes) {
         throw std::invalid_argument("sampling workspace: invalid profile or lane interval");
     }
-    return sample_detail::capacity(token_domain, min_lanes, max_lanes);
+    return sample_detail::capacity(token_domain, min_lanes, max_lanes, probability);
 }
 
-void sample(const Tensor& logits, Tensor& out, std::int32_t token_domain,
-            const SamplingConfig* configs, const Tensor& logical_positions, std::int32_t purpose,
-            const Tensor& live_rows, MemoryArena& workspace, CudaExecutionView execution) {
+void sample_impl(const Tensor& logits, Tensor& out, Tensor* probabilities, int token_domain,
+                 const SamplingConfig* configs, const Tensor& logical_positions, int purpose,
+                 const Tensor& live_rows, MemoryArena& workspace, CudaExecutionView execution) {
     if (workspace.device() != execution.device()) {
         throw std::invalid_argument("sample: workspace belongs to another device");
     }
@@ -62,16 +62,53 @@ void sample(const Tensor& logits, Tensor& out, std::int32_t token_domain,
                                   common::operand::range(out, "sample"), "sample");
     }
 
-    auto scratch_scope       = workspace.scope();
-    const auto plan          = sample_detail::select_plan(token_domain, logits.ne[1]);
-    const std::size_t bytes  = plan.workspace.bytes;
-    const MemorySpan scratch = bytes == 0 ? MemorySpan{} : workspace.alloc_bytes(bytes);
+    auto scratch_scope = workspace.scope();
+    const auto plan    = sample_detail::select_plan(token_domain, logits.ne[1], probabilities);
+    const MemorySpan scratch = plan.bytes == 0 ? MemorySpan{} : workspace.alloc_bytes(plan.bytes);
     if (live_rows.data && scratch.data)
         common::operand::disjoint(common::operand::range(live_rows, "sample"),
                                   common::operand::range(scratch.data, scratch.bytes, "sample"),
                                   "sample");
-    sample_detail::launch(logits, out, token_domain, configs, logical_positions, purpose, live_rows,
-                          plan, scratch, stream);
+    if (probabilities) {
+        using namespace common::operand;
+        constexpr const char* op = "sample with probability";
+        tensor(*probabilities, DType::FP32, {logits.ne[1]}, 4, op, "top1 probabilities",
+               execution.device());
+        const auto destination = range(*probabilities, op);
+        for (const auto* input :
+             {&logits, static_cast<const Tensor*>(&out), &logical_positions, &live_rows})
+            if (input->data) disjoint(destination, range(*input, op), op);
+        disjoint(destination, range(configs, sizeof(SamplingConfig) * logits.ne[1], op), op);
+        if (scratch.data) disjoint(destination, range(scratch.data, scratch.bytes, op), op);
+        // Count and mask pointers are Device metadata. Their disjointness is a caller contract.
+    }
+    sample_detail::launch(
+        logits, out, probabilities ? static_cast<float*>(probabilities->data) : nullptr,
+        token_domain, configs, logical_positions, purpose, live_rows, plan, scratch, stream);
+}
+} // namespace
+
+std::size_t sampling_workspace_capacity_bytes(int token_domain, int min_lanes, int max_lanes) {
+    return sample_capacity(token_domain, min_lanes, max_lanes, false);
+}
+
+std::size_t sampling_with_probability_workspace_capacity_bytes(int token_domain, int min_lanes,
+                                                               int max_lanes) {
+    return sample_capacity(token_domain, min_lanes, max_lanes, true);
+}
+
+void sample(const Tensor& logits, Tensor& out, int token_domain, const SamplingConfig* configs,
+            const Tensor& logical_positions, int purpose, const Tensor& live_rows,
+            MemoryArena& workspace, CudaExecutionView execution) {
+    sample_impl(logits, out, nullptr, token_domain, configs, logical_positions, purpose, live_rows,
+                workspace, execution);
+}
+
+void sample(const Tensor& logits, Tensor& out, Tensor& top1_probabilities, int token_domain,
+            const SamplingConfig* configs, const Tensor& logical_positions, int purpose,
+            const Tensor& live_rows, MemoryArena& workspace, CudaExecutionView execution) {
+    sample_impl(logits, out, &top1_probabilities, token_domain, configs, logical_positions, purpose,
+                live_rows, workspace, execution);
 }
 
 } // namespace ninfer::ops

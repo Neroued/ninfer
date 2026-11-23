@@ -1,5 +1,6 @@
 #include "ops/common/host/operands.h"
 #include "ops/common/cuda/reduce.cuh"
+#include "ops/reduction/online_softmax.cuh"
 #include "ninfer/ops/argmax.h"
 #include <cstdint>
 #include <stdexcept>
@@ -190,6 +191,76 @@ void argmax_tiled_atomic_launch(const Tensor& logits, Tensor& out, std::int32_t 
     });
 }
 
+constexpr int kProbabilityThreads = 256;
+constexpr int kProbabilityItems   = 8;
+constexpr int kProbabilityTile    = kProbabilityThreads * kProbabilityItems;
+
+int probability_partials(int valid_rows) { return 1 + (valid_rows - 1) / kProbabilityTile; }
+
+template <bool Tiled>
+__global__ __launch_bounds__(kProbabilityThreads) void argmax_probability_scan(
+    const __nv_bfloat16* logits, int physical_rows, int valid_rows, int* out, float* probabilities,
+    unsigned long long* partial_keys, float* partial_sums) {
+    const int column  = Tiled ? blockIdx.y : blockIdx.x;
+    const auto* input = logits + std::int64_t(column) * physical_rows;
+    const int prefix  = ((16 - (reinterpret_cast<std::uintptr_t>(input) & 15)) & 15) / 2;
+    const auto start  = (Tiled ? std::int64_t(blockIdx.x) * kProbabilityTile : 0) + prefix +
+                       threadIdx.x * kProbabilityItems;
+    unsigned long long best = 0;
+    SoftmaxMass mass;
+    const auto add = [&](float value, int id) {
+        best = max(best, static_cast<unsigned long long>(score_id_order_key(value, id)));
+        mass.add(value, 1.0f);
+    };
+    if ((!Tiled || blockIdx.x == 0) && threadIdx.x < min(prefix, valid_rows))
+        add(__bfloat162float(input[threadIdx.x]), threadIdx.x);
+    if (start + kProbabilityItems <= valid_rows) {
+        const auto values = Bf16Vector<kProbabilityItems>::load(input + start);
+#pragma unroll
+        for (int i = 0; i < kProbabilityItems; ++i)
+            add(__bfloat162float(values.word[i]), start + i);
+    } else {
+        for (auto id = start; id < min(start + kProbabilityItems, std::int64_t(valid_rows)); ++id)
+            add(__bfloat162float(input[id]), id);
+    }
+
+    __shared__ unsigned long long warp_keys[kProbabilityThreads / 32];
+    best = block_reduce_max_key(best, warp_keys);
+    mass = block_softmax_mass<kProbabilityThreads>(mass, 1.0f);
+    if (threadIdx.x == 0) {
+        if constexpr (Tiled) {
+            const auto index    = std::int64_t(column) * gridDim.x + blockIdx.x;
+            partial_keys[index] = best;
+            partial_sums[index] = mass.sum;
+        } else {
+            out[column]           = id_from_order_key(best);
+            probabilities[column] = 1.0f / mass.sum;
+        }
+    }
+}
+
+__global__ void argmax_probability_merge(const unsigned long long* partial_keys,
+                                         const float* partial_sums, int tiles, int* out,
+                                         float* probabilities) {
+    const int column        = blockIdx.x;
+    const auto base         = std::int64_t(column) * tiles;
+    unsigned long long best = 0;
+    SoftmaxMass mass;
+    for (int i = threadIdx.x; i < tiles; i += blockDim.x) {
+        const auto key = partial_keys[base + i];
+        if (!key) continue;
+        best = max(best, key);
+        mass.merge({score_from_order_key(key), partial_sums[base + i]}, 1.0f);
+    }
+    __shared__ unsigned long long warp_keys[4];
+    best = block_reduce_max_key(best, warp_keys);
+    mass = block_softmax_mass<128>(mass, 1.0f);
+    if (threadIdx.x == 0) {
+        out[column]           = id_from_order_key(best);
+        probabilities[column] = 1.0f / mass.sum;
+    }
+}
+
 } // namespace
 
 void argmax(const Tensor& logits, Tensor& out, std::int32_t valid_rows,
@@ -229,6 +300,65 @@ void argmax(const Tensor& logits, Tensor& out, std::int32_t valid_rows,
     }
 
     argmax_launch(logits, out, valid_rows, stream);
+}
+
+std::size_t argmax_with_probability_workspace_capacity_bytes(int max_valid_rows, int max_columns) {
+    if (max_valid_rows <= 0 || max_columns <= 0)
+        throw std::invalid_argument("argmax_with_probability: invalid workspace profile");
+    const auto tiles = probability_partials(max_valid_rows);
+    return tiles == 1 ? 0
+                      : std::size_t(tiles) * std::min(max_columns, kCudaGridYLimit) *
+                            (sizeof(unsigned long long) + sizeof(float));
+}
+
+void argmax_with_probability(const Tensor& logits, Tensor& out, Tensor& max_probabilities,
+                             int valid_rows, MemoryArena& workspace, CudaExecutionView execution) {
+    constexpr const char* op = "argmax_with_probability";
+    const int rows = logits.ne[0], columns = logits.ne[1];
+    if (valid_rows < 1 || valid_rows > rows || columns < 0)
+        throw std::invalid_argument("argmax_with_probability: invalid vocabulary or T");
+    operand::dtype(logits, DType::BF16, op, "logits must be BF16");
+    operand::dtype(out, DType::I32, op, "out must be I32");
+    operand::dtype(max_probabilities, DType::FP32, op, "max_probabilities must be FP32");
+    operand::shape(logits, {rows, columns, 1, 1}, op, "logits");
+    operand::shape(out, {columns, 1, 1, 1}, op, "out");
+    operand::shape(max_probabilities, {columns, 1, 1, 1}, op, "max_probabilities");
+    if (columns == 0) return;
+    operand::tensor(logits, DType::BF16, {rows, columns}, 2, op, "logits", execution.device());
+    operand::tensor(out, DType::I32, {columns}, 4, op, "out", execution.device());
+    operand::tensor(max_probabilities, DType::FP32, {columns}, 4, op, "max_probabilities",
+                    execution.device());
+    operand::device(workspace.device(), execution.device(), op, "workspace");
+    const std::array ranges{operand::range(logits, op), operand::range(out, op),
+                            operand::range(max_probabilities, op)};
+    operand::disjoint(ranges, op);
+    const auto* input   = static_cast<const __nv_bfloat16*>(logits.data);
+    auto* ids           = static_cast<int*>(out.data);
+    auto* probabilities = static_cast<float*>(max_probabilities.data);
+    const auto stream   = execution.stream();
+    const int tiles     = probability_partials(valid_rows);
+    if (tiles == 1) {
+        argmax_probability_scan<false><<<columns, kProbabilityThreads, 0, stream>>>(
+            input, rows, valid_rows, ids, probabilities, nullptr, nullptr);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+    auto scope         = workspace.scope();
+    const auto scratch = workspace.alloc_bytes(
+        argmax_with_probability_workspace_capacity_bytes(valid_rows, columns));
+    for (const auto range : ranges)
+        operand::disjoint(range, operand::range(scratch.data, scratch.bytes, op), op);
+    auto* keys = static_cast<unsigned long long*>(scratch.data);
+    auto* sums =
+        reinterpret_cast<float*>(keys + std::size_t(tiles) * std::min(columns, kCudaGridYLimit));
+    for_each_token_slice(columns, 1, [&](int begin, int count) {
+        argmax_probability_scan<true><<<dim3(tiles, count), kProbabilityThreads, 0, stream>>>(
+            input + std::int64_t(begin) * rows, rows, valid_rows, nullptr, nullptr, keys, sums);
+        CUDA_CHECK(cudaGetLastError());
+        argmax_probability_merge<<<count, 128, 0, stream>>>(keys, sums, tiles, ids + begin,
+                                                            probabilities + begin);
+        CUDA_CHECK(cudaGetLastError());
+    });
 }
 
 } // namespace ninfer::ops

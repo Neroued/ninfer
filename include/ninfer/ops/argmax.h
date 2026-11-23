@@ -1,10 +1,11 @@
 #pragma once
 
 #include "core/device.h"
+#include "core/arena.h"
 #include "core/tensor.h"
 
+#include <cstddef>
 #include <cstdint>
-
 
 namespace ninfer::ops {
 
@@ -20,5 +21,17 @@ namespace ninfer::ops {
  */
 void argmax(const Tensor& logits, Tensor& out, std::int32_t valid_rows,
             CudaExecutionView execution);
+
+// Scratch high-water mark for all positive extents through these bounds.
+[[nodiscard]] std::size_t
+argmax_with_probability_workspace_capacity_bytes(std::int32_t max_valid_rows,
+                                                 std::int32_t max_columns);
+
+// Same selection as argmax over finite consumed logits. Writes contiguous FP32 [T]
+// with 1 / sum_v exp(float(logits[v,t]) - max_v float(logits[v,t])). All operands and
+// caller-owned scratch are disjoint and on execution.device(). T == 0 is a shape-checked no-op.
+void argmax_with_probability(const Tensor& logits, Tensor& out, Tensor& max_probabilities,
+                             std::int32_t valid_rows, MemoryArena& workspace,
+                             CudaExecutionView execution);
 
 } // namespace ninfer::ops

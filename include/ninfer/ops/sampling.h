@@ -89,6 +89,21 @@ void sample(const Tensor& logits, Tensor& out, std::int32_t token_domain,
             const SamplingConfig* configs, const Tensor& logical_positions, std::int32_t purpose,
             const Tensor& live_rows, MemoryArena& workspace, CudaExecutionView execution);
 
+// Scratch high-water mark for the probability overload over the inclusive lane interval.
+[[nodiscard]] std::size_t
+sampling_with_probability_workspace_capacity_bytes(std::int32_t token_domain,
+                                                   std::int32_t min_lanes, std::int32_t max_lanes);
+
+// Same draw as sample(). Also writes contiguous Device FP32 [B] with the maximum
+// softmax probability over all allowed penalty-adjusted scores before filtering.
+// Uses the configured positive temperature or unit temperature for a greedy row.
+// An inactive row writes zero to both outputs. The probability output is disjoint
+// from all operands, referenced count/mask storage and scratch.
+void sample(const Tensor& logits, Tensor& out, Tensor& top1_probabilities,
+            std::int32_t token_domain, const SamplingConfig* configs,
+            const Tensor& logical_positions, std::int32_t purpose, const Tensor& live_rows,
+            MemoryArena& workspace, CudaExecutionView execution);
+
 // Adds every id in the contiguous non-empty I32 token_ids vector to the contiguous I32
 // [token_domain] committed count array. IDs must be in [0,token_domain).
 void increment_token_counts(const Tensor& token_ids, Tensor& token_counts,

@@ -381,7 +381,7 @@ struct Fixture {
         }
         if (!stable) throw std::runtime_error("could not construct stable selector fixture");
         if (ties) {
-            std::fill(unary_scores.begin(), unary_scores.end(), 0.0F);
+            std::fill(unary_scores.begin(), unary_scores.end(), 0x1p120f);
             std::fill(projected_hidden.begin(), projected_hidden.end(), 0);
             for (std::size_t first = 0; first < candidate_ids.size(); first += kCandidates)
                 std::reverse(candidate_ids.begin() + first,
@@ -425,7 +425,7 @@ struct Fixture {
         if (ties || dependent) {
             configs.resize(kMaxBatch);
             for (int b = 0; b < kMaxBatch; ++b) {
-                configs[b].temperature = !dependent && (b % 2 == 0) ? 0.75F : 0.0F;
+                configs[b].temperature = ties && (b % 2 == 0) ? 1e-6f : 0.0F;
                 configs[b].seed        = 1234 + b;
             }
         } else
@@ -473,6 +473,7 @@ struct Fixture {
             const std::size_t q_count     = draft_count * kCandidates;
             GuardedDeviceBuffer draft_device(draft_count * sizeof(std::int32_t));
             GuardedDeviceBuffer q_device(q_count * sizeof(float));
+            GuardedDeviceBuffer confidence_device(draft_count * sizeof(float));
             draft_device.fill(0xff);
             q_device.fill(0xff);
             Tensor ids(candidate_device.span(), DType::I32, {kCandidates, steps, batch_size});
@@ -484,17 +485,49 @@ struct Fixture {
                              {batch_size});
             Tensor drafts(draft_device.span(), DType::I32, {steps, batch_size});
             Tensor q(q_device.span(), DType::FP32, {kCandidates, steps, batch_size});
+            Tensor confidence(confidence_device.span(), DType::FP32, {steps, batch_size});
             const auto capacity = ops::candidate_selector_path_workspace_capacity_bytes(
                 ops::CandidateSelectorInput::Candidates, steps, steps, batch_size, batch_size);
             GuardedDeviceBuffer scratch(std::max<std::size_t>(capacity, 1));
             MemoryArena workspace(scratch.span());
-            const auto launch = [&](CudaExecutionView cuda) {
-                ops::candidate_selector_path(
-                    ids, unary, hidden, anchor, predecessor, successor, kTokenDomain, positions,
-                    static_cast<const ops::SamplingConfig*>(config_device.data()), drafts, q, {},
-                    workspace, cuda);
+            const auto launch = [&](CudaExecutionView cuda, bool with_confidence) {
+                const auto* cfg = static_cast<const ops::SamplingConfig*>(config_device.data());
+                if (with_confidence)
+                    ops::candidate_selector_path(ids, unary, hidden, anchor, predecessor, successor,
+                                                 kTokenDomain, positions, cfg, drafts, q,
+                                                 confidence, {}, workspace, cuda);
+                else
+                    ops::candidate_selector_path(ids, unary, hidden, anchor, predecessor, successor,
+                                                 kTokenDomain, positions, cfg, drafts, q, {},
+                                                 workspace, cuda);
             };
-            launch(ninfer::test::cuda_environment().default_execution);
+            const auto verify_confidence = [&](const auto& sampling, const auto& realized) {
+                std::vector<double> reference;
+                for (int b = 0; b < batch_size; ++b) {
+                    int predecessor  = 0;
+                    const double tau = sampling[b].temperature > 0 ? sampling[b].temperature : 1.0;
+                    for (int step = 0; step < steps; ++step) {
+                        const auto edges =
+                            lattice.begin() + lattice_offset(b, step, predecessor, 0);
+                        const double max = *std::max_element(edges, edges + kCandidates);
+                        double mass      = 0.0;
+                        for (int c = 0; c < kCandidates; ++c)
+                            mass += std::exp((edges[c] - max) / tau);
+                        reference.push_back(1.0 / mass);
+                        const auto first = candidate_ids.begin() + candidate_offset(b, step, 0);
+                        const auto found =
+                            std::find(first, first + kCandidates, realized[b * steps + step]);
+                        if (found == first + kCandidates) return 1;
+                        predecessor = found - first;
+                    }
+                }
+                const auto result = from_device<float>(confidence_device.data(), draft_count);
+                return verify_pointwise("separate selector conditional confidence",
+                                        std::vector<double>(result.begin(), result.end()),
+                                        reference, kProbabilityCriterion);
+            };
+            const auto eager = ninfer::test::cuda_environment().default_execution;
+            launch(eager, false);
             cuda_synchronize();
 
             const std::string label = "candidate_selector_path K=" + std::to_string(steps) +
@@ -505,6 +538,8 @@ struct Fixture {
                              std::vector<std::int32_t>(expected.drafts.begin(),
                                                        expected.drafts.begin() + draft_count));
             const std::vector<float> actual_q = from_device<float>(q_device.data(), q_count);
+            const auto actual_drafts          = from_device<int>(draft_device.data(), draft_count);
+            const auto q_bits = from_device<std::uint32_t>(q_device.data(), q_count);
             std::vector<double> actual_q_double(actual_q.begin(), actual_q.end());
             failures +=
                 verify_pointwise(label + " proposal_q", actual_q_double,
@@ -514,6 +549,15 @@ struct Fixture {
                                      from_device<int>(draft_device.data(), draft_count), actual_q);
             failures += draft_device.verify_guards(label + " drafts");
             failures += q_device.verify_guards(label + " proposal_q");
+            launch(eager, true);
+            cuda_synchronize();
+            failures +=
+                verify_exact((label + " confidence drafts").c_str(),
+                             from_device<int>(draft_device.data(), draft_count), actual_drafts);
+            failures += verify_exact((label + " confidence preserves q bits").c_str(),
+                                     from_device<std::uint32_t>(q_device.data(), q_count), q_bits);
+            failures += verify_confidence(configs, actual_drafts);
+            failures += confidence_device.verify_guards(label + " confidence");
             failures += scratch.verify_guards(label + " workspace");
             if (workspace.used() != 0 || workspace.peak_used() != capacity) {
                 std::cerr << label << " workspace scope/peak\n";
@@ -528,7 +572,7 @@ struct Fixture {
                 {
                     DecodeGraphDefinition definition;
                     DecodeGraphExecutable executable;
-                    definition.capture(stream, [&] { launch(stream_execution); });
+                    definition.capture(stream, [&] { launch(stream_execution, true); });
                     executable.instantiate(definition);
                     executable.launch(stream);
                     executable.launch(stream);
@@ -563,6 +607,7 @@ struct Fixture {
                         failures +=
                             verify_draws("selector graph updated q", batch_size, candidate_ids,
                                          next_configs, next_positions, next_drafts, next_q);
+                        failures += verify_confidence(next_configs, next_drafts);
                         cuda_check(cudaMemcpyAsync(positions.data, base_positions.data(),
                                                    base_positions.size() * sizeof(int),
                                                    cudaMemcpyHostToDevice, stream),
@@ -580,8 +625,10 @@ struct Fixture {
                                          from_device<int>(draft_device.data(), draft_count),
                                          std::vector<int>(expected.drafts.begin(),
                                                           expected.drafts.begin() + draft_count));
-                failures += verify_exact((label + " graph q").c_str(),
-                                         from_device<float>(q_device.data(), q_count), actual_q);
+                failures +=
+                    verify_exact((label + " graph q").c_str(),
+                                 from_device<std::uint32_t>(q_device.data(), q_count), q_bits);
+                failures += verify_confidence(configs, actual_drafts);
                 failures += scratch.verify_guards(label + " graph workspace");
             }
         }

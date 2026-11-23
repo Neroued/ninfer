@@ -47,6 +47,9 @@ add_library(ninfer_model_control STATIC
   common/context/prefix.cpp
   common/context/request_ledger.cpp
   common/context/work.cpp
+  common/speculative/calibration.cpp
+  common/speculative/controller.cpp
+  common/speculative/cost_model.cpp
   common/speculative/growth.cpp
   common/speculative/round_plan.cpp)
 ninfer_internal_includes(ninfer_model_control)

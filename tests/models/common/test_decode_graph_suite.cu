@@ -357,12 +357,6 @@ class TestLayer final : public moe::LayerGraphExecutable {
 public:
     explicit TestLayer(LayerControl& control) : control_(control) {}
 
-    void update(const moe::LayerGraphDefinition&) override { throw std::logic_error("test layer"); }
-
-    void update_mixer_child(const DecodeGraphDefinition&) override {
-        throw std::logic_error("test layer");
-    }
-
     void update_mixer_slice(std::size_t, const DecodeGraphKernelPatch&) override {
         throw std::logic_error("test layer");
     }
@@ -426,13 +420,6 @@ public:
 
     std::shared_ptr<const moe::LayerGraphDefinition>
     capture_layer(ExpertBankId, CudaExecutionView, moe::TokenGeometry, const moe::MixerBody&,
-                  const moe::GpuBody&, const std::function<void()>&,
-                  const std::shared_ptr<const moe::LayerGraphDefinition>&) override {
-        throw std::logic_error("test schedule");
-    }
-
-    std::shared_ptr<const moe::LayerGraphDefinition>
-    capture_layer(ExpertBankId, CudaExecutionView, moe::TokenGeometry, const moe::FlatMixerBody&,
                   const moe::GpuBody&, const std::function<void()>&) override {
         return std::make_shared<TestLayerDefinition>(control_);
     }
@@ -470,17 +457,22 @@ void check_layered(Fixture& f) {
                            &schedule);
     require(suite.topology() == ProposalTopology::SplitProposal, "offload must split proposal");
     auto binding = readout(f, 1);
+    CudaEventTimer timing(f.device);
     OffloadedTargetCapture capture;
     capture.physical_tokens = 4;
-    capture.prefix          = f.increment(0);
-    capture.layers          = {
+    capture.prefix          = [&, prefix = f.increment(0)] {
+        timing.start_external();
+        prefix();
+    };
+    capture.layers = {
         ReadoutCapture{{binding}, [emit = binding.capture](const auto& record) { record(emit); }},
         OffloadedLayerCapture{}, ReadoutCapture{{}, [&](const auto&) { f.increment(3)(); }}};
-    capture.hook   = InterLayerHookCapture{1, [&](std::uint32_t slot, cudaStream_t stream) {
+    capture.hook       = InterLayerHookCapture{1, [&](std::uint32_t slot, cudaStream_t stream) {
                                              add<<<1, 1, 0, stream>>>(f.values + 2, 1 + slot);
                                          }};
-    capture.suffix = f.increment(4);
-    capture.head   = f.increment(5);
+    capture.suffix     = f.increment(4);
+    capture.head       = f.increment(5);
+    capture.after_head = [&] { timing.record_stop_external(); };
     GraphPreparation preparation(f.device, GraphPreparationMode::Capture);
     TargetGraphBody body;
     body.prepare(f.device, nullptr, preparation, &schedule, capture, nullptr, false);
@@ -511,6 +503,17 @@ void check_layered(Fixture& f) {
     require(body.poll() == TargetProgress::Complete && !control.active && control.starts == 2 &&
                 f.read(2) == 1 && f.read(3) == 1 && f.read(4) == 1 && !f.read(5),
             "layered completion or head gating changed");
+    require(timing.elapsed_ms() >= 0.0F, "disabled head suppressed the target stop event");
+
+    f.clear();
+    auto with_head = replay;
+    with_head.head = true;
+    require(body.start(cuda, with_head) == TargetProgress::AwaitingHook,
+            "layered graph missed its hook with the head enabled");
+    body.launch_hook(0);
+    require(body.poll() == TargetProgress::Complete && f.read(5) == 1,
+            "layered graph did not re-enable the head");
+    require(timing.elapsed_ms() >= 0.0F, "head prevented target timing");
 }
 } // namespace
 

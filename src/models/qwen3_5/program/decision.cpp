@@ -137,10 +137,7 @@ void RankProgramImpl::launch_decision(ComputeOperation& operation) {
             gpu_timer.end_target();
         }
         if (graphs) {
-            (void)graphs->start(operation.verifies_drafts() ? GraphPhase::Accept
-                                                            : GraphPhase::Sample,
-                                operation.decode_route(), operation.rows.front().main_frontier, 0,
-                                device.execution_view());
+            graphs->decide(operation.decode_route());
         } else {
             decide_decode(operation.decode_route());
             readback_decode(operation.shape.rows, operation.verifies_drafts());

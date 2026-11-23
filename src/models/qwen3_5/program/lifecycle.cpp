@@ -157,7 +157,7 @@ void RankProgramImpl::drain() {
     };
     attempt([&] { device.bind_to_current_thread(); });
     if (compute && compute->text) attempt([&] { compute->text->cancel(); });
-    if (graphs) attempt([&] { graphs->cancel(); });
+    if (compute && compute->graph_target) attempt([&] { compute->graph_target->cancel(); });
     if (resources.moe) {
         attempt([&] { resources.moe->cancel(); });
         attempt([&] { resources.moe->synchronize(); });

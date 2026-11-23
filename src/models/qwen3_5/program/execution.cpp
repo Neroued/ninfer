@@ -26,7 +26,10 @@ void RankProgramImpl::progress() {
             operation.text->cancel();
             operation.text.reset();
         }
-        if (graphs) graphs->cancel();
+        if (operation.graph_target) {
+            operation.graph_target->cancel();
+            operation.graph_target = nullptr;
+        }
         if (resources.moe) resources.moe->cancel();
         gpu_timer.record_retirement();
         compute_retired.record(device.stream());
@@ -48,8 +51,8 @@ void RankProgramImpl::progress() {
             }
             if (std::holds_alternative<ForwardWork>(operation.request.work.operation))
                 append_draft_history(operation);
-            request_decision(operation);
             begin_target(operation);
+            request_decision(operation);
             operation.stage = ComputeStage::Forward;
             break;
         case ComputeStage::Forward:

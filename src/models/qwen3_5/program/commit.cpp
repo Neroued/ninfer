@@ -41,8 +41,7 @@ void RankProgramImpl::launch_commit(ComputeOperation& operation) {
     if (decode) {
         if (mtp) {
             if (graphs)
-                graphs->commit_mtp(operation.shape.rows, operation.width, repair_mtp, count_tokens,
-                                   device.execution_view());
+                graphs->commit(operation.decode_route(), repair_mtp, count_tokens);
             else
                 execute_mtp_commit(operation.shape.rows, operation.width, repair_mtp, count_tokens);
         } else {
@@ -107,8 +106,8 @@ void RankProgramImpl::launch_commit(ComputeOperation& operation) {
 }
 
 void RankProgramImpl::execute_mtp_commit(std::uint32_t batch, std::uint32_t width, bool repair,
-                                         bool counts, DecodeGraphSection* repair_section,
-                                         DecodeGraphSection* counts_section) {
+                                         bool counts, const SectionRecorder& repair_section,
+                                         const SectionRecorder& counts_section) {
     auto& frame     = resources.frame;
     const auto cuda = device.execution_view();
     if (width > 1)
@@ -117,7 +116,7 @@ void RankProgramImpl::execute_mtp_commit(std::uint32_t batch, std::uint32_t widt
                                              frame.accepted_columns.slice(0, 0, batch), cuda);
     const auto history = [&] { rebuild_mtp_history(batch, width); };
     if (repair_section)
-        repair_section->capture(cuda.stream(), history);
+        repair_section(history);
     else if (repair)
         history();
     const auto hidden = frame.decode_view(width, batch).hidden;
@@ -133,7 +132,7 @@ void RankProgramImpl::execute_mtp_commit(std::uint32_t batch, std::uint32_t widt
                                           resources.token_counts, cuda);
     };
     if (counts_section)
-        counts_section->capture(cuda.stream(), count);
+        counts_section(count);
     else if (counts)
         count();
 }

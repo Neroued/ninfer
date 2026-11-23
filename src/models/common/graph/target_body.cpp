@@ -203,6 +203,7 @@ void OffloadedLayeredBody::prepare(CudaExecutionView cuda, ParallelExecution* pa
         [&] {
             if (capture.suffix) capture.suffix();
             if (capture.head) head_.capture(cuda.stream(), capture.head);
+            if (capture.after_head) capture.after_head();
         },
         parallel);
 }

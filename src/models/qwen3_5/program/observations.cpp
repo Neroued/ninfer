@@ -6,7 +6,8 @@ namespace ninfer::models::qwen3_5::detail {
 
 RankExecutionObservation RankProgramImpl::retirement_observation() const noexcept {
     RankExecutionObservation out;
-    const auto peak            = std::max(resources.work.peak_used(), workspace_peak);
+    const auto peak = std::max(
+        {resources.work.peak_used(), workspace_peak, graphs ? graphs->workspace_peak() : 0});
     out.expert_upload_bytes    = resources.moe ? resources.moe->uploaded_bytes() : 0;
     out.workspace_peak_bytes   = std::max(workspace_lifetime_peak, peak);
     out.measurement_peak_bytes = peak;
@@ -32,8 +33,9 @@ RankMemoryUsage RankProgramImpl::observe_resources() const {
         a.expert_pinned_bytes = plan.bridge_pinned_bytes;
         a.expert_host_bytes   = plan.cpu_workspace_bytes;
     }
-    const auto peak = std::max(resources.work.peak_used(), workspace_peak);
-    out.workspace   = {resources.work.used(), std::max(workspace_lifetime_peak, peak), peak};
+    const auto peak = std::max(
+        {resources.work.peak_used(), workspace_peak, graphs ? graphs->workspace_peak() : 0});
+    out.workspace = {resources.work.used(), std::max(workspace_lifetime_peak, peak), peak};
     if (resources.vision) {
         out.vision = resources.vision->observe();
         a.persistent_device_bytes += resources.vision->capacity().output_bytes;
@@ -70,9 +72,9 @@ RankMemoryUsage RankProgramImpl::observe_resources() const {
 }
 
 void RankProgramImpl::reset_measurement_peaks() noexcept {
-    workspace_lifetime_peak =
-        std::max({workspace_lifetime_peak, resources.work.peak_used(), workspace_peak});
+    workspace_lifetime_peak = retirement_observation().workspace_peak_bytes;
     resources.work.reset_peak();
+    if (graphs) graphs->reset_workspace_peak();
     workspace_peak = 0;
     if (resources.vision) resources.vision->reset_peaks();
 }

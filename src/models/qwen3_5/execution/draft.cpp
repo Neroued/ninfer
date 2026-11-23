@@ -211,14 +211,78 @@ void submit_attention(Readout readout, ops::ContextBucket bucket, ops::ContextBu
     }
     auto scope       = execution.work.scope();
     const auto bytes = readout.scratch_bytes(buckets);
-    readout.scratch  = bytes ? execution.work.alloc_bytes(bytes)
-                             : MemorySpan{nullptr, 0, execution.cuda.device()};
+    readout.scratch =
+        bytes ? execution.work.alloc_bytes(bytes) : MemorySpan{nullptr, 0, execution.cuda.device()};
     submit(readout);
 }
 
+struct DraftAttentionTensors {
+    Tensor query, key, value, output;
+};
+
+DraftAttentionTensors dflash2_attention(MemoryArena& work, const dflash::AttentionConfig& config,
+                                        int width, int batch) {
+    const auto dim   = dimension(config.head_dim);
+    const auto heads = dimension(config.num_attention_heads);
+    const auto kv    = dimension(config.num_key_value_heads);
+    return {work.alloc(DType::BF16, {dim, heads, width, batch}),
+            work.alloc(DType::BF16, {dim, kv, width, batch}),
+            work.alloc(DType::BF16, {dim, kv, width, batch}),
+            work.alloc(DType::BF16, {dim, heads, width, batch})};
+}
+
+DraftAttentionTensors dflash_attention(const workspace::DFlashAttentionRoots& roots,
+                                       const dflash::AttentionConfig& config, int width,
+                                       int batch) {
+    const auto dim   = dimension(config.head_dim);
+    const auto heads = dimension(config.num_attention_heads);
+    const auto kv    = dimension(config.num_key_value_heads);
+    return {roots.query.view({dim, heads, width, batch}), roots.key.view({dim, kv, width, batch}),
+            roots.value.view({dim, kv, width, batch}),
+            roots.attention.view({dim, heads, width, batch})};
+}
+
+void submit_layer_attention(DraftExecutionView& execution, const DraftInputs& inputs,
+                            const Tensor& positions, const DraftAttentionTensors& tensors,
+                            std::uint32_t layer, DraftBuckets buckets,
+                            const DraftReadoutSubmit& submit) {
+    const auto& config = *execution.parameters.profile->config.draft;
+    const ops::AttentionHeadGeometry geometry{dimension(config.attention.head_dim),
+                                              dimension(config.attention.num_attention_heads),
+                                              dimension(config.attention.num_key_value_heads)};
+    const auto scale   = static_cast<float>(1.0 / std::sqrt(double(geometry.head_dim)));
+    const auto compact = config.compact_layer_index(layer);
+    if (config.layer_types[layer] == dflash::AttentionKind::SlidingAttention) {
+        const SlidingWindowReadout readout{tensors.query,
+                                           tensors.key,
+                                           tensors.value,
+                                           positions,
+                                           inputs.valid_columns,
+                                           tensors.output,
+                                           execution.local_layer(compact, inputs.state_offsets),
+                                           geometry,
+                                           scale,
+                                           {}};
+        submit_attention(readout, buckets.local, submit.buckets, submit.local, execution);
+    } else {
+        const ContextAttentionReadout readout{tensors.query,
+                                              tensors.key,
+                                              tensors.value,
+                                              inputs.frontiers,
+                                              inputs.valid_columns,
+                                              inputs.full_kv_rows,
+                                              tensors.output,
+                                              execution.full_layer(compact),
+                                              geometry,
+                                              scale,
+                                              {}};
+        submit_attention(readout, buckets.full, submit.buckets, submit.full, execution);
+    }
+}
+
 void propose_dflash2_batch(DraftExecutionView& execution, const DraftInputs& inputs,
-                           DraftOutputs& outputs, int batch, int width, int g,
-                           DraftBuckets buckets, const DraftReadoutSubmit& submit) {
+                           DraftOutputs& outputs, int batch, int width, int g, DraftBuckets buckets,
+                           const DraftReadoutSubmit& submit) {
     if (execution.parameters.profile->config.draft->dflash2) {
         const auto& target             = execution.parameters.profile->config.text;
         const auto& config             = *execution.parameters.profile->config.draft;
@@ -230,10 +294,8 @@ void propose_dflash2_batch(DraftExecutionView& execution, const DraftInputs& inp
         Tensor anchors                 = inputs.anchors;
         Tensor frontiers               = inputs.frontiers;
         Tensor valid_columns           = inputs.valid_columns;
-        Tensor state_offsets           = inputs.state_offsets;
         Tensor ids                     = outputs.ids;
         Tensor positions               = outputs.positions;
-        work.reset();
         ops::prepare_masked_block(anchors, frontiers, valid_columns,
                                   dimension(config.mask_token_id), ids, positions, cuda);
         Tensor residual = work.alloc(DType::BF16, {dimension(target.hidden_size), width, batch});
@@ -249,38 +311,22 @@ void propose_dflash2_batch(DraftExecutionView& execution, const DraftInputs& inp
                 auto branch = workspace::dflash2_branch(work, target, config, width, batch);
                 prepare_dynamic_branch(execution, residual, layer.input_norm, config.rms_norm_eps,
                                        *layer.attention_conv, branch);
-                Tensor query = work.alloc(
-                    DType::BF16, {dimension(config.attention.head_dim),
-                                  dimension(config.attention.num_attention_heads), width, batch});
-                Tensor key = work.alloc(
-                    DType::BF16, {dimension(config.attention.head_dim),
-                                  dimension(config.attention.num_key_value_heads), width, batch});
-                Tensor value = work.alloc(
-                    DType::BF16, {dimension(config.attention.head_dim),
-                                  dimension(config.attention.num_key_value_heads), width, batch});
+                auto tensors = dflash2_attention(work, config.attention, width, batch);
                 Tensor query_flat =
-                    query.view({dimension(config.attention.query_width()), columns});
-                Tensor key_flat   = key.view({dimension(config.attention.key_width()), columns});
-                Tensor value_flat = value.view({dimension(config.attention.key_width()), columns});
+                    tensors.query.view({dimension(config.attention.query_width()), columns});
+                Tensor key_flat = tensors.key.view({dimension(config.attention.key_width()), columns});
+                Tensor value_flat =
+                    tensors.value.view({dimension(config.attention.key_width()), columns});
                 std::array outputs{query_flat, key_flat, value_flat};
                 ops::linear_split(branch.prepared.view({dimension(target.hidden_size), columns}),
                                   layer.query_key_value.weight, outputs, cuda);
                 ops::rmsnorm_rope(positions, layer.query_norm, layer.key_norm, config.rms_norm_eps,
-                                  config.rope_theta, query, key, cuda);
-                Tensor attention = work.alloc(
-                    DType::BF16, {dimension(config.attention.head_dim),
-                                  dimension(config.attention.num_attention_heads), width, batch});
-                const SlidingWindowReadout readout{
-                    query, key, value, positions, valid_columns, attention,
-                    execution.local_layer(static_cast<std::uint32_t>(layer_index), state_offsets),
-                    {dimension(config.attention.head_dim),
-                     dimension(config.attention.num_attention_heads),
-                     dimension(config.attention.num_key_value_heads)},
-                    static_cast<float>(1.0 / std::sqrt(double(config.attention.head_dim))), {}};
-                submit_attention(readout, buckets.local, submit.buckets, submit.local, execution);
+                                  config.rope_theta, tensors.query, tensors.key, cuda);
+                submit_layer_attention(execution, inputs, positions, tensors, layer_index, buckets,
+                                       submit);
                 finish_dynamic_branch(
                     execution,
-                    attention.view({dimension(config.attention.query_width()), width, batch}),
+                    tensors.output.view({dimension(config.attention.query_width()), width, batch}),
                     layer.output, *layer.attention_conv, branch.finish_delta, residual);
             }
             {
@@ -331,7 +377,6 @@ void propose_dflash2_batch(DraftExecutionView& execution, const DraftInputs& inp
             weights.selector->predecessor_codebook, weights.selector->successor_codebook,
             dimension(execution.parameters.profile->public_tokens), frontiers, inputs.sampling,
             drafts, proposal_q, inputs.live_rows, work, cuda);
-        work.reset();
     }
 }
 
@@ -351,13 +396,10 @@ void propose_batch_impl(DraftExecutionView& execution, const DraftInputs& inputs
         Tensor anchors            = inputs.anchors;
         Tensor frontiers          = inputs.frontiers;
         Tensor valid_columns      = inputs.valid_columns;
-        Tensor state_destinations = inputs.state_offsets;
-        Tensor full_rows          = inputs.full_kv_rows;
         Tensor ids                = outputs.ids;
         Tensor positions          = outputs.positions;
         Tensor drafts             = outputs.drafts;
 
-        execution.work.reset();
         ops::prepare_masked_block(anchors, frontiers, valid_columns,
                                   dimension(config.mask_token_id), ids, positions, execution.cuda);
         Tensor residual =
@@ -406,37 +448,10 @@ void propose_batch_impl(DraftExecutionView& execution, const DraftInputs& inputs
                              execution.cuda);
                 ops::rope(positions.view({columns}), dimension(config.attention.head_dim),
                           config.rope_theta, query, key, execution.cuda);
-                Tensor query_batch = query.view({dimension(config.attention.head_dim),
-                                                 dimension(config.attention.num_attention_heads),
-                                                 width, batch_size});
-                Tensor key_batch =
-                    key.view({dimension(config.attention.head_dim),
-                              dimension(config.attention.num_key_value_heads), width, batch_size});
-                Tensor value_batch     = value.view({dimension(config.attention.head_dim),
-                                                     dimension(config.attention.num_key_value_heads),
-                                                     width, batch_size});
-                Tensor attention_batch = roots.attention.view(
-                    {dimension(config.attention.head_dim),
-                     dimension(config.attention.num_attention_heads), width, batch_size});
-                const ops::AttentionHeadGeometry geometry{
-                    dimension(config.attention.head_dim),
-                    dimension(config.attention.num_attention_heads),
-                    dimension(config.attention.num_key_value_heads)};
-                const auto scale = static_cast<float>(1.0 / std::sqrt(double(geometry.head_dim)));
-                const auto compact = config.compact_layer_index(layer);
-                if (config.layer_types[layer] == dflash::AttentionKind::SlidingAttention) {
-                    const SlidingWindowReadout readout{
-                        query_batch, key_batch, value_batch, positions, valid_columns,
-                        attention_batch, execution.local_layer(compact, state_destinations),
-                        geometry, scale, {}};
-                    submit_attention(readout, buckets.local, submit.buckets, submit.local,
-                                     execution);
-                } else {
-                    const ContextAttentionReadout readout{
-                        query_batch, key_batch, value_batch, frontiers, valid_columns, full_rows,
-                        attention_batch, execution.full_layer(compact), geometry, scale, {}};
-                    submit_attention(readout, buckets.full, submit.buckets, submit.full, execution);
-                }
+                submit_layer_attention(
+                    execution, inputs, positions,
+                    dflash_attention(roots, config.attention, width, batch_size), layer, buckets,
+                    submit);
                 project_add(
                     roots.attention.view({dimension(config.attention.query_width()), columns}),
                     weight.output, residual, execution.work, execution.cuda);
@@ -497,7 +512,6 @@ void propose_batch_impl(DraftExecutionView& execution, const DraftInputs& inputs
                                        static_cast<const std::int32_t*>(proposal.token_ids->data),
                                        dimension(proposal.rows), execution.cuda);
         }
-        execution.work.reset();
     }
 }
 
@@ -515,8 +529,8 @@ PagedKVBatchLayerView DraftExecutionView::full_layer(std::uint32_t layer) const 
 }
 
 ops::OpGraphProfile SlidingWindowReadout::profile(ops::ContextBucket bucket) const {
-    return ops::sliding_window_attention_graph_profile(
-        geometry, context.capacity, bucket, query.ne[3], query.ne[2]);
+    return ops::sliding_window_attention_graph_profile(geometry, context.capacity, bucket,
+                                                       query.ne[3], query.ne[2]);
 }
 
 std::size_t SlidingWindowReadout::scratch_bytes(ops::ContextBucketRange buckets) const {
@@ -541,15 +555,15 @@ ops::OpGraphProfile ContextAttentionReadout::profile(ops::ContextBucket bucket) 
 }
 
 std::size_t ContextAttentionReadout::scratch_bytes(ops::ContextBucketRange buckets) const {
-    return ops::context_softmax_attention_workspace_capacity_bytes(
-        geometry, buckets, query.ne[3], query.ne[2], query.ne[2]);
+    return ops::context_softmax_attention_workspace_capacity_bytes(geometry, buckets, query.ne[3],
+                                                                   query.ne[2], query.ne[2]);
 }
 
 void ContextAttentionReadout::execute(ops::ContextBucket bucket, MemoryArena& work,
-                                     CudaExecutionView cuda) const {
+                                      CudaExecutionView cuda) const {
     auto out = output;
-    ops::context_softmax_attention(query, key, value, frontiers, valid_columns, table_rows, geometry,
-                                   scale, context, bucket, work, out, cuda);
+    ops::context_softmax_attention(query, key, value, frontiers, valid_columns, table_rows,
+                                   geometry, scale, context, bucket, work, out, cuda);
 }
 
 void ContextAttentionReadout::execute(ops::ContextBucket bucket, CudaExecutionView cuda) const {
@@ -575,7 +589,32 @@ void draft_propose(DraftExecutionView execution, const DraftInputs& inputs, Draf
         outputs.drafts.ne[1] != batch) {
         throw std::invalid_argument("draft proposal has invalid geometry");
     }
+    auto scope = execution.work.scope();
     propose_batch_impl(execution, inputs, outputs, batch, width, g, buckets, submit);
+}
+
+void bind_draft_readouts(DraftExecutionView execution, const DraftInputs& inputs,
+                         const DraftOutputs& outputs, const DraftReadoutSubmit& submit) {
+    const auto& target = execution.parameters.profile->config.text;
+    const auto& config = *execution.parameters.profile->config.draft;
+    const auto width = outputs.ids.ne[0], batch = outputs.ids.ne[1];
+    const auto columns = width * batch;
+    auto scope         = execution.work.scope();
+    (void)execution.work.alloc(DType::BF16, {dimension(target.hidden_size), columns});
+    const DraftBuckets buckets{submit.buckets.first, submit.buckets.first};
+    for (std::uint32_t layer = 0; layer < config.num_hidden_layers; ++layer) {
+        auto layer_scope = execution.work.scope();
+        DraftAttentionTensors tensors;
+        if (config.dflash2) {
+            (void)workspace::dflash2_branch(execution.work, target, config, width, batch);
+            tensors = dflash2_attention(execution.work, config.attention, width, batch);
+        } else {
+            const auto roots = workspace::dflash_attention(execution.work, target, config, columns);
+            tensors          = dflash_attention(roots, config.attention, width, batch);
+        }
+        submit_layer_attention(execution, inputs, outputs.positions, tensors, layer, buckets,
+                               submit);
+    }
 }
 
 } // namespace ninfer::models::qwen3_5::execution

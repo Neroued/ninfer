@@ -28,11 +28,6 @@ class Definition;
 class Executable final : public moe::LayerGraphExecutable {
 public:
     explicit Executable(const Definition&);
-    void update(const moe::LayerGraphDefinition&) override;
-
-    void update_mixer_child(const DecodeGraphDefinition& next) override {
-        executable_.update_mixer_child(next);
-    }
 
     void update_mixer_slice(std::size_t index, const DecodeGraphKernelPatch& patch) override {
         executable_.update_mixer_slice(index, patch);
@@ -76,13 +71,6 @@ public:
 Executable::Executable(const Definition& source)
     : resources_(source.resources), bank_(source.bank), executable_(source.definition) {}
 
-void Executable::update(const moe::LayerGraphDefinition& source) {
-    const auto& definition = dynamic_cast<const Definition&>(source);
-    if (&definition.resources != &resources_ || definition.bank != bank_)
-        throw std::logic_error("MoE graph update changed its execution owner");
-    executable_.update(definition.definition);
-}
-
 class Execution final : public moe::Schedule {
 public:
     Execution(std::shared_ptr<const Plan> plan, std::span<const Parameters* const> layers,
@@ -105,16 +93,21 @@ public:
 
     std::shared_ptr<const moe::LayerGraphDefinition>
     capture_layer(ExpertBankId bank, CudaExecutionView cuda, TokenGeometry geometry,
-                  const MixerBody& mixer, const GpuBody& body, const std::function<void()>& feature,
-                  const std::shared_ptr<const moe::LayerGraphDefinition>& shared) override {
-        return capture(bank, cuda, geometry, mixer, body, feature, shared);
-    }
-
-    std::shared_ptr<const moe::LayerGraphDefinition>
-    capture_layer(ExpertBankId bank, CudaExecutionView cuda, TokenGeometry geometry,
-                  const FlatMixerBody& mixer, const GpuBody& body,
+                  const MixerBody& mixer, const GpuBody& body,
                   const std::function<void()>& feature) override {
-        return capture(bank, cuda, geometry, mixer, body, feature, {});
+        auto out = std::make_shared<Definition>(resources_, bank);
+        offload::capture_layer(
+            out->definition, resources_, bank, cuda, geometry, mixer,
+            [&](const PreparedExecution& call) {
+                body([&](const Tensor& hidden, Tensor& output, ops::MoeTokenValidity validity,
+                         MemoryArena& workspace, const ops::MoeExecutionHints& hints) {
+                    out->definition.validity = validity;
+                    enqueue_gpu(hidden, call, output, validity, workspace, GpuSubmission::Capture,
+                                hints);
+                });
+            },
+            feature);
+        return out;
     }
 
     void restore_cache_after_preparation() override {
@@ -130,35 +123,6 @@ public:
     const ScheduleDescription& description() const noexcept override { return description_; }
 
 private:
-    template <class Mixer>
-    std::shared_ptr<const moe::LayerGraphDefinition>
-    capture(ExpertBankId bank, CudaExecutionView cuda, TokenGeometry geometry, const Mixer& mixer,
-            const GpuBody& body, const std::function<void()>& feature,
-            const std::shared_ptr<const moe::LayerGraphDefinition>& shared) {
-        auto out = std::make_shared<Definition>(resources_, bank);
-        if (shared) {
-            const auto& existing = dynamic_cast<const Definition&>(*shared);
-            if (&existing.resources != &resources_ || existing.bank != bank)
-                throw std::logic_error("MoE graph sharing changed its execution owner");
-            out->definition.moe      = existing.definition.moe;
-            out->definition.validity = existing.definition.validity;
-        } else {
-            out->definition.moe = std::make_shared<SubsetGraphDefinitions>();
-        }
-        offload::capture_layer(
-            out->definition, resources_, bank, cuda, geometry, mixer,
-            [&](const PreparedExecution& call) {
-                body([&](const Tensor& hidden, Tensor& output, ops::MoeTokenValidity validity,
-                         MemoryArena& workspace, const ops::MoeExecutionHints& hints) {
-                    out->definition.validity = validity;
-                    enqueue_gpu(hidden, call, output, validity, workspace, GpuSubmission::Capture,
-                                hints);
-                });
-            },
-            feature);
-        return out;
-    }
-
     void begin_activity(std::int32_t physical_tokens, std::int32_t active_tokens) override {
         if (active_) throw std::logic_error("MoE traversal is already active");
         if (auto activity = resources_.begin(physical_tokens, active_tokens))

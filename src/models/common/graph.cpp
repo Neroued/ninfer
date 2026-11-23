@@ -21,34 +21,12 @@ void GraphSegment::launch(CudaExecutionView cuda, ParallelExecution* parallel,
     if (parallel) parallel->replayed(replay_work ? *replay_work : communication);
 }
 
-void MtpGraphSteps::Step::readout(cudaStream_t stream, const std::function<void()>& body) {
-    first.end(stream);
-    body();
-    after_readout.emplace().begin(stream);
-}
-
-void MtpGraphSteps::capture_step(cudaStream_t stream, ParallelExecution* parallel,
-                                 const std::function<void(Step*)>& body) {
-    if (work_.empty()) {
-        body(nullptr);
-    } else {
-        auto& step = steps_.emplace_back();
-        step.first.begin(stream);
-        body(&step);
-        if (step.after_readout)
-            step.after_readout->end(stream);
-        else
-            step.first.end(stream);
-    }
-    work_.push_back(parallel ? parallel->captured_work() : CommunicationGraphWork{});
-}
-
 void MtpGraphSteps::capture_step(cudaStream_t stream, ParallelExecution* parallel,
                                  const std::function<void()>& body) {
     if (work_.empty())
         body();
     else
-        steps_.emplace_back().first.capture(stream, body);
+        steps_.emplace_back().capture(stream, body);
     work_.push_back(parallel ? parallel->captured_work() : CommunicationGraphWork{});
 }
 
@@ -75,12 +53,8 @@ const CommunicationGraphWork& MtpGraphSteps::set_depth(const DecodeGraphExecutab
                                                        unsigned depth) {
     if (!installed_depth_ || !depth || depth > work_.size())
         throw std::logic_error("invalid MTP graph depth");
-    for (unsigned i = std::min(depth, installed_depth_); i < std::max(depth, installed_depth_);
-         ++i) {
-        auto& step = steps_[i - 1];
-        step.first.set_enabled(exec, i < depth);
-        if (step.after_readout) step.after_readout->set_enabled(exec, i < depth);
-    }
+    for (unsigned i = std::min(depth, installed_depth_); i < std::max(depth, installed_depth_); ++i)
+        steps_[i - 1].set_enabled(exec, i < depth);
     installed_depth_ = depth;
     return work_[depth - 1];
 }

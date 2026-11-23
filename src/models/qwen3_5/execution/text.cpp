@@ -39,11 +39,32 @@ bool is_sequence(const TextStateUpdate& update) {
     return std::holds_alternative<SequenceUpdate>(update);
 }
 
+CausalAttentionReadout attention_readout(const TextExecutionView& view, const TextInputs& inputs,
+                                         std::uint32_t compact_layer,
+                                         const workspace::TextAttentionProjectionRoots& projection,
+                                         const workspace::TextAttentionResultRoots& results) {
+    const auto& attn = *view.parameters.profile->config.text.attention;
+    const auto width = inputs.ids.ne[0], batch = inputs.ids.ne[1];
+    const auto dim   = dimension(attn.head_dim);
+    const auto heads = dimension(attn.num_attention_heads);
+    const auto kv    = dimension(attn.num_key_value_heads);
+    return {results.normalized_query.view({dim, heads, width, batch}),
+            results.normalized_key.view({dim, kv, width, batch}),
+            projection.value.view({dim, kv, width, batch}),
+            inputs.cache_positions,
+            inputs.valid_columns,
+            inputs.kv_table_rows,
+            results.attention.view({dim, heads, width, batch}),
+            view.cache.batch_layer_view(compact_layer),
+            {dim, heads, kv},
+            static_cast<float>(1.0 / std::sqrt(double(attn.head_dim))),
+            {}};
+}
+
 } // namespace
 
 TextRun::TextRun(TextExecutionView execution, TextInputs inputs, TextStateUpdate update,
-                 ops::ContextBucket bucket, Tensor hidden,
-                 const DFlashFeatureSink* features)
+                 ops::ContextBucket bucket, Tensor hidden, const DFlashFeatureSink* features)
     : view_(execution), inputs_(std::move(inputs)), update_(update), bucket_(bucket),
       hidden_(hidden), traversal_scope_(view_.workspace.scope()) {
     const auto& config = view_.parameters.profile->config.text;
@@ -120,8 +141,15 @@ TextRun::~TextRun() {
     }
 }
 
-void TextRun::set_attention_bucket(ops::ContextBucket bucket) noexcept {
-    bucket_ = bucket;
+void TextRun::bind_attention_readout(std::uint32_t layer, const CausalAttentionSubmit& submit) {
+    const auto& cfg       = view_.parameters.profile->config.text;
+    auto& work            = view_.workspace;
+    auto scope            = work.scope();
+    const auto projection = workspace::text_attention_projection(work, cfg, residual_.ne[1]);
+    const auto results    = workspace::text_attention_results(work, cfg, residual_.ne[1]);
+    auto readout =
+        attention_readout(view_, inputs_, cfg.compact_layer_indices[layer], projection, results);
+    readout.submit(work, view_.execution, submit);
 }
 
 void TextRun::prefix() {
@@ -143,8 +171,6 @@ void TextRun::attention(const BlockParameters& block, std::uint32_t compact_laye
     const auto& attn  = *cfg.attention;
     const auto& p     = std::get<AttentionParameters>(block.mixer);
     const auto tokens = residual_.ne[1];
-    const auto width  = inputs_.ids.ne[0];
-    const auto batch  = inputs_.ids.ne[1];
     const auto dim    = dimension(attn.head_dim);
     const auto heads  = dimension(attn.num_attention_heads);
     const auto kv     = dimension(attn.num_key_value_heads);
@@ -160,7 +186,6 @@ void TextRun::attention(const BlockParameters& block, std::uint32_t compact_laye
     query = query.view({dim, heads, tokens});
     gate  = gate.view({dim, heads, tokens});
     key   = key.view({dim, kv, tokens});
-    value = value.view({dim, kv, tokens});
 
     const auto results = workspace::text_attention_results(work, cfg, tokens);
     Tensor q           = results.normalized_query.view({dim, heads, tokens});
@@ -169,12 +194,7 @@ void TextRun::attention(const BlockParameters& block, std::uint32_t compact_laye
     ops::rmsnorm(query, p.query_norm, cfg.rms_norm_eps, true, q, cuda);
     ops::rmsnorm(key, p.key_norm, cfg.rms_norm_eps, true, k, cuda);
     text_rope(inputs_.rope_positions, *cfg.rope_parameters, q, k, cuda);
-    CausalAttentionReadout readout{
-        q.view({dim, heads, width, batch}), k.view({dim, kv, width, batch}),
-        value.view({dim, kv, width, batch}), inputs_.cache_positions, inputs_.valid_columns,
-        inputs_.kv_table_rows, a.view({dim, heads, width, batch}),
-        view_.cache.batch_layer_view(compact_layer), {dim, heads, kv},
-        static_cast<float>(1.0 / std::sqrt(double(attn.head_dim))), {}};
+    auto readout = attention_readout(view_, inputs_, compact_layer, projection, results);
     if (submit)
         readout.submit(work, cuda, submit);
     else

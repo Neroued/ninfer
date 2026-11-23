@@ -5,33 +5,22 @@
 
 #include <array>
 #include <functional>
-#include <memory>
 #include <optional>
 
 namespace ninfer::models::moe::offload {
 
 [[nodiscard]] GraphPlan graph_plan(const Plan&, ExpertBankId, TokenGeometry);
 
-// Subset bodies share exact-T bindings across attention context profiles.
-struct SubsetGraphDefinitions {
-    std::array<DecodeGraphDefinition, 3> subsets;
-};
-
 struct LayerGraphDefinition {
     GraphPlan plan;
     ops::MoeTokenValidity validity;
     DecodeGraphDefinition mixer, steady, feature;
-    DecodeGraphChild mixer_child, steady_child;
     std::vector<DecodeGraphKernelSlice> mixer_slices, steady_slices;
-    std::shared_ptr<SubsetGraphDefinitions> moe;
+    std::array<DecodeGraphDefinition, 3> subsets;
 };
 
 void capture_layer(LayerGraphDefinition&, Resources&, ExpertBankId, CudaExecutionView,
                    TokenGeometry, const MixerBody& mixer,
-                   const std::function<void(const PreparedExecution&)>& gpu_moe,
-                   const std::function<void()>& feature = {});
-void capture_layer(LayerGraphDefinition&, Resources&, ExpertBankId, CudaExecutionView,
-                   TokenGeometry, const FlatMixerBody& mixer,
                    const std::function<void(const PreparedExecution&)>& gpu_moe,
                    const std::function<void()>& feature = {});
 
@@ -39,8 +28,6 @@ void capture_layer(LayerGraphDefinition&, Resources&, ExpertBankId, CudaExecutio
 class LayerGraphExecutable {
 public:
     explicit LayerGraphExecutable(const LayerGraphDefinition&);
-    void update(const LayerGraphDefinition&);
-    void update_mixer_child(const DecodeGraphDefinition&);
     void update_mixer_slice(std::size_t, const DecodeGraphKernelPatch&);
     void upload_mixer(cudaStream_t);
     void upload(cudaStream_t);
@@ -65,7 +52,6 @@ private:
 
     [[nodiscard]] bool advance();
     std::optional<Invocation> pending_;
-    DecodeGraphChild mixer_child_, steady_child_;
     std::span<const DecodeGraphKernelSlice> mixer_slices_, steady_slices_;
     GraphPlan plan_;
     ops::MoeTokenValidity validity_;

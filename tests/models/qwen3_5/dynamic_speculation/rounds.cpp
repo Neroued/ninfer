@@ -7,13 +7,15 @@
 
 namespace {
 thread_local cudaGraphExec_t last_graph_launch = nullptr;
-}
+thread_local std::size_t graph_launch_count    = 0;
+} // namespace
 
 extern "C" cudaError_t CUDARTAPI cudaGraphLaunch(cudaGraphExec_t executable, cudaStream_t stream) {
     static const auto launch =
         ninfer::test::next_symbol<cudaError_t (*)(cudaGraphExec_t, cudaStream_t)>(
             "cudaGraphLaunch");
     last_graph_launch = executable;
+    ++graph_launch_count;
     return launch(executable, stream);
 }
 
@@ -183,9 +185,13 @@ void exercise_rounds(NativeRankFixture& fixture, models::qwen::Frontend& fronten
             auto& drafts = fixture.rank().resources.frame.mtp->drafts;
             CUDA_CHECK(cudaMemset(drafts.data, 0xff, drafts.bytes()));
         }
+        const auto before_launch = graph_launch_count;
         auto pending =
             driver.decode(active, budgets, constraints, [&](const runtime::DecisionRequest& r) {
                 // The target has launched and the constrained decision has not been supplied yet.
+                if (path == ExecutionPath::Graph)
+                    check(graph_launch_count == before_launch + 1,
+                          "resident round submitted more than one proposal/target graph");
                 if (backend == SpeculativeBackend::Mtp && path == ExecutionPath::Graph &&
                     std::ranges::max(extents)) {
                     check(last_graph_launch != nullptr, "missing target graph launch");
@@ -231,7 +237,7 @@ void exercise_rounds(NativeRankFixture& fixture, models::qwen::Frontend& fronten
                                .resources.frame.mtp->step_view(step, work.plan->route().shape.rows)
                                .ids;
                 CUDA_CHECK(cudaMemcpy(&token, ids.data, sizeof(token), cudaMemcpyDeviceToHost));
-                check((step < depth) == (token >= 0),
+                check(step < depth ? token >= 0 : token == -1,
                       "MTP wrote a different number of proposal steps");
             }
         }

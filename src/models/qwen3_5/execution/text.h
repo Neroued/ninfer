@@ -75,8 +75,7 @@ public:
     [[nodiscard]] std::uint32_t active_tokens() const noexcept { return inputs_.active_tokens; }
 
     TextRun(TextExecutionView execution, TextInputs inputs, TextStateUpdate update,
-            ops::ContextBucket bucket, Tensor hidden,
-            const DFlashFeatureSink* features = nullptr);
+            ops::ContextBucket bucket, Tensor hidden, const DFlashFeatureSink* features = nullptr);
     ~TextRun();
     TextRun(const TextRun&)            = delete;
     TextRun& operator=(const TextRun&) = delete;
@@ -90,17 +89,18 @@ public:
     // activity or acquire offloaded weights. A supplied GPU call binds the captured MoE body.
     void prefix();
     void mixer(std::uint32_t layer, const CausalAttentionSubmit& = {});
+    void bind_attention_readout(std::uint32_t layer, const CausalAttentionSubmit&);
     void post_mixer(std::uint32_t layer, const moe::GpuCall* call = nullptr);
     void capture_features(std::uint32_t layer);
     void finish();
-    void set_attention_bucket(ops::ContextBucket bucket) noexcept;
 
     [[nodiscard]] Tensor& residual() noexcept { return residual_; }
 
 private:
     enum class Stage : std::uint8_t { Idle, Layer, PostMixer, Done, Cancelled };
 
-    void attention(const BlockParameters&, std::uint32_t compact_layer, const CausalAttentionSubmit&);
+    void attention(const BlockParameters&, std::uint32_t compact_layer,
+                   const CausalAttentionSubmit&);
     void gdn(const BlockParameters&, std::uint32_t compact_layer);
     [[nodiscard]] ops::MoeExecutionHints next_projection_hints(std::uint32_t layer) const;
     void complete_layer();

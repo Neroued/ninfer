@@ -521,7 +521,6 @@ void qualify_flat_mixers(const DeviceContext& device, offload::Resources& resour
     const auto activity = resources.begin(1, 1);
     for (std::size_t count = 0; count <= patches.size(); ++count) {
         offload::LayerGraphDefinition definition;
-        definition.moe      = std::make_shared<offload::SubsetGraphDefinitions>();
         definition.validity = call.validity;
         offload::capture_layer(
             definition, resources, bank, cuda, {1, 1},
@@ -668,11 +667,11 @@ int qualify_schedule(const DeviceContext& device, const CpuTopology& topology,
                 if (graph && !calibration) {
                     auto& call = *calls[i];
                     offload::LayerGraphDefinition definition;
-                    definition.moe      = std::make_shared<offload::SubsetGraphDefinitions>();
                     definition.validity = call.validity;
                     offload::capture_layer(
                         definition, resources, order[i], device.execution_view(),
-                        {tokens, tokens == 9 ? 8 : tokens}, [](DecodeGraphChild&) {},
+                        {tokens, tokens == 9 ? 8 : tokens},
+                        [](const model_moe::MixerSliceRecorder&) {},
                         [&](const offload::PreparedExecution& prepared) {
                             offload::enqueue_gpu(call.device.x, prepared, call.destination,
                                                  call.validity, workspace,

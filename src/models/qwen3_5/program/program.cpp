@@ -230,7 +230,7 @@ void RankProgramImpl::validate_work(const Work& work, runtime::FrameKind kind) c
                 route.validate(backend, draft_window);
                 if (graphs && !graphs->contains(route))
                     throw std::invalid_argument("Qwen3.5 graph route is unprepared");
-                if (route.graph_entry.has_value() != graphs.has_value())
+                if (route.graph_entry.has_value() != bool(graphs))
                     throw std::invalid_argument(
                         "Qwen3.5 decode route differs from the prepared path");
                 for (std::size_t i = 0; i < op.rows.size(); ++i) {

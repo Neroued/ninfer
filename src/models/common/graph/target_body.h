@@ -88,6 +88,7 @@ struct OffloadedTargetCapture {
     std::vector<std::variant<ReadoutCapture, OffloadedLayerCapture>> layers;
     std::optional<InterLayerHookCapture> hook;
     GraphBody suffix, head;
+    GraphBody after_head;
 };
 
 using TargetCapture = std::variant<ResidentTargetCapture, OffloadedTargetCapture>;

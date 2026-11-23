@@ -94,5 +94,7 @@ void draft_append_context(DraftExecutionView, const Tensor& features, const Tens
 // ordinary DFlash leaves it absent.
 void draft_propose(DraftExecutionView, const DraftInputs&, DraftOutputs&, DraftBuckets,
                    const DraftReadoutSubmit& = {});
+void bind_draft_readouts(DraftExecutionView, const DraftInputs&, const DraftOutputs&,
+                         const DraftReadoutSubmit&);
 
 } // namespace ninfer::models::qwen3_5::execution

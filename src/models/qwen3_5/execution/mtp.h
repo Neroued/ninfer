@@ -42,8 +42,9 @@ struct MtpInputs {
     const Tensor* input_embeddings = nullptr;
 };
 
-void mtp_forward(MtpExecutionView state, const MtpInputs& inputs,
-                 ops::ContextBucket, Tensor& hidden, const CausalAttentionSubmit& = {});
+void mtp_forward(MtpExecutionView state, const MtpInputs& inputs, ops::ContextBucket,
+                 Tensor& hidden, const CausalAttentionSubmit& = {});
+void bind_mtp_attention_readout(MtpExecutionView, const MtpInputs&, const CausalAttentionSubmit&);
 
 // Materialize K/V from true target conditioning without running query attention or the MLP.
 void mtp_history(MtpExecutionView state, const MtpInputs& inputs,

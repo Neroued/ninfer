@@ -4,8 +4,6 @@
 #include "models/common/parallel_execution.h"
 #include "models/common/graph_preparation.h"
 
-#include <optional>
-
 namespace ninfer::models {
 
 struct GraphSegment {
@@ -21,15 +19,6 @@ struct GraphSegment {
 // One active prefix of serial MTP steps in a fused round.
 class MtpGraphSteps {
 public:
-    struct Step {
-        void readout(cudaStream_t, const std::function<void()>&);
-    private:
-        friend class MtpGraphSteps;
-        DecodeGraphSection first;
-        std::optional<DecodeGraphSection> after_readout;
-    };
-
-    void capture_step(cudaStream_t, ParallelExecution*, const std::function<void(Step*)>&);
     void capture_step(cudaStream_t, ParallelExecution*, const std::function<void()>&);
     void finish(const CommunicationGraphWork& full);
 
@@ -38,7 +27,7 @@ public:
     [[nodiscard]] const CommunicationGraphWork& set_depth(const DecodeGraphExecutable&, unsigned);
 
 private:
-    std::vector<Step> steps_;
+    std::vector<DecodeGraphSection> steps_;
     std::vector<CommunicationGraphWork> work_;
     unsigned installed_depth_ = 0;
 };

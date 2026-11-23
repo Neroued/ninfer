@@ -101,6 +101,28 @@ workspace::MtpStemRoots mtp_stem(MtpExecutionView state, const MtpInputs& inputs
     return roots;
 }
 
+CausalAttentionReadout
+mtp_attention_readout(MtpExecutionView state, const MtpInputs& inputs,
+                      const workspace::MtpAttentionProjectionRoots& projection,
+                      const workspace::MtpAttentionResultRoots& result) {
+    const auto& attention = *state.parameters.profile->config.text.attention;
+    const auto width = inputs.ids.ne[0], batch = inputs.ids.ne[1];
+    const auto head_dim = dimension(attention.head_dim);
+    const auto heads    = dimension(attention.num_attention_heads);
+    const auto kv_heads = dimension(attention.num_key_value_heads);
+    return {result.normalized_query.view({head_dim, heads, width, batch}),
+            result.normalized_key.view({head_dim, kv_heads, width, batch}),
+            projection.value.view({head_dim, kv_heads, width, batch}),
+            inputs.cache_positions,
+            inputs.valid_columns,
+            inputs.kv_table_rows,
+            result.attention.view({head_dim, heads, width, batch}),
+            state.cache,
+            {head_dim, heads, kv_heads},
+            static_cast<float>(1.0 / std::sqrt(double(attention.head_dim))),
+            {}};
+}
+
 } // namespace
 
 std::size_t mtp_projection_workspace_bytes(const MtpProjectionProfile& parameters,
@@ -169,8 +191,8 @@ void mtp_kv_projection(const Tensor& hidden, const MtpProjectionParameters& para
     mtp_projection(hidden, parameters, config, query, gate, key, value, workspace, execution);
 }
 
-void mtp_forward(MtpExecutionView state, const MtpInputs& inputs,
-                 ops::ContextBucket bucket, Tensor& hidden, const CausalAttentionSubmit& submit) {
+void mtp_forward(MtpExecutionView state, const MtpInputs& inputs, ops::ContextBucket bucket,
+                 Tensor& hidden, const CausalAttentionSubmit& submit) {
     const auto& parameters = require_mtp(state.parameters);
     const auto& config     = state.parameters.profile->config.text;
     const auto columns     = validate_inputs(state, inputs);
@@ -183,10 +205,7 @@ void mtp_forward(MtpExecutionView state, const MtpInputs& inputs,
     auto scope            = state.workspace.scope();
     auto stem             = mtp_stem(state, inputs, columns);
     const auto& attention = *config.attention;
-    const ops::AttentionHeadGeometry geometry{dimension(attention.head_dim),
-                                              dimension(attention.num_attention_heads),
-                                              dimension(attention.num_key_value_heads)};
-    auto projection = workspace::mtp_attention_projection(state.workspace, config, columns);
+    auto projection       = workspace::mtp_attention_projection(state.workspace, config, columns);
     mtp_projection(stem.attention_hidden, parameters.projection, attention, projection.query,
                    projection.gate, projection.key, projection.value, state.workspace,
                    state.execution);
@@ -206,12 +225,7 @@ void mtp_forward(MtpExecutionView state, const MtpInputs& inputs,
     text_rope(inputs.rope_positions, *config.rope_parameters, normalized_query, normalized_key,
               state.execution);
 
-    CausalAttentionReadout readout{
-        normalized_query.view({head_dim, heads, width, batch}),
-        normalized_key.view({head_dim, kv_heads, width, batch}),
-        projection.value.view({head_dim, kv_heads, width, batch}), inputs.cache_positions,
-        inputs.valid_columns, inputs.kv_table_rows, result.attention.view({head_dim, heads, width, batch}),
-        state.cache, geometry, static_cast<float>(1.0 / std::sqrt(double(attention.head_dim))), {}};
+    auto readout = mtp_attention_readout(state, inputs, projection, result);
     if (submit)
         readout.submit(state.workspace, state.execution, submit);
     else
@@ -240,6 +254,18 @@ void mtp_forward(MtpExecutionView state, const MtpInputs& inputs,
     Tensor output = hidden.view({dimension(config.hidden_size), columns});
     ops::rmsnorm(stem.residual, parameters.final_norm, config.rms_norm_eps, true, output,
                  state.execution);
+}
+
+void bind_mtp_attention_readout(MtpExecutionView state, const MtpInputs& inputs,
+                                const CausalAttentionSubmit& submit) {
+    const auto& config = state.parameters.profile->config.text;
+    const auto columns = validate_inputs(state, inputs);
+    auto scope         = state.workspace.scope();
+    (void)workspace::mtp_stem(state.workspace, config, columns, inputs.input_embeddings == nullptr);
+    const auto projection = workspace::mtp_attention_projection(state.workspace, config, columns);
+    const auto result     = workspace::mtp_attention_results(state.workspace, config, columns);
+    auto readout          = mtp_attention_readout(state, inputs, projection, result);
+    readout.submit(state.workspace, state.execution, submit);
 }
 
 void mtp_history(MtpExecutionView state, const MtpInputs& inputs,

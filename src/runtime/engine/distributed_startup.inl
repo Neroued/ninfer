@@ -21,20 +21,106 @@ build_distributed_model(const artifact::Reader& reader, EngineOptions& options,
     StartupPhaseScope frontend_phase(options.startup_observer, StartupPhase::FrontendInitialize);
     auto frontend = setup.frontend(options);
     frontend_phase.complete();
-    auto group = std::make_unique<distributed::ExecutionGroup>(
-        *options.deployment, setup.topology(), options.startup_observer,
-        [](auto rank, std::string_view message) {
-            std::cerr << "[rank " << rank << "] " << message << '\n';
-        });
+    std::unique_ptr<distributed::ExecutionGroup> group;
     std::optional<typename Types::PreparedSession> session;
-    auto prepared =
-        prepare_execution_group(*group, setup.requests(options), options.context_capacity,
-                                options.memory_headroom_bytes, std::chrono::minutes(30),
-                                {[&](auto descriptions) {
-                                     setup.resolve(descriptions, options);
-                                     session.emplace(setup.session());
-                                 },
-                                 [&] { session.reset(); }});
+    const auto prepare = [&](bool narrow) {
+        group = std::make_unique<distributed::ExecutionGroup>(
+            *options.deployment, setup.topology(), options.startup_observer,
+            [](auto rank, std::string_view message) {
+                std::cerr << "[rank " << rank << "] " << message << '\n';
+            });
+        auto requests = [&] {
+            if constexpr (requires { setup.requests(options, narrow); })
+                return setup.requests(options, narrow);
+            else
+                return setup.requests(options);
+        }();
+        return prepare_execution_group(*group, requests, options.context_capacity,
+                                       options.memory_headroom_bytes, std::chrono::minutes(30),
+                                       {[&](auto descriptions) {
+                                            setup.resolve(descriptions, options);
+                                            session.emplace(setup.session());
+                                        },
+                                        [&] { session.reset(); }});
+    };
+    auto prepared = [&] {
+        if constexpr (requires { setup.narrow_targets(options); }) {
+            if (setup.narrow_targets(options)) {
+                const auto requested = options;
+                const auto release = [&] {
+                    session.reset();
+                    if (group) group->shutdown();
+                    group.reset();
+                    options = requested;
+                };
+                const auto try_narrow = [&]() -> std::optional<GroupPreparation> {
+                    try {
+                        return prepare(true);
+                    } catch (const DeviceAllocationError&) {
+                    } catch (const distributed::RankDeviceAllocationError&) {
+                    } catch (const ContextBudgetError&) {
+                    }
+                    release();
+                    return {};
+                };
+                const auto preserves = [](const auto& proposed, const auto& reference) {
+                    for (std::size_t rank = 0; rank < proposed.size(); ++rank)
+                        if (!keeps_context_capacity(proposed[rank].device_bytes,
+                                                    reference[rank].device_bytes))
+                            return false;
+                    return true;
+                };
+                if (auto narrow = try_narrow()) {
+                    if (requested.context_capacity.mode == ContextCapacityMode::Explicit)
+                        return std::move(*narrow);
+                    // A corrected startup offer is already capped by a measured runtime limit.
+                    // Compare actual catalogs on this uncommon path.
+                    if (!narrow->attempt) {
+                        const auto budgets = setup.memory_budgets();
+                        std::vector<RankCapacityOffer> offers;
+                        std::optional<std::size_t> owner;
+                        for (std::size_t rank = 0; rank < narrow->reports.size(); ++rank) {
+                            const auto& report = narrow->reports[rank];
+                            auto& offer = offers.emplace_back(report.capacity);
+                            offer.available_bytes += budgets[rank].graphs->rebuild_estimate_bytes;
+                            if (report.control_owner) owner = rank;
+                        }
+                        auto upper = resolve_group_context_capacity(requested.context_capacity,
+                                                                    offers, owner);
+                        // The shared metadata owner allocates in rank order. Maximize each
+                        // rank's bound with the other non-owner ranks at their minimum, so a
+                        // change in allocation order cannot understate a baseline rank's capacity.
+                        if (owner) {
+                            auto minimum = offers;
+                            for (std::size_t rank = 0; rank < offers.size(); ++rank) {
+                                if (rank == *owner) continue;
+                                auto& offer = minimum[rank];
+                                offer.available_bytes = offer.plan.reservation_bytes(
+                                    offer.plan.minimum_capacity());
+                            }
+                            for (std::size_t rank = 0; rank < offers.size(); ++rank) {
+                                auto maximal = minimum;
+                                maximal[rank] = offers[rank];
+                                upper[rank] = resolve_group_context_capacity(
+                                    requested.context_capacity, maximal, owner)[rank];
+                            }
+                        }
+                        if (preserves(narrow->capacities, upper)) return std::move(*narrow);
+                    }
+                    release();
+                    auto baseline = prepare(false);
+                    if (!preserves(narrow->capacities, baseline.capacities)) return baseline;
+                    release();
+                    if (auto rebuilt = try_narrow()) {
+                        if (preserves(rebuilt->capacities, baseline.capacities))
+                            return std::move(*rebuilt);
+                        release();
+                    }
+                }
+            }
+        }
+        return prepare(false);
+    }();
     setup.resolve(prepared.layouts, options);
     auto codec = setup.codec();
     group->reserve_control_capacity(protocol::control_transport_limits(

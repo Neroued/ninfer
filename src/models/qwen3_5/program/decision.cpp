@@ -42,7 +42,7 @@ void RankProgramImpl::request_decision(ComputeOperation& operation) {
                 member.drafts.push_back(
                     drafts[backend == SpeculativeBackend::Mtp
                                ? step * operation.shape.rows + row
-                               : row * operation.decode_route().head_columns + step]);
+                               : row * operation.proposal_route().head_columns + step]);
         }
         request.rows.push_back(std::move(member));
     }
@@ -66,29 +66,33 @@ void RankProgramImpl::project_decode(std::uint32_t batch_value, std::uint32_t wi
     ops::argmax(flat_logits, flat_argmax, vocabulary, device.execution_view());
 }
 
-void RankProgramImpl::decide_decode(const speculative::RoundRoute& route) {
+void RankProgramImpl::decide_decode(const speculative::RoundRoute& route,
+                                    const speculative::RoundRoute& proposal) {
     auto& frame     = resources.frame;
     const int batch = static_cast<int>(route.shape.rows), width = static_cast<int>(route.width);
     const int rows       = frame.spec.output_rows;
     const int vocabulary = execution::dimension(parameters.profile->public_tokens);
     if (width > 1) {
-        Tensor logits    = prefix(frame.logits, {rows, width, batch});
-        Tensor argmax    = prefix(frame.target_argmax, {width, batch});
-        Tensor counts    = frame.output_counts.slice(0, 0, batch);
-        Tensor tokens    = prefix(frame.output_tokens, {width, batch});
-        Tensor frontiers = frame.sampling_positions.slice(0, 0, batch);
+        Tensor logits     = prefix(frame.logits, {rows, width, batch});
+        Tensor argmax     = prefix(frame.target_argmax, {width, batch});
+        Tensor counts     = frame.output_counts.slice(0, 0, batch);
+        Tensor tokens     = prefix(frame.output_tokens, {width, batch});
+        Tensor frontiers  = frame.sampling_positions.slice(0, 0, batch);
+        const auto steps  = std::min(route.width - 1, proposal.mtp_steps + proposal.head_columns);
+        const auto drafts = draft_tokens(proposal).slice(0, 0, steps);
         if (backend == SpeculativeBackend::DFlash2) {
-            const auto draft = frame.dflash->proposal(batch, static_cast<int>(route.head_columns));
+            const auto draft =
+                frame.dflash->proposal(batch, static_cast<int>(proposal.head_columns));
             ops::speculative_accept_sparse_drafts(
-                argmax, logits, draft.drafts, draft.candidate_ids, draft.proposal_q,
-                frame.extents.slice(0, 0, batch), frontiers, tokens, counts, vocabulary,
-                frame.sampling, {false}, frame.live_rows.slice(0, 0, batch), resources.work,
-                device.execution_view());
+                argmax, logits, drafts, draft.candidate_ids.slice(1, 0, steps),
+                draft.proposal_q.slice(1, 0, steps), frame.extents.slice(0, 0, batch), frontiers,
+                tokens, counts, vocabulary, frame.sampling, {false},
+                frame.live_rows.slice(0, 0, batch), resources.work, device.execution_view());
         } else {
             ops::speculative_accept_greedy_drafts(
-                argmax, logits, draft_tokens(route), frame.extents.slice(0, 0, batch), frontiers,
-                tokens, counts, vocabulary, frame.sampling, frame.live_rows.slice(0, 0, batch),
-                resources.work, device.execution_view());
+                argmax, logits, drafts, frame.extents.slice(0, 0, batch), frontiers, tokens, counts,
+                vocabulary, frame.sampling, frame.live_rows.slice(0, 0, batch), resources.work,
+                device.execution_view());
         }
     } else {
         Tensor logits        = prefix(frame.logits, {rows, batch});
@@ -153,7 +157,7 @@ void RankProgramImpl::launch_decision(ComputeOperation& operation) {
             graphs->decide(operation.decode_route());
         } else {
             const auto& route = operation.decode_route();
-            decide_decode(route);
+            decide_decode(route, operation.proposal_route());
             readback_result(operation.shape.rows, &route);
         }
         gpu_timer.record_result();
@@ -197,8 +201,8 @@ void RankProgramImpl::launch_decision(ComputeOperation& operation) {
 
 void RankProgramImpl::publish_result(ComputeOperation& operation) {
     gpu_timer.observe_result(operation.gpu);
-    if (std::holds_alternative<DecodeWork>(operation.request.work.operation))
-        gpu_timer.observe_decode(operation.gpu, operation.verifies_drafts());
+    const auto* decode = std::get_if<DecodeWork>(&operation.request.work.operation);
+    if (decode) gpu_timer.observe_decode(operation.gpu, operation.proposal_route().width > 1);
     Result result;
     const auto* forward  = std::get_if<ForwardWork>(&operation.request.work.operation);
     const bool generated = std::holds_alternative<DecodeWork>(operation.request.work.operation) ||
@@ -209,11 +213,14 @@ void RankProgramImpl::publish_result(ComputeOperation& operation) {
         value.row_stride = forward ? 1 : operation.width;
         value.tokens.assign(output.tokens.begin(),
                             output.tokens.begin() + value.row_stride * operation.batch);
-        if (operation.verifies_drafts()) {
-            const auto& route  = operation.decode_route();
+        if (decode) {
+            const auto& route  = operation.proposal_route();
             value.draft_stride = route.mtp_steps + route.head_columns;
             value.draft_confidences.resize(std::size_t(value.draft_stride) * operation.batch);
-        } else if (!forward && resources.frame.spec.draft_window) {
+            value.executed.emplace(operation.decode_route(), std::vector<std::uint32_t>{});
+            value.executed->verify_drafts.reserve(operation.batch);
+        }
+        if (decode && !operation.verifies_drafts() && resources.frame.spec.draft_window) {
             value.target_top1_probabilities.assign(output.top1_probabilities.begin(),
                                                    output.top1_probabilities.begin() +
                                                        operation.batch);
@@ -222,11 +229,13 @@ void RankProgramImpl::publish_result(ComputeOperation& operation) {
             const auto count   = operation.verifies_drafts() ? output.counts[row] : 1;
             output.counts[row] = count;
             const auto extent  = resources.frame.host_ingress.extents[row];
+            if (decode) value.executed->verify_drafts.push_back(extent);
             if (count < 1 || count > extent + 1)
                 throw std::runtime_error("Qwen3.5 sampling returned an invalid prefix length");
             value.counts.push_back(static_cast<std::uint32_t>(count));
             value.dead_positions.push_back(operation.dead_positions[row]);
-            for (int step = 0; value.draft_stride && step < extent; ++step) {
+            const auto proposed = decode ? decode->plan->verify_drafts()[row] : 0;
+            for (std::uint32_t step = 0; step < proposed; ++step) {
                 const auto to = row * value.draft_stride + step;
                 const auto from =
                     backend == SpeculativeBackend::Mtp ? step * operation.shape.rows + row : to;

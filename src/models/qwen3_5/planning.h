@@ -67,7 +67,8 @@ enum class TextPhase { Prefill, Verify };
 
 struct SessionPlan {
     std::shared_ptr<const speculative::DecodeGraphRoutes> decode_routes;
-    ExecutionPath decode_path = ExecutionPath::Eager;
+    ExecutionPath decode_path     = ExecutionPath::Eager;
+    bool split_proposal_narrowing = false;
     std::shared_ptr<const BatchExecutionPlan> batch_execution;
     std::shared_ptr<const execution::ModelProfile> profile;
     context::ContextDirectorySpec context;
@@ -136,13 +137,15 @@ private:
 
     friend SequencePlanner make_sequence_planner(std::shared_ptr<const execution::ModelProfile>,
                                                  DeviceContext&, const EngineOptions&,
-                                                 std::shared_ptr<const moe::Plan>);
+                                                 std::shared_ptr<const moe::Plan>,
+                                                 std::span<const std::uint32_t>);
 };
 
 [[nodiscard]] SessionPlan plan_session(const SequencePlan&);
 [[nodiscard]] SequencePlanner make_sequence_planner(std::shared_ptr<const execution::ModelProfile>,
                                                     DeviceContext&, const EngineOptions&,
-                                                    std::shared_ptr<const moe::Plan> = {});
+                                                    std::shared_ptr<const moe::Plan> = {},
+                                                    std::span<const std::uint32_t>   = {});
 [[nodiscard]] SequencePlanner make_sequence_planner(const execution::Parameters&, DeviceContext&,
                                                     const EngineOptions&);
 [[nodiscard]] std::unique_ptr<RankProgram>

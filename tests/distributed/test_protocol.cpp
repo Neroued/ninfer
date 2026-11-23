@@ -945,9 +945,9 @@ void startup_diagnostics() {
         phase.fail();
     }
     const auto failure = dist::decode_failure(
-        dist::encode_failure({"allocation rejected", reporter.failure_context()}));
-    require(failure.reason == "allocation rejected" && failure.startup &&
-                failure.startup->attempt == 1 &&
+        dist::encode_failure({"allocation rejected", reporter.failure_context(), true}));
+    require(failure.reason == "allocation rejected" && failure.device_allocation &&
+                failure.startup && failure.startup->attempt == 1 &&
                 failure.startup->phase == StartupPhase::ProgramInitialize,
             "failure lost its startup attempt or phase");
     reporter.close();

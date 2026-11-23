@@ -58,9 +58,8 @@ struct NarrowedTargetPlan {
     std::vector<std::uint32_t> verify_drafts;
 };
 
-// Confidence at row * confidence_stride + j must come from the draft distribution
-// before its draw. DFlash2 block distributions supplied here must be independent
-// of the block's sampled IDs, across both positions and rows.
+// Confidence at row * confidence_stride + j must come from the draft distribution before
+// its draw. DFlash2 finalizes each row in prefix order before choosing the physical route.
 [[nodiscard]] NarrowedTargetPlan
 narrow_after_proposal(SpeculativeBackend backend, std::uint32_t max_drafts,
                       std::uint32_t owner_count, ExecutionPath path,

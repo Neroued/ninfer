@@ -11,6 +11,7 @@ class Parameters;
 
 struct GraphPreparationPlan {
     bool segmented = false;
+    std::vector<std::uint32_t> target_widths;
     std::vector<moe::GraphPlan> layers_by_batch;
     friend bool operator==(const GraphPreparationPlan&, const GraphPreparationPlan&) = default;
 };
@@ -21,10 +22,12 @@ struct GraphCalibration {
 };
 
 [[nodiscard]] GraphPreparationPlan describe_graph_preparation(const EngineOptions&,
-                                                              const moe::Plan*);
+                                                              const moe::Plan*,
+                                                              std::span<const std::uint32_t> = {});
 // The loaded model outlives calibration. No probe resources survive this call.
 [[nodiscard]] GraphCalibration calibrate_graphs(const execution::Parameters&, DeviceContext&,
                                                 const EngineOptions&,
-                                                std::shared_ptr<const moe::Plan>);
+                                                std::shared_ptr<const moe::Plan>,
+                                                std::span<const std::uint32_t> = {});
 
 } // namespace ninfer::models::qwen3_5

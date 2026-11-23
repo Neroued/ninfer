@@ -37,9 +37,10 @@ struct Rounds {
     BatchExecutionPlan batches;
     DecodeGraphRoutes routes;
 
-    explicit Rounds(CostModelConfig cfg, std::uint32_t capacity = 32)
+    explicit Rounds(CostModelConfig cfg, std::uint32_t capacity = 32,
+                    std::span<const std::uint32_t> widths = {})
         : config(cfg), batches(make_batch_execution_spec(capacity, cfg.owner_count, true)),
-          routes(batches, cfg.backend, cfg.max_drafts) {}
+          routes(batches, cfg.backend, cfg.max_drafts, widths) {}
 
     PhysicalBatchShape shape(std::uint32_t rows, ExecutionPath path = ExecutionPath::Graph) const {
         const auto local = (rows + config.owner_count - 1) / config.owner_count;
@@ -461,7 +462,7 @@ void narrow_split_proposal() {
     const auto initial = block.plan({7, 7}, ExecutionPath::Eager);
     const auto nan     = std::numeric_limits<float>::quiet_NaN();
     const std::array<float, 18> live{
-        .98f, .98f, .98f, .01f, nan, nan, nan, nan, nan,
+        .98f, .99f, .98f, .01f, nan, nan, nan, nan, nan,
         .01f, nan,  nan,  nan,  nan, nan, nan, nan, nan,
     };
     const auto narrow = [&](const auto& confidences) {
@@ -487,10 +488,76 @@ void narrow_split_proposal() {
                               block.plan({7, 7}), rows, changed, 9, 8192);
     require(graph.target_route.width == 8 && graph.verify_drafts == Extents{2, 0},
             "graph split proposal failed to preserve its prepared route and causal cap");
+    const std::array widths{2U, 4U, 8U};
+    const Rounds narrow_block(block.config, 32, widths);
+    const auto narrow_graph = [&](const auto& confidences) {
+        return narrow_after_proposal(Backend::DFlash2, 7, 2, ExecutionPath::Mixed,
+                                     &narrow_block.routes, model, narrow_block.plan({7, 7}), rows,
+                                     confidences, 9, 8192);
+    };
+    require(narrow_graph(live).target_route.width == 4,
+            "narrow graph did not cover the causal cap");
+    changed          = live;
+    changed[1]       = .01f;
+    const auto first = narrow_graph(changed);
+    require(first.target_route.width == 2 && first.verify_drafts == Extents{1, 0},
+            "confidence after draft zero changed whether draft zero was verified");
+    std::fill_n(changed.begin() + 9, 7, .99f);
+    const auto two_rows = narrow_graph(changed);
+    require(two_rows.target_route.width == 8 && two_rows.verify_drafts == Extents{1, 7},
+            "another row's confidences changed the finalized first row");
+    changed         = live;
     changed[0]      = .01f;
     const auto zero = narrow(changed);
     require(zero.target_route.width == 1 && zero.verify_drafts == Extents{0, 0},
             "split proposal failed to bypass target verification when all rows stopped");
+}
+
+void overconfident_rejection() {
+    SequenceSpeculativeState state;
+    float attempts = 0.0f;
+    for (unsigned i = 0; i < 14; ++i) {
+        state.observe_speculative_round(7, 0, std::array{.99f});
+        attempts = 0.92f * attempts + 1.0f;
+    }
+    const auto empirical = 2.4 / (3.4 + attempts);
+    const auto weight    = .25 * 3.4 / (3.4 + attempts);
+    const auto odds =
+        std::pow(empirical / (1.0 - empirical), 1.0 - weight) * std::pow(49.0, weight);
+    std::array<float, 7> probs;
+    state.predict_conditional_survival(7, probs);
+    near(probs[0], odds / (1.0 + odds), 1e-6, "optimistic evidence was not shrunk");
+    for (const auto survival : std::span(probs).subspan(1))
+        near(survival, empirical, 1e-6, "unreached draft kept the fresh prior");
+    state.observe_speculative_round(7, 0, std::array{.02f});
+    const auto updated = 2.4 / (3.4 + .92 * attempts + 1.0);
+    const auto down    = std::pow(updated / (1.0 - updated), .75) * std::pow(.02 / .98, .25);
+    state.predict_conditional_survival(7, probs);
+    near(probs[0], down / (1.0 + down), 2e-5, "uncertain evidence was over-shrunk");
+}
+
+void split_cost_isolation() {
+    for (const auto backend : {Backend::Mtp, Backend::DFlash}) {
+        const Rounds rounds({backend, 7, 2, 256, 8});
+        SpeculativeCostModel model(rounds.config);
+        const auto ordinary = rounds.query({0, 0}, 2047);
+        const auto split    = CostQuery::from_split_plan(
+            backend, rounds.plan({7, 0}), rounds.plan({0, 0}), Extents{2047, 2047}, 8192);
+        require(split.width == 1 && split.active_target_tokens == 2 &&
+                    split.target_bucket == Bucket::K2 && split.active_proposal_rows == 1 &&
+                    split.proposal_bucket == Bucket::K8 &&
+                    split.mtp_steps + split.head_columns == 7,
+                "split query lost executed proposal or target geometry");
+        const auto features    = model.features(split);
+        const auto ordinary_ms = model.predict_ms(ordinary), split_ms = model.predict_ms(split);
+        require(split_ms > ordinary_ms, "W1 split ignored the proposal cost");
+        near(split_ms,
+             std::inner_product(features.begin(), features.end(), model.weights().begin(), 0.0),
+             1e-12, "split price differs from its feature dot product");
+        model.observe_retired_step(split, 2 * split_ms);
+        require(model.predict_ms(split) > split_ms && model.predict_ms(ordinary) == ordinary_ms,
+                "post-proposal W1 polluted the ordinary online cost cell");
+    }
 }
 
 void route_score_ties() {
@@ -524,6 +591,8 @@ int main() {
         calibration_schedule();
         sequence_and_rounds();
         narrow_split_proposal();
+        overconfident_rejection();
+        split_cost_isolation();
         route_score_ties();
         std::cout << "PASS speculative physical cost, calibration and adaptive rounds\n";
     } catch (const std::exception& error) {

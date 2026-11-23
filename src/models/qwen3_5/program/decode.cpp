@@ -99,12 +99,13 @@ Tensor RankProgramImpl::draft_tokens(const speculative::RoundRoute& route) const
     return frame.dflash->proposal(batch, static_cast<int>(route.head_columns)).drafts;
 }
 
-void RankProgramImpl::prepare_verification(const speculative::RoundRoute& route) {
+void RankProgramImpl::prepare_verification(const speculative::RoundRoute& target,
+                                           const speculative::RoundRoute& proposal) {
     auto& frame          = resources.frame;
-    const auto batch     = static_cast<int>(route.shape.rows);
-    const auto produced  = frame.mtp ? route.mtp_steps : route.head_columns;
-    const auto proposals = draft_tokens(route).slice(0, 0, produced);
-    auto ids             = frame.decode_view(route.width, batch).ids;
+    const auto batch     = static_cast<int>(target.shape.rows);
+    const auto produced  = proposal.mtp_steps + proposal.head_columns;
+    const auto proposals = draft_tokens(proposal).slice(0, 0, std::min(produced, target.width - 1));
+    auto ids             = frame.decode_view(target.width, batch).ids;
     ops::prepare_verify_ids(frame.anchors.slice(0, 0, batch), proposals,
                             frame.extents.slice(0, 0, batch), ids, device.execution_view());
 }
@@ -166,29 +167,60 @@ void RankProgramImpl::readback_drafts(const speculative::RoundRoute& route) {
 }
 
 void RankProgramImpl::begin_draft(ComputeOperation& operation) {
-    const auto& route = operation.decode_route();
+    const auto& route = operation.proposal_route();
     if (graphs && graphs->topology() != ProposalTopology::SplitProposal) return;
     const auto buckets = proposal_buckets(route);
+    const bool narrow =
+        resources.moe && std::get<DecodeWork>(operation.request.work.operation).narrowing;
     if (graphs) {
         graphs->launch_proposal(
             route, {.buckets = buckets.span(), .readback = operation.read_drafts_for_masks});
-        return;
-    }
-
-    gpu_timer.begin_draft();
-    if (backend == SpeculativeBackend::Mtp) {
-        gather_mtp_conditioning(route.shape.rows);
-        for (std::uint32_t step = 0; step < route.mtp_steps; ++step)
-            run_mtp_draft_step(route.shape.rows, step, buckets.values[step]);
     } else {
-        run_dflash_draft(route, buckets.span());
+        gpu_timer.begin_draft();
+        if (backend == SpeculativeBackend::Mtp) {
+            gather_mtp_conditioning(route.shape.rows);
+            for (std::uint32_t step = 0; step < route.mtp_steps; ++step)
+                run_mtp_draft_step(route.shape.rows, step, buckets.values[step]);
+        } else {
+            run_dflash_draft(route, buckets.span());
+        }
+        gpu_timer.end_draft();
+        if (operation.read_drafts_for_masks) readback_drafts(route);
     }
-    gpu_timer.end_draft();
-    prepare_verification(route);
-    if (operation.read_drafts_for_masks) {
-        readback_drafts(route);
+    if (narrow) {
+        const auto& frame = resources.frame;
+        const auto count  = std::size_t(route.shape.rows) * (route.mtp_steps + route.head_columns);
+        CUDA_CHECK(cudaMemcpyAsync(frame.host_egress.draft_confidences.data(),
+                                   frame.draft_confidences.data, count * sizeof(float),
+                                   cudaMemcpyDeviceToHost, device.stream()));
+    }
+    if (narrow || (!graphs && operation.read_drafts_for_masks))
         drafts_ready.record(device.stream());
+}
+
+void RankProgramImpl::narrow_target(ComputeOperation& operation) {
+    const auto& work     = std::get<DecodeWork>(operation.request.work.operation);
+    const auto& input    = *work.narrowing;
+    const auto& proposal = operation.proposal_route();
+    const auto stride    = proposal.mtp_steps + proposal.head_columns;
+    std::vector<speculative::AdaptiveRowInput> rows;
+    rows.reserve(input.rows.size());
+    for (const auto& row : input.rows) rows.push_back({row.member, row.frontier, &row.state});
+    auto confidences = std::span<const float>(resources.frame.host_egress.draft_confidences);
+    std::vector<float> row_major;
+    if (proposal.mtp_steps) {
+        row_major.resize(rows.size() * stride);
+        for (std::size_t row = 0; row < rows.size(); ++row)
+            for (std::uint32_t step = 0; step < stride; ++step)
+                row_major[row * stride + step] = confidences[step * proposal.shape.rows + row];
+        confidences = row_major;
     }
+    operation.narrowed = speculative::narrow_after_proposal(
+        backend, draft_window, 1, work.geometry->path, decode_routes.get(), input.cost, *work.plan,
+        rows, confidences, stride, input.max_context);
+    operation.width = operation.decode_route().width;
+    prepare_target_ingress(operation, operation.narrowed->verify_drafts);
+    if (!graphs || resources.dflash || operation.width > 1) upload_ingress();
 }
 
 void RankProgramImpl::begin_target(ComputeOperation& operation) {
@@ -227,6 +259,8 @@ void RankProgramImpl::begin_target(ComputeOperation& operation) {
         if (operation.row_finished) operation.graph_target = nullptr;
         return;
     }
+    if (!forward && operation.verifies_drafts())
+        prepare_verification(operation.decode_route(), operation.proposal_route());
     execution::TextInputs inputs{input.ids,
                                  input.cache_positions,
                                  input.rope_positions,

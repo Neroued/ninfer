@@ -9,6 +9,7 @@ namespace ninfer::models::qwen3_5 {
 
 struct ExecutionPreparation {
     std::shared_ptr<const moe::Plan> experts;
+    std::vector<std::uint32_t> target_widths;
 };
 
 // Native loading and execution planning. Runtime owns the budget, calibration loop and retries.
@@ -23,9 +24,14 @@ public:
 
     [[nodiscard]] Architecture architecture() const noexcept { return architecture_; }
 
-    [[nodiscard]] std::optional<ExecutionPlan> plan(DeviceContext&, const EngineOptions&,
-                                                    WeightPlacement, std::size_t available,
-                                                    std::size_t available_host_bytes) const;
+    [[nodiscard]] std::optional<ExecutionPlan>
+    plan(DeviceContext&, const EngineOptions&, WeightPlacement, std::size_t available,
+         std::size_t available_host_bytes, std::span<const std::uint32_t> target_widths = {}) const;
+    [[nodiscard]] std::vector<std::uint32_t> narrow_target_widths(const EngineOptions&,
+                                                                  WeightPlacement) const;
+    [[nodiscard]] std::size_t upper_context_bytes(DeviceContext&, const EngineOptions&,
+                                                  const ExecutionPlan&, std::size_t available,
+                                                  std::size_t available_host_bytes) const;
     [[nodiscard]] std::unique_ptr<ModelShard> materialize(DeviceContext&, WeightPlacement,
                                                           const StartupObserver&);
     [[nodiscard]] qwen::Frontend frontend(const EngineOptions&) const;

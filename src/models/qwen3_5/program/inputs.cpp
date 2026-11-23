@@ -173,8 +173,8 @@ void RankProgramImpl::initialize_forward(ComputeOperation& operation, const Forw
 }
 
 void RankProgramImpl::initialize_decode(ComputeOperation& operation, const DecodeWork& work) {
-    auto& frame     = resources.frame;
-    operation.batch = static_cast<std::uint32_t>(work.rows.size());
+    auto& frame        = resources.frame;
+    operation.batch    = static_cast<std::uint32_t>(work.rows.size());
     const auto& route  = work.plan->route();
     const auto extents = work.plan->verify_drafts();
     operation.shape    = route.shape;
@@ -190,39 +190,42 @@ void RankProgramImpl::initialize_decode(ComputeOperation& operation, const Decod
         operation.sampling.push_back(row.sampling);
         operation.read_drafts_for_masks |= row.sampling.constrained && extents[i] != 0;
         bind_row(frame.host_ingress, i, row.binding);
-        frame.host_ingress.anchors[i]                = row.anchor;
-        frame.host_ingress.extents[i]                = static_cast<int>(extents[i]);
-        frame.host_ingress.valid_columns[i]          = static_cast<int>(extents[i] + 1);
+        frame.host_ingress.anchors[i] = row.anchor;
         frame.host_ingress.proposal_valid_columns[i] =
             extents[i] ? static_cast<int>(draft_window + 1) : 0;
         frame.host_ingress.proposal_live_rows[i] = extents[i] != 0;
-        frame.host_ingress.sampling[i] = sampling_config(row.binding, row.sampling, i);
-    }
-    auto host             = frame.host_decode_view(static_cast<int>(operation.width),
-                                                   static_cast<int>(operation.shape.rows));
-    auto* positions       = static_cast<std::int32_t*>(host.cache_positions.data);
-    auto* rope            = static_cast<std::int32_t*>(host.rope_positions.data);
-    const auto columns    = operation.width * operation.shape.rows;
-    for (std::size_t row = 0; row < work.rows.size(); ++row) {
-        for (std::uint32_t column = 0; column < operation.width; ++column) {
-            const auto offset = row * operation.width + column;
-            positions[offset] = static_cast<int>(work.rows[row].binding.main_frontier +
-                                                 std::min(column, extents[row]));
-            for (int axis = 0; axis < 3; ++axis)
-                rope[axis * columns + offset] =
-                    positions[offset] + work.rows[row].binding.rope_delta;
-        }
-    }
-    for (std::size_t row = 0; row < work.rows.size(); ++row) {
-        frame.host_ingress.history_skip[row] =
-            work.rows[row].binding.main_frontier == 0 || extents[row] > 0;
+        frame.host_ingress.sampling[i]           = sampling_config(row.binding, row.sampling, i);
         for (int axis = 0; axis < 3; ++axis)
-            frame.host_ingress.previous_rope[axis * operation.shape.rows + row] =
-                work.rows[row].binding.tail_rope_position[axis];
+            frame.host_ingress.previous_rope[axis * operation.shape.rows + i] =
+                row.binding.tail_rope_position[axis];
     }
+    prepare_target_ingress(operation, extents);
     if (operation.verifies_drafts() && backend == SpeculativeBackend::Mtp)
         prepare_mtp_draft(operation);
     if (!graphs || resources.dflash) upload_ingress();
+}
+
+void RankProgramImpl::prepare_target_ingress(const ComputeOperation& operation,
+                                             std::span<const std::uint32_t> extents) {
+    auto& frame        = resources.frame;
+    auto host          = frame.host_decode_view(static_cast<int>(operation.width),
+                                                static_cast<int>(operation.shape.rows));
+    auto* positions    = static_cast<std::int32_t*>(host.cache_positions.data);
+    auto* rope         = static_cast<std::int32_t*>(host.rope_positions.data);
+    const auto columns = operation.width * operation.shape.rows;
+    for (std::size_t row = 0; row < operation.rows.size(); ++row) {
+        const auto& binding                   = operation.rows[row];
+        frame.host_ingress.extents[row]       = static_cast<int>(extents[row]);
+        frame.host_ingress.valid_columns[row] = static_cast<int>(extents[row] + 1);
+        frame.host_ingress.history_skip[row]  = binding.main_frontier == 0 || extents[row] > 0;
+        for (std::uint32_t column = 0; column < operation.width; ++column) {
+            const auto offset = row * operation.width + column;
+            positions[offset] =
+                static_cast<int>(binding.main_frontier + std::min(column, extents[row]));
+            for (int axis = 0; axis < 3; ++axis)
+                rope[axis * columns + offset] = positions[offset] + binding.rope_delta;
+        }
+    }
 }
 
 void RankProgramImpl::initialize_score(ComputeOperation& operation, const ScoreWork& work) {

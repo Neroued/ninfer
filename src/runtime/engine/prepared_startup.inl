@@ -50,27 +50,73 @@ build_prepared_local_model(const artifact::Reader& reader, EngineOptions& option
     preparation->materialize();
     device->synchronize();
     const auto after_weights = device_memory_snapshot(device->device());
-    if (preparation->report(budget.planning_available(after_weights)).preparation_required) {
+    const auto calibrate = [&] {
         StartupPhaseScope phase(options.startup_observer, StartupPhase::CudaGraphCalibration);
         preparation->prepare_probe();
         preparation->calibrate();
         preparation->prepare_rebuild_probe();
         preparation->calibrate_rebuild();
         phase.complete();
+    };
+    bool narrow = setup.narrow_targets(options);
+    std::optional<GraphMemorySummary> baseline_graphs;
+    const auto select_baseline = [&] {
+        narrow = false;
+        preparation->release_resources();
+        preparation->select_narrow_targets(false, baseline_graphs.value_or(GraphMemorySummary{}));
+        device->synchronize();
+        if (!baseline_graphs) calibrate();
+    };
+    if (preparation->report(budget.planning_available(after_weights)).preparation_required) {
+        if (narrow) {
+            preparation->select_narrow_targets(true);
+            try {
+                calibrate();
+            } catch (const DeviceAllocationError&) { select_baseline(); }
+        } else {
+            calibrate();
+        }
     }
     std::optional<typename Types::PreparedSession> session;
     ContextCapacityResolution capacity;
     std::size_t maximum_runtime = SIZE_MAX;
-    auto description            = [&] {
+    const auto resolve = [&](const DeviceMemorySnapshot& snapshot, bool no_graphs = false) {
+        const auto room = budget.planning_available(snapshot);
+        const auto report = preparation->report(room);
+        const auto offered = std::min(no_graphs ? room : report.capacity.available_bytes,
+                                      maximum_runtime);
+        return resolve_context_capacity(options.context_capacity, report.capacity.plan, offered,
+                                        budget.available_host(snapshot), snapshot.shared_physical_memory);
+    };
+    const auto gated_capacity = [&](const DeviceMemorySnapshot& before) {
+        auto value = resolve(before);
+        if (!narrow || options.context_capacity.mode == ContextCapacityMode::Explicit ||
+            keeps_context_capacity(value.device_bytes, resolve(before, true).device_bytes))
+            return value;
+
+        const auto narrow_graphs = preparation->graph_memory();
+        narrow = false;
+        preparation->select_narrow_targets(false, baseline_graphs.value_or(GraphMemorySummary{}));
+        if (!baseline_graphs) {
+            calibrate();
+            baseline_graphs = preparation->graph_memory();
+        }
+        const auto snapshot = device_memory_snapshot(device->device());
+        const auto baseline = resolve(snapshot);
+        preparation->select_narrow_targets(true, narrow_graphs);
+        narrow = true;
+        try {
+            value = resolve(snapshot);
+            if (keeps_context_capacity(value.device_bytes, baseline.device_bytes)) return value;
+        } catch (const ContextBudgetError&) {}
+        select_baseline();
+        return baseline;
+    };
+    const auto prepare_description = [&] {
         StartupPhaseScope phase(options.startup_observer, StartupPhase::ProgramInitialize);
         for (unsigned attempt = 0; attempt < 2; ++attempt) {
-            const auto before  = device_memory_snapshot(device->device());
-            const auto room    = budget.planning_available(before);
-            const auto report  = preparation->report(room);
-            const auto offered = std::min(report.capacity.available_bytes, maximum_runtime);
-            capacity = resolve_context_capacity(options.context_capacity, report.capacity.plan,
-                                                           offered, budget.available_host(before),
-                                                           before.shared_physical_memory);
+            capacity = gated_capacity(device_memory_snapshot(device->device()));
+            const auto before = device_memory_snapshot(device->device());
             std::optional<DeviceMemorySnapshot> ready;
             std::exception_ptr allocation_error;
             try {
@@ -112,9 +158,21 @@ build_prepared_local_model(const artifact::Reader& reader, EngineOptions& option
             device->synchronize();
             if (allocation_error) std::rethrow_exception(allocation_error);
             if (attempt == 1 || options.context_capacity.mode == ContextCapacityMode::Explicit)
-                throw std::runtime_error(failure);
+                throw ContextBudgetError(failure);
         }
         throw DeviceAllocationError("prepared runtime exceeds local resource budget");
+    };
+    auto description = [&] {
+        try {
+            return prepare_description();
+        } catch (const DeviceAllocationError&) {
+            if (!narrow) throw;
+        } catch (const ContextBudgetError&) {
+            if (!narrow) throw;
+        }
+        select_baseline();
+        maximum_runtime = SIZE_MAX;
+        return prepare_description();
     }();
     options.prefill_chunk                     = description.shape.prefill_chunk;
     options.context_cache.host_capacity_bytes = 0;

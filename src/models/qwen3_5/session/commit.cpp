@@ -11,11 +11,45 @@ PendingBatch SessionImpl::generated_pending(const GeneratedResult& generated) {
     if (!generated.row_stride || generated.tokens.size() != batch * generated.row_stride ||
         generated.counts.size() != batch || generated.dead_positions.size() != batch)
         throw std::logic_error("generated result has an invalid shape");
-    if (current.round && generated.row_stride != current.round->route().width)
-        throw std::logic_error("decode result differs from its frozen width");
     const auto stride =
         current.round ? current.round->route().mtp_steps + current.round->route().head_columns : 0U;
-    const auto top1_rows         = current.round && draft_window && !stride ? batch : 0;
+    if (current.round) {
+        const auto& initial = *current.round;
+        const auto path     = plan.decode_path;
+        if (!generated.executed || generated.executed->verify_drafts.size() != batch)
+            throw std::logic_error("decode result omitted its executed route or extents");
+        const auto& [route, extents] = *generated.executed;
+        if (route.shape != initial.route().shape || route.width > initial.route().width ||
+            generated.row_stride != route.width ||
+            route.graph_entry.has_value() != initial.route().graph_entry.has_value())
+            throw std::logic_error("executed target route exceeds its frozen route");
+        if (route.graph_entry) {
+            const auto prepared = plan.decode_routes->at(route.shape);
+            if (std::ranges::find(prepared, route) == prepared.end())
+                throw std::logic_error("executed target used an unavailable graph");
+        }
+        std::vector<speculative::RoundMember> members;
+        std::vector<std::uint32_t> frontiers;
+        members.reserve(batch);
+        frontiers.reserve(batch);
+        for (std::size_t b = 0; b < batch; ++b) {
+            const auto limit = initial.verify_drafts()[b];
+            if (extents[b] > limit)
+                throw std::logic_error("executed target extent exceeds its frozen extent");
+            members.push_back({initial.slots()[b].owner, limit, limit});
+            frontiers.push_back(current.bases[b].metadata.execution_frontier);
+        }
+        if (route != initial.route() || !std::ranges::equal(extents, initial.verify_drafts())) {
+            auto target = speculative::DecodeRoundPlan::freeze(speculative_backend, draft_window, 1,
+                                                               members, route, extents);
+            current.observed_result.work.speculative =
+                std::make_shared<const SpeculativeExecutionGeometry>(target.geometry(path));
+            current.observed_result.work.scheduled_positions = target.valid_target_tokens();
+            current.cost_query = speculative::CostQuery::from_split_plan(
+                speculative_backend, initial, target, frontiers, capacity);
+        }
+    }
+    const auto top1_rows = current.round && draft_window && generated.row_stride == 1 ? batch : 0;
     const auto valid_probability = [](float p) { return p >= 0.0f && p <= 1.0f; };
     if (generated.draft_stride != stride || generated.draft_confidences.size() != batch * stride ||
         generated.target_top1_probabilities.size() != top1_rows ||
@@ -31,7 +65,7 @@ PendingBatch SessionImpl::generated_pending(const GeneratedResult& generated) {
     for (std::size_t b = 0; b < batch; ++b) {
         const auto count = generated.counts[b];
         if (!count || count > generated.row_stride || count > 16 ||
-            (current.round && count - 1 > current.round->verify_drafts()[b]))
+            (current.round && count - 1 > generated.executed->verify_drafts[b]))
             throw std::logic_error("generated result has an invalid licensed prefix");
         out.counts_.push_back(static_cast<std::int32_t>(count));
         out.failed_.push_back((generated.dead_positions[b] & ((1U << count) - 1)) != 0);
@@ -303,7 +337,7 @@ CommitResult SessionImpl::commit(PendingBatch&& pending,
         auto& stats = request.speculative_stats;
         if (current.kind == OperationKind::Decode && draft_window &&
             speculative_backend != SpeculativeBackend::None) {
-            const auto drafted  = current.round->verify_drafts()[b];
+            const auto drafted  = current.generated->executed->verify_drafts[b];
             const auto accepted = current.generated->counts[b] - 1;
             if (!d.cancelled && !d.failed) {
                 const auto& generated = *current.generated;
@@ -405,6 +439,8 @@ void SessionImpl::retire(runtime::DeviceRetired event) {
                                     request.base->summary.prompt_tokens);
         }
     }
+    if (current.kind == OperationKind::Decode && current.generated)
+        event.execution.work = current.observed_result.work;
     if (current.kind != OperationKind::Normalize && current.kind != OperationKind::Score)
         events.push_back({current.ticket, current.members,
                           runtime::ExecutionComplete{event.execution, current.members.size()}});

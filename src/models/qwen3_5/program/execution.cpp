@@ -45,12 +45,25 @@ void RankProgramImpl::progress() {
                 operation.stage = ComputeStage::Readback;
                 break;
             }
-            if (std::holds_alternative<DecodeWork>(operation.request.work.operation)) {
+            if (const auto* decode = std::get_if<DecodeWork>(&operation.request.work.operation)) {
                 if (!operation.verifies_drafts() || !graphs) append_draft_history(operation);
-                if (operation.verifies_drafts()) begin_draft(operation);
+                if (operation.verifies_drafts()) {
+                    begin_draft(operation);
+                    if (resources.moe && decode->narrowing) {
+                        operation.stage = ComputeStage::Proposal;
+                        break;
+                    }
+                }
             }
             if (std::holds_alternative<ForwardWork>(operation.request.work.operation))
                 append_draft_history(operation);
+            begin_target(operation);
+            request_decision(operation);
+            operation.stage = ComputeStage::Forward;
+            break;
+        case ComputeStage::Proposal:
+            if (!drafts_ready.ready()) return;
+            narrow_target(operation);
             begin_target(operation);
             request_decision(operation);
             operation.stage = ComputeStage::Forward;

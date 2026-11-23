@@ -32,6 +32,7 @@ void encode_rank_load(Encoder& out, const RankLoadRequest& request) {
     out.u8(static_cast<std::uint8_t>(request.index_format));
     out.u64(request.host_reservation_bytes);
     out.boolean(request.control_owner);
+    out.boolean(request.narrow_dflash_targets);
 }
 
 RankLoadRequest decode_rank_load(Decoder& in) {
@@ -57,6 +58,7 @@ RankLoadRequest decode_rank_load(Decoder& in) {
     request.index_format           = static_cast<KvCacheVectorFormat>(in.u8());
     request.host_reservation_bytes = in.u64();
     request.control_owner          = in.boolean();
+    request.narrow_dflash_targets  = in.boolean();
     return request;
 }
 
@@ -70,6 +72,7 @@ void encode(Encoder& out, const RankResourceDescription& r) {
     out.boolean(s.context_cache);
     out.boolean(s.gpu_timing);
     out.u8(static_cast<std::uint8_t>(s.speculative));
+    out.boolean(s.narrow_dflash_targets);
     encode_batch_execution_spec(out, r.batches);
     for (auto record : {r.state.common, r.state.owner}) {
         out.u64(record.bytes);
@@ -113,7 +116,8 @@ RankResourceDescription decode_rank_resources(Decoder& in) {
                             static_cast<EnginePurpose>(in.u8()),
                             in.boolean(),
                             in.boolean(),
-                            static_cast<SpeculativeBackend>(in.u8())};
+                            static_cast<SpeculativeBackend>(in.u8()),
+                            in.boolean()};
     r.batches            = decode_batch_execution_spec(in);
     r.state.common       = {in.u64(), in.u64()};
     r.state.owner        = {in.u64(), in.u64()};

@@ -37,7 +37,8 @@ Startup::Startup(const artifact::Reader& definition_source, const artifact::Read
 
 std::optional<Startup::ExecutionPlan>
 Startup::plan(DeviceContext& device, const EngineOptions& options, WeightPlacement placement,
-              std::size_t available, std::size_t available_host_bytes) const {
+              std::size_t available, std::size_t available_host_bytes,
+              std::span<const std::uint32_t> target_widths) const {
     using runtime::resolve_context_capacity;
     const bool host_experts = placement == WeightPlacement::HostExperts;
     if (host_experts && !offload_) return {};
@@ -49,30 +50,37 @@ Startup::plan(DeviceContext& device, const EngineOptions& options, WeightPlaceme
     const auto& policy           = options.context_capacity;
     constexpr bool shared_memory = NINFER_SHARED_PHYSICAL_MEMORY != 0;
     auto prototype               = host_experts ? offload_ : nullptr;
-    auto planner                 = make_sequence_planner(profile, device, trial, prototype);
-    const auto& capacity_plan    = planner.capacity_plan();
-    const auto required_context  = policy.mode == ContextCapacityMode::Explicit
-                                       ? runtime::ContextCapacity{policy.explicit_bytes}
-                                       : capacity_plan.minimum_capacity();
-    const auto required_bytes    = capacity_plan.reservation_bytes(required_context) +
+    auto planner = make_sequence_planner(profile, device, trial, prototype, target_widths);
+    const auto& capacity_plan   = planner.capacity_plan();
+    const auto required_context = policy.mode == ContextCapacityMode::Explicit
+                                      ? runtime::ContextCapacity{policy.explicit_bytes}
+                                      : capacity_plan.minimum_capacity();
+    const auto required_bytes   = capacity_plan.reservation_bytes(required_context) +
                                 (shared_memory ? capacity_plan.control_bytes(required_context) : 0);
     if (required_bytes > available) return std::nullopt;
     if (!host_experts) {
         auto resolution = resolve_context_capacity(policy, capacity_plan, available,
                                                    available_host_bytes, shared_memory);
-        return ExecutionPlan{
-            std::move(planner).finalize(resolution.capacity()), resolution, placement, chunk, {}};
+        return ExecutionPlan{std::move(planner).finalize(resolution.capacity()),
+                             resolution,
+                             placement,
+                             chunk,
+                             {{}, {target_widths.begin(), target_widths.end()}}};
     }
     const auto max_tokens = static_cast<std::int32_t>(
         std::max(std::min(chunk, options.max_context),
                  options.max_concurrency * (options.speculative.draft_tokens + 1)));
     const BatchExecutionPlan batches(
         make_batch_execution_spec(options.max_concurrency, 1, options.use_cuda_graph));
-    const auto geometries = moe::decode_geometries(batches, options.speculative.draft_tokens + 1);
-    auto moe              = offload_->resolve(available - required_bytes, max_tokens, geometries,
-                                              options.moe.cpu_workers);
+    auto geometries = moe::decode_geometries(batches, options.speculative.draft_tokens + 1);
+    for (const auto width :
+         target_widths.first(target_widths.empty() ? 0 : target_widths.size() - 1))
+        for (const auto rows : batches.graph_rows())
+            geometries.push_back(moe::decode_geometry(batches, rows, width));
+    auto moe = offload_->resolve(available - required_bytes, max_tokens, geometries,
+                                 options.moe.cpu_workers);
     if (!moe) return std::nullopt;
-    auto final                 = make_sequence_planner(profile, device, trial, moe);
+    auto final                 = make_sequence_planner(profile, device, trial, moe, target_widths);
     const auto& final_capacity = final.capacity_plan();
     if (final_capacity.reservation_bytes(required_context) +
             (shared_memory ? final_capacity.control_bytes(required_context) : 0) >
@@ -84,7 +92,32 @@ Startup::plan(DeviceContext& device, const EngineOptions& options, WeightPlaceme
                          resolution,
                          placement,
                          chunk,
-                         {std::move(moe)}};
+                         {std::move(moe), {target_widths.begin(), target_widths.end()}}};
+}
+
+std::vector<std::uint32_t> Startup::narrow_target_widths(const EngineOptions& options,
+                                                         WeightPlacement placement) const {
+    if (!options.use_cuda_graph || !is_masked_draft_backend(options.speculative.backend) ||
+        options.speculative.draft_tokens < 5)
+        return {};
+    const auto full_width = options.speculative.draft_tokens + 1;
+    return placement == WeightPlacement::HostExperts ? std::vector{2U, 4U, full_width}
+                                                     : std::vector{4U, full_width};
+}
+
+std::size_t Startup::upper_context_bytes(DeviceContext& device, const EngineOptions& options,
+                                         const ExecutionPlan& candidate, std::size_t available,
+                                         std::size_t available_host_bytes) const {
+    auto trial          = options;
+    trial.prefill_chunk = candidate.chunk;
+    // The unresolved expert plan omits adaptive cache allocations, giving an upper bound
+    // even if the full-width catalog would select a different cache layout.
+    const auto prototype = candidate.placement == WeightPlacement::HostExperts ? offload_ : nullptr;
+    const auto planner   = make_sequence_planner(profile, device, trial, prototype);
+    return runtime::resolve_context_capacity(options.context_capacity, planner.capacity_plan(),
+                                             available, available_host_bytes,
+                                             NINFER_SHARED_PHYSICAL_MEMORY != 0)
+        .device_bytes;
 }
 
 std::unique_ptr<ModelShard> Startup::materialize(DeviceContext& device, WeightPlacement placement,
@@ -109,13 +142,15 @@ qwen::Frontend Startup::frontend(const EngineOptions& options) const {
 
 GraphPreparationPlan Startup::graph_plan(const EngineOptions& options,
                                          const ExecutionPreparation& preparation) const {
-    return describe_graph_preparation(options, preparation.experts.get());
+    return describe_graph_preparation(options, preparation.experts.get(),
+                                      preparation.target_widths);
 }
 
 Startup::Calibration Startup::calibrate(const execution::Parameters& parameters,
                                         DeviceContext& device, const EngineOptions& options,
                                         const ExecutionPreparation& preparation) const {
-    return calibrate_graphs(parameters, device, options, preparation.experts);
+    return calibrate_graphs(parameters, device, options, preparation.experts,
+                            preparation.target_widths);
 }
 
 std::string Startup::prefill_signature(const ExecutionPreparation& preparation,

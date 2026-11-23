@@ -231,7 +231,7 @@ prepare_execution_group(dist::ExecutionGroup& group, std::span<const wire::Bytes
                 }
             }
             if (attempt == 1 || policy.mode == ContextCapacityMode::Explicit)
-                throw std::runtime_error(allocation_failure);
+                throw ContextBudgetError(allocation_failure);
             if (control.release) control.release();
             enter_phase(PreparationAction::Release);
         }

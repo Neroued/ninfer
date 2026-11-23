@@ -99,10 +99,12 @@ void RankProgramImpl::accept_dflash(int b, int w, int steps) {
     auto counts   = row(*io.output_counts, b);
     const auto* configs =
         static_cast<const ops::SamplingConfig*>(resources.tensor(*io.sampling).data);
+    const auto verified = std::min(steps, w - 1);
     vocabulary().accept_sparse(
         logits, configs, row(io.decode.valid_columns, b), row(io.rows.live_rows, b),
-        draft_proposals(b, steps), resources.packed(d.candidate_ids, {k, steps, b}),
-        resources.packed(d.proposal_q, {k, steps, b}), row(io.speculative->extents, b),
-        row(io.rows.sampling_positions, b), licensed, counts);
+        draft_proposals(b, steps).slice(0, 0, verified),
+        resources.packed(d.candidate_ids, {k, steps, b}).slice(1, 0, verified),
+        resources.packed(d.proposal_q, {k, steps, b}).slice(1, 0, verified),
+        row(io.speculative->extents, b), row(io.rows.sampling_positions, b), licensed, counts);
 }
 } // namespace ninfer::models::glm5next::detail

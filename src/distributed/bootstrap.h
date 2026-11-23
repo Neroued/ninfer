@@ -58,7 +58,7 @@ public:
     [[nodiscard]] bool try_send(wire::Kind, wire::Bytes, bool continuation);
     [[nodiscard]] std::optional<wire::Message> poll();
     void shutdown();
-    void fail(std::string_view) noexcept;
+    void fail(std::string_view, bool device_allocation = false) noexcept;
 private:
     WorkerBootstrap bootstrap_;
     ExecutionTopology topology_;

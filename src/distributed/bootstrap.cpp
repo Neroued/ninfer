@@ -108,8 +108,10 @@ struct ExecutionGroup::Impl {
                 throw std::runtime_error(context(incoming.peer) + ": stale execution epoch");
             if (message.kind == wire::Kind::Failed) {
                 const auto report = decode_failure(message.payload);
-                if (primary_error.empty())
+                if (primary_error.empty()) {
                     primary_error = context(incoming.peer, report.startup) + ": " + report.reason;
+                    device_allocation_failure = report.device_allocation;
+                }
             } else if (message.kind == wire::Kind::StartupProgress) {
                 publish(incoming.peer, message.payload);
             } else {
@@ -126,7 +128,7 @@ struct ExecutionGroup::Impl {
     }
 
     void progress() {
-        if (!primary_error.empty()) throw std::runtime_error(primary_error);
+        if (!primary_error.empty()) raise_failure();
         drain();
         for (auto& process : processes) {
             try {
@@ -162,7 +164,12 @@ struct ExecutionGroup::Impl {
             }
             if (primary_error.empty()) primary_error = transport.failure();
         }
-        if (!primary_error.empty()) throw std::runtime_error(primary_error);
+        if (!primary_error.empty()) raise_failure();
+    }
+
+    [[noreturn]] void raise_failure() const {
+        if (device_allocation_failure) throw RankDeviceAllocationError(primary_error);
+        throw std::runtime_error(primary_error);
     }
 
     std::optional<IncomingMessage> poll() {
@@ -324,6 +331,7 @@ struct ExecutionGroup::Impl {
     std::map<RankId, PeerState> peers;
     std::deque<IncomingMessage> inbox;
     std::string primary_error;
+    bool device_allocation_failure = false;
     bool io_started = false, closing = false, closed = false;
 };
 
@@ -513,12 +521,12 @@ void WorkerConnection::shutdown() {
     closed_ = true;
 }
 
-void WorkerConnection::fail(std::string_view message) noexcept {
+void WorkerConnection::fail(std::string_view message, bool device_allocation) noexcept {
     if (closed_) return;
     if (communication_) communication_->request_stop();
     try {
         send(wire::Kind::Failed,
-             encode_failure({std::string(message), startup_.failure_context()}));
+             encode_failure({std::string(message), startup_.failure_context(), device_allocation}));
         const auto until = deadline(1000);
         while (transport_->sending() && transport_->failure().empty() &&
                std::chrono::steady_clock::now() < until)

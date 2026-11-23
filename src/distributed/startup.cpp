@@ -45,6 +45,7 @@ wire::Bytes encode_failure(const FailureReport& report) {
     out.string(report.reason);
     out.boolean(report.startup.has_value());
     if (report.startup) encode(out, *report.startup);
+    out.boolean(report.device_allocation);
     return std::move(out).take();
 }
 
@@ -52,6 +53,7 @@ FailureReport decode_failure(std::span<const std::byte> bytes) {
     wire::Decoder in(bytes);
     FailureReport result{in.string(), {}};
     if (in.boolean()) result.startup = decode(in);
+    result.device_allocation = in.boolean();
     in.finish();
     return result;
 }

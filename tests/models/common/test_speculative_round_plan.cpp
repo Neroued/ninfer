@@ -164,6 +164,27 @@ void invalid_rounds() {
             "ordinary decode used the grant as a proposal");
 }
 
+void narrow_block_routes() {
+    const BatchExecutionPlan batches(make_batch_execution_spec(4, 2, true));
+    for (const auto backend : {Backend::DFlash, Backend::DFlash2}) {
+        for (const auto widths : {std::vector{4U, 8U}, std::vector{2U, 4U, 8U}}) {
+            const DecodeGraphRoutes routes(batches, backend, 7, widths);
+            for (const auto shape : batches.graph_shapes()) {
+                const auto entries = routes.at(shape);
+                require(entries.size() == widths.size() + 1 && entries.front().width == 1,
+                        "narrow block catalog changed its ordinary route");
+                for (auto depth = 1U; depth <= 7; ++depth) {
+                    const auto selected = routes.select_route(shape, backend, depth);
+                    selected.validate(backend, 7);
+                    require(selected.width == *std::ranges::upper_bound(widths, depth) &&
+                                selected.head_columns == 7 && selected.covers(backend, depth),
+                            "narrow route changed proposal depth or missed the smallest width");
+                }
+            }
+        }
+    }
+}
+
 void optional_growth() {
     using namespace context;
     ContextDirectory directory({.ranks                 = {{0, 1024, 0}},
@@ -237,6 +258,7 @@ int main() {
             for (unsigned k : {1U, 4U, 9U, 15U}) check_routes(backend, k);
         check_routes(Backend::None, 0);
         invalid_rounds();
+        narrow_block_routes();
         optional_growth();
         std::cout << "PASS deterministic speculative routes, owner geometry and optional growth\n";
     } catch (const std::exception& error) {

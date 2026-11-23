@@ -51,6 +51,18 @@ CostQuery CostQuery::from_plan(SpeculativeBackend backend, const DecodeRoundPlan
     return query;
 }
 
+CostQuery CostQuery::from_split_plan(SpeculativeBackend backend, const DecodeRoundPlan& proposal,
+                                     const DecodeRoundPlan& target,
+                                     std::span<const std::uint32_t> row_frontiers,
+                                     std::uint32_t max_context) {
+    if (proposal.route().shape != target.route().shape ||
+        !std::ranges::equal(proposal.slots(), target.slots()))
+        throw std::invalid_argument("split cost plans differ in shape or membership");
+    auto query = from_plan(backend, target, row_frontiers, max_context);
+    detail::use_proposal_cost(query, from_plan(backend, proposal, row_frontiers, max_context));
+    return query;
+}
+
 SpeculativeCostModel::SpeculativeCostModel(CostModelConfig config)
     : config_(config), weights_(default_weights()) {
     if (config_.num_experts && config_.experts_per_token) {
@@ -82,7 +94,7 @@ SpeculativeCostModel::Features SpeculativeCostModel::default_weights() const {
 SpeculativeCostModel::Features SpeculativeCostModel::features(const CostQuery& q) const {
     const double rows           = std::max(1u, q.shape.rows);
     const double extra_columns  = double(q.width) - 1.0;
-    const bool proposal         = q.width > 1;
+    const bool proposal         = q.mtp_steps != 0 || q.head_columns != 0;
     const bool mtp              = config_.backend == SpeculativeBackend::Mtp;
     const bool hybrid           = config_.hybrid_max_tokens > 0;
     const bool full             = hybrid && q.active_target_tokens > config_.hybrid_max_tokens;

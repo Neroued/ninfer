@@ -29,6 +29,17 @@ struct CalibratedPlan {
 };
 
 template <class Setup>
+auto replan(const Setup& setup, DeviceContext& device, const EngineOptions& options,
+            const typename Setup::ExecutionPlan& candidate, std::size_t offered,
+            std::size_t available_host) {
+    if constexpr (requires { candidate.preparation.target_widths; })
+        return setup.plan(device, options, candidate.placement, offered, available_host,
+                          candidate.preparation.target_widths);
+    else
+        return setup.plan(device, options, candidate.placement, offered, available_host);
+}
+
+template <class Setup>
 std::optional<CalibratedPlan<typename Setup::ExecutionPlan>>
 calibrate_plan(const Setup& setup, RankModelInstance<typename Setup::Types>& instance,
                DeviceContext& device, const EngineOptions& options,
@@ -53,7 +64,7 @@ calibrate_plan(const Setup& setup, RankModelInstance<typename Setup::Types>& ins
         const auto available_host = budget.available_host(snapshot);
         if (graph_bytes > available) return std::nullopt;
         const auto offered = std::min(available - graph_bytes, maximum_runtime);
-        auto next = setup.plan(device, options, candidate.placement, offered, available_host);
+        auto next = replan(setup, device, options, candidate, offered, available_host);
         if (!next) return std::nullopt;
         const auto next_key = setup.graph_plan(probe_options, next->preparation);
         if (next_key == key) return CalibratedPlan{std::move(*next), graph};
@@ -65,8 +76,7 @@ calibrate_plan(const Setup& setup, RankModelInstance<typename Setup::Types>& ins
             auto high = offered;
             while (low < high) {
                 const auto middle = low + (high - low + 1) / 2;
-                auto trial =
-                    setup.plan(device, options, candidate.placement, middle, available_host);
+                auto trial = replan(setup, device, options, candidate, middle, available_host);
                 if (trial && setup.graph_plan(probe_options, trial->preparation) == key) {
                     low       = middle;
                     candidate = std::move(*trial);
@@ -147,9 +157,9 @@ prepare_program(const Setup& setup, RankModelInstance<typename Setup::Types>& in
         const auto after_cleanup = device_memory_snapshot(device.device());
         const auto available     = budget.planning_available(after_cleanup);
         if (reserve > available) return std::nullopt;
-        auto candidate = setup.plan(device, options, startup.placement,
-                                    std::min(available - reserve, maximum_runtime),
-                                    budget.available_host(after_cleanup));
+        auto candidate = replan(setup, device, options, startup,
+                                std::min(available - reserve, maximum_runtime),
+                                budget.available_host(after_cleanup));
         if (!candidate) return std::nullopt;
         auto corrected = calibrate_plan(setup, instance, device, options, budget,
                                         std::move(*candidate), measured, maximum_runtime);
@@ -174,6 +184,68 @@ initialize_program(const Setup& setup, RankModelInstance<typename Setup::Types>&
                    const StartupMemoryBudget& budget, typename Setup::ExecutionPlan candidate) {
     std::vector<typename Setup::Calibration> measured;
     StartupPhaseScope phase(options.startup_observer, StartupPhase::TargetFinalize);
+    if constexpr (requires { setup.narrow_target_widths(options, candidate.placement); }) {
+        const auto widths = setup.narrow_target_widths(options, candidate.placement);
+        if (!widths.empty()) {
+            const auto calibrated_now = [&](auto plan) {
+                return calibrate_plan(setup, instance, device, options, budget, std::move(plan), measured);
+            };
+            const auto offer = [&] {
+                const auto snapshot = device_memory_snapshot(device.device());
+                return std::pair{budget.planning_available(snapshot), budget.available_host(snapshot)};
+            };
+            const auto [available, available_host] = offer();
+            std::optional<CalibratedPlan<typename Setup::ExecutionPlan>> narrow, baseline;
+            const auto calibrate_baseline = [&] {
+                const auto [offered, host] = offer();
+                auto plan = setup.plan(device, options, candidate.placement, offered, host);
+                return plan ? calibrated_now(std::move(*plan)) : decltype(baseline){};
+            };
+            try {
+                auto plan = setup.plan(device, options, candidate.placement, available, available_host,
+                                       widths);
+                if (plan) narrow = calibrated_now(std::move(*plan));
+            } catch (const DeviceAllocationError&) {
+            } catch (const ContextBudgetError&) {}
+            if (narrow) {
+                const auto [offered, host] = offer();
+                auto reference = setup.upper_context_bytes(device, options, narrow->startup, offered,
+                                                            host);
+                if (!keeps_context_capacity(narrow->startup.capacity.device_bytes, reference)) {
+                    baseline = calibrate_baseline();
+                    if (baseline) reference = baseline->startup.capacity.device_bytes;
+                    try {
+                        narrow = calibrated_now(std::move(narrow->startup));
+                    } catch (const DeviceAllocationError&) {
+                        narrow.reset();
+                    } catch (const ContextBudgetError&) {
+                        narrow.reset();
+                    }
+                }
+                if (narrow && keeps_context_capacity(narrow->startup.capacity.device_bytes, reference)) {
+                    try {
+                        auto trial = options;
+                        auto ready = prepare_program(setup, instance, prepared_session, memory, device,
+                                                     trial, budget, std::move(*narrow), measured);
+                        if (ready && keeps_context_capacity(ready->startup.capacity.device_bytes, reference)) {
+                            options = std::move(trial);
+                            phase.complete();
+                            return ready;
+                        }
+                    } catch (const DeviceAllocationError&) {
+                    } catch (const ContextBudgetError&) {}
+                    prepared_session.reset();
+                    instance.program.reset();
+                    device.synchronize();
+                }
+            }
+            if (!baseline) baseline = calibrate_baseline();
+            if (!baseline) return {};
+            phase.complete();
+            return prepare_program(setup, instance, prepared_session, memory, device, options,
+                                   budget, std::move(*baseline), measured);
+        }
+    }
     auto calibrated =
         calibrate_plan(setup, instance, device, options, budget, std::move(candidate), measured);
     if (!calibrated) return {};

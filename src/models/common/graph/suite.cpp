@@ -49,6 +49,7 @@ void DecodeGraphSuite::prepare(const BatchExecutionPlan& batch,
     std::optional<moe::Schedule::Preparation> schedule_preparation;
     if (schedule_) schedule_preparation.emplace(*schedule_);
     std::set<TargetKey> targets;
+    std::set<ProposalKey> proposals;
     std::set<DecisionKey> decisions;
     std::set<CommitKey> commits;
     const auto cuda = device_.execution_view();
@@ -70,7 +71,8 @@ void DecodeGraphSuite::prepare(const BatchExecutionPlan& batch,
                 full_width && bindings.commit && commits.insert(commit_key).second;
             const auto replay = bindings.stage(route);
 
-            if (verify && !fused) {
+            if (verify && !fused &&
+                proposals.emplace(shape, std::max(route.mtp_steps, route.head_columns)).second) {
                 if (preparation.capturing())
                     prepare_proposal(route, preparation, bindings, replay.proposal);
                 else

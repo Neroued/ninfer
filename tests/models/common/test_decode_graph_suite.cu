@@ -348,6 +348,53 @@ void check_physical_sharing(Fixture& f) {
     }
 }
 
+void check_narrow_block_sharing(Fixture& f) {
+    const auto backend = SpeculativeBackend::DFlash2;
+    const BatchExecutionPlan batches({1, 1, {1}});
+    const std::array widths{2U, 4U, 8U};
+    const DecodeGraphRoutes routes(batches, backend, 7, widths);
+    DecodeGraphSuite suite(f.device, f.workspace, backend, true);
+    unsigned proposals = 0, warm_proposals = 0;
+    const std::array buckets{ContextBucket::K2};
+    DecodeGraphBindings bindings;
+    bindings.stage = [&](const RoundRoute&) {
+        return TargetReplay{.proposal = {.buckets = buckets}};
+    };
+    bindings.warmup_proposal = [&](const RoundRoute&) { ++warm_proposals; };
+    bindings.warmup_target   = [](const RoundRoute&) {};
+    bindings.proposal        = [&](const RoundRoute& route) {
+        ++proposals;
+        require(route.head_columns == 7, "narrow target changed the block proposal");
+        ProposalCapture capture;
+        capture.steps.emplace_back().forward.body = [&](const auto&) { f.increment(0)(); };
+        return capture;
+    };
+    bindings.target = [&](const RoundRoute& route) -> TargetCapture {
+        return ResidentTargetCapture{
+            .body = [run = f.increment(1, route.width)](const auto&, const auto&, const auto&,
+                                                        const auto&) { run(); }};
+    };
+    bindings.decision = [&](const RoundRoute& route) { f.increment(2, route.width)(); };
+    bindings.commit   = [&](const RoundRoute& route, const SectionRecorder&,
+                          const SectionRecorder& counts) { counts(f.increment(3, route.width)); };
+    GraphPreparation warmup(f.device, GraphPreparationMode::Warmup);
+    suite.prepare(batches, routes, warmup, bindings);
+    GraphPreparation capture(f.device, GraphPreparationMode::Capture);
+    suite.prepare(batches, routes, capture, bindings);
+    require(proposals == 1 && warm_proposals == 1, "split block proposal was prepared per width");
+    for (const auto& route : routes.at({1, 1})) {
+        f.clear();
+        if (route.width > 1) suite.launch_proposal(route, {.buckets = buckets});
+        require(suite.start_target(route, {}) == TargetProgress::Complete,
+                "narrow target replay did not submit");
+        suite.decide(route);
+        suite.commit(route, false, true);
+        require(f.read(0) == (route.width > 1) && f.read(1) == route.width &&
+                    f.read(2) == route.width && f.read(3) == route.width,
+                "a target width resolved another decision or commit graph");
+    }
+}
+
 struct LayerControl {
     bool active = false, ready = false, pending = false;
     unsigned starts = 0, cancels = 0;
@@ -533,6 +580,7 @@ int main() {
         check_suite(fixture, SpeculativeBackend::DFlash2, ProposalTopology::FusedBlock);
         check_suite(fixture, SpeculativeBackend::Mtp, ProposalTopology::SplitProposal);
         check_physical_sharing(fixture);
+        check_narrow_block_sharing(fixture);
         check_layered(fixture);
         return 0;
     } catch (const std::exception& error) {

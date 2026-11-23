@@ -86,7 +86,6 @@ ProposalCapture bind_proposal(RankProgramImpl& p, ops::ContextBucketRange bucket
     capture.before_readback = [&p] { p.timer.end_draft(true); };
     capture.readback        = [&p, drafts] { p.readback_drafts(drafts); };
     capture.drafts_ready    = [&p] { p.drafts_done.record_external(p.cuda.stream()); };
-    capture.verify_ids      = [&p, main, drafts] { p.prepare_verify_inputs(main, drafts); };
     if (p.parameters.mtp) {
         for (std::uint32_t step = 0; step < route.mtp_steps; ++step) {
             const auto batch = p.batch(p.frame.mtp->draft_steps[step], 1, main.rows,
@@ -100,7 +99,7 @@ ProposalCapture bind_proposal(RankProgramImpl& p, ops::ContextBucketRange bucket
 }
 
 ResidentTargetCapture bind_target(RankProgramImpl& p, ops::ContextBucketRange buckets,
-                                  const execution::BatchView& main) {
+                                  const execution::BatchView& main, int head_columns) {
     const auto hidden = p.target_hidden(main);
     ResidentTargetCapture capture;
     std::vector<execution::MlaReadout> expected;
@@ -113,10 +112,15 @@ ResidentTargetCapture bind_target(RankProgramImpl& p, ops::ContextBucketRange bu
         expected.push_back(call);
         bind_mla(capture.readouts, p.device, buckets, call);
     }
-    capture.body = [&p, main, hidden, expected = std::move(expected)](
+    capture.body = [&p, main, hidden, head_columns, expected = std::move(expected)](
                        const ReadoutRecorder& record, const GraphBody&, const GraphBody& head,
                        const StreamSectionRecorder&) {
         p.begin_target(main, true);
+        if (main.tokens > 1) {
+            const auto steps  = p.parameters.mtp ? dimension(p.shape.draft_tokens) : head_columns;
+            const auto drafts = p.draft_proposals(main.rows, steps);
+            p.prepare_verify_inputs(main, drafts);
+        }
         std::size_t next = 0;
         p.target_forward(main, hidden, false, [&](const execution::MlaReadout& actual) {
             record_mla(p.device, record, expected.at(next++), actual);
@@ -169,8 +173,8 @@ GraphPreparationSample RankProgramImpl::prepare_graphs(GraphPreparationMode mode
     bindings.proposal      = [&](const speculative::RoundRoute& route) {
         return bind_proposal(*this, buckets, route, main);
     };
-    bindings.target = [&](const speculative::RoundRoute&) -> TargetCapture {
-        return bind_target(*this, buckets, main);
+    bindings.target = [&](const speculative::RoundRoute& route) -> TargetCapture {
+        return bind_target(*this, buckets, main, static_cast<int>(route.head_columns));
     };
     bindings.decision = [&](const speculative::RoundRoute& route) {
         const bool verify = route.width > 1;

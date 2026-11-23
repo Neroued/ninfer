@@ -39,32 +39,15 @@ void RankProgramImpl::launch_commit(ComputeOperation& operation) {
         CUDA_CHECK(cudaMemcpyAsync(frame.commit.data, frame.host_commit_bytes.data,
                                    frame.commit.bytes, cudaMemcpyHostToDevice, device.stream()));
     if (decode) {
-        if (mtp) {
-            if (graphs)
-                graphs->commit(operation.decode_route(), repair_mtp, count_tokens);
-            else
-                execute_mtp_commit(operation.shape.rows, operation.width, repair_mtp, count_tokens);
-        } else {
-            if (operation.verifies_drafts())
-                resources.replay(operation.width)
-                    .fold.execute(
-                        frame.state_source_offsets.slice(0, 0, operation.shape.rows),
-                        frame.commit_destination_offsets.slice(0, 0, operation.shape.rows),
-                        frame.accepted_columns.slice(0, 0, operation.shape.rows),
-                        device.execution_view());
-            const auto hidden = frame.decode_view(operation.width, operation.shape.rows).hidden;
-            ops::scatter_batch_columns(
-                hidden, frame.last_columns.slice(0, 0, operation.shape.rows),
-                resources.state_images.continuation_hidden(
-                    frame.commit_destination_offsets.slice(0, 0, operation.shape.rows)),
-                device.execution_view());
-        }
+        if (graphs && draft_window)
+            graphs->commit(operation.decode_route(), repair_mtp, count_tokens);
+        else
+            execute_decode_commit(operation.shape.rows, operation.width, repair_mtp, count_tokens);
         if (append_terminal) commit_draft_history(operation);
     }
-    if (count_tokens && !mtp) {
-        const int width = decode ? static_cast<int>(operation.width) : 1;
+    if (count_tokens && !decode) {
         Tensor tokens({frame.output_tokens.data, frame.output_tokens.bytes(), device.device()},
-                      DType::I32, {width, static_cast<int>(operation.shape.rows)});
+                      DType::I32, {1, static_cast<int>(operation.shape.rows)});
         ops::increment_token_counts_batch(tokens,
                                           frame.count_columns.slice(0, 0, operation.shape.rows),
                                           frame.residency_slots.slice(0, 0, operation.shape.rows),
@@ -105,9 +88,9 @@ void RankProgramImpl::launch_commit(ComputeOperation& operation) {
     operation.stage = ComputeStage::Retiring;
 }
 
-void RankProgramImpl::execute_mtp_commit(std::uint32_t batch, std::uint32_t width, bool repair,
-                                         bool counts, const SectionRecorder& repair_section,
-                                         const SectionRecorder& counts_section) {
+void RankProgramImpl::execute_decode_commit(std::uint32_t batch, std::uint32_t width, bool repair,
+                                            bool counts, const SectionRecorder& repair_section,
+                                            const SectionRecorder& counts_section) {
     auto& frame     = resources.frame;
     const auto cuda = device.execution_view();
     if (width > 1)
@@ -115,10 +98,12 @@ void RankProgramImpl::execute_mtp_commit(std::uint32_t batch, std::uint32_t widt
                                              frame.commit_destination_offsets.slice(0, 0, batch),
                                              frame.accepted_columns.slice(0, 0, batch), cuda);
     const auto history = [&] { rebuild_mtp_history(batch, width); };
-    if (repair_section)
-        repair_section(history);
-    else if (repair)
-        history();
+    if (backend == SpeculativeBackend::Mtp) {
+        if (repair_section)
+            repair_section(history);
+        else if (repair)
+            history();
+    }
     const auto hidden = frame.decode_view(width, batch).hidden;
     ops::scatter_batch_columns(hidden, frame.last_columns.slice(0, 0, batch),
                                resources.state_images.continuation_hidden(

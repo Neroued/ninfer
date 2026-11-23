@@ -7,9 +7,15 @@
 namespace ninfer::models::speculative {
 
 DecodeGraphRoutes::DecodeGraphRoutes(const BatchExecutionPlan& batches, SpeculativeBackend backend,
-                                     std::uint32_t k)
+                                     std::uint32_t k, std::span<const std::uint32_t> target_widths)
     : backend_(backend) {
     if (k == UINT32_MAX) throw std::invalid_argument("invalid graph draft window");
+    if (!target_widths.empty() &&
+        ((backend != SpeculativeBackend::DFlash && backend != SpeculativeBackend::DFlash2) ||
+         target_widths.front() < 2 || target_widths.back() != k + 1 ||
+         !std::ranges::is_sorted(target_widths) ||
+         std::ranges::adjacent_find(target_widths) != target_widths.end()))
+        throw std::invalid_argument("invalid block proposal target widths");
     std::uint32_t id = 0;
     for (const auto shape : batches.graph_shapes()) {
         auto& routes = buckets_[shape];
@@ -18,7 +24,8 @@ DecodeGraphRoutes::DecodeGraphRoutes(const BatchExecutionPlan& batches, Speculat
             for (std::uint32_t depth = 1; depth <= k; ++depth)
                 routes.push_back({shape, k + 1, depth, 0, id++});
         } else if (k && backend != SpeculativeBackend::None) {
-            routes.push_back({shape, k + 1, 0, k, id++});
+            if (target_widths.empty()) routes.push_back({shape, k + 1, 0, k, id++});
+            for (const auto width : target_widths) routes.push_back({shape, width, 0, k, id++});
         }
     }
 }
@@ -32,10 +39,12 @@ RoundRoute DecodeGraphRoutes::select_route(PhysicalBatchShape shape, Speculative
     if (backend != backend_)
         throw std::invalid_argument("speculative backend differs from graph catalog");
     const auto routes = at(shape);
-    const auto entry  = backend == SpeculativeBackend::Mtp ? depth : std::uint32_t(depth != 0);
-    if (entry >= routes.size() || !routes[entry].covers(backend, depth))
+    if (!depth) return routes.front();
+    if (backend == SpeculativeBackend::Mtp && depth < routes.size()) return routes[depth];
+    const auto entry = std::ranges::upper_bound(routes, depth, {}, &RoundRoute::width);
+    if (entry == routes.end() || !entry->covers(backend, depth))
         throw std::invalid_argument("no prepared graph route covers the verification depth");
-    return routes[entry];
+    return *entry;
 }
 
 RoundRoute RoundRoute::eager(PhysicalBatchShape rows, SpeculativeBackend backend,
@@ -66,8 +75,7 @@ void RoundRoute::validate(SpeculativeBackend backend, std::uint32_t k) const {
             (graph_entry ? width != k + 1 : mtp_steps + 1 != width))
             throw std::invalid_argument("invalid MTP proposal route");
     } else if ((backend != SpeculativeBackend::DFlash && backend != SpeculativeBackend::DFlash2) ||
-               mtp_steps || !head_columns || head_columns > k ||
-               (head_columns != width - 1 || (graph_entry && width != k + 1))) {
+               mtp_steps || head_columns != (graph_entry ? k : width - 1)) {
         throw std::invalid_argument("invalid block proposal route");
     }
 }

@@ -6,12 +6,19 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 
 namespace ninfer::distributed {
 
 struct FailureReport {
     std::string reason;
     std::optional<StartupEvent> startup;
+    bool device_allocation = false;
+};
+
+class RankDeviceAllocationError : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
 };
 
 [[nodiscard]] wire::Bytes encode_failure(const FailureReport&);

@@ -43,6 +43,9 @@ void run_rank(distributed::WorkerConnection& connection, std::unique_ptr<artifac
         preparing.reset();
         instance.reset();
         connection.shutdown();
+    } catch (const DeviceAllocationError& error) {
+        connection.fail(error.what(), true);
+        throw;
     } catch (const std::exception& error) {
         connection.fail(error.what());
         throw;

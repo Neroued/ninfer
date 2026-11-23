@@ -37,6 +37,11 @@ struct CostQuery {
     [[nodiscard]] static CostQuery from_plan(SpeculativeBackend, const DecodeRoundPlan&,
                                              std::span<const std::uint32_t> row_frontiers,
                                              std::uint32_t max_context);
+    [[nodiscard]] static CostQuery from_split_plan(SpeculativeBackend,
+                                                   const DecodeRoundPlan& proposal,
+                                                   const DecodeRoundPlan& target,
+                                                   std::span<const std::uint32_t> row_frontiers,
+                                                   std::uint32_t max_context);
 };
 
 struct TimedCostAnchor {

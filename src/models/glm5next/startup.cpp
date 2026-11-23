@@ -17,6 +17,12 @@ KvCacheVectorFormat index_format_from_environment() {
     throw std::invalid_argument("NINFER_KPOOL_INDEXER_BF16 must be 0 or 1");
 }
 
+bool can_narrow_dflash_targets(const EngineOptions& options) noexcept {
+    return options.use_cuda_graph && options.purpose == EnginePurpose::Generation &&
+           options.speculative.backend == SpeculativeBackend::DFlash2 &&
+           options.speculative.draft_tokens >= 5;
+}
+
 RankPreparation::RankPreparation(const artifact::Reader& reader, RankLoadRequest request,
                                  DeviceContext& device, ContextCommunication peer)
     : device_(device), options_(std::move(request.options)), peer_(peer),
@@ -32,7 +38,8 @@ RankPreparation::RankPreparation(const artifact::Reader& reader, RankLoadRequest
                                              load_->expert_data(), load_->rank_plan());
     plan_        = plan_execution(std::move(profile), options_, request.index_format,
                                   device.multiprocessor_count(), std::move(request.batches));
-    capacity_    = describe_execution_capacity(plan_);
+    if (request.narrow_dflash_targets) select_narrow_targets(true);
+    capacity_ = describe_execution_capacity(plan_);
 }
 
 RankPreparation::~RankPreparation() = default;
@@ -143,6 +150,15 @@ void RankPreparation::release_resources() {
     }
 }
 
+void RankPreparation::select_narrow_targets(bool enabled, GraphMemorySummary measured) {
+    if ((enabled && !can_narrow_dflash_targets(options_)) || (instance_ && instance_->program))
+        throw std::logic_error("GLM5Next cannot change the decode graph catalog");
+    probe_.reset();
+    plan_.shape.narrow_dflash_targets = enabled;
+    plan_.decode_routes               = make_decode_routes(plan_.shape, *plan_.batches);
+    graph_memory_                     = measured;
+}
+
 RankResourceDescription RankPreparation::describe() const {
     if (!instance_ || !instance_->program)
         throw std::logic_error("GLM5Next resources have not been prepared");
@@ -204,6 +220,10 @@ Startup::Startup(const artifact::Reader& reader, const artifact::Reader& rank,
 
 Frontend Startup::frontend(const EngineOptions& options) const {
     return create_frontend(*definition_, options);
+}
+
+bool Startup::narrow_targets(const EngineOptions& options) const noexcept {
+    return can_narrow_dflash_targets(options);
 }
 
 std::unique_ptr<RankPreparation> Startup::preparation(const artifact::Reader& reader,

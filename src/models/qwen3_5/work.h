@@ -1,7 +1,7 @@
 #pragma once
 
 #include "models/common/token_input.h"
-#include "models/common/speculative/round_plan.h"
+#include "models/common/speculative/controller.h"
 
 #include "models/common/context/contract.h"
 #include "models/common/context/directory/state.h"
@@ -70,11 +70,24 @@ struct DecodeRow {
     SamplingInput sampling;
 };
 
+struct SplitProposalNarrowingInput {
+    struct Row {
+        speculative::RoundMember member;
+        std::uint32_t frontier;
+        speculative::SequenceSpeculativeState state;
+    };
+
+    speculative::SpeculativeCostModel cost;
+    std::vector<Row> rows;
+    std::uint32_t max_context;
+};
+
 struct DecodeWork {
     DecodeWork(speculative::DecodeRoundPlan, ExecutionPath);
     std::shared_ptr<const speculative::DecodeRoundPlan> plan;
     std::shared_ptr<const SpeculativeExecutionGeometry> geometry;
     std::vector<DecodeRow> rows;
+    std::optional<SplitProposalNarrowingInput> narrowing;
 };
 
 // DFlash target features occupy a residency's persistent plane until this range is appended.
@@ -114,6 +127,7 @@ struct GeneratedResult {
     std::uint32_t row_stride = 1;
     std::vector<float> draft_confidences, target_top1_probabilities;
     std::uint32_t draft_stride = 0;
+    std::optional<speculative::NarrowedTargetPlan> executed;
 };
 
 struct ForwardResult {

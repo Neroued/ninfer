@@ -64,8 +64,11 @@ BatchPlan plan_batch(std::span<const WorkRow> rows, const BatchExecutionPlan& pl
 std::shared_ptr<const speculative::DecodeGraphRoutes>
 make_decode_routes(const ExecutionShape& shape, const BatchExecutionPlan& batches) {
     if (batches.graph_shapes().empty()) return {};
+    const std::array narrow_widths{4U, shape.draft_tokens + 1};
+    const auto widths = shape.narrow_dflash_targets ? std::span<const std::uint32_t>(narrow_widths)
+                                                    : std::span<const std::uint32_t>{};
     return std::make_shared<const speculative::DecodeGraphRoutes>(batches, shape.speculative,
-                                                                  shape.draft_tokens);
+                                                                  shape.draft_tokens, widths);
 }
 
 const BatchPlan& work_batch(const Work& work) {

@@ -71,7 +71,15 @@ SessionImpl::start_decode_round(std::span<const SequenceHandle> members,
         pending.record_online_cost = selection.record_online_cost;
         DecodeWork decode(std::move(*round), plan.decode_path);
         pending.round = decode.plan;
-        prepared      = true;
+        if (plan.split_proposal_narrowing && !selection.budgets.empty() &&
+            decode.plan->route().width > 1) {
+            auto& narrowing = decode.narrowing.emplace(
+                SplitProposalNarrowingInput{.cost = cost_model, .max_context = capacity});
+            narrowing.rows.reserve(adaptive.size());
+            for (const auto& row : adaptive)
+                narrowing.rows.push_back({row.member, row.frontier, *row.state});
+        }
+        prepared = true;
         // Reserve all host bookkeeping before transferring any optional right to a history.
         for (std::size_t i = 0; i < size; ++i) growth[i].prepare(pending.round->verify_drafts()[i]);
         for (auto& row : growth) row.adopt();

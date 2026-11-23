@@ -35,6 +35,7 @@ struct Residency {
 
 enum class ComputeStage : std::uint8_t {
     Inputs,
+    Proposal,
     Forward,
     History,
     AwaitDecision,
@@ -76,12 +77,17 @@ struct ComputeOperation {
     std::optional<Tensor> input_embeddings;
     std::unique_ptr<execution::TextRun> text;
     TargetGraphBody* graph_target = nullptr;
+    std::optional<speculative::NarrowedTargetPlan> narrowed;
 
     [[nodiscard]] bool verifies_drafts() const noexcept {
         return width > 1 && std::holds_alternative<DecodeWork>(request.work.operation);
     }
 
     [[nodiscard]] const speculative::RoundRoute& decode_route() const {
+        return narrowed ? narrowed->target_route : proposal_route();
+    }
+
+    [[nodiscard]] const speculative::RoundRoute& proposal_route() const {
         return std::get<DecodeWork>(request.work.operation).plan->route();
     }
 
@@ -135,9 +141,12 @@ public:
     void begin_target(ComputeOperation&);
     bool advance_target(ComputeOperation&);
     void begin_draft(ComputeOperation&);
+    void narrow_target(ComputeOperation&);
+    void prepare_target_ingress(const ComputeOperation&, std::span<const std::uint32_t>);
     Tensor draft_tokens(const speculative::RoundRoute&) const;
     void readback_drafts(const speculative::RoundRoute&);
-    void prepare_verification(const speculative::RoundRoute&);
+    void prepare_verification(const speculative::RoundRoute& target,
+                              const speculative::RoundRoute& proposal);
     void prepare_mtp_draft(ComputeOperation&);
     [[nodiscard]] ProposalBuckets proposal_buckets(const speculative::RoundRoute&) const;
     [[nodiscard]] ops::ContextBucket target_bucket() const;
@@ -150,7 +159,8 @@ public:
     void run_dflash_draft(const speculative::RoundRoute&, std::span<const ops::ContextBucket>,
                           const execution::DraftReadoutSubmit& = {});
     void project_decode(std::uint32_t batch, std::uint32_t width);
-    void decide_decode(const speculative::RoundRoute&);
+    void decide_decode(const speculative::RoundRoute& target,
+                       const speculative::RoundRoute& proposal);
     void readback_result(std::uint32_t batch, const speculative::RoundRoute* route = nullptr);
     GraphPreparationSample initialize_graphs(GraphPreparationMode = GraphPreparationMode::Complete);
     void release_graphs();
@@ -159,9 +169,9 @@ public:
     void commit_draft_history(ComputeOperation&);
     void align_mtp_history(ComputeOperation&);
     void rebuild_mtp_history(std::uint32_t batch, std::uint32_t width);
-    void execute_mtp_commit(std::uint32_t batch, std::uint32_t width, bool repair, bool counts,
-                            const SectionRecorder& repair_section = {},
-                            const SectionRecorder& counts_section = {});
+    void execute_decode_commit(std::uint32_t batch, std::uint32_t width, bool repair, bool counts,
+                               const SectionRecorder& repair_section = {},
+                               const SectionRecorder& counts_section = {});
     void request_decision(ComputeOperation&);
     void launch_decision(ComputeOperation&);
     void launch_commit(ComputeOperation&);

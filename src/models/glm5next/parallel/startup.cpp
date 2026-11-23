@@ -15,8 +15,8 @@ Frontend ParallelStartup::frontend(const EngineOptions& options) const {
     return create_frontend(*definition_, options);
 }
 
-std::vector<distributed::wire::Bytes>
-ParallelStartup::requests(const EngineOptions& options) const {
+std::vector<distributed::wire::Bytes> ParallelStartup::requests(const EngineOptions& options,
+                                                                bool narrow_targets) const {
     std::vector<distributed::wire::Bytes> payloads;
     const auto batches = make_batch_execution_spec(
         options.max_concurrency, parallel_.ranks.size(),
@@ -35,10 +35,15 @@ ParallelStartup::requests(const EngineOptions& options) const {
                                .batches                = batches,
                                .index_format           = index_format_,
                                .host_reservation_bytes = control_owner ? media : 0,
-                               .control_owner          = control_owner});
+                               .control_owner          = control_owner,
+                               .narrow_dflash_targets  = narrow_targets});
         payloads.push_back(std::move(out).take());
     }
     return payloads;
+}
+
+bool ParallelStartup::narrow_targets(const EngineOptions& options) const noexcept {
+    return can_narrow_dflash_targets(options);
 }
 
 void ParallelStartup::resolve(std::span<const distributed::wire::Payload> descriptions,

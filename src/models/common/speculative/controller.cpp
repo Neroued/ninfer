@@ -36,8 +36,14 @@ struct RowYield {
     std::array<double, kMaxSpeculativeDrafts + 1> bonus;
 };
 
+float blend_live_confidence(float history, float confidence) {
+    if (!(confidence >= 0.0f && confidence <= 1.0f))
+        throw std::invalid_argument("invalid pre-draw draft confidence");
+    return logistic(0.35f * logit(history) + 0.65f * logit(std::clamp(confidence, 0.01f, 0.99f)));
+}
+
 RowYield expected_yield(const AdaptiveRowInput& row, std::uint32_t limit,
-                        SpeculativeBackend backend, std::span<const float> live) {
+                        std::span<const float> live) {
     if (!row.state && live.empty()) return {limit, kFreshBonus};
     RowYield result{};
     result.limit    = limit;
@@ -50,17 +56,8 @@ RowYield expected_yield(const AdaptiveRowInput& row, std::uint32_t limit,
     double survival = 1.0;
     for (std::uint32_t j = 0; j < limit; ++j) {
         auto p = probabilities[j];
-        if (!live.empty()) {
-            const auto confidence = live[j];
-            if (!(confidence >= 0.0f && confidence <= 1.0f))
-                throw std::invalid_argument("invalid pre-draw draft confidence");
-            p = logistic(0.35f * logit(p) + 0.65f * logit(std::clamp(confidence, 0.01f, 0.99f)));
-        }
+        if (!live.empty()) p = blend_live_confidence(p, live[j]);
         survival *= p;
-        if (!live.empty() && backend == SpeculativeBackend::DFlash2 && survival < 0.12f) {
-            result.limit = j;
-            break;
-        }
         result.bonus[j + 1] = result.bonus[j] + survival;
     }
     return result;
@@ -110,11 +107,12 @@ public:
     RouteLoad(SpeculativeBackend backend, const RoundRoute& route,
               std::span<const AdaptiveRowInput> rows, std::span<const std::uint32_t> extents,
               std::uint32_t owner_count, std::uint32_t max_owner_rows, std::uint32_t max_context,
-              bool short_context)
+              bool short_context, const CostQuery* executed_proposal)
         : query_(
               detail::route_query(route, static_cast<std::uint32_t>(rows.size()), max_owner_rows)),
           backend_(backend), route_(route), max_context_(max_context),
-          short_context_(short_context), owners_(owner_count > 1 ? owner_count : 0),
+          short_context_(short_context), fixed_proposal_(executed_proposal != nullptr),
+          owners_(owner_count > 1 ? owner_count : 0),
           token_counts_(
               owners_.empty()
                   ? 0
@@ -127,15 +125,16 @@ public:
             const auto extent = extents[i];
             const auto tokens = extent + 1;
             query_.active_target_tokens += tokens;
-            query_.active_proposal_rows += extent != 0;
+            const bool proposing = !fixed_proposal_ && extent != 0;
+            query_.active_proposal_rows += proposing;
             if (!short_context_) {
                 target_buckets_.add(target_index(rows[i], extent));
-                if (extent) proposal_buckets_.add(proposal_index(rows[i]));
+                if (proposing) proposal_buckets_.add(proposal_index(rows[i]));
             }
             if (!owners_.empty()) {
                 auto& owner = owners_[rows[i].member.owner];
                 owner.tokens += tokens;
-                owner.proposals += extent != 0;
+                owner.proposals += proposing;
             }
         }
         for (const auto owner : owners_) {
@@ -148,6 +147,7 @@ public:
             owners_.empty() ? query_.active_proposal_rows : max_proposals_.top();
         query_.target_bucket   = static_cast<ops::ContextBucket>(target_buckets_.top());
         query_.proposal_bucket = static_cast<ops::ContextBucket>(proposal_buckets_.top());
+        if (executed_proposal) detail::use_proposal_cost(query_, *executed_proposal);
     }
 
     [[nodiscard]] const CostQuery& query() const { return query_; }
@@ -156,18 +156,19 @@ public:
                                   std::uint32_t new_extent) const {
         auto next              = query_;
         const auto drop        = old_extent - new_extent;
-        const bool no_proposal = new_extent == 0;
+        const bool no_proposal = !fixed_proposal_ && new_extent == 0;
         next.active_target_tokens -= drop;
         next.active_proposal_rows -= no_proposal;
         if (owners_.empty()) {
             next.max_owner_target_tokens = next.active_target_tokens;
-            next.max_owner_proposal_rows = next.active_proposal_rows;
+            if (!fixed_proposal_) next.max_owner_proposal_rows = next.active_proposal_rows;
         } else {
             const auto owner = owners_[row.member.owner];
             next.max_owner_target_tokens =
                 max_tokens_.after_reducing(owner.tokens, owner.tokens - drop);
-            next.max_owner_proposal_rows =
-                max_proposals_.after_reducing(owner.proposals, owner.proposals - no_proposal);
+            if (!fixed_proposal_)
+                next.max_owner_proposal_rows =
+                    max_proposals_.after_reducing(owner.proposals, owner.proposals - no_proposal);
         }
         if (target_buckets_.can_lower())
             next.target_bucket = static_cast<ops::ContextBucket>(target_buckets_.after_reducing(
@@ -183,15 +184,16 @@ public:
         if (!owners_.empty()) {
             auto& owner          = owners_[row.member.owner];
             const auto tokens    = owner.tokens - (old_extent - new_extent);
-            const auto proposals = owner.proposals - (new_extent == 0);
+            const auto proposals = owner.proposals - (!fixed_proposal_ && new_extent == 0);
             max_tokens_.reduce(owner.tokens, tokens, next.max_owner_target_tokens);
-            max_proposals_.reduce(owner.proposals, proposals, next.max_owner_proposal_rows);
+            if (!fixed_proposal_)
+                max_proposals_.reduce(owner.proposals, proposals, next.max_owner_proposal_rows);
             owner = {tokens, proposals};
         }
         if (!short_context_) {
             target_buckets_.reduce(target_index(row, old_extent), target_index(row, new_extent),
                                    static_cast<std::uint32_t>(next.target_bucket));
-            if (!new_extent)
+            if (!fixed_proposal_ && !new_extent)
                 proposal_buckets_.reduce(proposal_index(row), 0,
                                          static_cast<std::uint32_t>(next.proposal_bucket));
         }
@@ -215,6 +217,7 @@ private:
     RoundRoute route_;
     std::uint32_t max_context_;
     bool short_context_;
+    bool fixed_proposal_;
     std::vector<OwnerLoad> owners_;
     std::vector<std::uint32_t> token_counts_, proposal_counts_;
     std::array<std::uint32_t, ops::kContextBucketCount> target_counts_{}, proposal_bucket_counts_{};
@@ -264,7 +267,7 @@ double refine_route(const SpeculativeCostModel& model, SpeculativeBackend backen
                     std::span<const RowYield> yields, std::span<std::uint32_t> extents,
                     std::vector<std::uint32_t>& order, std::uint32_t owner_count,
                     std::uint32_t max_owner_rows, std::uint32_t max_context, bool short_context,
-                    double minimum_score) {
+                    double minimum_score, const CostQuery* executed_proposal) {
     const auto cap              = route.verification_limit(backend);
     const auto required_depth   = route.covers(backend, 1) ? 1 : cap;
     auto expected               = double(rows.size());
@@ -280,9 +283,10 @@ double refine_route(const SpeculativeCostModel& model, SpeculativeBackend backen
     if (cap && !required_rows) return 0.0;
 
     RouteLoad load(backend, route, rows, extents, owner_count, max_owner_rows, max_context,
-                   short_context);
+                   short_context, executed_proposal);
     const detail::RouteCost pricing(model, load.query());
-    if (cap && !can_beat(pricing, load.query(), yields, extents, owner_count, minimum_score))
+    if (cap && !executed_proposal &&
+        !can_beat(pricing, load.query(), yields, extents, owner_count, minimum_score))
         return 0.0;
     auto score            = expected / pricing.predict_ms(load.query());
     const auto less_yield = [&](auto a, auto b) {
@@ -359,15 +363,6 @@ DecodeRoundPlan optimize(SpeculativeBackend backend, std::uint32_t max_drafts,
                          std::uint32_t stride = 0) {
     if (!owner_count || rows.empty() || rows.size() > shape.rows)
         throw std::invalid_argument("invalid adaptive round membership");
-    if (initial && (initial->verify_drafts().size() != rows.size() ||
-                    (stride && live.size() / stride < rows.size())))
-        throw std::invalid_argument("proposal confidences differ from round membership");
-    if (initial) {
-        initial->route().validate(backend, max_drafts);
-        if ((path == ExecutionPath::Eager) == initial->route().graph_entry.has_value() ||
-            initial->owner_target_tokens().size() != owner_count)
-            throw std::invalid_argument("split proposal execution differs from the initial plan");
-    }
 
     std::vector<RoundMember> members;
     members.reserve(rows.size());
@@ -375,9 +370,6 @@ DecodeRoundPlan optimize(SpeculativeBackend backend, std::uint32_t max_drafts,
     for (std::size_t i = 0; i < rows.size(); ++i) {
         const auto member = rows[i].member;
         members.push_back(member);
-        if (initial &&
-            (initial->slots()[i].owner != member.owner || initial->verify_drafts()[i] > stride))
-            throw std::invalid_argument("proposal confidence stride or owner differs from plan");
         const auto limit = initial ? initial->verify_drafts()[i] : max_drafts;
         max_limit        = std::max(max_limit, std::min(member.granted_limit, limit));
     }
@@ -407,12 +399,20 @@ DecodeRoundPlan optimize(SpeculativeBackend backend, std::uint32_t max_drafts,
             std::min(member.granted_limit, initial ? initial->verify_drafts()[i] : max_drafts);
         const auto confidence =
             initial ? live.subspan(i * stride, limit) : std::span<const float>{};
-        yields.push_back(expected_yield(rows[i], limit, backend, confidence));
+        yields.push_back(expected_yield(rows[i], limit, confidence));
         max_limit    = std::max(max_limit, yields.back().limit);
         max_frontier = std::max(max_frontier, rows[i].frontier);
     }
     const bool short_context =
         detail::target_bucket(max_frontier, max_drafts, max_context) == ops::ContextBucket::K2;
+
+    std::optional<CostQuery> executed_proposal;
+    if (initial) {
+        std::vector<std::uint32_t> frontiers;
+        frontiers.reserve(rows.size());
+        for (const auto& row : rows) frontiers.push_back(row.frontier);
+        executed_proposal = CostQuery::from_plan(backend, *initial, frontiers, max_context);
+    }
 
     std::vector<std::uint32_t> extents(rows.size()), order;
     order.reserve(rows.size());
@@ -424,7 +424,8 @@ DecodeRoundPlan optimize(SpeculativeBackend backend, std::uint32_t max_drafts,
         const auto minimum_score = std::min(best_score, 0.999 * max_score);
         const auto score =
             refine_route(cost_model, backend, route, rows, yields, extents, order, owner_count,
-                         max_owner_rows, max_context, short_context, minimum_score);
+                         max_owner_rows, max_context, short_context, minimum_score,
+                         executed_proposal ? &*executed_proposal : nullptr);
         if (score <= 0.0) continue;
         max_score = std::max(max_score, score);
         if (score > best_score || (route.width > best_route.width && score >= 0.999 * max_score)) {
@@ -477,8 +478,10 @@ void SequenceSpeculativeState::observe_ordinary_round(std::optional<float> targe
 void SequenceSpeculativeState::predict_conditional_survival(
     std::uint32_t max_drafts, std::span<float> out_probs) const noexcept {
     assert(max_drafts <= kMaxSpeculativeDrafts && max_drafts <= out_probs.size());
-    const auto empirical = [&](std::size_t j) {
-        return (kPriorAlpha + accepts_[j]) / (kPriorMass + attempts_[j]);
+    const auto emp0         = (kPriorAlpha + accepts_[0]) / (kPriorMass + attempts_[0]);
+    const auto deeper_alpha = emp0 < kPriorAlpha / kPriorMass ? kPriorMass * emp0 : kPriorAlpha;
+    const auto empirical    = [&](std::size_t j) {
+        return j ? (deeper_alpha + accepts_[j]) / (kPriorMass + attempts_[j]) : emp0;
     };
     if (last_target_top1_prob_) {
         // Propagate the first-position log-odds correction with a 0.85 depth decay.
@@ -493,11 +496,12 @@ void SequenceSpeculativeState::predict_conditional_survival(
     const auto blended_count = std::min<std::uint32_t>(max_drafts, last_draft_count_);
     for (std::uint32_t j = 0; j < blended_count; ++j) {
         const auto confidence = clamp_survival(last_draft_confidences_[j] / kConfidenceScale);
-        // Weighted geometric mean of the odds, equivalent to the logit blend.
-        const auto odds = (kPriorAlpha + accepts_[j]) / (kPriorBeta + attempts_[j] - accepts_[j]);
-        const auto weighted_odds = odds * odds * odds * (confidence / (1.0f - confidence));
-        const auto blended       = std::sqrt(std::sqrt(std::abs(weighted_odds)));
-        out_probs[j]             = clamp_survival(blended / (1.0f + blended));
+        const auto emp        = empirical(j);
+        const auto weight =
+            0.25f * (confidence > emp ? kPriorMass / (kPriorMass + attempts_[j]) : 1.0f);
+        const auto blended =
+            (1.0f - weight) * logit(clamp_survival(emp)) + weight * logit(confidence);
+        out_probs[j] = clamp_survival(logistic(blended));
     }
     for (auto j = blended_count; j < max_drafts; ++j) out_probs[j] = clamp_survival(empirical(j));
 }
@@ -557,6 +561,48 @@ narrow_after_proposal(SpeculativeBackend backend, std::uint32_t max_drafts,
                       const DecodeRoundPlan& initial_plan, std::span<const AdaptiveRowInput> rows,
                       std::span<const float> live_draft_confidences,
                       std::uint32_t confidence_stride, std::uint32_t max_context) {
+    const auto& initial = initial_plan.route();
+    initial.validate(backend, max_drafts);
+    if ((path == ExecutionPath::Eager) == initial.graph_entry.has_value() ||
+        initial_plan.owner_target_tokens().size() != owner_count)
+        throw std::invalid_argument("split proposal execution differs from the initial plan");
+    if (max_drafts > kMaxSpeculativeDrafts || rows.size() != initial_plan.verify_drafts().size() ||
+        (confidence_stride && live_draft_confidences.size() / confidence_stride < rows.size()))
+        throw std::invalid_argument("proposal confidences differ from round membership");
+    for (std::size_t i = 0; i < rows.size(); ++i)
+        if (initial_plan.slots()[i].owner != rows[i].member.owner ||
+            initial_plan.verify_drafts()[i] > confidence_stride)
+            throw std::invalid_argument("proposal confidence stride or owner differs from plan");
+
+    if (backend == SpeculativeBackend::DFlash2) {
+        constexpr SequenceSpeculativeState fresh;
+        std::vector<RoundMember> members;
+        std::vector<std::uint32_t> extents;
+        members.reserve(rows.size());
+        extents.reserve(rows.size());
+        for (std::size_t i = 0; i < rows.size(); ++i) {
+            const auto& row = rows[i];
+            members.push_back(row.member);
+            const auto limit = std::min(row.member.granted_limit, initial_plan.verify_drafts()[i]);
+            std::array<float, kMaxSpeculativeDrafts> history;
+            (row.state ? *row.state : fresh).predict_conditional_survival(limit, history);
+            double survival = 1.0;
+            std::uint32_t j = 0;
+            for (; j < limit; ++j) {
+                survival *= blend_live_confidence(
+                    history[j], live_draft_confidences[i * confidence_stride + j]);
+                if (survival < 0.12f) break;
+            }
+            extents.push_back(j);
+        }
+        // Route selection may pack the finalized extents but cannot change them. Confidence for
+        // a later draft can depend on this row's earlier sampled tokens.
+        const auto plan = DecodeRoundPlan::select(backend, max_drafts, owner_count, initial.shape,
+                                                  path, routes, members, extents);
+        if (plan.route().width > initial.width)
+            throw std::invalid_argument("narrowed target exceeds the initial route");
+        return {plan.route(), std::move(extents)};
+    }
     auto plan = optimize(backend, max_drafts, owner_count, initial_plan.route().shape, path, routes,
                          cost_model, rows, max_context, &initial_plan, live_draft_confidences,
                          confidence_stride);

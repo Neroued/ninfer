@@ -43,6 +43,10 @@ public:
     void prepare(runtime::ContextCapacity, std::size_t available_bytes,
                  std::size_t available_host_bytes);
     void release_resources();
+    void select_narrow_targets(bool enabled, GraphMemorySummary measured = {});
+
+    [[nodiscard]] GraphMemorySummary graph_memory() const noexcept { return graph_memory_; }
+
     [[nodiscard]] RankResourceDescription describe() const;
     [[nodiscard]] ExecutionCodec codec(const distributed::ExecutionTopology&) const;
     [[nodiscard]] std::unique_ptr<Instance> finish() &&;
@@ -74,6 +78,7 @@ public:
     Frontend frontend(const EngineOptions&) const;
     std::unique_ptr<Preparation> preparation(const artifact::Reader&, const EngineOptions&,
                                              DeviceContext&) const;
+    [[nodiscard]] bool narrow_targets(const EngineOptions&) const noexcept;
     PreparedSession session(const RankResourceDescription&,
                             std::uint32_t checkpoint_interval) const;
 
@@ -90,5 +95,6 @@ private:
                                             std::uint32_t ranks, std::uint32_t ep_size);
 
 [[nodiscard]] Frontend create_frontend(const ModelDefinition&, const EngineOptions&);
+[[nodiscard]] bool can_narrow_dflash_targets(const EngineOptions&) noexcept;
 
 } // namespace ninfer::models::glm5next

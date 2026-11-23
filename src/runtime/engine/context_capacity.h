@@ -5,9 +5,19 @@
 #include <cstddef>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <vector>
 
 namespace ninfer::runtime {
+
+class ContextBudgetError : public std::invalid_argument {
+public:
+    using std::invalid_argument::invalid_argument;
+};
+
+[[nodiscard]] constexpr bool keeps_context_capacity(std::size_t narrow, std::size_t baseline) {
+    return narrow >= baseline - baseline / 20;
+}
 
 // Available bytes are net allowances supplied by startup budgeting. Capacity selection charges
 // model resources and their metadata; it does not reserve startup headroom again.

@@ -293,7 +293,6 @@ ProposalCapture bind_proposal(RankProgramImpl& p, ops::ContextBucketRange bucket
     capture.before_readback = [&p] { p.gpu_timer.end_draft(true); };
     capture.readback        = [&p, route] { p.readback_drafts(route); };
     capture.drafts_ready    = [&p] { p.drafts_ready.record_external(p.device.stream()); };
-    capture.verify_ids      = [&p, route] { p.prepare_verification(route); };
     if (route.mtp_steps) {
         for (std::uint32_t step = 0; step < route.mtp_steps; ++step)
             capture.steps.push_back({.forward = bind_mtp_step(p, buckets, route.shape.rows, step)});
@@ -338,6 +337,7 @@ std::unique_ptr<execution::TextRun> target_run(RankProgramImpl& p,
 void target_prefix(RankProgramImpl& p, const speculative::RoundRoute& route, bool capture) {
     p.gpu_timer.begin_target(capture);
     if (route.width == 1 && !p.resources.dflash) p.upload_ingress();
+    if (route.width > 1) p.prepare_verification(route, route);
 }
 
 GraphBody target_head(RankProgramImpl& p, const speculative::RoundRoute& route) {
@@ -473,7 +473,6 @@ GraphPreparationSample RankProgramImpl::initialize_graphs(GraphPreparationMode m
             run_dflash_draft(route, draft_buckets.span());
         }
         gpu_timer.end_draft();
-        prepare_verification(route);
     };
     bindings.warmup_target = [&](const speculative::RoundRoute& route) {
         auto run = target_run(*this, route, main_bucket, active_tokens);
@@ -492,13 +491,13 @@ GraphPreparationSample RankProgramImpl::initialize_graphs(GraphPreparationMode m
     };
     bindings.decision = [&](const speculative::RoundRoute& route) {
         auto scope = resources.work.scope();
-        decide_decode(route);
+        decide_decode(route, route);
         readback_result(route.shape.rows, &route);
     };
-    if (backend == SpeculativeBackend::Mtp)
+    if (draft_window)
         bindings.commit = [&](const speculative::RoundRoute& route, const SectionRecorder& repair,
                               const SectionRecorder& counts) {
-            execute_mtp_commit(route.shape.rows, route.width, true, true, repair, counts);
+            execute_decode_commit(route.shape.rows, route.width, true, true, repair, counts);
         };
     graphs->prepare(*batch_execution, *decode_routes, observation, bindings);
     inputs.finish();

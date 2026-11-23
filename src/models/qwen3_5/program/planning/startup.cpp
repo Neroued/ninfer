@@ -607,7 +607,8 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->draft_window        = inputs.draft_window;
     impl->speculative_backend = inputs.speculative_backend;
     impl->decode_routes       = std::make_shared<const speculative::DecodeGraphRoutes>(
-        *impl->batch_execution, impl->speculative_backend, impl->draft_window);
+        *impl->batch_execution, impl->speculative_backend, impl->draft_window,
+        inputs.target_widths);
     impl->proposal_head                     = inputs.proposal_head;
     impl->features                          = inputs.features;
     impl->gpu_timing                        = inputs.gpu_timing;
@@ -647,12 +648,14 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
 std::unique_ptr<qwen3_5::detail::SequencePlannerImpl>
 make_sequence_planner_impl(std::shared_ptr<const execution::ModelProfile> profile,
                            DeviceContext& device, const EngineOptions& options,
-                           std::shared_ptr<const moe::Plan> moe) {
+                           std::shared_ptr<const moe::Plan> moe,
+                           std::span<const std::uint32_t> target_widths) {
     validate_target_options(*profile, device, options);
     SequencePlanningInputs inputs{
         .batch_execution = std::make_shared<const BatchExecutionPlan>(make_batch_execution_spec(
             options.max_concurrency, 1,
             options.use_cuda_graph && options.purpose == EnginePurpose::Generation)),
+        .target_widths   = {target_widths.begin(), target_widths.end()},
         .profile         = std::move(profile),
         .moe             = std::move(moe),
         .capacity        = options.max_context,
@@ -719,8 +722,9 @@ make_sequence_planner_impl(std::shared_ptr<const execution::ModelProfile> profil
 std::unique_ptr<SequencePlanImpl>
 make_graph_probe_plan(std::shared_ptr<const execution::ModelProfile> profile, DeviceContext& device,
                       const EngineOptions& options, std::shared_ptr<const moe::Plan> moe,
-                      GraphProbeBacking backing) {
-    auto planner = make_sequence_planner_impl(std::move(profile), device, options, std::move(moe));
+                      std::span<const std::uint32_t> target_widths, GraphProbeBacking backing) {
+    auto planner = make_sequence_planner_impl(std::move(profile), device, options, std::move(moe),
+                                              target_widths);
     auto inputs  = std::move(planner->inputs);
     inputs.context_cache.host_capacity_bytes = 0;
     const auto& records                      = planner->capacity_plan.records;

@@ -50,6 +50,18 @@ int main() {
                           discrete.metadata_budget_bytes == metadata(10) &&
                           discrete.control_reservation_bytes == metadata(10),
                       "discrete Device budget charged Host directory bytes");
+    const auto graph_capacity = [&](std::size_t reserve) {
+        return resolve_context_capacity(ContextCapacityPolicy::automatic(), plan,
+                                        100 + 198 * block / 10 - reserve, SIZE_MAX, false)
+            .device_bytes;
+    };
+    const auto narrow   = graph_capacity(9 * block / 10);
+    const auto baseline = graph_capacity(block / 10);
+    failures += check(narrow == 18 * block && baseline == 19 * block &&
+                          !keeps_context_capacity(narrow, graph_capacity(0)) &&
+                          !keeps_context_capacity(narrow, baseline) &&
+                          keeps_context_capacity(19 * block, 20 * block),
+                      "narrow graph gate missed a block-rounded loss above 5% or rejected 5%");
     const auto explicit_bytes = 3 * block + 500;
     const auto explicit_capacity =
         resolve_context_capacity(ContextCapacityPolicy::explicit_capacity(explicit_bytes), plan,

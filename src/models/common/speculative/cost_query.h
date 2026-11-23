@@ -22,6 +22,14 @@ inline CostQuery route_query(const RoundRoute& route, std::uint32_t rows,
             .head_columns   = route.head_columns};
 }
 
+inline void use_proposal_cost(CostQuery& target, const CostQuery& proposal) {
+    target.mtp_steps               = proposal.mtp_steps;
+    target.head_columns            = proposal.head_columns;
+    target.active_proposal_rows    = proposal.active_proposal_rows;
+    target.max_owner_proposal_rows = proposal.max_owner_proposal_rows;
+    target.proposal_bucket         = proposal.proposal_bucket;
+}
+
 inline ops::ContextBucket visible_bucket(std::uint32_t frontier, std::uint64_t extra,
                                          std::uint32_t max_context) {
     const auto tokens = std::min<std::uint64_t>(

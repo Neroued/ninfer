@@ -1,5 +1,6 @@
 #include "models/glm5next/parallel/preparation.h"
 #include "models/glm5next/program/resources.h"
+#include "models/glm5next/work.h"
 #include "core/platform.h"
 
 #include <algorithm>
@@ -190,6 +191,16 @@ void dflash_storage() {
     std::array placement{glm::describe_state(plans[0].state), glm::describe_state(plans[1].state)};
     constexpr std::size_t cyclic_bytes = 5ULL * 2048 * 4 * 128 * 4;
     for (const auto& plan : plans) {
+        auto selected                  = plan.shape;
+        selected.narrow_dflash_targets = true;
+        const auto baseline            = glm::make_decode_routes(plan.shape, *plan.batches);
+        const auto narrow              = glm::make_decode_routes(selected, *plan.batches);
+        for (const auto shape : plan.batches->graph_shapes()) {
+            require(baseline->select_route(shape, selected.speculative, 1).width == 8 &&
+                        narrow->select_route(shape, selected.speculative, 1).width == 4 &&
+                        narrow->select_route(shape, selected.speculative, 4).width == 8,
+                    "GLM target catalog disagrees with the resolved execution shape");
+        }
         require(plan.state.common.image_bytes == ordinary.state.common.image_bytes + cyclic_bytes &&
                     plan.state.owner.image_bytes == ordinary.state.owner.image_bytes + cyclic_bytes,
                 "DFlash history was not included in both State placement variants");

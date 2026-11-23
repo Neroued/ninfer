@@ -91,13 +91,13 @@ struct CapacityOwner {
     for (const auto& set : plan.working_sets) {
         const auto required = geometry.required_bytes(set.records);
         if (required > available)
-            throw std::invalid_argument("Context rank " + std::to_string(rank) +
-                                        " cannot hold startup working set '" + set.name +
-                                        "': requires " + std::to_string(required) +
-                                        " backing bytes, available " + std::to_string(available));
+            throw ContextBudgetError("Context rank " + std::to_string(rank) +
+                                     " cannot hold startup working set '" + set.name +
+                                     "': requires " + std::to_string(required) +
+                                     " backing bytes, available " + std::to_string(available));
     }
-    throw std::invalid_argument("Context rank " + std::to_string(rank) +
-                                " capacity and directory metadata exceed the memory budget");
+    throw ContextBudgetError("Context rank " + std::to_string(rank) +
+                             " capacity and directory metadata exceed the memory budget");
 }
 
 } // namespace
@@ -142,16 +142,16 @@ resolve_group_context_capacity(const ContextCapacityPolicy& policy,
             insufficient(rank, offer.plan, geometry, std::min(selected, usable));
         if (!offer.shared_physical_memory &&
             offer.plan.fixed_host_bytes > offer.available_host_bytes)
-            throw std::invalid_argument("Context rank " + std::to_string(rank) +
-                                        " fixed Host resources exceed available RAM");
+            throw ContextBudgetError("Context rank " + std::to_string(rank) +
+                                     " fixed Host resources exceed available RAM");
         owners.push_back({offer, std::move(geometry), minimum, usable, selected});
         metadata_total = checked_add(metadata_total, owners.back().metadata(selected));
     }
     if (control_memory_owner) {
         const auto& control = owners[*control_memory_owner];
         if (metadata_total > control.metadata_capacity(control.selected))
-            throw std::invalid_argument("Context rank " + std::to_string(*control_memory_owner) +
-                                        " directory metadata exceeds its available memory");
+            throw ContextBudgetError("Context rank " + std::to_string(*control_memory_owner) +
+                                     " directory metadata exceeds its available memory");
     }
 
     if (policy.mode == ContextCapacityMode::Automatic) {

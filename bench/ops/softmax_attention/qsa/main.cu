@@ -85,7 +85,7 @@ void measure_prepare(const qsa::Options& options, DeviceContext& device, L2Flush
 
 void measure_indexer(const qsa::Options& options, DeviceContext& device, L2FlushBuffer& flush) {
     measurement::Csv csv(options.timing.csv_out,
-                         std::string("contexts,context_capacity,score_pattern,round,") +
+                         std::string("contexts,bucket,context_capacity,score_pattern,round,") +
                              qsa::Metrics::columns);
     for (int tokens : options.tokens) {
         qsa::IndexerFixture fixture(options, tokens, device.execution_view());
@@ -97,7 +97,8 @@ void measure_indexer(const qsa::Options& options, DeviceContext& device, L2Flush
         row.qk_heads        = 4;
         row.valid           = qsa::csv_list(fixture.lengths);
         row.workspace_bytes = fixture.workspace_bytes;
-        const auto metrics  = qsa::indexer_metrics(tokens, fixture.contexts, fixture.lengths);
+        const auto metrics  = qsa::indexer_metrics(tokens, fixture.contexts, fixture.lengths,
+                                                   fixture.shared_prefix_tokens);
         for (int round = 0; round < options.rounds; ++round)
             for (const auto& execution :
                  measurement::selections(options.timing.execution, "graph", "eager"))
@@ -109,7 +110,8 @@ void measure_indexer(const qsa::Options& options, DeviceContext& device, L2Flush
                     row.workspace_peak = fixture.workspace->peak_used();
                     csv.write(row, result, execution, cache,
                               qsa::csv_list(fixture.contexts) + "," +
-                                  std::to_string(fixture.envelope.max_visible_tokens) + "," +
+                                  std::string(ops::context_bucket_name(fixture.bucket)) + "," +
+                                  std::to_string(ops::context_bucket_tokens(fixture.bucket)) + "," +
                                   options.score_pattern + "," + std::to_string(round) + "," +
                                   metrics.csv(result.gpu.median_us));
                 }

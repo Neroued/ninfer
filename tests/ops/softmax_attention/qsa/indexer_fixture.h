@@ -6,6 +6,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <optional>
+#include <span>
 #include <vector>
 
 namespace ninfer::test::qsa::indexer {
@@ -28,7 +30,7 @@ inline std::uint16_t sample(std::uint32_t seed, Pattern pattern) {
 }
 
 struct Fixture {
-    int T, B, history, pages_per_row, pages, table_width = 4096, table_stride;
+    int T, B, history, pages_per_row, pages, table_width, table_stride;
     Pattern pattern;
     std::int64_t key_row_stride, key_page_stride;
     std::vector<std::uint16_t> q_host, k_host;
@@ -40,16 +42,20 @@ struct Fixture {
     ops::QsaBatchView batch;
     ops::QsaBlockSelection selected;
     Tensor query;
-    ops::QsaIndexerExecutionEnvelope envelope{262144};
+    ops::ContextBucket bucket;
 
-    Fixture(int tokens, int batch_size, int max_history, int layout, Pattern values)
+    Fixture(int tokens, int batch_size, int max_history, int layout, Pattern values,
+            std::optional<ops::ContextBucket> bucket_override = {}, int page_table_width = 0)
         : T(tokens), B(batch_size), history(max_history), pages_per_row((history + 63) / 64),
-          pages(pages_per_row * B + 2), table_stride(table_width), pattern(values),
-          key_row_stride(128), key_page_stride(16 * key_row_stride),
-          q_host(std::size_t(512) * T * B), k_host(key_page_stride * pages), positions(T * B),
-          valid(B), table_rows(B), tables(table_stride * (B + 2)), q(q_host.size() * 2),
-          pos(positions.size() * 4), lengths(B * 4), rows(B * 4), table(tables.size() * 8),
-          ids(std::size_t(512) * T * B * 4), counts(std::size_t(T) * B * 4) {
+          pages(pages_per_row * B + 2),
+          table_width(page_table_width ? page_table_width : std::max(1, pages_per_row)),
+          table_stride(table_width), pattern(values), key_row_stride(128),
+          key_page_stride(16 * key_row_stride), q_host(std::size_t(512) * T * B),
+          k_host(key_page_stride * pages), positions(T * B), valid(B), table_rows(B),
+          tables(table_stride * (B + 2)), q(q_host.size() * 2), pos(positions.size() * 4),
+          lengths(B * 4), rows(B * 4), table(tables.size() * 8), ids(std::size_t(512) * T * B * 4),
+          counts(std::size_t(T) * B * 4),
+          bucket(bucket_override.value_or(ops::select_context_bucket(max_history))) {
         query  = Tensor(q.span(), DType::BF16, {128, 4, T, B});
         packed = std::make_unique<tool::PackedKVFixture>(
             q.device(), KVPageGeometry{64, {{DType::BF16, 128, 1, layout ? 2u : 256u, 4}}}, pages);
@@ -62,10 +68,7 @@ struct Fixture {
     }
 
     void reset(int phase, bool all_empty = false) {
-        std::fill(k_host.begin(), k_host.end(), 0x7fc1);
-        std::fill(q_host.begin(), q_host.end(), 0x7fc1);
-        std::fill(tables.begin(), tables.end(), -1);
-        std::fill(positions.begin(), positions.end(), -1);
+        std::vector<int> contexts(B), lengths_host(B);
         for (int b = 0; b < B; ++b) {
             int end = history;
             int n   = std::min(T, end);
@@ -87,11 +90,23 @@ struct Fixture {
                     break;
                 }
             }
-            if (all_empty) n = 0;
+            contexts[b]     = end;
+            lengths_host[b] = all_empty ? 0 : n;
+        }
+        reset(phase, contexts, lengths_host);
+    }
+
+    void reset(int phase, std::span<const int> contexts, std::span<const int> lengths_host) {
+        std::fill(k_host.begin(), k_host.end(), 0x7fc1);
+        std::fill(q_host.begin(), q_host.end(), 0x7fc1);
+        std::fill(tables.begin(), tables.end(), -1);
+        std::fill(positions.begin(), positions.end(), -1);
+        for (int b = 0; b < B; ++b) {
+            const int end = contexts[b], n = lengths_host[b];
             valid[b]      = n;
             const int row = 1 + (B - 1 - b + phase) % B;
             table_rows[b] = n ? row : -1;
-            for (int page = 0; page < pages_per_row; ++page) {
+            for (int page = 0; page < (n ? (end + 63) / 64 : 0); ++page) {
                 const int physical = (pages - 1 - (b * pages_per_row + page) + phase * 17) % pages;
                 tables[row * table_stride + page] = physical;
                 for (int r = 0; r < 16; ++r) {
@@ -137,7 +152,7 @@ struct Fixture {
     }
 
     void launch(MemoryArena& workspace, CudaExecutionView execution) {
-        ops::qsa_indexer(query, cache, batch, envelope, workspace, selected, execution);
+        ops::qsa_indexer(query, cache, batch, bucket, workspace, selected, execution);
     }
 };
 } // namespace ninfer::test::qsa::indexer

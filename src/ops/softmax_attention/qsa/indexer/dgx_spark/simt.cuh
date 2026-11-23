@@ -4,16 +4,15 @@
 
 namespace ninfer::ops::detail::qsa {
 template <int Lanes, int Threads, bool Vector, int MaxQueries = 64>
-__global__ __launch_bounds__(Threads) void indexer_score_simt_kernel(
-    const __grid_constant__ IndexerArguments a) {
-    __shared__ IndexerJobs<MaxQueries> jobs;
+__device__ __forceinline__ void indexer_score_simt(const IndexerArguments& a, int worker,
+                                                   int stride, IndexerJobs<MaxQueries>& jobs) {
     if (!jobs.template build<1, kIndexerKeyTile>(a)) return;
     constexpr int D = 128 / Lanes, Groups = Threads / Lanes;
     const int lane = threadIdx.x % Lanes, group = threadIdx.x / Lanes;
     const unsigned mask = (0xffffffffu >> (32 - Lanes)) << ((threadIdx.x % 32) / Lanes * Lanes);
     float q[4][D];
     int previous = -1;
-    for (int job = blockIdx.x; job < jobs.prefix[jobs.groups]; job += gridDim.x) {
+    for (int job = worker; job < jobs.prefix[jobs.groups]; job += stride) {
         const int slot = jobs.group_for(job), b = slot / a.width;
         const int g0 = (job - jobs.prefix[slot]) * kIndexerKeyTile;
         if (slot != previous) {
@@ -54,5 +53,16 @@ __global__ __launch_bounds__(Threads) void indexer_score_simt_kernel(
             if (lane == 0) a.scores[std::int64_t(slot) * a.columns + g] = value;
         }
     }
+}
+
+template <int Lanes, int Threads, bool Vector, int MaxQueries = 64, bool BatchedLoop = false>
+__global__
+__launch_bounds__(Threads, (!BatchedLoop && Lanes == 16) ? 8 : 1) void indexer_score_simt_kernel(
+    const __grid_constant__ IndexerArguments a) {
+    __shared__ IndexerJobs<MaxQueries> jobs;
+    for_each_indexer_job_group<MaxQueries, BatchedLoop>(
+        a, [&](const auto& group, int worker, int stride) {
+            indexer_score_simt<Lanes, Threads, Vector>(group, worker, stride, jobs);
+        });
 }
 } // namespace ninfer::ops::detail::qsa

@@ -11,48 +11,6 @@
 
 namespace ninfer::ops::detail::qsa {
 namespace {
-void launch_finish(IndexerArguments args, cudaStream_t stream) {
-    const auto submit = [&]<int Parts>() {
-        indexer_finish_kernel<kIndexerPartition, 6, 2, Parts>
-            <<<args.width * args.batch, 256, 0, stream>>>(args);
-    };
-    switch (args.partitions) {
-    case 0:
-    case 1:
-        return submit.template operator()<1>();
-    case 2:
-        return submit.template operator()<2>();
-    case 3:
-        return submit.template operator()<3>();
-    case 4:
-        return submit.template operator()<4>();
-    case 5:
-        return submit.template operator()<5>();
-    case 6:
-        return submit.template operator()<6>();
-    case 7:
-        return submit.template operator()<7>();
-    case 8:
-        return submit.template operator()<8>();
-    case 9:
-        return submit.template operator()<9>();
-    case 10:
-        return submit.template operator()<10>();
-    case 11:
-        return submit.template operator()<11>();
-    case 12:
-        return submit.template operator()<12>();
-    case 13:
-        return submit.template operator()<13>();
-    case 14:
-        return submit.template operator()<14>();
-    case 15:
-        return submit.template operator()<15>();
-    default:
-        return submit.template operator()<16>();
-    }
-}
-
 template <int Tile, bool Vector, int Stages, bool RetainKeys = false, int MapCapacity = 32>
 void launch_score(IndexerArguments args, IndexerWindowPlan plan, cudaStream_t stream) {
     constexpr int threads = Tile > 16 ? Tile * 8 : 128;
@@ -65,11 +23,15 @@ void launch_score(IndexerArguments args, IndexerWindowPlan plan, cudaStream_t st
 template <bool Vector>
 void launch_score(IndexerArguments args, IndexerWindowPlan plan, cudaStream_t stream) {
     if (plan.score == IndexerScore::Simt16) {
-        if (args.width * args.batch > 64)
-            indexer_score_simt_kernel<16, 128, Vector, kIndexerMaxWindowQueries>
+        const int slots = args.width * args.batch;
+        if (slots > kIndexerMaxWindowQueries)
+            indexer_score_simt_kernel<16, 128, Vector, kIndexerMaxWindowQueries, true>
+                <<<plan.score_workers, 128, 0, stream>>>(args);
+        else if (slots > 64)
+            indexer_score_simt_kernel<16, 128, Vector, kIndexerMaxWindowQueries, false>
                 <<<plan.score_workers, 128, 0, stream>>>(args);
         else
-            indexer_score_simt_kernel<16, 128, Vector>
+            indexer_score_simt_kernel<16, 128, Vector, 64, false>
                 <<<plan.score_workers, 128, 0, stream>>>(args);
         return;
     }
@@ -125,28 +87,39 @@ void launch_score(IndexerArguments args, IndexerWindowPlan plan, cudaStream_t st
 
 void launch_window(IndexerArguments args, IndexerWindowPlan plan, bool vector_cache,
                    const CUtensorMap* map, CudaExecutionView execution) {
+    const auto stream = execution.stream();
+    if (args.partitions == 0) {
+        launch_indexer_select_all(args, plan.select_workers, stream);
+        return;
+    }
     if (plan.score == IndexerScore::Tma) {
         const int shared =
             common::prepare_shared<kIndexerTmaSharedBytes, indexer_score_tma_kernel, true>();
-        indexer_score_tma_kernel<<<plan.score_workers, 128, shared, execution.stream()>>>(args,
-                                                                                          *map);
+        indexer_score_tma_kernel<<<plan.score_workers, 128, shared, stream>>>(args, *map);
     } else if (vector_cache)
-        launch_score<true>(args, plan, execution.stream());
+        launch_score<true>(args, plan, stream);
     else
-        launch_score<false>(args, plan, execution.stream());
-    const auto partition = [&]<int Queries>() {
+        launch_score<false>(args, plan, stream);
+    if (args.partitions == 1) {
+        launch_indexer_single_select<6, 2>(args, plan.select_workers, stream);
+        return;
+    }
+    const auto partition = [&]<int Queries, bool BatchedLoop>() {
         if (plan.reverse_selection)
-            indexer_partition_kernel<kIndexerPartition, 6, 2, 4, Queries, true>
-                <<<plan.select_workers, 256, 0, execution.stream()>>>(args);
+            indexer_partition_kernel<kIndexerPartition, 6, 2, 4, Queries, true, BatchedLoop>
+                <<<plan.select_workers, 256, 0, stream>>>(args);
         else
-            indexer_partition_kernel<kIndexerPartition, 6, 2, 4, Queries>
-                <<<plan.select_workers, 256, 0, execution.stream()>>>(args);
+            indexer_partition_kernel<kIndexerPartition, 6, 2, 4, Queries, false, BatchedLoop>
+                <<<plan.select_workers, 256, 0, stream>>>(args);
     };
-    if (args.width * args.batch <= 64)
-        partition.template operator()<64>();
+    const int slots = args.width * args.batch;
+    if (slots <= 64)
+        partition.template operator()<64, false>();
+    else if (slots <= kIndexerMaxWindowQueries)
+        partition.template operator()<kIndexerMaxWindowQueries, false>();
     else
-        partition.template operator()<128>();
-    launch_finish(args, execution.stream());
+        partition.template operator()<kIndexerMaxWindowQueries, true>();
+    launch_indexer_finish<6, 2>(args, stream);
 }
 } // namespace
 

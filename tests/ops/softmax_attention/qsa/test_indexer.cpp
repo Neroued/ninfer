@@ -1,9 +1,12 @@
 #include "ops/suite.h"
+#include "ops/graph_patch_check.h"
 #include "kv_cache_storage.h"
 #include "indexer_fixture.h"
 #include "cuda_fixture.h"
 #include "core/buffer.h"
 #include "core/decode_graph.h"
+
+#include <cuda.h>
 
 #include <initializer_list>
 #include <numeric>
@@ -12,6 +15,7 @@
 using namespace ninfer;
 using namespace ninfer::test;
 using namespace ninfer::test::qsa::indexer;
+using ops::ContextBucket;
 
 namespace {
 // Fixed score-error criterion over represented inputs: 128-term dot products, ReLU and
@@ -131,12 +135,11 @@ int verify(Fixture& f, const std::string& label, bool preserved = true) {
 }
 
 int run(DeviceContext& device, int t, int b, int history, int layout, Pattern pattern,
-        bool replay = false, std::uint32_t capacity = 262144) {
-    Fixture f(t, b, history, layout, pattern);
-    f.envelope.max_visible_tokens = capacity;
-    const auto bytes              = ops::qsa_indexer_workspace_capacity_bytes(1, t, b, f.envelope);
+        bool replay = false, std::optional<ContextBucket> bucket = {}, int table_width = 0) {
+    Fixture f(t, b, history, layout, pattern, bucket, table_width);
+    const auto bytes = ops::qsa_indexer_workspace_capacity_bytes(f.bucket, b, 1, t);
     GuardedDeviceBuffer scratch(std::max<std::size_t>(256, bytes));
-    MemoryArena workspace(scratch.span().subspan(0, std::max<std::size_t>(256, bytes)));
+    MemoryArena workspace(scratch.span().subspan(0, bytes));
     DecodeGraphDefinition definition;
     DecodeGraphExecutable graph;
     int failures     = 0;
@@ -167,46 +170,73 @@ int run(DeviceContext& device, int t, int b, int history, int layout, Pattern pa
     return failures;
 }
 
-int graph_update(DeviceContext& device) {
-    Fixture f(65, 1, 262144, 1, Pattern::Dyadic);
-    const auto bytes = ops::qsa_indexer_workspace_capacity_bytes(65, 65, 1, {262144});
+int flat_graph_patch(DeviceContext& device) {
+    constexpr int B = 4, T = 4;
+    constexpr ops::ContextBucketRange buckets{ContextBucket::K2, ContextBucket::K256};
+    Fixture f(T, B, 262144, 0, Pattern::Dyadic);
+    const auto bytes = ops::qsa_indexer_workspace_capacity_bytes(buckets, B, T, T);
     GuardedDeviceBuffer scratch(bytes);
     MemoryArena workspace(scratch.span());
-    DecodeGraphExecutable graph;
-    int failures = 0;
-    for (std::uint32_t bound : {0u, 2051u, 2052u, 8192u, 32768u, 65540u, 131076u, 262144u, 2051u}) {
-        f.history                     = std::max(1u, bound);
-        f.envelope.max_visible_tokens = bound;
-        f.reset(0, bound == 0);
-        DecodeGraphDefinition definition;
-        definition.capture(device.stream(), [&] { f.launch(workspace, device.execution_view()); });
-        if (graph.ready())
-            graph.update(definition);
-        else
-            graph.instantiate(definition);
-        graph.launch(device.stream());
-        device.synchronize();
-        failures += verify(f, "indexer graph update bound=" + std::to_string(bound));
-        failures += scratch.verify_guards("indexer graph workspace");
-        if (workspace.used() != 0 || workspace.peak_used() > bytes) ++failures;
-        if (failures) return failures;
+    const auto cuda = device.execution_view();
+    std::vector<CapturedKernelSequence> captures;
+    std::vector<ops::OpGraphProfile> profiles;
+    buckets.for_each([&](ContextBucket bucket) {
+        f.bucket = bucket;
+        captures.emplace_back(cuda, [&](auto execution) { f.launch(workspace, execution); });
+        profiles.push_back(
+            ops::qsa_indexer_graph_profile(bucket, B, T, cuda.multiprocessor_count()));
+    });
+    for (std::size_t i = 0; i < captures.size(); ++i) {
+        if (captures[i].params().size() != 3) {
+            std::cerr << "expected three kernel nodes in every captured bucket\n";
+            return 1;
+        }
+        if (std::find(profiles.begin(), profiles.begin() + i, profiles[i]) !=
+            profiles.begin() + i) {
+            std::cerr << "buckets with different launch parameters shared a profile\n";
+            return 1;
+        }
     }
-    return failures;
+
+    constexpr std::array hops{ContextBucket::K2,  ContextBucket::K8,   ContextBucket::K16,
+                              ContextBucket::K64, ContextBucket::K256, ContextBucket::K16,
+                              ContextBucket::K2,  ContextBucket::K32,  ContextBucket::K128};
+    for (bool whole_graph : {false, true}) {
+        FlatGraphPatchHarness harness(captures.front());
+        for (const auto bucket : hops) {
+            const auto index = static_cast<std::size_t>(bucket);
+            const int limit  = ops::context_bucket_tokens(bucket);
+            const std::array contexts{0, 384, std::min(limit, 2400),
+                                      bucket == ContextBucket::K64 ? 40000 : limit};
+            const std::array lengths{0, 3, 1, 4};
+            f.reset(index, contexts, lengths);
+            if (whole_graph)
+                harness.update_whole_graph_and_launch(captures[index], cuda);
+            else
+                harness.patch_and_launch(captures[index], cuda);
+            device.synchronize();
+            const auto label = std::string(whole_graph ? "whole graph update " : "node patch ") +
+                               std::string(ops::context_bucket_name(bucket));
+            if (const int failures = verify(f, label); failures) return failures;
+        }
+    }
+    return scratch.verify_guards("flat graph workspace") + (workspace.used() != 0) +
+           (workspace.peak_used() != bytes);
 }
 
-int batched_graph_update(DeviceContext& device, int tokens, int batch, int history_limit,
-                         Pattern pattern, std::initializer_list<std::uint32_t> bounds) {
-    Fixture f(tokens, batch, history_limit, 0, pattern);
-    const auto capacity = *std::max_element(bounds.begin(), bounds.end());
-    const auto bytes    = ops::qsa_indexer_workspace_capacity_bytes(f.T, f.T, f.B, {capacity});
+int graph_update(DeviceContext& device, int tokens, int batch, int history_limit, int layout,
+                 Pattern pattern, std::initializer_list<int> histories) {
+    Fixture f(tokens, batch, history_limit, layout, pattern);
+    const auto bytes = ops::qsa_indexer_workspace_capacity_bytes(
+        ops::ContextBucketRange::through(history_limit), batch, tokens, tokens);
     GuardedDeviceBuffer scratch(bytes);
     MemoryArena workspace(scratch.span());
     DecodeGraphExecutable graph;
     int failures = 0;
-    for (const auto bound : bounds) {
-        f.history                     = std::max(1U, std::min(bound, std::uint32_t(history_limit)));
-        f.envelope.max_visible_tokens = bound;
-        f.reset(1, bound == 0);
+    for (const int history : histories) {
+        f.history = history;
+        f.bucket  = ops::select_context_bucket(history);
+        f.reset(batch > 1 ? 1 : 0, history == 0);
         DecodeGraphDefinition definition;
         definition.capture(device.stream(), [&] { f.launch(workspace, device.execution_view()); });
         if (graph.ready())
@@ -215,8 +245,8 @@ int batched_graph_update(DeviceContext& device, int tokens, int batch, int histo
             graph.instantiate(definition);
         graph.launch(device.stream());
         device.synchronize();
-        failures += verify(f, "batched indexer graph update bound=" + std::to_string(bound));
-        failures += scratch.verify_guards("batched indexer graph workspace");
+        failures += verify(f, "indexer graph update history=" + std::to_string(history));
+        failures += scratch.verify_guards("indexer graph workspace");
         if (workspace.used() || workspace.peak_used() > bytes) ++failures;
         if (failures) return failures;
     }
@@ -267,7 +297,7 @@ int read_footprint(DeviceContext& device) {
     }
     ninfer::DeviceBuffer workspace_storage(
         ninfer::test::cuda_environment().context.device(),
-        ops::qsa_indexer_workspace_capacity_bytes(f.T, f.T, f.B, f.envelope));
+        ops::qsa_indexer_workspace_capacity_bytes(f.bucket, f.B, f.T, f.T));
     MemoryArena workspace(workspace_storage.span());
     f.launch(workspace, device.execution_view());
     device.synchronize();
@@ -286,82 +316,177 @@ int rejects(F&& call) {
 int validation(DeviceContext& device) {
     Fixture f(1, 1, 4, 0, Pattern::Dyadic);
     f.reset(0);
-    ninfer::DeviceBuffer workspace_storage(
-        ninfer::test::cuda_environment().context.device(),
-        ops::qsa_indexer_workspace_capacity_bytes(1, 1, 1, f.envelope));
-    MemoryArena workspace(workspace_storage.span());
+    const auto cuda = device.execution_view();
+    MemoryArena workspace({nullptr, 0, cuda.device()});
+    constexpr auto k2 = ContextBucket::K2;
     int failures =
-        rejects([&] { (void)ops::qsa_indexer_workspace_capacity_bytes(2, 1, 1, f.envelope); });
-    auto original = f.query;
+        rejects([&] { (void)ops::qsa_indexer_workspace_capacity_bytes(k2, 1, 2, 1); }) +
+        rejects([&] { (void)ops::qsa_indexer_workspace_capacity_bytes(k2, 1, 0, 1); }) +
+        rejects([&] { (void)ops::qsa_indexer_workspace_capacity_bytes(k2, 0, 1, 1); }) +
+        rejects([&] {
+            (void)ops::qsa_indexer_workspace_capacity_bytes({ContextBucket::K8, k2}, 1, 1, 1);
+        }) +
+        rejects([&] { (void)ops::qsa_indexer_graph_profile(k2, 1, 1, 0); }) +
+        rejects([&] { (void)ops::qsa_indexer_graph_profile(k2, 1, 0, 1); }) +
+        rejects([&] { (void)ops::qsa_indexer_graph_profile(k2, 0, 1, 1); });
+    const auto original = f.query;
     f.query.nb[1] += 2;
-    failures += rejects([&] { f.launch(workspace, device.execution_view()); });
-    f.query                   = original;
+    failures += rejects([&] { f.launch(workspace, cuda); });
+    f.query = original;
+    for (int axis : {2, 3}) {
+        f.query.ne[axis] = 0;
+        failures += rejects([&] { f.launch(workspace, cuda); });
+        f.query = original;
+    }
     auto output               = f.selected.block_ids;
     f.selected.block_ids.data = f.query.data;
-    failures += rejects([&] { f.launch(workspace, device.execution_view()); });
-    f.selected.block_ids          = output;
-    f.envelope.max_visible_tokens = 262145;
-    failures += rejects([&] { f.launch(workspace, device.execution_view()); });
-    f.envelope.max_visible_tokens = 0;
-    f.reset(0, true);
-    if (ops::qsa_indexer_workspace_capacity_bytes(1, 1, 1, f.envelope) != 0) ++failures;
-    ninfer::DeviceBuffer empty_storage(ninfer::test::cuda_environment().context.device(), 256);
-    MemoryArena empty(empty_storage.span());
-    f.launch(empty, device.execution_view());
+    failures += rejects([&] { f.launch(workspace, cuda); });
+    f.selected.block_ids = output;
+    for (int axis : {0, 1}) {
+        auto& table      = f.cache.keys.records.page_offsets;
+        const auto shape = table.ne[axis];
+        table.ne[axis]   = 0;
+        failures += rejects([&] { f.launch(workspace, cuda); });
+        table.ne[axis] = shape;
+    }
+    for (const auto bucket : {ContextBucket::K512, ContextBucket::M1, ContextBucket{255}}) {
+        f.bucket = bucket;
+        failures += rejects([&] { f.launch(workspace, cuda); });
+        failures +=
+            rejects([&] { (void)ops::qsa_indexer_workspace_capacity_bytes(bucket, 1, 1, 1); });
+        failures += rejects([&] { (void)ops::qsa_indexer_graph_profile(bucket, 1, 1, 1); });
+    }
+    return failures;
+}
+
+int zero_workspace(DeviceContext& device) {
+    Fixture f(4, 3, 2048, 0, Pattern::Dyadic);
+    f.reset(0, std::array{2048, 191, 0}, std::array{4, 2, 0});
+    const auto cuda = device.execution_view();
+    MemoryArena workspace({nullptr, 0, cuda.device()});
+    if (ops::qsa_indexer_workspace_capacity_bytes(f.bucket, f.B, 1, f.T) != 0) return 1;
+
+    // Device VA with no mapping makes any accidental Q, key or table read fault.
+    CUmemAllocationProp properties{};
+    properties.type         = CU_MEM_ALLOCATION_TYPE_PINNED;
+    properties.location     = {CU_MEM_LOCATION_TYPE_DEVICE, cuda.device().index()};
+    std::size_t granularity = 0;
+    if (cuInit(0) != CUDA_SUCCESS ||
+        cuMemGetAllocationGranularity(&granularity, &properties,
+                                      CU_MEM_ALLOC_GRANULARITY_MINIMUM) != CUDA_SUCCESS)
+        throw std::runtime_error("unable to query device VA granularity for K2");
+    const auto bytes =
+        std::max({f.query.bytes(), f.packed->storage().bytes,
+                  f.cache.keys.records.page_offsets.bytes(), f.batch.table_rows.bytes()});
+
+    struct Reservation {
+        CUdeviceptr address = 0;
+        std::size_t bytes;
+
+        ~Reservation() {
+            if (address) (void)cuMemAddressFree(address, bytes);
+        }
+    } reserved{0, ((bytes + granularity - 1) / granularity) * granularity};
+
+    if (cuMemAddressReserve(&reserved.address, reserved.bytes, 0, 0, 0) != CUDA_SUCCESS)
+        throw std::runtime_error("unable to reserve unmapped device addresses for K2");
+    auto* unreadable                       = reinterpret_cast<void*>(reserved.address);
+    f.query.data                           = unreadable;
+    f.cache.keys.records.storage.data      = unreadable;
+    f.cache.keys.records.page_offsets.data = unreadable;
+    f.batch.table_rows.data                = unreadable;
+    f.launch(workspace, cuda);
     device.synchronize();
-    failures += verify(f, "zero envelope");
-    failures += empty.peak_used() != 0;
+    return verify(f, "K2 with unreadable scoring operands", false) + (workspace.peak_used() != 0);
+}
+
+int single_partition_workspace(DeviceContext& device) {
+    int failures = 0;
+    for (const auto bucket : {ContextBucket::K8, ContextBucket::K16}) {
+        const int history = ops::context_bucket_tokens(bucket);
+        Fixture f(4, 3, history, 0, Pattern::Dyadic, bucket);
+        const auto bytes = ops::qsa_indexer_workspace_capacity_bytes(bucket, f.B, 1, f.T);
+        if (bytes != std::size_t(history / 4) * f.B * f.T * sizeof(float)) {
+            std::cerr << "single-partition workspace must contain only scores\n";
+            return 1;
+        }
+        GuardedDeviceBuffer scratch(bytes);
+        MemoryArena workspace(scratch.span());
+        f.reset(0, std::array{0, 384, history}, std::array{0, 3, 4});
+        f.launch(workspace, device.execution_view());
+        device.synchronize();
+        failures += verify(f, "single-partition workspace");
+        failures += scratch.verify_guards("scores-only workspace");
+        failures += workspace.used() != 0 || workspace.peak_used() != bytes;
+    }
     return failures;
 }
 } // namespace
 
 int main(int argc, char** argv) {
     OpSuite suite;
-    suite.add("qsa_indexer/graph_update", [] { return graph_update(cuda_environment().context); },
+    suite.add("qsa_indexer/flat_graph_patch",
+              [] { return flat_graph_patch(cuda_environment().context); },
+              {{"execution", "graph"}});
+    suite.add("qsa_indexer/graph_update",
+              [] {
+                  return graph_update(cuda_environment().context, 129, 1, 262144, 1,
+                                      Pattern::Dyadic,
+                                      {0, 2048, 2052, 8192, 32768, 65540, 131076, 262144, 2051});
+              },
               {{"execution", "graph"}});
     suite.add("qsa_indexer/batched_graph_update/t1/b129",
               [] {
-                  return batched_graph_update(cuda_environment().context, 1, 129, 4096,
-                                              Pattern::Dyadic, {0, 2051, 65536, 2052, 0, 4096});
+                  return graph_update(cuda_environment().context, 1, 129, 16388, 0, Pattern::Dyadic,
+                                      {0, 2051, 16388, 2052, 0, 4096});
               },
               {{"execution", "graph"}, {"suite", "concurrency"}});
     suite.add("qsa_indexer/batched_graph_update/t4/b17",
               [] {
-                  return batched_graph_update(cuda_environment().context, 4, 17, 16388,
-                                              Pattern::Dense, {0, 2051, 65536, 16384, 0, 4096});
+                  return graph_update(cuda_environment().context, 4, 17, 16388, 0, Pattern::Dense,
+                                      {0, 2051, 16388, 16384, 0, 4096});
               },
               {{"execution", "graph"}, {"suite", "concurrency"}});
     suite.add("qsa_indexer/contract", [] { return validation(cuda_environment().context); });
     suite.add("qsa_indexer/read_footprint",
               [] { return read_footprint(cuda_environment().context); });
+    suite.add("qsa_indexer/k2_small_page_table", [] {
+        return run(cuda_environment().context, 4, 1, 192, 0, Pattern::Dyadic, false,
+                   ContextBucket::K2, 4);
+    });
+    suite.add("qsa_indexer/k2_zero_workspace",
+              [] { return zero_workspace(cuda_environment().context); });
+    suite.add("qsa_indexer/single_partition_workspace",
+              [] { return single_partition_workspace(cuda_environment().context); });
     const auto add = [&](int t, int b, int history, int layout, Pattern pattern, bool graph = false,
-                         std::uint32_t capacity = 262144) {
+                         std::optional<ContextBucket> bucket = {}) {
         std::vector<std::pair<std::string, std::string>> tags{
             {"execution", graph ? "graph" : "eager"}};
         if (b > 8) tags.emplace_back("suite", "concurrency");
         suite.add(
             "qsa_indexer/t" + std::to_string(t) + "/b" + std::to_string(b) + "/l" +
                 std::to_string(history) + "/layout" + std::to_string(layout) + "/pattern" +
-                std::to_string(int(pattern)) + "/capacity" + std::to_string(capacity),
+                std::to_string(int(pattern)) + "/bucket" +
+                std::string(
+                    ops::context_bucket_name(bucket.value_or(ops::select_context_bucket(history)))),
             [=] {
                 return run(cuda_environment().context, t, b, history, layout, pattern, graph,
-                           capacity);
+                           bucket);
             },
             std::move(tags));
     };
-    for (int history :
-         {1, 3, 4, 5, 2047, 2048, 2049, 2050, 2051, 2052, 2053, 32764, 32768, 32772, 262144})
+    for (int history : {1,    3,    4,    5,    512,   2047,  2048,  2049,  2050,  2051,  2052,
+                        2053, 4096, 8192, 8448, 16384, 16640, 32764, 32768, 32772, 65536, 262144})
         add(1, 1, history, 0, Pattern::Dyadic);
-    for (int capacity : {2051, 2052, 16388})
-        add(5, 3, capacity, 1, Pattern::Dyadic, true, capacity);
+    for (int capacity : {2051, 2052, 16388}) add(5, 3, capacity, 1, Pattern::Dyadic, true);
     for (int t : {2, 3, 4, 5, 8, 9, 16, 17, 31, 32, 33, 63, 64, 65})
         add(t, 1, 32772, t % 2, Pattern::Dyadic, t == 4 || t == 65);
     for (int b = 2; b <= 8; ++b) add(64 / b + 1, b, 32772, b % 2, Pattern::Dyadic, true);
-    add(16, 17, 4096, 1, Pattern::Dyadic, true, 4096);
-    add(1, 65, 2055, 0, Pattern::Dyadic, false, 2055);
+    add(16, 17, 4096, 1, Pattern::Dyadic, true);
+    add(1, 65, 2055, 0, Pattern::Dyadic, false);
     for (int t : {128, 1024, 2048, 4096}) add(t, 1, 262144, 0, Pattern::Dyadic);
-    add(129, 1, 131076, 0, Pattern::Dense, true, 131076);
-    add(65, 4, 65540, 0, Pattern::NearBoundary, true, 65540);
+    add(129, 1, 131076, 0, Pattern::Dense, true);
+    add(65, 4, 65540, 0, Pattern::NearBoundary, true);
     add(2, 1, 262144, 0, Pattern::Dense, true);
     for (auto pattern :
          {Pattern::Dense, Pattern::Zero, Pattern::Concentrated, Pattern::NearBoundary}) {

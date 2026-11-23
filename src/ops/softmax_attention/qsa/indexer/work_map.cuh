@@ -3,6 +3,28 @@
 #include "ops/softmax_attention/qsa/indexer/arguments.h"
 
 namespace ninfer::ops::detail::qsa {
+
+// Large batches keep one kernel node per stage. Split the CTA-local work maps while
+// retaining window-wide score and candidate storage.
+template <int Capacity, bool BatchedLoop, class Run>
+__device__ __forceinline__ void for_each_indexer_job_group(const IndexerArguments& a, Run&& run) {
+    if constexpr (!BatchedLoop) {
+        run(a, int(blockIdx.x), int(gridDim.x));
+    } else {
+        const int group_rows = Capacity / a.width;
+        const int groups     = 1 + (a.batch - 1) / group_rows;
+        const int lanes      = min(int(gridDim.x), groups);
+        const int lane       = int(blockIdx.x) % lanes;
+        const int worker     = int(blockIdx.x) / lanes;
+        const int stride     = 1 + (int(gridDim.x) - 1 - lane) / lanes;
+        for (std::int64_t group = lane; group < groups; group += lanes) {
+            const int first = int(group * group_rows);
+            run(a.rows(first, min(group_rows, a.batch - first)), worker, stride);
+            if (group + lanes < groups) __syncthreads();
+        }
+    }
+}
+
 template <int Capacity = 64>
 struct IndexerJobs {
     int visible[Capacity];

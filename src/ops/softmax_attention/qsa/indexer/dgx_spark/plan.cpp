@@ -5,6 +5,8 @@ int indexer_window_capacity(int) { return kIndexerMaxWindowQueries; }
 
 IndexerWindowPlan select_indexer_window(IndexerPlan plan, int width, int batch, int sms,
                                         bool tma_cache) {
+    const int slots = width * batch;
+    if (plan.partitions == 0) return {0, 0, indexer_workers(2, sms, slots)};
     const int tile            = width <= 4    ? 4
                                 : width <= 8  ? 8
                                 : width <= 16 ? 16
@@ -33,16 +35,16 @@ IndexerWindowPlan select_indexer_window(IndexerPlan plan, int width, int batch, 
     const int rows         = score == IndexerScore::Mma || score == IndexerScore::Tma
                                  ? (width + tile - 1) / tile
                                  : width;
-    const int tasks        = batch * rows * (plan.columns / kIndexerKeyTile);
+    const auto tasks       = std::int64_t(batch) * rows * (plan.columns / kIndexerKeyTile);
     const int select_waves = width > 32 ? 8 : 4;
     // Retain reused keys where the wider score window competes with them for L2 capacity.
-    const bool retain_keys = tile == 128 && plan.partitions >= 6 && plan.partitions <= 9;
+    const bool retain_keys = tile == 128 && plan.partitions == 8;
     return {tile,
-            std::max(1, std::min(resident * sms, tasks)),
-            std::max(1, std::min(select_waves * sms, width * batch * plan.partitions)),
+            indexer_workers(resident, sms, tasks),
+            indexer_workers(select_waves, sms, std::int64_t(slots) * plan.partitions),
             stages,
             score,
-            width * batch > 64,
+            slots > 64,
             retain_keys};
 }
 } // namespace ninfer::ops::detail::qsa

@@ -5,8 +5,6 @@
 
 namespace ninfer::ops::detail::qsa {
 
-inline constexpr int kIndexerMaxVisibleTokens = 262144;
-inline constexpr int kIndexerMaxBlocks        = kIndexerMaxVisibleTokens / 4;
 inline constexpr int kIndexerMaxWindowQueries = 128;
 inline constexpr int kIndexerSelected         = 512;
 inline constexpr int kIndexerKeyTile          = 64;
@@ -28,6 +26,22 @@ struct IndexerArguments {
     __device__ int visible(int slot) const {
         const int t = begin + slot % width, b = slot / width;
         return t < valid[b] ? (positions[t + std::int64_t(b) * tokens] + 1) / 4 : 0;
+    }
+
+    __device__ IndexerArguments rows(int first, int count) const {
+        auto group        = *this;
+        const auto column = std::int64_t(first) * tokens;
+        const auto slot   = std::int64_t(first) * width;
+        group.query += column * 512;
+        group.positions += column;
+        group.valid += first;
+        group.table_rows += first;
+        group.scores += slot * columns;
+        if (group.candidates) group.candidates += slot * partitions * kIndexerSelected;
+        group.ids += column * kIndexerSelected;
+        group.counts += column;
+        group.batch = count;
+        return group;
     }
 
     __device__ const __nv_bfloat16* key(int b, int g) const {

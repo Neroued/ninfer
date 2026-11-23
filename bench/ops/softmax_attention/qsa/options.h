@@ -1,6 +1,7 @@
 #pragma once
 
 #include "op_measurement.cuh"
+#include "context_bucket_workload.h"
 #include "ninfer/types.h"
 
 namespace ninfer::bench::qsa {
@@ -56,9 +57,14 @@ struct Options {
     bool explicit_contexts         = false;
     int context_capacity           = 0;
     bool context_capacity_explicit = false;
-    int selected_blocks            = 512;
-    std::string selection          = "random";
-    std::string score_pattern      = "random";
+    std::optional<ops::ContextBucket> bucket;
+    bool explicit_bucket             = false;
+    bool explicit_valid              = false;
+    workload::LengthDist length_dist = workload::LengthDist::Uniform;
+    workload::ValidDist valid_dist   = workload::ValidDist::Full;
+    int selected_blocks              = 512;
+    std::string selection            = "random";
+    std::string score_pattern        = "random";
     std::string valid = "dense", accepted = "dense", layout = "contiguous";
     int batch    = 1;
     int axes     = 1;
@@ -70,7 +76,7 @@ inline Options parse_options(int argc, char** argv) {
     bool token_options = false, state_options = false;
     bool projection_only = false, tail_only = false, prepare_only = false, head_options = false;
     bool indexer_only = false, base_options = false, sparse_only = false, cache_option = false;
-    bool score_option = false, layout_option = false;
+    bool indexer_workload_options = false, layout_option = false;
     for (int i = 1; i < argc; ++i) {
         const std::string_view flag = argv[i];
         if (flag == "--help" || flag == "-h") {
@@ -87,8 +93,11 @@ inline Options parse_options(int argc, char** argv) {
                    "  --base-positions F[,F...] --valid dense|N[,N...] --layout "
                    "contiguous|layered|unaligned\n"
                    "Indexer: --tokens T[,T...] --batch B --contexts L[,L...]\n"
-                   "  --context-capacity N (default maximum L) --score-pattern random|ties\n"
-                   "  --valid dense|N[,N...]\n"
+                   "  --bucket auto|2k|8k|16k|32k|64k|128k|256k (default auto)\n"
+                   "  --context-capacity N (legacy bucket selection if --bucket is omitted)\n"
+                   "  --length-dist uniform|skewed-1long|staggered|shared-prefix (single L)\n"
+                   "  --valid dense|N[,N...] or --valid-dist full|ragged|with-inert\n"
+                   "  --score-pattern random|ties\n"
                    "Sparse GQA: --tokens T[,T...] --batch B --contexts L[,L...]\n  "
                    "--query-heads Hq --kv-heads Hkv (24/2 or 12/1; RTX 5090 prepare/sparse GQA "
                    "also accept 24/4)\n  --prefix-tokens "
@@ -122,7 +131,8 @@ inline Options parse_options(int argc, char** argv) {
         base_options |= flag == "--base-positions";
         sparse_only |= flag == "--selection" || flag == "--selected-blocks" ||
                        flag == "--query-heads" || flag == "--prefix-tokens";
-        score_option |= flag == "--score-pattern";
+        indexer_workload_options |= flag == "--score-pattern" || flag == "--bucket" ||
+                                    flag == "--length-dist" || flag == "--valid-dist";
         layout_option |= flag == "--layout";
         const auto value = measurement::take(argc, argv, i);
         if (flag == "--op")
@@ -136,6 +146,13 @@ inline Options parse_options(int argc, char** argv) {
             o.explicit_contexts = true;
         } else if (flag == "--prefix-tokens")
             o.prefixes = measurement::integers(value, 0);
+        else if (flag == "--bucket") {
+            o.bucket          = workload::parse_bucket_override(value);
+            o.explicit_bucket = true;
+        } else if (flag == "--length-dist")
+            o.length_dist = workload::parse_length_dist(value);
+        else if (flag == "--valid-dist")
+            o.valid_dist = workload::parse_valid_dist(value);
         else if (flag == "--score-pattern")
             o.score_pattern = value;
         else if (flag == "--selection")
@@ -163,9 +180,10 @@ inline Options parse_options(int argc, char** argv) {
             o.batch = measurement::integer(value);
         else if (flag == "--base-positions")
             o.bases = measurement::integers(value, 0);
-        else if (flag == "--valid")
-            o.valid = value;
-        else if (flag == "--accepted")
+        else if (flag == "--valid") {
+            o.valid          = value;
+            o.explicit_valid = true;
+        } else if (flag == "--accepted")
             o.accepted = value;
         else if (flag == "--layout")
             o.layout = value;
@@ -206,7 +224,7 @@ inline Options parse_options(int argc, char** argv) {
     if (((o.op == "indexer" || o.op == "sparse-gqa") && layout_option) ||
         (o.op != "input-proj" && o.op != "prepare" && o.op != "prepare-kv" &&
          o.op != "sparse-gqa" && head_options) ||
-        (o.op != "indexer" && score_option) ||
+        (o.op != "indexer" && indexer_workload_options) ||
         (o.op != "prepare" && o.op != "prepare-kv" && o.op != "sparse-gqa" && cache_option) ||
         (o.op != "sparse-gqa" && sparse_only) ||
         (o.op == "sparse-gqa" &&

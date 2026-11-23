@@ -57,10 +57,11 @@ struct Metrics {
 };
 
 inline Metrics indexer_metrics(int tokens, std::span<const int> contexts,
-                               std::span<const int> lengths) {
+                               std::span<const int> lengths, int shared_prefix_tokens) {
     Metrics m;
-    m.read_bytes  = lengths.size() * sizeof(std::int32_t);
-    m.write_bytes = std::uint64_t(tokens) * lengths.size() * sizeof(std::int32_t);
+    m.read_bytes      = lengths.size() * sizeof(std::int32_t);
+    m.write_bytes     = std::uint64_t(tokens) * lengths.size() * sizeof(std::int32_t);
+    int shared_blocks = 0;
     for (std::size_t b = 0; b < lengths.size(); ++b) {
         int maximum_scored = 0;
         m.live_queries += lengths[b];
@@ -74,8 +75,11 @@ inline Metrics indexer_metrics(int tokens, std::span<const int> contexts,
             maximum_scored = blocks;
         }
         if (maximum_scored) m.read_bytes += 4ULL + 8ULL * ((maximum_scored + 15) / 16);
-        m.index_read += 256ULL * maximum_scored;
+        const int shared = std::min(maximum_scored, shared_prefix_tokens / 4);
+        m.index_read += 256ULL * (maximum_scored - shared);
+        shared_blocks = std::max(shared_blocks, shared);
     }
+    m.index_read += 256ULL * shared_blocks;
     m.qk_flops              = m.candidate_blocks * 2 * 4 * 128;
     m.per_query_cache_bytes = m.candidate_blocks * 256;
     m.read_bytes += m.index_read + m.scoring_queries * 4 * 128 * 2;

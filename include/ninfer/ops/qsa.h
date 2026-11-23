@@ -3,6 +3,7 @@
 #include "core/device.h"
 #include "core/paged_kv_cache.h"
 #include "core/tensor.h"
+#include "ninfer/ops/context_bucket.h"
 
 #include <cuda_runtime.h>
 #include <array>
@@ -100,16 +101,20 @@ struct QsaBlockSelection {
     Tensor block_counts; // Device I32 [T,B].
 };
 
-struct QsaIndexerExecutionEnvelope {
-    std::uint32_t max_visible_tokens = 0; // Fixed capture capacity, in original tokens.
-};
-
-/** Capacity over every positive T in [min_tokens,max_tokens], with fixed B and envelope.
- * Includes only Op-local scratch, measured from a 256-byte-aligned workspace cursor.
+/** Capacity over every bucket in `buckets` and every positive T in [min_tokens, max_tokens],
+ * with fixed B. Includes only Op-local scratch from a 256-byte-aligned workspace cursor.
  */
-[[nodiscard]] std::size_t
-qsa_indexer_workspace_capacity_bytes(std::int32_t min_tokens, std::int32_t max_tokens,
-                                     std::int32_t batch_size, QsaIndexerExecutionEnvelope envelope);
+[[nodiscard]] std::size_t qsa_indexer_workspace_capacity_bytes(ContextBucketRange buckets,
+                                                               std::int32_t batch_size,
+                                                               std::int32_t min_tokens,
+                                                               std::int32_t max_tokens);
+
+/** Equality identifies identical captured launch parameters and scratch layout at fixed
+ * operands, cache alignment, batch_size, tokens, and device SM count across ContextBuckets.
+ */
+[[nodiscard]] OpGraphProfile qsa_indexer_graph_profile(ContextBucket bucket,
+                                                       std::int32_t batch_size, std::int32_t tokens,
+                                                       std::int32_t sm_count);
 
 /**
  * Op: qsa_indexer
@@ -129,10 +134,11 @@ qsa_indexer_workspace_capacity_bytes(std::int32_t min_tokens, std::int32_t max_t
  * I64 byte offsets from their record arena.
  * Positions are contiguous I32 [T,B]; valid_columns and table_rows are Device I32 [B].
  * Each row has 0<=n<=T; live positions are consecutive nonnegative original-token ordinals.
- * Every live p+1 is <= envelope.max_visible_tokens <=262144, within the table capacity.
- * Envelope zero permits only inert queries. Live scoring operands and scores are
- * finite. Ranking approximates the formula from represented inputs; there is no semantic
- * intermediate score-storage rounding boundary.
+ * Buckets K2 through K256 are supported. For every live (t,b), positions[t,b] + 1 is at most
+ * min<std::int64_t>(context_bucket_tokens(bucket), table.ne[0] * 64), where table is page_offsets.
+ * Kernels never index page_offsets beyond the live positions[t,b] / 64. Live scoring operands
+ * and scores are finite. Ranking approximates the formula from represented inputs; there is no
+ * semantic intermediate score-storage rounding boundary.
  * Device counts, positions, selectors and readable live pages are caller guarantees.
  *
  * Effects / output:
@@ -145,15 +151,16 @@ qsa_indexer_workspace_capacity_bytes(std::int32_t min_tokens, std::int32_t max_t
  *
  * Workspace / execution:
  * Scratch comes from the caller's arena and is reused across bounded query windows, without
- * hidden allocation. Fixed T/B, views and device facts keep node count/order compatible across
- * envelope updates; the bound selects launch/workspace configuration.
+ * hidden allocation. At fixed T, B, views and device, capture is a linear chain of 3 * windows
+ * kernel nodes across K2 through K256, where windows depends only on T, B and the target.
+ * The chain supports cudaGraphExecKernelNodeSetParams and cudaGraphExecUpdate across buckets.
  * Actual per-query lengths, mixed batch contexts and all-select/inert cases are handled inside
  * the same kernels, including Graph replay. Metadata is not read back by the Host. Downstream
  * consumers read only count ids; same-stream ordering supplies the dependency.
  */
 void qsa_indexer(const Tensor& index_query, const ConstQsaIndexCacheView& cache,
-                 const QsaBatchView& batch, QsaIndexerExecutionEnvelope envelope,
-                 MemoryArena& workspace, QsaBlockSelection& out, CudaExecutionView execution);
+                 const QsaBatchView& batch, ContextBucket bucket, MemoryArena& workspace,
+                 QsaBlockSelection& out, CudaExecutionView execution);
 
 struct QsaSparseGqaExecutionEnvelope {
     // Host-known upper bound on p+1 over live queries. Zero permits only inert queries.

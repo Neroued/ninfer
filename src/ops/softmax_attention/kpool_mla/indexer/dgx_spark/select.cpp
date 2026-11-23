@@ -7,8 +7,8 @@ constexpr int kScoreWindowBytes = 16 << 20;
 constexpr int kRequestGroup     = 16;
 } // namespace
 
-void indexer_geometry(const KpoolIndexerProfile& p, KvCacheVectorFormat format,
-                      KpoolExecutionEnvelope envelope, int batch, int lo, int hi, int sms) {
+void indexer_geometry(const KpoolIndexerProfile& p, KvCacheVectorFormat format, int batch, int lo,
+                      int hi, int sms) {
     require(p.index_heads == 32 && p.index_dim == 128 && p.pool_size == 4 &&
                 p.selected_pools == 512,
             "unsupported Indexer profile");
@@ -17,7 +17,6 @@ void indexer_geometry(const KpoolIndexerProfile& p, KvCacheVectorFormat format,
             "unsupported Indexer format");
     require(lo > 0 && hi >= lo && batch >= 1 && sms > 0, "Indexer T/B/device");
     require(std::int64_t(hi) * batch <= std::numeric_limits<int>::max(), "selection row extent");
-    require(envelope.max_visible_tokens <= kKpoolMaxVisibleTokens, "Indexer context limit");
 }
 
 int indexer_group_size(int tokens, int batch) {
@@ -29,23 +28,6 @@ int indexer_group_size(int tokens, int batch) {
 
 int indexer_selection_items(int columns) {
     return columns <= 1024 ? 4 : columns <= 2048 ? 8 : kIndexPartition / 256;
-}
-
-IndexerWindows indexer_windows(int lo, int hi, int batch, int columns) {
-    // Bound scratch with request groups and query windows while preserving K reuse.
-    // Increasing batch does not keep shrinking the per-request query target.
-    // Graph slots are independent of this execution-window choice.
-    constexpr int columns_per_slot = kScoreWindowBytes / (4 * kRequestGroup);
-    int slots                      = 8;
-    while (slots > 1 && columns > columns_per_slot / slots) slots /= 2;
-    const int target = 2 * std::max(16, slots * (kRequestGroup / batch));
-    // Balance query tiles so a partial tail does not change the other windows'
-    // tile count or persistent-worker occupancy. The interval peak is at its first
-    // complete window bucket, or hi when that bucket is not reached.
-    const auto bucket = (std::int64_t(lo) + target - 1) / target;
-    const auto peak   = std::min<std::int64_t>(hi, bucket * target);
-    const int windows = int((peak + target - 1) / target);
-    return {windows, indexer_window_width(int(peak), windows)};
 }
 
 IndexerSchedule select_indexer(const IndexerArguments& a, int sms) {
@@ -60,73 +42,44 @@ IndexerSchedule select_indexer(const IndexerArguments& a, int sms) {
     return {q, stages, workers, select, select > 2 * sms};
 }
 
-bool separate_indexer_requests(const IndexerArguments& a) {
-    // A long request's keys already occupy most or all of L2. Give its queries
-    // the whole planned row budget instead of interleaving several such histories.
-    // Short query extents retain cross-request parallelism.
-    return a.batch > 2 && a.tokens >= 64 && a.columns >= 65536;
-}
+IndexerWindows indexer_windows(int tokens, int batch, int columns, int prepared_batch) {
+    const bool fp8 = prepared_batch > 0;
+    const int tile = fp8 ? 8 : 4;
+    if (tokens <= 16 || columns <= kIndexSelected) return {batch, 0, tile};
 
-Fp8IndexerWindows fp8_indexer_windows(int tokens, int batch, int columns) {
-    // Scores remain FP32. Keep their window bounded independently of prepared Q.
+    const int width = fp8 ? std::min(tokens, kIndexPreparedQueries) : tokens;
+    int group_size  = batch;
+    // Long histories benefit from reusing keys across a request's queries.
+    if (width >= kIndexLongRequestQueries && columns >= 65536 && batch > (fp8 ? 1 : 2))
+        group_size = 1;
+    else if (batch > 2) {
+        if (columns >= 131072 || (columns >= 65536 && width > 32))
+            group_size = 1;
+        else if (columns >= 65536)
+            group_size = 2;
+        else if (batch > 4 && columns >= 32768)
+            group_size = 4;
+    }
+
     constexpr int columns_per_slot = kScoreWindowBytes / (4 * kRequestGroup);
     int slots                      = 8;
     while (slots > 1 && columns > columns_per_slot / slots) slots /= 2;
-    const int target  = 2 * std::max(16, slots * (kRequestGroup / batch));
-    const int windows = (tokens + target - 1) / target;
-    // Round the planning budget to complete tiles. A partial first window must
-    // not reduce the number of windows abruptly when its last row becomes live.
-    const int budget = (indexer_window_width(tokens, windows, 8) + 7) / 8 * 8;
-    Fp8IndexerWindows result{batch, budget * batch, 0};
-    // Group concurrent histories so their FP32 scores remain in L2 for selection.
-    // The score row budget is shared by the requests in each group.
-    if (batch > 1 && tokens >= 64 && columns >= 65536)
-        result.group_size = 1;
-    else if (batch > 2 && tokens >= 8) {
-        if (columns >= 131072 || (columns >= 65536 && tokens > 32)) result.group_size = 1;
-        // Small batches whose score rows already fit L2 retain cross-request
-        // reuse, including shared prefixes. Larger batches also bound K pressure.
-        else if (columns >= 65536 &&
-                 (batch > 4 || std::int64_t(tokens) * batch * columns * 4 > kScoreWindowBytes))
-            result.group_size = 2;
-        else if (batch > 4 && columns >= 32768)
-            result.group_size = 4;
-    }
-    if (result.group_size < batch) {
-        // Keep enough query rows per group to amortize score and selection dispatch.
-        const int query_stride = kRequestGroup / batch;
-        const int max_groups   = (tokens + query_stride - 1) / query_stride;
-        result.group_size      = std::max(result.group_size, (batch + max_groups - 1) / max_groups);
-    }
-    for (int b = 0; b < batch; b += result.group_size) {
-        const int take  = std::min(result.group_size, batch - b);
-        const int count = result.count(tokens, take);
-        result.rows     = std::max(result.rows, indexer_window_width(tokens, count, 8) * take);
-    }
-    return result;
+    const int target =
+        std::min(kIndexMaxWindowQueries,
+                 (2 * std::max(16, slots * (kRequestGroup / batch)) + tile - 1) / tile * tile);
+    return {group_size, target * group_size, tile};
 }
 
-int indexer_graph_slots(int tokens, int batch) {
-    // Every envelope admits at least 32 queries per request window. The largest
-    // context also bounds the separately submitted long-request route.
-    const int windows = int((std::int64_t(tokens) + 31) / 32);
-    if (batch <= 2 || tokens < 64) return windows;
-    const int rows = indexer_window_width(tokens, windows) * batch;
-    return std::max(windows, batch * int((std::int64_t(tokens) + rows - 1) / rows));
-}
-
-int fp8_indexer_graph_slots(int tokens, int batch) {
-    if (tokens < 8) return 1;
-    int slots = 0;
-    // Window budgets and request grouping change only at these padded-column
-    // boundaries. Capture reserves their maximum independently of the envelope.
-    const int pressure = int(kScoreWindowBytes / (4LL * tokens * batch) / 64 + 1) * 64;
-    for (const int columns : {512, 32768, 32832, 65536, 65600, 131072, 131136, 262144, pressure}) {
-        if (columns > kKpoolMaxVisibleTokens / 4) continue;
-        const auto windows = fp8_indexer_windows(tokens, batch, columns);
-        int count          = 0;
-        for (int first = 0; first < batch; first += windows.group_size)
-            count += windows.count(tokens, std::min(windows.group_size, batch - first));
+int indexer_graph_slots(int tokens, int width, int batch, int prepared_batch) {
+    if (tokens <= 16) return 1;
+    int slots = 1;
+    for (const auto bucket : kAllContextBuckets) {
+        const auto windows =
+            indexer_windows(tokens, batch, indexer_dimensions(bucket).columns, prepared_batch);
+        const int groups = batch / windows.group_size;
+        const int tail   = batch % windows.group_size;
+        int count        = groups * windows.count(width, windows.group_size);
+        if (tail) count += windows.count(width, tail);
         slots = std::max(slots, count);
     }
     return slots;

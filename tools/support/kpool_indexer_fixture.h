@@ -6,6 +6,7 @@
 
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <cmath>
 #include <cuda_fp8.h>
 
@@ -16,6 +17,7 @@ namespace ninfer::tool::kpool {
 struct IndexerCase {
     std::vector<int> ends, valid, reserve_ends;
     int envelope = 0, shared_prefix = 0;
+    std::optional<ops::ContextBucket> bucket;
     bool contiguous_pages = false;
 
     int table_end(int fallback) const {
@@ -28,10 +30,10 @@ struct IndexerCase {
     int pages(int batch, int fallback) const {
         if (ends.empty()) return batch * std::max(1, (fallback + 63) / 64);
         int count = shared_prefix / 64;
-        for (int b = 0; b < batch; ++b)
-            count +=
-                (reserve_ends.empty() ? (ends.at(b) + 63) / 64 : (reserve_ends.at(b) + 63) / 64) -
-                shared_prefix / 64;
+        for (int b = 0; b < batch; ++b) {
+            const int reserved = reserve_ends.empty() ? ends.at(b) : reserve_ends.at(b);
+            count += std::max(0, (reserved + 63) / 64 - shared_prefix / 64);
+        }
         return std::max(1, count);
     }
 };
@@ -48,7 +50,7 @@ struct IndexerFixture {
     PackedKVFixture packed;
     ops::ConstKpoolIndexCacheView cache;
     ops::KpoolBlockSelection selection;
-    ops::KpoolExecutionEnvelope envelope;
+    ops::ContextBucket bucket;
     std::vector<std::uint16_t> keys;
     std::vector<std::uint8_t> key_codes, key_scales;
     DeviceBuffer scratch;
@@ -73,10 +75,12 @@ struct IndexerFixture {
           packed(cuda.device(), layout.page.geometry, physical_pages),
           cache(layout.layer(PagedRecordView{packed.storage(), tables.view, 64}, layer).index),
           selection{ids.view, counts.view, ends.view},
-          envelope{std::uint32_t(shape.envelope ? shape.envelope : end)},
+          bucket(shape.bucket.value_or(
+              ops::select_context_bucket(std::uint32_t(shape.envelope ? shape.envelope : end)))),
           keys(initialize_history ? std::size_t(physical_pages) * 16 * 128 : 0),
           workspace_bytes(ops::kpool_indexer_workspace_capacity_bytes(
-              {32, 128}, index_format, envelope, B, 1, T, cuda.multiprocessor_count())) {
+              {32, 128}, index_format, ops::ContextBucketRange{bucket}, B, 1, T,
+              cuda.multiprocessor_count())) {
         if (T <= 0 || B < 1 || E < 0 || E > 1048576 || (E && E < T))
             throw std::invalid_argument("Indexer fixture T/B/end");
         plane_index = packed.plane_index(cache.keys.plane);
@@ -93,8 +97,9 @@ struct IndexerFixture {
                                                        : ragged ? std::max(1, T - b)
                                                                 : T)
                                                     : shape.valid.at(b);
-            if (n < 0 || n > T || row_end < n || row_end > int(envelope.max_visible_tokens) ||
-                (n && row_end - n < shape.shared_prefix))
+            if (n < 0 || n > T || row_end < n ||
+                (n && (row_end > int(ops::context_bucket_tokens(bucket)) ||
+                       row_end - n < shape.shared_prefix)))
                 throw std::invalid_argument("invalid per-row history");
             valid.at(b)     = n;
             selectors.at(b) = n ? B - 1 - b : -1;
@@ -139,9 +144,8 @@ struct IndexerFixture {
         tables.upload();
     }
 
-    // Reuse the same physical histories and allocation addresses across a token
-    // sweep. Only contiguous query/selection views and live metadata change.
-    void reset_tokens(int tokens, bool ragged, CudaExecutionView cuda) {
+    // Reuse the same physical histories and allocation addresses across a token sweep.
+    void resize_queries(int tokens, CudaExecutionView cuda) {
         if (tokens <= 0 || tokens > E || std::size_t(tokens) * B > counts.host.size())
             throw std::invalid_argument("Indexer fixture token capacity");
         T                  = tokens;
@@ -157,6 +161,15 @@ struct IndexerFixture {
         reshape(ids, {512, T * B});
         reshape(counts, {T * B});
         reshape(ends, {T * B});
+        selection       = {ids.view, counts.view, ends.view};
+        workspace_bytes = ops::kpool_indexer_workspace_capacity_bytes(
+            {32, 128}, cache.format, ops::ContextBucketRange{bucket}, B, 1, T,
+            cuda.multiprocessor_count());
+        workspace = std::make_unique<MemoryArena>(scratch.span().subspan(256, workspace_bytes));
+    }
+
+    void reset_tokens(int tokens, bool ragged, CudaExecutionView cuda) {
+        resize_queries(tokens, cuda);
         for (int b = 0; b < B; ++b) {
             const int n     = ragged && b == B - 1 ? 0 : ragged ? std::max(1, T - b) : T;
             valid.at(b)     = n;
@@ -166,10 +179,6 @@ struct IndexerFixture {
         positions.upload();
         valid.upload();
         selectors.upload();
-        selection       = {ids.view, counts.view, ends.view};
-        workspace_bytes = ops::kpool_indexer_workspace_capacity_bytes(
-            {32, 128}, cache.format, envelope, B, 1, T, cuda.multiprocessor_count());
-        workspace = std::make_unique<MemoryArena>(scratch.span().subspan(256, workspace_bytes));
     }
 
     void upload_keys() {
@@ -223,7 +232,7 @@ struct IndexerFixture {
 
     void launch(CudaExecutionView cuda) {
         ops::kpool_indexer(query.view, coeff.view, cache,
-                           {positions.view, valid.view, selectors.view}, envelope, *workspace,
+                           {positions.view, valid.view, selectors.view}, bucket, *workspace,
                            selection, cuda);
     }
 

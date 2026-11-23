@@ -1,46 +1,73 @@
 #include "ops/softmax_attention/kpool_mla/indexer/plan.h"
 #include "ops/softmax_attention/kpool_mla/validation.h"
+#include "ops/common/host/graph_profile.h"
 
 namespace ninfer::ops {
 using namespace detail::kpool;
 
-KpoolGraphProfile kpool_indexer_graph_profile(const KpoolIndexerProfile& profile,
-                                              KvCacheVectorFormat index_format,
-                                              KpoolExecutionEnvelope envelope, int batch,
-                                              int tokens, int sms) {
-    indexer_geometry(profile, index_format, envelope, batch, tokens, tokens, sms);
-    const auto p = index_format == KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0
-                       ? fp8_indexer_plan(tokens, batch, envelope)
-                       : indexer_plan(tokens, tokens, batch, envelope);
-    KpoolGraphProfile key;
-    key.words_ = {
-        std::uint64_t(tokens),       std::uint64_t(batch),          std::uint64_t(sms),
-        std::uint64_t(index_format), std::uint64_t(p.windows),      std::uint64_t(p.columns),
-        std::uint64_t(p.partitions), std::uint64_t(p.merge_groups), p.bytes,
-        std::uint64_t(p.query_width)};
-    return key;
+OpGraphProfile kpool_indexer_graph_profile(const KpoolIndexerProfile& profile,
+                                           KvCacheVectorFormat index_format, ContextBucket bucket,
+                                           int batch, int tokens, int sms) {
+    ContextBucketRange{bucket}.validate(ContextBucket::M1, "kpool_indexer");
+    indexer_geometry(profile, index_format, batch, tokens, tokens, sms);
+    const bool fp8           = index_format == KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0;
+    const auto p             = indexer_plan(tokens, batch, bucket, fp8);
+    const int group          = indexer_group_size(tokens, batch);
+    const int prepared_batch = fp8 ? group : 0;
+    // The geometry and window budgets determine every score/selection binding.
+    // Only the full and tail request groups and prepared chunks can differ.
+    std::array<std::uint64_t, 23> words{std::uint64_t(tokens),
+                                        std::uint64_t(batch),
+                                        std::uint64_t(sms),
+                                        std::uint64_t(index_format),
+                                        std::uint64_t(p.columns),
+                                        std::uint64_t(p.partitions),
+                                        std::uint64_t(p.merge_groups),
+                                        p.bytes,
+                                        std::uint64_t(p.query_width),
+                                        std::uint64_t(group),
+                                        p.query_fp8.region.offset,
+                                        p.weighted_coefficients.region.offset,
+                                        p.candidates.region.offset,
+                                        p.scores.region.offset,
+                                        p.merged.region.offset};
+    std::size_t word = 15;
+    for (const int outer : {group, batch % group}) {
+        if (!outer) break;
+        const auto windows = indexer_windows(tokens, outer, p.columns, prepared_batch);
+        const int tail     = tokens % p.query_width;
+        words[word++]      = windows.group_size;
+        words[word++]      = windows.row_budget;
+        words[word++]      = indexer_graph_slots(tokens, p.query_width, outer, prepared_batch);
+        words[word++]      = tail ? indexer_graph_slots(tokens, tail, outer, prepared_batch) : 0;
+    }
+    return detail::make_op_graph_profile(words);
 }
 
 std::size_t kpool_indexer_workspace_capacity_bytes(const KpoolIndexerProfile& profile,
                                                    KvCacheVectorFormat index_format,
-                                                   KpoolExecutionEnvelope envelope,
-                                                   std::int32_t batch, std::int32_t lo,
-                                                   std::int32_t hi, std::int32_t sms) {
-    indexer_geometry(profile, index_format, envelope, batch, lo, hi, sms);
-    if (index_format == KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0)
-        return fp8_indexer_capacity(lo, hi, batch, envelope);
-    return indexer_plan(lo, hi, batch, envelope).bytes;
+                                                   ContextBucketRange buckets, std::int32_t batch,
+                                                   std::int32_t lo, std::int32_t hi,
+                                                   std::int32_t sms) {
+    buckets.validate(ContextBucket::M1, "kpool_indexer");
+    indexer_geometry(profile, index_format, batch, lo, hi, sms);
+    const bool fp8    = index_format == KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0;
+    std::size_t bytes = 0;
+    buckets.for_each([&](ContextBucket bucket) {
+        bytes = std::max(bytes, indexer_capacity(lo, hi, batch, bucket, fp8));
+    });
+    return bytes;
 }
 
 void kpool_indexer(const Tensor& query, const Tensor& coefficients,
                    const ConstKpoolIndexCacheView& cache, const KpoolMlaBatchView& batch,
-                   KpoolExecutionEnvelope envelope, MemoryArena& workspace,
-                   KpoolBlockSelection& out, CudaExecutionView execution) {
+                   ContextBucket bucket, MemoryArena& workspace, KpoolBlockSelection& out,
+                   CudaExecutionView execution) {
     const int T = query.ne[2], B = query.ne[3];
     const auto device = execution.device();
-    indexer_geometry({query.ne[1], query.ne[0]}, cache.format, envelope, B, T, T,
+    ContextBucketRange{bucket}.validate(ContextBucket::M1, "kpool_indexer");
+    indexer_geometry({query.ne[1], query.ne[0]}, cache.format, B, T, T,
                      execution.multiprocessor_count());
-    require(std::int64_t(T) * B <= std::numeric_limits<int>::max(), "selection row extent");
     const int rows = T * B;
     std::array<operand::Range, 5> inputs;
     int n            = 0;
@@ -55,8 +82,7 @@ void kpool_indexer(const Tensor& query, const Tensor& coefficients,
     input(batch.valid_columns, DType::I32, {B}, 4, "valid columns");
     input(batch.table_rows, DType::I32, {B}, 4, "table rows");
     index_cache(cache, 128, device);
-    const auto& table = cache.keys.records.page_offsets;
-    require(std::uint64_t(table.ne[0]) * 64 >= envelope.max_visible_tokens, "page table capacity");
+    const auto& table       = cache.keys.records.page_offsets;
     const auto table_blocks = operand::blocks(table, kOperation);
     operand::tensor(out.pool_ids, DType::I32, {512, rows}, 4, kOperation, "pool IDs", device);
     operand::tensor(out.pool_counts, DType::I32, {rows}, 4, kOperation, "pool counts", device);
@@ -71,7 +97,7 @@ void kpool_indexer(const Tensor& query, const Tensor& coefficients,
     }
     operand::device(workspace.device(), device, kOperation, "workspace");
     const bool fp8  = cache.format == KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0;
-    const auto plan = fp8 ? fp8_indexer_plan(T, B, envelope) : indexer_plan(T, T, B, envelope);
+    const auto plan = indexer_plan(T, B, bucket, fp8);
     auto scope      = workspace.scope();
     MemorySpan scratch{};
     if (plan.bytes) {

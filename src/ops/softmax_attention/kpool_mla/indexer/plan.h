@@ -8,12 +8,8 @@
 
 namespace ninfer::ops::detail::kpool {
 
-void indexer_geometry(const KpoolIndexerProfile&, KvCacheVectorFormat, KpoolExecutionEnvelope,
-                      int batch, int min_tokens, int max_tokens, int sms);
-
-struct IndexerWindows {
-    int count, width;
-};
+void indexer_geometry(const KpoolIndexerProfile&, KvCacheVectorFormat, int batch, int min_tokens,
+                      int max_tokens, int sms);
 
 struct IndexerWindow {
     int begin, width;
@@ -25,9 +21,9 @@ inline IndexerWindow indexer_window(int tokens, int windows, int slot, int tile 
     const auto tiles = (std::int64_t(tokens) + tile - 1) / tile;
     const auto width = tiles / windows, larger = tiles % windows;
     const int padding = int(tiles * tile - tokens);
-    const int begin =
-        int((slot * width + std::min<std::int64_t>(slot, larger)) * tile) - (slot ? padding : 0);
-    return {begin, int((width + (slot < larger)) * tile) - (slot ? 0 : padding)};
+    const auto begin =
+        (slot * width + std::min<std::int64_t>(slot, larger)) * tile - (slot ? padding : 0);
+    return {int(begin), int((width + (slot < larger)) * tile - (slot ? 0 : padding))};
 }
 
 inline int indexer_window_width(int tokens, int windows, int tile = 4) {
@@ -35,38 +31,41 @@ inline int indexer_window_width(int tokens, int windows, int tile = 4) {
     return windows == 1 ? first : std::max(first, indexer_window(tokens, windows, 1, tile).width);
 }
 
-IndexerWindows indexer_windows(int min_tokens, int max_tokens, int batch, int columns);
-inline constexpr int kIndexPreparedQueries = 128;
+inline constexpr int kIndexPreparedQueries    = 128;
+inline constexpr int kIndexMaxWindowQueries   = 256;
+inline constexpr int kIndexLongRequestQueries = 64;
 
 int indexer_group_size(int tokens, int batch);
 
-struct Fp8IndexerWindows {
-    int group_size, row_budget, rows;
+struct IndexerWindows {
+    int group_size, row_budget, tile;
 
     int count(int tokens, int batch) const {
-        const int width = row_budget / batch;
-        return (tokens + width - 1) / width;
+        if (!row_budget) return 1;
+        const int width = std::min(kIndexMaxWindowQueries, row_budget / batch / tile * tile);
+        return int((std::int64_t(tokens) + width - 1) / width);
     }
 };
 
-Fp8IndexerWindows fp8_indexer_windows(int tokens, int batch, int columns);
-int indexer_graph_slots(int tokens, int batch);
-int fp8_indexer_graph_slots(int tokens, int batch);
+// FP8 retains the largest outer group's prepared queries in the scratch layout.
+// BF16 passes zero prepared_batch.
+IndexerWindows indexer_windows(int tokens, int batch, int columns, int prepared_batch = 0);
+int indexer_graph_slots(int tokens, int width, int batch, int prepared_batch = 0);
 int indexer_selection_items(int columns);
 
 struct IndexerPlan {
-    int windows, columns, partitions, merge_groups;
+    int columns, partitions, merge_groups;
     TensorRegion scores, candidates, merged;
     TensorRegion query_fp8, weighted_coefficients;
     int query_width   = 0;
     std::size_t bytes = 0;
 };
 
-inline IndexerPlan indexer_dimensions(KpoolExecutionEnvelope envelope) {
-    const int count = envelope.max_visible_tokens / 4;
+inline IndexerPlan indexer_dimensions(ContextBucket bucket) {
     IndexerPlan p{};
-    p.columns      = (count + 63) / 64 * 64;
-    p.partitions   = (count + kIndexPartition - 1) / kIndexPartition;
+    p.columns = context_bucket_tokens(bucket) / 4;
+    if (p.columns <= kIndexSelected) return p;
+    p.partitions   = (p.columns + kIndexPartition - 1) / kIndexPartition;
     p.merge_groups = (p.partitions + kIndexFanIn - 1) / kIndexFanIn;
     return p;
 }
@@ -87,57 +86,49 @@ inline void indexer_scratch(IndexerPlan& p, int rows, LayoutBuilder& builder) {
     p.bytes = builder.finish(1);
 }
 
-// A singleton interval plans execution; a wider interval plans its peak storage.
-inline IndexerPlan indexer_plan(int min_tokens, int max_tokens, int batch,
-                                KpoolExecutionEnvelope envelope) {
-    auto p = indexer_dimensions(envelope);
-    if (p.columns <= kIndexSelected) return p;
-    int rows           = 0;
-    const auto account = [&](int lo, int hi) {
-        const int group   = indexer_group_size(hi, batch);
-        const auto window = indexer_windows(lo, hi, group, p.columns);
-        p.windows         = std::max(p.windows, window.count);
-        rows              = std::max(rows, window.width * group);
-        if (const int tail = batch % group)
-            rows = std::max(rows, indexer_windows(lo, hi, tail, p.columns).width * tail);
-    };
-    for (int t = min_tokens; t <= std::min(max_tokens, 4); ++t) account(t, t);
-    if (max_tokens > 4) account(std::max(min_tokens, 5), max_tokens);
-    LayoutBuilder builder;
-    indexer_scratch(p, rows, builder);
-    return p;
-}
-
-inline IndexerPlan fp8_indexer_plan(int tokens, int batch, KpoolExecutionEnvelope envelope) {
-    auto p        = indexer_dimensions(envelope);
-    p.query_width = std::min(tokens, kIndexPreparedQueries);
+inline IndexerPlan indexer_plan(int tokens, int batch, ContextBucket bucket, bool fp8) {
+    auto p        = indexer_dimensions(bucket);
+    p.query_width = fp8 ? std::min(tokens, kIndexPreparedQueries) : tokens;
     if (p.columns <= kIndexSelected) return p;
     const int group = indexer_group_size(tokens, batch);
     int rows        = 0;
-    for (const int count : {group, batch % group}) {
-        if (!count) continue;
-        rows           = std::max(rows, fp8_indexer_windows(p.query_width, count, p.columns).rows);
-        const int tail = tokens % kIndexPreparedQueries;
-        if (tokens > kIndexPreparedQueries && tail)
-            rows = std::max(rows, fp8_indexer_windows(tail, count, p.columns).rows);
+    for (const int outer : {group, batch % group}) {
+        if (!outer) continue;
+        const auto windows = indexer_windows(tokens, outer, p.columns, fp8 ? group : 0);
+        for (const int take : {windows.group_size, outer % windows.group_size}) {
+            if (!take) continue;
+            const int tail = fp8 ? tokens % p.query_width : 0;
+            for (const int width : {p.query_width, tail}) {
+                if (!width) continue;
+                const int window_width =
+                    indexer_window_width(width, windows.count(width, take), windows.tile);
+                rows = std::max(rows, window_width * take);
+            }
+        }
     }
     LayoutBuilder builder;
-    // These operands survive every score/select window inside the prepared window.
-    p.query_fp8 = builder.add_tensor(DType::FP8_E4M3FN, {128, 32, p.query_width, group}, 256,
-                                     "Kpool FP8 query");
-    p.weighted_coefficients = builder.add_tensor(DType::FP32, {32, p.query_width, group}, 256,
-                                                 "Kpool scaled coefficients");
+    if (fp8) {
+        // Prepared operands survive all score/select windows in their chunk.
+        p.query_fp8 = builder.add_tensor(DType::FP8_E4M3FN, {128, 32, p.query_width, group}, 256,
+                                         "Kpool FP8 query");
+        p.weighted_coefficients = builder.add_tensor(DType::FP32, {32, p.query_width, group}, 256,
+                                                     "Kpool scaled coefficients");
+    }
     indexer_scratch(p, rows, builder);
     return p;
 }
 
-inline std::size_t fp8_indexer_capacity(int lo, int hi, int batch,
-                                        KpoolExecutionEnvelope envelope) {
+inline std::size_t indexer_capacity(int lo, int hi, int batch, ContextBucket bucket, bool fp8) {
+    if (bucket == ContextBucket::K2) return 0;
+    // BF16 reaches every group's maximum window width within one full window
+    // after the decode range. FP8 repeats with the residue after a full chunk.
+    const auto limit =
+        fp8 ? std::max(lo, kIndexPreparedQueries) + std::int64_t(kIndexPreparedQueries) - 1
+            : std::max(lo, kIndexLongRequestQueries) + std::int64_t(kIndexMaxWindowQueries) - 1;
+    const auto end     = std::min<std::int64_t>(hi, limit);
     std::size_t result = 0;
-    // Above one full prepared window, scratch repeats with the final window's residue.
-    const auto end = std::min<std::int64_t>(hi, std::int64_t(lo) + 2 * kIndexPreparedQueries - 1);
     for (std::int64_t t = lo; t <= end; ++t)
-        result = std::max(result, fp8_indexer_plan(int(t), batch, envelope).bytes);
+        result = std::max(result, indexer_plan(int(t), batch, bucket, fp8).bytes);
     return result;
 }
 
@@ -179,7 +170,6 @@ struct Fp8IndexerSchedule {
 };
 
 Fp8IndexerSchedule select_fp8_indexer(const IndexerArguments&, int sms);
-bool separate_indexer_requests(const IndexerArguments&);
 void launch_indexer(IndexerArguments, int sms, cudaStream_t);
 void launch_fp8_indexer(Fp8IndexerArguments, int sms, cudaStream_t);
 

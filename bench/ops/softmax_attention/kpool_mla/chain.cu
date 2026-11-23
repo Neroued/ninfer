@@ -164,9 +164,11 @@ int main(int argc, char** argv) {
             "pools,selected_token_visits,"
             "diagnostic_graph_prepare_us,diagnostic_graph_wb_us,diagnostic_graph_indexer_us,"
             "diagnostic_graph_mla_us");
+        kp::IndexerCase shape;
+        shape.bucket = ops::select_context_bucket(std::uint32_t(E));
         for (int T : tokens) {
             if (T > E) throw std::invalid_argument("T exceeds end");
-            kp::ChainFixture f(device.execution_view(), T, B, E, layers, ragged, {}, false, true,
+            kp::ChainFixture f(device.execution_view(), T, B, E, layers, ragged, shape, false, true,
                                index_format, storage);
             f.launch(device.execution_view());
             device.synchronize();

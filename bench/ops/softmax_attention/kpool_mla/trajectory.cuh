@@ -1,7 +1,7 @@
 #pragma once
 
 // The benchmark owns frontier policy, graph definitions, and metadata lifetimes.
-// Ops receive only public views and a valid capacity envelope.
+// Ops receive public views and the indexer bucket / sparse MLA envelope.
 struct TraceStep {
     std::vector<int> frontiers, valid;
     bool reset = false;
@@ -41,10 +41,11 @@ static Json trajectory(CudaExecutionView cuda, const Json& c, int repetitions) {
         bounds.insert(bucket(max_end));
     }
     shape.envelope         = *bounds.rbegin();
+    shape.bucket           = ops::select_context_bucket(std::uint32_t(shape.envelope));
     Json budget            = c;
     budget["reserve_ends"] = shape.reserve_ends;
     budget["envelope_max"] = shape.envelope;
-    Json out               = {{"case", c}, {"admission", admission(cuda, budget)}};
+    Json out               = {{"case", c}, {"admission", admission(cuda, budget, bounds)}};
     if (!out["admission"]["admitted"].get<bool>()) {
         out["status"] = "not_admitted";
         return out;
@@ -53,7 +54,7 @@ static Json trajectory(CudaExecutionView cuda, const Json& c, int repetitions) {
     app::Fixture f(cuda, T, B, shape, c.value("prepare", "update") == "record",
                    c.value("layers", 11), index_format_of(c), latent_storage_of(c));
     f.after = f.before;
-    f.reserve(cuda, {bounds.begin(), bounds.end()});
+    f.reserve(cuda, bounds);
     // One pinned, immutable upload frame per step. Reuse only after the final event.
     const std::size_t x_words     = std::size_t(T) * B * 4096;
     const std::size_t meta_words  = T * B + 4 * B;
@@ -88,7 +89,8 @@ static Json trajectory(CudaExecutionView cuda, const Json& c, int repetitions) {
     CUDA_CHECK(cudaDeviceSynchronize());
     std::map<int, DecodeGraphDefinition> definitions;
     for (int u : bounds) {
-        f.index.envelope = {std::uint32_t(u)};
+        f.index.bucket = ops::select_context_bucket(std::uint32_t(u));
+        f.envelope     = {std::uint32_t(u)};
         definitions[u].capture(cuda.stream(), [&] {
             f.launch(cuda);
             if (f.record) f.extract(cuda);

@@ -20,6 +20,7 @@ static double us(Clock::time_point a, Clock::time_point b) {
     return std::chrono::duration<double, std::micro>(b - a).count();
 }
 
+// The application trajectory still uses continuous sparse-MLA envelopes.
 static int bucket(int e) {
     int u = 128;
     while (u < e) u *= 2;
@@ -43,6 +44,7 @@ static kp::IndexerCase shape_of(const Json& c) {
         throw std::invalid_argument("frontiers and valid_columns must have B entries");
     for (std::size_t b = 0; b < f.size(); ++b) s.ends.push_back(f[b] + s.valid[b]);
     s.envelope         = c.at("envelope_max");
+    s.bucket           = ops::select_context_bucket(std::uint32_t(s.envelope));
     s.shared_prefix    = c.value("shared_prefix_tokens", 0);
     s.contiguous_pages = c.value("contiguous_pages", false);
     if (c.contains("reserve_ends")) s.reserve_ends = c.at("reserve_ends").get<std::vector<int>>();
@@ -63,25 +65,25 @@ static KvCacheVectorFormat index_format_of(const Json& c) {
     throw std::invalid_argument("index_cache must be bf16 or fp8");
 }
 
-static Json admission(CudaExecutionView cuda, const Json& c) {
+static Json admission(CudaExecutionView cuda, const Json& c, const std::set<int>& bounds = {}) {
     const auto shape        = shape_of(c);
     const auto storage      = latent_storage_of(c);
     const auto index_format = index_format_of(c);
     const int T = c.at("T"), B = c.at("B"), L = c.value("layers", 11);
-    const auto layout   = ops::plan_kpool_mla_cache_layout({storage, index_format, 512, 128, L});
-    const auto page     = plan_kv_page_layout(layout.page.geometry);
-    const auto bytes    = page.alignment + shape.pages(B, 0) * (page.page_bytes + page.alignment);
-    const auto envelope = ops::KpoolExecutionEnvelope{std::uint32_t(shape.envelope)};
-    const auto scratch =
-        std::max({ops::kpool_indexer_workspace_capacity_bytes({32, 128}, index_format, envelope, B,
-                                                              1, T, cuda.multiprocessor_count()),
-                  ops::kpool_sparse_mla_workspace_capacity_bytes(
-                      {64, 256, 256, 512}, storage, envelope, B, 1, T, cuda.multiprocessor_count()),
+    const auto layout = ops::plan_kpool_mla_cache_layout({storage, index_format, 512, 128, L});
+    const auto page   = plan_kv_page_layout(layout.page.geometry);
+    const auto bytes  = page.alignment + shape.pages(B, 0) * (page.page_bytes + page.alignment);
+    auto scratch =
+        std::max({app::history_workspace(index_format, storage, shape.envelope, B, T,
+                                         cuda.multiprocessor_count()),
                   ops::kpool_mla_prepare_record_workspace_capacity_bytes(
                       kp::bf16_prepare_profile(kp::Projection::Full), storage, index_format, B, 1,
                       T, cuda.multiprocessor_count()),
                   ops::linear_workspace_capacity_bytes(QType::Q8_G32_FP16, 4096, 16384,
                                                        ops::LinearPolicy::A16Only, B, T * B)});
+    for (const int bound : bounds)
+        scratch = std::max(scratch, app::history_workspace(index_format, storage, bound, B, T,
+                                                           cuda.multiprocessor_count()));
     std::size_t free = 0, total = 0;
     CUDA_CHECK(cudaMemGetInfo(&free, &total));
     // Conservative fixture budget: device + Host mirrors of frame/weights, flush and

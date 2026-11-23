@@ -3,6 +3,7 @@
 #include "ops/softmax_attention/kpool_mla/indexer/arguments.h"
 #include "ops/common/cuda/mma.cuh"
 #include "ops/common/cuda/pipeline.cuh"
+#include "ops/softmax_attention/kpool_mla/indexer/work.cuh"
 
 namespace ninfer::ops::detail::kpool {
 
@@ -15,7 +16,7 @@ __launch_bounds__((Queries < 4 ? 4 : Queries) * 32,
     constexpr int KeyGroups = Queries < 4 ? 4 / Queries : 1;
     constexpr int Threads   = Queries * KeyGroups * 32;
     constexpr int WarpKeys = Keys / KeyGroups, MT = WarpKeys / 16;
-    const int tid = threadIdx.x, lane = tid % 32, warp = tid / 32;
+    const int tid = threadIdx.x, lane = tid % 32;
     for (int slot = blockIdx.x; slot < a.width * a.batch; slot += gridDim.x) {
         const int end = a.end(slot), count = end / 4;
         const auto column = a.column(slot);
@@ -26,20 +27,22 @@ __launch_bounds__((Queries < 4 ? 4 : Queries) * 32,
         if (count <= kIndexSelected)
             for (int i = tid; i < count; i += Threads) a.ids[column * kIndexSelected + i] = i;
     }
-    if (a.columns <= kIndexSelected) return;
-    const int per_batch = (a.width + Queries - 1) / Queries;
-    const int groups = per_batch * a.batch, group = blockIdx.x % groups;
-    const int b = group / per_batch, first = group % per_batch * Queries;
-    // Bound positions directly by the resolved request and this CTA's query group.
-    const int live_end        = min(min(a.width, a.valid[b] - a.begin), first + Queries);
-    const auto request_column = std::int64_t(b) * a.tokens + a.begin;
-    const int visible = live_end > first ? (a.positions[request_column + live_end - 1] + 1) / 4 : 0;
-    const int start   = blockIdx.x / groups * Keys;
-    if (visible <= kIndexSelected || start >= visible) return;
-    const int step = gridDim.x / groups * Keys;
+    auto work = score_work<Queries, Keys>(a);
+    if (work.batch < 0) return;
+    // REDUX makes CTA-uniform scheduling values visible to the register allocator.
+    work.batch    = __reduce_or_sync(0xffffffffu, unsigned(work.batch));
+    work.first    = __reduce_or_sync(0xffffffffu, unsigned(work.first));
+    work.start    = __reduce_or_sync(0xffffffffu, unsigned(work.start));
+    work.step     = __reduce_or_sync(0xffffffffu, unsigned(work.step));
+    work.live     = __reduce_or_sync(0xffffffffu, unsigned(work.live));
+    work.position = __reduce_or_sync(0xffffffffu, unsigned(work.position));
+    const int b = work.batch, first = work.first, start = work.start, step = work.step;
+    const int live_end = min(work.live, first + Queries), visible = (work.position + live_end) / 4;
+    if (start >= visible) return;
+    const int warp = __reduce_or_sync(0xffffffffu, unsigned(tid / 32));
     const int t = first + (Queries == 1 ? 0 : warp / KeyGroups), slot = b * a.width + t;
-    const auto column = request_column + t;
-    const int limit   = Queries == 1 ? visible : t < live_end ? (a.positions[column] + 1) / 4 : 0;
+    const auto column = std::int64_t(b) * a.tokens + a.begin + t;
+    const int limit   = t < live_end ? (work.position + t + 1) / 4 : 0;
     // MMA rows are pools and columns are heads. Four adjacent lanes reduce the 32 heads.
     unsigned qf[4][8][2];
     float weight[4][2];

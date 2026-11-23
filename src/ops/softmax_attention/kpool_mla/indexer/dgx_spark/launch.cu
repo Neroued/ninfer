@@ -10,15 +10,25 @@ namespace {
 __global__ void indexer_idle_kernel() {}
 
 __global__ void indexer_all_kernel(const __grid_constant__ IndexerArguments a) {
-    for (int slot = blockIdx.x; slot < a.width * a.batch; slot += gridDim.x) {
-        const int end = a.end(slot), count = end / 4;
-        const auto column = a.column(slot);
+    for (std::int64_t slot = blockIdx.x; slot < a.width * a.batch; slot += gridDim.x) {
+        const int end = a.end(int(slot)), count = end / 4;
+        const auto column = a.column(int(slot));
         if (threadIdx.x == 0) {
             a.ends[column]   = end;
             a.counts[column] = count;
         }
-        for (int i = threadIdx.x; i < count; i += blockDim.x)
-            a.ids[column * kIndexSelected + i] = i;
+        auto* ids = a.ids + column * kIndexSelected;
+        if (reinterpret_cast<std::uintptr_t>(ids) % alignof(int4) == 0) {
+            auto* vectors = reinterpret_cast<int4*>(ids);
+            for (int v = threadIdx.x; v < count / 4; v += blockDim.x) {
+                const int i = v * 4;
+                vectors[v]  = make_int4(i, i + 1, i + 2, i + 3);
+            }
+            const int i = count / 4 * 4 + threadIdx.x;
+            if (i < count) ids[i] = i;
+        } else {
+            for (int i = threadIdx.x; i < count; i += blockDim.x) ids[i] = i;
+        }
     }
 }
 
@@ -63,10 +73,6 @@ void launch_selection(IndexerArguments a, int workers, bool resident, cudaStream
 }
 
 void launch_indexer_window(IndexerArguments a, IndexerSchedule s, cudaStream_t stream) {
-    if (a.columns <= kIndexSelected) {
-        select_all(a, s.score_workers, stream);
-        return;
-    }
     const auto submit = [&]<int Q, int G>() {
         if (s.stages == 2)
             score<Q, G, 2>(a, s, stream);
@@ -98,10 +104,6 @@ void score_fp8(Fp8IndexerArguments a, Fp8IndexerSchedule s, cudaStream_t stream)
 }
 
 void launch_fp8_window(Fp8IndexerArguments a, Fp8IndexerSchedule s, cudaStream_t stream) {
-    if (a.index.columns <= kIndexSelected) {
-        select_all(a.index, s.score_workers, stream);
-        return;
-    }
     switch (s.route) {
     case Fp8IndexerRoute::Q1K64S2:
         score_fp8<Fp8IndexerRoute::Q1K64S2>(a, s, stream);
@@ -125,99 +127,9 @@ void launch_fp8_window(Fp8IndexerArguments a, Fp8IndexerSchedule s, cudaStream_t
     launch_selection(a.index, s.select_workers, s.resident_selection, stream);
 }
 
-int launch_fp8_windows(Fp8IndexerArguments f, int begin, int count, int windows, int sms,
-                       cudaStream_t stream) {
-    for (int slot = 0; slot < windows; ++slot) {
-        const auto window = indexer_window(count, windows, slot, 8);
-        f.index.begin     = begin + window.begin;
-        f.index.width     = window.width;
-        launch_fp8_window(f, select_fp8_indexer(f.index, sms), stream);
-    }
-    return windows;
-}
-
-int launch_windows(IndexerArguments a, int windows, int sms, cudaStream_t stream) {
-    for (int slot = 0; slot < windows; ++slot) {
-        const auto window = indexer_window(a.tokens, windows, slot);
-        a.begin           = window.begin;
-        a.width           = window.width;
-        launch_indexer_window(a, select_indexer(a, sms), stream);
-    }
-    return windows;
-}
-
-void launch_request_group(IndexerArguments a, int windows, int sms, cudaStream_t stream) {
-    const int slots = indexer_graph_slots(a.tokens, a.batch);
-    int submitted   = 0;
-    if (separate_indexer_requests(a)) {
-        // Request windows share the group's score/candidate storage in stream order.
-        // Tensor and selection strides stay T.
-        const int rows            = indexer_window_width(a.tokens, windows) * a.batch;
-        const int request_windows = a.tokens / rows + (a.tokens % rows != 0);
-        auto request              = a;
-        request.batch             = 1;
-        for (int b = 0; b < a.batch; ++b) {
-            submitted += launch_windows(request, request_windows, sms, stream);
-            request.query += std::int64_t(a.tokens) * 4096;
-            request.coefficients += std::int64_t(a.tokens) * 32;
-            request.positions += a.tokens;
-            ++request.valid;
-            ++request.table_rows;
-            request.ids += std::int64_t(a.tokens) * kIndexSelected;
-            request.counts += a.tokens;
-            request.ends += a.tokens;
-        }
-    } else {
-        submitted = launch_windows(a, windows, sms, stream);
-    }
-    // Four nodes per fixed Graph slot, including when envelope growth changes
-    // request grouping.
+void pad_windows(int submitted, int slots, cudaStream_t stream) {
     for (int slot = submitted; slot < slots; ++slot)
         for (int stage = 0; stage < 4; ++stage) indexer_idle_kernel<<<1, 1, 0, stream>>>();
-    CUDA_CHECK(cudaGetLastError());
-}
-
-void launch_fp8_request_group(Fp8IndexerArguments f, int sms, cudaStream_t stream) {
-    for (int begin = 0; begin < f.index.tokens;) {
-        const int width      = std::min(kIndexPreparedQueries, f.index.tokens - begin);
-        f.query_begin        = begin;
-        f.query_width        = width;
-        const int query_jobs = f.index.columns > kIndexSelected ? width * f.index.batch * 8 : 1;
-        if (f.index.columns > kIndexSelected)
-            indexer_query_fp8_kernel<<<query_jobs, 128, 0, stream>>>(f);
-        else
-            indexer_idle_kernel<<<1, 1, 0, stream>>>();
-        const auto windows = fp8_indexer_windows(width, f.index.batch, f.index.columns);
-        int submitted      = 0;
-        auto request       = f;
-        for (int b = 0; b < f.index.batch; b += windows.group_size) {
-            const int take      = std::min(windows.group_size, f.index.batch - b);
-            request.index.batch = take;
-            submitted +=
-                launch_fp8_windows(request, begin, width, windows.count(width, take), sms, stream);
-            if (b + take == f.index.batch) break;
-            // Scratch is reused only after the group's final merge. Prepared Q
-            // survives all groups; its stride is the outer window, not tokens.
-            request.query += std::int64_t(take) * width * 4096;
-            request.coefficients += std::int64_t(take) * width * 32;
-            auto& a = request.index;
-            a.query += std::int64_t(take) * a.tokens * 4096;
-            a.coefficients += std::int64_t(take) * a.tokens * 32;
-            a.positions += take * a.tokens;
-            a.valid += take;
-            a.table_rows += take;
-            a.ids += std::int64_t(take) * a.tokens * kIndexSelected;
-            a.counts += take * a.tokens;
-            a.ends += take * a.tokens;
-        }
-        // Q preparation has one node per fixed outer window. Only the four score /
-        // selection stages occupy the envelope-independent inner Graph slots.
-        const int slots = fp8_indexer_graph_slots(width, f.index.batch);
-        for (int slot = submitted; slot < slots; ++slot)
-            for (int stage = 0; stage < 4; ++stage) indexer_idle_kernel<<<1, 1, 0, stream>>>();
-        begin += width;
-    }
-    CUDA_CHECK(cudaGetLastError());
 }
 
 IndexerArguments request_group(IndexerArguments a, int begin, int count) {
@@ -233,25 +145,94 @@ IndexerArguments request_group(IndexerArguments a, int begin, int count) {
     a.batch = count;
     return a;
 }
+
+void launch_request_group(IndexerArguments group, int sms, cudaStream_t stream) {
+    const int slots    = indexer_graph_slots(group.tokens, group.tokens, group.batch);
+    const auto windows = indexer_windows(group.tokens, group.batch, group.columns);
+    int submitted      = 0;
+    for (int b = 0; b < group.batch;) {
+        const int take  = std::min(windows.group_size, group.batch - b);
+        auto a          = request_group(group, b, take);
+        const int count = windows.count(a.tokens, take);
+        for (int slot = 0; slot < count; ++slot) {
+            const auto window = indexer_window(a.tokens, count, slot, windows.tile);
+            a.begin           = window.begin;
+            a.width           = window.width;
+            if (a.columns <= kIndexSelected)
+                select_all(a, 4 * sms, stream);
+            else
+                launch_indexer_window(a, select_indexer(a, sms), stream);
+        }
+        submitted += count;
+        b += take;
+    }
+    pad_windows(submitted, slots, stream);
+}
+
+void launch_fp8_request_group(Fp8IndexerArguments group, int prepared_batch, int sms,
+                              cudaStream_t stream) {
+    const auto windows =
+        indexer_windows(group.index.tokens, group.index.batch, group.index.columns, prepared_batch);
+    const bool all = group.index.columns <= kIndexSelected;
+    for (int begin = 0; begin < group.index.tokens;) {
+        const int width   = std::min(kIndexPreparedQueries, group.index.tokens - begin);
+        group.query_begin = begin;
+        group.query_width = width;
+        if (all)
+            indexer_idle_kernel<<<1, 1, 0, stream>>>();
+        else
+            indexer_query_fp8_kernel<<<width * group.index.batch * 8, 128, 0, stream>>>(group);
+
+        int submitted = 0;
+        for (int b = 0; b < group.index.batch;) {
+            const int take = std::min(windows.group_size, group.index.batch - b);
+            auto f         = group;
+            f.index        = request_group(group.index, b, take);
+            if (!all) {
+                // Prepared Q is shared across all score windows in the chunk.
+                f.query += std::int64_t(b) * width * 4096;
+                f.coefficients += b * width * 32;
+            }
+            const int count = windows.count(width, take);
+            for (int slot = 0; slot < count; ++slot) {
+                const auto window = indexer_window(width, count, slot, windows.tile);
+                f.index.begin     = begin + window.begin;
+                f.index.width     = window.width;
+                if (all)
+                    select_all(f.index, 4 * sms, stream);
+                else
+                    launch_fp8_window(f, select_fp8_indexer(f.index, sms), stream);
+            }
+            submitted += count;
+            b += take;
+        }
+        pad_windows(
+            submitted,
+            indexer_graph_slots(group.index.tokens, width, group.index.batch, prepared_batch),
+            stream);
+        begin += width;
+    }
+}
 } // namespace
 
 void launch_indexer(IndexerArguments a, int sms, cudaStream_t stream) {
     for (int begin = 0; begin < a.batch;) {
-        auto group         = request_group(a, begin, indexer_group_size(a.tokens, a.batch - begin));
-        const auto windows = indexer_windows(a.tokens, a.tokens, group.batch, a.columns);
-        launch_request_group(group, windows.count, sms, stream);
-        begin += group.batch;
+        const int count = indexer_group_size(a.tokens, a.batch - begin);
+        launch_request_group(request_group(a, begin, count), sms, stream);
+        begin += count;
     }
+    CUDA_CHECK(cudaGetLastError());
 }
 
 void launch_fp8_indexer(Fp8IndexerArguments f, int sms, cudaStream_t stream) {
+    const int prepared_batch = indexer_group_size(f.index.tokens, f.index.batch);
     for (int begin = 0; begin < f.index.batch;) {
-        auto group  = f;
-        group.index = request_group(f.index, begin,
-                                    indexer_group_size(f.index.tokens, f.index.batch - begin));
-        // Prepared Q and score scratch are reused only after this group's final selection.
-        launch_fp8_request_group(group, sms, stream);
-        begin += group.index.batch;
+        const int count = std::min(prepared_batch, f.index.batch - begin);
+        auto group      = f;
+        group.index     = request_group(f.index, begin, count);
+        launch_fp8_request_group(group, prepared_batch, sms, stream);
+        begin += count;
     }
+    CUDA_CHECK(cudaGetLastError());
 }
 } // namespace ninfer::ops::detail::kpool

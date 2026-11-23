@@ -24,6 +24,7 @@ struct ChainFixture {
     std::vector<std::uint8_t> latent_codes, latent_scales;
     ops::KpoolTailStateView before, after;
     ops::KpoolMlaCacheView cache;
+    ops::KpoolExecutionEnvelope envelope;
     std::array<std::size_t, 4> capacities;
     float scale = 1.F / 16;
 
@@ -44,7 +45,8 @@ struct ChainFixture {
           selection_rows(cuda.device(), DType::I32, {T, B}),
           before_offsets(cuda.device(), DType::I64, {B}),
           after_offsets(cuda.device(), DType::I64, {B}),
-          latent(initialize_history ? std::size_t(index.physical_pages) * 64 * 512 : 0) {
+          latent(initialize_history ? std::size_t(index.physical_pages) * 64 * 512 : 0),
+          envelope{std::uint32_t(shape.envelope ? shape.envelope : E)} {
         StateImageBuilder builder;
         fields            = ops::append_kpool_tail_fields(builder, 128, layers);
         state_layout      = builder.finish();
@@ -124,9 +126,8 @@ struct ChainFixture {
                 ops::ProjectionWeights{ops::SingleProjectionWeight{query_weight}}, split_rows, B,
                 T * B),
             index.workspace_bytes,
-            ops::kpool_sparse_mla_workspace_capacity_bytes({64, 256, 256, 512}, storage,
-                                                           index.envelope, B, 1, T,
-                                                           cuda.multiprocessor_count())};
+            ops::kpool_sparse_mla_workspace_capacity_bytes({64, 256, 256, 512}, storage, envelope,
+                                                           B, 1, T, cuda.multiprocessor_count())};
         index.workspace.reset();
         index.workspace_bytes = *std::max_element(capacities.begin(), capacities.end());
         index.scratch         = DeviceBuffer(cuda.device(), index.workspace_bytes + 512);
@@ -167,8 +168,8 @@ struct ChainFixture {
             query.view,
             {dense_weight(key_up.view, 16384, 512), dense_weight(value_up.view, 16384, 512)},
             cache.latent, {index.positions.view, index.valid.view, index.selectors.view},
-            index.selection, selection_rows.view, scale, index.envelope, *index.workspace,
-            output.view, cuda);
+            index.selection, selection_rows.view, scale, envelope, *index.workspace, output.view,
+            cuda);
     }
 
     void launch(CudaExecutionView cuda) {

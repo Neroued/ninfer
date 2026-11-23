@@ -6,6 +6,7 @@
 #include "core/record_view.h"
 #include "core/tensor.h"
 #include "core/weight.h"
+#include "ninfer/ops/context_bucket.h"
 #include "ninfer/ops/projection_weights.h"
 
 #include <cstddef>
@@ -60,13 +61,13 @@ inline constexpr std::int32_t kKpoolPoolSize          = 4;
 inline constexpr std::int32_t kKpoolSelectedPools     = 512;
 inline constexpr std::uint32_t kKpoolMaxVisibleTokens = 1048576;
 
+// Live positions in each row are consecutive and nonnegative; padding consumes no ordinal.
 struct KpoolMlaBatchView {
     Tensor positions;     // Device I32 [T,B], original-token ordinals.
     Tensor valid_columns; // Device I32 [B], 0<=n[b]<=T.
     Tensor table_rows;    // Device I32 [B], row of the page-offset table.
 };
 
-// Live positions in each row are consecutive and nonnegative; padding consumes no ordinal.
 // Every live p+1 fits the page table and the semantic context limit. The Host envelope is only
 // a resource bound, not an exact length or a claim that selections are full. Zero permits no
 // live queries. A valid envelope change must not change mathematical output.
@@ -338,17 +339,18 @@ void kpool_mla_prepare_update(const Tensor& x, const KpoolMlaPrepareParameters& 
  * output row m=t+T*b; Nselection must equal T*B. Inert rows write count=E=0, leave IDs undefined
  * and do not read positions, query, coefficients, cache or selectors. IDs beyond count are
  * undefined. Inputs/cache are preserved. Mathematical operands and computed scores are finite.
- * Each live E fits both the page table and envelope.max_visible_tokens<=kKpoolMaxVisibleTokens.
+ * Each live E <= min<std::int64_t>(context_bucket_tokens(bucket), std::int64_t(table.ne[0]) * 64),
+ * where table is the cache page-offset table.
  *
  * Mixed per-row lengths/all-select/inert cases are Device decisions. Scratch is reused across
- * bounded query windows. Fixed T/B/profile/index format/device facts keep Graph node count/order
- * compatible across envelope updates; changing a Host variable alone does not update captured
- * nodes.
+ * query windows. K2 uses zero scratch. Fixed T/B/profile/index format/device produce a linear
+ * kernel chain with the same node count across K2..M1. Both cudaGraphExecKernelNodeSetParams and
+ * cudaGraphExecUpdate can install the launches captured for a different bucket.
  */
 void kpool_indexer(const Tensor& index_query, const Tensor& head_coeff,
                    const ConstKpoolIndexCacheView& cache, const KpoolMlaBatchView& batch,
-                   KpoolExecutionEnvelope envelope, MemoryArena& workspace,
-                   KpoolBlockSelection& out, CudaExecutionView execution);
+                   ContextBucket bucket, MemoryArena& workspace, KpoolBlockSelection& out,
+                   CudaExecutionView execution);
 
 struct KpoolMlaFactors {
     // Logical [Hq*Dq,Dc] / [Hq*Dv,Dc], preserving the native per-head row order.
@@ -428,7 +430,8 @@ void kpool_tail_extract(ConstKpoolTailStateView before, const KpoolRawRecordRead
 
 /**
  * Minimum sufficient Op-local high-water bytes over the inclusive positive T interval, with
- * fixed profile/storage/B/envelope and the execution device's positive physical sm_count.
+ * fixed profile/storage/B and the execution device's positive physical sm_count. Indexer
+ * capacity covers the inclusive bucket range; sparse MLA capacity uses a fixed envelope.
  * Include every legal length, pool phase, alias form, private route and internal alignment gap;
  * exclude trailing padding and caller outputs/cache/tail/records/selection. Count from a
  * 256-byte-aligned local cursor. Invalid/unsupported profiles or intervals throw; zero means
@@ -445,10 +448,11 @@ void kpool_tail_extract(ConstKpoolTailStateView before, const KpoolRawRecordRead
     KvCacheVectorFormat index_format, std::int32_t batch_size, std::int32_t min_tokens,
     std::int32_t max_tokens, std::int32_t sm_count);
 
-[[nodiscard]] std::size_t kpool_indexer_workspace_capacity_bytes(
-    const KpoolIndexerProfile& profile, KvCacheVectorFormat index_format,
-    KpoolExecutionEnvelope envelope, std::int32_t batch_size, std::int32_t min_tokens,
-    std::int32_t max_tokens, std::int32_t sm_count);
+[[nodiscard]] std::size_t
+kpool_indexer_workspace_capacity_bytes(const KpoolIndexerProfile& profile,
+                                       KvCacheVectorFormat index_format, ContextBucketRange buckets,
+                                       std::int32_t batch_size, std::int32_t min_tokens,
+                                       std::int32_t max_tokens, std::int32_t sm_count);
 
 [[nodiscard]] std::size_t
 kpool_sparse_mla_workspace_capacity_bytes(const KpoolSparseMlaProfile& profile,
@@ -464,19 +468,17 @@ public:
     bool operator==(const KpoolGraphProfile&) const = default;
 private:
     std::array<std::uint64_t, 24> words_{};
-    friend KpoolGraphProfile kpool_indexer_graph_profile(const KpoolIndexerProfile&,
-                                                         KvCacheVectorFormat,
-                                                         KpoolExecutionEnvelope, std::int32_t,
-                                                         std::int32_t, std::int32_t);
     friend KpoolGraphProfile kpool_sparse_mla_graph_profile(const KpoolSparseMlaProfile&,
                                                             KpoolMlaStorage, KpoolExecutionEnvelope,
                                                             std::int32_t, std::int32_t,
                                                             std::int32_t);
 };
 
-[[nodiscard]] KpoolGraphProfile
-kpool_indexer_graph_profile(const KpoolIndexerProfile&, KvCacheVectorFormat, KpoolExecutionEnvelope,
-                            std::int32_t batch_size, std::int32_t tokens, std::int32_t sm_count);
+// Equality guarantees identical launches and scratch layout at fixed operands.
+[[nodiscard]] OpGraphProfile
+kpool_indexer_graph_profile(const KpoolIndexerProfile& profile, KvCacheVectorFormat index_format,
+                            ContextBucket bucket, std::int32_t batch_size, std::int32_t tokens,
+                            std::int32_t sm_count);
 [[nodiscard]] KpoolGraphProfile
 kpool_sparse_mla_graph_profile(const KpoolSparseMlaProfile&, KpoolMlaStorage,
                                KpoolExecutionEnvelope, std::int32_t batch_size, std::int32_t tokens,

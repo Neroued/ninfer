@@ -252,8 +252,10 @@ int verify(kp::ChainFixture& f, const std::vector<int>& accepted = {}) {
 
 int run(int T, int B, int E, int layers, bool graph, bool fp8 = false, bool fp8_latent = false) {
     auto& d = cuda_environment().context;
+    kp::IndexerCase shape;
+    shape.bucket = ops::select_context_bucket(std::uint32_t(E));
     kp::ChainFixture f(
-        d.execution_view(), T, B, E, layers, B > 1, {}, true, true,
+        d.execution_view(), T, B, E, layers, B > 1, shape, true, true,
         fp8 ? KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0 : KvCacheVectorFormat::BFloat16,
         fp8_latent ? ops::KpoolMlaStorage::Fp8E4m3fnGroup128Ue8m0 : ops::KpoolMlaStorage::BFloat16);
     if (graph) {

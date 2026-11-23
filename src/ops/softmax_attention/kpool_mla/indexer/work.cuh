@@ -50,23 +50,26 @@ __device__ __forceinline__ ScoreWork score_work(const IndexerArguments& a) {
                 span.live,
                 span.position};
     }
-    int groups = 0, work = 0;
+    int groups        = 0;
+    std::int64_t work = 0;
     for (int b = 0; b < a.batch; ++b) {
         const auto span = query_span(a, b);
         const int n     = span.groups<Queries>();
         groups += n;
-        work += n * span.visible;
+        work += std::int64_t(n) * span.visible;
     }
     if (!groups) return {};
-    int remaining = blockIdx.x;
+    const int available = max(0, int(gridDim.x) - groups);
+    int remaining       = blockIdx.x;
     for (int b = 0; b < a.batch; ++b) {
         const auto span = query_span(a, b);
         const int n     = span.groups<Queries>();
         if (!n) continue;
         // Reserve one worker per scored group, then distribute the remainder by
         // history length. Rounding down keeps the total within the captured grid.
-        const int workers = 1 + (int(gridDim.x) - groups) * span.visible / work;
-        const int jobs    = workers * n;
+        const int workers =
+            1 + (n == groups ? available / n : int(available * std::int64_t(span.visible) / work));
+        const int jobs = workers * n;
         if (remaining < jobs)
             return {b,
                     span.first + remaining % n * Queries,

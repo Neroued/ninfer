@@ -1,4 +1,5 @@
 #include "ops/op_measurement.cuh"
+#include "ops/context_bucket_workload.h"
 #include "common/gpu_activity.cuh"
 #include "../../../../tools/support/kpool_indexer_fixture.h"
 
@@ -12,18 +13,23 @@ int main(int argc, char** argv) {
         std::vector<int> tokens{1, 2, 4, 8, 16, 32, 64};
         int batch = 1, end = 65536, layers = 11, active_rows = -1;
         bool ragged = false, inactive = false;
+        std::optional<ops::ContextBucket> bucket_override;
+        auto length_dist = workload::LengthDist::Uniform;
+        std::optional<workload::ValidDist> valid_dist;
         auto storage      = ops::KpoolMlaStorage::BFloat16;
         auto index_format = KvCacheVectorFormat::BFloat16;
         for (int i = 1; i < argc; ++i) {
             const std::string flag = argv[i];
             if (flag == "--help") {
-                std::cout
-                    << "Complete Kpool weighted Indexer + exact Top512.\n"
-                       "  --tokens N,... --batch B --end E --layers 1|11 --ragged 0|1\n"
-                       "  --latent-cache bf16|fp8 --index-cache bf16|fp8\n"
-                       "  --inactive 0|1  zero valid columns in every physical row\n"
-                       "  --active-rows 0..B  leading active request rows (default B)\n"
-                       "E is the last physical query's exclusive end; requires T<=E<=1048576.\n";
+                std::cout << "Complete Kpool weighted Indexer + exact Top512.\n"
+                             "  --tokens N,... --batch B --end E --layers 1|11 --ragged 0|1\n"
+                             "  --latent-cache bf16|fp8 --index-cache bf16|fp8\n"
+                             "  --bucket auto|2k|8k|16k|32k|64k|128k|256k|512k|1m\n"
+                             "  --length-dist uniform|skewed-1long|staggered|shared-prefix\n"
+                             "  --valid-dist full|ragged|with-inert  overrides --ragged\n"
+                             "  --inactive 0|1  zero valid columns in every physical row\n"
+                             "  --active-rows 0..B  leading active request rows (default B)\n"
+                             "E is the largest requested exclusive end; requires T<=E<=1048576.\n";
                 measurement::help();
                 return 0;
             }
@@ -49,7 +55,13 @@ int main(int argc, char** argv) {
             } else if (flag == "--index-cache" && (value == "bf16" || value == "fp8")) {
                 index_format = value == "fp8" ? KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0
                                               : KvCacheVectorFormat::BFloat16;
-            } else if (flag == "--ragged")
+            } else if (flag == "--bucket")
+                bucket_override = workload::parse_bucket_override(value);
+            else if (flag == "--length-dist")
+                length_dist = workload::parse_length_dist(value);
+            else if (flag == "--valid-dist")
+                valid_dist = workload::parse_valid_dist(value);
+            else if (flag == "--ragged")
                 ragged = measurement::integer(value, 0, 1);
             else if (flag == "--inactive")
                 inactive = measurement::integer(value, 0, 1);
@@ -66,8 +78,47 @@ int main(int argc, char** argv) {
         L2FlushBuffer flush(options.flush_bytes);
         const int max_tokens = *std::max_element(tokens.begin(), tokens.end());
         if (max_tokens > end) throw std::invalid_argument("tokens exceed --end");
-        kp::IndexerFixture f(device.execution_view(), max_tokens, batch, end, layers, ragged,
-                             storage, {}, true, index_format);
+        const auto validity =
+            valid_dist.value_or(ragged ? workload::ValidDist::Ragged : workload::ValidDist::Full);
+        const auto make_shape = [&](int T) {
+            auto w = workload::generate_batch_workload(end, T, batch, length_dist, validity);
+            kp::IndexerCase shape;
+            shape.reserve_ends = w.row_contexts;
+            if (length_dist == workload::LengthDist::Uniform)
+                std::fill(shape.reserve_ends.begin(), shape.reserve_ends.end(), end);
+            shape.ends          = std::move(w.row_contexts);
+            shape.valid         = std::move(w.valid_columns);
+            shape.shared_prefix = w.shared_prefix_tokens;
+            int max_visible     = 0;
+            for (int b = 0; b < batch; ++b) {
+                if (!valid_dist && ragged) {
+                    shape.valid[b] = b == batch - 1 ? 0 : std::max(1, T - b);
+                    shape.ends[b]  = std::max(shape.valid[b], shape.ends[b] - T + shape.valid[b]);
+                }
+                if (b >= active_rows) shape.valid[b] = 0;
+                if (!shape.valid[b]) {
+                    shape.ends[b] = 0;
+                    continue;
+                }
+                max_visible = std::max(max_visible, shape.ends[b]);
+                shape.shared_prefix =
+                    std::min(shape.shared_prefix, (shape.ends[b] - shape.valid[b]) / 64 * 64);
+            }
+            shape.bucket = bucket_override.value_or(ops::select_context_bucket(max_visible));
+            if (ops::context_bucket_tokens(*shape.bucket) < std::uint32_t(max_visible))
+                throw std::invalid_argument("--bucket is smaller than the live history");
+            if (!max_visible) shape.shared_prefix = 0;
+            return shape;
+        };
+        auto backing = make_shape(max_tokens);
+        for (const int T : tokens) {
+            const auto shape      = make_shape(T);
+            backing.shared_prefix = std::min(backing.shared_prefix, shape.shared_prefix);
+            for (int b = 0; b < batch; ++b)
+                backing.reserve_ends[b] = std::max(backing.reserve_ends[b], shape.reserve_ends[b]);
+        }
+        kp::IndexerFixture f(device.execution_view(), max_tokens, batch, end, layers, false,
+                             storage, backing, true, index_format);
         measurement::Csv csv(options.csv_out, "latent_storage,end,live_queries,scored_queries,key_"
                                               "payload_bytes,query_payload_bytes,output_bytes,"
                                               "score_flops,key_payload_GBps,score_TFLOps,"
@@ -75,19 +126,22 @@ int main(int argc, char** argv) {
                                               "candidate_io_bytes,prepared_query_io_bytes,"
                                               "pipeline_bytes,minimum_io_GBps,pipeline_GBps,"
                                               "tensor_peak_TFLOps,tensor_peak_pct,"
-                                              "minimum_io_read_reference_pct,roofline_lower_us");
+                                              "minimum_io_read_reference_pct,roofline_lower_us,"
+                                              "bucket,length_dist,valid_dist");
         for (int T : tokens) {
-            f.reset_tokens(T, ragged, device.execution_view());
-            if (active_rows < batch) {
-                for (int b = active_rows; b < batch; ++b) {
-                    f.valid.at(b)     = 0;
-                    f.selectors.at(b) = -1;
-                    for (int t = 0; t < T; ++t) f.positions.at(t, b) = -1;
-                }
-                f.positions.upload();
-                f.valid.upload();
-                f.selectors.upload();
+            const auto shape = make_shape(T);
+            f.bucket         = *shape.bucket;
+            f.resize_queries(T, device.execution_view());
+            for (int b = 0; b < batch; ++b) {
+                f.valid.at(b)     = shape.valid[b];
+                f.selectors.at(b) = shape.valid[b] ? batch - 1 - b : -1;
+                for (int t = 0; t < T; ++t)
+                    f.positions.at(t, b) =
+                        t < shape.valid[b] ? shape.ends[b] - shape.valid[b] + t : -1;
             }
+            f.positions.upload();
+            f.valid.upload();
+            f.selectors.upload();
             std::uint64_t live = 0, scored = 0, key_bytes = 0, query_bytes = 0,
                           output_bytes   = 8ULL * T * batch;
             std::uint64_t metadata_bytes = 4ULL * batch;
@@ -136,7 +190,10 @@ int main(int argc, char** argv) {
             row.tokens = T;
             row.batch  = batch;
             row.layers = layers;
-            row.valid  = inactive ? "inactive" : ragged ? "ragged" : "dense";
+            row.valid  = inactive     ? "inactive"
+                         : valid_dist ? std::string(workload::valid_dist_name(validity))
+                         : ragged     ? "ragged"
+                                      : "dense";
             if (!inactive && active_rows < batch)
                 row.valid += "-rows" + std::to_string(active_rows);
             row.workspace_bytes = f.workspace_bytes;
@@ -164,7 +221,10 @@ int main(int argc, char** argv) {
                             std::to_string(pipeline / us / 1000) + "," + std::to_string(peak) +
                             "," + std::to_string(flops / us / 1e6 / peak * 100) + "," +
                             std::to_string(minimum_io / us / 257420 * 100) + "," +
-                            std::to_string(std::max(flops / (peak * 1e6), minimum_io / 257420.)));
+                            std::to_string(std::max(flops / (peak * 1e6), minimum_io / 257420.)) +
+                            "," + std::string(ops::context_bucket_name(f.bucket)) + "," +
+                            std::string(workload::length_dist_name(length_dist)) + "," +
+                            std::string(workload::valid_dist_name(validity)));
                 }
         }
     } catch (const std::exception& e) {

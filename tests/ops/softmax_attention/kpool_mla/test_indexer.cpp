@@ -1,5 +1,6 @@
 #include "reference.h"
 #include "ops/suite.h"
+#include "ops/graph_patch_check.h"
 #include "cuda_fixture.h"
 #include "core/decode_graph.h"
 #include "../../../../tools/support/kpool_indexer_fixture.h"
@@ -10,12 +11,28 @@
 #include <iostream>
 #include <set>
 #include <tuple>
+#include <cuda.h>
 
 using namespace ninfer;
 using namespace ninfer::test;
 namespace kp = ninfer::tool::kpool;
 
 namespace {
+using ops::ContextBucket;
+using ops::ContextBucketRange;
+
+KvCacheVectorFormat index_format(bool fp8) {
+    return fp8 ? KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0 : KvCacheVectorFormat::BFloat16;
+}
+
+void reserve_workspace(kp::IndexerFixture& f, std::size_t bytes, Device device) {
+    f.workspace.reset();
+    f.workspace_bytes = bytes;
+    f.scratch         = DeviceBuffer(device, bytes + 512);
+    f.scratch.fill(0xa5);
+    f.workspace = std::make_unique<MemoryArena>(f.scratch.span().subspan(256, bytes));
+}
+
 int verify(kp::IndexerFixture& f, bool exact = false) {
     if (const int failures = verify_selection(f, exact)) return failures;
     if (f.query.download() != f.query.host || f.coeff.download() != f.coeff.host ||
@@ -79,25 +96,28 @@ int graph(bool fp8_index = false, int T = 129, int B = 3, int maximum = 262148) 
     kp::IndexerFixture f(
         d.execution_view(), T, B, maximum, 1, false, ops::KpoolMlaStorage::BFloat16, {}, true,
         fp8_index ? KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0 : KvCacheVectorFormat::BFloat16);
-    const auto bounds = maximum == 8192 ? std::vector<int>{2051, 8192, 0, 4096}
-                                        : std::vector<int>{2051, 262148, 131108, 0, 8192};
-    // Capacity is for a fixed Host envelope; different envelopes may choose
-    // different windows. Reserve the union before capturing any child graph.
-    for (int bound : bounds)
-        f.workspace_bytes =
-            std::max(f.workspace_bytes, ops::kpool_indexer_workspace_capacity_bytes(
-                                            {32, 128}, f.cache.format, {unsigned(bound)}, B, 1, T,
-                                            d.execution_view().multiprocessor_count()));
-    f.scratch = DeviceBuffer(d.execution_view().device(), f.workspace_bytes + 512);
-    f.scratch.fill(0xa5);
-    f.workspace = std::make_unique<MemoryArena>(f.scratch.span().subspan(256, f.workspace_bytes));
+    const auto bounds   = maximum == 8192 ? std::vector<int>{2051, 8192, 0, 4096}
+                                          : std::vector<int>{2051, 262148, 131108, 0, 8192};
+    const auto cuda     = d.execution_view();
+    const auto capacity = ops::kpool_indexer_workspace_capacity_bytes(
+        {32, 128}, f.cache.format, {ContextBucket::K2, ContextBucket::M1}, B, T, T,
+        cuda.multiprocessor_count());
+    reserve_workspace(f, capacity, d.device());
+    std::size_t nodes = 0;
+    for (const auto bucket : ops::kAllContextBuckets) {
+        f.bucket = bucket;
+        const CapturedKernelSequence seq(cuda, [&](auto c) { f.launch(c); });
+        if (nodes && seq.params().size() != nodes) return 1;
+        nodes = seq.params().size();
+    }
+    if (T <= 16 && B <= 16 && nodes != (fp8_index ? 5 : 4)) return 1;
     DecodeGraphDefinition outer;
     DecodeGraphExecutable graph;
     DecodeGraphChild child;
-    std::optional<ops::KpoolGraphProfile> installed;
+    std::optional<ops::OpGraphProfile> installed;
     int failures = 0;
     for (int bound : bounds) {
-        f.envelope.max_visible_tokens = bound;
+        f.bucket = ops::select_context_bucket(bound);
         for (int b = 0; b < f.B; ++b) {
             f.valid.at(b)     = bound ? (b == 2 ? 0 : f.T) : 0;
             f.selectors.at(b) = f.valid.at(b) ? f.B - 1 - b : -1;
@@ -106,7 +126,7 @@ int graph(bool fp8_index = false, int T = 129, int B = 3, int maximum = 262148) 
         }
         f.upload_metadata();
         const auto profile =
-            ops::kpool_indexer_graph_profile({32, 128}, f.cache.format, f.envelope, f.B, f.T,
+            ops::kpool_indexer_graph_profile({32, 128}, f.cache.format, f.bucket, f.B, f.T,
                                              d.execution_view().multiprocessor_count());
         if (!installed || *installed != profile) {
             DecodeGraphDefinition definition;
@@ -143,7 +163,7 @@ int graph_growth(bool fp8_index) {
     DecodeGraphExecutable executable;
     executable.instantiate(definition);
     int failures = 0;
-    // One captured envelope covers metadata-only transitions from inert/all-select
+    // One captured bucket covers metadata-only transitions from inert/all-select
     // to scored selection and through both merge levels, without a Graph update.
     for (int end : {0, 2051, 2052, 16388, 131076, 262148, 2051}) {
         for (int b = 0; b < f.B; ++b) {
@@ -163,10 +183,10 @@ int graph_growth(bool fp8_index) {
 int mixed_history() {
     auto& d = cuda_environment().context;
     kp::IndexerCase shape;
-    shape.ends     = {2051, 8192, 65536, 1048576};
-    shape.valid    = {4, 3, 2, 1};
-    shape.envelope = 1048576;
-    kp::IndexerFixture f(d.execution_view(), 4, 4, shape.envelope, 1, false,
+    shape.ends   = {2051, 8192, 65536, 1048576};
+    shape.valid  = {4, 3, 2, 1};
+    shape.bucket = ContextBucket::M1;
+    kp::IndexerFixture f(d.execution_view(), 4, 4, 1048576, 1, false,
                          ops::KpoolMlaStorage::BFloat16, shape, true,
                          KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0);
     f.selectors.at(0) = -1;
@@ -202,7 +222,7 @@ int request_groups(bool fp8) {
     constexpr int batch = 129, tokens = 2;
     shape.ends.resize(batch, 2052);
     shape.valid.resize(batch, tokens);
-    shape.envelope = 2052;
+    shape.bucket = ContextBucket::K8;
     for (int b = 0; b < batch; ++b) {
         if (b >= 64 && b < 128)
             shape.valid[b] = 0;
@@ -211,10 +231,9 @@ int request_groups(bool fp8) {
         else if (b % 3 == 1)
             shape.valid[b] = 1;
     }
-    kp::IndexerFixture f(d.execution_view(), tokens, batch, shape.envelope, 1, false,
-                         ops::KpoolMlaStorage::BFloat16, shape, true,
-                         fp8 ? KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0
-                             : KvCacheVectorFormat::BFloat16);
+    kp::IndexerFixture f(
+        d.execution_view(), tokens, batch, 2052, 1, false, ops::KpoolMlaStorage::BFloat16, shape,
+        true, fp8 ? KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0 : KvCacheVectorFormat::BFloat16);
     for (int b = 0; b < batch; ++b) {
         if (shape.ends[b] <= 2051 || !shape.valid[b]) {
             f.selectors.at(b) = -1;
@@ -230,32 +249,154 @@ int request_groups(bool fp8) {
     return verify(f);
 }
 
+int small_page_table(bool fp8) {
+    auto& d = cuda_environment().context;
+    kp::IndexerFixture f(d.execution_view(), 4, 1, 96, 1, false, ops::KpoolMlaStorage::BFloat16, {},
+                         true, index_format(fp8));
+    if (f.P != 2 || f.bucket != ContextBucket::K2) return 1;
+    f.launch(d.execution_view());
+    d.synchronize();
+    return verify(f, true);
+}
+
+int zero_workspace(bool fp8) {
+    auto& d         = cuda_environment().context;
+    const auto cuda = d.execution_view();
+    kp::IndexerCase shape;
+    shape.ends  = {2048, 98, 0};
+    shape.valid = {4, 2, 0};
+    kp::IndexerFixture f(cuda, 4, 3, 2048, 1, false, ops::KpoolMlaStorage::BFloat16, shape, true,
+                         index_format(fp8));
+    MemoryArena workspace({nullptr, 0, d.device()});
+    if (f.workspace_bytes != 0) return 1;
+
+    CUmemAllocationProp properties{};
+    properties.type         = CU_MEM_ALLOCATION_TYPE_PINNED;
+    properties.location     = {CU_MEM_LOCATION_TYPE_DEVICE, d.device().index()};
+    std::size_t granularity = 0;
+    if (cuInit(0) != CUDA_SUCCESS ||
+        cuMemGetAllocationGranularity(&granularity, &properties,
+                                      CU_MEM_ALLOC_GRANULARITY_MINIMUM) != CUDA_SUCCESS)
+        throw std::runtime_error("unable to query device VA granularity for Kpool K2");
+    const auto bytes =
+        std::max({f.query.view.bytes(), f.coeff.view.bytes(), f.packed.storage().bytes,
+                  f.tables.storage.size(), f.selectors.view.bytes()});
+
+    struct Reservation {
+        CUdeviceptr address = 0;
+        std::size_t bytes;
+
+        ~Reservation() {
+            if (address) (void)cuMemAddressFree(address, bytes);
+        }
+    } reserved{0, (bytes + granularity - 1) / granularity * granularity};
+
+    if (cuMemAddressReserve(&reserved.address, reserved.bytes, 0, 0, 0) != CUDA_SUCCESS)
+        throw std::runtime_error("unable to reserve unmapped device addresses for Kpool K2");
+
+    auto* unreadable = reinterpret_cast<void*>(reserved.address);
+    auto query = f.query.view, coefficients = f.coeff.view, selectors = f.selectors.view;
+    query.data = coefficients.data = selectors.data = unreadable;
+    auto cache                                      = f.cache;
+    cache.keys.records.storage.data                 = unreadable;
+    cache.keys.records.page_offsets.data            = unreadable;
+    if (fp8) cache.scales.records = cache.keys.records;
+    ops::kpool_indexer(query, coefficients, cache, {f.positions.view, f.valid.view, selectors},
+                       ContextBucket::K2, workspace, f.selection, cuda);
+    d.synchronize();
+    return verify(f, true) + (workspace.peak_used() != 0);
+}
+
+int flat_graph_patch(bool fp8) {
+    auto& d         = cuda_environment().context;
+    const auto cuda = d.execution_view();
+    constexpr int T = 4, B = 4, longest = 530000;
+    kp::IndexerCase shape;
+    shape.ends  = {longest, 6500, 1024, 0};
+    shape.valid = {1, 3, 2, 0};
+    kp::IndexerFixture f(cuda, T, B, longest, 1, false, ops::KpoolMlaStorage::BFloat16, shape, true,
+                         index_format(fp8));
+    exact_inputs(f, 0);
+    reserve_workspace(f,
+                      ops::kpool_indexer_workspace_capacity_bytes(
+                          {32, 128}, f.cache.format, {ContextBucket::K2, ContextBucket::M1}, B, T,
+                          T, cuda.multiprocessor_count()),
+                      d.device());
+
+    std::vector<CapturedKernelSequence> captures;
+    std::vector<ops::OpGraphProfile> profiles;
+    for (const auto bucket : ops::kAllContextBuckets) {
+        f.bucket     = bucket;
+        auto profile = ops::kpool_indexer_graph_profile({32, 128}, f.cache.format, bucket, B, T,
+                                                        cuda.multiprocessor_count());
+        if (std::find(profiles.begin(), profiles.end(), profile) != profiles.end()) return 1;
+        profiles.push_back(profile);
+        captures.emplace_back(cuda, [&](auto c) { f.launch(c); });
+        if (captures.back().params().size() != (fp8 ? 5 : 4)) return 1;
+    }
+
+    FlatGraphPatchHarness patched(captures.front());
+    FlatGraphPatchHarness updated(captures.front());
+    for (const auto bucket :
+         {ContextBucket::K2, ContextBucket::K8, ContextBucket::K16, ContextBucket::K64,
+          ContextBucket::K256, ContextBucket::M1, ContextBucket::K32, ContextBucket::K2}) {
+        const int bound = ops::context_bucket_tokens(bucket);
+        const std::array row_ends{std::min(bound, longest), std::min(bound / 2, 6500), 1024, 0};
+        const std::array valid{bucket >= ContextBucket::K256 ? 1 : 4, bound > 2048 ? 3 : 0, 2, 0};
+        for (int b = 0; b < B; ++b) {
+            f.valid.at(b)     = valid[b];
+            f.selectors.at(b) = valid[b] && row_ends[b] > 2051 ? B - 1 - b : -1;
+            for (int t = 0; t < T; ++t)
+                f.positions.at(t, b) = t < valid[b] ? row_ends[b] - valid[b] + t : -1;
+        }
+        f.positions.upload();
+        f.valid.upload();
+        f.selectors.upload();
+        const auto& seq = captures[static_cast<std::size_t>(bucket)];
+        patched.patch_and_launch(seq, cuda);
+        d.synchronize();
+        if (verify_selection(f, true)) return 1;
+        // Clear outputs so an omitted stage during whole-graph update cannot
+        // pass by leaving the already checked per-node patch result in place.
+        f.ids.storage.fill(0xa5);
+        f.counts.storage.fill(0xa5);
+        f.ends.storage.fill(0xa5);
+        updated.update_whole_graph_and_launch(seq, cuda);
+        d.synchronize();
+        if (verify_selection(f, true)) return 1;
+    }
+    return !f.ids.guards() || !f.counts.guards() || !f.ends.guards() || !f.scratch_guards() ||
+           f.workspace->used() != 0 || f.workspace->peak_used() > f.workspace_bytes;
+}
+
 int workspace_interval(bool fp8 = false) {
     auto& d = cuda_environment().context;
     const auto format =
         fp8 ? KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0 : KvCacheVectorFormat::BFloat16;
-    const auto bytes = ops::kpool_indexer_workspace_capacity_bytes(
-        {32, 128}, format, {65536}, 1, 128, 256, d.execution_view().multiprocessor_count());
+    const auto bytes =
+        ops::kpool_indexer_workspace_capacity_bytes({32, 128}, format, ContextBucket::K64, 1, 128,
+                                                    256, d.execution_view().multiprocessor_count());
     int failures        = 0;
-    const auto capacity = [&](int B, unsigned E, int lo, int hi) {
+    const auto capacity = [&](int B, ContextBucket bucket, int lo, int hi) {
         return ops::kpool_indexer_workspace_capacity_bytes(
-            {32, 128}, format, {E}, B, lo, hi, d.execution_view().multiprocessor_count());
+            {32, 128}, format, bucket, B, lo, hi, d.execution_view().multiprocessor_count());
     };
     for (int B : {1, 2, 3, 5, 8, 9, 17, 33})
-        for (unsigned E : {8192u, 65536u, 131072u, 262144u, 1048576u})
+        for (const auto bucket : ops::kAllContextBuckets)
             for (auto [lo, hi] : {std::pair{1, 257}, {127, 513}}) {
                 std::size_t peak = 0;
-                for (int t = lo; t <= hi; ++t) peak = std::max(peak, capacity(B, E, t, t));
-                failures += capacity(B, E, lo, hi) != peak;
+                for (int t = lo; t <= hi; ++t) peak = std::max(peak, capacity(B, bucket, t, t));
+                failures += capacity(B, bucket, lo, hi) != peak;
             }
+    for (const int batch : {16, 17}) {
+        failures += ops::kpool_indexer_workspace_capacity_bytes(
+                        {32, 128}, format, {ContextBucket::K2, ContextBucket::M1}, batch, 17, 1025,
+                        d.execution_view().multiprocessor_count()) > (50U << 20);
+    }
     for (int T : {128, 129, 255, 256}) {
         kp::IndexerFixture f(d.execution_view(), T, 1, 65536, 1, false,
                              ops::KpoolMlaStorage::BFloat16, {}, true, format);
-        f.workspace.reset();
-        f.workspace_bytes = bytes;
-        f.scratch         = DeviceBuffer(d.device(), bytes + 512);
-        f.scratch.fill(0xa5);
-        f.workspace = std::make_unique<MemoryArena>(f.scratch.span().subspan(256, bytes));
+        reserve_workspace(f, bytes, d.device());
         f.launch(d.execution_view());
         d.synchronize();
         failures += verify(f);
@@ -276,13 +417,29 @@ int admission() {
          {ops::KpoolIndexerProfile{4, 128}, {32, 64}, {32, 128, 8, 512}, {32, 128, 4, 256}})
         failures += rejects([&] {
             (void)ops::kpool_indexer_workspace_capacity_bytes(
-                profile, KvCacheVectorFormat::BFloat16, {8192}, 1, 1, 8, 48);
+                profile, KvCacheVectorFormat::BFloat16, ContextBucket::K8, 1, 1, 8, 48);
         });
-    failures += rejects([&] {
-        (void)ops::kpool_indexer_workspace_capacity_bytes({32, 128}, KvCacheVectorFormat::BFloat16,
-                                                          {1048577}, 1, 1, 8, 48);
-    });
     kp::IndexerFixture f(d.execution_view(), 2, 1, 8192, 1);
+    constexpr ContextBucket invalid{255};
+    for (const auto range : {ContextBucketRange{invalid}, {ContextBucket::K8, ContextBucket::K2}}) {
+        failures += rejects([&] {
+            (void)ops::kpool_indexer_workspace_capacity_bytes({32, 128}, f.cache.format, range, 1,
+                                                              1, 8, 48);
+        });
+    }
+    failures += rejects([&] {
+        (void)ops::kpool_indexer_graph_profile({32, 128}, f.cache.format, invalid, 1, 2, 48);
+    });
+    f.bucket = invalid;
+    failures += rejects([&] { f.launch(d.execution_view()); });
+    f.bucket = ContextBucket::K8;
+    for (const int axis : {0, 1}) {
+        auto& extent    = f.cache.keys.records.page_offsets.ne[axis];
+        const int saved = extent;
+        extent          = 0;
+        failures += rejects([&] { f.launch(d.execution_view()); });
+        extent = saved;
+    }
     const auto coeff   = f.coeff.view;
     f.coeff.view.ne[0] = 31;
     failures += rejects([&] { f.launch(d.execution_view()); });
@@ -317,6 +474,12 @@ int main(int argc, char** argv) {
                   {{"format", format}, {"execution", "eager"}, {"suite", "concurrency"}});
         suite.add(prefix + "graph_batch17", [=] { return graph(fp8, 3, 17, 8192); },
                   {{"format", format}, {"execution", "graph"}, {"suite", "concurrency"}});
+        suite.add(prefix + "k2_small_page_table", [=] { return small_page_table(fp8); },
+                  {{"format", format}});
+        suite.add(prefix + "k2_zero_workspace", [=] { return zero_workspace(fp8); },
+                  {{"format", format}});
+        suite.add(prefix + "flat_graph_patch", [=] { return flat_graph_patch(fp8); },
+                  {{"format", format}, {"execution", "graph"}});
     }
     for (int kind : {0, 1, 2})
         suite.add("kpool_indexer/exact/" + std::to_string(kind),

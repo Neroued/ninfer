@@ -380,7 +380,7 @@ double expected_progress(std::span<const AdaptiveRowInput> rows,
     double total = rows.size();
     for (std::size_t i = 0; i < rows.size(); ++i) {
         std::array<float, kMaxSpeculativeDrafts> probabilities;
-        rows[i].state->predict_conditional_survival(extents[i], probabilities);
+        rows[i].state->predict_conditional_survival(Backend::DFlash, extents[i], probabilities);
         double reach = 1.0;
         for (std::uint32_t j = 0; j < extents[i]; ++j) total += reach *= probabilities[j];
     }
@@ -390,10 +390,12 @@ double expected_progress(std::span<const AdaptiveRowInput> rows,
 void sequence_and_rounds() {
     SequenceSpeculativeState state;
     std::array<float, 7> prior, probs;
-    state.predict_conditional_survival(7, prior);
+    state.predict_conditional_survival(Backend::DFlash, 7, prior);
     near(prior.front(), 2.4 / 3.4, 1e-6, "wrong startup survival prior");
+    require(std::ranges::all_of(prior, [&](auto p) { return p == prior.front(); }),
+            "fresh masked draft inherited evidence without an observed prefix");
     state.observe_speculative_round(7, 2);
-    state.predict_conditional_survival(7, probs);
+    state.predict_conditional_survival(Backend::DFlash, 7, probs);
     near(probs[0], 3.4 / 4.4, 1e-6, "accepted draft had no successful attempt");
     near(probs[1], 3.4 / 4.4, 1e-6, "second draft was not accepted");
     near(probs[2], 2.4 / 4.4, 1e-6, "first rejected draft had no failed attempt");
@@ -401,10 +403,10 @@ void sequence_and_rounds() {
             "unreached drafts were recorded as failures");
     auto copy = state;
     copy.observe_ordinary_round(std::nullopt);
-    copy.predict_conditional_survival(7, probs);
+    copy.predict_conditional_survival(Backend::DFlash, 7, probs);
     near(probs[2], 2.4 / 4.35, 1e-6, "ordinary step failed to recover stale acceptance");
     copy.observe_speculative_round(7, 2, std::array{.99f});
-    copy.predict_conditional_survival(7, probs);
+    copy.predict_conditional_survival(Backend::DFlash, 7, probs);
     require(probs[0] > .83f, "recent confidence failed to influence survival");
 
     const Rounds block({Backend::DFlash, 7, 1, 256, 8});
@@ -525,15 +527,72 @@ void overconfident_rejection() {
     const auto odds =
         std::pow(empirical / (1.0 - empirical), 1.0 - weight) * std::pow(49.0, weight);
     std::array<float, 7> probs;
-    state.predict_conditional_survival(7, probs);
+    state.predict_conditional_survival(Backend::DFlash, 7, probs);
     near(probs[0], odds / (1.0 + odds), 1e-6, "optimistic evidence was not shrunk");
     for (const auto survival : std::span(probs).subspan(1))
         near(survival, empirical, 1e-6, "unreached draft kept the fresh prior");
     state.observe_speculative_round(7, 0, std::array{.02f});
     const auto updated = 2.4 / (3.4 + .92 * attempts + 1.0);
     const auto down    = std::pow(updated / (1.0 - updated), .75) * std::pow(.02 / .98, .25);
-    state.predict_conditional_survival(7, probs);
+    state.predict_conditional_survival(Backend::DFlash, 7, probs);
     near(probs[0], down / (1.0 + down), 2e-5, "uncertain evidence was over-shrunk");
+}
+
+void parallel_draft_confidence() {
+    const auto high = train(7, .55f);
+    std::array<float, 7> parallel, causal, mtp;
+    high.predict_conditional_survival(Backend::DFlash, 7, parallel);
+    high.predict_conditional_survival(Backend::DFlash2, 7, causal);
+    high.predict_conditional_survival(Backend::Mtp, 7, mtp);
+    require(parallel.back() > .92f && causal == mtp && causal.back() < .89f,
+            "parallel marginals suppressed recent verified acceptance");
+
+    const std::array widths{2U, 4U, 8U};
+    const Rounds block({Backend::DFlash, 7, 1, 256, 8, 64}, 1, widths);
+    SpeculativeCostModel cost(block.config);
+    const auto initial = block.plan({7}, ExecutionPath::Mixed);
+    const std::array frontiers{64U};
+    std::vector<TimedCostAnchor> anchors;
+    for (unsigned depth = 0; depth <= 7; ++depth) {
+        const auto target = block.plan({depth}, ExecutionPath::Mixed);
+        const auto query =
+            CostQuery::from_split_plan(Backend::DFlash, initial, target, frontiers, 8192);
+        anchors.push_back({query, 1.0 + .13 * query.width});
+    }
+    cost.fit(anchors);
+
+    const std::array live{.97f, .82f, .70f, .56f, .56f, .56f, .56f};
+    SequenceSpeculativeState shallow;
+    for (int i = 0; i < 80; ++i) shallow.observe_speculative_round(3, 3, std::span(live).first(3));
+    auto rows         = block.inputs(1);
+    rows[0].state     = &shallow;
+    const auto narrow = [&](const auto& confidences) {
+        return narrow_after_proposal(Backend::DFlash, 7, 1, ExecutionPath::Mixed, &block.routes,
+                                     cost, initial, rows, confidences, 7, 8192);
+    };
+    require(narrow(live).verify_drafts.front() > 3,
+            "parallel marginals locked a high-acceptance sequence to the observed prefix");
+    auto invalid   = live;
+    invalid.back() = std::numeric_limits<float>::quiet_NaN();
+    try {
+        (void)narrow(invalid);
+    } catch (const std::invalid_argument&) { return; }
+    throw std::runtime_error("parallel proposal admitted an invalid later confidence");
+}
+
+void unreached_masked_draft_prior() {
+    SequenceSpeculativeState state;
+    for (int i = 0; i < 32; ++i) state.observe_speculative_round(3, 3);
+    std::array<float, 7> mtp, masked;
+    state.predict_conditional_survival(Backend::Mtp, 7, mtp);
+    for (const auto backend : {Backend::DFlash, Backend::DFlash2}) {
+        state.predict_conditional_survival(backend, 7, masked);
+        require(std::ranges::equal(std::span(masked).first(3), std::span(mtp).first(3)),
+                "positive prefix evidence overrode a verified posterior");
+        for (std::size_t j = 3; j < masked.size(); ++j)
+            require(masked[j] > mtp[j] && masked[j] < masked[j - 1],
+                    "unreached masked draft failed to inherit decaying prefix evidence");
+    }
 }
 
 void split_cost_isolation() {
@@ -592,6 +651,8 @@ int main() {
         sequence_and_rounds();
         narrow_split_proposal();
         overconfident_rejection();
+        parallel_draft_confidence();
+        unreached_masked_draft_prior();
         split_cost_isolation();
         route_score_ties();
         std::cout << "PASS speculative physical cost, calibration and adaptive rounds\n";

@@ -108,16 +108,10 @@ std::vector<std::uint32_t> Startup::narrow_target_widths(const EngineOptions& op
 std::size_t Startup::upper_context_bytes(DeviceContext& device, const EngineOptions& options,
                                          const ExecutionPlan& candidate, std::size_t available,
                                          std::size_t available_host_bytes) const {
-    auto trial          = options;
-    trial.prefill_chunk = candidate.chunk;
-    // The unresolved expert plan omits adaptive cache allocations, giving an upper bound
-    // even if the full-width catalog would select a different cache layout.
-    const auto prototype = candidate.placement == WeightPlacement::HostExperts ? offload_ : nullptr;
-    const auto planner   = make_sequence_planner(profile, device, trial, prototype);
-    return runtime::resolve_context_capacity(options.context_capacity, planner.capacity_plan(),
-                                             available, available_host_bytes,
-                                             NINFER_SHARED_PHYSICAL_MEMORY != 0)
-        .device_bytes;
+    // Resolve the full-width layout, including its expert cache, before charging graph memory.
+    const auto baseline =
+        plan(device, options, candidate.placement, available, available_host_bytes);
+    return baseline ? baseline->capacity.device_bytes : 0;
 }
 
 std::unique_ptr<ModelShard> Startup::materialize(DeviceContext& device, WeightPlacement placement,

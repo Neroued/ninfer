@@ -314,7 +314,7 @@ void masked_decode(EngineOptions options, bool expect_offload) {
             options.speculative.backend, k, 1, {1, 1}, constraints.path, constraints.routes, cost,
             std::array{sp::AdaptiveRowInput{grants.front(), frontiers.front()}},
             constraints.max_context);
-        if (initial.route().width <= 1) continue;
+        if (initial.route().width <= 1 || initial.verify_drafts().front() == k) continue;
         for (const auto salt : {17U, 251U, 853U}) {
             std::vector<TokenId> prompt(frontiers.front());
             for (std::size_t i = 0; i < prompt.size(); ++i) prompt[i] = (salt * (i + 1)) % 28000;
@@ -342,9 +342,14 @@ void masked_decode(EngineOptions options, bool expect_offload) {
                     .count;
             };
             const auto before = draft_intervals();
+            const auto ticket = session.start_decode(member, budgets, constrained);
+            check(ticket.has_value(), "adaptive split proposal could not start");
+            const auto allowed = session.decode_cost_query(*ticket);
+            check(allowed && allowed->active_target_tokens == k + 1 && allowed->width == k + 1,
+                  "shallow selection did not reserve the full masked draft grant");
             unsigned verified = 0;
             auto pending =
-                driver.decode(member, budgets, constrained, [&](const runtime::DecisionRequest& r) {
+                driver.wait<q::PendingBatch>(*ticket, [&](const runtime::DecisionRequest& r) {
                     check(r.rows.size() == 1 && r.rows.front().member == 0,
                           "split-narrow masks lost membership");
                     verified = r.rows.front().drafts.size();
@@ -359,8 +364,7 @@ void masked_decode(EngineOptions options, bool expect_offload) {
                     return result;
                 });
             const auto executed = pending.execution_sample().work.speculative;
-            check(executed->valid_target_tokens == verified + 1 &&
-                      verified <= initial.verify_drafts().front(),
+            check(executed->valid_target_tokens == verified + 1 && verified <= k,
                   "split proposal and target execution did not match the grammar prefix");
             const auto count = static_cast<unsigned>(pending.row_counts().front());
             const auto committed =
@@ -370,10 +374,10 @@ void masked_decode(EngineOptions options, bool expect_offload) {
                       stats.fallback_steps == unsigned(!verified),
                   "split-narrow statistics used the original proposal extent");
             (void)driver.abort(member.front());
-            if (executed->verify_width < initial.route().width) {
-                std::cout << "OK live offload proposal narrowed W" << initial.route().width
-                          << " to W" << executed->verify_width << " with " << verified
-                          << " drafts\n";
+            if (executed->verify_width < allowed->width) {
+                std::cout << "OK live offload proposal expanded W" << initial.route().width
+                          << " to W" << allowed->width << " then narrowed" << " to W"
+                          << executed->verify_width << " with " << verified << " drafts\n";
                 return;
             }
         }

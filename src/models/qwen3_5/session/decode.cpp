@@ -65,14 +65,28 @@ SessionImpl::start_decode_round(std::span<const SequenceHandle> members,
         auto round = selection.select(shape, plan.decode_path, plan.decode_routes.get(), cost_model,
                                       rows, adaptive, capacity);
         if (!round) return {};
+        const bool narrow =
+            plan.split_proposal_narrowing && !selection.budgets.empty() && round->route().width > 1;
+        if (narrow && is_masked_draft_backend(speculative_backend) &&
+            !std::ranges::equal(round->verify_drafts(), rows, [](auto depth, const auto& row) {
+                return !depth || depth == row.granted_limit;
+            })) {
+            // Freeze the full grant for each selected proposal row before any draws. The
+            // split target may narrow within that grant before executing or adopting tokens.
+            std::vector<std::uint32_t> extents(size);
+            for (std::size_t i = 0; i < size; ++i)
+                if (round->verify_drafts()[i]) extents[i] = rows[i].granted_limit;
+            round = speculative::DecodeRoundPlan::select(speculative_backend, draft_window, 1,
+                                                         shape, plan.decode_path,
+                                                         plan.decode_routes.get(), rows, extents);
+        }
         if (draft_window)
             pending.cost_query =
                 speculative::CostQuery::from_plan(speculative_backend, *round, frontiers, capacity);
         pending.record_online_cost = selection.record_online_cost;
         DecodeWork decode(std::move(*round), plan.decode_path);
         pending.round = decode.plan;
-        if (plan.split_proposal_narrowing && !selection.budgets.empty() &&
-            decode.plan->route().width > 1) {
+        if (narrow) {
             auto& narrowing = decode.narrowing.emplace(
                 SplitProposalNarrowingInput{.cost = cost_model, .max_context = capacity});
             narrowing.rows.reserve(adaptive.size());

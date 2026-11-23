@@ -11,8 +11,9 @@ struct SequenceSpeculativeState {
     void observe_speculative_round(std::uint32_t attempted_extent, std::uint32_t accepted_drafts,
                                    std::span<const float> draft_confidences = {});
     void observe_ordinary_round(std::optional<float> target_top1_prob);
-    void predict_conditional_survival(std::uint32_t max_drafts,
+    void predict_conditional_survival(SpeculativeBackend backend, std::uint32_t max_drafts,
                                       std::span<float> out_probs) const noexcept;
+    [[nodiscard]] float draft_attempt_weight(std::uint32_t position) const noexcept;
 
 private:
     void decay(float factor) noexcept;

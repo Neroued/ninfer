@@ -1,6 +1,7 @@
 #include "models/common/speculative/controller.h"
 
 #include "models/common/speculative/cost_query.h"
+#include "models/load_options.h"
 
 #include <cassert>
 #include <cmath>
@@ -13,6 +14,7 @@ namespace {
 constexpr float kPriorAlpha      = 2.4f;
 constexpr float kPriorBeta       = 1.0f;
 constexpr float kPriorMass       = kPriorAlpha + kPriorBeta;
+constexpr float kPriorMean       = kPriorAlpha / kPriorMass;
 constexpr float kConfidenceScale = std::numeric_limits<std::uint16_t>::max();
 
 float logit(float p) { return std::log(p / (1.0f - p)); }
@@ -25,7 +27,7 @@ constexpr auto kFreshBonus = [] {
     std::array<double, kMaxSpeculativeDrafts + 1> bonus{};
     double survival = 1.0;
     for (std::size_t j = 1; j < bonus.size(); ++j) {
-        survival *= kPriorAlpha / kPriorMass;
+        survival *= kPriorMean;
         bonus[j] = bonus[j - 1] + survival;
     }
     return bonus;
@@ -36,14 +38,18 @@ struct RowYield {
     std::array<double, kMaxSpeculativeDrafts + 1> bonus;
 };
 
-float blend_live_confidence(float history, float confidence) {
+float draft_confidence_logit(float confidence) {
     if (!(confidence >= 0.0f && confidence <= 1.0f))
         throw std::invalid_argument("invalid pre-draw draft confidence");
-    return logistic(0.35f * logit(history) + 0.65f * logit(std::clamp(confidence, 0.01f, 0.99f)));
+    return logit(std::clamp(confidence, 0.01f, 0.99f));
 }
 
-RowYield expected_yield(const AdaptiveRowInput& row, std::uint32_t limit,
-                        std::span<const float> live) {
+float blend_live_confidence(float history, float confidence) {
+    return logistic(0.35f * logit(history) + 0.65f * draft_confidence_logit(confidence));
+}
+
+RowYield expected_yield(SpeculativeBackend backend, const AdaptiveRowInput& row,
+                        std::uint32_t limit, std::span<const float> live) {
     if (!row.state && live.empty()) return {limit, kFreshBonus};
     RowYield result{};
     result.limit    = limit;
@@ -52,11 +58,26 @@ RowYield expected_yield(const AdaptiveRowInput& row, std::uint32_t limit,
 
     constexpr SequenceSpeculativeState fresh;
     std::array<float, kMaxSpeculativeDrafts> probabilities;
-    (row.state ? *row.state : fresh).predict_conditional_survival(limit, probabilities);
-    double survival = 1.0;
+    const auto& state = row.state ? *row.state : fresh;
+    state.predict_conditional_survival(backend, limit, probabilities);
+    double survival      = 1.0;
+    float horizon_weight = 0.65f;
     for (std::uint32_t j = 0; j < limit; ++j) {
         auto p = probabilities[j];
-        if (!live.empty()) p = blend_live_confidence(p, live[j]);
+        if (!live.empty()) {
+            if (backend == SpeculativeBackend::DFlash) {
+                // Parallel mask predictions are marginals. Later positions provide less
+                // evidence about survival conditioned on all earlier drafts being accepted.
+                const auto confidence = live[j];
+                const auto weight =
+                    horizon_weight * (confidence < p ? state.draft_attempt_weight(j) : 1.0f);
+                p = logistic((1.0f - weight) * logit(p) +
+                             weight * draft_confidence_logit(confidence));
+                horizon_weight *= 0.55f;
+            } else {
+                p = blend_live_confidence(p, live[j]);
+            }
+        }
         survival *= p;
         result.bonus[j + 1] = result.bonus[j] + survival;
     }
@@ -399,7 +420,7 @@ DecodeRoundPlan optimize(SpeculativeBackend backend, std::uint32_t max_drafts,
             std::min(member.granted_limit, initial ? initial->verify_drafts()[i] : max_drafts);
         const auto confidence =
             initial ? live.subspan(i * stride, limit) : std::span<const float>{};
-        yields.push_back(expected_yield(rows[i], limit, confidence));
+        yields.push_back(expected_yield(backend, rows[i], limit, confidence));
         max_limit    = std::max(max_limit, yields.back().limit);
         max_frontier = std::max(max_frontier, rows[i].frontier);
     }
@@ -475,18 +496,34 @@ void SequenceSpeculativeState::observe_ordinary_round(std::optional<float> targe
     last_draft_count_ = 0;
 }
 
+float SequenceSpeculativeState::draft_attempt_weight(std::uint32_t position) const noexcept {
+    assert(position < kMaxSpeculativeDrafts);
+    return kPriorMass / (kPriorMass + attempts_[position]);
+}
+
 void SequenceSpeculativeState::predict_conditional_survival(
-    std::uint32_t max_drafts, std::span<float> out_probs) const noexcept {
+    SpeculativeBackend backend, std::uint32_t max_drafts,
+    std::span<float> out_probs) const noexcept {
     assert(max_drafts <= kMaxSpeculativeDrafts && max_drafts <= out_probs.size());
     const auto emp0         = (kPriorAlpha + accepts_[0]) / (kPriorMass + attempts_[0]);
-    const auto deeper_alpha = emp0 < kPriorAlpha / kPriorMass ? kPriorMass * emp0 : kPriorAlpha;
+    const auto deeper_alpha = emp0 < kPriorMean ? kPriorMass * emp0 : kPriorAlpha;
+    const bool masked       = is_masked_draft_backend(backend);
+    const auto base_logit   = logit(kPriorMean);
+    auto previous           = emp0;
     const auto empirical    = [&](std::size_t j) {
-        return j ? (deeper_alpha + accepts_[j]) / (kPriorMass + attempts_[j]) : emp0;
+        if (!j) return emp0;
+        // An untested tail inherits evidence from the verified prefix, with decay at each
+        // position. A posterior at or below the prior stops the upward inheritance.
+        if (masked && attempts_[j] == 0.0f && previous > kPriorMean)
+            previous =
+                logistic(base_logit + 0.92f * (logit(clamp_survival(previous)) - base_logit));
+        else
+            previous = (deeper_alpha + accepts_[j]) / (kPriorMass + attempts_[j]);
+        return previous;
     };
     if (last_target_top1_prob_) {
         // Propagate the first-position log-odds correction with a 0.85 depth decay.
-        auto correction =
-            0.5f * (logit(clamp_survival(*last_target_top1_prob_)) - logit(empirical(0)));
+        auto correction = 0.5f * (logit(clamp_survival(*last_target_top1_prob_)) - logit(emp0));
         for (std::uint32_t j = 0; j < max_drafts; ++j) {
             out_probs[j] = clamp_survival(logistic(logit(empirical(j)) + correction));
             correction *= 0.85f;
@@ -497,8 +534,11 @@ void SequenceSpeculativeState::predict_conditional_survival(
     for (std::uint32_t j = 0; j < blended_count; ++j) {
         const auto confidence = clamp_survival(last_draft_confidences_[j] / kConfidenceScale);
         const auto emp        = empirical(j);
-        const auto weight =
-            0.25f * (confidence > emp ? kPriorMass / (kPriorMass + attempts_[j]) : 1.0f);
+        auto weight           = 0.25f;
+        if (confidence > emp)
+            weight *= draft_attempt_weight(j);
+        else if (backend == SpeculativeBackend::DFlash && confidence < emp)
+            weight *= kPriorMass / (kPriorMass + accepts_[j]);
         const auto blended =
             (1.0f - weight) * logit(clamp_survival(emp)) + weight * logit(confidence);
         out_probs[j] = clamp_survival(logistic(blended));
@@ -585,7 +625,7 @@ narrow_after_proposal(SpeculativeBackend backend, std::uint32_t max_drafts,
             members.push_back(row.member);
             const auto limit = std::min(row.member.granted_limit, initial_plan.verify_drafts()[i]);
             std::array<float, kMaxSpeculativeDrafts> history;
-            (row.state ? *row.state : fresh).predict_conditional_survival(limit, history);
+            (row.state ? *row.state : fresh).predict_conditional_survival(backend, limit, history);
             double survival = 1.0;
             std::uint32_t j = 0;
             for (; j < limit; ++j) {

@@ -164,10 +164,12 @@ struct Driver {
             }
             decisions[i].accepted_tokens = count;
         }
-        const auto k         = options.speculative.draft_tokens;
-        const bool mtp       = options.speculative.backend == SpeculativeBackend::Mtp;
-        const unsigned width = depth && options.use_cuda_graph ? k + 1 : depth + 1;
-        const auto g         = pending.execution_sample().work.speculative;
+        const auto k   = options.speculative.draft_tokens;
+        const bool mtp = options.speculative.backend == SpeculativeBackend::Mtp;
+        // The explicit-capacity fixture exercises the narrow DFlash2 target graph.
+        const unsigned graph_width = !mtp && k >= 5 && depth <= 3 ? 4U : k + 1;
+        const unsigned width       = depth && options.use_cuda_graph ? graph_width : depth + 1;
+        const auto g               = pending.execution_sample().work.speculative;
         check(g && g->verify_width == width && g->mtp_steps == (mtp ? depth : 0) &&
                   g->head_columns == (!mtp && depth ? (options.use_cuda_graph ? k : depth) : 0) &&
                   g->owner_target_tokens == owner_tokens &&

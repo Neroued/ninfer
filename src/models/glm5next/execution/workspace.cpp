@@ -37,6 +37,7 @@ void mla(WorkspaceLayoutBuilder& a, const ModelProfile& p, const MlaProfile& m,
          const ExecutionShape& s, int first, int last, int local, int sm_count, bool record,
          bool frozen) {
     const auto storage = latent_storage(s.kv_storage);
+    const auto buckets = ops::ContextBucketRange::through(s.max_context);
     for (int mode = 0; mode < (frozen ? 2 : 1); ++mode) {
         auto scope        = a.scope();
         const bool reuse  = mode != 0;
@@ -56,11 +57,11 @@ void mla(WorkspaceLayoutBuilder& a, const ModelProfile& p, const MlaProfile& m,
             scratch(a, ops::linear_split_workspace_capacity_bytes(m.query_index, m.query_rows,
                                                                   minimum, columns));
             scratch(a, ops::kpool_indexer_workspace_capacity_bytes(m.indexer, s.index_format,
-                                                                   {s.max_context}, local, first,
+                                                                   buckets, local, first,
                                                                    last, sm_count));
         }
         scratch(a, ops::kpool_sparse_mla_workspace_capacity_bytes(
-                       m.attention, storage, {s.max_context}, local, first, last, sm_count));
+                       m.attention, storage, buckets, local, first, last, sm_count));
         scratch(a, linear(m.output, minimum, columns));
     }
 }

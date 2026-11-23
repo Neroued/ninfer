@@ -3,9 +3,8 @@
 #include "core/gdn_replay_records.h"
 #include "core/linear_attention_state.h"
 #include "models/common/moe/schedule.h"
-#include "models/qwen3_5/execution/parameters.h"
+#include "models/qwen3_5/execution/attention.h"
 #include "models/qwen3_5/state/decoder_state.h"
-#include "ninfer/ops/softmax_attention.h"
 
 #include <cstdint>
 #include <optional>
@@ -76,7 +75,7 @@ public:
     [[nodiscard]] std::uint32_t active_tokens() const noexcept { return inputs_.active_tokens; }
 
     TextRun(TextExecutionView execution, TextInputs inputs, TextStateUpdate update,
-            ops::CausalAttentionExecutionEnvelope envelope, Tensor hidden,
+            ops::ContextBucket bucket, Tensor hidden,
             const DFlashFeatureSink* features = nullptr);
     ~TextRun();
     TextRun(const TextRun&)            = delete;
@@ -90,18 +89,18 @@ public:
     // Explicit mathematical segments for rank-owned capture. These do not start an MoE
     // activity or acquire offloaded weights. A supplied GPU call binds the captured MoE body.
     void prefix();
-    void mixer(std::uint32_t layer);
+    void mixer(std::uint32_t layer, const CausalAttentionSubmit& = {});
     void post_mixer(std::uint32_t layer, const moe::GpuCall* call = nullptr);
     void capture_features(std::uint32_t layer);
     void finish();
-    void set_attention_envelope(ops::CausalAttentionExecutionEnvelope envelope) noexcept;
+    void set_attention_bucket(ops::ContextBucket bucket) noexcept;
 
     [[nodiscard]] Tensor& residual() noexcept { return residual_; }
 
 private:
     enum class Stage : std::uint8_t { Idle, Layer, PostMixer, Done, Cancelled };
 
-    void attention(const BlockParameters&, std::uint32_t compact_layer);
+    void attention(const BlockParameters&, std::uint32_t compact_layer, const CausalAttentionSubmit&);
     void gdn(const BlockParameters&, std::uint32_t compact_layer);
     [[nodiscard]] ops::MoeExecutionHints next_projection_hints(std::uint32_t layer) const;
     void complete_layer();
@@ -109,7 +108,7 @@ private:
     TextExecutionView view_;
     TextInputs inputs_;
     TextStateUpdate update_;
-    ops::CausalAttentionExecutionEnvelope envelope_;
+    ops::ContextBucket bucket_;
     Tensor hidden_;
     std::optional<DFlashFeatureSink> features_;
     MemoryArena::Scope traversal_scope_;

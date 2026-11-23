@@ -16,16 +16,17 @@ void Graphs::bind_sites(Round& round, Body body, const execution::BatchView& mai
     const int g = main.rows, c = main.attention.rows;
     auto& p        = owner_;
     const auto& io = p.frame;
+    const auto buckets = ops::ContextBucketRange::through(p.shape.max_context);
     const auto add = [&](execution::MlaReadout call, int step) {
         Site site{.call = call, .draft_step = step};
-        const auto visible = call.visible;
+        const auto bucket = call.bucket;
         const auto sms     = p.cuda.multiprocessor_count();
         if (call.index) {
-            site.index_profile = call.index_profile(visible, sms);
-            site.index.capture(p.cuda.stream(), [&] { call.indexer(visible, p.cuda); });
+            site.index_profile = call.index_profile(bucket, sms);
+            site.index.capture(p.cuda.stream(), [&] { call.indexer(bucket, p.cuda); });
         }
-        site.attention_profile = call.attention_profile(visible, sms);
-        site.attention.capture(p.cuda.stream(), [&] { call.attention(visible, p.cuda); });
+        site.attention_profile = call.attention_profile(bucket, sms);
+        site.attention.capture(p.cuda.stream(), [&] { call.attention(bucket, p.cuda); });
         round.sites.push_back(std::move(site));
     };
     if (body == Body::Proposal || body == Body::MtpRound)
@@ -33,16 +34,16 @@ void Graphs::bind_sites(Round& round, Body body, const execution::BatchView& mai
             auto call  = p.batch(io.mtp->draft_steps[step], 1, g, c, p.shape.max_context);
             auto run   = p.mtp_run(step, call);
             auto local = run.local_mla(p.mtp_selection(step, c));
-            add(local.readout(), step);
+            add(local.readout(buckets), step);
         }
     if (body == Body::BlockRound) {
-        auto run = p.dflash_run(g, p.shape.max_context, head_columns);
+        auto run = p.dflash_run(g, buckets.last, head_columns);
         for (std::uint32_t i = 0; i < p.parameters.draft->layers.size(); ++i) {
             auto layer = run.attention(i);
             DraftSite site{.call = layer.readout()};
-            site.profile = site.call.profile(p.shape.max_context);
+            site.profile = site.call.profile(buckets.last);
             site.attention.capture(p.cuda.stream(),
-                                   [&] { site.call.execute(p.shape.max_context, p.cuda); });
+                                   [&] { site.call.execute(buckets.last, p.cuda); });
             round.draft_sites.push_back(std::move(site));
         }
     }
@@ -55,7 +56,7 @@ void Graphs::bind_sites(Round& round, Body body, const execution::BatchView& mai
         if (!std::holds_alternative<execution::MlaParameters>(p.parameters.text.layers[i].mixer))
             continue;
         auto local = run.local_mla(i);
-        add(local.readout(), -1);
+        add(local.readout(buckets), -1);
     }
 }
 
@@ -196,26 +197,27 @@ void Graphs::launch(Round& round, const execution::BatchView& main,
     for (auto& site : round.sites) {
         auto bound = main.attention.max_visible_tokens;
         if (site.draft_step >= 0) bound = site.draft_step < depth ? draft[site.draft_step] : 0U;
+        const auto bucket = ops::select_context_bucket(std::max(1U, bound));
         if (site.call.index) {
-            const auto profile = site.call.index_profile(bound, sms);
+            const auto profile = site.call.index_profile(bucket, sms);
             if (profile != site.index_profile) {
-                site.index.capture(p.cuda.stream(), [&] { site.call.indexer(bound, p.cuda); });
+                site.index.capture(p.cuda.stream(), [&] { site.call.indexer(bucket, p.cuda); });
                 round.graph.executable.update_child(site.index_node, site.index);
                 site.index_profile = profile;
             }
         }
-        const auto profile = site.call.attention_profile(bound, sms);
+        const auto profile = site.call.attention_profile(bucket, sms);
         if (profile != site.attention_profile) {
-            site.attention.capture(p.cuda.stream(), [&] { site.call.attention(bound, p.cuda); });
+            site.attention.capture(p.cuda.stream(), [&] { site.call.attention(bucket, p.cuda); });
             round.graph.executable.update_child(site.attention_node, site.attention);
             site.attention_profile = profile;
         }
     }
     for (auto& site : round.draft_sites) {
-        const auto bound   = draft.front();
-        const auto profile = site.call.profile(bound);
+        const auto bucket  = ops::select_context_bucket(std::max(1U, draft.front()));
+        const auto profile = site.call.profile(bucket);
         if (profile != site.profile) {
-            site.attention.capture(p.cuda.stream(), [&] { site.call.execute(bound, p.cuda); });
+            site.attention.capture(p.cuda.stream(), [&] { site.call.execute(bucket, p.cuda); });
             round.graph.executable.update_child(site.node, site.attention);
             site.profile = profile;
         }

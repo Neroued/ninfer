@@ -6,6 +6,8 @@
 #include "ninfer/ops/residual_add_rmsnorm.h"
 #include "ninfer/ops/rmsnorm.h"
 
+#include <algorithm>
+
 namespace ninfer::models::glm5next::execution {
 namespace {
 void prepare_stem(const Parameters& p, const BatchView& batch, const Tensor& hidden,
@@ -44,12 +46,13 @@ void MtpRun::stem(const Tensor& conditioning) {
 MlaRun MtpRun::local_mla(MlaSelection selection) {
     const auto& p     = *parameters_.profile;
     const auto& local = batch_.attention;
-    return MlaRun(
-        attention_.input.data ? attention_.input : roots_.input, p.config.text,
-        parameters_.mtp->attention, {local.positions, local.valid_columns, local.table_rows},
-        execution_.before, execution_.after, execution_.cache.layer(0), {}, local.selection_rows,
-        local.max_visible_tokens, attention_.output.data ? attention_.output : roots_.output,
-        execution_.workspace, cuda_, selection);
+    const auto bucket = ops::select_context_bucket(std::max(1U, local.max_visible_tokens));
+    return MlaRun(attention_.input.data ? attention_.input : roots_.input, p.config.text,
+                  parameters_.mtp->attention,
+                  {local.positions, local.valid_columns, local.table_rows}, execution_.before,
+                  execution_.after, execution_.cache.layer(0), {}, local.selection_rows, bucket,
+                  attention_.output.data ? attention_.output : roots_.output, execution_.workspace,
+                  cuda_, selection);
 }
 
 void MtpRun::local_attention(MlaSelection selection, const MlaSubmit& submit) {

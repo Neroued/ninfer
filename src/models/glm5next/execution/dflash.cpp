@@ -49,17 +49,17 @@ std::size_t linear(const ops::LinearProfile& p, int lo, int hi) {
 }
 } // namespace
 
-ops::SlidingWindowAttentionGraphProfile DraftReadout::profile(std::uint32_t bound) const {
-    return ops::sliding_window_attention_graph_profile(geometry, context.capacity, {0, bound},
-                                                       query.ne[2], query.ne[3]);
+ops::OpGraphProfile DraftReadout::profile(ops::ContextBucket bucket) const {
+    return ops::sliding_window_attention_graph_profile(geometry, context.capacity, bucket,
+                                                       query.ne[3], query.ne[2]);
 }
 
-void DraftReadout::execute(std::uint32_t bound, CudaExecutionView cuda) const {
+void DraftReadout::execute(ops::ContextBucket bucket, CudaExecutionView cuda) const {
     MemoryArena arena(scratch);
     auto out = output;
     ops::sliding_window_attention(query, key, value, positions, valid_columns, geometry,
                                   context.capacity, float(1.0 / std::sqrt(geometry.head_dim)),
-                                  context, {0, bound}, arena, out, cuda);
+                                  context, bucket, arena, out, cuda);
 }
 
 DraftAttentionRun::DraftAttentionRun(const Parameters& p, DraftExecution e, const DraftInputs& in,
@@ -83,9 +83,11 @@ DraftReadout DraftAttentionRun::readout() {
                      {}};
     auto scope       = execution_.workspace.scope();
     const auto bytes = ops::sliding_window_attention_workspace_capacity_bytes(
-        out.geometry, out.context.capacity, {0, p.config.text.max_context}, residual_.ne[1],
-        residual_.ne[1], residual_.ne[2]);
-    out.scratch = execution_.workspace.alloc_bytes(bytes);
+        out.geometry, out.context.capacity,
+        ops::ContextBucketRange::through(p.config.text.max_context), residual_.ne[2],
+        residual_.ne[1], residual_.ne[1]);
+    out.scratch =
+        bytes ? execution_.workspace.alloc_bytes(bytes) : MemorySpan{nullptr, 0, cuda_.device()};
     return out;
 }
 
@@ -107,7 +109,7 @@ void DraftAttentionRun::execute(const DraftSubmit& submit) {
     if (submit)
         submit(call);
     else
-        call.execute(inputs_.context_bound, cuda_);
+        call.execute(inputs_.bucket, cuda_);
     finish_dynamic_branch(v.output.view({v.output.ne[0] * v.output.ne[1], w, b}), p.output,
                           p.attention_conv, v.branch, residual_, execution_.parallel, cuda_);
 }
@@ -197,8 +199,9 @@ void draft_append_context(const Parameters& p, DraftExecution e, const Tensor& f
 
 std::size_t draft_workspace_capacity(const ModelProfile& p, int width, int max_batch) {
     WorkspaceLayoutBuilder a;
-    const auto& c = *p.config.draft;
-    const int h   = dimension(p.config.text.hidden);
+    const auto& c      = *p.config.draft;
+    const int h        = dimension(p.config.text.hidden);
+    const auto buckets = ops::ContextBucketRange::through(p.config.text.max_context);
     for (int b = 1; b <= max_batch; ++b) {
         auto batch  = a.scope();
         const int m = width * b;
@@ -214,8 +217,7 @@ std::size_t draft_workspace_capacity(const ModelProfile& p, int width, int max_b
                                       g.query_heads * g.head_dim};
                 scratch(a, ops::linear_split_workspace_capacity_bytes({layer.kvq, {}}, rows, m, m));
                 scratch(a, ops::sliding_window_attention_workspace_capacity_bytes(
-                               g, c.sliding_window.value(), {0, p.config.text.max_context}, width,
-                               width, b));
+                               g, c.sliding_window.value(), buckets, b, width, width));
             }
             {
                 auto scope = a.scope();

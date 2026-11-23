@@ -1,8 +1,7 @@
 #pragma once
 
-#include "models/qwen3_5/execution/parameters.h"
+#include "models/qwen3_5/execution/attention.h"
 #include "ninfer/ops/kv_cache_append.h"
-#include "ninfer/ops/softmax_attention.h"
 #include "ninfer/types.h"
 
 namespace ninfer::models::qwen3_5::execution {
@@ -44,7 +43,7 @@ struct MtpInputs {
 };
 
 void mtp_forward(MtpExecutionView state, const MtpInputs& inputs,
-                 ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden);
+                 ops::ContextBucket, Tensor& hidden, const CausalAttentionSubmit& = {});
 
 // Materialize K/V from true target conditioning without running query attention or the MLP.
 void mtp_history(MtpExecutionView state, const MtpInputs& inputs,

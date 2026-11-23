@@ -79,12 +79,6 @@ struct Offloaded {
     }
 };
 
-ops::CausalAttentionExecutionEnvelope envelope(const GraphProfile& profile, std::uint32_t width,
-                                               std::uint32_t capacity) {
-    return {1, static_cast<std::uint32_t>(
-                   std::min<std::uint64_t>(capacity, std::uint64_t(profile.max) + width))};
-}
-
 } // namespace
 
 struct TextGraph::Impl {
@@ -114,7 +108,7 @@ void TextGraph::prepare(TextRun& run, const Parameters& parameters, moe::Schedul
     const auto cuda     = device.execution_view();
     const auto layers   = parameters.text.layers.size();
     if (!preparation.capturing()) {
-        run.set_attention_envelope(envelope(profiles.front(), width, capacity));
+        run.set_attention_bucket(target_graph_bucket(profiles.front(), width, capacity));
         prologue();
         bool ready = run.start();
         while (!ready) {
@@ -124,7 +118,7 @@ void TextGraph::prepare(TextRun& run, const Parameters& parameters, moe::Schedul
         }
         epilogue();
         for (const auto& profile : profiles) {
-            run.set_attention_envelope(envelope(profile, width, capacity));
+            run.set_attention_bucket(target_graph_bucket(profile, width, capacity));
             for (std::uint32_t layer = 0; layer < layers; ++layer)
                 if (std::holds_alternative<AttentionParameters>(
                         parameters.text.layers[layer].mixer))
@@ -144,7 +138,7 @@ void TextGraph::prepare(TextRun& run, const Parameters& parameters, moe::Schedul
             }
         }
         for (std::size_t profile = 0; profile < profiles.size(); ++profile) {
-            run.set_attention_envelope(envelope(profiles[profile], width, capacity));
+            run.set_attention_bucket(target_graph_bucket(profiles[profile], width, capacity));
             auto& definitions = graph.profiles[profile];
             definitions.resize(attention_layers.size());
             for (std::size_t index = 0; index < attention_layers.size(); ++index) {
@@ -193,7 +187,7 @@ void TextGraph::prepare(TextRun& run, const Parameters& parameters, moe::Schedul
         });
         graph.profiles.resize(profiles.size());
         for (std::size_t profile = 0; profile < profiles.size(); ++profile) {
-            run.set_attention_envelope(envelope(profiles[profile], width, capacity));
+            run.set_attention_bucket(target_graph_bucket(profiles[profile], width, capacity));
             auto& definitions = graph.profiles[profile];
             definitions.resize(layers);
             for (std::uint32_t layer = 0; layer < layers; ++layer) {

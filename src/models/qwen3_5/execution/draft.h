@@ -9,6 +9,8 @@
 #include "ninfer/ops/sliding_window_attention.h"
 #include "ninfer/ops/softmax_attention.h"
 
+#include <functional>
+
 namespace ninfer::models::qwen3_5::execution {
 
 struct DraftExecutionView {
@@ -42,9 +44,43 @@ struct DraftOutputs {
     Tensor proposal_q;
 };
 
-struct DraftEnvelopes {
-    ops::SlidingWindowAttentionExecutionEnvelope local;
-    ops::ContextAttentionExecutionEnvelope full;
+struct DraftBuckets {
+    ops::ContextBucket local;
+    ops::ContextBucket full;
+};
+
+struct SlidingWindowReadout {
+    Tensor query, key, value, positions, valid_columns, output;
+    ConstCyclicKVCacheLayerView context;
+    ops::AttentionHeadGeometry geometry;
+    float scale;
+    MemorySpan scratch;
+
+    [[nodiscard]] ops::OpGraphProfile profile(ops::ContextBucket) const;
+    [[nodiscard]] std::size_t scratch_bytes(ops::ContextBucketRange) const;
+    void execute(ops::ContextBucket, CudaExecutionView) const;
+    void execute(ops::ContextBucket, MemoryArena&, CudaExecutionView) const;
+};
+
+struct ContextAttentionReadout {
+    Tensor query, key, value, frontiers, valid_columns, table_rows, output;
+    ConstPagedKVBatchLayerView context;
+    ops::AttentionHeadGeometry geometry;
+    float scale;
+    MemorySpan scratch;
+
+    [[nodiscard]] ops::OpGraphProfile profile(ops::ContextBucket) const;
+    [[nodiscard]] std::size_t scratch_bytes(ops::ContextBucketRange) const;
+    void execute(ops::ContextBucket, CudaExecutionView) const;
+    void execute(ops::ContextBucket, MemoryArena&, CudaExecutionView) const;
+};
+
+// Each supplied callback submits the current layer's readout on the draft stream.
+// The proposal workspace owns all operand and scratch backing.
+struct DraftReadoutSubmit {
+    ops::ContextBucketRange buckets;
+    std::function<void(const SlidingWindowReadout&)> local;
+    std::function<void(const ContextAttentionReadout&)> full;
 };
 
 // Appends target features to cyclic State records and full-attention history. Byte offsets
@@ -56,6 +92,7 @@ void draft_append_context(DraftExecutionView, const Tensor& features, const Tens
 // Produces this round's proposal for each row. ids/positions are [K+1,B], drafts [g,B] for the
 // first 1 <= g <= K mask columns. DFlash2 additionally writes its sparse proposal distribution;
 // ordinary DFlash leaves it absent.
-void draft_propose(DraftExecutionView, const DraftInputs&, DraftOutputs&, DraftEnvelopes);
+void draft_propose(DraftExecutionView, const DraftInputs&, DraftOutputs&, DraftBuckets,
+                   const DraftReadoutSubmit& = {});
 
 } // namespace ninfer::models::qwen3_5::execution

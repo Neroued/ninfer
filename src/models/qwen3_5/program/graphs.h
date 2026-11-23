@@ -28,7 +28,7 @@ struct GraphInvocation {
     std::uint32_t batch;
     std::uint32_t width;
     GraphProfile profile;
-    ops::CausalAttentionExecutionEnvelope envelope;
+    ops::ContextBucket bucket;
     const speculative::RoundRoute* route = nullptr;
 };
 
@@ -110,6 +110,8 @@ private:
     std::size_t workspace_peak_    = 0;
 };
 
+[[nodiscard]] ops::ContextBucket target_graph_bucket(const GraphProfile&, std::uint32_t width,
+                                                     std::uint32_t capacity);
 [[nodiscard]] std::vector<GraphProfile> target_graph_profiles(std::uint32_t capacity,
                                                               std::uint32_t width);
 [[nodiscard]] std::vector<GraphProfile> draft_graph_profiles(const GraphSpec&);

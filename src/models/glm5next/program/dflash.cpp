@@ -11,7 +11,7 @@ Tensor RankProgramImpl::draft_features(const execution::BatchView& call) {
     return resources.packed(field, {field.shape[0], columns.count / call.rows, call.rows});
 }
 
-execution::DFlashRun RankProgramImpl::dflash_run(int b, std::uint32_t bound, int steps) {
+execution::DFlashRun RankProgramImpl::dflash_run(int b, ops::ContextBucket bucket, int steps) {
     const auto& io  = frame;
     const auto& d   = *io.dflash;
     const auto& s   = *io.speculative;
@@ -21,7 +21,7 @@ execution::DFlashRun RankProgramImpl::dflash_run(int b, std::uint32_t bound, int
         parameters, {resources.workspace, resources.states, *parallel},
         {row(io.rows.anchors, b), row(io.rows.base_positions, b), row(d.valid_columns, b),
          row(io.rows.source_offsets, b), row(d.proposal_rows, b),
-         static_cast<const ops::SamplingConfig*>(resources.tensor(*io.sampling).data), bound},
+         static_cast<const ops::SamplingConfig*>(resources.tensor(*io.sampling).data), bucket},
         {resources.packed(d.ids, {w, b}), resources.packed(d.positions, {w, b}),
          resources.packed(s.drafts, {steps, b}), resources.packed(d.candidate_ids, {k, steps, b}),
          resources.packed(d.proposal_q, {k, steps, b})},

@@ -15,9 +15,18 @@ struct QsaReadout {
     ops::QsaBatchView batch;
     ops::QsaBlockSelection selection;
     MemorySpan scratch;
+    int multiprocessor_count;
 
-    void execute(std::uint32_t visible, CudaExecutionView) const;
-    void execute(std::uint32_t visible, MemoryArena&, CudaExecutionView) const;
+    [[nodiscard]] ops::OpGraphProfile index_profile(ops::ContextBucket) const;
+    [[nodiscard]] ops::OpGraphProfile attention_profile(ops::ContextBucket, int sms) const;
+    void indexer(ops::ContextBucket, CudaExecutionView) const;
+    void attention(ops::ContextBucket, CudaExecutionView) const;
+    void execute(ops::ContextBucket, MemoryArena&, CudaExecutionView) const;
+    void execute(ops::ContextBucket, CudaExecutionView) const;
+
+private:
+    void indexer(ops::ContextBucket, MemoryArena&, CudaExecutionView) const;
+    void attention(ops::ContextBucket, MemoryArena&, CudaExecutionView) const;
 };
 
 using QsaSubmit = std::function<void(const QsaReadout&)>;
@@ -29,11 +38,13 @@ public:
            ops::QsaCacheView, ops::QsaRawRecordWriteView, Tensor output, MemoryArena&,
            CudaExecutionView);
     void prepare();
-    [[nodiscard]] QsaReadout readout(std::span<const std::uint32_t> bounds = {});
+    [[nodiscard]] QsaReadout readout(ops::ContextBucketRange);
     void finish();
     void execute(const QsaSubmit& = {});
 
 private:
+    [[nodiscard]] QsaReadout bind_readout() const;
+
     Tensor input_, output_;
     const QsaConfig& config_;
     const QsaParameters& parameters_;

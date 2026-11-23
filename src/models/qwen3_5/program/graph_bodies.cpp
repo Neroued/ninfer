@@ -48,7 +48,7 @@ GraphPreparationSample RankProgramImpl::initialize_graphs(GraphPreparationMode m
             execution::TextExecutionView{parameters, resources.work, device.execution_view(),
                                          resources.decoder.text_kv, resources.state_images.linear(),
                                          resources.moe.get()},
-            std::move(inputs), update, call.envelope, input.hidden, feature ? &*feature : nullptr);
+            std::move(inputs), update, call.bucket, input.hidden, feature ? &*feature : nullptr);
     };
     bodies.project = [this, capture = observation.capturing()](const GraphInvocation& call) {
         project_decode(call.batch, call.width);
@@ -61,7 +61,7 @@ GraphPreparationSample RankProgramImpl::initialize_graphs(GraphPreparationMode m
             run_mtp_draft(call.batch, call.route->mtp_steps, std::max(1U, call.profile.max));
         } else {
             append_draft_history(call.batch, {0, draft_window + 1});
-            run_dflash_draft(*call.route, 0, call.profile.max);
+            run_dflash_draft(*call.route, call.profile.max);
         }
         prepare_verification(*call.route);
         gpu_timer.end_draft(capture);

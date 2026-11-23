@@ -104,7 +104,8 @@ void RankProgramImpl::run_mtp_draft(std::uint32_t batch_size, std::uint32_t step
             .valid_columns   = input.valid_columns,
             .kv_table_rows   = frame.backend_table_rows.slice(0, 0, batch),
         };
-        execution::mtp_forward(mtp_execution, inputs, {1, visible}, next);
+        const auto bucket = ops::select_context_bucket(std::max(1U, visible));
+        execution::mtp_forward(mtp_execution, inputs, bucket, next);
         execution::mtp_propose(mtp_execution, next.view({hidden, batch}), logits, input.ids);
     }
 }

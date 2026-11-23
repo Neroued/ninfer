@@ -85,11 +85,11 @@ std::size_t body(const ModelProfile& p, const EngineOptions& options, int first,
                 const auto& q = std::get<QsaProfile>(layer.mixer);
                 (void)workspace::qsa(a, p.local.qsa, columns, prefill || mtp);
                 scratch(qsa_projection_workspace_bytes(q, minimum, columns));
-                scratch(ops::qsa_indexer_workspace_capacity_bytes(first, last, batch,
-                                                                  {options.max_context}));
+                const auto buckets = ops::ContextBucketRange::through(options.max_context);
+                scratch(ops::qsa_indexer_workspace_capacity_bytes(buckets, batch, first, last));
                 scratch(ops::qsa_sparse_gqa_workspace_capacity_bytes(
                     options.kv_cache, dimension(p.local.qsa.query_heads),
-                    dimension(p.local.qsa.kv_heads), first, last, batch, {options.max_context},
+                    dimension(p.local.qsa.kv_heads), buckets, batch, first, last,
                     sm_count));
                 scratch(linear(q.output, minimum, columns));
             }

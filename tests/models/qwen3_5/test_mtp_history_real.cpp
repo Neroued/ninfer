@@ -120,10 +120,10 @@ public:
         if (forward) {
             DeviceBuffer output(device, input.conditioning.size() * sizeof(std::uint16_t));
             Tensor hidden_output(output.span(), DType::BF16, {hidden, input.width, input.batch});
-            const auto maximum =
-                *std::max_element(input.positions.begin(), input.positions.end()) + 1;
-            q35::execution::mtp_forward(execution, values, {1, static_cast<std::uint32_t>(maximum)},
-                                        hidden_output);
+            const auto maximum = *std::max_element(input.positions.begin(), input.positions.end());
+            const auto bucket  = ninfer::ops::select_context_bucket(
+                static_cast<std::uint32_t>(std::max(1, maximum + 1)));
+            q35::execution::mtp_forward(execution, values, bucket, hidden_output);
             fixture_.device().synchronize();
         } else {
             q35::execution::mtp_history(execution, values,

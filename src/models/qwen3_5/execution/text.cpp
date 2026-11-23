@@ -42,9 +42,9 @@ bool is_sequence(const TextStateUpdate& update) {
 } // namespace
 
 TextRun::TextRun(TextExecutionView execution, TextInputs inputs, TextStateUpdate update,
-                 ops::CausalAttentionExecutionEnvelope envelope, Tensor hidden,
+                 ops::ContextBucket bucket, Tensor hidden,
                  const DFlashFeatureSink* features)
-    : view_(execution), inputs_(std::move(inputs)), update_(update), envelope_(envelope),
+    : view_(execution), inputs_(std::move(inputs)), update_(update), bucket_(bucket),
       hidden_(hidden), traversal_scope_(view_.workspace.scope()) {
     const auto& config = view_.parameters.profile->config.text;
     const auto width   = inputs_.ids.ne[0];
@@ -120,8 +120,8 @@ TextRun::~TextRun() {
     }
 }
 
-void TextRun::set_attention_envelope(ops::CausalAttentionExecutionEnvelope envelope) noexcept {
-    envelope_ = envelope;
+void TextRun::set_attention_bucket(ops::ContextBucket bucket) noexcept {
+    bucket_ = bucket;
 }
 
 void TextRun::prefix() {
@@ -135,7 +135,8 @@ void TextRun::prefix() {
     }
 }
 
-void TextRun::attention(const BlockParameters& block, std::uint32_t compact_layer) {
+void TextRun::attention(const BlockParameters& block, std::uint32_t compact_layer,
+                        const CausalAttentionSubmit& submit) {
     auto& work        = view_.workspace;
     const auto cuda   = view_.execution;
     const auto& cfg   = view_.parameters.profile->config.text;
@@ -168,14 +169,16 @@ void TextRun::attention(const BlockParameters& block, std::uint32_t compact_laye
     ops::rmsnorm(query, p.query_norm, cfg.rms_norm_eps, true, q, cuda);
     ops::rmsnorm(key, p.key_norm, cfg.rms_norm_eps, true, k, cuda);
     text_rope(inputs_.rope_positions, *cfg.rope_parameters, q, k, cuda);
-    Tensor qb = q.view({dim, heads, width, batch});
-    Tensor kb = k.view({dim, kv, width, batch});
-    Tensor vb = value.view({dim, kv, width, batch});
-    Tensor ab = a.view({dim, heads, width, batch});
-    ops::causal_softmax_attention(
-        qb, kb, vb, inputs_.cache_positions, inputs_.valid_columns, inputs_.kv_table_rows,
-        {dim, heads, kv}, static_cast<float>(1.0 / std::sqrt(double(attn.head_dim))),
-        view_.cache.batch_layer_view(compact_layer), envelope_, work, ab, cuda);
+    CausalAttentionReadout readout{
+        q.view({dim, heads, width, batch}), k.view({dim, kv, width, batch}),
+        value.view({dim, kv, width, batch}), inputs_.cache_positions, inputs_.valid_columns,
+        inputs_.kv_table_rows, a.view({dim, heads, width, batch}),
+        view_.cache.batch_layer_view(compact_layer), {dim, heads, kv},
+        static_cast<float>(1.0 / std::sqrt(double(attn.head_dim))), {}};
+    if (submit)
+        readout.submit(work, cuda, submit);
+    else
+        readout.execute(bucket_, work, cuda);
     ops::sigmoid_mul(gate, a, cuda);
     ops::linear_add(a.view({dimension(attn.query_width()), tokens}), p.output.weight, residual_,
                     p.output.policy, work, cuda);
@@ -282,7 +285,7 @@ ops::MoeExecutionHints TextRun::next_projection_hints(std::uint32_t layer) const
                : ops::MoeExecutionHints{};
 }
 
-void TextRun::mixer(std::uint32_t layer) {
+void TextRun::mixer(std::uint32_t layer, const CausalAttentionSubmit& submit) {
     const auto& config  = view_.parameters.profile->config.text;
     const auto& block   = view_.parameters.text.layers.at(layer);
     const bool full     = config.layer_types[layer] == MixerKind::FullAttention;
@@ -294,7 +297,7 @@ void TextRun::mixer(std::uint32_t layer) {
     auto scope         = view_.workspace.scope();
     const auto compact = config.compact_layer_indices[layer];
     if (full)
-        attention(block, compact);
+        attention(block, compact, submit);
     else
         gdn(block, compact);
 }

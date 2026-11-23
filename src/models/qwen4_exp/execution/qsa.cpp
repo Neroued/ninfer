@@ -2,6 +2,8 @@
 #include "models/qwen4_exp/execution/workspace.h"
 #include "ninfer/ops/linear_split.h"
 
+#include <algorithm>
+
 namespace ninfer::models::qwen4_exp::execution {
 namespace {
 
@@ -63,27 +65,30 @@ void QsaRun::prepare() {
                      records_, query, index_query, cuda_);
 }
 
-QsaReadout QsaRun::readout(std::span<const std::uint32_t> bounds) {
+QsaReadout QsaRun::bind_readout() const {
     const int t = batch_.tokens, b = batch_.batch, d = dimension(config_.head_dim);
     const int qh = dimension(config_.query_heads);
-    QsaReadout call{buffers_.query.view({d, qh, t, b}),
-                    buffers_.gate.view({d, qh, t, b}),
-                    buffers_.index_query.view(
-                        {dimension(config_.index_dim), dimension(config_.index_heads), t, b}),
-                    buffers_.output.view({d, qh, t, b}),
-                    cache_.index,
-                    cache_.main,
-                    {batch_.positions, batch_.valid_columns, batch_.table_rows},
-                    {buffers_.selection.view({dimension(config_.block_budget), t, b}),
-                     buffers_.counts.view({t, b})},
-                    {nullptr, 0, cuda_.device()}};
-    std::size_t bytes = 0;
-    for (const auto visible : bounds) {
-        bytes = std::max({bytes, ops::qsa_indexer_workspace_capacity_bytes(t, t, b, {visible}),
-                          ops::qsa_sparse_gqa_workspace_capacity_bytes(
-                              cache_.main.storage, qh, cache_.main.num_kv_heads, t, t, b, {visible},
-                              cuda_.multiprocessor_count())});
-    }
+    return {buffers_.query.view({d, qh, t, b}),
+            buffers_.gate.view({d, qh, t, b}),
+            buffers_.index_query.view(
+                {dimension(config_.index_dim), dimension(config_.index_heads), t, b}),
+            buffers_.output.view({d, qh, t, b}),
+            cache_.index,
+            cache_.main,
+            {batch_.positions, batch_.valid_columns, batch_.table_rows},
+            {buffers_.selection.view({dimension(config_.block_budget), t, b}),
+             buffers_.counts.view({t, b})},
+            {nullptr, 0, cuda_.device()},
+            cuda_.multiprocessor_count()};
+}
+
+QsaReadout QsaRun::readout(ops::ContextBucketRange buckets) {
+    auto call   = bind_readout();
+    const int t = call.query.ne[2], b = call.query.ne[3];
+    const auto bytes = std::max(ops::qsa_indexer_workspace_capacity_bytes(buckets, b, t, t),
+                                ops::qsa_sparse_gqa_workspace_capacity_bytes(
+                                    call.cache.storage, call.query.ne[1], call.cache.num_kv_heads,
+                                    buckets, b, t, t, call.multiprocessor_count));
     if (bytes) {
         auto scope   = arena_.scope();
         call.scratch = arena_.alloc_bytes(bytes, 256);
@@ -91,20 +96,48 @@ QsaReadout QsaRun::readout(std::span<const std::uint32_t> bounds) {
     return call;
 }
 
-void QsaReadout::execute(std::uint32_t visible, MemoryArena& arena, CudaExecutionView cuda) const {
-    auto selected = selection;
-    {
-        auto scope = arena.scope();
-        ops::qsa_indexer(index_query, index, batch, {visible}, arena, selected, cuda);
-    }
-    auto scope = arena.scope();
-    auto out   = output;
-    ops::qsa_sparse_gqa(query, gate, cache, batch, selected, {visible}, arena, out, cuda);
+ops::OpGraphProfile QsaReadout::index_profile(ops::ContextBucket bucket) const {
+    return ops::qsa_indexer_graph_profile(bucket, query.ne[3], query.ne[2], multiprocessor_count);
 }
 
-void QsaReadout::execute(std::uint32_t visible, CudaExecutionView cuda) const {
+ops::OpGraphProfile QsaReadout::attention_profile(ops::ContextBucket bucket, int sms) const {
+    return ops::qsa_sparse_gqa_graph_profile(cache.storage, query.ne[1], cache.num_kv_heads, bucket,
+                                             query.ne[3], query.ne[2], sms);
+}
+
+void QsaReadout::indexer(ops::ContextBucket bucket, CudaExecutionView cuda) const {
     MemoryArena arena(scratch);
-    execute(visible, arena, cuda);
+    indexer(bucket, arena, cuda);
+}
+
+void QsaReadout::indexer(ops::ContextBucket bucket, MemoryArena& arena,
+                         CudaExecutionView cuda) const {
+    auto scope    = arena.scope();
+    auto selected = selection;
+    ops::qsa_indexer(index_query, index, batch, bucket, arena, selected, cuda);
+}
+
+void QsaReadout::attention(ops::ContextBucket bucket, CudaExecutionView cuda) const {
+    MemoryArena arena(scratch);
+    attention(bucket, arena, cuda);
+}
+
+void QsaReadout::attention(ops::ContextBucket bucket, MemoryArena& arena,
+                           CudaExecutionView cuda) const {
+    auto scope = arena.scope();
+    auto out   = output;
+    ops::qsa_sparse_gqa(query, gate, cache, batch, selection, bucket, arena, out, cuda);
+}
+
+void QsaReadout::execute(ops::ContextBucket bucket, MemoryArena& arena,
+                         CudaExecutionView cuda) const {
+    indexer(bucket, arena, cuda);
+    attention(bucket, arena, cuda);
+}
+
+void QsaReadout::execute(ops::ContextBucket bucket, CudaExecutionView cuda) const {
+    MemoryArena arena(scratch);
+    execute(bucket, arena, cuda);
 }
 
 void QsaRun::finish() {
@@ -116,11 +149,14 @@ void QsaRun::finish() {
 
 void QsaRun::execute(const QsaSubmit& submit) {
     prepare();
-    auto call = readout();
-    if (submit)
-        submit(call);
-    else
-        call.execute(batch_.max_visible_tokens, arena_, cuda_);
+    if (submit) {
+        const auto pages =
+            static_cast<std::uint32_t>(cache_.main.k_pages.records.page_offsets.ne[0]);
+        submit(readout(ops::ContextBucketRange::through(pages * kPagedKVPageSize)));
+    } else {
+        const auto bucket = ops::select_context_bucket(std::max(1U, batch_.max_visible_tokens));
+        bind_readout().execute(bucket, arena_, cuda_);
+    }
     finish();
 }
 

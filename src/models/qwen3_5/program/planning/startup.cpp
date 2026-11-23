@@ -138,7 +138,7 @@ WorkspaceSpec build_workspace_plan(const SequencePlanImpl& plan) {
     const auto chunk  = static_cast<std::int32_t>(chunk_u32);
     const auto drafts = static_cast<std::int32_t>(plan.draft_window);
     const auto verify = drafts + 1;
-    const ops::CausalAttentionExecutionEnvelope text_envelope{1, plan.capacity};
+    const auto text_buckets = ops::ContextBucketRange::through(plan.capacity);
 
     const auto matrix  = [](WorkspaceLayoutBuilder& layout, DType dtype, std::int32_t rows,
                            std::int32_t tokens) { (void)layout.alloc(dtype, {rows, tokens}); };
@@ -167,7 +167,7 @@ WorkspaceSpec build_workspace_plan(const SequencePlanImpl& plan) {
                                  std::int32_t last, TextPhase phase, GdnWorkspacePath path,
                                  std::int32_t batch_size, std::int32_t min_width,
                                  std::int32_t max_width,
-                                 ops::CausalAttentionExecutionEnvelope envelope) {
+                                 ops::ContextBucketRange buckets) {
         for (const auto& block : profile.text.layers) {
             {
                 auto stage = layout.scope();
@@ -181,7 +181,7 @@ WorkspaceSpec build_workspace_plan(const SequencePlanImpl& plan) {
                                         {dimension(config.attention->head_dim),
                                          dimension(config.attention->num_attention_heads),
                                          dimension(config.attention->num_key_value_heads)},
-                                        plan.kv_storage, envelope, batch_size, min_width, max_width,
+                                        plan.kv_storage, buckets, batch_size, min_width, max_width,
                                         plan.multiprocessor_count));
                     add_scratch(layout, attention->output, first, last);
                 } else {
@@ -238,7 +238,7 @@ WorkspaceSpec build_workspace_plan(const SequencePlanImpl& plan) {
             WorkspaceLayoutBuilder target;
             matrix(target, DType::BF16, dimension(config.hidden_size), columns);
             target_body(target, columns, columns, TextPhase::Verify, GdnWorkspacePath::ReplayRecord,
-                        batch, width, width, text_envelope);
+                        batch, width, width, text_buckets);
             peak = std::max(peak, finish(target));
         }
         return peak;
@@ -267,7 +267,7 @@ WorkspaceSpec build_workspace_plan(const SequencePlanImpl& plan) {
     WorkspaceLayoutBuilder text_prefill;
     text_common_root(text_prefill, chunk);
     target_body(text_prefill, 1, chunk, qwen3_5::TextPhase::Prefill, GdnWorkspacePath::Prefill, 1,
-                1, chunk, text_envelope);
+                1, chunk, text_buckets);
     if (!plan.causal_scoring) {
         scratch(text_prefill,
                 ops::sampling_workspace_capacity_bytes(dimension(profile.public_tokens), 1, 1));
@@ -289,7 +289,7 @@ WorkspaceSpec build_workspace_plan(const SequencePlanImpl& plan) {
             WorkspaceLayoutBuilder ordinary;
             matrix(ordinary, DType::BF16, dimension(config.hidden_size), batch);
             target_body(ordinary, batch, batch, qwen3_5::TextPhase::Verify,
-                        GdnWorkspacePath::Snapshot, batch, 1, 1, text_envelope);
+                        GdnWorkspacePath::Snapshot, batch, 1, 1, text_buckets);
             scratch(ordinary, ops::sampling_workspace_capacity_bytes(
                                   dimension(profile.public_tokens), batch, batch));
             out.ordinary_round = std::max(out.ordinary_round, finish(ordinary));
@@ -325,7 +325,7 @@ WorkspaceSpec build_workspace_plan(const SequencePlanImpl& plan) {
                         {dimension(config.attention->head_dim),
                          dimension(config.attention->num_attention_heads),
                          dimension(config.attention->num_key_value_heads)},
-                        plan.kv_storage, text_envelope, batch, 1, 1, plan.multiprocessor_count));
+                        plan.kv_storage, text_buckets, batch, 1, 1, plan.multiprocessor_count));
             (void)workspace::mtp_post_attention(layout, config, batch);
             mtp_post_mixer(layout, batch, batch);
             return finish(layout);
@@ -410,7 +410,7 @@ WorkspaceSpec build_workspace_plan(const SequencePlanImpl& plan) {
                                              dimension(draft->attention.num_attention_heads),
                                              dimension(draft->attention.num_key_value_heads)},
                                             dimension(draft->sliding_window.value_or(0)),
-                                            {0, plan.capacity}, width, width, batch));
+                                            text_buckets, batch, width, width));
                         scratch(layout,
                                 ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
                                     dimension(draft->attention.query_width()), width, width, batch,
@@ -457,12 +457,12 @@ WorkspaceSpec build_workspace_plan(const SequencePlanImpl& plan) {
                                           dimension(draft->attention.num_attention_heads),
                                           dimension(draft->attention.num_key_value_heads)},
                                          dimension(draft->sliding_window.value_or(0)),
-                                         {0, plan.capacity}, width, width, batch),
+                                         text_buckets, batch, width, width),
                                      ops::context_softmax_attention_workspace_capacity_bytes(
                                          {dimension(draft->attention.head_dim),
                                           dimension(draft->attention.num_attention_heads),
                                           dimension(draft->attention.num_key_value_heads)},
-                                         {0, plan.capacity}, width, width, batch)));
+                                         text_buckets, batch, width, width)));
                     for (const auto& block : profile.draft->layers) {
                         add_scratch(layout, block.output, tokens, tokens);
                     }

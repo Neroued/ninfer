@@ -43,7 +43,8 @@ void RankProgramImpl::execute_proposal(const execution::BatchView& main,
         }
     } else {
         nvtx::ScopedRange range(nvtx::Name::DFlashProposal, nvtx::Category::DFlash);
-        auto run = dflash_run(rows, draft_bounds.front(), head_columns);
+        const auto bucket = ops::select_context_bucket(std::max(1U, draft_bounds.front()));
+        auto run = dflash_run(rows, bucket, head_columns);
         run.stem();
         for (std::uint32_t layer = 0; layer < parameters.draft->layers.size(); ++layer) {
             {

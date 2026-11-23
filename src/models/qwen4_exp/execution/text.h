@@ -42,7 +42,6 @@ public:
 
     [[nodiscard]] Tensor& block_output() { return roots_.output; }
 
-    void set_visible_tokens(std::uint32_t maximum) { batch_.max_visible_tokens = maximum; }
 
 private:
     void mix(const HcParameters&);

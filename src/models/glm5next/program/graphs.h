@@ -36,14 +36,14 @@ private:
         int draft_step = -1;
         DecodeGraphDefinition index, attention;
         DecodeGraphChild index_node, attention_node;
-        ops::KpoolGraphProfile index_profile, attention_profile;
+        ops::OpGraphProfile index_profile, attention_profile;
     };
 
     struct DraftSite {
         execution::DraftReadout call;
         DecodeGraphDefinition attention;
         DecodeGraphChild node;
-        ops::SlidingWindowAttentionGraphProfile profile;
+        ops::OpGraphProfile profile;
     };
 
     struct Round {

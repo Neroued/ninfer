@@ -8,7 +8,7 @@
 namespace ninfer::models::qwen4_exp::detail {
 class RankProgramImpl;
 
-[[nodiscard]] std::vector<std::uint32_t> decode_context_bounds(std::uint32_t capacity);
+[[nodiscard]] std::vector<ops::ContextBucket> decode_context_buckets(std::uint32_t capacity);
 
 class GraphInputs {
 public:
@@ -68,7 +68,7 @@ private:
     void prepare_main(Batch&, std::uint32_t batch, bool verify, GraphPreparation&);
     void prepare_drafts(Batch&, std::uint32_t batch, GraphInputs&, GraphPreparation&);
     RankProgramImpl& owner_;
-    std::vector<std::uint32_t> bounds_;
+    std::vector<ops::ContextBucket> buckets_;
     std::map<std::uint32_t, Batch> batches_;
     std::size_t workspace_peak_ = 0;
 };

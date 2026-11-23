@@ -11,14 +11,11 @@
 
 namespace ninfer::models::qwen4_exp::detail {
 
-std::vector<std::uint32_t> decode_context_bounds(std::uint32_t capacity) {
-    std::vector<std::uint32_t> out;
-    for (const auto bound : {128U, 512U, 2048U, 8192U, 32768U, 131072U}) {
-        if (bound >= capacity) break;
-        out.push_back(bound);
-    }
-    out.push_back(capacity);
-    return out;
+std::vector<ops::ContextBucket> decode_context_buckets(std::uint32_t capacity) {
+    std::vector<ops::ContextBucket> buckets;
+    ops::ContextBucketRange::through(capacity).for_each(
+        [&](ops::ContextBucket bucket) { buckets.push_back(bucket); });
+    return buckets;
 }
 
 namespace {
@@ -191,7 +188,7 @@ void GraphInputs::batch(execution::BatchView call, std::uint32_t visible) {
 }
 
 Graphs::Graphs(RankProgramImpl& owner)
-    : owner_(owner), bounds_(decode_context_bounds(owner.shape.max_context)) {}
+    : owner_(owner), buckets_(decode_context_buckets(owner.shape.max_context)) {}
 
 void Graphs::prepare_main(Batch& graph, std::uint32_t batch, bool verify,
                           GraphPreparation& preparation) {
@@ -199,8 +196,8 @@ void Graphs::prepare_main(Batch& graph, std::uint32_t batch, bool verify,
     auto& r             = p.resources;
     const auto& buffers = r.buffers();
     const auto tokens   = verify ? p.shape.draft_tokens + 1 : 1;
-    auto call           = r.main_batch(tokens, batch, bounds_.back());
-    call.active_tokens  = std::min(tokens, bounds_.back()) * r.plan.batches->minimum_rows(batch);
+    auto call           = r.main_batch(tokens, batch, p.shape.max_context);
+    call.active_tokens  = std::min(tokens, p.shape.max_context) * r.plan.batches->minimum_rows(batch);
     const auto& c       = p.parameters.profile->config.text;
     const auto t = static_cast<std::int32_t>(tokens), b = static_cast<std::int32_t>(batch);
     execution::TextOutputs output{r.packed(buffers.pending_sample, {dimension(c.hidden), t, b}),
@@ -233,13 +230,13 @@ void Graphs::prepare_main(Batch& graph, std::uint32_t batch, bool verify,
             preparation.checkpoint();
             return;
         }
-        selected.prepare(run, p.parameters, r.experts.get(), bounds_, ple, output, logits,
+        selected.prepare(run, p.parameters, r.experts.get(), buckets_, ple, output, logits,
                          moe::decode_geometry(*r.plan.batches, batch, tokens), r.workspace,
                          p.device, [&] {
                              if (!verify) p.install_decode(batch);
                          });
     }
-    selected.select(bounds_.back());
+    selected.select(buckets_.back());
     execution::TextRun run(p.parameters, execution, call, update, p.cuda);
     if (selected.resident()) {
         selected.replay(1, p.cuda);
@@ -260,7 +257,8 @@ void Graphs::prepare_drafts(Batch& graph, std::uint32_t batch, GraphInputs& inpu
     for (std::uint32_t step = 0; step < p.shape.draft_tokens; ++step) {
         auto& call = graph.drafts[step];
         if (!preparation.capturing()) {
-            for (const auto bound : bounds_) {
+            for (const auto bucket : buckets_) {
+                const auto bound = std::min(p.shape.max_context, ops::context_bucket_tokens(bucket));
                 inputs.batch(p.resources.mtp_batch(p.resources.buffers().mtp->draft_steps[step], 1,
                                                    batch, bound),
                              bound);
@@ -271,8 +269,8 @@ void Graphs::prepare_drafts(Batch& graph, std::uint32_t batch, GraphInputs& inpu
         }
         p.resources.workspace.reset_peak();
         {
-            auto run = p.draft_run(step, batch, bounds_.back());
-            call.readout.prepare(run.local_qsa(), bounds_, p.cuda);
+            auto run = p.draft_run(step, batch, p.shape.max_context);
+            call.readout.prepare(run.local_qsa(), buckets_, p.cuda);
         }
         call.workspace_bytes = p.resources.workspace.peak_used();
         const auto ids = p.draft_output_ids(step, batch);
@@ -287,7 +285,7 @@ void Graphs::prepare_drafts(Batch& graph, std::uint32_t batch, GraphInputs& inpu
     for (const auto& route : p.resources.plan.decode_routes->at({batch, batch})) {
         const auto depth = route.mtp_steps;
         if (!depth) continue;
-        inputs.stage_proposal(batch, depth, bounds_.back());
+        inputs.stage_proposal(batch, depth, p.shape.max_context);
         auto& chain = graph.chains[depth - 1];
         chain.installed.resize(depth);
         chain.graph.prepare(p.cuda, [&] {
@@ -295,7 +293,7 @@ void Graphs::prepare_drafts(Batch& graph, std::uint32_t batch, GraphInputs& inpu
             for (std::uint32_t step = 0; step < depth; ++step) {
                 auto& call = graph.drafts[step];
                 p.resources.workspace.reset_peak();
-                p.draft_forward(step, batch, bounds_.front(), [&](const execution::QsaReadout& r) {
+                p.draft_forward(step, batch, p.shape.max_context, [&](const execution::QsaReadout& r) {
                     chain.steps.push_back(call.readout.append(r, p.cuda.stream()));
                 });
                 call.workspace_bytes =
@@ -312,14 +310,14 @@ void Graphs::prepare_drafts(Batch& graph, std::uint32_t batch, GraphInputs& inpu
                 p.device_tensor(io.anchors).slice(0, 0, batch), p.draft_proposals(batch),
                 p.device_tensor(io.mtp->extents).slice(0, 0, batch), ids, p.cuda);
         });
-        for (std::size_t context = 0; context < bounds_.size(); ++context) {
+        for (std::size_t context = 0; context < buckets_.size(); ++context) {
             for (std::uint32_t step = 0; step < depth; ++step)
                 chain.graph.executable.update_child(chain.steps[step],
                                                     graph.drafts[step].readout.at(context));
             chain.graph.executable.upload(p.cuda.stream());
             p.device.synchronize();
         }
-        std::fill(chain.installed.begin(), chain.installed.end(), bounds_.size() - 1);
+        std::fill(chain.installed.begin(), chain.installed.end(), buckets_.size() - 1);
         for (std::uint32_t slot : {1U, 0U}) {
             for (std::uint32_t step = 0; step < depth; ++step)
                 chain.graph.executable.update_child(chain.handoffs[step],
@@ -338,7 +336,7 @@ void Graphs::prepare(GraphInputs& inputs, GraphPreparation& observation) {
     for (auto batch : r.plan.batches->graph_rows()) {
         r.select_batch(batch);
         auto& graph = batches_[batch];
-        inputs.batch(r.main_batch(1, batch, bounds_.back()), bounds_.back());
+        inputs.batch(r.main_batch(1, batch, p.shape.max_context), p.shape.max_context);
         inputs.stage();
         prepare_main(graph, batch, false, observation);
         r.workspace.reset_peak();
@@ -353,12 +351,12 @@ void Graphs::prepare(GraphInputs& inputs, GraphPreparation& observation) {
         if (p.parameters.mtp) {
             const auto& frame = *r.buffers().mtp;
             for (std::uint32_t step = 0; step < p.shape.draft_tokens; ++step)
-                inputs.batch(r.mtp_batch(frame.draft_steps[step], 1, batch, bounds_.back()),
-                             bounds_.back());
+                inputs.batch(r.mtp_batch(frame.draft_steps[step], 1, batch, p.shape.max_context),
+                             p.shape.max_context);
             inputs.stage();
             prepare_drafts(graph, batch, inputs, observation);
-            inputs.batch(r.main_batch(p.shape.draft_tokens + 1, batch, bounds_.back()),
-                         bounds_.back());
+            inputs.batch(r.main_batch(p.shape.draft_tokens + 1, batch, p.shape.max_context),
+                         p.shape.max_context);
             prepare_main(graph, batch, true, observation);
             r.workspace.reset_peak();
             if (observation.capturing()) {
@@ -381,7 +379,7 @@ TextGraph& Graphs::main(std::uint32_t batch, bool verify, std::uint32_t visible,
     auto& group = batches_.at(batch);
     auto& graph = verify ? group.verify : group.main;
     graph.set_head(head);
-    graph.select(visible);
+    graph.select(ops::select_context_bucket(std::max(1U, visible)));
     workspace_peak_ = std::max(workspace_peak_, graph.workspace_bytes());
     return graph;
 }
@@ -392,10 +390,11 @@ void Graphs::draft(std::uint32_t batch, std::span<const execution::BatchView> ca
     auto& chain = group.chains.at(calls.size() - 1);
     for (std::size_t step = 0; step < calls.size(); ++step) {
         const auto& call = group.drafts[step];
-        const auto found =
-            std::lower_bound(bounds_.begin(), bounds_.end(), calls[step].max_visible_tokens);
-        if (found == bounds_.end()) throw std::logic_error("MTP graph context exceeds capacity");
-        const auto selected = static_cast<std::size_t>(found - bounds_.begin());
+        const auto bucket =
+            ops::select_context_bucket(std::max(1U, calls[step].max_visible_tokens));
+        const auto found = std::lower_bound(buckets_.begin(), buckets_.end(), bucket);
+        if (found == buckets_.end()) throw std::logic_error("MTP graph context exceeds capacity");
+        const auto selected = static_cast<std::size_t>(found - buckets_.begin());
         workspace_peak_     = std::max(workspace_peak_, call.workspace_bytes);
         if (chain.installed[step] != selected) {
             chain.graph.executable.update_child(chain.steps[step], call.readout.at(selected));

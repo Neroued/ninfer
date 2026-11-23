@@ -6,13 +6,13 @@
 
 namespace ninfer::models::qwen4_exp {
 
-void QsaGraphReadout::prepare(execution::QsaRun run, std::span<const std::uint32_t> bounds,
+void QsaGraphReadout::prepare(execution::QsaRun run, std::span<const ops::ContextBucket> buckets,
                               CudaExecutionView cuda) {
-    const auto call = run.readout(bounds);
+    const auto call = run.readout({buckets.front(), buckets.back()});
     query_          = call.query;
     output_         = call.output;
-    for (const auto visible : bounds)
-        profiles_.emplace_back().capture(cuda.stream(), [&] { call.execute(visible, cuda); });
+    for (const auto bucket : buckets)
+        profiles_.emplace_back().capture(cuda.stream(), [&] { call.execute(bucket, cuda); });
 }
 
 DecodeGraphChild QsaGraphReadout::append(const execution::QsaReadout& call,
@@ -23,17 +23,17 @@ DecodeGraphChild QsaGraphReadout::append(const execution::QsaReadout& call,
 }
 
 void TextGraph::prepare(execution::TextRun& run, const execution::Parameters& parameters,
-                        moe::Schedule* experts, std::span<const std::uint32_t> bounds,
+                        moe::Schedule* experts, std::span<const ops::ContextBucket> buckets,
                         std::array<ple::DeviceEmbedding, 2> ple, execution::TextOutputs output,
                         Tensor logits, moe::TokenGeometry geometry, MemoryArena& workspace,
                         DeviceContext& device, const std::function<void()>& install_inputs) {
-    bounds_.assign(bounds.begin(), bounds.end());
+    buckets_.assign(buckets.begin(), buckets.end());
     const auto cuda = device.execution_view();
     workspace.reset_peak();
     readouts_.resize(parameters.text.layers.size());
     for (std::size_t i = 0; i < readouts_.size(); ++i)
         if (std::holds_alternative<execution::QsaParameters>(parameters.text.layers[i].mixer))
-            readouts_[i].emplace().prepare(run.local_qsa(i), bounds, cuda);
+            readouts_[i].emplace().prepare(run.local_qsa(i), buckets, cuda);
     workspace_bytes_ = workspace.peak_used();
     if (experts)
         prepare_offloaded(run, parameters, *experts, ple, output, logits, geometry, workspace, cuda,
@@ -41,8 +41,8 @@ void TextGraph::prepare(execution::TextRun& run, const execution::Parameters& pa
     else
         prepare_resident(run, parameters, ple, output, logits, workspace, cuda, install_inputs);
     // Qualify every child/layer update before accepting requests.
-    for (const auto bound : bounds_) {
-        select(bound);
+    for (const auto bucket : buckets_) {
+        select(bucket);
         if (resident()) {
             std::get<Resident>(implementation_).main.executable.upload(cuda.stream());
         } else {
@@ -51,7 +51,7 @@ void TextGraph::prepare(execution::TextRun& run, const execution::Parameters& pa
         }
         device.synchronize();
     }
-    select(bounds_.front());
+    select(buckets_.front());
 }
 
 void TextGraph::prepare_resident(execution::TextRun& run, const execution::Parameters& p,
@@ -68,7 +68,6 @@ void TextGraph::prepare_resident(execution::TextRun& run, const execution::Param
             inputs[slot].consumed.record_external(cuda.stream());
         });
     }
-    run.set_visible_tokens(bounds_.front());
     graph.main.prepare(cuda, [&] {
         install_inputs();
         run.stem();
@@ -145,10 +144,10 @@ void TextGraph::set_head(bool enabled) {
 
 bool TextGraph::resident() const { return std::holds_alternative<Resident>(implementation_); }
 
-void TextGraph::select(std::uint32_t visible) {
-    const auto it = std::lower_bound(bounds_.begin(), bounds_.end(), visible);
-    if (it == bounds_.end()) throw std::logic_error("Qwen4Exp graph context exceeds capacity");
-    const auto next = static_cast<std::size_t>(it - bounds_.begin());
+void TextGraph::select(ops::ContextBucket bucket) {
+    const auto it = std::lower_bound(buckets_.begin(), buckets_.end(), bucket);
+    if (it == buckets_.end()) throw std::logic_error("Qwen4Exp graph context exceeds capacity");
+    const auto next = static_cast<std::size_t>(it - buckets_.begin());
     if (next == installed_) return;
     if (resident()) {
         auto& graph = std::get<Resident>(implementation_);

@@ -5,6 +5,8 @@
 #include "ninfer/ops/embedding.h"
 #include "ninfer/ops/indexing.h"
 
+#include <algorithm>
+
 namespace ninfer::models::glm5next::execution {
 TextRun::TextRun(const Parameters& p, TextExecution execution, BatchView batch, StateUpdate update,
                  CudaExecutionView cuda)
@@ -78,12 +80,13 @@ MlaRun TextRun::local_mla(std::uint32_t layer) {
         records = {execution_.raw_keys.slice(3, index, 1).slice(2, 0, local.rows),
                    execution_.raw_gates.slice(3, index, 1).slice(2, 0, local.rows),
                    local.record_offsets};
-    return MlaRun(
-        attention_.input.data ? attention_.input : roots_.input, profile.config.text,
-        std::get<MlaParameters>(parameters_.text.layers.at(layer).mixer),
-        {local.positions, local.valid_columns, local.table_rows}, before, after,
-        execution_.cache.layer(index), records, local.selection_rows, local.max_visible_tokens,
-        attention_.output.data ? attention_.output : roots_.output, execution_.workspace, cuda_);
+    const auto bucket = ops::select_context_bucket(std::max(1U, local.max_visible_tokens));
+    return MlaRun(attention_.input.data ? attention_.input : roots_.input, profile.config.text,
+                  std::get<MlaParameters>(parameters_.text.layers.at(layer).mixer),
+                  {local.positions, local.valid_columns, local.table_rows}, before, after,
+                  execution_.cache.layer(index), records, local.selection_rows, bucket,
+                  attention_.output.data ? attention_.output : roots_.output, execution_.workspace,
+                  cuda_);
 }
 
 std::optional<std::uint32_t> TextRun::attention_owner(std::uint32_t layer) const {

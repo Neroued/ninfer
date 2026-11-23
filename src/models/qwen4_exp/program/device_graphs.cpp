@@ -8,7 +8,7 @@ namespace ninfer::models::qwen4_exp::detail {
 
 DeviceGraphs::DeviceGraphs(RankProgramImpl& owner)
     : owner_(owner), fused_(!owner.parallel || owner.parallel->supports_graph_gating()),
-      bounds_(decode_context_bounds(owner.shape.max_context)) {}
+      buckets_(decode_context_buckets(owner.shape.max_context)) {}
 
 execution::TextRun DeviceGraphs::main_run(std::uint32_t batch, bool verify, std::uint32_t visible) {
     auto& p            = owner_;
@@ -33,7 +33,7 @@ execution::TextRun DeviceGraphs::main_run(std::uint32_t batch, bool verify, std:
 void DeviceGraphs::proposal(Batch& profiles, DraftSites* sites, std::uint32_t batch,
                             std::uint32_t depth, MtpGraphSteps* gates) {
     auto& p            = owner_;
-    const auto visible = sites ? bounds_.front() : bounds_.back();
+    const auto visible = p.shape.max_context;
     p.install_decode(batch);
     p.gpu_timer.begin_draft(sites != nullptr);
     for (std::uint32_t step = 0; step < depth; ++step) {
@@ -66,7 +66,7 @@ void DeviceGraphs::target(Batch& profiles, Round* capture, std::uint32_t batch, 
     const auto& io = r.buffers();
     const auto& c  = p.parameters.profile->config.text;
     const int b = batch, t = verify ? p.shape.draft_tokens + 1 : 1;
-    const auto visible = capture ? bounds_.front() : bounds_.back();
+    const auto visible = p.shape.max_context;
     if (!verify) p.install_decode(batch);
     const auto call = r.main_batch(t, b, visible);
     if (verify) {
@@ -125,16 +125,17 @@ void DeviceGraphs::prepare(GraphInputs& inputs, GraphPreparation& preparation) {
         batch.drafts.resize(drafts);
         for (std::uint32_t verify = 0; verify < (drafts ? 2U : 1U); ++verify) {
             const auto t = verify ? p.shape.draft_tokens + 1 : 1;
-            inputs.batch(r.main_batch(t, b, bounds_.back()), bounds_.back());
+            inputs.batch(r.main_batch(t, b, p.shape.max_context), p.shape.max_context);
             if (preparation.capturing()) {
-                auto run = main_run(b, verify, bounds_.back());
+                auto run = main_run(b, verify, p.shape.max_context);
                 for (std::uint32_t layer = 0; layer < p.parameters.text.layers.size(); ++layer)
                     if (std::holds_alternative<execution::QsaParameters>(
                             p.parameters.text.layers[layer].mixer))
-                        batch.main[verify].emplace_back().prepare(run.local_qsa(layer), bounds_,
+                        batch.main[verify].emplace_back().prepare(run.local_qsa(layer), buckets_,
                                                                   p.cuda);
             } else {
-                for (const auto visible : bounds_) {
+                for (const auto bucket : buckets_) {
+                    const auto visible = std::min(p.shape.max_context, ops::context_bucket_tokens(bucket));
                     inputs.batch(r.main_batch(t, b, visible), visible);
                     auto run = main_run(b, verify, visible);
                     for (std::uint32_t layer = 0; layer < p.parameters.text.layers.size(); ++layer)
@@ -146,10 +147,11 @@ void DeviceGraphs::prepare(GraphInputs& inputs, GraphPreparation& preparation) {
         }
         for (std::uint32_t step = 0; step < drafts; ++step) {
             if (preparation.capturing()) {
-                auto run = p.draft_run(step, b, bounds_.back());
-                batch.drafts[step].prepare(run.local_qsa(), bounds_, p.cuda);
+                auto run = p.draft_run(step, b, p.shape.max_context);
+                batch.drafts[step].prepare(run.local_qsa(), buckets_, p.cuda);
             } else {
-                for (const auto visible : bounds_) {
+                for (const auto bucket : buckets_) {
+                    const auto visible = std::min(p.shape.max_context, ops::context_bucket_tokens(bucket));
                     inputs.batch(r.mtp_batch(io.mtp->draft_steps[step], 1, b, visible), visible);
                     auto run = p.draft_run(step, b, visible);
                     run.local_qsa().execute();
@@ -158,7 +160,7 @@ void DeviceGraphs::prepare(GraphInputs& inputs, GraphPreparation& preparation) {
         }
         if (!fused_) batch.proposals.resize(drafts);
         for (std::uint32_t depth = 1; depth <= batch.proposals.size(); ++depth) {
-            inputs.stage_proposal(b, depth, bounds_.back());
+            inputs.stage_proposal(b, depth, p.shape.max_context);
             auto& item = batch.proposals[depth - 1];
             if (preparation.capturing()) {
                 item.sites.installed.resize(depth);
@@ -173,9 +175,9 @@ void DeviceGraphs::prepare(GraphInputs& inputs, GraphPreparation& preparation) {
         for (int verify = 0; verify < (drafts ? 2 : 1); ++verify) {
             const auto t = verify ? drafts + 1 : 1;
             if (verify)
-                inputs.stage_proposal(b, drafts, bounds_.back());
+                inputs.stage_proposal(b, drafts, p.shape.max_context);
             else
-                inputs.batch(r.main_batch(t, b, bounds_.back()), bounds_.back());
+                inputs.batch(r.main_batch(t, b, p.shape.max_context), p.shape.max_context);
             const auto decision = [&] {
                 if (verify)
                     p.accept_forward(b, t);
@@ -204,8 +206,8 @@ void DeviceGraphs::prepare(GraphInputs& inputs, GraphPreparation& preparation) {
                 batch.decisions[verify].prepare(p.cuda, decision,
                                                 p.parallel ? &*p.parallel : nullptr);
                 replay(b, verify ? drafts : 0,
-                       std::vector<std::uint32_t>(verify ? drafts : 0, bounds_.back()),
-                       bounds_.back(), true, false);
+                       std::vector<std::uint32_t>(verify ? drafts : 0, p.shape.max_context),
+                       p.shape.max_context, true, false);
                 decide(b, verify);
             }
             preparation.checkpoint();
@@ -215,9 +217,10 @@ void DeviceGraphs::prepare(GraphInputs& inputs, GraphPreparation& preparation) {
 }
 
 std::size_t DeviceGraphs::bound(std::uint32_t visible) const {
-    const auto found = std::lower_bound(bounds_.begin(), bounds_.end(), visible);
-    if (found == bounds_.end()) throw std::logic_error("decode graph context exceeds its capacity");
-    return found - bounds_.begin();
+    const auto bucket = ops::select_context_bucket(std::max(1U, visible));
+    const auto found  = std::lower_bound(buckets_.begin(), buckets_.end(), bucket);
+    if (found == buckets_.end()) throw std::logic_error("decode graph context exceeds its capacity");
+    return found - buckets_.begin();
 }
 
 void DeviceGraphs::replay(std::uint32_t batch, std::uint32_t depth,

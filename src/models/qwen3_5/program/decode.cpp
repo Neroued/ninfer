@@ -62,8 +62,8 @@ void RankProgramImpl::append_draft_history(std::uint32_t batch_size,
                                     frame.backend_table_rows.slice(0, 0, batch), envelope);
 }
 
-void RankProgramImpl::run_dflash_draft(const speculative::RoundRoute& route, std::uint32_t minimum,
-                                       std::uint32_t maximum) {
+void RankProgramImpl::run_dflash_draft(const speculative::RoundRoute& route,
+                                       std::uint32_t max_frontier) {
     auto& frame     = resources.frame;
     auto& draft     = *frame.dflash;
     const int batch = static_cast<int>(route.shape.rows);
@@ -75,8 +75,13 @@ void RankProgramImpl::run_dflash_draft(const speculative::RoundRoute& route, std
                                   frame.proposal_live_rows.slice(0, 0, batch),
                                   frame.sampling};
     auto outputs = draft.proposal(batch, static_cast<int>(route.head_columns));
-    execution::DraftEnvelopes envelopes{{minimum, maximum}, {minimum, maximum}};
-    execution::draft_propose(draft_view(*this), inputs, outputs, envelopes);
+    // A live draft row has the full proposal width. Only graph profiles can extend
+    // into the frontier interval where no proposal fits.
+    const auto width         = static_cast<std::uint32_t>(outputs.ids.ne[0]);
+    const auto local_visible = std::min(capacity, max_frontier + width);
+    const execution::DraftBuckets buckets{ops::select_context_bucket(std::max(1U, local_visible)),
+                                          ops::select_context_bucket(std::max(1U, max_frontier))};
+    execution::draft_propose(draft_view(*this), inputs, outputs, buckets);
 }
 
 Tensor RankProgramImpl::draft_tokens(const speculative::RoundRoute& route) const {
@@ -99,10 +104,9 @@ void RankProgramImpl::prepare_verification(const speculative::RoundRoute& route)
 void RankProgramImpl::begin_draft(ComputeOperation& operation) {
     auto& frame           = resources.frame;
     const int batch       = static_cast<int>(operation.shape.rows);
-    std::uint32_t minimum = capacity, maximum = 0;
+    std::uint32_t maximum = 0;
     for (std::size_t i = 0; i < operation.rows.size(); ++i) {
         if (!frame.host_ingress.extents[i]) continue;
-        minimum = std::min(minimum, operation.rows[i].main_frontier);
         maximum = std::max(maximum, operation.rows[i].main_frontier);
     }
     if (!graphs) gpu_timer.begin_draft();
@@ -112,7 +116,7 @@ void RankProgramImpl::begin_draft(ComputeOperation& operation) {
     } else if (backend == SpeculativeBackend::Mtp) {
         run_mtp_draft(batch, operation.decode_route().mtp_steps, maximum);
     } else {
-        run_dflash_draft(operation.decode_route(), minimum, maximum);
+        run_dflash_draft(operation.decode_route(), maximum);
     }
     if (!graphs) {
         gpu_timer.end_draft();
@@ -177,13 +181,14 @@ void RankProgramImpl::begin_target(ComputeOperation& operation) {
     } else if (operation.verifies_drafts()) {
         update.emplace<execution::ReplayRecords>(resources.replay(width).records);
     }
-    std::uint32_t minimum = capacity, maximum = 0;
+    std::uint32_t maximum = inputs.valid_columns.data ? 1U : operation.width;
     for (std::uint32_t row = 0; row < (forward ? 1 : operation.batch); ++row) {
+        if (!frame.host_ingress.valid_columns[row]) continue;
         const auto end = static_cast<std::uint32_t>(frame.host_ingress.frontiers[row] +
                                                     frame.host_ingress.valid_columns[row]);
-        minimum        = std::min(minimum, end);
         maximum        = std::max(maximum, end);
     }
+    const auto bucket = ops::select_context_bucket(maximum);
     std::optional<execution::DFlashFeatureSink> features;
     if (resources.dflash) {
         auto& state = *resources.dflash;
@@ -204,8 +209,7 @@ void RankProgramImpl::begin_target(ComputeOperation& operation) {
         execution::TextExecutionView{parameters, resources.work, device.execution_view(),
                                      resources.decoder.text_kv, resources.state_images.linear(),
                                      resources.moe.get()},
-        std::move(inputs), update, ops::CausalAttentionExecutionEnvelope{minimum, maximum},
-        input.hidden, features ? &*features : nullptr);
+        std::move(inputs), update, bucket, input.hidden, features ? &*features : nullptr);
     operation.row_finished = operation.text->start();
 }
 

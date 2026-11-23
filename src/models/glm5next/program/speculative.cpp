@@ -10,16 +10,16 @@ Tensor RankProgramImpl::draft_proposals(int batch, int columns) {
 }
 
 void RankProgramImpl::prepare_speculative() {
-    auto& f          = *compute;
-    const auto& work = std::get<SpeculativeWork>(f.request.work.operation);
-    const auto& io   = frame;
-    const auto rank  = parameters.profile->local.rank;
+    auto& f           = *compute;
+    const auto& work  = std::get<SpeculativeWork>(f.request.work.operation);
+    const auto& io    = frame;
+    const auto rank   = parameters.profile->local.rank;
     const auto& route = *work.speculative;
     const int b = work.rows.size(), d = static_cast<int>(route.mtp_steps),
               width = dimension(route.verify_width);
-    f.physical = work.batch;
-    f.tokens   = width;
-    f.sequence = false;
+    f.physical      = work.batch;
+    f.tokens        = width;
+    f.sequence      = false;
     std::vector<std::uint32_t> valid(b);
     for (int i = 0; i < b; ++i) valid[i] = work.draft_extents[i] + 1;
     prepare_inputs(work.rows, f.physical, width, {valid.data(), work.rows.size()});
@@ -38,8 +38,11 @@ void RankProgramImpl::prepare_speculative() {
         const auto logical              = f.physical.members[i];
         const auto& r                   = work.rows[logical];
         i32(io.speculative->extents)[i] = work.draft_extents[logical];
-        if (parameters.draft && work.draft_extents[logical])
-            f.draft_visible[0] = std::max(f.draft_visible[0], r.main_frontier);
+        if (parameters.draft && work.draft_extents[logical]) {
+            // Active rows always run the full masked proposal block.
+            const auto end     = r.main_frontier + shape.draft_tokens + 1;
+            f.draft_visible[0] = std::max(f.draft_visible[0], end);
+        }
         if (parameters.mtp)
             for (int s = 0; s < d; ++s) {
                 const auto& step  = io.mtp->draft_steps[s];

@@ -170,7 +170,7 @@ void mtp_kv_projection(const Tensor& hidden, const MtpProjectionParameters& para
 }
 
 void mtp_forward(MtpExecutionView state, const MtpInputs& inputs,
-                 ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden) {
+                 ops::ContextBucket bucket, Tensor& hidden, const CausalAttentionSubmit& submit) {
     const auto& parameters = require_mtp(state.parameters);
     const auto& config     = state.parameters.profile->config.text;
     const auto columns     = validate_inputs(state, inputs);
@@ -206,14 +206,16 @@ void mtp_forward(MtpExecutionView state, const MtpInputs& inputs,
     text_rope(inputs.rope_positions, *config.rope_parameters, normalized_query, normalized_key,
               state.execution);
 
-    Tensor attention_output = result.attention.view({head_dim, heads, width, batch});
-    ops::causal_softmax_attention(
+    CausalAttentionReadout readout{
         normalized_query.view({head_dim, heads, width, batch}),
         normalized_key.view({head_dim, kv_heads, width, batch}),
         projection.value.view({head_dim, kv_heads, width, batch}), inputs.cache_positions,
-        inputs.valid_columns, inputs.kv_table_rows, geometry,
-        static_cast<float>(1.0 / std::sqrt(static_cast<double>(attention.head_dim))), state.cache,
-        envelope, state.workspace, attention_output, state.execution);
+        inputs.valid_columns, inputs.kv_table_rows, result.attention.view({head_dim, heads, width, batch}),
+        state.cache, geometry, static_cast<float>(1.0 / std::sqrt(double(attention.head_dim))), {}};
+    if (submit)
+        readout.submit(state.workspace, state.execution, submit);
+    else
+        readout.execute(bucket, state.workspace, state.execution);
     Tensor gated_attention = result.attention;
     ops::sigmoid_mul(projection.gate, gated_attention, state.execution);
 

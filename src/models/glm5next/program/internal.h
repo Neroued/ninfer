@@ -93,7 +93,7 @@ public:
     void accept_mtp(int rows, int width);
     void accept_dflash(int rows, int width, int head_columns);
     void accept_speculative(int rows, int width, int head_columns);
-    [[nodiscard]] execution::DFlashRun dflash_run(int rows, std::uint32_t bound, int head_columns);
+    [[nodiscard]] execution::DFlashRun dflash_run(int rows, ops::ContextBucket, int head_columns);
     [[nodiscard]] Tensor draft_features(const execution::BatchView&);
     void append_dflash_context(const execution::BatchView&, const Tensor& counts,
                                ops::ContextKVMaterializeExecutionEnvelope);

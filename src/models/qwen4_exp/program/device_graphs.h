@@ -55,7 +55,7 @@ private:
     [[nodiscard]] std::size_t bound(std::uint32_t visible) const;
     RankProgramImpl& owner_;
     bool fused_;
-    std::vector<std::uint32_t> bounds_;
+    std::vector<ops::ContextBucket> buckets_;
     std::map<std::uint32_t, Batch> batches_;
     std::size_t workspace_peak_ = 0;
 };

@@ -229,7 +229,7 @@ void run(const char* artifact, SpeculativeBackend backend) {
                                     {},
                                     {}},
                                    execution::SequenceUpdate{state_source, state_destination},
-                                   {frontier + count, frontier + count}, input.hidden, &sink);
+                                   ops::select_context_bucket(frontier + count), input.hidden, &sink);
             require(run.start(), "resident Main unexpectedly yielded for offloaded weights");
         }
         const execution::DraftExecutionView draft{

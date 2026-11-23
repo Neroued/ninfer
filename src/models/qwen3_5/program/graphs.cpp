@@ -30,9 +30,7 @@ std::vector<GraphProfile> profiles_through(std::uint32_t capacity,
 GraphInvocation invocation(GraphPhase phase, std::uint32_t batch, std::uint32_t width,
                            GraphProfile profile, std::uint32_t capacity,
                            const speculative::RoundRoute* route = nullptr) {
-    const auto visible = static_cast<std::uint32_t>(
-        std::min<std::uint64_t>(capacity, std::uint64_t(profile.max) + width));
-    return {phase, batch, width, profile, {1, visible}, route};
+    return {phase, batch, width, profile, target_graph_bucket(profile, width, capacity), route};
 }
 
 class PreparationInputs {
@@ -73,9 +71,9 @@ public:
             resources_.dflash && room < frame.spec.draft_window
                 ? 0U
                 : std::min(call.route && frame.mtp ? call.route->mtp_steps : call.width - 1, room);
-        const auto input    = frame.host_decode_view(call.width, call.batch);
-        auto* positions     = static_cast<std::int32_t*>(input.cache_positions.data);
-        auto* rope          = static_cast<std::int32_t*>(input.rope_positions.data);
+        const auto input = frame.host_decode_view(call.width, call.batch);
+        auto* positions  = static_cast<std::int32_t*>(input.cache_positions.data);
+        auto* rope       = static_cast<std::int32_t*>(input.rope_positions.data);
         for (std::uint32_t row = 0; row < live; ++row) {
             auto& host                              = frame.host_ingress;
             host.live_rows[row]                     = 1;
@@ -201,11 +199,17 @@ private:
 
 } // namespace
 
+ops::ContextBucket target_graph_bucket(const GraphProfile& profile, std::uint32_t width,
+                                       std::uint32_t capacity) {
+    const auto visible = static_cast<std::uint32_t>(
+        std::min<std::uint64_t>(capacity, std::uint64_t(profile.max) + width));
+    return ops::select_context_bucket(std::max(1U, visible));
+}
+
 std::vector<GraphProfile> target_graph_profiles(std::uint32_t capacity, std::uint32_t width) {
     if (!width) throw std::invalid_argument("graph width must be positive");
-    constexpr std::array tiers{128U, 512U, 2048U, 4096U, 8192U, 16384U, 32768U};
     std::vector<std::uint32_t> ends;
-    for (const auto visible : tiers) {
+    for (const auto visible : ops::kContextBucketTokens) {
         if (visible >= width) ends.push_back(visible - width);
     }
     return profiles_through(capacity, ends);
@@ -215,20 +219,16 @@ std::vector<GraphProfile> draft_graph_profiles(const GraphSpec& spec) {
     if (spec.backend == SpeculativeBackend::Mtp) {
         return target_graph_profiles(spec.capacity, spec.draft_window + 1);
     }
-    if (spec.backend == SpeculativeBackend::DFlash2) {
-        constexpr std::array ends{96U, 511U, 2047U, 8191U, 32767U};
-        auto profiles = profiles_through(spec.capacity, ends);
-        for (std::size_t index = 0; index < profiles.size(); ++index) {
-            profiles[index].topology_class = static_cast<std::uint32_t>(index);
-        }
-        return profiles;
-    }
+    if (spec.backend == SpeculativeBackend::DFlash2)
+        return target_graph_profiles(spec.capacity, spec.draft_window + 1);
     if (spec.backend == SpeculativeBackend::DFlash) {
-        constexpr std::array ends{96U,   127U,   511U,   1023U,  2047U,   4095U,
-                                  8191U, 16383U, 32767U, 65536U, 131072U, 196608U};
-        auto profiles = profiles_through(spec.capacity, ends);
-        for (auto& profile : profiles) profile.topology_class = profile.max > 96 ? 1 : 0;
-        return profiles;
+        std::vector<std::uint32_t> ends;
+        // Local attention includes the draft block. Full attention bounds the history alone.
+        for (const auto visible : ops::kContextBucketTokens) {
+            ends.push_back(visible - (spec.draft_window + 1));
+            ends.push_back(visible);
+        }
+        return profiles_through(spec.capacity, ends);
     }
     return {};
 }
@@ -302,7 +302,7 @@ void Graphs::prepare(Resources& resources, const execution::Parameters& paramete
     PreparationInputs inputs(resources, device, *spec_.batch_execution);
     const auto ordinary_profiles = target_graph_profiles(spec_.capacity, 1);
     const auto draft_profiles    = draft_graph_profiles(spec_);
-    const auto prepare_batch = [&](std::uint32_t batch) {
+    const auto prepare_batch     = [&](std::uint32_t batch) {
         auto& target            = batches_[batch];
         const auto prepare_main = [&](GraphPhase phase, execution::TextGraph& graph,
                                       std::uint32_t width, const auto& profiles) {
@@ -337,7 +337,7 @@ void Graphs::prepare(Resources& resources, const execution::Parameters& paramete
             auto [entry, inserted] = target.verify.try_emplace(route.width);
             if (inserted)
                 prepare_main(GraphPhase::Verify, entry->second, route.width,
-                             target_graph_profiles(spec_.capacity, route.width));
+                                 target_graph_profiles(spec_.capacity, route.width));
         }
         const auto prepare_segment = [&](SegmentFamily& family, GraphPhase phase,
                                          const auto& profiles, std::uint32_t width,
@@ -378,8 +378,8 @@ void Graphs::prepare(Resources& resources, const execution::Parameters& paramete
             }
         };
         for (const auto& route : routes.subspan(1))
-            prepare_segment(target.proposals[*route.graph_entry], GraphPhase::Draft,
-                            draft_profiles, route.width, &route);
+            prepare_segment(target.proposals[*route.graph_entry], GraphPhase::Draft, draft_profiles,
+                                route.width, &route);
         const std::array decision_profiles{GraphProfile{0, spec_.capacity - 1, 0}};
         prepare_segment(target.sample, GraphPhase::Sample, decision_profiles, 1, &routes.front());
         for (const auto& route : routes.subspan(1)) {
@@ -387,12 +387,12 @@ void Graphs::prepare(Resources& resources, const execution::Parameters& paramete
                 target.accept.try_emplace(std::pair{route.width, route.head_columns});
             if (inserted)
                 prepare_segment(entry->second, GraphPhase::Accept, decision_profiles, route.width,
-                                &route);
+                                    &route);
         }
         if (bodies.mtp_commit) {
             for (const auto width : {1U, spec_.draft_window + 1}) {
                 inputs.prepare(invocation(GraphPhase::Verify, batch, width,
-                                          {0, spec_.capacity - 1, 0}, spec_.capacity));
+                                              {0, spec_.capacity - 1, 0}, spec_.capacity));
                 resources.work.reset_peak();
                 if (!observation.capturing()) {
                     bodies.mtp_commit(batch, width, nullptr, nullptr);

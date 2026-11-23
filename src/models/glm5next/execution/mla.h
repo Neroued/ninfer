@@ -21,14 +21,14 @@ struct MlaReadout {
     ops::KpoolBlockSelection selection;
     MemorySpan scratch;
     float scale;
-    std::uint32_t visible;
+    ops::ContextBucket bucket;
     bool index;
 
-    [[nodiscard]] ops::KpoolGraphProfile index_profile(std::uint32_t, int sms) const;
-    [[nodiscard]] ops::KpoolGraphProfile attention_profile(std::uint32_t, int sms) const;
-    [[nodiscard]] std::size_t scratch_bytes(int sms) const;
-    void indexer(std::uint32_t, CudaExecutionView) const;
-    void attention(std::uint32_t, CudaExecutionView) const;
+    [[nodiscard]] ops::OpGraphProfile index_profile(ops::ContextBucket, int sms) const;
+    [[nodiscard]] ops::OpGraphProfile attention_profile(ops::ContextBucket, int sms) const;
+    [[nodiscard]] std::size_t scratch_bytes(ops::ContextBucketRange, int sms) const;
+    void indexer(ops::ContextBucket, CudaExecutionView) const;
+    void attention(ops::ContextBucket, CudaExecutionView) const;
 };
 
 using MlaSubmit = std::function<void(const MlaReadout&)>;
@@ -38,10 +38,10 @@ public:
     MlaRun(const Tensor&, const TextConfig&, const MlaParameters&, ops::KpoolMlaBatchView,
            ops::ConstKpoolTailStateView, std::optional<ops::KpoolTailStateView>,
            ops::KpoolMlaCacheView, ops::KpoolRawRecordWriteView, const Tensor& selection_rows,
-           std::uint32_t visible, Tensor output, MemoryArena&, CudaExecutionView,
+           ops::ContextBucket bucket, Tensor output, MemoryArena&, CudaExecutionView,
            std::optional<MlaSelection> = {});
     void prepare();
-    [[nodiscard]] MlaReadout readout();
+    [[nodiscard]] MlaReadout readout(ops::ContextBucketRange);
     void execute(const MlaSubmit& = {});
     void finish();
 private:
@@ -53,7 +53,7 @@ private:
     std::optional<ops::KpoolTailStateView> after_;
     ops::KpoolMlaCacheView cache_;
     ops::KpoolRawRecordWriteView records_;
-    std::uint32_t visible_;
+    ops::ContextBucket bucket_;
     MemoryArena& arena_;
     CudaExecutionView cuda_;
     MemoryArena::Scope scope_;

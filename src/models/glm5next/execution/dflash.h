@@ -20,7 +20,7 @@ struct DraftExecution {
 struct DraftInputs {
     Tensor anchors, frontiers, valid_columns, state_offsets, live_rows;
     const ops::SamplingConfig* sampling;
-    std::uint32_t context_bound;
+    ops::ContextBucket bucket;
 };
 
 struct DraftOutputs {
@@ -33,8 +33,8 @@ struct DraftReadout {
     ops::AttentionHeadGeometry geometry;
     MemorySpan scratch;
 
-    [[nodiscard]] ops::SlidingWindowAttentionGraphProfile profile(std::uint32_t) const;
-    void execute(std::uint32_t, CudaExecutionView) const;
+    [[nodiscard]] ops::OpGraphProfile profile(ops::ContextBucket) const;
+    void execute(ops::ContextBucket, CudaExecutionView) const;
 };
 
 using DraftSubmit = std::function<void(const DraftReadout&)>;

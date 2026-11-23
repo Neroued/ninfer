@@ -201,9 +201,24 @@ void finish_dynamic_branch(DraftExecutionView& execution, const Tensor& input,
                                          finish_delta, residual, scratch, execution.cuda);
 }
 
+template <class Readout>
+void submit_attention(Readout readout, ops::ContextBucket bucket, ops::ContextBucketRange buckets,
+                      const std::function<void(const Readout&)>& submit,
+                      DraftExecutionView& execution) {
+    if (!submit) {
+        readout.execute(bucket, execution.work, execution.cuda);
+        return;
+    }
+    auto scope       = execution.work.scope();
+    const auto bytes = readout.scratch_bytes(buckets);
+    readout.scratch  = bytes ? execution.work.alloc_bytes(bytes)
+                             : MemorySpan{nullptr, 0, execution.cuda.device()};
+    submit(readout);
+}
+
 void propose_dflash2_batch(DraftExecutionView& execution, const DraftInputs& inputs,
                            DraftOutputs& outputs, int batch, int width, int g,
-                           DraftEnvelopes envelopes) {
+                           DraftBuckets buckets, const DraftReadoutSubmit& submit) {
     if (execution.parameters.profile->config.draft->dflash2) {
         const auto& target             = execution.parameters.profile->config.text;
         const auto& config             = *execution.parameters.profile->config.draft;
@@ -255,15 +270,14 @@ void propose_dflash2_batch(DraftExecutionView& execution, const DraftInputs& inp
                 Tensor attention = work.alloc(
                     DType::BF16, {dimension(config.attention.head_dim),
                                   dimension(config.attention.num_attention_heads), width, batch});
-                ops::sliding_window_attention(
-                    query, key, value, positions, valid_columns,
+                const SlidingWindowReadout readout{
+                    query, key, value, positions, valid_columns, attention,
+                    execution.local_layer(static_cast<std::uint32_t>(layer_index), state_offsets),
                     {dimension(config.attention.head_dim),
                      dimension(config.attention.num_attention_heads),
                      dimension(config.attention.num_key_value_heads)},
-                    dimension(config.sliding_window.value_or(0)),
-                    static_cast<float>(1.0 / std::sqrt(double(config.attention.head_dim))),
-                    execution.local_layer(static_cast<std::uint32_t>(layer_index), state_offsets),
-                    envelopes.local, work, attention, cuda);
+                    static_cast<float>(1.0 / std::sqrt(double(config.attention.head_dim))), {}};
+                submit_attention(readout, buckets.local, submit.buckets, submit.local, execution);
                 finish_dynamic_branch(
                     execution,
                     attention.view({dimension(config.attention.query_width()), width, batch}),
@@ -323,11 +337,11 @@ void propose_dflash2_batch(DraftExecutionView& execution, const DraftInputs& inp
 
 void propose_batch_impl(DraftExecutionView& execution, const DraftInputs& inputs,
                         DraftOutputs& outputs, std::int32_t batch_size, int width, int g,
-                        DraftEnvelopes envelopes) {
+                        DraftBuckets buckets, const DraftReadoutSubmit& submit) {
     if (execution.parameters.profile->config.draft->dflash2) {
         nvtx::ScopedRange proposal_range(nvtx::Name::DFlashProposal, nvtx::Category::DFlash,
                                          static_cast<std::uint64_t>(width) * batch_size);
-        propose_dflash2_batch(execution, inputs, outputs, batch_size, width, g, envelopes);
+        propose_dflash2_batch(execution, inputs, outputs, batch_size, width, g, buckets, submit);
     } else {
         const auto& target         = execution.parameters.profile->config.text;
         const auto& config         = *execution.parameters.profile->config.draft;
@@ -404,26 +418,24 @@ void propose_batch_impl(DraftExecutionView& execution, const DraftInputs& inputs
                 Tensor attention_batch = roots.attention.view(
                     {dimension(config.attention.head_dim),
                      dimension(config.attention.num_attention_heads), width, batch_size});
+                const ops::AttentionHeadGeometry geometry{
+                    dimension(config.attention.head_dim),
+                    dimension(config.attention.num_attention_heads),
+                    dimension(config.attention.num_key_value_heads)};
+                const auto scale = static_cast<float>(1.0 / std::sqrt(double(geometry.head_dim)));
+                const auto compact = config.compact_layer_index(layer);
                 if (config.layer_types[layer] == dflash::AttentionKind::SlidingAttention) {
-                    ops::sliding_window_attention(
+                    const SlidingWindowReadout readout{
                         query_batch, key_batch, value_batch, positions, valid_columns,
-                        {dimension(config.attention.head_dim),
-                         dimension(config.attention.num_attention_heads),
-                         dimension(config.attention.num_key_value_heads)},
-                        dimension(config.sliding_window.value_or(0)),
-                        static_cast<float>(1.0 / std::sqrt(double(config.attention.head_dim))),
-                        execution.local_layer(config.compact_layer_index(layer),
-                                              state_destinations),
-                        envelopes.local, execution.work, attention_batch, execution.cuda);
+                        attention_batch, execution.local_layer(compact, state_destinations),
+                        geometry, scale, {}};
+                    submit_attention(readout, buckets.local, submit.buckets, submit.local,
+                                     execution);
                 } else {
-                    ops::context_softmax_attention(
+                    const ContextAttentionReadout readout{
                         query_batch, key_batch, value_batch, frontiers, valid_columns, full_rows,
-                        {dimension(config.attention.head_dim),
-                         dimension(config.attention.num_attention_heads),
-                         dimension(config.attention.num_key_value_heads)},
-                        static_cast<float>(1.0 / std::sqrt(double(config.attention.head_dim))),
-                        execution.full_layer(config.compact_layer_index(layer)), envelopes.full,
-                        execution.work, attention_batch, execution.cuda);
+                        attention_batch, execution.full_layer(compact), geometry, scale, {}};
+                    submit_attention(readout, buckets.full, submit.buckets, submit.full, execution);
                 }
                 project_add(
                     roots.attention.view({dimension(config.attention.query_width()), columns}),
@@ -502,6 +514,49 @@ PagedKVBatchLayerView DraftExecutionView::full_layer(std::uint32_t layer) const 
     return full->batch_layer_view(layer);
 }
 
+ops::OpGraphProfile SlidingWindowReadout::profile(ops::ContextBucket bucket) const {
+    return ops::sliding_window_attention_graph_profile(
+        geometry, context.capacity, bucket, query.ne[3], query.ne[2]);
+}
+
+std::size_t SlidingWindowReadout::scratch_bytes(ops::ContextBucketRange buckets) const {
+    return ops::sliding_window_attention_workspace_capacity_bytes(
+        geometry, context.capacity, buckets, query.ne[3], query.ne[2], query.ne[2]);
+}
+
+void SlidingWindowReadout::execute(ops::ContextBucket bucket, MemoryArena& work,
+                                   CudaExecutionView cuda) const {
+    auto out = output;
+    ops::sliding_window_attention(query, key, value, positions, valid_columns, geometry,
+                                  context.capacity, scale, context, bucket, work, out, cuda);
+}
+
+void SlidingWindowReadout::execute(ops::ContextBucket bucket, CudaExecutionView cuda) const {
+    MemoryArena work(scratch);
+    execute(bucket, work, cuda);
+}
+
+ops::OpGraphProfile ContextAttentionReadout::profile(ops::ContextBucket bucket) const {
+    return ops::context_softmax_attention_graph_profile(geometry, bucket, query.ne[3], query.ne[2]);
+}
+
+std::size_t ContextAttentionReadout::scratch_bytes(ops::ContextBucketRange buckets) const {
+    return ops::context_softmax_attention_workspace_capacity_bytes(
+        geometry, buckets, query.ne[3], query.ne[2], query.ne[2]);
+}
+
+void ContextAttentionReadout::execute(ops::ContextBucket bucket, MemoryArena& work,
+                                     CudaExecutionView cuda) const {
+    auto out = output;
+    ops::context_softmax_attention(query, key, value, frontiers, valid_columns, table_rows, geometry,
+                                   scale, context, bucket, work, out, cuda);
+}
+
+void ContextAttentionReadout::execute(ops::ContextBucket bucket, CudaExecutionView cuda) const {
+    MemoryArena work(scratch);
+    execute(bucket, work, cuda);
+}
+
 void draft_append_context(DraftExecutionView execution, const Tensor& features,
                           const Tensor& positions, const Tensor& counts, const Tensor& offsets,
                           const Tensor& table_rows,
@@ -512,7 +567,7 @@ void draft_append_context(DraftExecutionView execution, const Tensor& features,
 }
 
 void draft_propose(DraftExecutionView execution, const DraftInputs& inputs, DraftOutputs& outputs,
-                   DraftEnvelopes envelopes) {
+                   DraftBuckets buckets, const DraftReadoutSubmit& submit) {
     if (!execution.parameters.draft) throw std::logic_error("draft parameters are unavailable");
     const auto width = outputs.ids.ne[0], batch = outputs.ids.ne[1];
     const auto g = outputs.drafts.ne[0];
@@ -520,7 +575,7 @@ void draft_propose(DraftExecutionView execution, const DraftInputs& inputs, Draf
         outputs.drafts.ne[1] != batch) {
         throw std::invalid_argument("draft proposal has invalid geometry");
     }
-    propose_batch_impl(execution, inputs, outputs, batch, width, g, envelopes);
+    propose_batch_impl(execution, inputs, outputs, batch, width, g, buckets, submit);
 }
 
 } // namespace ninfer::models::qwen3_5::execution

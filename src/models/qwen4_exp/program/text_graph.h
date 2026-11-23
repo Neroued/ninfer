@@ -6,10 +6,10 @@
 
 namespace ninfer::models::qwen4_exp {
 
-// One site has fixed operands and a bounded scratch span for every context envelope.
+// One site has fixed operands and a bounded scratch span for every context bucket.
 class QsaGraphReadout {
 public:
-    void prepare(execution::QsaRun, std::span<const std::uint32_t> bounds, CudaExecutionView);
+    void prepare(execution::QsaRun, std::span<const ops::ContextBucket> buckets, CudaExecutionView);
     [[nodiscard]] DecodeGraphChild append(const execution::QsaReadout&, cudaStream_t) const;
 
     [[nodiscard]] const DecodeGraphDefinition& at(std::size_t index) const {
@@ -25,10 +25,10 @@ private:
 class TextGraph {
 public:
     void prepare(execution::TextRun&, const execution::Parameters&, moe::Schedule*,
-                 std::span<const std::uint32_t> bounds, std::array<ple::DeviceEmbedding, 2>,
+                 std::span<const ops::ContextBucket> buckets, std::array<ple::DeviceEmbedding, 2>,
                  execution::TextOutputs, Tensor logits, moe::TokenGeometry geometry, MemoryArena&,
                  DeviceContext&, const std::function<void()>& install_inputs);
-    void select(std::uint32_t visible_tokens);
+    void select(ops::ContextBucket);
     void set_head(bool enabled);
     [[nodiscard]] bool resident() const;
     void replay(std::uint32_t ple_slot, CudaExecutionView);
@@ -74,7 +74,7 @@ private:
                         Tensor logits, MemoryArena&, CudaExecutionView);
     DecodeGraphSection head_;
     std::variant<std::monostate, Resident, Offloaded> implementation_;
-    std::vector<std::uint32_t> bounds_;
+    std::vector<ops::ContextBucket> buckets_;
     std::size_t workspace_bytes_ = 0;
     std::vector<std::optional<QsaGraphReadout>> readouts_;
     std::size_t installed_ = 0;

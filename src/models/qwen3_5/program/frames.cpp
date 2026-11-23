@@ -107,7 +107,14 @@ FrameControlLayout plan_frame_controls(const FrameSpec& spec, std::uint32_t row_
     LayoutBuilder output;
     result.egress.tokens = output.add_tensor(DType::I32, {width, rows}, 4, "output tokens");
     result.egress.counts = output.add_tensor(DType::I32, {rows}, 4, "output counts");
-    result.egress.bytes  = output.finish(kAlignment);
+    if (spec.draft_window) {
+        result.egress.top1_probabilities =
+            output.add_tensor(DType::FP32, {rows}, 4, "target top-1 probabilities");
+        const auto drafts = dimension(spec.draft_window);
+        result.egress.draft_confidences =
+            output.add_tensor(DType::FP32, {rows * drafts}, 4, "draft confidences");
+    }
+    result.egress.bytes = output.finish(kAlignment);
     return result;
 }
 
@@ -390,6 +397,14 @@ void ExecutionFrame::bind_rows(std::uint32_t rows) {
     host_egress.tokens = span.template operator()<TokenId>(layout.egress.tokens, host_egress_bytes);
     host_egress.counts =
         span.template operator()<std::int32_t>(layout.egress.counts, host_egress_bytes);
+    if (layout.egress.draft_confidences) {
+        top1_probabilities = layout.egress.top1_probabilities->bind(egress);
+        draft_confidences  = layout.egress.draft_confidences->bind(egress);
+        host_egress.top1_probabilities =
+            span.template operator()<float>(*layout.egress.top1_probabilities, host_egress_bytes);
+        host_egress.draft_confidences =
+            span.template operator()<float>(*layout.egress.draft_confidences, host_egress_bytes);
+    }
     if (mtp) {
         mtp->step_positions         = layout.ingress.step_positions.bind(ingress);
         mtp->step_valid_columns     = layout.ingress.step_valid.bind(ingress);

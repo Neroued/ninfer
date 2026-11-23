@@ -1,5 +1,9 @@
 #include "output_fixture.h"
+#include "core/platform.h"
 #include "models/glm5next/frontend/prepared_prompt.h"
+#if NINFER_ENABLE_DISTRIBUTED
+#    include "models/glm5next/wire.h"
+#endif
 #include "serve/anthropic_messages.h"
 #include "serve/generation_service.h"
 #include "serve/openai_chat.h"
@@ -13,6 +17,30 @@ namespace {
 using namespace ninfer;
 using namespace ninfer::serve;
 using namespace glm_fixture;
+
+#if NINFER_ENABLE_DISTRIBUTED
+void decode_result_probabilities() {
+    namespace wire = distributed::wire;
+    const glm::ComputeResult published{{
+        {.tokens = {7, 8}, .drafts = 2, .accepted_drafts = 1, .draft_confidences = {0.625f, 1.0f}},
+        {.tokens = {9}, .target_top1_probability = 0.25f},
+        {.processed = 4},
+    }};
+    wire::Encoder out;
+    glm::encode_result(out, glm::Result(published));
+    const auto bytes = std::move(out).take();
+    wire::Decoder in(bytes);
+    const auto decoded = std::get<glm::ComputeResult>(glm::decode_result(in));
+    in.finish();
+    require(decoded.rows.size() == published.rows.size(), "wire changed result membership");
+    for (std::size_t b = 0; b < published.rows.size(); ++b) {
+        require(decoded.rows[b].draft_confidences == published.rows[b].draft_confidences &&
+                    decoded.rows[b].target_top1_probability ==
+                        published.rows[b].target_top1_probability,
+                "wire changed decode probabilities");
+    }
+}
+#endif
 
 GenerationRequest responses_request(const Json& body) {
     const auto parsed = parse_openai_responses_create_request(body, {});
@@ -318,6 +346,9 @@ int main(int argc, char** argv) {
                                               tokenizer, processor);
         tools(frontend, *tokenizer);
         media_and_errors(frontend);
+#if NINFER_ENABLE_DISTRIBUTED
+        decode_result_probabilities();
+#endif
         std::cout << "GLM Chat, Responses, Anthropic, media counts and errors passed\n";
     } catch (const std::exception& e) {
         std::cerr << e.what() << '\n';

@@ -106,39 +106,51 @@ std::optional<runtime::ExecutionTicket>
 Session::start_decode(std::span<const SequenceHandle> members,
                       std::span<const runtime::RoundBudget> budgets,
                       std::span<const std::uint8_t> constrained) {
+    return start_decode_round(members, {.budgets = budgets}, constrained);
+}
+
+std::optional<runtime::ExecutionTicket>
+Session::start_decode_round(std::span<const SequenceHandle> members,
+                            speculative::DecodeRoundRequest selection,
+                            std::span<const std::uint8_t> constrained) {
     auto& p = *impl_;
     if (p.compute) return {};
     if (members.empty() || members.size() > p.shape.max_concurrency ||
-        budgets.size() != members.size() ||
+        !selection.valid_membership(members.size()) ||
         (!constrained.empty() && constrained.size() != members.size()))
         throw std::logic_error("invalid decode members");
     auto reservation = p.executor->try_reserve(runtime::FrameKind::Compute);
     if (!reservation) return {};
-    p.compute = std::make_unique<detail::ComputeTransaction>(Kind::Ordinary, p.directory);
-    auto& tx  = *p.compute;
+    auto pending  = std::make_unique<detail::ComputeTransaction>(Kind::Ordinary, p.directory);
+    auto& tx      = *pending;
+    bool prepared = false;
     try {
         tx.members.assign(members.begin(), members.end());
         const auto& options = p.definition->options();
         std::vector<speculative::RoundMember> limits;
+        std::vector<speculative::AdaptiveRowInput> adaptive;
+        std::vector<std::uint32_t> frontiers;
         limits.reserve(members.size());
+        adaptive.reserve(members.size());
+        frontiers.reserve(members.size());
         std::vector<speculative::RowGrowth> growth(members.size());
         const auto mark = p.next_membership_mark();
         for (std::size_t b = 0; b < members.size(); ++b) {
             auto& s      = p.sequence(members[b]);
             const auto f = s.continuation.metadata.main_frontier;
             if (s.phase != detail::Phase::Active || !s.permit ||
-                s.permit->kind != ExecutionUnitKind::Decode ||
-                !budgets[b].generated_tokens_remaining || s.ledger.size() != f + 1 ||
+                s.permit->kind != ExecutionUnitKind::Decode || s.ledger.size() != f + 1 ||
                 f >= p.shape.max_context || s.permitted_frontier < f + 1 ||
                 s.membership_mark == mark)
                 throw std::logic_error("decode row is not executable");
             s.membership_mark = mark;
-            const auto hard =
-                options.mtp() && f
-                    ? std::min({p.shape.draft_tokens, budgets[b].generated_tokens_remaining - 1,
-                                p.shape.max_context - f - 1})
-                    : 0U;
+            const auto hard   = options.mtp() && f
+                                    ? std::min({p.shape.draft_tokens, selection.draft_budget(b),
+                                                p.shape.max_context - f - 1})
+                                    : 0U;
             limits.push_back({0, hard, hard});
+            frontiers.push_back(f);
+            adaptive.push_back({limits.back(), f, &s.speculative_state});
             if (hard) {
                 growth[b].text.emplace(p.directory.pool(0).histories(), s.histories[0].handle(), f,
                                        f + 1);
@@ -148,13 +160,19 @@ Session::start_decode(std::span<const SequenceHandle> members,
             }
         }
         grant_windows(p.directory, growth, limits);
-        const auto n = static_cast<std::uint32_t>(members.size());
+        for (std::size_t b = 0; b < limits.size(); ++b) adaptive[b].member = limits[b];
+        const auto n     = static_cast<std::uint32_t>(members.size());
         const auto shape = p.plan.batches->decode(n, n);
-        const auto path = p.plan.decode_path;
-        tx.round = speculative::DecodeRoundPlan::select(options.speculative, p.shape.draft_tokens,
-                                                       1, shape, path, p.plan.decode_routes.get(),
-                                                       limits);
-        const auto extents = tx.round->verify_drafts();
+        const auto path  = p.plan.decode_path;
+        tx.round = selection.select(shape, path, p.plan.decode_routes.get(), p.cost_model, limits,
+                                    adaptive, p.shape.max_context);
+        if (!tx.round) return {};
+        if (p.shape.draft_tokens)
+            tx.cost_query = speculative::CostQuery::from_plan(options.speculative, *tx.round,
+                                                              frontiers, p.shape.max_context);
+        tx.record_online_cost = selection.record_online_cost;
+        prepared              = true;
+        const auto extents    = tx.round->verify_drafts();
         for (std::size_t b = 0; b < members.size(); ++b) growth[b].prepare(extents[b]);
         for (auto& row : growth) row.adopt();
         for (std::size_t b = 0; b < members.size(); ++b) {
@@ -179,10 +197,11 @@ Session::start_decode(std::span<const SequenceHandle> members,
             ordinary.speculative = std::move(geometry);
             work.operation       = std::move(ordinary);
         }
+        p.compute = std::move(pending);
         submit(p, std::move(*reservation), std::move(work));
         return tx.ticket;
     } catch (const std::exception& error) {
-        p.executor->fail(error.what());
+        if (prepared) p.executor->fail(error.what());
         throw;
     }
 }

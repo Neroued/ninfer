@@ -140,9 +140,10 @@ public:
     void accept_forward(std::int32_t batch, std::int32_t width);
     [[nodiscard]] DistributedVocabulary vocabulary();
     void vocabulary_sample(std::int32_t batch, bool first_token);
-    void vocabulary_draft(const Tensor& logits, const Tensor& valid_columns, Tensor& ids);
+    void vocabulary_draft(const Tensor& logits, const Tensor& valid_columns, Tensor& ids,
+                          Tensor& confidences);
     void vocabulary_accept(std::int32_t batch, std::int32_t width);
-    void copy_sample_result(std::int32_t batch, bool verify);
+    void copy_sample_result(std::int32_t batch, bool verify, bool first_token = false);
     [[nodiscard]] execution::BatchView mtp_inputs(const MtpBatchLayout&, std::span<const WorkRow>,
                                                   std::uint32_t tokens,
                                                   std::span<const MtpInputRow>, bool history);

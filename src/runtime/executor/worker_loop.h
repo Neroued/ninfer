@@ -136,6 +136,10 @@ private:
         std::string error;
         try {
             measurement_.apply(boundary.command, program_);
+            if (boundary.command.action == MeasurementAction::ResetStartup) {
+                host_ = {};
+                connection_.communication().reset_statistics();
+            }
         } catch (const std::exception& e) { error = e.what(); }
         observe_resources(true);
         distributed::wire::Encoder report;

@@ -18,6 +18,7 @@ ResidencyBinding SessionImpl::context_binding(BindOperation& operation) {
         sequence.last_saved                = previous.last_saved;
         sequence.last_intermediate_attempt = previous.last_intermediate_attempt;
         sequence.speculative               = previous.speculative;
+        sequence.speculative_state         = previous.speculative_state;
     } else {
         sequence.id           = next_sequence++;
         sequence.epoch        = identity_generation;

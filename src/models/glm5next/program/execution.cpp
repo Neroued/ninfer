@@ -214,7 +214,7 @@ void RankProgramImpl::forward() {
 
 execution::TextRun RankProgramImpl::text_run(const execution::BatchView& call,
                                              execution::StateUpdate update) {
-    const auto& io = frame;
+    const auto& io     = frame;
     const auto records = [&](const TensorRegion& region) {
         return std::holds_alternative<execution::RecordWindow>(update)
                    ? resources.raw_record(region, call.tokens, call.attention.rows)
@@ -318,8 +318,9 @@ void RankProgramImpl::decide() {
             auto hidden = f.sequence ? f.hidden.slice(1, f.tokens ? f.tokens - 1 : 0, 1) : f.hidden;
             project_head(hidden);
         }
-        sample(b, std::get<ForwardWork>(f.request.work.operation).sample);
-        copy_result(b, false);
+        const auto kind = std::get<ForwardWork>(f.request.work.operation).sample;
+        sample(b, kind);
+        copy_result(b, false, kind);
     }
     timer.record_result();
     compute_done.record(cuda.stream());
@@ -336,14 +337,22 @@ void RankProgramImpl::result() {
     }
     const auto* forward = std::get_if<ForwardWork>(&f.request.work.operation);
     if (forward && forward->sample != SampleKind::None) {
-        const auto* ids = static_cast<const TokenId*>(resources.egress().data);
-        for (std::size_t b = 0; b < f.physical.members.size(); ++b)
-            f.result.rows[f.physical.members[b]].tokens = {ids[b]};
+        const auto* ids  = static_cast<const TokenId*>(resources.egress().data);
+        const auto* top1 = forward->sample == SampleKind::NextToken && frame.top1_probabilities
+                               ? static_cast<const float*>(output(*frame.top1_probabilities).data)
+                               : nullptr;
+        for (std::size_t b = 0; b < f.physical.members.size(); ++b) {
+            auto& row  = f.result.rows[f.physical.members[b]];
+            row.tokens = {ids[b]};
+            if (top1) row.target_top1_probability = top1[b];
+        }
     }
     if (const auto* speculative = std::get_if<SpeculativeWork>(&f.request.work.operation)) {
-        const auto& io     = frame;
-        const auto* ids    = static_cast<const TokenId*>(output(*io.sampled_ids).data);
-        const auto* counts = static_cast<const std::int32_t*>(output(*io.output_counts).data);
+        const auto& io         = frame;
+        const auto* ids        = static_cast<const TokenId*>(output(*io.sampled_ids).data);
+        const auto* counts     = static_cast<const std::int32_t*>(output(*io.output_counts).data);
+        const auto* confidence = static_cast<const float*>(output(*io.draft_confidences).data);
+        const auto& route      = *speculative->speculative;
         for (std::size_t b = 0; b < f.physical.members.size(); ++b) {
             const auto logical = f.physical.members[b];
             if (counts[b] < 1 || std::uint32_t(counts[b]) > speculative->draft_extents[logical] + 1)
@@ -352,6 +361,10 @@ void RankProgramImpl::result() {
             r.processed       = speculative->draft_extents[logical] + 1;
             r.drafts          = speculative->draft_extents[logical];
             r.accepted_drafts = counts[b] - 1;
+            for (std::uint32_t step = 0; step < r.drafts; ++step)
+                r.draft_confidences.push_back(
+                    confidence[route.mtp_steps ? step * route.physical_rows + b
+                                               : b * route.head_columns + step]);
             r.tokens.assign(ids + b * speculative->speculative->verify_width,
                             ids + b * speculative->speculative->verify_width + counts[b]);
         }

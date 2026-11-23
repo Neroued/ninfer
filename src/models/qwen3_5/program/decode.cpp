@@ -74,8 +74,8 @@ void RankProgramImpl::append_draft_history(std::uint32_t batch_size,
 
 void RankProgramImpl::bind_dflash_draft(const speculative::RoundRoute& route,
                                         const execution::DraftReadoutSubmit& submit) {
-    const auto& frame = resources.frame;
-    const auto batch = static_cast<int>(route.shape.rows);
+    const auto& frame  = resources.frame;
+    const auto batch   = static_cast<int>(route.shape.rows);
     const auto outputs = frame.dflash->proposal(batch, static_cast<int>(route.head_columns));
     execution::bind_draft_readouts(draft_view(*this), draft_inputs(frame, batch), outputs, submit);
 }
@@ -83,12 +83,13 @@ void RankProgramImpl::bind_dflash_draft(const speculative::RoundRoute& route,
 void RankProgramImpl::run_dflash_draft(const speculative::RoundRoute& route,
                                        std::span<const ops::ContextBucket> buckets,
                                        const execution::DraftReadoutSubmit& submit) {
-    const auto& frame = resources.frame;
-    const auto batch = static_cast<int>(route.shape.rows);
-    auto outputs = frame.dflash->proposal(batch, static_cast<int>(route.head_columns));
-    execution::draft_propose(
-        draft_view(*this), draft_inputs(frame, batch), outputs,
-        {buckets.front(), buckets.back()}, submit);
+    const auto& frame   = resources.frame;
+    const auto batch    = static_cast<int>(route.shape.rows);
+    auto outputs        = frame.dflash->proposal(batch, static_cast<int>(route.head_columns));
+    outputs.confidences = frame.draft_confidences.slice(0, 0, batch * route.head_columns)
+                              .view({static_cast<int>(route.head_columns), batch});
+    execution::draft_propose(draft_view(*this), draft_inputs(frame, batch), outputs,
+                             {buckets.front(), buckets.back()}, submit);
 }
 
 Tensor RankProgramImpl::draft_tokens(const speculative::RoundRoute& route) const {
@@ -117,8 +118,8 @@ ProposalBuckets RankProgramImpl::proposal_buckets(const speculative::RoundRoute&
             std::uint32_t maximum = 1;
             for (std::uint32_t row = 0; row < route.shape.rows; ++row) {
                 if (ingress.extents[row] > static_cast<int>(step))
-                    maximum = std::max(maximum, static_cast<std::uint32_t>(ingress.frontiers[row]) +
-                                                    step);
+                    maximum = std::max(maximum,
+                                       static_cast<std::uint32_t>(ingress.frontiers[row]) + step);
             }
             out.values[step] = ops::select_context_bucket(std::min(capacity, maximum));
         }
@@ -128,30 +129,30 @@ ProposalBuckets RankProgramImpl::proposal_buckets(const speculative::RoundRoute&
             if (ingress.extents[row])
                 frontier = std::max(frontier, static_cast<std::uint32_t>(ingress.frontiers[row]));
         const auto local_visible = std::min(capacity, frontier + draft_window + 1);
-        out.values[0] = ops::select_context_bucket(std::max(1U, local_visible));
-        out.count = 1;
+        out.values[0]            = ops::select_context_bucket(std::max(1U, local_visible));
+        out.count                = 1;
         if (backend == SpeculativeBackend::DFlash) {
             out.values[1] = ops::select_context_bucket(std::max(1U, frontier));
-            out.count = 2;
+            out.count     = 2;
         }
     }
     return out;
 }
 
 ops::ContextBucket RankProgramImpl::target_bucket() const {
-    const auto& ingress = resources.frame.host_ingress;
+    const auto& ingress   = resources.frame.host_ingress;
     std::uint32_t maximum = 1;
     for (std::size_t row = 0; row < ingress.valid_columns.size(); ++row) {
         if (ingress.valid_columns[row] <= 0) continue;
-        const auto end = static_cast<std::uint32_t>(ingress.frontiers[row] +
-                                                    ingress.valid_columns[row]);
+        const auto end =
+            static_cast<std::uint32_t>(ingress.frontiers[row] + ingress.valid_columns[row]);
         maximum = std::max(maximum, end);
     }
     return ops::select_context_bucket(maximum);
 }
 
 void RankProgramImpl::readback_drafts(const speculative::RoundRoute& route) {
-    const auto& frame = resources.frame;
+    const auto& frame    = resources.frame;
     const auto proposals = draft_tokens(route);
     if (backend == SpeculativeBackend::Mtp) {
         const auto row_bytes = std::size_t(route.shape.rows) * sizeof(TokenId);
@@ -169,8 +170,8 @@ void RankProgramImpl::begin_draft(ComputeOperation& operation) {
     if (graphs && graphs->topology() != ProposalTopology::SplitProposal) return;
     const auto buckets = proposal_buckets(route);
     if (graphs) {
-        graphs->launch_proposal(route, {.buckets = buckets.span(),
-                                       .readback = operation.read_drafts_for_masks});
+        graphs->launch_proposal(
+            route, {.buckets = buckets.span(), .readback = operation.read_drafts_for_masks});
         return;
     }
 
@@ -206,17 +207,18 @@ void RankProgramImpl::begin_target(ComputeOperation& operation) {
         for (std::uint32_t row = 0; row < operation.batch; ++row)
             active_tokens += frame.host_ingress.valid_columns[row];
     operation.attention.valid_positions += active_tokens;
-    auto input = forward ? frame.input_view(width, batch) : frame.decode_view(width, batch);
+    auto input        = forward ? frame.input_view(width, batch) : frame.decode_view(width, batch);
     const auto bucket = target_bucket();
     if (!forward && graphs) {
         const auto& route = operation.decode_route();
-        TargetReplay replay{.bucket = bucket,
-                            .head = true,
+        TargetReplay replay{.bucket        = bucket,
+                            .head          = true,
                             .active_tokens = static_cast<std::int32_t>(active_tokens)};
         ProposalBuckets buckets;
         if (operation.verifies_drafts() && graphs->topology() != ProposalTopology::SplitProposal) {
-            buckets = proposal_buckets(route);
-            replay.proposal = {.buckets = buckets.span(), .readback = operation.read_drafts_for_masks};
+            buckets         = proposal_buckets(route);
+            replay.proposal = {.buckets  = buckets.span(),
+                               .readback = operation.read_drafts_for_masks};
         }
         if (resources.moe) operation.graph_target = &graphs->target(route);
         operation.graph_started = true;
@@ -273,7 +275,7 @@ bool RankProgramImpl::advance_target(ComputeOperation& operation) {
                                      : operation.text->poll();
     }
     if (!operation.row_finished) return false;
-    workspace_peak = std::max(workspace_peak, resources.work.peak_used());
+    workspace_peak         = std::max(workspace_peak, resources.work.peak_used());
     operation.graph_target = nullptr;
     operation.text.reset();
     return true;

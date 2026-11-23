@@ -132,21 +132,25 @@ void RankProgramImpl::mtp_forward(std::uint32_t step, const execution::BatchView
         resources.packed(*io.logits, {dimension(parameters.profile->local.vocabulary.size), b});
     const auto& head = parameters.mtp->head;
     ops::linear(next, head.weight, logits, head.policy, resources.workspace, cuda);
-    auto ids = mtp_output_ids(step, b);
+    auto ids         = mtp_output_ids(step, b);
+    auto confidences = resources.tensor(*io.draft_confidences).slice(0, step * b, b);
     if (parallel) {
-        auto keys = resources.packed(*io.candidates, {1, 1, b});
+        auto local = resources.packed(*io.candidates, {2, 1, b});
+        auto gathered =
+            resources.packed(*io.gathered_candidates, {2, 1, b, dimension(parallel->size())});
         const auto* configs =
             static_cast<const ops::SamplingConfig*>(resources.tensor(m.proposal_sampling).data);
-        ops::vocabulary_candidates(logits.view({logits.ne[0], 1, b}),
-                                   parameters.profile->local.vocabulary.begin,
-                                   parameters.profile->public_tokens, configs, call.valid_columns,
-                                   {}, keys, resources.workspace, cuda);
-        parallel->maximum(keys, cuda);
-        ops::sample_vocabulary_candidates(keys.view({1, 1, b, 1}), configs,
-                                          row(io.rows.sampling_positions, b),
-                                          ops::kSamplePurposeDecode, ids, call.valid_columns, cuda);
+        ops::vocabulary_candidates_with_lse(
+            logits.view({logits.ne[0], 1, b}), parameters.profile->local.vocabulary.begin,
+            parameters.profile->public_tokens, configs, call.valid_columns, {}, local,
+            resources.workspace, cuda);
+        parallel->gather_unsigned_words(local, gathered, cuda);
+        ops::sample_vocabulary_candidates(gathered, configs, row(io.rows.sampling_positions, b),
+                                          ops::kSamplePurposeDecode, ids, confidences,
+                                          call.valid_columns, cuda);
     } else {
-        ops::argmax(logits, ids, parameters.profile->public_tokens, cuda);
+        ops::argmax_with_probability(logits, ids, confidences, parameters.profile->public_tokens,
+                                     resources.workspace, cuda);
     }
 }
 
@@ -180,9 +184,9 @@ void RankProgramImpl::repair_mtp_history(const execution::BatchView& call, bool 
     const auto& io = frame;
     const auto& m  = *io.mtp;
     const int b = call.rows, w = call.tokens, c = call.attention.rows,
-              h       = parameters.profile->config.text.hidden;
-    const auto hidden = resources.packed(io.pending_hidden, {h, w, b});
-    auto accepted     = row(io.rows.accepted_columns, b);
+              h               = parameters.profile->config.text.hidden;
+    const auto hidden         = resources.packed(io.pending_hidden, {h, w, b});
+    auto accepted             = row(io.rows.accepted_columns, b);
     const auto& local         = call.attention;
     const auto history_update = [&] {
         const int pairs   = std::max(1, w - 1);

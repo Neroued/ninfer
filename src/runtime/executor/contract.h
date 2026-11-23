@@ -13,6 +13,7 @@ namespace ninfer::runtime {
 struct WorkPayloadCapacity {
     std::size_t compute_work, context_work, decision, commit;
     std::size_t rank_context_storage, coordinator_context_storage;
+    std::size_t compute_result;
 };
 
 struct SessionEpoch {

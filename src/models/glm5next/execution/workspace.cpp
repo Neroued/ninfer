@@ -1,5 +1,6 @@
 #include "models/glm5next/execution/workspace.h"
 #include "core/platform.h"
+#include "ninfer/ops/argmax.h"
 #include "models/glm5next/execution/dflash.h"
 #include "ninfer/ops/linear_pair.h"
 
@@ -56,12 +57,11 @@ void mla(WorkspaceLayoutBuilder& a, const ModelProfile& p, const MlaProfile& m,
         else {
             scratch(a, ops::linear_split_workspace_capacity_bytes(m.query_index, m.query_rows,
                                                                   minimum, columns));
-            scratch(a, ops::kpool_indexer_workspace_capacity_bytes(m.indexer, s.index_format,
-                                                                   buckets, local, first,
-                                                                   last, sm_count));
+            scratch(a, ops::kpool_indexer_workspace_capacity_bytes(
+                           m.indexer, s.index_format, buckets, local, first, last, sm_count));
         }
-        scratch(a, ops::kpool_sparse_mla_workspace_capacity_bytes(
-                       m.attention, storage, buckets, local, first, last, sm_count));
+        scratch(a, ops::kpool_sparse_mla_workspace_capacity_bytes(m.attention, storage, buckets,
+                                                                  local, first, last, sm_count));
         scratch(a, linear(m.output, minimum, columns));
     }
 }
@@ -229,6 +229,25 @@ WorkspacePlan plan_workspace(const ModelProfile& p, const ExecutionShape& s, int
     if (p.mtp)
         out.finish = std::max(out.finish, linear(p.mtp->head, 1, dimension(s.max_concurrency)));
     if (s.purpose == EnginePurpose::Generation) {
+        if (s.draft_tokens) {
+            if (p.local.size > 1) {
+                out.finish = std::max(out.finish,
+                                      ops::vocabulary_candidates_with_lse_workspace_capacity_bytes(
+                                          p.local.vocabulary.size, s.max_concurrency, 20));
+                if (p.mtp)
+                    out.finish = std::max(
+                        out.finish, ops::vocabulary_candidates_with_lse_workspace_capacity_bytes(
+                                        p.local.vocabulary.size, s.max_concurrency, 1));
+            } else {
+                out.finish =
+                    std::max(out.finish, ops::sampling_with_probability_workspace_capacity_bytes(
+                                             p.public_tokens, 1, s.max_concurrency));
+                if (p.mtp)
+                    out.finish =
+                        std::max(out.finish, ops::argmax_with_probability_workspace_capacity_bytes(
+                                                 p.public_tokens, s.max_concurrency));
+            }
+        }
         out.finish =
             std::max(out.finish,
                      ops::sampling_workspace_capacity_bytes(p.public_tokens, 1, s.max_concurrency));

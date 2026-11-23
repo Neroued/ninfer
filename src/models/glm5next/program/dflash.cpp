@@ -14,11 +14,11 @@ Tensor RankProgramImpl::draft_features(const execution::BatchView& call) {
 }
 
 execution::DFlashRun RankProgramImpl::dflash_run(int b, ops::ContextBucket bucket, int steps) {
-    const auto& io  = frame;
-    const auto& d   = *io.dflash;
-    const auto& s   = *io.speculative;
-    const int w     = dimension(shape.draft_tokens + 1);
-    const int k = dimension(parameters.profile->config.draft->dflash2->selector_top_k);
+    const auto& io = frame;
+    const auto& d  = *io.dflash;
+    const auto& s  = *io.speculative;
+    const int w    = dimension(shape.draft_tokens + 1);
+    const int k    = dimension(parameters.profile->config.draft->dflash2->selector_top_k);
     return execution::DFlashRun(
         parameters, {resources.workspace, resources.states, *parallel},
         {row(io.rows.anchors, b), row(io.rows.base_positions, b), row(d.valid_columns, b),
@@ -26,7 +26,8 @@ execution::DFlashRun RankProgramImpl::dflash_run(int b, ops::ContextBucket bucke
          static_cast<const ops::SamplingConfig*>(resources.tensor(*io.sampling).data), bucket},
         {resources.packed(d.ids, {w, b}), resources.packed(d.positions, {w, b}),
          resources.packed(s.drafts, {steps, b}), resources.packed(d.candidate_ids, {k, steps, b}),
-         resources.packed(d.proposal_q, {k, steps, b})},
+         resources.packed(d.proposal_q, {k, steps, b}),
+         resources.packed(*io.draft_confidences, {steps, b})},
         cuda);
 }
 
@@ -89,9 +90,9 @@ void RankProgramImpl::append_dflash_context(const execution::BatchView& call, co
 }
 
 void RankProgramImpl::accept_dflash(int b, int w, int steps) {
-    const auto& io  = frame;
-    const auto& d   = *io.dflash;
-    const int k = dimension(parameters.profile->config.draft->dflash2->selector_top_k);
+    const auto& io = frame;
+    const auto& d  = *io.dflash;
+    const int k    = dimension(parameters.profile->config.draft->dflash2->selector_top_k);
     auto logits =
         resources.packed(*io.logits, {dimension(parameters.profile->local.vocabulary.size), w, b});
     auto licensed = resources.packed(*io.sampled_ids, {w, b});

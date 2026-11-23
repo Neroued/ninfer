@@ -512,6 +512,44 @@ DecodeRoundPlan select_adaptive_round(SpeculativeBackend backend, std::uint32_t 
                     max_context);
 }
 
+bool DecodeRoundRequest::valid_membership(std::size_t rows) const noexcept {
+    if (budgets.empty()) return extents.size() == rows;
+    return budgets.size() == rows && std::ranges::all_of(budgets, [](auto budget) {
+               return budget.generated_tokens_remaining != 0;
+           });
+}
+
+std::uint32_t DecodeRoundRequest::draft_budget(std::size_t row) const noexcept {
+    return budgets.empty() ? extents[row] : budgets[row].generated_tokens_remaining - 1;
+}
+
+std::optional<DecodeRoundPlan> DecodeRoundRequest::select(
+    PhysicalBatchShape shape, ExecutionPath path, const DecodeGraphRoutes* routes,
+    const SpeculativeCostModel& cost, std::span<const RoundMember> limits,
+    std::span<const AdaptiveRowInput> rows, std::uint32_t max_context) const {
+    const auto& config = cost.config();
+    const auto backend = config.backend;
+    const auto k       = config.max_drafts;
+    const auto owners  = config.owner_count;
+    if (!budgets.empty())
+        return select_adaptive_round(backend, k, owners, shape, path, routes, cost, rows,
+                                     max_context);
+    for (std::size_t i = 0; i < extents.size(); ++i)
+        if (extents[i] > limits[i].granted_limit) return {};
+    if (!route)
+        return DecodeRoundPlan::select(backend, k, owners, shape, path, routes, limits, extents);
+    if (route->shape != shape || (path == ExecutionPath::Eager) == route->graph_entry.has_value())
+        throw std::invalid_argument("probe route differs from the prepared execution shape");
+    if (route->graph_entry) {
+        if (!routes) throw std::logic_error("probe has no prepared decode graph catalog");
+        const auto prepared = routes->at(shape);
+        if (std::ranges::find(prepared, *route) == prepared.end())
+            throw std::invalid_argument("probe route is absent from the prepared catalog");
+    }
+    return DecodeRoundPlan::freeze(backend, k, owners, limits, *route,
+                                   {extents.begin(), extents.end()});
+}
+
 NarrowedTargetPlan
 narrow_after_proposal(SpeculativeBackend backend, std::uint32_t max_drafts,
                       std::uint32_t owner_count, ExecutionPath path,

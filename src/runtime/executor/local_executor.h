@@ -235,6 +235,7 @@ public:
         if (pool_.busy()) throw std::logic_error("measurement boundary requires an idle executor");
         try {
             measurement_.apply(command, worker_->program());
+            if (command.action == MeasurementAction::ResetStartup) host_ = {};
             sample_resources(true);
         } catch (...) {
             const auto error = std::current_exception();

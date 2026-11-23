@@ -358,6 +358,10 @@ void encode_result(Encoder& out, const Result& result) {
                     out.u32(r.dead_positions);
                     out.u32(r.drafts);
                     out.u32(r.accepted_drafts);
+                    out.u64(r.draft_confidences.size());
+                    for (const auto value : r.draft_confidences) out.f32(value);
+                    out.boolean(r.target_top1_probability.has_value());
+                    if (r.target_top1_probability) out.f32(*r.target_top1_probability);
                 }
 
             } else if constexpr (std::is_same_v<T, ContextResult>) {
@@ -393,13 +397,16 @@ Result decode_result(Decoder& in) {
     switch (in.u8()) {
     case 1: {
         ComputeResult v;
-        v.rows.resize(in.count(24));
+        v.rows.resize(in.count(33));
         for (auto& r : v.rows) {
             r.processed       = in.u32();
             r.tokens          = integers<TokenId>(in);
             r.dead_positions  = in.u32();
             r.drafts          = in.u32();
             r.accepted_drafts = in.u32();
+            r.draft_confidences.resize(in.count(4));
+            for (auto& value : r.draft_confidences) value = in.f32();
+            if (in.boolean()) r.target_top1_probability = in.f32();
         }
 
         return v;

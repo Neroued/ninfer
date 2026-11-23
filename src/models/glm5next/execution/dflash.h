@@ -24,7 +24,7 @@ struct DraftInputs {
 };
 
 struct DraftOutputs {
-    Tensor ids, positions, drafts, candidate_ids, proposal_q;
+    Tensor ids, positions, drafts, candidate_ids, proposal_q, confidences;
 };
 
 struct DraftReadout {

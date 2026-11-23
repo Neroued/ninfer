@@ -91,20 +91,33 @@ void RankProgramImpl::decide_decode(const speculative::RoundRoute& route) {
                 resources.work, device.execution_view());
         }
     } else {
-        Tensor logits = prefix(frame.logits, {rows, batch});
-        Tensor tokens = prefix(frame.output_tokens, {batch});
-        ops::sample(logits, tokens, vocabulary, frame.sampling,
-                    frame.sampling_positions.slice(0, 0, batch), ops::kSamplePurposeDecode,
-                    frame.live_rows.slice(0, 0, batch), resources.work, device.execution_view());
+        Tensor logits        = prefix(frame.logits, {rows, batch});
+        Tensor tokens        = prefix(frame.output_tokens, {batch});
+        const auto positions = frame.sampling_positions.slice(0, 0, batch);
+        const auto live      = frame.live_rows.slice(0, 0, batch);
+        if (frame.spec.draft_window) {
+            auto probabilities = frame.top1_probabilities.slice(0, 0, batch);
+            ops::sample(logits, tokens, probabilities, vocabulary, frame.sampling, positions,
+                        ops::kSamplePurposeDecode, live, resources.work, device.execution_view());
+        } else {
+            ops::sample(logits, tokens, vocabulary, frame.sampling, positions,
+                        ops::kSamplePurposeDecode, live, resources.work, device.execution_view());
+        }
     }
 }
 
-void RankProgramImpl::readback_decode(std::uint32_t batch, bool speculative) {
+void RankProgramImpl::readback_result(std::uint32_t batch, const speculative::RoundRoute* route) {
     const auto& frame = resources.frame;
-    const auto bytes  = (speculative ? static_cast<std::byte*>(frame.output_counts.data) -
-                                          static_cast<std::byte*>(frame.egress.data)
-                                     : 0) +
-                       batch * sizeof(TokenId);
+    auto bytes        = batch * sizeof(TokenId);
+    const auto end    = [&](const Tensor& tensor, std::size_t elements) {
+        return static_cast<const std::byte*>(tensor.data) -
+               static_cast<const std::byte*>(frame.egress.data) + elements * sizeof(float);
+    };
+    if (route && route->width > 1)
+        bytes = end(frame.draft_confidences,
+                    std::size_t(batch) * (route->mtp_steps + route->head_columns));
+    else if (route && frame.spec.draft_window)
+        bytes = end(frame.top1_probabilities, batch);
     CUDA_CHECK(cudaMemcpyAsync(resources.frame.host_egress_bytes.data, resources.frame.egress.data,
                                bytes, cudaMemcpyDeviceToHost, device.stream()));
 }
@@ -139,8 +152,9 @@ void RankProgramImpl::launch_decision(ComputeOperation& operation) {
         if (graphs) {
             graphs->decide(operation.decode_route());
         } else {
-            decide_decode(operation.decode_route());
-            readback_decode(operation.shape.rows, operation.verifies_drafts());
+            const auto& route = operation.decode_route();
+            decide_decode(route);
+            readback_result(operation.shape.rows, &route);
         }
         gpu_timer.record_result();
         result_ready.record(device.stream());
@@ -175,7 +189,7 @@ void RankProgramImpl::launch_decision(ComputeOperation& operation) {
                     frame.sampling_positions.slice(0, 0, batch), purpose,
                     frame.live_rows.slice(0, 0, batch), resources.work, device.execution_view());
     }
-    readback_decode(operation.shape.rows, false);
+    readback_result(operation.shape.rows);
     gpu_timer.record_result();
     result_ready.record(device.stream());
     operation.stage = ComputeStage::Readback;
@@ -195,6 +209,15 @@ void RankProgramImpl::publish_result(ComputeOperation& operation) {
         value.row_stride = forward ? 1 : operation.width;
         value.tokens.assign(output.tokens.begin(),
                             output.tokens.begin() + value.row_stride * operation.batch);
+        if (operation.verifies_drafts()) {
+            const auto& route  = operation.decode_route();
+            value.draft_stride = route.mtp_steps + route.head_columns;
+            value.draft_confidences.resize(std::size_t(value.draft_stride) * operation.batch);
+        } else if (!forward && resources.frame.spec.draft_window) {
+            value.target_top1_probabilities.assign(output.top1_probabilities.begin(),
+                                                   output.top1_probabilities.begin() +
+                                                       operation.batch);
+        }
         for (std::uint32_t row = 0; row < operation.batch; ++row) {
             const auto count   = operation.verifies_drafts() ? output.counts[row] : 1;
             output.counts[row] = count;
@@ -203,6 +226,12 @@ void RankProgramImpl::publish_result(ComputeOperation& operation) {
                 throw std::runtime_error("Qwen3.5 sampling returned an invalid prefix length");
             value.counts.push_back(static_cast<std::uint32_t>(count));
             value.dead_positions.push_back(operation.dead_positions[row]);
+            for (int step = 0; value.draft_stride && step < extent; ++step) {
+                const auto to = row * value.draft_stride + step;
+                const auto from =
+                    backend == SpeculativeBackend::Mtp ? step * operation.shape.rows + row : to;
+                value.draft_confidences[to] = output.draft_confidences[from];
+            }
             for (int column = 0; column < count; ++column) {
                 const auto token = value.tokens[row * value.row_stride + column];
                 if (token < 0 ||

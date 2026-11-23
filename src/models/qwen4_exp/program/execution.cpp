@@ -326,11 +326,18 @@ void RankProgramImpl::sample_forward(std::int32_t batch, bool first_token) {
     auto sampled   = device_tensor(*io.sampled_ids)
                        .view({static_cast<std::int32_t>(device_tensor(*io.sampled_ids).numel())})
                        .slice(0, 0, batch);
-    auto scope = resources.workspace.scope();
-    ops::sample(logits, sampled, parameters.profile->public_tokens,
-                static_cast<const ops::SamplingConfig*>(configs.data), positions,
-                first_token ? ops::kSamplePurposePrefill : ops::kSamplePurposeDecode,
-                device_tensor(io.batch.live_rows).slice(0, 0, batch), resources.workspace, cuda);
+    auto scope           = resources.workspace.scope();
+    const auto* sampling = static_cast<const ops::SamplingConfig*>(configs.data);
+    const auto live      = device_tensor(io.batch.live_rows).slice(0, 0, batch);
+    if (!first_token && io.top1_probabilities) {
+        auto probabilities = packed_tensor(*io.top1_probabilities, {batch});
+        ops::sample(logits, sampled, probabilities, parameters.profile->public_tokens, sampling,
+                    positions, ops::kSamplePurposeDecode, live, resources.workspace, cuda);
+    } else {
+        ops::sample(logits, sampled, parameters.profile->public_tokens, sampling, positions,
+                    first_token ? ops::kSamplePurposePrefill : ops::kSamplePurposeDecode, live,
+                    resources.workspace, cuda);
+    }
 }
 
 void RankProgramImpl::request_decision() {
@@ -452,19 +459,21 @@ void RankProgramImpl::prepare_decision() {
             }
             sample_forward(batch, f.first_sample);
         }
-        copy_sample_result(batch, f.verify.has_value());
+        copy_sample_result(batch, f.verify.has_value(), f.first_sample);
     }
     gpu_timer.record_result();
     compute_done.record(cuda.stream());
     f.phase = ComputePhase::AwaitResult;
 }
 
-void RankProgramImpl::copy_sample_result(std::int32_t batch, bool verify) {
+void RankProgramImpl::copy_sample_result(std::int32_t batch, bool verify, bool first_token) {
     const auto& io   = resources.buffers();
     const auto begin = io.sampled_ids->region.offset;
-    const auto bytes =
-        verify ? io.output_counts->region.offset + io.output_counts->region.bytes - begin
-               : std::size_t(batch) * sizeof(TokenId);
+    auto bytes       = std::size_t(batch) * sizeof(TokenId);
+    if (verify || (!first_token && io.top1_probabilities)) {
+        const auto& last = (verify ? *io.draft_confidences : *io.top1_probabilities).region;
+        bytes            = last.offset + last.bytes - begin;
+    }
     copy_bytes_async(resources.egress().subspan(0, bytes),
                      resources.persistent().subspan(begin, bytes), cuda);
 }

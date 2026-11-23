@@ -4,7 +4,7 @@
 
 namespace ninfer::runtime {
 
-enum class MeasurementAction : std::uint8_t { Reset, Begin, End, Cancel };
+enum class MeasurementAction : std::uint8_t { Reset, Begin, End, Cancel, ResetStartup };
 
 struct MeasurementCommand {
     MeasurementAction action;
@@ -25,6 +25,7 @@ public:
         validate(command);
         switch (command.action) {
         case MeasurementAction::Reset:
+        case MeasurementAction::ResetStartup:
             program.reset_measurement_peaks();
             break;
         case MeasurementAction::Begin:

@@ -85,24 +85,22 @@ void ParallelExecution::merge_unique(Tensor& value, CudaExecutionView cuda) {
     sum(words, cuda);
 }
 
-void ParallelExecution::maximum(Tensor& value, CudaExecutionView cuda) {
-    if (value.dtype != DType::I64 && value.dtype != DType::U64)
-        throw std::invalid_argument("vocabulary maximum requires 64-bit packed candidates");
-    auto keys  = value;
-    keys.dtype = DType::U64;
-#if NINFER_ENABLE_DISTRIBUTED
-    ops::all_reduce(keys, keys, distributed::Reduction::Max, *binding_.group, cuda);
-#else
-    throw std::logic_error("distributed execution was not built");
-#endif
-}
-
 void ParallelExecution::gather(const Tensor& source, Tensor& destination, CudaExecutionView cuda) {
 #if NINFER_ENABLE_DISTRIBUTED
     ops::all_gather(source, destination, *binding_.group, cuda);
 #else
     throw std::logic_error("distributed execution was not built");
 #endif
+}
+
+void ParallelExecution::gather_unsigned_words(const Tensor& source, Tensor& destination,
+                                              CudaExecutionView cuda) {
+    if (source.dtype != DType::I64 || destination.dtype != DType::I64)
+        throw std::invalid_argument("packed vocabulary records require I64 storage");
+    auto local    = source;
+    auto gathered = destination;
+    local.dtype = gathered.dtype = DType::U64;
+    gather(local, gathered, cuda);
 }
 
 void ParallelExecution::broadcast(Tensor& value, CudaExecutionView cuda) {

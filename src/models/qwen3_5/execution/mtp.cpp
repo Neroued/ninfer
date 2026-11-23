@@ -296,7 +296,8 @@ void mtp_history(MtpExecutionView state, const MtpInputs& inputs,
                                 envelope, state.cache, state.execution);
 }
 
-void mtp_propose(MtpExecutionView state, const Tensor& hidden, Tensor& full_logits, Tensor& ids) {
+void mtp_propose(MtpExecutionView state, const Tensor& hidden, Tensor& full_logits, Tensor& ids,
+                 Tensor& confidences) {
     const auto& parameters = require_mtp(state.parameters);
     const auto& config     = state.parameters.profile->config.text;
     const auto columns     = hidden.ne[1];
@@ -313,8 +314,9 @@ void mtp_propose(MtpExecutionView state, const Tensor& hidden, Tensor& full_logi
                        state.execution.device(), "proposal logits");
         ops::linear(hidden, parameters.output_head.weight, full_logits,
                     parameters.output_head.policy, state.workspace, state.execution);
-        ops::argmax(full_logits, ids, dimension(state.parameters.profile->public_tokens),
-                    state.execution);
+        ops::argmax_with_probability(full_logits, ids, confidences,
+                                     dimension(state.parameters.profile->public_tokens),
+                                     state.workspace, state.execution);
         return;
     case ProposalHead::Optimized: {
         if (!state.parameters.proposal) {
@@ -325,9 +327,10 @@ void mtp_propose(MtpExecutionView state, const Tensor& hidden, Tensor& full_logi
         Tensor logits        = state.workspace.alloc(DType::BF16, {rows, columns});
         ops::linear(hidden, proposal.head.weight, logits, proposal.head.policy, state.workspace,
                     state.execution);
-        ops::argmax(logits, ids,
-                    proposal.token_ids ? rows : dimension(state.parameters.profile->public_tokens),
-                    state.execution);
+        ops::argmax_with_probability(
+            logits, ids, confidences,
+            proposal.token_ids ? rows : dimension(state.parameters.profile->public_tokens),
+            state.workspace, state.execution);
         if (proposal.token_ids) {
             ops::remap_ids_inplace(ids, static_cast<const std::int32_t*>(proposal.token_ids->data),
                                    rows, state.execution);

@@ -68,6 +68,7 @@ struct FrameLayout {
     std::optional<DFlashFrameLayout> dflash;
     std::optional<TensorRegion> logits, token_counts, sampling, grammar_masks;
     std::optional<TensorRegion> candidates, gathered_candidates, sampled_ids, output_counts;
+    std::optional<TensorRegion> top1_probabilities, draft_confidences;
     std::optional<TensorRegion> visual_indices;
 };
 

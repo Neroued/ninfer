@@ -107,13 +107,11 @@ struct Driver {
         traffic.begin(executor.observations());
         const auto b = rows.size();
         std::vector<glm::ExecutionUnit> anchor;
-        std::vector<runtime::RoundBudget> budgets;
         for (unsigned i = 0; i < b; ++i) {
             anchor.push_back({rows[i], glm::ExecutionUnitKind::Decode, 1});
-            budgets.push_back({limits[i] + 1});
         }
         check(bool(session.reserve_units(anchor)) &&
-                  bool(session.start_decode(rows, budgets, std::vector<std::uint8_t>(b, 1))),
+                  bool(session.start_decode_extents(rows, limits, std::vector<std::uint8_t>(b, 1))),
               "decode admission failed");
         Round out;
         out.drafts.resize(b);

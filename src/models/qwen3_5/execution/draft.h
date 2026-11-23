@@ -42,6 +42,7 @@ struct DraftOutputs {
     Tensor drafts;
     Tensor candidate_ids;
     Tensor proposal_q;
+    Tensor confidences;
 };
 
 struct DraftBuckets {

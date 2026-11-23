@@ -52,6 +52,7 @@ struct BufferLayout {
     std::optional<TensorRegion> ple_embedding, vocabulary_local, vocabulary_gathered;
     std::optional<TensorRegion> proposal_sampling;
     std::optional<TensorRegion> sampled_ids, output_counts;
+    std::optional<TensorRegion> top1_probabilities, draft_confidences;
     std::optional<TensorRegion> token_counts, sampling, grammar_masks;
 };
 

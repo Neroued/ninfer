@@ -82,13 +82,13 @@ struct Driver {
         traffic.begin(executor.observations());
         const auto n = members.size();
         std::vector<q::ExecutionUnit> units;
-        std::vector<runtime::RoundBudget> budgets;
+        std::vector<std::uint32_t> extents;
         for (std::size_t b = 0; b < n; ++b) {
             units.push_back({members[b], q::ExecutionUnitKind::Decode, 1});
-            budgets.push_back({1 + limits[b]});
+            extents.push_back(std::min(limits[b], k));
         }
         check(bool(s.reserve_units(units)), "required anchor permit was denied");
-        check(bool(s.start_decode(members, budgets, std::vector<std::uint8_t>(n, 1))),
+        check(bool(s.start_decode_extents(members, extents, std::vector<std::uint8_t>(n, 1))),
               "decode frame unavailable");
         std::vector<unsigned> verified(n, UINT32_MAX);
         auto pending     = wait<q::PendingBatch>([&](const runtime::DecisionRequest& req) {
@@ -128,8 +128,11 @@ struct Driver {
         }
         if (truncate) decisions[0] = {.accepted_tokens = 1, .terminal = true};
         if (cancel) decisions.back() = {.terminal = true, .cancelled = true};
-        const auto candidate_bytes = std::uint64_t(models::DistributedVocabulary::candidates) *
-                                     g->physical_rows * g->verify_width * sizeof(std::int64_t);
+        const auto words = depth ? models::DistributedVocabulary::candidates
+                                 : models::DistributedVocabulary::candidates_with_lse;
+        const auto candidate_bytes =
+            (std::uint64_t(words) * g->verify_width + 2ULL * g->mtp_steps) * g->physical_rows *
+            sizeof(std::uint64_t);
         auto rows = s.commit(std::move(pending), decisions).rows;
         (void)wait<runtime::ExecutionComplete>();
         for (std::size_t i = 0; i < before.size(); ++i) {

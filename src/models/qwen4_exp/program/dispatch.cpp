@@ -175,10 +175,21 @@ void RankProgramImpl::finish_result() {
     auto& f      = *compute;
     auto& result = f.result;
     result.rows.resize(f.rows.size());
-    const auto& buffers        = resources.buffers();
-    const auto* ids            = static_cast<const TokenId*>(resources.egress().data);
-    const auto* forward        = std::get_if<ForwardWork>(&f.request.work.operation);
-    const bool sampled         = f.verify || (forward && forward->sample != SampleKind::None);
+    const auto& buffers      = resources.buffers();
+    const auto* ids          = static_cast<const TokenId*>(resources.egress().data);
+    const auto* forward      = std::get_if<ForwardWork>(&f.request.work.operation);
+    const bool sampled       = f.verify || (forward && forward->sample != SampleKind::None);
+    const auto probabilities = [&](const TensorRegion& region) {
+        return static_cast<const float*>(
+            resources.egress()
+                .subspan(region.region.offset - buffers.sampled_ids->region.offset)
+                .data);
+    };
+    const auto* top1 =
+        forward && forward->sample == SampleKind::NextToken && buffers.top1_probabilities
+            ? probabilities(*buffers.top1_probabilities)
+            : nullptr;
+    const auto* confidence     = f.verify ? probabilities(*buffers.draft_confidences) : nullptr;
     const std::int32_t* counts = nullptr;
     if (f.verify) {
         counts = reinterpret_cast<const std::int32_t*>(
@@ -190,6 +201,9 @@ void RankProgramImpl::finish_result() {
         auto& row     = result.rows[b];
         row.processed = f.verify ? 0 : f.rows[b].ids.size();
         row.drafts    = f.verify ? f.verify->extents[b] : 0;
+        if (top1) row.target_top1_probability = top1[b];
+        for (std::uint32_t step = 0; step < row.drafts; ++step)
+            row.draft_confidences.push_back(confidence[step * f.physical.rows + b]);
         if (sampled) {
             const auto count = counts ? counts[b] : 1;
             if (count < 1 || static_cast<std::uint32_t>(count) > row.drafts + 1)

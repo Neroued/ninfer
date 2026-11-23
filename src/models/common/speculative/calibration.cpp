@@ -1,4 +1,5 @@
 #include "models/common/speculative/calibration.h"
+#include "models/common/context/directory.h"
 
 #include <algorithm>
 #include <stdexcept>
@@ -77,6 +78,29 @@ void add_width_probes(std::vector<CalibrationProbeSpec>& schedule, const Calibra
 }
 
 } // namespace
+
+std::uint32_t available_calibration_pages(const context::ContextDirectory& directory,
+                                          std::span<const PlacementDescriptor> placements) {
+    if (placements.empty() || !directory.pool_count()) return 0;
+    std::uint32_t low = 0, high = UINT32_MAX;
+    for (std::uint32_t pool = 0; pool < directory.pool_count(); ++pool)
+        high = std::min(
+            high, static_cast<std::uint32_t>(directory.pool(pool).pages().available_descriptors() /
+                                             placements.size()));
+    while (low < high) {
+        const auto count = low + static_cast<std::uint32_t>((std::uint64_t(high) - low + 1) / 2);
+        context::ContextDemand demand;
+        for (const auto& placement : placements)
+            for (std::uint32_t pool = 0; pool < directory.pool_count(); ++pool)
+                demand.add_history(pool, count, context::ContextMemory::Device,
+                                   placement.attention_ranks);
+        if (directory.assess(demand).feasible())
+            low = count;
+        else
+            high = count - 1;
+    }
+    return low;
+}
 
 std::vector<CalibrationProbeSpec>
 build_corner_calibration_schedule(const CalibrationConstraints& c) {

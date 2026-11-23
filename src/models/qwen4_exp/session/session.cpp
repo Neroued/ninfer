@@ -1,12 +1,17 @@
 #include "models/qwen4_exp/session/internal.h"
+#include "core/paged_kv_geometry.h"
 
 #include <algorithm>
 
 namespace ninfer::models::qwen4_exp::detail {
 
 SessionImpl::SessionImpl(std::shared_ptr<const ModelDefinition> model, SessionPlan prepared)
-    : definition(std::move(model)), plan(std::move(prepared)), shape(plan.shape),
-      directory(plan.context),
+    : definition(std::move(model)), plan(std::move(prepared)),
+      cost_model({definition ? definition->options().speculative : SpeculativeBackend::None,
+                  plan.shape.draft_tokens, 1,
+                  definition ? definition->config().text.moe.experts : 0,
+                  definition ? definition->config().text.moe.top_k : 0, 0}),
+      shape(plan.shape), directory(plan.context),
       recovery_metadata(directory.metadata_budget(),
                         shape.purpose == EnginePurpose::Generation ? shape.max_concurrency : 0,
                         plan.context.ranks.size(), 1),
@@ -342,6 +347,55 @@ std::span<const runtime::KvPoolDescriptor> Session::kv_pools() const noexcept {
 }
 
 PhysicalUsageSnapshot Session::physical_usage() const noexcept { return impl_->usage(); }
+
+std::optional<runtime::ExecutionTicket>
+Session::start_decode_probe(std::span<const SequenceHandle> members,
+                            const speculative::RoundRoute& route,
+                            std::span<const std::uint32_t> extents,
+                            std::span<const std::uint8_t> constrained, bool record_online_cost) {
+    return start_decode_round(
+        members, {.extents = extents, .route = &route, .record_online_cost = record_online_cost},
+        constrained);
+}
+
+std::optional<runtime::ExecutionTicket>
+Session::start_decode_extents(std::span<const SequenceHandle> members,
+                              std::span<const std::uint32_t> extents,
+                              std::span<const std::uint8_t> constrained) {
+    return start_decode_round(members, {.extents = extents}, constrained);
+}
+
+speculative::CostModelSummary Session::speculative_cost_summary() const noexcept {
+    return impl_->cost_model.summary();
+}
+
+speculative::CalibrationConstraints Session::calibration_constraints() const {
+    const auto& p = *impl_;
+    return {.model           = p.cost_model.config(),
+            .batches         = p.plan.batches.get(),
+            .path            = p.plan.decode_path,
+            .routes          = p.plan.decode_routes.get(),
+            .max_concurrency = p.shape.max_concurrency,
+            .max_context     = p.shape.max_context,
+            .kv_page_tokens  = kPagedKVPageSize,
+            .available_kv_pages =
+                speculative::available_calibration_pages(p.directory, placement_descriptions())};
+}
+
+std::optional<speculative::CostQuery>
+Session::decode_cost_query(runtime::ExecutionTicket ticket) const noexcept {
+    const auto& active = impl_->compute;
+    return active && active->ticket == ticket ? active->cost_query : std::nullopt;
+}
+
+void Session::fit_speculative_cost_model(std::span<const speculative::TimedCostAnchor> anchors,
+                                         double elapsed_ms) {
+    impl_->cost_model.fit(anchors, elapsed_ms);
+}
+
+std::uint32_t Session::decode_frontier(SequenceHandle handle) const {
+    return impl_->sequence(handle).continuation.metadata.main_frontier;
+}
 
 bool Session::has_context_operation() const noexcept {
     return impl_->operation || impl_->pending_maintenance || impl_->release_ticket ||

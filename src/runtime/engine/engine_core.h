@@ -8,6 +8,7 @@
 #include "runtime/engine/context_cache/resource_manager.h"
 #include "runtime/engine/context_cache/placement_policy.h"
 #include "runtime/engine/scheduler.h"
+#include "runtime/engine/speculative_calibration.h"
 #include "runtime/engine/generation_budget.h"
 #include "runtime/executor/contract.h"
 #include "runtime/executor/measurement.h"
@@ -108,6 +109,7 @@ public:
         worker_                   = std::thread([this, startup = std::move(startup)]() mutable {
             try {
                 instance_.executor->bind_to_current_thread();
+                if (speculative_positions_) calibrate_speculative(instance_);
                 publish_runtime_stats();
                 startup.set_value();
             } catch (...) {

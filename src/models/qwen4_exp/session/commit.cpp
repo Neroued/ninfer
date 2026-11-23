@@ -155,6 +155,10 @@ void SessionImpl::retire_compute(const runtime::DeviceRetired& event) {
     if (tx.kind != Kind::Score)
         events.push_back({tx.ticket, tx.members,
                           runtime::ExecutionComplete{event.execution, tx.members.size()}});
+    if (tx.cost_query && tx.record_online_cost && !tx.discarded &&
+        std::ranges::none_of(tx.decisions, [](const auto& d) { return d.cancelled || d.failed; }))
+        cost_model.observe_retired_step(*tx.cost_query,
+                                        double(event.execution.latency.total_ns) * 1.0e-6);
     for (std::size_t b = 0; b < tx.members.size(); ++b) {
         if (!tx.discarded &&
             (tx.decisions.empty() || (!tx.decisions[b].cancelled && !tx.decisions[b].failed)))
@@ -249,8 +253,17 @@ CommitResult Session::commit(PendingBatch&& batch,
         auto& row            = result.rows[b];
         if (batch.decode_ && p.definition->options().mtp()) {
             auto& stats         = s.speculative;
-            const auto drafted  = tx.result->rows[b].drafts;
-            const auto accepted = tx.result->rows[b].accepted_drafts;
+            const auto& output  = tx.result->rows[b];
+            const auto drafted  = output.drafts;
+            const auto accepted = output.accepted_drafts;
+            if (!decision.cancelled && !decision.failed) {
+                if (drafted)
+                    s.speculative_state.observe_speculative_round(
+                        drafted, accepted,
+                        std::span<const float>(output.draft_confidences).first(drafted));
+                else
+                    s.speculative_state.observe_ordinary_round(output.target_top1_probability);
+            }
             stats.committed_draft_tokens += std::min(decision.accepted_tokens, accepted);
             if (drafted)
                 ++stats.rounds;

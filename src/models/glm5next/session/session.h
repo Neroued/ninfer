@@ -1,5 +1,8 @@
 #pragma once
 
+#include "models/common/speculative/calibration.h"
+#include "models/common/speculative/controller.h"
+
 #include "models/common/context/recovery_value.h"
 
 #include "models/common/context/checkpoint_store.h"
@@ -423,6 +426,22 @@ public:
     start_decode(std::span<const SequenceHandle>, std::span<const runtime::RoundBudget>,
                  std::span<const std::uint8_t> constrained = {});
     [[nodiscard]] std::optional<runtime::ExecutionTicket>
+    start_decode_probe(std::span<const SequenceHandle>, const speculative::RoundRoute&,
+                       std::span<const std::uint32_t> verify_drafts,
+                       std::span<const std::uint8_t> constrained = {},
+                       bool record_online_cost                   = false);
+    [[nodiscard]] std::optional<runtime::ExecutionTicket>
+    start_decode_extents(std::span<const SequenceHandle>,
+                         std::span<const std::uint32_t> verify_drafts,
+                         std::span<const std::uint8_t> constrained = {});
+    [[nodiscard]] speculative::CostModelSummary speculative_cost_summary() const noexcept;
+    [[nodiscard]] speculative::CalibrationConstraints calibration_constraints() const;
+    [[nodiscard]] std::optional<speculative::CostQuery>
+        decode_cost_query(runtime::ExecutionTicket) const noexcept;
+    void fit_speculative_cost_model(std::span<const speculative::TimedCostAnchor>,
+                                    double elapsed_ms);
+    [[nodiscard]] std::uint32_t decode_frontier(SequenceHandle) const;
+    [[nodiscard]] std::optional<runtime::ExecutionTicket>
     start_control(std::span<const SequenceHandle>, std::span<const TokenId>, std::uint32_t stride);
     [[nodiscard]] std::optional<runtime::ExecutionTicket> start_score(PreparedPrompt&&,
                                                                       std::uint32_t first_target);
@@ -436,6 +455,9 @@ public:
     [[nodiscard]] PhysicalUsageSnapshot physical_usage() const noexcept;
 
 private:
+    [[nodiscard]] std::optional<runtime::ExecutionTicket>
+    start_decode_round(std::span<const SequenceHandle>, speculative::DecodeRoundRequest,
+                       std::span<const std::uint8_t> constrained);
     std::unique_ptr<detail::SessionImpl> impl_;
 };
 

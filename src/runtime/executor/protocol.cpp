@@ -19,11 +19,12 @@ std::size_t work_payload_memory(const WorkPayloadCapacity& p, ExecutionCapacity 
                         (p.context_work + p.rank_context_storage) * frames.context_frames;
     // Encoder vectors can grow to twice their payload. Compute rows are retained by Session
     // and Executor; a Context snapshot moves from Session into Executor without a second copy.
-    const auto control = coordinator ? 2 * ranks * (work + continuation) +
-                                           4 * ranks * p.compute_work * frames.compute_frames +
+    const auto retained_compute = std::max(p.compute_work, p.compute_result);
+    const auto control          = coordinator ? 2 * ranks * (work + continuation) +
+                                           4 * ranks * retained_compute * frames.compute_frames +
                                            p.coordinator_context_storage * frames.context_frames +
                                            2 * ranks * continuation
-                                     : 0;
+                                              : 0;
     return worker + control;
 }
 

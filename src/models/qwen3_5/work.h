@@ -112,6 +112,8 @@ struct GeneratedResult {
     std::vector<std::uint32_t> counts;
     std::vector<std::uint32_t> dead_positions;
     std::uint32_t row_stride = 1;
+    std::vector<float> draft_confidences, target_top1_probabilities;
+    std::uint32_t draft_stride = 0;
 };
 
 struct ForwardResult {

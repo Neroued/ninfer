@@ -106,6 +106,8 @@ struct RowResult {
     std::uint32_t accepted_drafts = 0;
     std::vector<TokenId> tokens;
     std::uint32_t dead_positions = 0;
+    std::vector<float> draft_confidences;
+    std::optional<float> target_top1_probability;
 };
 
 struct ComputeResult {

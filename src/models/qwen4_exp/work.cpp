@@ -16,16 +16,16 @@ ExecutionWork ExecutionTypes::describe_work(const Work& work) {
             using T = std::decay_t<decltype(op)>;
             if constexpr (std::is_same_v<T, ForwardWork>) {
                 result.speculative = op.speculative;
-                result.kind = op.kind == ForwardKind::Prefill   ? ExecutionKind::Prefill
-                              : op.kind == ForwardKind::Replay  ? ExecutionKind::Replay
-                              : op.kind == ForwardKind::Control ? ExecutionKind::Control
-                                                                : ExecutionKind::Decode;
-                result.rows = op.rows.size();
+                result.kind        = op.kind == ForwardKind::Prefill   ? ExecutionKind::Prefill
+                                     : op.kind == ForwardKind::Replay  ? ExecutionKind::Replay
+                                     : op.kind == ForwardKind::Control ? ExecutionKind::Control
+                                                                       : ExecutionKind::Decode;
+                result.rows        = op.rows.size();
                 for (const auto& row : op.rows) result.input_tokens += row.ids.size();
                 result.scheduled_positions = result.input_tokens;
             } else if constexpr (std::is_same_v<T, MtpWork>) {
                 result.speculative = op.speculative;
-                result.kind = ExecutionKind::Decode;
+                result.kind        = ExecutionKind::Decode;
                 result.rows = result.input_tokens = op.rows.size();
                 for (const auto extent : op.draft_extents) result.scheduled_positions += extent + 1;
             } else if constexpr (std::is_same_v<T, ScoreWork>) {
@@ -129,7 +129,7 @@ runtime::WorkPayloadCapacity WorkContract::payload_capacity(std::uint32_t rank_c
     const auto work =
         std::max({payload(1, chunk, 20 * chunk), payload(batch, width, 16) + route_bytes,
                   payload(batch, control_token_limit, 8ULL * control_token_limit)});
-    const auto context      = header + context::action_batch_capacity() + 128 + 88 +
+    const auto context = header + context::action_batch_capacity() + 128 + 88 +
                          TokenCounts::encoded_capacity(public_tokens) + 16 * batch;
     const auto decision = header + 12 + batch * (20 + 4 * width * ((public_tokens + 31ULL) / 32));
     const auto commit   = header + 64 + batch * (64 + 20 * rank_count) + actions(batch, width);
@@ -141,7 +141,8 @@ runtime::WorkPayloadCapacity WorkContract::payload_capacity(std::uint32_t rank_c
             decision,
             commit,
             context_rows + actions_storage,
-            context_rows + rank_count * actions_storage};
+            context_rows + rank_count * actions_storage,
+            9 + batch * (33 + 4 * width + 4 * shape.draft_tokens)};
 }
 
 void WorkContract::validate(const Work& work, runtime::FrameKind kind) const {
@@ -407,10 +408,10 @@ void WorkContract::validate(const Work& work, const Result& result, const Commit
 
 void WorkContract::validate_commit(const Work& work, std::span<const RowResult> results,
                                    const Commit& commit) const {
-    const auto rows     = work_rows(work);
-    const auto* forward = std::get_if<ForwardWork>(&work.operation);
+    const auto rows      = work_rows(work);
+    const auto* forward  = std::get_if<ForwardWork>(&work.operation);
     const auto* mtp_work = std::get_if<MtpWork>(&work.operation);
-    const bool scoring  = std::holds_alternative<ScoreWork>(work.operation);
+    const bool scoring   = std::holds_alternative<ScoreWork>(work.operation);
     const bool sampled   = mtp_work || (forward && forward->sample != SampleKind::None);
     if (commit.rows.size() != rows.size() || (!scoring && results.size() != rows.size()))
         throw std::logic_error("Qwen4Exp commit rows differ from its result");
@@ -426,8 +427,19 @@ void WorkContract::validate_commit(const Work& work, std::span<const RowResult> 
                 (!mtp_work && offsets.destination != previous.destination))
                 throw std::logic_error("Qwen4Exp commit changes its prepared State binding");
         }
-        if (mtp_work && (results[b].drafts != mtp_work->draft_extents[b] ||
-                         results[b].accepted_drafts > results[b].drafts ||
+        if (!scoring) {
+            const auto& output = results[b];
+            const auto drafts  = mtp_work ? mtp_work->draft_extents[b] : 0U;
+            const bool top1 =
+                forward && forward->sample == SampleKind::NextToken && shape.draft_tokens;
+            const auto valid = [](float p) { return p >= 0.0f && p <= 1.0f; };
+            if (output.drafts != drafts || output.draft_confidences.size() != drafts ||
+                !std::ranges::all_of(output.draft_confidences, valid) ||
+                output.target_top1_probability.has_value() != top1 ||
+                (top1 && !valid(*output.target_top1_probability)))
+                throw std::invalid_argument("Qwen4Exp result probabilities differ from its work");
+        }
+        if (mtp_work && (results[b].accepted_drafts > results[b].drafts ||
                          results[b].tokens.size() != std::uint64_t(results[b].accepted_drafts) + 1))
             throw std::invalid_argument(
                 "Qwen4Exp acceptance result differs from its verified prefix");

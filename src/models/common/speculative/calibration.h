@@ -1,6 +1,11 @@
 #pragma once
 
 #include "models/common/speculative/cost_model.h"
+#include "ninfer/observability/snapshot.h"
+
+namespace ninfer::models::context {
+class ContextDirectory;
+}
 
 namespace ninfer::models::speculative {
 
@@ -30,5 +35,8 @@ struct CalibrationConstraints {
 // The runner enforces the wall-clock budget while executing this priority order.
 [[nodiscard]] std::vector<CalibrationProbeSpec>
 build_corner_calibration_schedule(const CalibrationConstraints&);
+
+[[nodiscard]] std::uint32_t available_calibration_pages(const context::ContextDirectory&,
+                                                        std::span<const PlacementDescriptor>);
 
 } // namespace ninfer::models::speculative

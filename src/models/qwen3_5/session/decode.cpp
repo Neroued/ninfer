@@ -6,22 +6,28 @@
 
 namespace ninfer::models::qwen3_5::detail {
 std::optional<runtime::ExecutionTicket>
-SessionImpl::start_decode(std::span<const SequenceHandle> members,
-                          std::span<const runtime::RoundBudget> budgets,
-                          std::span<const std::uint8_t> constrained) {
+SessionImpl::start_decode_round(std::span<const SequenceHandle> members,
+                                speculative::DecodeRoundRequest selection,
+                                std::span<const std::uint8_t> constrained) {
     if (execution) return {};
-    if (members.empty() || members.size() > max_concurrency || budgets.size() != members.size() ||
+    if (members.empty() || members.size() > max_concurrency ||
+        !selection.valid_membership(members.size()) ||
         (!constrained.empty() && constrained.size() != members.size()))
         throw std::invalid_argument("decode membership is invalid");
     auto reservation = executor().try_reserve(runtime::FrameKind::Compute);
     if (!reservation) return {};
+    bool prepared = false;
     try {
         Execution pending{.kind = OperationKind::Decode};
         pending.members.assign(members.begin(), members.end());
         pending.preparation = std::make_unique<context::ContextTransaction>(directory);
         std::vector<speculative::RoundMember> rows;
+        std::vector<speculative::AdaptiveRowInput> adaptive;
+        std::vector<std::uint32_t> frontiers;
         std::vector<speculative::RowGrowth> growth;
         rows.reserve(members.size());
+        adaptive.reserve(members.size());
+        frontiers.reserve(members.size());
         growth.reserve(members.size());
         const auto mark = next_lane_mark();
         for (std::size_t b = 0; b < members.size(); ++b) {
@@ -33,15 +39,16 @@ SessionImpl::start_decode(std::span<const SequenceHandle> members,
             const auto& base    = state.continuation.metadata;
             const auto f        = base.execution_frontier;
             if (request.lifecycle != Lifecycle::Active || state.ledger.size() != f + 1 ||
-                !budgets[b].generated_tokens_remaining)
+                f >= capacity)
                 throw std::logic_error("sequence is not decode ready");
             require_unit(l, ExecutionUnitKind::Decode, 1);
-            auto hard = std::min(
-                {draft_window, budgets[b].generated_tokens_remaining - 1, capacity - f - 1});
+            auto hard = std::min({draft_window, selection.draft_budget(b), capacity - f - 1});
             if ((speculative_backend == SpeculativeBackend::Mtp && !f) ||
                 (is_masked_draft_backend(speculative_backend) && capacity - f <= draft_window))
                 hard = 0;
             rows.push_back({0, hard, hard});
+            frontiers.push_back(f);
+            adaptive.push_back({rows.back(), f, &request.speculative_state});
             auto& row = growth.emplace_back();
             if (hard) {
                 row.text.emplace(*text_kv_histories, state.kv->text.handle(), base.text_kv_valid,
@@ -52,13 +59,19 @@ SessionImpl::start_decode(std::span<const SequenceHandle> members,
             }
         }
         grant_windows(directory, growth, rows);
+        for (std::size_t b = 0; b < rows.size(); ++b) adaptive[b].member = rows[b];
         const auto size  = static_cast<std::uint32_t>(members.size());
         const auto shape = plan.batch_execution->decode(size, size);
-        DecodeWork decode(speculative::DecodeRoundPlan::select(speculative_backend, draft_window, 1,
-                                                               shape, plan.decode_path,
-                                                               plan.decode_routes.get(), rows),
-                          plan.decode_path);
+        auto round = selection.select(shape, plan.decode_path, plan.decode_routes.get(), cost_model,
+                                      rows, adaptive, capacity);
+        if (!round) return {};
+        if (draft_window)
+            pending.cost_query =
+                speculative::CostQuery::from_plan(speculative_backend, *round, frontiers, capacity);
+        pending.record_online_cost = selection.record_online_cost;
+        DecodeWork decode(std::move(*round), plan.decode_path);
         pending.round = decode.plan;
+        prepared      = true;
         // Reserve all host bookkeeping before transferring any optional right to a history.
         for (std::size_t i = 0; i < size; ++i) growth[i].prepare(pending.round->verify_drafts()[i]);
         for (auto& row : growth) row.adopt();
@@ -83,7 +96,7 @@ SessionImpl::start_decode(std::span<const SequenceHandle> members,
         return submit_execution(std::move(pending), std::move(*reservation),
                                 Work{.operation = std::move(decode)});
     } catch (const std::exception& error) {
-        executor().fail(error.what());
+        if (prepared) executor().fail(error.what());
         throw;
     }
 }

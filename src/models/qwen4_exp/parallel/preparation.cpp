@@ -97,8 +97,11 @@ std::vector<distributed::GroupRequirements> RankPreparation::communication_requi
         constexpr auto candidates = std::size_t(DistributedVocabulary::candidates);
         work.push_back(
             {Collective::AllGather, DType::I64, candidates, candidates * decode, candidates});
-        if (profile_->mtp)
-            work.push_back({Collective::AllReduce, DType::U64, 1, batch, 1, Reduction::Max});
+        if (profile_->mtp) {
+            constexpr auto records = std::size_t(DistributedVocabulary::candidates_with_lse);
+            work.push_back({Collective::AllGather, DType::U64, records, records * batch, records});
+            work.push_back({Collective::AllGather, DType::U64, 2, 2 * batch, 2});
+        }
     } else {
         work.push_back({Collective::AllGather, DType::FP32, 3,
                         3 * std::size_t(std::min(shape.prefill_chunk, 1024U)), 3});

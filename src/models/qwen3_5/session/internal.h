@@ -122,6 +122,7 @@ struct RequestControl {
     Lifecycle lifecycle = Lifecycle::Empty;
     ResolvedSamplingParameters sampling_host;
     SpeculativeStats speculative_stats;
+    speculative::SequenceSpeculativeState speculative_state;
     std::shared_ptr<const RequestBasePlanImpl> base;
     std::optional<UnitDemand> permit;
     std::optional<RecoveryPermit> recovery;
@@ -379,8 +380,23 @@ public:
                                                                         bool constrained = false);
     [[nodiscard]] std::optional<runtime::ExecutionTicket> start_replay(SequenceHandle);
     [[nodiscard]] std::optional<runtime::ExecutionTicket>
-    start_decode(std::span<const SequenceHandle>, std::span<const runtime::RoundBudget>,
-                 std::span<const std::uint8_t> constrained = {});
+    start_decode_round(std::span<const SequenceHandle>, speculative::DecodeRoundRequest,
+                       std::span<const std::uint8_t> constrained = {});
+
+    [[nodiscard]] std::optional<runtime::ExecutionTicket>
+    start_decode(std::span<const SequenceHandle> members,
+                 std::span<const runtime::RoundBudget> budgets,
+                 std::span<const std::uint8_t> constrained = {}) {
+        return start_decode_round(members, {.budgets = budgets}, constrained);
+    }
+
+    [[nodiscard]] std::optional<runtime::ExecutionTicket>
+    start_decode_extents(std::span<const SequenceHandle> members,
+                         std::span<const std::uint32_t> verify_drafts,
+                         std::span<const std::uint8_t> constrained = {}) {
+        return start_decode_round(members, {.extents = verify_drafts}, constrained);
+    }
+
     [[nodiscard]] std::optional<runtime::ExecutionTicket>
     start_control(std::span<const SequenceHandle>, std::span<const TokenId>, std::uint32_t stride);
     [[nodiscard]] std::optional<runtime::ExecutionTicket> start_score(qwen::PreparedPromptData&&,
@@ -417,6 +433,7 @@ public:
     const std::uint32_t prefill_chunk;
     const std::uint32_t draft_window;
     const SpeculativeBackend speculative_backend;
+    speculative::SpeculativeCostModel cost_model;
     const ContextCacheOptions context_cache;
     const bool vision_enabled;
     const bool causal_scoring;
@@ -472,6 +489,8 @@ public:
         std::unique_ptr<context::ContextTransaction> preparation;
         std::unique_ptr<context::ContextTransaction> settlement;
         std::shared_ptr<const speculative::DecodeRoundPlan> round;
+        std::optional<speculative::CostQuery> cost_query;
+        bool record_online_cost = true;
         std::optional<GeneratedResult> generated;
         ExecutionSample observed_result;
         std::optional<SessionEvent> completion;

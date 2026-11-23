@@ -99,6 +99,7 @@ struct Sequence {
     std::uint64_t membership_mark = 0;
     bool computing                = false;
     SpeculativeStats speculative;
+    speculative::SequenceSpeculativeState speculative_state;
 };
 
 struct Suspended {
@@ -221,6 +222,8 @@ struct ComputeTransaction {
     std::vector<SequenceHandle> members;
     std::vector<WorkRow> rows;
     std::optional<speculative::DecodeRoundPlan> round;
+    std::optional<speculative::CostQuery> cost_query;
+    bool record_online_cost = true;
     std::optional<ComputeResult> result;
     ExecutionSample observed_result;
     std::vector<runtime::CommitDecision> decisions;
@@ -330,6 +333,7 @@ public:
 
     std::shared_ptr<const ModelDefinition> definition;
     const SessionPlan plan;
+    speculative::SpeculativeCostModel cost_model;
     vision::Window vision_window;
     [[nodiscard]] std::optional<qwen::VisionWork>
     prepare_visual(const Sequence&, std::uint32_t begin, std::uint32_t end);

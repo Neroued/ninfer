@@ -67,7 +67,7 @@ enum class TextPhase { Prefill, Verify };
 
 struct SessionPlan {
     std::shared_ptr<const speculative::DecodeGraphRoutes> decode_routes;
-    ExecutionPath decode_path             = ExecutionPath::Eager;
+    ExecutionPath decode_path = ExecutionPath::Eager;
     std::shared_ptr<const BatchExecutionPlan> batch_execution;
     std::shared_ptr<const execution::ModelProfile> profile;
     context::ContextDirectorySpec context;
@@ -77,6 +77,7 @@ struct SessionPlan {
     std::uint32_t prefill_chunk            = 0;
     std::uint32_t draft_window             = 0;
     SpeculativeBackend speculative_backend = SpeculativeBackend::None;
+    std::uint32_t hybrid_max_tokens        = 0;
     ContextCacheOptions context_cache;
     KvCacheStorage kv_storage  = KvCacheStorage::BFloat16;
     ProposalHead proposal_head = ProposalHead::Full;

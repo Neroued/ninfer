@@ -2,21 +2,24 @@
 
 namespace ninfer::models::qwen4_exp::detail {
 
-void RankProgramImpl::vocabulary_draft(const Tensor& logits, const Tensor& valid, Tensor& ids) {
-    const auto& io     = resources.buffers();
-    const auto batch   = static_cast<std::int32_t>(ids.numel());
-    auto keys          = packed_tensor(*io.vocabulary_local, {1, 1, batch});
+void RankProgramImpl::vocabulary_draft(const Tensor& logits, const Tensor& valid, Tensor& ids,
+                                       Tensor& confidences) {
+    const auto& io   = resources.buffers();
+    const auto batch = static_cast<std::int32_t>(ids.numel());
+    auto local       = packed_tensor(*io.vocabulary_local, {2, 1, batch});
+    auto gathered =
+        packed_tensor(*io.vocabulary_gathered, {2, 1, batch, dimension(parallel->size())});
     const auto configs = device_tensor(*io.proposal_sampling);
     auto scope         = resources.workspace.scope();
-    ops::vocabulary_candidates(
+    ops::vocabulary_candidates_with_lse(
         logits.view({logits.ne[0], 1, batch}), parameters.profile->local.vocabulary_begin,
         parameters.profile->public_tokens, static_cast<const ops::SamplingConfig*>(configs.data),
-        valid, {}, keys, resources.workspace, cuda);
-    parallel->maximum(keys, cuda);
+        valid, {}, local, resources.workspace, cuda);
+    parallel->gather_unsigned_words(local, gathered, cuda);
     auto positions = device_tensor(io.batch.sampling_positions).slice(0, 0, batch);
-    ops::sample_vocabulary_candidates(keys.view({1, 1, batch, 1}),
-                                      static_cast<const ops::SamplingConfig*>(configs.data),
-                                      positions, ops::kSamplePurposeDecode, ids, valid, cuda);
+    ops::sample_vocabulary_candidates(
+        gathered, static_cast<const ops::SamplingConfig*>(configs.data), positions,
+        ops::kSamplePurposeDecode, ids, confidences, valid, cuda);
 }
 
 DistributedVocabulary RankProgramImpl::vocabulary() {
@@ -39,8 +42,15 @@ void RankProgramImpl::vocabulary_sample(std::int32_t batch, bool first_token) {
     auto live            = device_tensor(io.batch.live_rows).slice(0, 0, batch);
     auto positions       = device_tensor(io.batch.sampling_positions).slice(0, 0, batch);
     auto ids             = packed_tensor(*io.sampled_ids, {batch});
-    vocabulary().sample(logits, sampling, live, live, positions,
-                        first_token ? ops::kSamplePurposePrefill : ops::kSamplePurposeDecode, ids);
+    if (!first_token && io.top1_probabilities) {
+        auto probabilities = packed_tensor(*io.top1_probabilities, {batch});
+        vocabulary().sample(logits, sampling, live, live, positions, ops::kSamplePurposeDecode, ids,
+                            probabilities);
+    } else {
+        vocabulary().sample(logits, sampling, live, live, positions,
+                            first_token ? ops::kSamplePurposePrefill : ops::kSamplePurposeDecode,
+                            ids);
+    }
 }
 
 void RankProgramImpl::vocabulary_accept(std::int32_t batch, std::int32_t width) {

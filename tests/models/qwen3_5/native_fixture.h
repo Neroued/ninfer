@@ -255,6 +255,15 @@ public:
         return wait<q35::PendingBatch>(*ticket, std::move(decision));
     }
 
+    q35::PendingBatch decode_extents(std::span<const q35::SequenceHandle> members,
+                                     std::span<const std::uint32_t> extents,
+                                     std::span<const std::uint8_t> constrained = {},
+                                     DecisionHandler decision                  = {}) {
+        const auto ticket = session_.start_decode_extents(members, extents, constrained);
+        if (!ticket) throw std::logic_error("native decode could not grant the exact extents");
+        return wait<q35::PendingBatch>(*ticket, std::move(decision));
+    }
+
     q35::CommitResult commit(q35::PendingBatch&& pending,
                              std::span<const runtime::CommitDecision> decisions) {
         const auto ticket = pending.ticket();

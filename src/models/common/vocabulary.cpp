@@ -15,7 +15,10 @@ Tensor DistributedVocabulary::collect(const Tensor& logits, const ops::SamplingC
     else
         ops::vocabulary_candidates(logits, begin, domain, configs, valid, drafts, keys, workspace,
                                    cuda);
-    peer.gather(keys, combined, cuda);
+    if constexpr (RelativeLse)
+        peer.gather_unsigned_words(keys, combined, cuda);
+    else
+        peer.gather(keys, combined, cuda);
     return combined;
 }
 

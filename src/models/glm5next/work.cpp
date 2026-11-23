@@ -64,8 +64,8 @@ BatchPlan plan_batch(std::span<const WorkRow> rows, const BatchExecutionPlan& pl
 std::shared_ptr<const speculative::DecodeGraphRoutes>
 make_decode_routes(const ExecutionShape& shape, const BatchExecutionPlan& batches) {
     if (batches.graph_shapes().empty()) return {};
-    return std::make_shared<const speculative::DecodeGraphRoutes>(
-        batches, shape.speculative, shape.draft_tokens);
+    return std::make_shared<const speculative::DecodeGraphRoutes>(batches, shape.speculative,
+                                                                  shape.draft_tokens);
 }
 
 const BatchPlan& work_batch(const Work& work) {
@@ -153,7 +153,8 @@ runtime::WorkPayloadCapacity WorkContract::payload_capacity(std::uint32_t rank_c
             decision,
             commit,
             context_rows + actions_storage,
-            context_rows + rank_count * actions_storage};
+            context_rows + rank_count * actions_storage,
+            9 + batch * (33 + 4 * width + 4 * shape.draft_tokens)};
 }
 
 void WorkContract::validate(const Work& work, runtime::FrameKind kind) const {
@@ -402,6 +403,19 @@ void WorkContract::validate_commit(const Work& work, std::span<const RowResult> 
             const auto before = rows[i].states.at(rank);
             require(s.source == before.source && s.destination == before.destination,
                     "commit changes State binding");
+        }
+        if (!std::holds_alternative<ScoreWork>(work.operation)) {
+            const auto& output = result[i];
+            const auto drafts  = m ? m->draft_extents[i] : 0U;
+            const bool top1    = f && f->sample == SampleKind::NextToken && shape.draft_tokens;
+            const auto valid   = [](float p) { return p >= 0.0f && p <= 1.0f; };
+            require(output.drafts == drafts && output.accepted_drafts <= drafts &&
+                        (!m || output.tokens.size() == std::size_t(output.accepted_drafts) + 1) &&
+                        output.draft_confidences.size() == drafts &&
+                        std::ranges::all_of(output.draft_confidences, valid) &&
+                        output.target_top1_probability.has_value() == top1 &&
+                        (!top1 || valid(*output.target_top1_probability)),
+                    "result probabilities differ from work");
         }
         require(!(c.cancelled && c.failed), "conflicting terminal disposition");
         if (c.cancelled || c.failed) {

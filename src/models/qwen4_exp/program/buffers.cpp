@@ -79,8 +79,8 @@ BufferLayout plan_buffers(LayoutBuilder& b, const Config& c, const EngineOptions
     };
     TensorRegion last_ingress = out.sampling ? *out.sampling : out.batch.sampling_positions;
     if (c.mtp) {
-        auto& mtp      = out.mtp.emplace();
-        mtp.extents    = rows();
+        auto& mtp         = out.mtp.emplace();
+        mtp.extents       = rows();
         mtp.previous_rope = tensor(DType::I32, {3, batch}, "previous anchor coordinates");
         for (int step = 0; step < width - 1; ++step)
             mtp.draft_steps.push_back(metadata(batch, {}, false));
@@ -95,8 +95,8 @@ BufferLayout plan_buffers(LayoutBuilder& b, const Config& c, const EngineOptions
     out.batch.count_columns        = rows();
     TensorRegion last_commit       = out.batch.count_columns;
     if (out.mtp) {
-        out.mtp->last_columns   = rows();
-        out.mtp->active_columns = rows();
+        out.mtp->last_columns           = rows();
+        out.mtp->active_columns         = rows();
         out.mtp->skip_first             = rows();
         out.mtp->history_base_positions = rows();
         last_commit                     = out.mtp->history_base_positions;
@@ -177,7 +177,8 @@ BufferLayout plan_buffers(LayoutBuilder& b, const Config& c, const EngineOptions
         out.ple_embedding = tensor(DType::BF16, {dimension(c.text.ple.embedding), positions},
                                    "PLE lookup and merge");
     if (ranks > 1) {
-        constexpr int candidates = DistributedVocabulary::candidates;
+        const int candidates = width > 1 ? DistributedVocabulary::candidates_with_lse
+                                         : DistributedVocabulary::candidates;
         out.vocabulary_local =
             tensor(DType::I64, {candidates, width, batch}, "local vocabulary candidates");
         out.vocabulary_gathered = tensor(DType::I64, {candidates, width, batch, dimension(ranks)},
@@ -192,6 +193,10 @@ BufferLayout plan_buffers(LayoutBuilder& b, const Config& c, const EngineOptions
                    "head logits");
         out.sampled_ids   = tensor(DType::I32, {width, batch}, "generated IDs");
         out.output_counts = rows();
+        if (out.mtp) {
+            out.top1_probabilities = tensor(DType::FP32, {batch}, "target top-1 probabilities");
+            out.draft_confidences  = tensor(DType::FP32, {batch, width - 1}, "draft confidences");
+        }
         out.token_counts =
             tensor(DType::I32, {static_cast<std::int32_t>(public_tokens), batch}, "token counts");
         out.grammar_masks =
@@ -256,7 +261,7 @@ void select_buffer_rows(BufferLayout& out, const BufferLayout& backing, std::uin
     if (out.sampling)
         out.sampling = plane(DType::I32, {static_cast<int>(sizeof(ops::SamplingConfig) / 4), n});
     if (out.mtp) {
-        out.mtp->extents    = row();
+        out.mtp->extents       = row();
         out.mtp->previous_rope = plane(DType::I32, {3, n});
         for (std::size_t step = 0; step < out.mtp->draft_steps.size(); ++step) {
             auto& draft               = out.mtp->draft_steps[step];
@@ -280,8 +285,8 @@ void select_buffer_rows(BufferLayout& out, const BufferLayout& backing, std::uin
     out.batch.accepted_columns     = row();
     out.batch.count_columns        = row();
     if (out.mtp) {
-        out.mtp->last_columns   = row();
-        out.mtp->active_columns = row();
+        out.mtp->last_columns           = row();
+        out.mtp->active_columns         = row();
         out.mtp->skip_first             = row();
         out.mtp->history_base_positions = row();
     }
@@ -292,6 +297,10 @@ void select_buffer_rows(BufferLayout& out, const BufferLayout& backing, std::uin
         ControlLayout result(backing.sampled_ids->region.offset);
         out.sampled_ids   = result.plane(DType::I32, {dimension(width), n});
         out.output_counts = result.plane(DType::I32, {n});
+        if (out.mtp) {
+            out.top1_probabilities = result.plane(DType::FP32, {n});
+            out.draft_confidences  = result.plane(DType::FP32, {n, dimension(width - 1)});
+        }
     }
     const auto positions = out.decode.positions, rope = out.decode.rope_positions;
     out.decode                = out.batch;

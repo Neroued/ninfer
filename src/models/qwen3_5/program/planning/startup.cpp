@@ -12,6 +12,7 @@
 #include "core/device.h"
 #include "core/platform.h"
 #include "ninfer/ops/gated_delta_net.h"
+#include "ninfer/ops/argmax.h"
 #include "ninfer/ops/candidate_selector.h"
 #include "ninfer/ops/context_kv_materialize.h"
 #include "ninfer/ops/dynamic_grouped_conv.h"
@@ -135,9 +136,9 @@ WorkspaceSpec build_workspace_plan(const SequencePlanImpl& plan) {
         plan.draft_window >= static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::invalid_argument("sequence workspace dimensions are invalid");
     }
-    const auto chunk  = static_cast<std::int32_t>(chunk_u32);
-    const auto drafts = static_cast<std::int32_t>(plan.draft_window);
-    const auto verify = drafts + 1;
+    const auto chunk        = static_cast<std::int32_t>(chunk_u32);
+    const auto drafts       = static_cast<std::int32_t>(plan.draft_window);
+    const auto verify       = drafts + 1;
     const auto text_buckets = ops::ContextBucketRange::through(plan.capacity);
 
     const auto matrix  = [](WorkspaceLayoutBuilder& layout, DType dtype, std::int32_t rows,
@@ -166,8 +167,7 @@ WorkspaceSpec build_workspace_plan(const SequencePlanImpl& plan) {
     const auto target_body = [&](WorkspaceLayoutBuilder& layout, std::int32_t first,
                                  std::int32_t last, TextPhase phase, GdnWorkspacePath path,
                                  std::int32_t batch_size, std::int32_t min_width,
-                                 std::int32_t max_width,
-                                 ops::ContextBucketRange buckets) {
+                                 std::int32_t max_width, ops::ContextBucketRange buckets) {
         for (const auto& block : profile.text.layers) {
             {
                 auto stage = layout.scope();
@@ -255,12 +255,16 @@ WorkspaceSpec build_workspace_plan(const SequencePlanImpl& plan) {
         }
     };
     const auto proposal_scratch = [&](WorkspaceLayoutBuilder& layout, std::int32_t columns) {
+        auto valid = profile.public_tokens;
         if (plan.proposal_head == ProposalHead::Optimized) {
             matrix(layout, DType::BF16, dimension(profile.proposal->rows), columns);
             linear_scratch(layout, profile.proposal->head, columns, columns);
+            valid = std::min(valid, profile.proposal->rows);
         } else {
             linear_scratch(layout, profile.mtp->output_head, columns, columns);
         }
+        scratch(layout,
+                ops::argmax_with_probability_workspace_capacity_bytes(dimension(valid), columns));
     };
 
     WorkspaceSpec out;
@@ -290,8 +294,11 @@ WorkspaceSpec build_workspace_plan(const SequencePlanImpl& plan) {
             matrix(ordinary, DType::BF16, dimension(config.hidden_size), batch);
             target_body(ordinary, batch, batch, qwen3_5::TextPhase::Verify,
                         GdnWorkspacePath::Snapshot, batch, 1, 1, text_buckets);
-            scratch(ordinary, ops::sampling_workspace_capacity_bytes(
-                                  dimension(profile.public_tokens), batch, batch));
+            const auto vocabulary = dimension(profile.public_tokens);
+            scratch(ordinary,
+                    drafts ? ops::sampling_with_probability_workspace_capacity_bytes(vocabulary,
+                                                                                     batch, batch)
+                           : ops::sampling_workspace_capacity_bytes(vocabulary, batch, batch));
             out.ordinary_round = std::max(out.ordinary_round, finish(ordinary));
         }
     }
@@ -456,8 +463,8 @@ WorkspaceSpec build_workspace_plan(const SequencePlanImpl& plan) {
                                          {dimension(draft->attention.head_dim),
                                           dimension(draft->attention.num_attention_heads),
                                           dimension(draft->attention.num_key_value_heads)},
-                                         dimension(draft->sliding_window.value_or(0)),
-                                         text_buckets, batch, width, width),
+                                         dimension(draft->sliding_window.value_or(0)), text_buckets,
+                                         batch, width, width),
                                      ops::context_softmax_attention_workspace_capacity_bytes(
                                          {dimension(draft->attention.head_dim),
                                           dimension(draft->attention.num_attention_heads),
@@ -490,6 +497,11 @@ WorkspaceSpec build_workspace_plan(const SequencePlanImpl& plan) {
                                        ? profile.proposal->head
                                        : profile.draft->output_head;
                 linear_scratch(layout, head, drafts * batch, drafts * batch);
+                const auto valid = plan.proposal_head == ProposalHead::Optimized
+                                       ? std::min(profile.public_tokens, profile.proposal->rows)
+                                       : profile.public_tokens;
+                scratch(layout, ops::argmax_with_probability_workspace_capacity_bytes(
+                                    dimension(valid), drafts * batch));
                 return finish(layout);
             };
 
@@ -584,17 +596,17 @@ void validate_target_options(const execution::ModelProfile& profile, DeviceConte
 
 std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlanningInputs& inputs,
                                                            std::size_t context_bytes) {
-    auto impl                               = std::make_unique<SequencePlanImpl>();
-    impl->batch_execution                   = inputs.batch_execution;
-    impl->profile                           = inputs.profile;
-    impl->moe                               = inputs.moe;
-    impl->capacity                          = inputs.capacity;
-    impl->context_bytes                     = context_bytes;
-    impl->max_concurrency                   = inputs.max_concurrency;
-    impl->prefill_chunk                     = inputs.prefill_chunk;
-    impl->draft_window                      = inputs.draft_window;
-    impl->speculative_backend               = inputs.speculative_backend;
-    impl->decode_routes = std::make_shared<const speculative::DecodeGraphRoutes>(
+    auto impl                 = std::make_unique<SequencePlanImpl>();
+    impl->batch_execution     = inputs.batch_execution;
+    impl->profile             = inputs.profile;
+    impl->moe                 = inputs.moe;
+    impl->capacity            = inputs.capacity;
+    impl->context_bytes       = context_bytes;
+    impl->max_concurrency     = inputs.max_concurrency;
+    impl->prefill_chunk       = inputs.prefill_chunk;
+    impl->draft_window        = inputs.draft_window;
+    impl->speculative_backend = inputs.speculative_backend;
+    impl->decode_routes       = std::make_shared<const speculative::DecodeGraphRoutes>(
         *impl->batch_execution, impl->speculative_backend, impl->draft_window);
     impl->proposal_head                     = inputs.proposal_head;
     impl->features                          = inputs.features;

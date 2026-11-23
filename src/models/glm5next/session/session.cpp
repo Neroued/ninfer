@@ -1,4 +1,5 @@
 #include "models/glm5next/session/internal.h"
+#include "core/paged_kv_geometry.h"
 
 #include <algorithm>
 
@@ -6,8 +7,11 @@ namespace ninfer::models::glm5next::detail {
 
 SessionImpl::SessionImpl(std::shared_ptr<const ModelDefinition> model, SessionPlan prepared,
                          std::unique_ptr<context::ContextDirectory> prepared_directory)
-    : definition(std::move(model)), plan(std::move(prepared)), shape(plan.shape),
-      directory_owner(std::move(prepared_directory)), directory(*directory_owner),
+    : definition(std::move(model)), plan(std::move(prepared)),
+      cost_model({plan.shape.speculative, plan.shape.draft_tokens, plan.batches->attention_owners(),
+                  definition->config().text.moe.experts, definition->config().text.moe.top_k, 0}),
+      shape(plan.shape), directory_owner(std::move(prepared_directory)),
+      directory(*directory_owner),
       recovery_metadata(directory.metadata_budget(),
                         shape.purpose == EnginePurpose::Generation ? shape.max_concurrency : 0,
                         plan.states.size(), plan.states.size()),
@@ -183,7 +187,7 @@ PreparedSession prepare_session(std::shared_ptr<const ModelDefinition> definitio
     if (!plan.batches || plan.batches->resident_capacity() != plan.shape.max_concurrency ||
         plan.batches->attention_owners() != plan.states.size())
         throw std::invalid_argument("GLM Session batch plan differs from prepared state");
-    plan.decode_routes  = make_decode_routes(plan.shape, *plan.batches);
+    plan.decode_routes = make_decode_routes(plan.shape, *plan.batches);
     return PreparedSession(std::make_unique<detail::SessionImpl>(
         std::move(definition), std::move(plan), std::move(directory)));
 }
@@ -203,6 +207,55 @@ std::span<const runtime::KvPoolDescriptor> Session::kv_pools() const noexcept {
 }
 
 PhysicalUsageSnapshot Session::physical_usage() const noexcept { return impl_->usage(); }
+
+std::optional<runtime::ExecutionTicket>
+Session::start_decode_probe(std::span<const SequenceHandle> members,
+                            const speculative::RoundRoute& route,
+                            std::span<const std::uint32_t> extents,
+                            std::span<const std::uint8_t> constrained, bool record_online_cost) {
+    return start_decode_round(
+        members, {.extents = extents, .route = &route, .record_online_cost = record_online_cost},
+        constrained);
+}
+
+std::optional<runtime::ExecutionTicket>
+Session::start_decode_extents(std::span<const SequenceHandle> members,
+                              std::span<const std::uint32_t> extents,
+                              std::span<const std::uint8_t> constrained) {
+    return start_decode_round(members, {.extents = extents}, constrained);
+}
+
+speculative::CostModelSummary Session::speculative_cost_summary() const noexcept {
+    return impl_->cost_model.summary();
+}
+
+speculative::CalibrationConstraints Session::calibration_constraints() const {
+    const auto& p = *impl_;
+    return {.model           = p.cost_model.config(),
+            .batches         = p.plan.batches.get(),
+            .path            = p.plan.decode_routes ? ExecutionPath::Graph : ExecutionPath::Eager,
+            .routes          = p.plan.decode_routes.get(),
+            .max_concurrency = p.shape.max_concurrency,
+            .max_context     = p.shape.max_context,
+            .kv_page_tokens  = kPagedKVPageSize,
+            .available_kv_pages =
+                speculative::available_calibration_pages(p.directory, placement_descriptions())};
+}
+
+std::optional<speculative::CostQuery>
+Session::decode_cost_query(runtime::ExecutionTicket ticket) const noexcept {
+    const auto& active = impl_->compute;
+    return active && active->ticket == ticket ? active->cost_query : std::nullopt;
+}
+
+void Session::fit_speculative_cost_model(std::span<const speculative::TimedCostAnchor> anchors,
+                                         double elapsed_ms) {
+    impl_->cost_model.fit(anchors, elapsed_ms);
+}
+
+std::uint32_t Session::decode_frontier(SequenceHandle handle) const {
+    return impl_->sequence(handle).continuation.metadata.main_frontier;
+}
 
 bool Session::has_context_operation() const noexcept {
     return impl_->operation || impl_->pending_maintenance || impl_->release_ticket ||

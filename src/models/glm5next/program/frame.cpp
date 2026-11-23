@@ -79,8 +79,8 @@ void control_layout(LayoutBuilder& b, FrameLayout& out, PhysicalBatchShape shape
     global.accepted_columns = rows();
     global.count_columns    = rows();
     if (out.mtp) out.mtp->skip_first = rows();
-    local.accepted_columns  = locals();
-    local.active_columns    = locals();
+    local.accepted_columns = locals();
+    local.active_columns   = locals();
     if (out.speculative) out.speculative->last_columns = rows();
     const auto commit_end = b.finish(256);
     out.commit_ingress    = {global.accepted_columns.region.offset,
@@ -120,6 +120,13 @@ void reshape_frame_controls(FrameLayout& out, PhysicalBatchShape shape) {
                                             256, "generated tokens");
         out.output_counts =
             output.add_tensor(DType::I32, {dimension(shape.rows)}, 256, "generated token counts");
+        if (out.speculative) {
+            const auto rows = dimension(shape.rows), steps = dimension(width - 1);
+            out.top1_probabilities =
+                output.add_tensor(DType::FP32, {rows}, 256, "target top-1 probabilities");
+            out.draft_confidences =
+                output.add_tensor(DType::FP32, {rows * steps}, 256, "draft confidences");
+        }
         out.result_egress = {begin, output.finish() - begin, 256};
         if (out.speculative)
             out.speculative->drafts = output.add_tensor(
@@ -233,8 +240,9 @@ FrameLayout plan_frame(LayoutBuilder& b, const execution::ModelProfile& p,
         const auto& end      = out.grammar_masks->region;
         out.sampling_ingress = {begin, end.offset + end.bytes - begin, 256};
         if (p.local.size > 1) {
-            constexpr int n = DistributedVocabulary::candidates;
-            out.candidates  = tensor(DType::I64, {n, width, batch}, "local vocabulary candidates");
+            const int n    = out.speculative ? DistributedVocabulary::candidates_with_lse
+                                             : DistributedVocabulary::candidates;
+            out.candidates = tensor(DType::I64, {n, width, batch}, "local vocabulary candidates");
             out.gathered_candidates = tensor(DType::I64, {n, width, batch, dimension(p.local.size)},
                                              "gathered vocabulary candidates");
         }
@@ -242,6 +250,11 @@ FrameLayout plan_frame(LayoutBuilder& b, const execution::ModelProfile& p,
         out.output_counts = rows();
         const auto first  = out.sampled_ids->region.offset;
         auto last         = out.output_counts->region;
+        if (out.speculative) {
+            out.top1_probabilities = tensor(DType::FP32, {batch}, "target top-1 probabilities");
+            out.draft_confidences = tensor(DType::FP32, {batch * (width - 1)}, "draft confidences");
+            last                  = out.draft_confidences->region;
+        }
         out.result_egress = {first, last.offset + last.bytes - first, 256};
         if (out.speculative) {
             out.speculative->drafts = out.mtp

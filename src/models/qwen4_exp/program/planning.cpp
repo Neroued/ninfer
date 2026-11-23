@@ -83,9 +83,9 @@ ExecutionPlan physical_plan(std::shared_ptr<const execution::ModelProfile> profi
     if (!batches || batches->resident_capacity() != o.max_concurrency ||
         batches->attention_owners() != 1)
         throw std::invalid_argument("Qwen4Exp batch plan differs from execution configuration");
-    out.batches           = std::move(batches);
-    out.profile           = std::move(profile);
-    out.shape             = describe_execution_shape(*out.profile, o);
+    out.batches = std::move(batches);
+    out.profile = std::move(profile);
+    out.shape   = describe_execution_shape(*out.profile, o);
     if (out.shape.cuda_graph)
         out.decode_routes = std::make_shared<const speculative::DecodeGraphRoutes>(
             *out.batches, o.speculative.backend, out.shape.draft_tokens);
@@ -117,7 +117,8 @@ ExecutionPlan physical_plan(std::shared_ptr<const execution::ModelProfile> profi
     if (out.persistent.buffers.sampled_ids) {
         out.pinned_sampling_bytes = out.persistent.buffers.grammar_masks->region.bytes;
         const auto& buffers       = out.persistent.buffers;
-        const auto end            = *buffers.output_counts;
+        const auto& end =
+            buffers.draft_confidences ? *buffers.draft_confidences : *buffers.output_counts;
         out.pinned_output_bytes =
             end.region.offset + end.region.bytes - buffers.sampled_ids->region.offset;
     }

@@ -314,7 +314,8 @@ void propose_dflash2_batch(DraftExecutionView& execution, const DraftInputs& inp
                 auto tensors = dflash2_attention(work, config.attention, width, batch);
                 Tensor query_flat =
                     tensors.query.view({dimension(config.attention.query_width()), columns});
-                Tensor key_flat = tensors.key.view({dimension(config.attention.key_width()), columns});
+                Tensor key_flat =
+                    tensors.key.view({dimension(config.attention.key_width()), columns});
                 Tensor value_flat =
                     tensors.value.view({dimension(config.attention.key_width()), columns});
                 std::array outputs{query_flat, key_flat, value_flat};
@@ -376,7 +377,7 @@ void propose_dflash2_batch(DraftExecutionView& execution, const DraftInputs& inp
             projected.view({dimension(config.dflash2->selector_rank), g, batch}), anchors,
             weights.selector->predecessor_codebook, weights.selector->successor_codebook,
             dimension(execution.parameters.profile->public_tokens), frontiers, inputs.sampling,
-            drafts, proposal_q, inputs.live_rows, work, cuda);
+            drafts, proposal_q, outputs.confidences, inputs.live_rows, work, cuda);
     }
 }
 
@@ -393,12 +394,12 @@ void propose_batch_impl(DraftExecutionView& execution, const DraftInputs& inputs
         const std::int32_t columns = width * batch_size;
         nvtx::ScopedRange proposal_range(nvtx::Name::DFlashProposal, nvtx::Category::DFlash,
                                          static_cast<std::uint64_t>(columns));
-        Tensor anchors            = inputs.anchors;
-        Tensor frontiers          = inputs.frontiers;
-        Tensor valid_columns      = inputs.valid_columns;
-        Tensor ids                = outputs.ids;
-        Tensor positions          = outputs.positions;
-        Tensor drafts             = outputs.drafts;
+        Tensor anchors       = inputs.anchors;
+        Tensor frontiers     = inputs.frontiers;
+        Tensor valid_columns = inputs.valid_columns;
+        Tensor ids           = outputs.ids;
+        Tensor positions     = outputs.positions;
+        Tensor drafts        = outputs.drafts;
 
         ops::prepare_masked_block(anchors, frontiers, valid_columns,
                                   dimension(config.mask_token_id), ids, positions, execution.cuda);
@@ -448,10 +449,9 @@ void propose_batch_impl(DraftExecutionView& execution, const DraftInputs& inputs
                              execution.cuda);
                 ops::rope(positions.view({columns}), dimension(config.attention.head_dim),
                           config.rope_theta, query, key, execution.cuda);
-                submit_layer_attention(
-                    execution, inputs, positions,
-                    dflash_attention(roots, config.attention, width, batch_size), layer, buckets,
-                    submit);
+                submit_layer_attention(execution, inputs, positions,
+                                       dflash_attention(roots, config.attention, width, batch_size),
+                                       layer, buckets, submit);
                 project_add(
                     roots.attention.view({dimension(config.attention.query_width()), columns}),
                     weight.output, residual, execution.work, execution.cuda);
@@ -488,13 +488,15 @@ void propose_batch_impl(DraftExecutionView& execution, const DraftInputs& inputs
         ops::rmsnorm(packed, execution.parameters.draft->final_norm, config.rms_norm_eps, false,
                      proposal_hidden, execution.cuda);
         Tensor flat_drafts = drafts.view({g * batch_size});
+        Tensor confidences = outputs.confidences.view({g * batch_size});
         if (execution.proposal_head == ProposalHead::Full) {
             Tensor logits =
                 execution.work.alloc(DType::BF16, {dimension(target.vocab_size), g * batch_size});
             project(proposal_hidden, execution.parameters.draft->output_head, logits,
                     execution.work, execution.cuda);
-            ops::argmax(logits, flat_drafts, dimension(execution.parameters.profile->public_tokens),
-                        execution.cuda);
+            ops::argmax_with_probability(logits, flat_drafts, confidences,
+                                         dimension(execution.parameters.profile->public_tokens),
+                                         execution.work, execution.cuda);
         } else {
             if (!execution.parameters.proposal.has_value()) {
                 throw std::logic_error("optimized DFlash proposal head is unavailable");
@@ -503,10 +505,11 @@ void propose_batch_impl(DraftExecutionView& execution, const DraftInputs& inputs
             Tensor logits =
                 execution.work.alloc(DType::BF16, {dimension(proposal.rows), g * batch_size});
             project(proposal_hidden, proposal.head, logits, execution.work, execution.cuda);
-            ops::argmax(logits, flat_drafts,
-                        proposal.token_ids ? dimension(proposal.rows)
-                                           : dimension(execution.parameters.profile->public_tokens),
-                        execution.cuda);
+            ops::argmax_with_probability(
+                logits, flat_drafts, confidences,
+                proposal.token_ids ? dimension(proposal.rows)
+                                   : dimension(execution.parameters.profile->public_tokens),
+                execution.work, execution.cuda);
             if (proposal.token_ids)
                 ops::remap_ids_inplace(flat_drafts,
                                        static_cast<const std::int32_t*>(proposal.token_ids->data),

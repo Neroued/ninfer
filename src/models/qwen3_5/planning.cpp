@@ -189,6 +189,8 @@ SessionPlan plan_session(const SequencePlan& sequence) {
     out.prefill_chunk       = source.prefill_chunk;
     out.draft_window        = source.draft_window;
     out.speculative_backend = source.speculative_backend;
+    if (source.moe && !source.moe->description().layers.empty())
+        out.hybrid_max_tokens = source.moe->description().layers.front().hybrid_max_tokens;
     out.context_cache       = source.context_cache;
     out.kv_storage          = source.kv_storage;
     out.proposal_head       = source.proposal_head;

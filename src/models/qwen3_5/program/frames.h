@@ -62,6 +62,7 @@ struct FrameCommitLayout {
 
 struct FrameEgressLayout {
     TensorRegion tokens, counts;
+    std::optional<TensorRegion> top1_probabilities, draft_confidences;
     std::size_t bytes = 0;
 };
 
@@ -108,6 +109,7 @@ struct FrameCommitView {
 struct FrameEgressView {
     std::span<TokenId> tokens;
     std::span<std::int32_t> counts;
+    std::span<float> top1_probabilities, draft_confidences;
 };
 
 [[nodiscard]] FrameControlLayout plan_frame_controls(const FrameSpec&, std::uint32_t rows);
@@ -248,7 +250,7 @@ public:
     Tensor decode_positions, decode_rope;
     Tensor commit_destination_offsets, last_columns, count_columns, accepted_columns;
     Tensor draft_append_starts, draft_append_ends;
-    Tensor output_tokens, output_counts;
+    Tensor output_tokens, output_counts, top1_probabilities, draft_confidences;
     Tensor input_ids, cache_positions, rope_positions, hidden;
     Tensor input_embeddings;
     Tensor visual_indices;

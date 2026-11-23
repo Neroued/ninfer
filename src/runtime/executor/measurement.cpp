@@ -15,6 +15,7 @@ void RankMeasurement::validate(MeasurementCommand command) const {
         throw std::invalid_argument("profiling can only be enabled when beginning a measurement");
     switch (command.action) {
     case MeasurementAction::Reset:
+    case MeasurementAction::ResetStartup:
     case MeasurementAction::Begin:
         if (active_) throw std::logic_error("a measurement window is already active");
         break;

@@ -34,7 +34,8 @@ public:
                 fixed.calls[op] -= d * calls;
                 fixed.payload_bytes[op] -= d * bytes;
             };
-            subtract(0, attention_dp ? 2 : 3, (attention_dp ? 2ULL : 4ULL) * hidden * p + 8 * p);
+            subtract(0, attention_dp ? 1 : 2, (attention_dp ? 2ULL : 4ULL) * hidden * p);
+            subtract(2, 1, 16 * p);
             if (attention_dp) subtract(2, 1, 2ULL * hidden * l);
             const auto [it, inserted] = fixed_.try_emplace({r, p, l, g.verify_width}, fixed);
             if (!inserted && (it->second.calls != fixed.calls ||

@@ -18,7 +18,7 @@ ExecutionCodec::ExecutionCodec(const ModelDefinition& definition,
                 static_cast<std::uint32_t>(definition.resources().text.control_tokens->size()),
                 {}} {
     contract_.decode_routes = make_decode_routes(rank.shape, *contract_.batches);
-    scope_.result_owner = topology.output_rank;
+    scope_.result_owner     = topology.output_rank;
     for (const auto& r : topology.ranks) scope_.owners.push_back(r.rank);
     scope_.validate(topology);
     const std::size_t batch = rank.shape.max_concurrency;
@@ -27,8 +27,8 @@ ExecutionCodec::ExecutionCodec(const ModelDefinition& definition,
     const auto width    = std::size_t(rank.shape.draft_tokens) + 1;
     const auto event =
         runtime::protocol::rank_execution_observation_capacity() + 128 +
-        std::max<std::size_t>({batch * (24 + 4 * width), 4ULL * rank.shape.prefill_chunk,
-                               64ULL * 5 * (pools + 1) * ranks});
+        std::max<std::size_t>({payloads.compute_result, batch * (24 + 4 * width),
+                               4ULL * rank.shape.prefill_chunk, 64ULL * 5 * (pools + 1) * ranks});
     auto snapshot = rank.observation;
     snapshot.physical_memory.emplace();
     snapshot.communication.clear();

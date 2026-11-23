@@ -5,6 +5,7 @@
 #include "runtime/observability/execution.h"
 #include "ninfer/types.h"
 
+#include <algorithm>
 #include <stdexcept>
 
 namespace ninfer::runtime {
@@ -36,6 +37,20 @@ public:
     [[nodiscard]] virtual bool has_pending_work() const noexcept          = 0;
     virtual void measure(MeasurementCommand command)                      = 0;
     virtual void observe_in_flight(std::vector<ExecutionProgress>&) const = 0;
+
+    void reset_startup_observations() {
+        measure({MeasurementAction::ResetStartup});
+        execution_statistics_ = {};
+        std::ranges::fill(decode_statistics_, ExecutionCounters{});
+        for (auto& rank : observations_) {
+            rank.host                = {};
+            rank.gpu_intervals       = {};
+            rank.attention           = {};
+            rank.communication_eager = {};
+            rank.communication_graph = {};
+            rank.compute_paths       = {};
+        }
+    }
 
     [[nodiscard]] std::span<const RankSnapshot> observations() const noexcept {
         return observations_;

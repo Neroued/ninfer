@@ -51,18 +51,19 @@ struct MtpDraftStep {
 };
 
 MtpDraftStep mtp_draft_step(ExecutionFrame& frame, int batch, std::uint32_t step) {
-    auto& mtp = *frame.mtp;
-    const auto hidden = frame.spec.hidden;
-    const auto input = mtp.step_view(static_cast<int>(step), batch);
-    const auto ids = step == 0 ? frame.anchors.slice(0, 0, batch)
-                               : mtp.step_view(static_cast<int>(step - 1), batch).ids;
-    const auto conditioning =
-        step == 0 ? mtp.base_conditioning : step % 2 ? mtp.ar_hidden : mtp.next_hidden;
-    return {
-        {ids.view({1, batch}), packed(conditioning, {hidden, 1, batch}),
-         input.positions.view({1, batch}), input.rope_positions, input.valid_columns,
-         frame.backend_table_rows.slice(0, 0, batch)},
-        packed(step % 2 ? mtp.next_hidden : mtp.ar_hidden, {hidden, 1, batch}), input.ids};
+    auto& mtp               = *frame.mtp;
+    const auto hidden       = frame.spec.hidden;
+    const auto input        = mtp.step_view(static_cast<int>(step), batch);
+    const auto ids          = step == 0 ? frame.anchors.slice(0, 0, batch)
+                                        : mtp.step_view(static_cast<int>(step - 1), batch).ids;
+    const auto conditioning = step == 0  ? mtp.base_conditioning
+                              : step % 2 ? mtp.ar_hidden
+                                         : mtp.next_hidden;
+    return {{ids.view({1, batch}), packed(conditioning, {hidden, 1, batch}),
+             input.positions.view({1, batch}), input.rope_positions, input.valid_columns,
+             frame.backend_table_rows.slice(0, 0, batch)},
+            packed(step % 2 ? mtp.next_hidden : mtp.ar_hidden, {hidden, 1, batch}),
+            input.ids};
 }
 
 } // namespace
@@ -99,25 +100,27 @@ void RankProgramImpl::gather_mtp_conditioning(std::uint32_t batch) {
 }
 
 void RankProgramImpl::bind_mtp_draft_step(std::uint32_t batch, std::uint32_t step,
-                                         const execution::CausalAttentionSubmit& submit) {
+                                          const execution::CausalAttentionSubmit& submit) {
     const auto binding = mtp_draft_step(resources.frame, static_cast<int>(batch), step);
     execution::bind_mtp_attention_readout(
-        mtp_view(parameters, resources, device.execution_view(), proposal_head),
-        binding.inputs, submit);
+        mtp_view(parameters, resources, device.execution_view(), proposal_head), binding.inputs,
+        submit);
 }
 
 void RankProgramImpl::run_mtp_draft_step(std::uint32_t batch_size, std::uint32_t step,
-                                        ops::ContextBucket bucket,
-                                        const execution::CausalAttentionSubmit& submit) {
+                                         ops::ContextBucket bucket,
+                                         const execution::CausalAttentionSubmit& submit) {
     const auto batch = static_cast<int>(batch_size);
-    auto& frame = resources.frame;
-    auto binding = mtp_draft_step(frame, batch, step);
-    const auto mtp = mtp_view(parameters, resources, device.execution_view(), proposal_head);
-    auto logits = packed(frame.mtp->proposal_logits,
-                         {execution::dimension(parameters.profile->config.text.vocab_size), batch});
-    auto scope = resources.work.scope();
+    auto& frame      = resources.frame;
+    auto binding     = mtp_draft_step(frame, batch, step);
+    const auto mtp   = mtp_view(parameters, resources, device.execution_view(), proposal_head);
+    auto logits      = packed(frame.mtp->proposal_logits,
+                              {execution::dimension(parameters.profile->config.text.vocab_size), batch});
+    auto scope       = resources.work.scope();
     execution::mtp_forward(mtp, binding.inputs, bucket, binding.hidden, submit);
-    execution::mtp_propose(mtp, binding.hidden.view({frame.spec.hidden, batch}), logits, binding.ids);
+    auto confidences = frame.draft_confidences.slice(0, step * batch, batch);
+    execution::mtp_propose(mtp, binding.hidden.view({frame.spec.hidden, batch}), logits,
+                           binding.ids, confidences);
 }
 
 void RankProgramImpl::align_mtp_history(ComputeOperation& operation) {
@@ -130,7 +133,7 @@ void RankProgramImpl::align_mtp_history(ComputeOperation& operation) {
     const auto width         = static_cast<std::int32_t>(operation.width);
     const auto hidden        = execution::dimension(parameters.profile->config.text.hidden_size);
     const auto skip          = operation.rows[operation.forward_row].main_frontier == 0 ? 1 : 0;
-    auto history_width = width - skip;
+    auto history_width       = width - skip;
     if (history_width == 0) return;
 
     const auto main   = frame.input_view(width, batch);
@@ -167,12 +170,12 @@ void RankProgramImpl::align_mtp_history(ComputeOperation& operation) {
 }
 
 void RankProgramImpl::rebuild_mtp_history(std::uint32_t batch_size, std::uint32_t verify_width) {
-    auto& frame       = resources.frame;
-    auto& mtp         = *frame.mtp;
-    const auto cuda   = device.execution_view();
-    const auto batch  = static_cast<std::int32_t>(batch_size);
-    const auto width  = static_cast<std::int32_t>(verify_width);
-    const auto count  = std::max(1, width - 1);
+    auto& frame      = resources.frame;
+    auto& mtp        = *frame.mtp;
+    const auto cuda  = device.execution_view();
+    const auto batch = static_cast<std::int32_t>(batch_size);
+    const auto width = static_cast<std::int32_t>(verify_width);
+    const auto count = std::max(1, width - 1);
     if (width == 1) gather_conditioning(resources, batch, cuda);
     const auto hidden = execution::dimension(parameters.profile->config.text.hidden_size);
     const auto main   = frame.decode_view(width, batch);

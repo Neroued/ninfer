@@ -90,7 +90,7 @@ public:
     [[nodiscard]] execution::TextRun text_run(const execution::BatchView&, execution::StateUpdate);
     [[nodiscard]] execution::MtpRun mtp_run(std::uint32_t step, const execution::BatchView&);
     [[nodiscard]] execution::MlaSelection mtp_selection(std::uint32_t step, int local);
-    void copy_result(int rows, bool verify);
+    void copy_result(int rows, bool verify, SampleKind kind = SampleKind::NextToken);
     void prepare_speculative();
     void mtp_forward(std::uint32_t step, const execution::BatchView&,
                      const execution::MlaSubmit& = {});

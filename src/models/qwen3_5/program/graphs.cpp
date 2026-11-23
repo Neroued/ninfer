@@ -493,7 +493,7 @@ GraphPreparationSample RankProgramImpl::initialize_graphs(GraphPreparationMode m
     bindings.decision = [&](const speculative::RoundRoute& route) {
         auto scope = resources.work.scope();
         decide_decode(route);
-        readback_decode(route.shape.rows, route.width > 1);
+        readback_result(route.shape.rows, &route);
     };
     if (backend == SpeculativeBackend::Mtp)
         bindings.commit = [&](const speculative::RoundRoute& route, const SectionRecorder& repair,

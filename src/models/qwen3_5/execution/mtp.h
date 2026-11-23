@@ -50,8 +50,10 @@ void bind_mtp_attention_readout(MtpExecutionView, const MtpInputs&, const Causal
 void mtp_history(MtpExecutionView state, const MtpInputs& inputs,
                  ops::KVCacheAppendPrefixExecutionEnvelope envelope);
 
-// hidden is BF16 [H,C] and ids is I32 [C]. Full uses caller-owned BF16 [V,C] logits;
+// hidden is BF16 [H,C], ids is I32 [C] and confidences is FP32 [C].
+// Full uses caller-owned BF16 [V,C] logits;
 // Optimized uses its selected proposal head and optional token-ID map, leaving full_logits alone.
-void mtp_propose(MtpExecutionView state, const Tensor& hidden, Tensor& full_logits, Tensor& ids);
+void mtp_propose(MtpExecutionView state, const Tensor& hidden, Tensor& full_logits, Tensor& ids,
+                 Tensor& confidences);
 
 } // namespace ninfer::models::qwen3_5::execution

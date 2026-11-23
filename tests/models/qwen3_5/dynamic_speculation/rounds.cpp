@@ -172,12 +172,10 @@ void exercise_rounds(NativeRankFixture& fixture, models::qwen::Frontend& fronten
         const auto active = std::span{members}.first(batch);
         for (auto& extent : extents) extent = std::min(extent, k);
         std::vector<q::ExecutionUnit> units(batch);
-        std::vector<runtime::RoundBudget> budgets(batch);
         std::vector<std::uint8_t> constraints(batch, 1);
         if (batch == 3 && !extents.back() && !cancel_last) constraints.back() = 0;
         for (std::size_t i = 0; i < batch; ++i) {
-            units[i]   = {active[i], q::ExecutionUnitKind::Decode, 1};
-            budgets[i] = {extents[i] + 1};
+            units[i] = {active[i], q::ExecutionUnitKind::Decode, 1};
         }
         check(bool(session.reserve_units(units)), "required anchor grant failed");
         PendingFeatures old(fixture, session, active);
@@ -186,26 +184,26 @@ void exercise_rounds(NativeRankFixture& fixture, models::qwen::Frontend& fronten
             CUDA_CHECK(cudaMemset(drafts.data, 0xff, drafts.bytes()));
         }
         const auto before_launch = graph_launch_count;
-        auto pending =
-            driver.decode(active, budgets, constraints, [&](const runtime::DecisionRequest& r) {
+        auto pending             = driver.decode_extents(
+            active, extents, constraints, [&](const runtime::DecisionRequest& r) {
                 // The target has launched and the constrained decision has not been supplied yet.
                 if (path == ExecutionPath::Graph)
                     check(graph_launch_count == before_launch + 1,
-                          "resident round submitted more than one proposal/target graph");
+                                      "resident round submitted more than one proposal/target graph");
                 if (backend == SpeculativeBackend::Mtp && path == ExecutionPath::Graph &&
                     std::ranges::max(extents)) {
                     check(last_graph_launch != nullptr, "missing target graph launch");
                     const auto it = shared_verify.try_emplace(batch, last_graph_launch).first;
                     check(it->second == last_graph_launch,
-                          "MTP depths launched different target executables");
+                                      "MTP depths launched different target executables");
                 }
                 runtime::DecisionInput masks{.stage = r.stage};
                 check(r.rows.size() == std::ranges::count(constraints, 1),
-                      "grammar included an unconstrained row");
+                                  "grammar included an unconstrained row");
                 for (const auto& row : r.rows) {
                     const unsigned i = row.member;
                     check(row.drafts.size() == extents[i],
-                          "grammar received a wrong proposal prefix");
+                                      "grammar received a wrong proposal prefix");
                     auto& mask        = masks.rows.emplace_back();
                     mask.member       = i;
                     mask.positions    = row.drafts.size() + 1;
@@ -341,8 +339,9 @@ void exercise_rounds(NativeRankFixture& fixture, models::qwen::Frontend& fronten
         if (!one.reservations) break;
         occupied.emplace_back(std::move(one.reservations->front()));
     }
-    const std::array limits{runtime::RoundBudget{k + 1}, runtime::RoundBudget{k + 1}};
-    auto limited = driver.decode(tight, limits);
+    check(!session.start_decode_extents(tight, std::array{k, k}),
+          "exact decode accepted an extent beyond the available pages");
+    auto limited = driver.decode_extents(tight, std::array{0U, std::min(k, 3U)});
     const auto& frozen =
         *std::get<q::DecodeWork>(fixture.rank().compute->request.work.operation).plan;
     check(std::ranges::equal(frozen.verify_drafts(), std::array{0U, std::min(k, 3U)}),
@@ -362,8 +361,7 @@ void exercise_rounds(NativeRankFixture& fixture, models::qwen::Frontend& fronten
     if (session.requests[0].capture_pending) session.skip_capture(seed[0]);
     const std::array seed_unit{q::ExecutionUnit{seed[0], q::ExecutionUnitKind::Decode, 1}};
     check(bool(session.reserve_units(seed_unit)), "prefix producer permit");
-    const std::array seed_budget{runtime::RoundBudget{k + 1}};
-    auto output = driver.decode(seed, seed_budget);
+    auto output = driver.decode_extents(seed, std::array{k});
     const std::array end{runtime::CommitDecision{.accepted_tokens = 1, .terminal = true}};
     (void)driver.commit(std::move(output), end);
     const auto& writer = session.active_sequence(0);

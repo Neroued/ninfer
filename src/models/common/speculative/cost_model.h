@@ -58,6 +58,8 @@ public:
 
     explicit SpeculativeCostModel(CostModelConfig);
 
+    [[nodiscard]] const CostModelConfig& config() const noexcept { return config_; }
+
     [[nodiscard]] Features features(const CostQuery&) const;
 
     [[nodiscard]] const Features& weights() const noexcept { return weights_; }

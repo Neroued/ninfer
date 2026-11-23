@@ -597,10 +597,16 @@ void native_work() {
     rejects([&] { contract.validate(work, extra, masks); });
     masks.rows[0].words.pop_back();
     rejects([&] { contract.validate(work, request, masks); });
-    q::ComputeResult result{{{0, 2, 1, {5, 6}, 0}}};
+    q::ComputeResult result{{{.drafts            = 2,
+                              .accepted_drafts   = 1,
+                              .tokens            = {5, 6},
+                              .draft_confidences = {0.875f, 0.125f}}}};
     q::Commit commit{
         {{original.member, {{0, {2048, 6144}}, {1, {8192, 24576}}}, 2, false, false, false}}, {}};
     contract.validate(work, q::Result{result}, commit);
+    auto invalid_result = result;
+    invalid_result.rows[0].draft_confidences.pop_back();
+    rejects([&] { contract.validate(work, q::Result{invalid_result}, commit); });
     commit.rows[0].accepted = 1;
     rejects([&] { contract.validate(work, q::Result{result}, commit); });
     commit.rows[0].terminal = true;
@@ -630,8 +636,11 @@ void native_work() {
     const auto result_bytes = std::move(encoded_result).take();
     wire::Decoder result_input(result_bytes);
     const auto received_result = std::get<q::ComputeResult>(q::decode_result(result_input));
+    result_input.finish();
     require(received_result.rows[0].tokens == result.rows[0].tokens &&
-                received_result.rows[0].accepted_drafts == result.rows[0].accepted_drafts,
+                received_result.rows[0].accepted_drafts == result.rows[0].accepted_drafts &&
+                received_result.rows[0].draft_confidences == result.rows[0].draft_confidences &&
+                !received_result.rows[0].target_top1_probability,
             "result changed in transit");
 }
 

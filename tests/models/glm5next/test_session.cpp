@@ -112,8 +112,13 @@ public:
                     r.drafts          = mtp->draft_extents[b];
                     r.accepted_drafts = accept.empty() ? r.drafts : std::min(accept[b], r.drafts);
                     r.tokens.resize(r.accepted_drafts + 1, 0);
-                } else if (forward->sample != glm::SampleKind::None)
+                    r.draft_confidences.resize(r.drafts, 0.75f);
+                } else if (forward->sample != glm::SampleKind::None) {
                     r.tokens = {static_cast<TokenId>(row.member.sequence.value % 2)};
+                    if (forward->sample == glm::SampleKind::NextToken &&
+                        contract.shape.draft_tokens)
+                        r.target_top1_probability = 0.75f;
+                }
                 result.rows.push_back(std::move(r));
             }
             if (forward && forward->kind == glm::ForwardKind::Replay && replay_submitted)
@@ -423,21 +428,18 @@ void expanded_membership(std::shared_ptr<const glm::ModelDefinition> definition)
         const auto depth = std::array{3U, 1U, 2U, 0U, k}[round++];
         f.executor.accept.resize(count);
         std::vector<glm::ExecutionUnit> units;
-        std::vector<rt::RoundBudget> budgets;
         std::vector<glm::SequenceHandle> ordered;
         std::vector<unsigned> drafts;
         for (std::uint32_t i = 0; i < count; ++i) {
             f.executor.accept[i] = i % 2;
             const auto h         = members[(i + 5) % members.size()];
-            const auto width = i == 0 ? depth : std::min(i % 4, depth);
-            const auto budget = width + 1;
+            const auto width     = i == 0 ? depth : std::min(i % 4, depth);
             drafts.push_back(width);
             ordered.push_back(h);
             units.push_back({h, glm::ExecutionUnitKind::Decode, 1});
-            budgets.push_back({budget});
         }
         require(bool(f.session.reserve_units(units)), "expanded decode reservation failed");
-        require(f.session.start_decode(ordered, budgets).has_value(),
+        require(f.session.start_decode_extents(ordered, drafts).has_value(),
                 "expanded decode not started");
         const auto& physical = glm::work_batch(f.executor.last);
         require(physical.shape == f.layout.batches->decode(count, count) &&
@@ -446,14 +448,15 @@ void expanded_membership(std::shared_ptr<const glm::ModelDefinition> definition)
                 "expanded work lost real membership or invented empty-rank rows");
         const auto described = glm::ExecutionTypes::describe_work(f.executor.last);
         const auto& geometry = described.speculative;
-        const auto target = std::accumulate(drafts.begin(), drafts.end(), std::uint64_t(count));
+        const auto target    = std::accumulate(drafts.begin(), drafts.end(), std::uint64_t(count));
         require(geometry && geometry->mtp_steps == depth &&
                     geometry->verify_width == (depth ? k + 1 : 1) &&
                     geometry->owner_target_tokens == std::vector<std::uint64_t>{target, 0} &&
                     geometry->valid_target_tokens == target,
                 "heterogeneous budgets changed the physical route or owner token count");
         if (depth)
-            require(std::get<glm::SpeculativeWork>(f.executor.last.operation).draft_extents == drafts,
+            require(std::get<glm::SpeculativeWork>(f.executor.last.operation).draft_extents ==
+                        drafts,
                     "GLM Session lost a heterogeneous verification extent");
         else
             require(std::holds_alternative<glm::ForwardWork>(f.executor.last.operation),
@@ -482,6 +485,31 @@ void expanded_membership(std::shared_ptr<const glm::ModelDefinition> definition)
     for (auto h : members) (void)f.session.abort(h);
     f.idle();
     require(f.session.physical_usage().state_objects == 0, "expanded membership retained State");
+}
+
+void calibrate_attention_owners(std::shared_ptr<const glm::ModelDefinition> definition) {
+    Fixture f(std::move(definition));
+    auto frontend           = glm::make_frontend(f.definition->resources(),
+                                                 {.vision_enabled = false, .max_context = 256});
+    f.executor.unit_time_ns = 1'000'000;
+
+    struct Instance {
+        using ModelContract = glm::RuntimeTypes;
+        glm::Frontend& frontend;
+        Executor* executor;
+        glm::Session* session;
+    } instance{frontend, &f.executor, &f.session};
+
+    rt::calibrate_speculative(instance, "aabbab");
+    const auto cost = f.session.speculative_cost_summary();
+    require(cost.fitted && cost.anchor_count && !cost.online_cell_count,
+            "two-owner calibration did not fit from isolated probes");
+    const auto usage = f.session.physical_usage();
+    require(f.executor.bindings == 2 + f.layout.shape.max_concurrency &&
+                !f.executor.has_pending_work() && !f.session.has_context_operation() &&
+                !usage.state_objects && !usage.history_objects &&
+                std::ranges::all_of(usage.kv_page_groups, [](auto pages) { return !pages; }),
+            "two-owner calibration did not create and release one root per owner");
 }
 
 struct CopyWork {
@@ -1029,8 +1057,9 @@ void owner_window_grants(std::shared_ptr<const glm::ModelDefinition> definition)
         if (!reserve || !reserve->ready()) break;
         held.push_back(reserve->materialize(1));
     }
-    const std::array budgets{rt::RoundBudget{4}, rt::RoundBudget{4}};
-    require(f.session.start_decode(members, budgets).has_value(),
+    require(!f.session.start_decode_extents(members, std::array{3u, 3u}),
+            "an exact extent exceeded its owner's KV grant");
+    require(f.session.start_decode_extents(members, std::array{0u, 3u}).has_value(),
             "optional growth blocked the batch");
     const auto& work = std::get<glm::SpeculativeWork>(f.executor.last.operation);
     require(work.draft_extents == std::vector<unsigned>{0, 3} &&
@@ -1079,11 +1108,9 @@ void mtp_transactions(std::shared_ptr<const glm::ModelDefinition> definition) {
         const std::array units{glm::ExecutionUnit{a, glm::ExecutionUnitKind::Decode, 1},
                                glm::ExecutionUnit{b, glm::ExecutionUnitKind::Decode, 1}};
         require(bool(f.session.reserve_units(units)), "MTP capacity not reserved");
-        std::array<rt::RoundBudget, 2> budgets;
-        budgets[0].generated_tokens_remaining = 4;
-        budgets[1].generated_tokens_remaining = 1;
-        f.executor.accept                     = {accepted, 0};
-        require(f.session.start_decode(members, budgets).has_value(), "MTP did not start");
+        f.executor.accept = {accepted, 0};
+        require(f.session.start_decode_extents(members, std::array{3u, 0u}).has_value(),
+                "MTP did not start");
         const auto& work = std::get<glm::SpeculativeWork>(f.executor.last.operation);
         require(work.draft_extents == std::vector<std::uint32_t>{3, 0} &&
                     glm::work_batch(f.executor.last).members == std::vector<std::uint32_t>{1, 0},
@@ -1564,6 +1591,7 @@ int main(int argc, char** argv) {
         cancelled_prefix_statistics(glm::read_definition(reader, {}));
         engine_pressure(glm::read_definition(reader, {}), false, true);
         auto mtp = glm::read_definition(reader, {.speculative = SpeculativeBackend::Mtp});
+        calibrate_attention_owners(mtp);
         expanded_membership(mtp);
         owner_window_grants(mtp);
         masked_block_at_context_boundary(

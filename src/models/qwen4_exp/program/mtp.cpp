@@ -123,11 +123,14 @@ void RankProgramImpl::draft_forward(std::uint32_t step, std::int32_t batch, std:
     auto logits =
         packed_tensor(*buffers.logits, {dimension(parameters.profile->local.vocabulary), batch});
     execution::project_head(sample, parameters.mtp->head, logits, resources.workspace, cuda);
-    auto ids = draft_output_ids(step, batch);
+    auto ids         = draft_output_ids(step, batch);
+    auto confidences = device_tensor(*buffers.draft_confidences).slice(1, step, 1).view({batch});
     if (parallel)
-        vocabulary_draft(logits, device_tensor(frame.draft_steps[step].valid_columns), ids);
+        vocabulary_draft(logits, device_tensor(frame.draft_steps[step].valid_columns), ids,
+                         confidences);
     else
-        ops::argmax(logits, ids, parameters.profile->public_tokens, cuda);
+        ops::argmax_with_probability(logits, ids, confidences, parameters.profile->public_tokens,
+                                     resources.workspace, cuda);
 }
 
 Tensor RankProgramImpl::draft_proposals(std::int32_t batch) {

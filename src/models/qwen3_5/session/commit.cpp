@@ -13,6 +13,15 @@ PendingBatch SessionImpl::generated_pending(const GeneratedResult& generated) {
         throw std::logic_error("generated result has an invalid shape");
     if (current.round && generated.row_stride != current.round->route().width)
         throw std::logic_error("decode result differs from its frozen width");
+    const auto stride =
+        current.round ? current.round->route().mtp_steps + current.round->route().head_columns : 0U;
+    const auto top1_rows         = current.round && draft_window && !stride ? batch : 0;
+    const auto valid_probability = [](float p) { return p >= 0.0f && p <= 1.0f; };
+    if (generated.draft_stride != stride || generated.draft_confidences.size() != batch * stride ||
+        generated.target_top1_probabilities.size() != top1_rows ||
+        !std::ranges::all_of(generated.draft_confidences, valid_probability) ||
+        !std::ranges::all_of(generated.target_top1_probabilities, valid_probability))
+        throw std::logic_error("generated probabilities differ from the decode round");
     PendingBatch out;
     out.ticket_    = current.ticket;
     out.members_   = current.members;
@@ -292,10 +301,23 @@ CommitResult SessionImpl::commit(PendingBatch&& pending,
             request.prefill.reset();
         }
         auto& stats = request.speculative_stats;
-        if (current.kind == OperationKind::Decode &&
+        if (current.kind == OperationKind::Decode && draft_window &&
             speculative_backend != SpeculativeBackend::None) {
             const auto drafted  = current.round->verify_drafts()[b];
             const auto accepted = current.generated->counts[b] - 1;
+            if (!d.cancelled && !d.failed) {
+                const auto& generated = *current.generated;
+                if (drafted)
+                    request.speculative_state.observe_speculative_round(
+                        drafted, accepted,
+                        std::span<const float>(generated.draft_confidences)
+                            .subspan(b * generated.draft_stride, drafted));
+                else
+                    request.speculative_state.observe_ordinary_round(
+                        generated.target_top1_probabilities.empty()
+                            ? std::nullopt
+                            : std::optional{generated.target_top1_probabilities[b]});
+            }
             stats.committed_draft_tokens += std::min(d.accepted_tokens, accepted);
             if (drafted)
                 ++stats.rounds;
@@ -386,6 +408,11 @@ void SessionImpl::retire(runtime::DeviceRetired event) {
     if (current.kind != OperationKind::Normalize && current.kind != OperationKind::Score)
         events.push_back({current.ticket, current.members,
                           runtime::ExecutionComplete{event.execution, current.members.size()}});
+    if (current.cost_query && current.record_online_cost && !current.discarded &&
+        std::ranges::none_of(current.decisions,
+                             [](const auto& d) { return d.cancelled || d.failed; }))
+        cost_model.observe_retired_step(*current.cost_query,
+                                        double(event.execution.latency.total_ns) * 1.0e-6);
     for (std::size_t b = 0; b < current.members.size(); ++b) {
         if (!valid_sequence(current.members[b])) continue;
         const auto l  = lane(current.members[b]);

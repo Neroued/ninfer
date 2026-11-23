@@ -1,6 +1,7 @@
 #pragma once
 
 #include "models/common/speculative/cost_model.h"
+#include "runtime/contract/execution.h"
 
 namespace ninfer::models::speculative {
 
@@ -37,6 +38,20 @@ select_adaptive_round(SpeculativeBackend backend, std::uint32_t max_drafts,
                       std::uint32_t owner_count, PhysicalBatchShape shape, ExecutionPath path,
                       const DecodeGraphRoutes* routes, const SpeculativeCostModel& cost_model,
                       std::span<const AdaptiveRowInput> rows, std::uint32_t max_context);
+
+struct DecodeRoundRequest {
+    std::span<const runtime::RoundBudget> budgets;
+    std::span<const std::uint32_t> extents;
+    const RoundRoute* route = nullptr;
+    bool record_online_cost = true;
+
+    [[nodiscard]] bool valid_membership(std::size_t rows) const noexcept;
+    [[nodiscard]] std::uint32_t draft_budget(std::size_t row) const noexcept;
+    [[nodiscard]] std::optional<DecodeRoundPlan>
+    select(PhysicalBatchShape, ExecutionPath, const DecodeGraphRoutes*, const SpeculativeCostModel&,
+           std::span<const RoundMember>, std::span<const AdaptiveRowInput>,
+           std::uint32_t max_context) const;
+};
 
 struct NarrowedTargetPlan {
     RoundRoute target_route;

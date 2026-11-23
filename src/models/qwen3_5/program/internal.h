@@ -151,7 +151,7 @@ public:
                           const execution::DraftReadoutSubmit& = {});
     void project_decode(std::uint32_t batch, std::uint32_t width);
     void decide_decode(const speculative::RoundRoute&);
-    void readback_decode(std::uint32_t batch, bool speculative);
+    void readback_result(std::uint32_t batch, const speculative::RoundRoute* route = nullptr);
     GraphPreparationSample initialize_graphs(GraphPreparationMode = GraphPreparationMode::Complete);
     void release_graphs();
     void append_draft_history(ComputeOperation&);

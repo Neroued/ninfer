@@ -10,13 +10,11 @@ namespace ninfer::bench::kpool_application {
 namespace kp = ninfer::tool::kpool;
 
 inline std::size_t history_workspace(KvCacheVectorFormat index_format, ops::KpoolMlaStorage storage,
-                                     int bound, int batch, int tokens, int sms) {
-    const auto bucket = ops::select_context_bucket(std::uint32_t(bound));
+                                     ops::ContextBucket bucket, int batch, int tokens, int sms) {
     return std::max(ops::kpool_indexer_workspace_capacity_bytes({32, 128}, index_format, bucket,
                                                                 batch, 1, tokens, sms),
                     ops::kpool_sparse_mla_workspace_capacity_bytes({64, 256, 256, 512}, storage,
-                                                                   {std::uint32_t(bound)}, batch, 1,
-                                                                   tokens, sms));
+                                                                   bucket, batch, 1, tokens, sms));
 }
 
 // Generate represented histories outside timing, without a multi-GiB Host mirror.
@@ -137,7 +135,7 @@ struct Fixture : kp::ChainFixture {
     }
 
     // Reserve once for every measured phase on this workload.
-    void reserve(CudaExecutionView cuda, const std::set<int>& bounds = {}) {
+    void reserve(CudaExecutionView cuda, const std::set<ops::ContextBucket>& buckets = {}) {
         auto cap              = std::max({o_capacity, capacities[1], capacities[2], capacities[3]});
         auto prepare_capacity = record ? ops::kpool_mla_prepare_record_workspace_capacity_bytes
                                        : ops::kpool_mla_prepare_update_workspace_capacity_bytes;
@@ -150,8 +148,8 @@ struct Fixture : kp::ChainFixture {
         cap = std::max(cap, ops::linear_workspace_capacity_bytes(QType::BF16, 16384, 1536,
                                                                  ops::LinearPolicy::A16Only,
                                                                  index.B, index.T * index.B));
-        for (const int bound : bounds)
-            cap = std::max(cap, history_workspace(cache.index.format, cache.latent.storage, bound,
+        for (const auto bucket : buckets)
+            cap = std::max(cap, history_workspace(cache.index.format, cache.latent.storage, bucket,
                                                   index.B, index.T, cuda.multiprocessor_count()));
         index.workspace.reset();
         index.scratch = DeviceBuffer(cuda.device(), cap + 512);

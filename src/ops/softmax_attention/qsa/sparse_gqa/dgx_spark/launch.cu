@@ -4,7 +4,6 @@
 #include "ops/softmax_attention/qsa/sparse_gqa/columns.cuh"
 #include "ops/softmax_attention/qsa/sparse_gqa/dgx_spark/grouped.cuh"
 #include "ops/softmax_attention/qsa/sparse_gqa/kernel.cuh"
-#include "ops/softmax_attention/qsa/sparse_gqa/simt.cuh"
 
 namespace ninfer::ops::detail::qsa {
 namespace {
@@ -75,7 +74,7 @@ void launch(const SparseGqaArguments& arguments, SparseGqaPlan plan, SparseGqaLa
                 prefix);
         }
         // Device metadata gives each query to exactly one pass, including mixed histories
-        // and partial groups. Both nodes remain present for every execution envelope.
+        // and partial groups. Both nodes remain present for every bucket.
         // The two passes remain selected only by Device metadata. Avoid a nearly
         // empty final residency wave in the sparse fallback's 16-key tile on GB10.
         if constexpr (Storage == KvCacheStorage::BFloat16) {
@@ -94,14 +93,7 @@ void launch(const SparseGqaArguments& arguments, SparseGqaPlan plan, SparseGqaLa
     const bool direct_short =
         !plan.partial &&
         queries >= sparse_gqa_direct_queries(a.kv_heads, execution.multiprocessor_count());
-    if (plan.instance == SparseGqaInstance::Simt) {
-        if (selected.kernel == SparseGqaKernel::Simt4)
-            sparse_gqa_simt_kernel<Storage, 4, Vector>
-                <<<dim3(queries * a.query_heads, a.splits), 128, 0, stream>>>(a);
-        else
-            sparse_gqa_simt_kernel<Storage, 8, Vector>
-                <<<dim3(queries * a.query_heads, a.splits), 256, 0, stream>>>(a);
-    } else if constexpr (Async) {
+    if constexpr (Async) {
         if (selected.load == SparseGqaLoad::InPlace)
             launch_mma<Storage, Vector, SparseGqaLoad::InPlace>(a, selected, queries, stream,
                                                                 direct_short);

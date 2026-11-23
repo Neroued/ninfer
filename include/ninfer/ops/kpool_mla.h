@@ -68,13 +68,6 @@ struct KpoolMlaBatchView {
     Tensor table_rows;    // Device I32 [B], row of the page-offset table.
 };
 
-// Every live p+1 fits the page table and the semantic context limit. The Host envelope is only
-// a resource bound, not an exact length or a claim that selections are full. Zero permits no
-// live queries. A valid envelope change must not change mathematical output.
-struct KpoolExecutionEnvelope {
-    std::uint32_t max_visible_tokens = 0;
-};
-
 // A layer borrows planes of one page-group record. The data plane is BF16 or E4M3FN [Dc,64,1]
 // according to storage, with tokens_per_row=1; the optional scale plane is U8 UE8M0 [Dc/128,64,1],
 // also tokens_per_row=1.
@@ -365,8 +358,10 @@ struct KpoolMlaFactors {
 /**
  * Complete factorized attention. query is BF16 [Dq,Hq,T,B], out is BF16 [Dv,Hq,T,B].
  * Device I32 selection_rows[T,B] maps each live query to a selected row in [0,Nselection).
- * For its frozen E/count, require 0<=E<=p+1<=envelope.max_visible_tokens<=context limit,
- * 0<=count<=min(512,floor(E/4)), and distinct IDs[0:count] in [0,floor(E/4)). Caller supplies
+ * For its frozen E/count, require 0<=E<=p+1<=context_bucket_tokens(bucket),
+ * E<=page_columns*64, 0<=count<=min(512,floor(E/4)), and distinct IDs[0:count] in
+ * [0,floor(E/4)). The page table has at least one page column. Supported buckets are K2
+ * through M1. Caller supplies
  * a selection belonging to the same request/layer/history. It need not be this query's TopK.
  *   J = union({4*g,4*g+1,4*g+2,4*g+3} for selected g) union [4*floor(E/4),E);
  *   q_latent_h = transpose(U_K[h]) * query_h;
@@ -392,15 +387,15 @@ struct KpoolMlaFactors {
  * Empty J and inert queries write exact BF16 +0, without reading their query, factors or cache
  * payload in any stage. Inert queries also do not read positions, selection mappings/contents
  * or table selectors. Never read invalid ID suffixes or a fourth incomplete-tail token.
- * Caller-scoped scratch covers every private stage. Fixed T/B/profile/storage/device facts
- * keep Graph node count/order compatible across envelope updates; workspace and the actual
- * capture/update must cover the chosen bound. No expanded global BF16 cache is created.
+ * Caller-scoped scratch covers every private stage. At fixed T/B/profile/storage/device,
+ * capture emits four ordered nodes per query window across buckets and supports per-node
+ * patching and whole-graph updates. No expanded global BF16 cache is created.
  */
 void kpool_sparse_mla(const Tensor& query, const KpoolMlaFactors& factors,
                       const ConstKpoolMlaLatentCacheView& cache, const KpoolMlaBatchView& batch,
                       const KpoolBlockSelection& selected, const Tensor& selection_rows,
-                      float attention_scale, KpoolExecutionEnvelope envelope,
-                      MemoryArena& workspace, Tensor& out, CudaExecutionView execution);
+                      float attention_scale, ContextBucket bucket, MemoryArena& workspace,
+                      Tensor& out, CudaExecutionView execution);
 
 /**
  * Restore the raw tail of an accepted prefix, across L layers in one call. accepted_columns
@@ -431,7 +426,7 @@ void kpool_tail_extract(ConstKpoolTailStateView before, const KpoolRawRecordRead
 /**
  * Minimum sufficient Op-local high-water bytes over the inclusive positive T interval, with
  * fixed profile/storage/B and the execution device's positive physical sm_count. Indexer
- * capacity covers the inclusive bucket range; sparse MLA capacity uses a fixed envelope.
+ * and sparse MLA capacities cover the inclusive bucket range.
  * Include every legal length, pool phase, alias form, private route and internal alignment gap;
  * exclude trailing padding and caller outputs/cache/tail/records/selection. Count from a
  * 256-byte-aligned local cursor. Invalid/unsupported profiles or intervals throw; zero means
@@ -456,32 +451,18 @@ kpool_indexer_workspace_capacity_bytes(const KpoolIndexerProfile& profile,
 
 [[nodiscard]] std::size_t
 kpool_sparse_mla_workspace_capacity_bytes(const KpoolSparseMlaProfile& profile,
-                                          KpoolMlaStorage storage, KpoolExecutionEnvelope envelope,
+                                          KpoolMlaStorage storage, ContextBucketRange buckets,
                                           std::int32_t batch_size, std::int32_t min_tokens,
                                           std::int32_t max_tokens, std::int32_t sm_count);
-
-// Equality identifies identical captured launch parameters and scratch layout at fixed
-// operands/profile/storage/device. Device positions, validity and mappings remain replay inputs.
-// A changed value requires a new capture/update; the value has no caller-interpretable fields.
-class KpoolGraphProfile {
-public:
-    bool operator==(const KpoolGraphProfile&) const = default;
-private:
-    std::array<std::uint64_t, 24> words_{};
-    friend KpoolGraphProfile kpool_sparse_mla_graph_profile(const KpoolSparseMlaProfile&,
-                                                            KpoolMlaStorage, KpoolExecutionEnvelope,
-                                                            std::int32_t, std::int32_t,
-                                                            std::int32_t);
-};
 
 // Equality guarantees identical launches and scratch layout at fixed operands.
 [[nodiscard]] OpGraphProfile
 kpool_indexer_graph_profile(const KpoolIndexerProfile& profile, KvCacheVectorFormat index_format,
                             ContextBucket bucket, std::int32_t batch_size, std::int32_t tokens,
                             std::int32_t sm_count);
-[[nodiscard]] KpoolGraphProfile
-kpool_sparse_mla_graph_profile(const KpoolSparseMlaProfile&, KpoolMlaStorage,
-                               KpoolExecutionEnvelope, std::int32_t batch_size, std::int32_t tokens,
+[[nodiscard]] OpGraphProfile
+kpool_sparse_mla_graph_profile(const KpoolSparseMlaProfile& profile, KpoolMlaStorage storage,
+                               ContextBucket bucket, std::int32_t batch_size, std::int32_t tokens,
                                std::int32_t sm_count);
 
 } // namespace ninfer::ops

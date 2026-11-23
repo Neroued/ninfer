@@ -44,7 +44,6 @@ struct MlaAttentionStorage {
 template <int Tokens, int HeadGroups, bool IndependentHeads>
 __global__ __launch_bounds__(64 * HeadGroups, HeadGroups == 2 ? 2 : 1) void mla_attention_kernel(
     const __grid_constant__ SparseMlaArguments a, const __grid_constant__ CUtensorMap map) {
-    if (a.direct) return;
     constexpr int Parts = 2, Stages = 2;
     constexpr int Threads = 32 * Parts * HeadGroups;
     const int local = blockIdx.x / (4 / HeadGroups), split = blockIdx.y;

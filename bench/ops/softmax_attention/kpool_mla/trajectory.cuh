@@ -1,7 +1,7 @@
 #pragma once
 
 // The benchmark owns frontier policy, graph definitions, and metadata lifetimes.
-// Ops receive public views and the indexer bucket / sparse MLA envelope.
+// Indexer and sparse MLA share the context bucket.
 struct TraceStep {
     std::vector<int> frontiers, valid;
     bool reset = false;
@@ -15,7 +15,7 @@ static Json trajectory(CudaExecutionView cuda, const Json& c, int repetitions) {
     auto shape         = shape_of(c);
     const auto initial = c.at("frontiers").get<std::vector<int>>();
     std::vector<TraceStep> sequence;
-    std::set<int> bounds;
+    std::set<ops::ContextBucket> buckets;
     shape.reserve_ends.assign(B, 0);
     auto frontier = initial;
     for (int step = 0; step < steps; ++step) {
@@ -38,14 +38,13 @@ static Json trajectory(CudaExecutionView cuda, const Json& c, int repetitions) {
             if (n[b]) max_end = std::max(max_end, frontier[b]);
             shape.reserve_ends[b] = std::max(shape.reserve_ends[b], frontier[b]);
         }
-        bounds.insert(bucket(max_end));
+        buckets.insert(ops::select_context_bucket(max_end));
     }
-    shape.envelope         = *bounds.rbegin();
-    shape.bucket           = ops::select_context_bucket(std::uint32_t(shape.envelope));
+    shape.bucket           = *buckets.rbegin();
     Json budget            = c;
     budget["reserve_ends"] = shape.reserve_ends;
-    budget["envelope_max"] = shape.envelope;
-    Json out               = {{"case", c}, {"admission", admission(cuda, budget, bounds)}};
+    budget["envelope_max"] = ops::context_bucket_tokens(*shape.bucket);
+    Json out               = {{"case", c}, {"admission", admission(cuda, budget, buckets)}};
     if (!out["admission"]["admitted"].get<bool>()) {
         out["status"] = "not_admitted";
         return out;
@@ -54,7 +53,7 @@ static Json trajectory(CudaExecutionView cuda, const Json& c, int repetitions) {
     app::Fixture f(cuda, T, B, shape, c.value("prepare", "update") == "record",
                    c.value("layers", 11), index_format_of(c), latent_storage_of(c));
     f.after = f.before;
-    f.reserve(cuda, bounds);
+    f.reserve(cuda, buckets);
     // One pinned, immutable upload frame per step. Reuse only after the final event.
     const std::size_t x_words     = std::size_t(T) * B * 4096;
     const std::size_t meta_words  = T * B + 4 * B;
@@ -87,11 +86,10 @@ static Json trajectory(CudaExecutionView cuda, const Json& c, int repetitions) {
         }
     }
     CUDA_CHECK(cudaDeviceSynchronize());
-    std::map<int, DecodeGraphDefinition> definitions;
-    for (int u : bounds) {
-        f.index.bucket = ops::select_context_bucket(std::uint32_t(u));
-        f.envelope     = {std::uint32_t(u)};
-        definitions[u].capture(cuda.stream(), [&] {
+    std::map<ops::ContextBucket, DecodeGraphDefinition> definitions;
+    for (const auto bucket : buckets) {
+        f.index.bucket = bucket;
+        definitions[bucket].capture(cuda.stream(), [&] {
             f.launch(cuda);
             if (f.record) f.extract(cuda);
         });
@@ -103,11 +101,12 @@ static Json trajectory(CudaExecutionView cuda, const Json& c, int repetitions) {
     DecodeGraphExecutable graph;
     graph.instantiate(parent);
     // Validate every child update and upload before entering the timed trajectory.
-    for (auto& [u, definition] : definitions) graph.update_child(child, definition);
+    for (const auto& entry : definitions) graph.update_child(child, entry.second);
     graph.upload(cuda.stream());
     CUDA_CHECK(cudaStreamSynchronize(cuda.stream()));
     out["setup_us"]              = us(setup, Clock::now());
-    out["bounds"]                = bounds;
+    out["bounds"]                = Json::array();
+    for (const auto bucket : buckets) out["bounds"].push_back(ops::context_bucket_tokens(bucket));
     out["workspace_bytes"]       = f.index.workspace_bytes;
     out["upload_bytes_per_step"] = frame_bytes;
     std::vector<cudaEvent_t> starts(steps), stops(steps);
@@ -118,10 +117,12 @@ static Json trajectory(CudaExecutionView cuda, const Json& c, int repetitions) {
     for (int rep = -1; rep < repetitions; ++rep) {
         f.restore(cuda);
         CUDA_CHECK(cudaStreamSynchronize(cuda.stream()));
-        int current = -1;
+        std::optional<ops::ContextBucket> current;
 
         struct Sample {
-            int end, u, active;
+            int end;
+            ops::ContextBucket bucket;
+            int active;
             bool changed;
             double select, update, launch;
         };
@@ -138,12 +139,12 @@ static Json trajectory(CudaExecutionView cuda, const Json& c, int repetitions) {
                 if (s.valid[b]) end = std::max(end, s.frontiers[b] + s.valid[b]);
                 active += s.valid[b];
             }
-            int u         = bucket(end);
-            bool changed  = u != current;
+            const auto bucket  = ops::select_context_bucket(end);
+            const bool changed = bucket != current;
             auto selected = Clock::now();
             if (changed) {
-                graph.update_child(child, definitions.at(u));
-                current = u;
+                graph.update_child(child, definitions.at(bucket));
+                current = bucket;
             }
             auto updated = Clock::now();
             if (s.reset) f.restore(cuda);
@@ -167,7 +168,7 @@ static Json trajectory(CudaExecutionView cuda, const Json& c, int repetitions) {
             auto launched = Clock::now();
             CUDA_CHECK(cudaEventRecord(stops[k], cuda.stream()));
             samples[k] = {end,
-                          u,
+                          bucket,
                           active,
                           changed,
                           us(a, selected),
@@ -185,7 +186,7 @@ static Json trajectory(CudaExecutionView cuda, const Json& c, int repetitions) {
                 const auto& s = sequence[k];
                 trace.push_back({{"step", k},
                                  {"end_max", h.end},
-                                 {"envelope", h.u},
+                                 {"envelope", ops::context_bucket_tokens(h.bucket)},
                                  {"active_columns", h.active},
                                  {"frontiers", s.frontiers},
                                  {"valid", s.valid},

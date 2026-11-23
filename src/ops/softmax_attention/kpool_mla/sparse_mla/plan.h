@@ -6,8 +6,8 @@
 
 namespace ninfer::ops::detail::kpool {
 
-void sparse_mla_geometry(const KpoolSparseMlaProfile&, KpoolMlaStorage, KpoolExecutionEnvelope,
-                         int batch, int min_tokens, int max_tokens, int sms);
+void sparse_mla_geometry(const KpoolSparseMlaProfile&, KpoolMlaStorage, int batch, int min_tokens,
+                         int max_tokens, int sms);
 
 enum class MlaFactorSchedule { Small, Medium, Bulk };
 enum class MlaAttentionSchedule { Small, Bulk };
@@ -17,8 +17,7 @@ struct SparseMlaPlan {
     MlaAttentionSchedule attention;
     int splits, tile;
     int preferred_splits = 0;
-    bool direct;
-    bool merge_value = false;
+    bool merge_value     = false;
     MlaFactorSchedule fp8_query;
     TensorRegion mapped, numerator, maximum, denominator;
     TensorRegion query_fp8, query_scales;
@@ -26,10 +25,10 @@ struct SparseMlaPlan {
 };
 
 SparseMlaPlan sparse_mla_plan(const KpoolSparseMlaProfile&, KpoolMlaStorage, int columns, int batch,
-                              KpoolExecutionEnvelope, int sms);
+                              ContextBucket, int sms);
 std::size_t sparse_mla_capacity(const KpoolSparseMlaProfile&, KpoolMlaStorage, int lo, int hi,
-                                int batch, KpoolExecutionEnvelope, int sms);
+                                int batch, ContextBucket, int sms);
 void launch_sparse_mla(SparseMlaArguments, MemorySpan, const KpoolSparseMlaProfile&,
-                       KpoolMlaStorage, KpoolExecutionEnvelope, int sms, cudaStream_t);
+                       KpoolMlaStorage, ContextBucket, int sms, cudaStream_t);
 
 } // namespace ninfer::ops::detail::kpool

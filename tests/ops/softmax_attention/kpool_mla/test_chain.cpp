@@ -350,6 +350,7 @@ int main(int argc, char** argv) {
                   [=] { return record_chain(fp8); }, {{"format", "fp8"}, {"execution", "graph"}});
     for (auto [T, B, E, layers, graph] : {std::tuple{1, 1, 1, 1, false},
                                           {1, 1, 3, 11, false},
+                                          {4, 2, 253, 1, true},
                                           {1, 1, 2051, 11, false},
                                           {1, 1, 2052, 11, true},
                                           {5, 3, 2054, 11, true},

@@ -1,5 +1,6 @@
 #include "ops/softmax_attention/kpool_mla/sparse_mla/plan.h"
 #include "ops/softmax_attention/kpool_mla/validation.h"
+#include "ops/common/host/graph_profile.h"
 
 #include <cmath>
 
@@ -20,51 +21,57 @@ KpoolSparseMlaProfile kpool_sparse_mla_profile(const KpoolMlaFactors& factors, i
             factors.value_up.qtype};
 }
 
-KpoolGraphProfile kpool_sparse_mla_graph_profile(const KpoolSparseMlaProfile& profile,
-                                                 KpoolMlaStorage storage,
-                                                 KpoolExecutionEnvelope envelope, int batch,
-                                                 int tokens, int sms) {
-    sparse_mla_geometry(profile, storage, envelope, batch, tokens, tokens, sms);
-    KpoolGraphProfile key;
-    key.words_        = {std::uint64_t(tokens),
-                         std::uint64_t(batch),
-                         std::uint64_t(sms),
-                         std::uint64_t(storage),
-                         std::uint64_t(profile.key_format),
-                         std::uint64_t(profile.value_format)};
+OpGraphProfile kpool_sparse_mla_graph_profile(const KpoolSparseMlaProfile& profile,
+                                              KpoolMlaStorage storage, ContextBucket bucket,
+                                              int batch, int tokens, int sms) {
+    ContextBucketRange{bucket}.validate(ContextBucket::M1, "kpool_sparse_mla");
+    sparse_mla_geometry(profile, storage, batch, tokens, tokens, sms);
+    std::array<std::uint64_t, 22> words{std::uint64_t(tokens),
+                                        std::uint64_t(batch),
+                                        std::uint64_t(sms),
+                                        std::uint64_t(storage),
+                                        std::uint64_t(profile.key_format),
+                                        std::uint64_t(profile.value_format)};
     std::size_t at    = 6;
     const auto append = [&](int columns) {
         if (!columns) return;
-        const auto p = sparse_mla_plan(profile, storage, columns, batch, envelope, sms);
+        const auto p = sparse_mla_plan(profile, storage, columns, batch, bucket, sms);
+        // Storage, window width and splits determine every region of the layout.
         for (const auto word :
              {std::uint64_t(p.factor), std::uint64_t(p.attention), std::uint64_t(p.splits),
-              std::uint64_t(p.preferred_splits), std::uint64_t(p.tile), std::uint64_t(p.direct),
+              std::uint64_t(p.preferred_splits), std::uint64_t(p.tile),
               std::uint64_t(p.merge_value), std::uint64_t(p.fp8_query), std::uint64_t(p.bytes)})
-            key.words_[at++] = word;
+            words[at++] = word;
     };
     const auto columns = std::int64_t(tokens) * batch;
     if (columns >= kMlaWindow) append(kMlaWindow);
     append(columns % kMlaWindow);
-    return key;
+    return detail::make_op_graph_profile(words);
 }
 
 std::size_t kpool_sparse_mla_workspace_capacity_bytes(const KpoolSparseMlaProfile& profile,
                                                       KpoolMlaStorage storage,
-                                                      KpoolExecutionEnvelope envelope,
+                                                      ContextBucketRange buckets,
                                                       std::int32_t batch, std::int32_t lo,
                                                       std::int32_t hi, std::int32_t sms) {
-    sparse_mla_geometry(profile, storage, envelope, batch, lo, hi, sms);
-    return sparse_mla_capacity(profile, storage, lo, hi, batch, envelope, sms);
+    buckets.validate(ContextBucket::M1, "kpool_sparse_mla");
+    sparse_mla_geometry(profile, storage, batch, lo, hi, sms);
+    std::size_t peak = 0;
+    buckets.for_each([&](ContextBucket bucket) {
+        peak = std::max(peak, sparse_mla_capacity(profile, storage, lo, hi, batch, bucket, sms));
+    });
+    return peak;
 }
 
 void kpool_sparse_mla(const Tensor& query, const KpoolMlaFactors& factors,
                       const ConstKpoolMlaLatentCacheView& cache, const KpoolMlaBatchView& batch,
                       const KpoolBlockSelection& selected, const Tensor& selection_rows,
-                      float attention_scale, KpoolExecutionEnvelope envelope,
-                      MemoryArena& workspace, Tensor& out, CudaExecutionView execution) {
+                      float attention_scale, ContextBucket bucket, MemoryArena& workspace,
+                      Tensor& out, CudaExecutionView execution) {
+    ContextBucketRange{bucket}.validate(ContextBucket::M1, "kpool_sparse_mla");
     const int T = query.ne[2], B = query.ne[3], sms = execution.multiprocessor_count();
     const auto profile = kpool_sparse_mla_profile(factors, query.ne[1]);
-    sparse_mla_geometry(profile, cache.storage, envelope, B, T, T, sms);
+    sparse_mla_geometry(profile, cache.storage, B, T, T, sms);
     require(std::isfinite(attention_scale) && attention_scale > 0, "Sparse MLA scale");
     const auto device = execution.device();
     std::array<operand::Range, 14> inputs{};
@@ -87,8 +94,7 @@ void kpool_sparse_mla(const Tensor& query, const KpoolMlaFactors& factors,
     input(selected.pool_counts, DType::I32, {selected_rows}, 4, "pool counts");
     input(selected.selection_end, DType::I32, {selected_rows}, 4, "selection end");
     latent_cache(cache, 512, device);
-    const auto& table = cache.data.records.page_offsets;
-    require(std::uint64_t(table.ne[0]) * 64 >= envelope.max_visible_tokens, "page table capacity");
+    const auto& table       = cache.data.records.page_offsets;
     const auto table_blocks = operand::blocks(table, kOperation);
     operand::tensor(out, DType::BF16, {256, 64, T, B}, 16, kOperation, "MLA output", device);
     const auto output = operand::range(out, kOperation);
@@ -123,7 +129,7 @@ void kpool_sparse_mla(const Tensor& query, const KpoolMlaFactors& factors,
     a.batch          = B;
     a.scale          = attention_scale;
     auto scope       = workspace.scope();
-    const auto bytes = sparse_mla_capacity(profile, cache.storage, T, T, B, envelope, sms);
+    const auto bytes = sparse_mla_capacity(profile, cache.storage, T, T, B, bucket, sms);
     MemorySpan scratch{};
     if (bytes) {
         scratch          = workspace.alloc_bytes(bytes, 256);
@@ -132,6 +138,6 @@ void kpool_sparse_mla(const Tensor& query, const KpoolMlaFactors& factors,
         operand::disjoint(range, output, kOperation);
         require(!operand::overlaps(table_blocks, range), "workspace overlaps page table");
     }
-    launch_sparse_mla(a, scratch, profile, cache.storage, envelope, sms, execution.stream());
+    launch_sparse_mla(a, scratch, profile, cache.storage, bucket, sms, execution.stream());
 }
 } // namespace ninfer::ops

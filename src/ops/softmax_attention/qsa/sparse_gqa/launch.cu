@@ -1,10 +1,13 @@
 #include "ops/softmax_attention/qsa/sparse_gqa/plan.h"
+#include "ops/common/host/operands.h"
+
+#include <algorithm>
 
 namespace ninfer::ops::detail::qsa {
 
 void launch_sparse_gqa(const Tensor& query, const Tensor& gate,
                        const ConstPagedKVBatchLayerView& cache, const QsaBatchView& batch,
-                       const QsaBlockSelection& selected, SparseGqaPlan plan,
+                       const QsaBlockSelection& selected, ContextBucket bucket, SparseGqaPlan plan,
                        const SparseGqaWorkspace& scratch, Tensor& out,
                        CudaExecutionView execution) {
     const auto i32  = [](const Tensor& t) { return static_cast<const int*>(t.data); };
@@ -37,14 +40,17 @@ void launch_sparse_gqa(const Tensor& query, const Tensor& gate,
                          0};
     a.min_split_tiles  = plan.min_split_tiles;
     a.direct_single    = plan.direct_single;
-    const auto queries = std::int64_t(a.tokens) * a.batch;
-    // This slab only bounds grid.x (including the per-head merge); scratch/output indexing
-    // stays global and T is not a semantic launch limit.
-    constexpr int slab = 1 << 24;
-    for (a.begin = 0; a.begin < queries; a.begin += slab) {
-        const int n = int(std::min<std::int64_t>(slab, queries - a.begin));
+    const auto aligned = [](const ConstPagedPlaneView& t) {
+        return common::operand::aligned(t.data(), 16) && t.row_stride_bytes() % 16 == 0 &&
+               t.head_stride_bytes() % 16 == 0 && t.plane.tensor.region.alignment % 16 == 0;
+    };
+    const bool vector_cache = aligned(cache.k_pages) && aligned(cache.v_pages);
+    const auto queries      = std::int64_t(a.tokens) * a.batch;
+    for (a.begin = 0; a.begin < queries; a.begin += kSparseGqaSlab) {
+        const int n = int(std::min<std::int64_t>(kSparseGqaSlab, queries - a.begin));
         const auto selected_launch =
-            select_sparse_gqa_launch(cache, plan, n, a.batch, execution.multiprocessor_count());
+            select_sparse_gqa_launch(cache.storage, cache.num_kv_heads, bucket, plan, n, a.batch,
+                                     execution.multiprocessor_count(), vector_cache);
         launch_sparse_gqa_instance(a, cache.storage, cache.num_kv_heads, plan, selected_launch, n,
                                    execution);
     }

@@ -28,7 +28,6 @@ struct SparseMlaArguments {
     int first_row = 0, last_row = 0;
     int preferred_splits = 0, split_wave_size = 0;
     float scale;
-    bool direct              = false;
     std::size_t latent_bytes = 0;
 
     __device__ MlaWork work(int local) const {

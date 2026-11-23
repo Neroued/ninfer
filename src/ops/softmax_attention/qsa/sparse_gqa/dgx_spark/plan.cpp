@@ -1,5 +1,6 @@
 #include "ops/softmax_attention/qsa/sparse_gqa/plan.h"
-#include "ops/common/host/operands.h"
+
+#include <algorithm>
 
 namespace ninfer::ops::detail::qsa {
 namespace {
@@ -20,26 +21,14 @@ bool streaming_history(KvCacheStorage storage, int batch, int kv_heads, std::uin
 }
 } // namespace
 
-int sparse_gqa_direct_queries(int kv_heads, int sms) {
+std::int64_t sparse_gqa_direct_queries(int kv_heads, int sms) {
     // A grouped CTA owns eight queries. One local KV group needs one full SM wave.
-    return kv_heads == 1 ? 8 * sms : 256;
-}
-
-SparseGqaCapacityEnvelopes sparse_gqa_capacity_envelopes(KvCacheStorage, int, int, int,
-                                                         QsaSparseGqaExecutionEnvelope envelope,
-                                                         int) {
-    SparseGqaCapacityEnvelopes out;
-    // Short SIMT calls materialize partials even when MMA can write a single partition directly.
-    for (std::uint32_t bound : {0u, 8u, 64u})
-        if (bound <= envelope.max_visible_tokens) out.values[out.count++] = bound;
-    out.values[out.count++] = envelope.max_visible_tokens;
-    return out;
+    return kv_heads == 1 ? std::int64_t(8) * sms : 256;
 }
 
 SparseGqaPlan select_sparse_gqa_plan(KvCacheStorage storage, int tokens, int batch, int kv_heads,
-                                     QsaSparseGqaExecutionEnvelope envelope, int sms) {
+                                     ContextBucket bucket, int sms) {
     const auto queries = std::int64_t(tokens) * batch;
-    const auto visible = envelope.max_visible_tokens;
     if (queries >= sparse_gqa_direct_queries(kv_heads, sms)) {
         if (tokens < 8) {
             // An eight-query prefix tile cannot fit inside one physical request.
@@ -47,54 +36,41 @@ SparseGqaPlan select_sparse_gqa_plan(KvCacheStorage storage, int tokens, int bat
             const bool rotated_value = storage == KvCacheStorage::Nvfp4Group16 ||
                                        storage == KvCacheStorage::Fp8KeyNvfp4Value;
             const int key_rows = rotated_value ? 16 : 32;
-            auto plan          = SparseGqaPlan{key_rows, 1, SparseGqaInstance::Mma, false, visible};
+            auto plan          = SparseGqaPlan{key_rows, 1, SparseGqaInstance::Mma, false};
             plan.merge_node    = true;
             return plan;
         }
-        return {16, 1, SparseGqaInstance::Grouped, false, visible};
+        return {16, 1, SparseGqaInstance::Grouped, false};
     }
     const int partition_heads = partition_head_groups(storage, kv_heads, queries);
     const auto target         = std::max<std::int64_t>(
         1, (std::int64_t(sms) * 3 / (2 * partition_heads) + queries - 1) / queries);
     int splits = 1;
     while (splits < target && splits < (partition_heads == 1 ? 64 : 32)) splits *= 2;
-    const bool simt = (visible <= 8 && queries <= 16) || (visible <= 64 && queries == 1);
-    if (simt) splits = std::max(1, splits / 12);
     // A 16-key output tile admits four CTAs per SM. Fill those slots when a large
     // history otherwise leaves only two CTAs, keeping the same core/merge node pair.
-    const bool expand = !simt && storage != KvCacheStorage::BFloat16 && queries > 6 &&
-                        queries * kv_heads * splits <= 2 * sms &&
-                        streaming_history(storage, batch, kv_heads, visible);
+    const bool expand = storage != KvCacheStorage::BFloat16 && queries > 6 &&
+                        queries * kv_heads * splits <= std::int64_t(2) * sms &&
+                        streaming_history(storage, batch, kv_heads, context_bucket_tokens(bucket));
     const int key_rows = expand ? 16 : 32;
     if (expand) splits = std::min(partition_heads == 1 ? 64 : 32, splits * 2);
-    const int tiles = std::max(1, (int(std::min(visible, 2051u)) + key_rows - 1) / key_rows);
-    splits          = std::min(splits, tiles);
-    auto plan =
-        SparseGqaPlan{key_rows, splits, simt ? SparseGqaInstance::Simt : SparseGqaInstance::Mma,
-                      simt || splits > 1, visible};
+    // Even K2 has at least 64 key tiles. The device caps the chosen split count to live work.
+    auto plan = SparseGqaPlan{key_rows, splits, SparseGqaInstance::Mma, splits > 1};
     // The MMA epilogue can normalize any cache format directly when unsplit.
-    // Fixed geometry retains attention + merge across every visible-token bound.
+    // Fixed geometry retains attention + merge across buckets.
     // An unsplit MMA writes output directly and leaves the merge node idle.
     plan.merge_node = true;
     return plan;
 }
 
-SparseGqaLaunchPlan select_sparse_gqa_launch(const ConstPagedKVBatchLayerView& cache,
-                                             SparseGqaPlan plan, int queries, int batch, int sms) {
-    const auto aligned = [](const ConstPagedPlaneView& t) {
-        return common::operand::aligned(t.data(), 16) && t.row_stride_bytes() % 16 == 0 &&
-               t.head_stride_bytes() % 16 == 0 && t.plane.tensor.region.alignment % 16 == 0;
-    };
-    const bool vector    = aligned(cache.k_pages) && aligned(cache.v_pages);
-    const bool quantized = cache.storage != KvCacheStorage::BFloat16;
+SparseGqaLaunchPlan select_sparse_gqa_launch(KvCacheStorage storage, int kv_heads,
+                                             ContextBucket bucket, SparseGqaPlan plan, int queries,
+                                             int batch, int sms, bool vector) {
+    const bool quantized = storage != KvCacheStorage::BFloat16;
     const auto staged    = quantized && vector ? SparseGqaLoad::Staged : SparseGqaLoad::Direct;
     if (plan.instance == SparseGqaInstance::Grouped)
         return {staged, vector, 1, SparseGqaKernel::Columns16};
-    if (plan.instance == SparseGqaInstance::Simt)
-        return {SparseGqaLoad::Direct, vector, plan.splits,
-                queries > 8 ? SparseGqaKernel::Simt4 : SparseGqaKernel::Simt8};
-    if (plan.instance == SparseGqaInstance::Mma &&
-        queries >= sparse_gqa_direct_queries(cache.num_kv_heads, sms)) {
+    if (queries >= sparse_gqa_direct_queries(kv_heads, sms)) {
         const auto load = plan.key_rows == 16   ? staged
                           : quantized && vector ? SparseGqaLoad::InPlace
                                                 : SparseGqaLoad::Direct;
@@ -102,27 +78,26 @@ SparseGqaLaunchPlan select_sparse_gqa_launch(const ConstPagedKVBatchLayerView& c
                 plan.key_rows == 16 ? SparseGqaKernel::Columns16 : SparseGqaKernel::Columns32};
     }
     if (!vector) return {SparseGqaLoad::Direct, false, plan.splits};
-    if (plan.visible_tokens <= 64)
-        return {staged, true, plan.splits, SparseGqaKernel::Columns32Wide};
-
     if (plan.key_rows == 16) return {staged, true, plan.splits, SparseGqaKernel::Columns16};
     const bool streaming =
-        streaming_history(cache.storage, batch, cache.num_kv_heads, plan.visible_tokens);
+        streaming_history(storage, batch, kv_heads, context_bucket_tokens(bucket));
     if (queries == 4) return {staged, true, plan.splits, SparseGqaKernel::Columns16};
     if (queries <= 6) {
-        int splits = 1;
-        const int partition_heads =
-            partition_head_groups(cache.storage, cache.num_kv_heads, queries);
-        const int target = std::max(1, 2 * sms / (partition_heads * queries));
+        int splits                = 1;
+        const int partition_heads = partition_head_groups(storage, kv_heads, queries);
+        const auto target =
+            std::max<std::int64_t>(1, std::int64_t(2) * sms / (partition_heads * queries));
         while (splits * 2 <= target && splits < (partition_heads == 1 ? 64 : 32)) splits *= 2;
         return {staged, true, std::min(splits, plan.splits), SparseGqaKernel::Columns32Wide};
     }
-    const auto blocks = std::int64_t(queries) * cache.num_kv_heads * plan.splits;
+    const auto blocks = std::int64_t(queries) * kv_heads * plan.splits;
     // The in-place column tile needs a third CTA to hide its extra barriers/QK work.
-    if (!quantized || (streaming && blocks > 2 * sms))
+    const auto wave2 = std::int64_t(2) * sms;
+    if (!quantized || (streaming && blocks > wave2))
         return {quantized ? SparseGqaLoad::InPlace : SparseGqaLoad::Direct, true, plan.splits,
                 SparseGqaKernel::Columns32};
-    const bool inplace = (blocks + 3 * sms - 1) / (3 * sms) < (blocks + 2 * sms - 1) / (2 * sms);
+    const auto wave3   = std::int64_t(3) * sms;
+    const bool inplace = (blocks + wave3 - 1) / wave3 < (blocks + wave2 - 1) / wave2;
     return {inplace ? SparseGqaLoad::InPlace : SparseGqaLoad::Staged, true, plan.splits};
 }
 } // namespace ninfer::ops::detail::qsa

@@ -16,15 +16,14 @@ namespace ninfer::tool::kpool {
 // physical reservation are independent. Shared pages are read-only prefix pages.
 struct IndexerCase {
     std::vector<int> ends, valid, reserve_ends;
-    int envelope = 0, shared_prefix = 0;
+    int shared_prefix = 0;
     std::optional<ops::ContextBucket> bucket;
     bool contiguous_pages = false;
 
     int table_end(int fallback) const {
-        return std::max(fallback, std::max(envelope, reserve_ends.empty()
-                                                         ? 0
-                                                         : *std::max_element(reserve_ends.begin(),
-                                                                             reserve_ends.end())));
+        return reserve_ends.empty() ? fallback
+                                    : std::max(fallback, *std::max_element(reserve_ends.begin(),
+                                                                           reserve_ends.end()));
     }
 
     int pages(int batch, int fallback) const {
@@ -75,8 +74,7 @@ struct IndexerFixture {
           packed(cuda.device(), layout.page.geometry, physical_pages),
           cache(layout.layer(PagedRecordView{packed.storage(), tables.view, 64}, layer).index),
           selection{ids.view, counts.view, ends.view},
-          bucket(shape.bucket.value_or(
-              ops::select_context_bucket(std::uint32_t(shape.envelope ? shape.envelope : end)))),
+          bucket(shape.bucket ? *shape.bucket : ops::select_context_bucket(end)),
           keys(initialize_history ? std::size_t(physical_pages) * 16 * 128 : 0),
           workspace_bytes(ops::kpool_indexer_workspace_capacity_bytes(
               {32, 128}, index_format, ops::ContextBucketRange{bucket}, B, 1, T,

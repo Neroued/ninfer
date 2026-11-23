@@ -1,4 +1,5 @@
 #include "ops/op_measurement.cuh"
+#include "ops/context_bucket_workload.h"
 #include "common/gpu_activity.cuh"
 #include "../../../../tools/support/kpool_sparse_mla_fixture.h"
 
@@ -15,7 +16,10 @@ int main(int argc, char** argv) {
         measurement::Options options;
         std::vector<int> tokens{1, 2, 4, 8, 16, 32, 64}, reserve_tokens;
         int batch = 1, end = 8192, layers = 11, selected = 512, selection_span = 1;
-        int shared_prefix = 0, envelope = 0, active_rows = -1;
+        int shared_prefix = -1, envelope = 0, active_rows = -1;
+        std::optional<ops::ContextBucket> bucket_override;
+        auto length_dist = workload::LengthDist::Uniform;
+        std::optional<workload::ValidDist> valid_dist;
         bool ragged = false, frozen = false, mxfp8 = false;
         auto storage      = ops::KpoolMlaStorage::BFloat16;
         auto index_format = KvCacheVectorFormat::BFloat16;
@@ -32,7 +36,10 @@ int main(int argc, char** argv) {
                        "  --latent-cache bf16|fp8 --index-cache bf16|fp8\n"
                        "  --factor-format bf16|mxfp8\n"
                        "  --shared-prefix N  share N original tokens, in complete 64-token pages\n"
-                       "  --envelope E       execution bound (default: --end)\n"
+                       "  --bucket auto|2k|8k|16k|32k|64k|128k|256k|512k|1m (default auto)\n"
+                       "  --envelope E       auto bucket selection (default: --end)\n"
+                       "  --length-dist uniform|skewed-1long|staggered|shared-prefix\n"
+                       "  --valid-dist full|ragged|with-inert (overrides --ragged)\n"
                        "E is the final query's exclusive end; T<=E<=1048576.\n";
                 measurement::help();
                 return 0;
@@ -60,6 +67,12 @@ int main(int argc, char** argv) {
                 shared_prefix = measurement::integer(value, 0, 1048576);
             else if (flag == "--envelope")
                 envelope = measurement::integer(value, 1, 1048576);
+            else if (flag == "--bucket")
+                bucket_override = workload::parse_bucket_override(value);
+            else if (flag == "--length-dist")
+                length_dist = workload::parse_length_dist(value);
+            else if (flag == "--valid-dist")
+                valid_dist = workload::parse_valid_dist(value);
             else if (flag == "--layers") {
                 layers = measurement::integer(value, 1, 11);
                 if (layers != 1 && layers != 11)
@@ -86,11 +99,28 @@ int main(int argc, char** argv) {
         std::sort(reserve_tokens.begin(), reserve_tokens.end());
         reserve_tokens.erase(std::unique(reserve_tokens.begin(), reserve_tokens.end()),
                              reserve_tokens.end());
-        const int max_tokens = *std::max_element(reserve_tokens.begin(), reserve_tokens.end());
+        const int max_tokens = reserve_tokens.back();
         if (max_tokens > end) throw std::invalid_argument("tokens exceed --end");
+        const auto bucket = bucket_override ? *bucket_override
+                                            : ops::select_context_bucket(envelope ? envelope : end);
+        std::vector<kp::SparseMlaBatch> sweep;
+        const bool legacy_ragged = ragged && !valid_dist;
+        for (int t : reserve_tokens) {
+            auto shape = workload::generate_batch_workload(
+                end, t, batch, length_dist, valid_dist.value_or(workload::ValidDist::Full));
+            if (shared_prefix < 0) shared_prefix = shape.shared_prefix_tokens;
+            if (legacy_ragged) {
+                for (int b = 0; b < batch; ++b) {
+                    const int live         = b == batch - 1 ? 0 : std::max(1, t - b);
+                    shape.valid_columns[b] = live;
+                    shape.row_contexts[b]  = live ? shape.row_contexts[b] - (t - live) : 0;
+                }
+            }
+            sweep.push_back({t, std::move(shape.row_contexts), std::move(shape.valid_columns)});
+        }
         kp::SparseMlaFixture f(device.execution_view(), max_tokens, batch, end, selected, layers,
-                               ragged, frozen, 1, selection_span, storage, index_format,
-                               shared_prefix, envelope, reserve_tokens);
+                               false, frozen, 1, selection_span, storage, index_format,
+                               shared_prefix, ops::ContextBucketRange{bucket}, sweep);
         if (mxfp8) f.encode_factors(device.execution_view());
         measurement::Csv csv(
             options.csv_out,
@@ -99,9 +129,13 @@ int main(int argc, char** argv) {
             "token_visits,attention_token_visits,unique_"
             "latent_bytes,"
             "factor_bytes,query_bytes,output_bytes,metadata_bytes,factor_flops,attention_flops,"
-            "useful_TFLOps,qk_flops,pv_flops,index_storage,shared_prefix,envelope");
+            "useful_TFLOps,qk_flops,pv_flops,index_storage,shared_prefix,bucket,envelope,"
+            "length_dist,valid_dist");
         for (int T : tokens) {
-            f.reset_tokens(T, selected, ragged, frozen, selection_span, device.execution_view());
+            const auto shape = std::find_if(sweep.begin(), sweep.end(),
+                                            [&](const auto& s) { return s.tokens == T; });
+            f.reset_tokens(T, selected, false, frozen, selection_span, device.execution_view(),
+                           &*shape);
             if (active_rows < batch) {
                 for (int b = active_rows; b < batch; ++b) {
                     f.valid.at(b)     = 0;
@@ -157,7 +191,9 @@ int main(int argc, char** argv) {
             row.tokens      = T;
             row.batch       = batch;
             row.layers      = layers;
-            row.valid       = ragged ? "ragged" : "dense";
+            row.valid       = valid_dist      ? workload::valid_dist_name(*valid_dist)
+                              : legacy_ragged ? "ragged"
+                                              : "dense";
             if (active_rows < batch) row.valid += "-rows" + std::to_string(active_rows);
             row.workspace_bytes = f.workspace_bytes;
             for (const auto& execution :
@@ -187,7 +223,12 @@ int main(int argc, char** argv) {
                                   std::to_string(attention_flops / 2) + "," +
                                   (index_format == KvCacheVectorFormat::BFloat16 ? "bf16" : "fp8") +
                                   "," + std::to_string(shared_prefix) + "," +
-                                  std::to_string(f.envelope.max_visible_tokens));
+                                  std::string(ops::context_bucket_name(bucket)) + "," +
+                                  std::to_string(ops::context_bucket_tokens(bucket)) + "," +
+                                  std::string(workload::length_dist_name(length_dist)) + "," +
+                                  (valid_dist ? std::string(workload::valid_dist_name(*valid_dist))
+                                   : legacy_ragged ? "ragged"
+                                                   : "full"));
                 }
         }
     } catch (const std::exception& e) {

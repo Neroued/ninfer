@@ -162,20 +162,22 @@ void qsa_indexer(const Tensor& index_query, const ConstQsaIndexCacheView& cache,
                  const QsaBatchView& batch, ContextBucket bucket, MemoryArena& workspace,
                  QsaBlockSelection& out, CudaExecutionView execution);
 
-struct QsaSparseGqaExecutionEnvelope {
-    // Host-known upper bound on p+1 over live queries. Zero permits only inert queries.
-    // This resource promise does not assert that a selection is full.
-    std::uint32_t max_visible_tokens = 262144;
-};
-
-/** Capacity over every positive T in [min_tokens,max_tokens], with fixed storage, query/KV heads, B
- * and envelope. Includes only Op-local scratch, measured from a 256-byte-aligned workspace cursor.
- * multiprocessor_count is the positive physical SM count used by execution.
+/** Capacity over every positive T in [min_tokens,max_tokens] and every bucket in the inclusive
+ * range K2 through K256, with fixed storage, query/KV heads, B and physical SM count.
+ * Includes only Op-local scratch, measured from a 256-byte-aligned workspace cursor.
  */
-[[nodiscard]] std::size_t qsa_sparse_gqa_workspace_capacity_bytes(
-    KvCacheStorage storage, std::int32_t query_heads, std::int32_t kv_heads,
-    std::int32_t min_tokens, std::int32_t max_tokens, std::int32_t batch_size,
-    QsaSparseGqaExecutionEnvelope envelope, std::int32_t multiprocessor_count);
+[[nodiscard]] std::size_t
+qsa_sparse_gqa_workspace_capacity_bytes(KvCacheStorage storage, std::int32_t query_heads,
+                                        std::int32_t kv_heads, ContextBucketRange buckets,
+                                        std::int32_t batch_size, std::int32_t min_tokens,
+                                        std::int32_t max_tokens, std::int32_t sm_count);
+
+// Equality guarantees identical captured kernels, launch parameters and scratch layout at
+// fixed operands and workspace, for both vector-aligned and naturally aligned cache views.
+[[nodiscard]] OpGraphProfile
+qsa_sparse_gqa_graph_profile(KvCacheStorage storage, std::int32_t query_heads,
+                             std::int32_t kv_heads, ContextBucket bucket, std::int32_t batch_size,
+                             std::int32_t tokens, std::int32_t sm_count);
 
 /**
  * Op: qsa_sparse_gqa
@@ -201,9 +203,10 @@ struct QsaSparseGqaExecutionEnvelope {
  * probabilities are not quantized to low-bit operands. The A16 numerical policy applies to the
  * complete attention and gate; intermediate arithmetic remains private. Decoded KV tiles stay on
  * chip; there is no expanded global cache. Tables contain contiguous I64 arena-relative record
- * offsets. Positions are contiguous I32 [T,B]; valid_columns/table_rows are contiguous Device I32
- * [B]. Each row has 0<=n<=T, with consecutive nonnegative live positions satisfying
- * p+1<=envelope.max_visible_tokens<=262144, covered by its table. Selection is contiguous I32
+ * offsets with at least one page column. Positions are contiguous I32 [T,B]; valid_columns/
+ * table_rows are contiguous Device I32 [B]. Each row has 0<=n<=T, with consecutive nonnegative
+ * live positions satisfying p+1<=min(context_bucket_tokens(bucket), page_columns*64).
+ * Supported buckets are K2 through K256. Selection is contiguous I32
  * [512,T,B] and [T,B]; each live c lies in [0,min(512,C)], with distinct ids in [0,C). Id order is
  * unspecified; the set need not be an Indexer's actual TopK. Device metadata and readable selected
  * pages are caller guarantees. Live mathematical operands/results are finite. Cache storage
@@ -216,17 +219,17 @@ struct QsaSparseGqaExecutionEnvelope {
  * unselected cache values are not read. Output and used workspace do not overlap inputs or
  * each other; read-only views may share storage. Selected-record alias relationships are caller
  * guarantees. Scratch is caller-owned, without hidden Device
- * allocation. Fixed T/B, storage, views and device facts keep node count/order compatible across
- * envelope updates. The Host bound selects launch/workspace configuration without reading Device
- * metadata. Within a captured bound, per-query lengths, selections and mixed/all-select/inert
- * cases remain Device inputs during replay. Each query attends at most 512*4+3 tokens.
+ * allocation. At fixed T/B, storage, views and device, the captured kernel chain has the same
+ * node count across buckets and supports per-node patching and whole-graph updates. The bucket
+ * selects launch/workspace configuration. Per-query lengths and selections remain Device inputs
+ * during replay. Each query attends at most 512*4+3 tokens.
  * Same-stream ordering consumes Prepare/Indexer output directly; readiness/lifetime belong to the
  * caller.
  */
 void qsa_sparse_gqa(const Tensor& query, const Tensor& output_gate,
                     const ConstPagedKVBatchLayerView& cache, const QsaBatchView& batch,
-                    const QsaBlockSelection& selected, QsaSparseGqaExecutionEnvelope envelope,
-                    MemoryArena& workspace, Tensor& out, CudaExecutionView execution);
+                    const QsaBlockSelection& selected, ContextBucket bucket, MemoryArena& workspace,
+                    Tensor& out, CudaExecutionView execution);
 
 /**
  * Op: qsa_prepare

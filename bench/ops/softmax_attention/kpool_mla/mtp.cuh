@@ -2,15 +2,15 @@
 
 static Json mtp_round(CudaExecutionView cuda, const Json& c, int repeats, int warmup) {
     const int B = c.at("B"), S = c.at("draft_steps"), W = S + 1, E = c.at("context"), F = E - 1;
-    const int U = bucket(F + W);
+    const auto bucket = ops::select_context_bucket(F + W);
     kp::IndexerCase ms, ds;
     ms.ends.assign(B, F + W);
     ms.valid.assign(B, W);
-    ms.envelope = U;
+    ms.bucket = bucket;
     ds.ends.assign(B, F + 1);
     ds.valid.assign(B, 1);
     ds.reserve_ends.assign(B, F + W);
-    ds.envelope = U;
+    ds.bucket = bucket;
     app::Fixture main(cuda, W, B, ms, true, 11, index_format_of(c), latent_storage_of(c)),
         draft(cuda, 1, B, ds, false, 1, index_format_of(c), latent_storage_of(c));
     main.after           = main.before;
@@ -121,7 +121,7 @@ static Json mtp_round(CudaExecutionView cuda, const Json& c, int repeats, int wa
         {"scope", "controlled_attention_round"},
         {"history_columns", history_columns},
         {"selection_end", E},
-        {"envelope", U},
+        {"envelope", ops::context_bucket_tokens(bucket)},
         {"native_kv_bytes", main.index.packed.storage().bytes + draft.index.packed.storage().bytes},
         {"workspace_bytes",
          main.index.workspace_bytes + draft.index.workspace_bytes + history_capacity}};

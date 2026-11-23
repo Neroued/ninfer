@@ -84,7 +84,7 @@ struct Fixture {
     PagedKVBatchLayerView cache;
     ops::QsaBatchView batch;
     ops::QsaBlockSelection selected;
-    ops::QsaSparseGqaExecutionEnvelope envelope;
+    ops::ContextBucket bucket;
 
     Fixture(int tokens, int batch_size, int max_history, bool padded,
             KvCacheStorage format = KvCacheStorage::BFloat16, bool padded_scales = false,
@@ -98,8 +98,8 @@ struct Fixture {
           visible(T * B), keys(pages, DType::BF16, kv_heads), values(pages, DType::FP16, kv_heads),
           storage(format), q(qhost.size() * 2), gate(ghost.size() * 2), out(qhost.size() * 2),
           pos(positions.size() * 4), lengths(B * 4), rows(B * 4), table(tables.size() * 8),
-          selections(ids.size() * 4), sizes(counts.size() * 4) {
-        envelope.max_visible_tokens = history;
+          selections(ids.size() * 4), sizes(counts.size() * 4),
+          bucket(ops::select_context_bucket(max_history)) {
         query                       = Tensor(q.span(), DType::BF16, {256, q_heads, T, B});
         output_gate                 = Tensor(gate.span(), DType::BF16, {256, q_heads, T, B});
         output                      = Tensor(out.span(), DType::BF16, {256, q_heads, T, B});
@@ -232,7 +232,7 @@ struct Fixture {
     }
 
     void launch(MemoryArena& arena, CudaExecutionView execution) {
-        ops::qsa_sparse_gqa(query, output_gate, cache, batch, selected, envelope, arena, output,
+        ops::qsa_sparse_gqa(query, output_gate, cache, batch, selected, bucket, arena, output,
                             execution);
     }
 

@@ -160,7 +160,8 @@ int main(int argc, char** argv) {
         L2FlushBuffer flush(options.flush_bytes);
         measurement::Csv csv(
             options.csv_out,
-            "index_storage,end,minimum_external_bytes,useful_flops,bf16_flops,fp8_flops,candidate_"
+            "index_storage,end,bucket,minimum_external_bytes,useful_flops,bf16_flops,fp8_flops,"
+            "candidate_"
             "pools,selected_token_visits,"
             "diagnostic_graph_prepare_us,diagnostic_graph_wb_us,diagnostic_graph_indexer_us,"
             "diagnostic_graph_mla_us");
@@ -196,6 +197,7 @@ int main(int argc, char** argv) {
                         (storage == ops::KpoolMlaStorage::BFloat16 ? 0 : w.latent_qk_flops);
                     std::string values =
                         std::string(fp8 ? "fp8," : "bf16,") + std::to_string(E) + ',' +
+                        std::string(ops::context_bucket_name(f.index.bucket)) + ',' +
                         std::to_string(w.minimum_bytes) + ',' + std::to_string(w.flops) + ',' +
                         std::to_string(w.flops - fp8_flops) + ',' + std::to_string(fp8_flops) +
                         ',' + std::to_string(w.candidates) + ',' + std::to_string(w.visits);

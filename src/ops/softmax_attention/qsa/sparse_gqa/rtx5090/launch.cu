@@ -1,7 +1,6 @@
 #include "ops/softmax_attention/qsa/sparse_gqa/plan.h"
 #include "ops/common/host/launch.h"
 #include "ops/softmax_attention/qsa/sparse_gqa/prefill.cuh"
-#include "ops/softmax_attention/qsa/sparse_gqa/simt.cuh"
 #include "ops/softmax_attention/qsa/sparse_gqa/compact.cuh"
 #include "ops/softmax_attention/qsa/sparse_gqa/merge.cuh"
 #include "ops/softmax_attention/qsa/sparse_gqa/rtx5090/compact_schedule.h"
@@ -51,17 +50,7 @@ void launch(const SparseGqaArguments& arguments, SparseGqaPlan plan,
     };
     if constexpr (KvHeads == 4) {
         if (plan.instance == SparseGqaInstance::FullPrefix) {
-            if (plan.key_rows == 32)
-                submit.template operator()<32, 2, true>();
-            else
-                submit.template operator()<64, 4, true>();
-        } else if (plan.instance == SparseGqaInstance::Simt) {
-            if (plan.partial)
-                sparse_gqa_simt_kernel<Storage, 8, VectorCache, KvHeads, false>
-                    <<<dim3(queries * a.query_heads, a.splits), 256, 0, execution.stream()>>>(a);
-            else
-                sparse_gqa_simt_kernel<Storage, 8, VectorCache, KvHeads, true>
-                    <<<dim3(queries * a.query_heads, a.splits), 256, 0, execution.stream()>>>(a);
+            submit.template operator()<64, 4, true>();
         } else if constexpr (Storage == KvCacheStorage::BFloat16) {
             if (plan.key_rows == 32)
                 submit.template operator()<32, 2, false>();
@@ -78,13 +67,6 @@ void launch(const SparseGqaArguments& arguments, SparseGqaPlan plan,
                 submit.template operator()<32, 4, true>();
             else
                 submit.template operator()<64, 8, true>();
-        } else if (plan.instance == SparseGqaInstance::Simt) {
-            if (plan.partial)
-                sparse_gqa_simt_kernel<Storage, 8, VectorCache, KvHeads, false>
-                    <<<dim3(queries * a.query_heads, a.splits), 256, 0, execution.stream()>>>(a);
-            else
-                sparse_gqa_simt_kernel<Storage, 8, VectorCache, KvHeads, true>
-                    <<<dim3(queries * a.query_heads, a.splits), 256, 0, execution.stream()>>>(a);
         } else if (plan.key_rows == 16)
             submit.template operator()<16, 2, false>();
         else if (launch_plan.kernel == SparseGqaKernel::CompactLateSoftmax)
@@ -99,9 +81,6 @@ void launch(const SparseGqaArguments& arguments, SparseGqaPlan plan,
             (sizeof(SparseGqaStorage<Storage, 64, 4, load>) + 15) / 16 * 16 + 4 * 16 * 256 * 2;
         const int shared = common::prepare_shared<bytes, kernel, true>();
         kernel<<<(queries + 3) / 4 * a.kv_heads, 128, shared, execution.stream()>>>(a);
-    } else if (plan.instance == SparseGqaInstance::Simt) {
-        sparse_gqa_simt_kernel<Storage, 8, VectorCache>
-            <<<dim3(queries * a.query_heads, a.splits), 256, 0, execution.stream()>>>(a);
     } else if constexpr (Async) {
         if (launch_plan.load == SparseGqaLoad::InPlace)
             sparse_gqa_mma_kernel<Storage, 32, 2, VectorCache, SparseGqaLoad::InPlace>
@@ -119,9 +98,10 @@ void launch(const SparseGqaArguments& arguments, SparseGqaPlan plan,
                execution.stream()>>>(a);
     }
     if (plan.merge_node) {
-        if (!plan.partial)
+        if (!plan.partial) {
+            // No partials were allocated. The merge tests the null pointer before any access.
             sparse_gqa_merge_kernel<Storage><<<1, 1, 0, execution.stream()>>>(a);
-        else if (queries >= 256)
+        } else if (queries >= 256)
             sparse_gqa_merge_warp_kernel<Storage, 8>
                 <<<queries*((a.query_heads + 7) / 8), 256, 0, execution.stream()>>>(a);
         else if (queries >= 8)

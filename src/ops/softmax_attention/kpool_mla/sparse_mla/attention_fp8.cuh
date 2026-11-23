@@ -29,7 +29,6 @@ template <int Tokens, int HeadGroups>
 __global__
 __launch_bounds__(64 * HeadGroups, HeadGroups == 2 ? 2 : 1) void mla_attention_fp8_kernel(
     const __grid_constant__ SparseMlaArguments a, const __grid_constant__ CUtensorMap map) {
-    if (a.direct) return;
     constexpr int Parts = 2, Threads = 64 * HeadGroups;
     constexpr int Chunk = Tokens == 64 ? 32 : Tokens;
     const int local = blockIdx.x / (4 / HeadGroups), split = blockIdx.y;

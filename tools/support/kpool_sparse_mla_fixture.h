@@ -9,9 +9,16 @@
 #include <memory>
 #include <map>
 #include <numeric>
+#include <optional>
+#include <span>
 #include <set>
 
 namespace ninfer::tool::kpool {
+
+struct SparseMlaBatch {
+    int tokens;
+    std::vector<int> contexts, valid;
+};
 
 // Allocate only referenced logical pages, each as a complete native Main/MTP page
 // group. Unreferenced table entries stay invalid; no dense or single-layer cache proxy.
@@ -23,7 +30,8 @@ struct SparseMlaFixture {
     ops::KpoolMlaCacheLayout layout;
     std::unique_ptr<PackedKVFixture> packed;
     ops::ConstKpoolMlaLatentCacheView cache;
-    ops::KpoolExecutionEnvelope envelope;
+    ops::ContextBucketRange buckets;
+    ops::ContextBucket bucket;
     std::vector<std::uint16_t> latent;
     std::vector<std::uint8_t> latent_codes, latent_scales;
     int scale_plane_index = -1;
@@ -38,11 +46,11 @@ struct SparseMlaFixture {
                      float magnitude = 1, int selection_span = 1,
                      ops::KpoolMlaStorage storage     = ops::KpoolMlaStorage::BFloat16,
                      KvCacheVectorFormat index_format = KvCacheVectorFormat::BFloat16,
-                     int shared_prefix = 0, int max_visible = 0,
-                     const std::vector<int>& sweep_tokens = {})
-        : T(tokens), B(batch), E(end), P(std::max(1, (std::max(end, max_visible) + 63) / 64)),
-          layers(layer_count), layer(layers / 2),
-          query(cuda.device(), DType::BF16, {256, 64, T, B}),
+                     int shared_prefix                = 0,
+                     std::optional<ops::ContextBucketRange> bucket_range = std::nullopt,
+                     std::span<const SparseMlaBatch> sweep               = {})
+        : T(tokens), B(batch), E(end), P(std::max(1, (end + 63) / 64)), layers(layer_count),
+          layer(layers / 2), query(cuda.device(), DType::BF16, {256, 64, T, B}),
           key_up(cuda.device(), DType::BF16, {512, 256, 64}),
           value_up(cuda.device(), DType::BF16, {512, 256, 64}),
           output(cuda.device(), DType::BF16, {256, 64, T, B}),
@@ -52,25 +60,30 @@ struct SparseMlaFixture {
           ids(cuda.device(), DType::I32, {512, T * B}), counts(cuda.device(), DType::I32, {T * B}),
           ends(cuda.device(), DType::I32, {T * B}), tables(cuda.device(), DType::I64, {P, B}, true),
           layout(ops::plan_kpool_mla_cache_layout({storage, index_format, 512, 128, layers})),
-          envelope{std::uint32_t(max_visible ? max_visible : end)},
+          buckets(bucket_range ? *bucket_range
+                               : ops::ContextBucketRange{ops::select_context_bucket(end)}),
+          bucket(buckets.last),
           workspace_bytes(ops::kpool_sparse_mla_workspace_capacity_bytes(
-              {64, 256, 256, 512}, storage, envelope, B, 1, T, cuda.multiprocessor_count())) {
+              {64, 256, 256, 512}, storage, buckets, B, 1, T, cuda.multiprocessor_count())) {
         if (E < 0 || E > 1048576 || (E && E < T) || cap < 0 || cap > 512 || selection_span < 1 ||
-            shared_prefix < 0 || shared_prefix > E || shared_prefix % 64 ||
-            envelope.max_visible_tokens < unsigned(E))
+            shared_prefix < 0 || shared_prefix > E || shared_prefix % 64)
             throw std::invalid_argument("Sparse MLA fixture T/end/cap");
         std::fill(ids.host.begin(), ids.host.end(), -1);
         std::fill(counts.host.begin(), counts.host.end(), -1);
         std::fill(ends.host.begin(), ends.host.end(), -1);
         std::fill(tables.host.begin(), tables.host.end(), -1);
-        auto pages = selection_metadata(cap, ragged, frozen, selection_span);
-        for (int extent : sweep_tokens) {
-            reshape_tokens(extent);
-            auto extra = selection_metadata(cap, ragged, frozen, selection_span);
-            pages.merge(extra);
+        std::set<std::pair<int, int>> pages;
+        const SparseMlaBatch* initial = nullptr;
+        for (const auto& shape : sweep) {
+            if (shape.tokens == tokens) {
+                initial = &shape;
+                continue;
+            }
+            reshape_tokens(shape.tokens);
+            pages.merge(selection_metadata(cap, ragged, frozen, selection_span, &shape));
         }
         reshape_tokens(tokens);
-        (void)selection_metadata(cap, ragged, frozen, selection_span);
+        pages.merge(selection_metadata(cap, ragged, frozen, selection_span, initial));
         std::map<std::pair<int, int>, int> physical;
         for (auto [b, p] : pages)
             physical.emplace(std::pair{p < shared_prefix / 64 ? 0 : b + 1, p}, 0);
@@ -110,19 +123,33 @@ struct SparseMlaFixture {
     // Host-only metadata construction is shared by fixtures and fixed-address
     // benchmark sweeps; the latter reserve the union of referenced native pages.
     std::set<std::pair<int, int>> selection_metadata(int cap, bool ragged, bool frozen,
-                                                     int selection_span) {
+                                                     int selection_span,
+                                                     const SparseMlaBatch* shape) {
+        const bool explicit_rows = shape && (!shape->contexts.empty() || !shape->valid.empty());
+        if (explicit_rows && (shape->tokens != T || std::ssize(shape->contexts) != B ||
+                              std::ssize(shape->valid) != B))
+            throw std::invalid_argument("Sparse MLA fixture batch metadata dimensions");
         std::set<std::pair<int, int>> pages;
         for (int b = 0; b < B; ++b) {
-            valid.at(b)     = !E || (ragged && b == B - 1) ? 0 : ragged ? std::max(1, T - b) : T;
-            selectors.at(b) = valid.at(b) ? B - 1 - b : -1;
+            const int live = explicit_rows                  ? shape->valid[b]
+                             : !E || (ragged && b == B - 1) ? 0
+                             : ragged                       ? std::max(1, T - b)
+                                                            : T;
+            const int base = explicit_rows ? shape->contexts[b] - live : E - T;
+            if (live < 0 || live > T ||
+                (live && (base < 0 || std::int64_t(base) + live > E ||
+                          std::uint64_t(base) + live > ops::context_bucket_tokens(bucket))))
+                throw std::invalid_argument("Sparse MLA fixture per-row context or validity");
+            valid.at(b)     = live;
+            selectors.at(b) = live ? B - 1 - b : -1;
             for (int t = 0; t < T; ++t) {
-                positions.at(t, b)      = t < valid.at(b) ? E - T + t : -1;
+                positions.at(t, b)      = t < live ? base + t : -1;
                 const int source        = t / selection_span * selection_span;
                 const int row           = b * T + T - 1 - source;
                 selection_rows.at(t, b) = t < valid.at(b) ? row : -1;
                 if (t >= valid.at(b)) continue;
                 if (t != source) continue;
-                const int e = frozen ? E - T : E - T + t + 1, c = e / 4;
+                const int e = frozen ? base : base + t + 1, c = e / 4;
                 counts.at(row) = std::min(cap, c);
                 ends.at(row)   = e;
                 int stride     = 503;
@@ -158,9 +185,9 @@ struct SparseMlaFixture {
     }
 
     void reset_tokens(int tokens, int cap, bool ragged, bool frozen, int selection_span,
-                      CudaExecutionView cuda) {
+                      CudaExecutionView cuda, const SparseMlaBatch* shape = nullptr) {
         reshape_tokens(tokens);
-        for (auto [b, page] : selection_metadata(cap, ragged, frozen, selection_span))
+        for (auto [b, page] : selection_metadata(cap, ragged, frozen, selection_span, shape))
             if (tables.at(page, B - 1 - b) < 0)
                 throw std::invalid_argument("Sparse MLA sweep page was not reserved");
         positions.upload();
@@ -171,7 +198,7 @@ struct SparseMlaFixture {
         counts.upload();
         ends.upload();
         workspace_bytes = ops::kpool_sparse_mla_workspace_capacity_bytes(
-            ops::kpool_sparse_mla_profile(factors(), 64), cache.storage, envelope, B, 1, T,
+            ops::kpool_sparse_mla_profile(factors(), 64), cache.storage, buckets, B, 1, T,
             cuda.multiprocessor_count());
         workspace = std::make_unique<MemoryArena>(scratch.span().subspan(256, workspace_bytes));
     }
@@ -234,7 +261,7 @@ struct SparseMlaFixture {
         value_encoded =
             std::make_unique<EncodedWeight>(query.view.device, QType::MXFP8, 16384, 512, values);
         workspace_bytes = ops::kpool_sparse_mla_workspace_capacity_bytes(
-            ops::kpool_sparse_mla_profile(factors(), 64), cache.storage, envelope, B, 1, T,
+            ops::kpool_sparse_mla_profile(factors(), 64), cache.storage, buckets, B, 1, T,
             cuda.multiprocessor_count());
         scratch = DeviceBuffer(cuda.device(), workspace_bytes + 512);
         scratch.fill(0xa5);
@@ -250,7 +277,7 @@ struct SparseMlaFixture {
         ops::kpool_sparse_mla(query.view, factors(), cache,
                               {positions.view, valid.view, selectors.view},
                               {ids.view, counts.view, ends.view}, selection_rows.view, scale,
-                              envelope, *workspace, output.view, cuda);
+                              bucket, *workspace, output.view, cuda);
     }
 
     bool scratch_guards() const {

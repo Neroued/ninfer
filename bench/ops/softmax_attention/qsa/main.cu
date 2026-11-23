@@ -120,7 +120,7 @@ void measure_indexer(const qsa::Options& options, DeviceContext& device, L2Flush
 
 void measure_sparse(const qsa::Options& options, DeviceContext& device, L2FlushBuffer& flush) {
     measurement::Csv csv(options.timing.csv_out,
-                         std::string("contexts,context_capacity,selection,selected_blocks,"
+                         std::string("contexts,bucket,context_capacity,selection,selected_blocks,"
                                      "physical_cache_bytes,round,graph_calls,") +
                              qsa::Metrics::columns);
     for (int tokens : options.tokens) {
@@ -167,7 +167,8 @@ void measure_sparse(const qsa::Options& options, DeviceContext& device, L2FlushB
                     csv.write(
                         row, result, execution, cache,
                         qsa::csv_list(fixture.contexts) + "," +
-                            std::to_string(fixture.envelope.max_visible_tokens) + "," +
+                            std::string(ops::context_bucket_name(fixture.bucket)) + "," +
+                            std::to_string(ops::context_bucket_tokens(fixture.bucket)) + "," +
                             options.selection + "," + std::to_string(options.selected_blocks) +
                             "," + std::to_string(fixture.packed->storage().bytes) + "," +
                             std::to_string(round) + "," + std::to_string(options.graph_calls) +

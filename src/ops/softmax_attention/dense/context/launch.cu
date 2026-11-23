@@ -56,22 +56,22 @@ void launch_context_attention(const Tensor& q, const Tensor& query_k, const Tens
                               const ContextAttentionPlan& plan, Tensor& partial_acc,
                               Tensor& partial_m, Tensor& partial_l, Tensor& out,
                               cudaStream_t stream) {
+    const int logical_pages = context.k_pages.records.page_offsets.ne[0];
+    // This guard protects page lookups for both tile sizes. The caller supplies live lengths
+    // within the selected bucket; at fixed page-table shape the guard is the same for all buckets.
+    const int max_context =
+        static_cast<int>(std::min<std::int64_t>(context_bucket_tokens(kContextAttentionMaxBucket),
+                                                std::int64_t(logical_pages) * kPagedKVPageSize));
     dispatch_tokens(plan.tokens, [&]<int Tokens, int Warps>() {
-        const bool direct = plan.route == ContextAttentionRoute::Direct;
-        if (plan.warps != Warps || plan.split_capacity < 1 ||
-            plan.split_capacity > kContextQueryMaxSplit) {
+        if (plan.split_capacity < 1 || plan.split_capacity > kContextQueryMaxSplit) {
             throw std::invalid_argument("context_softmax_attention: inconsistent plan");
         }
-        if (direct) {
-            if (plan.key_block != 32 || plan.split_capacity != 1) {
-                throw std::invalid_argument("context_softmax_attention: inconsistent plan");
-            }
-            constexpr int KeyBlock = 32;
+        const auto launch_partial = [&]<int KeyBlock, bool Direct>() {
             constexpr std::size_t SmemBytes =
                 2u * KeyBlock * kContextQueryHeadDim * sizeof(__nv_bfloat16);
-            const dim3 direct_grid(kContextQueryKVHeads, 1, q.ne[3]);
-            context_attention_split_partial_kernel<Tokens, Warps, KeyBlock, true>
-                <<<direct_grid, Warps * 32, SmemBytes, stream>>>(
+            const dim3 grid(kContextQueryKVHeads, plan.split_capacity, q.ne[3]);
+            context_attention_split_partial_kernel<Tokens, Warps, KeyBlock, Direct>
+                <<<grid, Warps * 32, SmemBytes, stream>>>(
                     static_cast<const __nv_bfloat16*>(q.data),
                     static_cast<const __nv_bfloat16*>(query_k.data),
                     static_cast<const __nv_bfloat16*>(query_v.data),
@@ -81,53 +81,29 @@ void launch_context_attention(const Tensor& q, const Tensor& query_k, const Tens
                     static_cast<const __nv_bfloat16*>(context.k_pages.data()),
                     static_cast<const __half*>(context.v_pages.data()),
                     static_cast<const std::int64_t*>(context.k_pages.records.page_offsets.data),
-                    context.k_pages.records.page_offsets.ne[0],
-                    context.k_pages.records.page_offsets.ne[0] * kPagedKVPageSize, 1, scale,
+                    logical_pages, max_context, plan.split_capacity, scale,
                     static_cast<__nv_bfloat16*>(partial_acc.data),
                     static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data),
                     static_cast<__nv_bfloat16*>(out.data));
             CUDA_CHECK(cudaGetLastError());
-            if (plan.keep_reduce_slot) {
-                context_attention_idle_kernel<<<1, 1, 0, stream>>>();
-                CUDA_CHECK(cudaGetLastError());
-            }
+        };
+        if (plan.route == ContextAttentionRoute::Direct) {
+            launch_partial.template operator()<32, true>();
+            context_attention_idle_kernel<<<1, 1, 0, stream>>>();
+            CUDA_CHECK(cudaGetLastError());
             return;
         }
 
-        if (plan.route != ContextAttentionRoute::SplitKv) {
-            throw std::invalid_argument("context_softmax_attention: inconsistent plan");
-        }
-
         const auto launch_split = [&]<int KeyBlock>() {
-            constexpr std::size_t SmemBytes =
-                2u * KeyBlock * kContextQueryHeadDim * sizeof(__nv_bfloat16);
-            const dim3 partial_grid(kContextQueryKVHeads, plan.split_capacity, q.ne[3]);
-            context_attention_split_partial_kernel<Tokens, Warps, KeyBlock, false>
-                <<<partial_grid, Warps * 32, SmemBytes, stream>>>(
-                    static_cast<const __nv_bfloat16*>(q.data),
-                    static_cast<const __nv_bfloat16*>(query_k.data),
-                    static_cast<const __nv_bfloat16*>(query_v.data),
-                    static_cast<const std::int32_t*>(context_lengths.data),
-                    static_cast<const std::int32_t*>(valid_columns.data),
-                    static_cast<const std::int32_t*>(table_rows.data),
-                    static_cast<const __nv_bfloat16*>(context.k_pages.data()),
-                    static_cast<const __half*>(context.v_pages.data()),
-                    static_cast<const std::int64_t*>(context.k_pages.records.page_offsets.data),
-                    context.k_pages.records.page_offsets.ne[0],
-                    context.k_pages.records.page_offsets.ne[0] * kPagedKVPageSize,
-                    plan.split_capacity, scale, static_cast<__nv_bfloat16*>(partial_acc.data),
-                    static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data),
-                    static_cast<__nv_bfloat16*>(out.data));
-            CUDA_CHECK(cudaGetLastError());
+            launch_partial.template operator()<KeyBlock, false>();
             const dim3 reduce_grid(kContextQueryQHeads * Tokens / 4, 1, q.ne[3]);
             context_attention_reduce_kernel<Tokens, KeyBlock><<<reduce_grid, 128, 0, stream>>>(
                 static_cast<const __nv_bfloat16*>(partial_acc.data),
                 static_cast<const float*>(partial_m.data),
                 static_cast<const float*>(partial_l.data),
                 static_cast<const std::int32_t*>(context_lengths.data),
-                static_cast<const std::int32_t*>(valid_columns.data),
-                context.k_pages.records.page_offsets.ne[0] * kPagedKVPageSize, plan.split_capacity,
-                static_cast<__nv_bfloat16*>(out.data));
+                static_cast<const std::int32_t*>(valid_columns.data), max_context,
+                plan.split_capacity, static_cast<__nv_bfloat16*>(out.data));
             CUDA_CHECK(cudaGetLastError());
         };
         if (plan.key_block == 32) {

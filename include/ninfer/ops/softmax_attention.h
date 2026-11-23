@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ninfer/ops/attention_geometry.h"
+#include "ninfer/ops/context_bucket.h"
 
 #include "core/arena.h"
 #include "core/device.h"
@@ -18,11 +19,6 @@ inline constexpr std::uint32_t kCausalAttentionMaximumVisibleKeys = 262144;
 struct CausalAttentionExecutionEnvelope {
     std::uint32_t min_visible_keys = 0;
     std::uint32_t max_visible_keys = 0;
-};
-
-struct ContextAttentionExecutionEnvelope {
-    std::uint32_t min_context = 0;
-    std::uint32_t max_context = 0;
 };
 
 /**
@@ -152,6 +148,13 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
     CausalAttentionExecutionEnvelope envelope, std::int32_t batch_size, std::int32_t min_tokens,
     std::int32_t max_tokens, std::int32_t multiprocessor_count);
 
+// Equal profiles permit capture reuse at fixed operands and workspace. Device metadata and
+// page offsets remain replay inputs.
+[[nodiscard]] OpGraphProfile context_softmax_attention_graph_profile(AttentionHeadGeometry geometry,
+                                                                     ContextBucket bucket,
+                                                                     std::int32_t batch_size,
+                                                                     std::int32_t tokens);
+
 /**
  * Non-causal grouped-query attention over persistent context plus one live query block.
  *
@@ -169,25 +172,26 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
  * context and temporary query K/V remain separate physical segments; every input and cache byte is
  * unchanged, and out is the only observable mutation and is completely overwritten.
  *
- * The caller guarantees envelope.min_context <= L <= envelope.max_context and materialized block
- * table entries for every logical page intersecting [0,L). The envelope may affect finite launch
- * selection and workspace capacity, never the admitted key set or numerical result. Inputs,
- * context, output, and live workspace allocations are pairwise non-overlapping.
+ * Buckets K2 through K256 are supported. For every live row (V>0), the caller guarantees
+ * 0 <= L <= min(context_bucket_tokens(bucket), logical_pages * 64) and materialized block table
+ * entries for every logical page intersecting [0,L). The bucket determines launch and workspace
+ * capacity. The visible keys and numerical semantics follow the device inputs. Fixed geometry
+ * and T/B preserve capture topology across bucket updates. Inputs, context, output, and live
+ * workspace allocations are pairwise non-overlapping.
  */
 void context_softmax_attention(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
                                const Tensor& context_lengths, const Tensor& valid_columns,
                                const Tensor& table_rows, AttentionHeadGeometry geometry,
                                float scale, const ConstPagedKVBatchLayerView& context,
-                               ContextAttentionExecutionEnvelope envelope, MemoryArena& workspace,
-                               Tensor& out, CudaExecutionView execution);
+                               ContextBucket bucket, MemoryArena& workspace, Tensor& out,
+                               CudaExecutionView execution);
 
 /**
- * Return transient capacity for every T in the inclusive optimized interval at the exact batch
- * size. The execution envelope is fixed; invalid profiles or intervals throw.
- * An envelope with max_context=0 requires no transient storage.
+ * Return transient capacity for every bucket and T in the inclusive ranges at the exact batch
+ * size. Invalid profiles or ranges throw. The returned capacity may be zero.
  */
 [[nodiscard]] std::size_t context_softmax_attention_workspace_capacity_bytes(
-    AttentionHeadGeometry geometry, ContextAttentionExecutionEnvelope envelope,
-    std::int32_t min_tokens, std::int32_t max_tokens, std::int32_t batch_size);
+    AttentionHeadGeometry geometry, ContextBucketRange buckets, std::int32_t batch_size,
+    std::int32_t min_tokens, std::int32_t max_tokens);
 
 } // namespace ninfer::ops

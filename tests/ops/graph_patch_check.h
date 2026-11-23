@@ -5,6 +5,7 @@
 
 #include <array>
 #include <cstddef>
+#include <cstring>
 #include <memory>
 #include <span>
 #include <stdexcept>
@@ -82,6 +83,31 @@ private:
 
     std::shared_ptr<const Capture> capture_;
 };
+
+// Compare ordinary kernel launches at fixed operands, including scalar argument bits.
+inline bool same_kernel_launches(const CapturedKernelSequence& first,
+                                 const CapturedKernelSequence& second) {
+    const auto equal_dimensions = [](dim3 a, dim3 b) {
+        return a.x == b.x && a.y == b.y && a.z == b.z;
+    };
+    if (first.params().size() != second.params().size()) return false;
+    for (std::size_t node = 0; node < first.params().size(); ++node) {
+        const auto& a = first.params()[node];
+        const auto& b = second.params()[node];
+        if (a.func != b.func || !equal_dimensions(a.gridDim, b.gridDim) ||
+            !equal_dimensions(a.blockDim, b.blockDim) || a.sharedMemBytes != b.sharedMemBytes)
+            return false;
+        std::size_t count = 0;
+        CUDA_CHECK(cudaFuncGetParamCount(a.func, &count));
+        if (count && (!a.kernelParams || !b.kernelParams)) return false;
+        for (std::size_t arg = 0; arg < count; ++arg) {
+            std::size_t offset = 0, bytes = 0;
+            CUDA_CHECK(cudaFuncGetParamInfo(a.func, arg, &offset, &bytes));
+            if (std::memcmp(a.kernelParams[arg], b.kernelParams[arg], bytes) != 0) return false;
+        }
+    }
+    return true;
+}
 
 // Keeps the original graph nodes alive across both update methods. Launches are asynchronous.
 class FlatGraphPatchHarness {

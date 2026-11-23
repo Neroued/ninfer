@@ -2,39 +2,24 @@
 
 #include "core/device.h"
 #include "ninfer/ops/attention_geometry.h"
+#include "ninfer/ops/context_bucket.h"
 
 #include "core/arena.h"
 #include "core/cyclic_kv_cache.h"
 #include "core/tensor.h"
 
-#include <array>
 #include <cstddef>
 #include <cstdint>
 
 namespace ninfer::ops {
 
-struct SlidingWindowAttentionExecutionEnvelope {
-    std::uint32_t min_context = 0;
-    std::uint32_t max_context = 0;
-};
-
-// Equality means the captured call is reusable for another envelope at fixed operands.
-// Device positions, valid columns and State offsets remain replay inputs.
-class SlidingWindowAttentionGraphProfile {
-public:
-    bool operator==(const SlidingWindowAttentionGraphProfile&) const = default;
-private:
-    std::array<std::int32_t, 11> words_{};
-    friend SlidingWindowAttentionGraphProfile
-        sliding_window_attention_graph_profile(AttentionHeadGeometry, std::uint32_t,
-                                               SlidingWindowAttentionExecutionEnvelope,
-                                               std::int32_t, std::int32_t);
-};
-
-[[nodiscard]] SlidingWindowAttentionGraphProfile
-sliding_window_attention_graph_profile(AttentionHeadGeometry, std::uint32_t window,
-                                       SlidingWindowAttentionExecutionEnvelope, std::int32_t tokens,
-                                       std::int32_t batch);
+// Equal profiles permit capture reuse at fixed operands and workspace. Device positions,
+// valid columns and record offsets remain replay inputs.
+[[nodiscard]] OpGraphProfile sliding_window_attention_graph_profile(AttentionHeadGeometry geometry,
+                                                                    std::uint32_t window,
+                                                                    ContextBucket bucket,
+                                                                    std::int32_t batch_size,
+                                                                    std::int32_t tokens);
 
 /**
  * Symmetric non-causal sliding-window grouped-query attention.
@@ -65,25 +50,24 @@ sliding_window_attention_graph_profile(AttentionHeadGeometry, std::uint32_t wind
  * overlap no writable storage. Inputs and context remain unchanged; out is the only observable
  * mutation and is completely overwritten.
  *
- * The caller guarantees envelope.min_context <= L <= envelope.max_context, sequential nonnegative
- * live positions, and that the selected record contains the declared committed interval. The
- * envelope is a host launch/workspace resource promise; it never changes the admitted key set or
- * numerical result. Fixed geometry and T/B preserve capture topology across envelope updates.
+ * Buckets K2 through M1 are supported. For every live row (V>0), the caller guarantees
+ * 0 <= L <= context_bucket_tokens(bucket), L + V <= context_bucket_tokens(bucket), sequential live
+ * positions, and that the selected record contains the declared committed interval. The bucket
+ * determines launch and workspace capacity. The visible keys and numerical semantics follow the
+ * device inputs. Fixed geometry and T/B preserve capture topology across bucket updates.
  */
 void sliding_window_attention(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
                               const Tensor& positions, const Tensor& valid_columns,
                               AttentionHeadGeometry geometry, std::uint32_t window, float scale,
-                              const ConstCyclicKVCacheLayerView& context,
-                              SlidingWindowAttentionExecutionEnvelope envelope,
+                              const ConstCyclicKVCacheLayerView& context, ContextBucket bucket,
                               MemoryArena& workspace, Tensor& out, CudaExecutionView execution);
 
 /**
- * Return transient capacity for every T in the inclusive optimized interval at the exact batch
- * size. Geometry, window, and execution envelope are fixed profile inputs; invalid inputs throw.
+ * Return transient capacity for every bucket and T in the inclusive ranges at the exact batch
+ * size. Invalid profiles or ranges throw.
  */
 [[nodiscard]] std::size_t sliding_window_attention_workspace_capacity_bytes(
-    AttentionHeadGeometry geometry, std::uint32_t window,
-    SlidingWindowAttentionExecutionEnvelope envelope, std::int32_t min_tokens,
-    std::int32_t max_tokens, std::int32_t batch_size);
+    AttentionHeadGeometry geometry, std::uint32_t window, ContextBucketRange buckets,
+    std::int32_t batch_size, std::int32_t min_tokens, std::int32_t max_tokens);
 
 } // namespace ninfer::ops

@@ -25,6 +25,27 @@ inline constexpr std::array<std::string_view, 4> kLengthDistNames{
     "shared-prefix",
 };
 inline constexpr std::array<std::string_view, 3> kValidDistNames{"full", "ragged", "with-inert"};
+
+[[nodiscard]] inline int shared_prefix_length(int target, LengthDist dist, int page_tokens) {
+    return dist == LengthDist::SharedPrefix && target / 2 >= page_tokens
+               ? (target * 3 / 4) / page_tokens * page_tokens
+               : 0;
+}
+
+[[nodiscard]] inline int distributed_length(int target, int prefix, int row, int batch,
+                                            LengthDist dist) {
+    if (row == 0 || dist == LengthDist::Uniform) return target;
+    if (dist == LengthDist::Skewed1Long) {
+        constexpr std::array short_lengths{512, 1024, 384, 1536, 768, 256, 1280};
+        return std::min(target, short_lengths[(row - 1) % short_lengths.size()]);
+    }
+    return prefix + static_cast<int>(std::int64_t(target - prefix) * (batch - row) / batch);
+}
+
+[[nodiscard]] inline int distributed_valid(int tokens, int row, int batch, ValidDist dist) {
+    if (tokens == 0 || (dist == ValidDist::WithInert && batch >= 2 && row == batch - 1)) return 0;
+    return dist == ValidDist::Full ? tokens : tokens - row % tokens;
+}
 } // namespace detail
 
 [[nodiscard]] constexpr std::string_view length_dist_name(LengthDist dist) {
@@ -85,42 +106,93 @@ struct BatchWorkload {
     (void)length_dist_name(length_dist);
     (void)valid_dist_name(valid_dist);
 
-    const bool has_inert_row = valid_dist == ValidDist::WithInert && batch >= 2;
-    const auto live_rows     = tokens == 0 ? 0 : batch - static_cast<int>(has_inert_row);
-
     BatchWorkload workload;
     // Row zero always reaches the target if the batch has any live rows.
-    workload.max_visible_tokens = live_rows > 0 ? static_cast<std::uint32_t>(target_context) : 0U;
-    workload.natural_bucket     = ops::select_context_bucket(workload.max_visible_tokens);
+    workload.max_visible_tokens =
+        batch > 0 && tokens > 0 ? static_cast<std::uint32_t>(target_context) : 0U;
+    workload.natural_bucket = ops::select_context_bucket(workload.max_visible_tokens);
     workload.valid_columns.resize(static_cast<std::size_t>(batch));
     workload.row_contexts.resize(static_cast<std::size_t>(batch));
-    if (length_dist == LengthDist::SharedPrefix && target_context / 2 >= page_tokens) {
-        workload.shared_prefix_tokens = (target_context * 3 / 4) / page_tokens * page_tokens;
+    workload.shared_prefix_tokens =
+        detail::shared_prefix_length(target_context, length_dist, page_tokens);
+    for (std::int32_t row = 0; row < batch; ++row) {
+        const int valid = detail::distributed_valid(tokens, row, batch, valid_dist);
+        if (valid == 0) continue;
+        workload.valid_columns[row] = valid;
+        workload.row_contexts[row]  = std::max(
+            valid, detail::distributed_length(target_context, workload.shared_prefix_tokens, row,
+                                               batch, length_dist));
     }
-    constexpr std::array<std::int32_t, 7> short_lengths{512, 1024, 384, 1536, 768, 256, 1280};
-    for (std::int32_t row = 0; row < live_rows; ++row) {
-        const auto index = static_cast<std::size_t>(row);
-        const auto valid = valid_dist == ValidDist::Full ? tokens : tokens - row % tokens;
-        workload.valid_columns[index] = valid;
+    return workload;
+}
 
-        auto context = target_context;
-        if (row > 0) {
-            switch (length_dist) {
-            case LengthDist::Uniform:
-                break;
-            case LengthDist::Skewed1Long:
-                context = short_lengths[(index - 1) % short_lengths.size()];
-                break;
-            case LengthDist::Staggered:
-            case LengthDist::SharedPrefix: {
-                const auto prefix = workload.shared_prefix_tokens;
-                const auto suffix = static_cast<std::int64_t>(target_context - prefix);
-                context = prefix + static_cast<std::int32_t>(suffix * (batch - row) / batch);
-                break;
-            }
-            }
+struct ContextQueryOptions {
+    std::optional<ops::ContextBucket> bucket;
+    std::optional<LengthDist> length_dist;
+    std::optional<ValidDist> valid_dist;
+    std::string_view lengths = "uniform";
+    std::string_view valid   = "full";
+    int envelope_max         = -1;
+
+    [[nodiscard]] std::string_view length_name() const {
+        return length_dist ? length_dist_name(*length_dist) : lengths;
+    }
+
+    [[nodiscard]] std::string_view valid_name() const {
+        return valid_dist ? valid_dist_name(*valid_dist) : valid;
+    }
+
+    [[nodiscard]] ops::ContextBucket select_bucket(std::uint32_t required_tokens) const {
+        const auto selected =
+            bucket ? *bucket
+                   : ops::select_context_bucket(envelope_max >= 0 ? envelope_max : required_tokens);
+        if (ops::context_bucket_tokens(selected) < required_tokens)
+            throw std::invalid_argument("selected bucket is too small for the live rows");
+        return selected;
+    }
+};
+
+struct ContextQueryWorkload {
+    std::vector<std::int32_t> lengths;
+    std::vector<std::int32_t> valid_columns;
+    int shared_prefix_tokens         = 0;
+    std::uint32_t max_history        = 0;
+    std::uint32_t max_visible_tokens = 0;
+};
+
+// The context-query benchmarks take committed history as --context. Distribute it independently
+// of query validity, and expose both bounds because the cyclic bucket includes the live queries.
+[[nodiscard]] inline ContextQueryWorkload
+generate_context_query_workload(int context, int tokens, int batch,
+                                const ContextQueryOptions& options, int page_tokens = 64) {
+    ContextQueryWorkload workload;
+    workload.lengths.resize(batch);
+    workload.valid_columns.resize(batch);
+    const auto dist  = options.length_dist.value_or(LengthDist::Uniform);
+    const int prefix = detail::shared_prefix_length(context, dist, page_tokens);
+    for (int row = 0; row < batch; ++row) {
+        int valid = tokens;
+        if (options.valid_dist)
+            valid = detail::distributed_valid(tokens, row, batch, *options.valid_dist);
+        else if (options.valid == "mixed")
+            valid = static_cast<int>((std::int64_t(row) * 7 + tokens) % (tokens + 1));
+        else if (options.valid == "half")
+            valid = (tokens + 1) / 2;
+        else if (options.valid == "zero")
+            valid = 0;
+        if (valid == 0) continue;
+
+        int length = detail::distributed_length(context, prefix, row, batch, dist);
+        if (!options.length_dist && options.lengths == "mixed") {
+            if (row % 3 == 1) length = std::max(0, context - 63);
+            if (row % 3 == 2) length = std::min(context, 128);
         }
-        workload.row_contexts[index] = std::clamp(context, valid, target_context);
+        workload.lengths[row]         = length;
+        workload.valid_columns[row]   = valid;
+        workload.shared_prefix_tokens = prefix;
+        workload.max_history = std::max(workload.max_history, static_cast<std::uint32_t>(length));
+        workload.max_visible_tokens =
+            std::max(workload.max_visible_tokens, static_cast<std::uint32_t>(length + valid));
     }
     return workload;
 }

@@ -1,13 +1,13 @@
 #include "ninfer/ops/softmax_attention.h"
 
 #include "core/layout.h"
+#include "ops/common/host/graph_profile.h"
 #include "ops/common/host/operands.h"
 #include "ops/softmax_attention/dense/context/launch.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
-#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -27,8 +27,7 @@ void require_profile(AttentionHeadGeometry geometry, const char* op) {
     }
 }
 
-std::uint32_t validate_context(const ConstPagedKVBatchLayerView& context, const char* op,
-                               Device device) {
+void validate_context(const ConstPagedKVBatchLayerView& context, const char* op, Device device) {
     common::operand::device(context.device(), device, op, "cache");
     if (context.storage != KvCacheStorage::BFloat16 || context.num_kv_heads != kKVHeads ||
         context.head_dim != kHeadDim) {
@@ -50,12 +49,6 @@ std::uint32_t validate_context(const ConstPagedKVBatchLayerView& context, const 
         context.v_scale_pages.records.storage.data != nullptr) {
         throw std::invalid_argument(std::string(op) + ": BF16 context must not have scales");
     }
-    const std::uint64_t logical_capacity =
-        static_cast<std::uint64_t>(context.k_pages.records.page_offsets.ne[0]) * kPagedKVPageSize;
-    if (logical_capacity > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) {
-        throw std::overflow_error(std::string(op) + ": logical context capacity exceeds int32");
-    }
-    return static_cast<std::uint32_t>(logical_capacity);
 }
 
 struct PartialWorkspace {
@@ -79,27 +72,39 @@ PartialWorkspace allocate_workspace(Allocator& workspace, std::int32_t tokens,
 
 } // namespace
 
-std::size_t context_softmax_attention_workspace_capacity_bytes(
-    AttentionHeadGeometry geometry, ContextAttentionExecutionEnvelope envelope,
-    std::int32_t min_tokens, std::int32_t max_tokens, std::int32_t batch_size) {
-    require_profile(geometry, "context_softmax_attention workspace");
-    if (min_tokens < 1 || max_tokens < min_tokens || max_tokens > 16 || batch_size < 1 ||
-        envelope.min_context > envelope.max_context ||
-        envelope.max_context >
-            static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
-        throw std::invalid_argument(
-            "context_softmax_attention workspace: invalid envelope or token interval");
-    }
-    const auto endpoint_capacity = [&](std::int32_t tokens) {
-        const auto plan = detail::select_context_attention_plan(tokens, batch_size, envelope);
-        WorkspaceLayoutBuilder layout;
-        (void)allocate_workspace(layout, tokens, plan, std::min(batch_size, kMaximumGridRows));
-        return layout.peak_bytes(1);
-    };
+OpGraphProfile context_softmax_attention_graph_profile(AttentionHeadGeometry geometry,
+                                                       ContextBucket bucket,
+                                                       std::int32_t batch_size,
+                                                       std::int32_t tokens) {
+    require_profile(geometry, "context_softmax_attention graph");
+    const auto plan = detail::select_context_attention_plan(bucket, batch_size, tokens);
+    const std::uint64_t words[]{
+        std::uint64_t(geometry.head_dim), std::uint64_t(geometry.query_heads),
+        std::uint64_t(geometry.kv_heads), std::uint64_t(batch_size),
+        std::uint64_t(plan.tokens),       std::uint64_t(plan.route),
+        std::uint64_t(plan.key_block),    std::uint64_t(plan.split_capacity)};
+    return detail::make_op_graph_profile(words);
+}
 
+std::size_t context_softmax_attention_workspace_capacity_bytes(AttentionHeadGeometry geometry,
+                                                               ContextBucketRange buckets,
+                                                               std::int32_t batch_size,
+                                                               std::int32_t min_tokens,
+                                                               std::int32_t max_tokens) {
+    require_profile(geometry, "context_softmax_attention workspace");
+    buckets.validate(detail::kContextAttentionMaxBucket, "context_softmax_attention");
+    if (min_tokens < 1 || max_tokens < min_tokens || max_tokens > 16 || batch_size < 1) {
+        throw std::invalid_argument("context_softmax_attention workspace: invalid B/T interval");
+    }
     std::size_t maximum = 0;
-    if (min_tokens <= 8) { maximum = endpoint_capacity(std::min(max_tokens, 8)); }
-    if (max_tokens >= 9) { maximum = std::max(maximum, endpoint_capacity(max_tokens)); }
+    buckets.for_each([&](ContextBucket bucket) {
+        for (int tokens = min_tokens; tokens <= max_tokens; ++tokens) {
+            const auto plan = detail::select_context_attention_plan(bucket, batch_size, tokens);
+            WorkspaceLayoutBuilder layout;
+            (void)allocate_workspace(layout, tokens, plan, std::min(batch_size, kMaximumGridRows));
+            maximum = std::max(maximum, layout.peak_bytes(1));
+        }
+    });
     return maximum;
 }
 
@@ -107,8 +112,8 @@ void context_softmax_attention(const Tensor& q, const Tensor& query_k, const Ten
                                const Tensor& context_lengths, const Tensor& valid_columns,
                                const Tensor& table_rows, AttentionHeadGeometry geometry,
                                float scale, const ConstPagedKVBatchLayerView& context,
-                               ContextAttentionExecutionEnvelope envelope, MemoryArena& workspace,
-                               Tensor& out, CudaExecutionView execution) {
+                               ContextBucket bucket, MemoryArena& workspace, Tensor& out,
+                               CudaExecutionView execution) {
     if (workspace.device() != execution.device()) {
         throw std::invalid_argument(
             "context_softmax_attention: workspace belongs to another device");
@@ -127,10 +132,7 @@ void context_softmax_attention(const Tensor& q, const Tensor& query_k, const Ten
     }
     const std::int32_t tokens = q.ne[2];
     const std::int32_t batch  = q.ne[3];
-    if (tokens < 1 || tokens > 16) {
-        throw std::invalid_argument("context_softmax_attention: optimized domain is T=1..16");
-    }
-    if (batch < 1) { throw std::invalid_argument("context_softmax_attention: B must be positive"); }
+    const auto plan           = detail::select_context_attention_plan(bucket, batch, tokens);
     common::operand::shape(q, {kHeadDim, kQHeads, tokens, batch}, op, "q");
     common::operand::shape(query_k, {kHeadDim, kKVHeads, tokens, batch}, op, "query k");
     common::operand::shape(query_v, {kHeadDim, kKVHeads, tokens, batch}, op, "query v");
@@ -145,15 +147,11 @@ void context_softmax_attention(const Tensor& q, const Tensor& query_k, const Ten
     common::operand::contiguous_nonnull(valid_columns, op, "valid columns", execution.device());
     common::operand::contiguous_nonnull(table_rows, op, "table rows", execution.device());
     common::operand::contiguous_nonnull(out, op, "out", execution.device());
-    const std::uint32_t logical_capacity = validate_context(context, op, execution.device());
-    if (envelope.min_context > envelope.max_context || envelope.max_context > logical_capacity) {
-        throw std::invalid_argument("context_softmax_attention: invalid execution envelope");
-    }
+    validate_context(context, op, execution.device());
     if (!std::isfinite(scale) || std::abs(scale - kExpectedScale) > 1e-7f) {
         throw std::invalid_argument("context_softmax_attention: scale must be 1/sqrt(128)");
     }
 
-    const auto plan = detail::select_context_attention_plan(tokens, batch, envelope);
     for (std::int64_t begin = 0; begin < batch; begin += kMaximumGridRows) {
         const int rows = std::min<std::int64_t>(kMaximumGridRows, batch - begin);
         auto scope     = workspace.scope();

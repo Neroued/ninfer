@@ -7,6 +7,7 @@
 
 #include "core/decode_graph.h"
 #include "core/device.h"
+#include "ops/graph_patch_check.h"
 #include "ops/op_tester.h"
 #include "ops/softmax_attention/oracle.h"
 
@@ -24,6 +25,8 @@
 
 using namespace ninfer;
 using namespace ninfer::test;
+using ops::ContextBucket;
+using ops::ContextBucketRange;
 
 namespace {
 constexpr int D = 128, Lanes = 8;
@@ -183,8 +186,8 @@ std::vector<double> oracle(const Cache& cache, int width, int batch, const std::
 
 enum class Prefix { Full, Mixed, Zero };
 
-int run_case(Cache& cache, int width, int batch, int base_context, int envelope_max, Prefix prefix,
-             bool replay, bool update = false) {
+int run_case(Cache& cache, int width, int batch, int base_context, ContextBucket initial_bucket,
+             Prefix prefix, bool replay, bool cross_bucket = false) {
     const int Hkv = cache.kv_heads, Hq = Hkv * 4;
     const ops::AttentionHeadGeometry geometry{D, Hq, Hkv};
     const std::size_t q_count  = static_cast<std::size_t>(D) * Hq * width * batch;
@@ -220,10 +223,10 @@ int run_case(Cache& cache, int width, int batch, int base_context, int envelope_
                                               : 0;
         lanes[b]   = LaneOrder[b % LaneOrder.size()];
     }
-    ops::SlidingWindowAttentionExecutionEnvelope envelope{0,
-                                                          static_cast<std::uint32_t>(envelope_max)};
+    const ContextBucketRange buckets =
+        cross_bucket ? ContextBucketRange{ContextBucket::K2, ContextBucket::M1} : initial_bucket;
     const auto capacity = ops::sliding_window_attention_workspace_capacity_bytes(
-        geometry, cache.window, envelope, width, width, batch);
+        geometry, cache.window, buckets, batch, width, width);
     GuardedDeviceBuffer scratch(std::max<std::size_t>(capacity, 1));
     MemoryArena workspace(scratch.span().subspan(0, std::max<std::size_t>(capacity, 1)));
     GuardedDeviceBuffer dq(q_count * 2), dk(kv_count * 2), dv(kv_count * 2),
@@ -236,27 +239,57 @@ int run_case(Cache& cache, int width, int batch, int base_context, int envelope_
         to(output.span(), DType::BF16, {D, Hq, width, batch});
     auto context = cache.view(tlane);
     DeviceContext device;
-    const auto launch = [&] {
+    const auto execution = device.execution_view();
+    const auto launch    = [&](ContextBucket bucket, CudaExecutionView cuda) {
         ops::sliding_window_attention(tq, tk, tv, tp, tvalid, geometry, cache.window, Scale,
-                                      context, envelope, workspace, to, device.execution_view());
+                                         context, bucket, workspace, to, cuda);
     };
     DecodeGraphDefinition definition;
     DecodeGraphExecutable graph;
-    DecodeGraphDefinition child;
-    DecodeGraphChild child_node;
-    ops::SlidingWindowAttentionGraphProfile captured;
+    std::vector<CapturedKernelSequence> captures;
+    std::optional<FlatGraphPatchHarness> patched, updated;
+    constexpr std::array steps{ContextBucket::K2, ContextBucket::K8, ContextBucket::K64,
+                               ContextBucket::M1, ContextBucket::K2};
     int failures = 0;
-    for (int phase = 0; phase < (update ? 4 : replay ? 2 : 1); ++phase) {
+    if (cross_bucket) {
+        const auto profile = [&](ContextBucket bucket) {
+            return ops::sliding_window_attention_graph_profile(geometry, cache.window, bucket,
+                                                               batch, width);
+        };
+        const auto first  = profile(ContextBucket::K2);
+        const auto second = profile(ContextBucket::K8);
+        failures += (first == second) != (cache.window == 2048);
+        for (const auto bucket : ops::kAllContextBuckets) {
+            const std::size_t index = captures.size();
+            captures.emplace_back(execution, [&](auto cuda) { launch(bucket, cuda); });
+            const std::size_t representative = cache.window == 2048 || index == 0 ? 0 : 1;
+            if (captures.back().params().size() != 2 ||
+                profile(bucket) != (representative == 0 ? first : second) ||
+                !same_kernel_launches(captures[representative], captures.back())) {
+                std::cerr << "SWA window=" << cache.window
+                          << " bucket=" << ops::context_bucket_name(bucket)
+                          << ": unexpected graph profile or captured launch\n";
+                ++failures;
+            }
+        }
+        if (failures) return failures;
+        patched.emplace(captures.front());
+        updated.emplace(captures.front());
+    }
+    const int phases = cross_bucket ? static_cast<int>(steps.size()) : replay ? 2 : 1;
+    for (int phase = 0; phase < phases; ++phase) {
+        const auto bucket = cross_bucket ? steps[phase] : initial_bucket;
+        const int bound   = static_cast<int>(ops::context_bucket_tokens(bucket));
         if (phase)
             for (int b = 0; b < batch; ++b) {
-                lengths[b] = (b % 2 == 0 ? 17 : lengths[b] + 17) % (envelope_max + 1);
-                lanes[b]   = LaneOrder[(b + 3) % 8];
+                lanes[b] = LaneOrder[(b + 3) % 8];
                 if (prefix != Prefix::Zero) valid[b] = valid[b] == 0 ? width : valid[b] - 1;
+                lengths[b] = (b % 2 == 0 ? 17 : lengths[b] + 17) % (bound - width + 1);
             }
-        if (update) {
-            const unsigned bounds[]{96, 2048, 1048576, 96};
-            envelope.max_context = bounds[phase];
-            for (int b = 0; b < batch; ++b) lengths[b] = int(bounds[phase]) - b;
+        if (cross_bucket) {
+            lengths[0] = bound - valid[0];
+            lengths[1] = 64;
+            lengths[2] = 0;
         }
         for (int b = 0; b < batch; ++b)
             for (int t = 0; t < width; ++t)
@@ -289,50 +322,49 @@ int run_case(Cache& cache, int width, int batch, int base_context, int envelope_
         output.fill(0xff);
         scratch.fill(0xa7);
         cuda_synchronize();
-        if (update) {
-            const auto profile = ops::sliding_window_attention_graph_profile(
-                geometry, cache.window, envelope, width, batch);
-            if (!phase || profile != captured) {
-                child.capture(device.stream(), launch);
-                if (!phase) {
-                    definition.capture(device.stream(),
-                                       [&] { child_node = child.append_to(device.stream()); });
-                    graph.instantiate(definition);
-                } else
-                    graph.update_child(child_node, child);
-                captured = profile;
-            }
-        } else if (replay && phase == 0) {
-            definition.capture(device.stream(), launch);
+        if (!cross_bucket && replay && phase == 0) {
+            definition.capture(device.stream(), [&] { launch(bucket, execution); });
             graph.instantiate(definition);
         }
-        if (replay)
-            graph.launch(device.stream());
-        else
-            launch();
-        cuda_synchronize(device.stream());
         const auto expected = oracle(cache, width, batch, q, qk, value, positions, valid, lanes);
         const std::string label = "SWA window=" + std::to_string(cache.window) +
                                   " W=" + std::to_string(width) + " B=" + std::to_string(batch) +
                                   " L=" + std::to_string(base_context) +
-                                  " envelope=" + std::to_string(envelope_max) +
-                                  (replay ? " graph " : " eager ") + std::to_string(phase);
-        const auto out_bits = from_device<std::uint16_t>(output.data(), q_count);
-        failures +=
-            verify_reduction(label, from_device_bf16(output.data(), q_count), expected, Criterion);
-        bool zero = true;
-        for (int b = 0; b < batch; ++b)
-            for (int t = valid[b]; t < width; ++t)
-                for (int i = 0; i < Hq * D; ++i)
-                    zero = zero &&
-                           out_bits[(static_cast<std::size_t>(b) * width + t) * Hq * D + i] == 0;
-        if (!zero) {
-            std::cerr << label << ": inert tail is not exact zero\n";
-            ++failures;
+                                  " bucket=" + std::string(ops::context_bucket_name(bucket)) +
+                                  " phase=" + std::to_string(phase);
+        const auto verify = [&](const std::string& mode) {
+            cuda_synchronize(device.stream());
+            const auto check    = label + " " + mode;
+            const auto out_bits = from_device<std::uint16_t>(output.data(), q_count);
+            failures += verify_reduction(check, from_device_bf16(output.data(), q_count), expected,
+                                         Criterion);
+            for (int b = 0; b < batch; ++b) {
+                const auto begin =
+                    out_bits.begin() + (static_cast<std::ptrdiff_t>(b) * width + valid[b]) * Hq * D;
+                const auto end = begin + (width - valid[b]) * Hq * D;
+                if (std::any_of(begin, end, [](auto bits) { return bits != 0; })) {
+                    std::cerr << check << ": inert tail is not exact zero\n";
+                    ++failures;
+                }
+            }
+            failures += output.verify_guards(check) + scratch.verify_guards(check + " scratch");
+        };
+        if (cross_bucket) {
+            const auto& target = captures[static_cast<std::size_t>(bucket)];
+            patched->patch_and_launch(target, execution);
+            verify("node patch");
+            output.fill(0xff);
+            scratch.fill(0xa7);
+            updated->update_whole_graph_and_launch(target, execution);
+            verify("whole-graph update");
+        } else if (replay) {
+            graph.launch(device.stream());
+            verify("graph");
+        } else {
+            launch(bucket, execution);
+            verify("eager");
         }
-        failures += output.verify_guards(label) + scratch.verify_guards(label + " scratch");
-        if (workspace.used() != 0 ||
-            (update ? workspace.peak_used() > capacity : workspace.peak_used() != capacity)) {
+        if (workspace.used() != 0 || workspace.peak_used() != capacity) {
             std::cerr << label << ": workspace query/scope mismatch\n";
             ++failures;
         }
@@ -367,84 +399,81 @@ int main(int argc, char** argv) {
     };
 
     struct Case {
-        int width, batch, context, envelope;
+        int width, batch, context;
+        ContextBucket bucket;
         Prefix prefix;
         bool graph;
         bool operator==(const Case&) const = default;
     };
 
     std::map<std::tuple<int, bool, int>, std::vector<Case>> groups;
-    const auto add = [&](Recipe recipe, int width, int batch, int context, int envelope,
-                         Prefix prefix, bool graph) {
-        auto& cases = groups[{recipe.window, recipe.boundary, recipe.kv_heads}];
-        const Case c{width, batch, context, envelope, prefix, graph};
+    const auto add = [&](Recipe recipe, int width, int batch, int context, Prefix prefix,
+                         bool graph, std::optional<ContextBucket> bucket = std::nullopt) {
+        auto& cases         = groups[{recipe.window, recipe.boundary, recipe.kv_heads}];
+        const auto visible  = context < 0 || prefix == Prefix::Zero ? 0 : context + width;
+        const auto selected = bucket ? *bucket : ops::select_context_bucket(visible);
+        const Case c{width, batch, context, selected, prefix, graph};
         // Several boundary tables intersect at the same complete input recipe.
         if (std::find(cases.begin(), cases.end(), c) == cases.end()) cases.push_back(c);
     };
     const Recipe cache{2048};
     for (int batch = 1; batch <= 8; ++batch)
         for (int width = 1; width <= 16; ++width)
-            add(cache, width, batch, -1, batch % 2 ? 96 : 2048, Prefix::Mixed,
-                batch == 1 || batch == 8);
-    for (int width : {2, 3, 8, 16}) {
-        add(cache, width, 8, -1, 96, Prefix::Mixed, true);
-        add(cache, width, 1, -1, 2048, Prefix::Mixed, true);
-    }
+            add(cache, width, batch, -1, Prefix::Mixed, batch == 1 || batch == 8);
     for (int length : {64, 96, 97, 128})
-        for (int batch : {1, 8}) add(cache, 3, batch, length, length, Prefix::Mixed, false);
+        for (int batch : {1, 8}) add(cache, 3, batch, length, Prefix::Mixed, false);
     for (int width : {2, 8, 16})
         for (int batch : {1, 8}) {
-            const int length = width == 16 ? 262144 : width == 8 ? 4103 : 2048;
-            add(cache, width, batch, length, 262144, Prefix::Mixed, true);
+            const int length = width == 16 ? 262144 - width : width == 8 ? 4103 : 2048;
+            add(cache, width, batch, length, Prefix::Mixed, true, ContextBucket::K256);
         }
     for (int width : {1, 3, 16})
-        for (int batch : {1, 8}) add(cache, width, batch, 2048, 262144, Prefix::Zero, true);
+        for (int batch : {1, 8})
+            add(cache, width, batch, 2048, Prefix::Zero, true, ContextBucket::K256);
     // Every width/CTA and batch dispatch boundary with full active split work.
     for (int width : {4, 5, 8, 9, 16})
         for (int batch = 1; batch <= 8; ++batch)
-            add(cache, width, batch, 2048, 2048, Prefix::Mixed, false);
+            add(cache, width, batch, 2048, Prefix::Mixed, false);
     for (int width : {8, 9, 16})
         for (int batch : {1, 5, 6, 8})
             for (int length : {96, 97, 128, 129})
-                add(cache, width, batch, length, length, Prefix::Mixed, false);
+                add(cache, width, batch, length, Prefix::Mixed, false);
     for (int width : {8, 9, 16})
         for (int batch : {2, 4, 6})
             for (int length : {511, 512, 513, 1024})
-                add(cache, width, batch, length, length, Prefix::Mixed, false);
+                add(cache, width, batch, length, Prefix::Mixed, false);
     const Recipe boundary{2048, true};
-    for (int width : {2, 3, 16})
-        add(boundary, width, width == 3 ? 8 : 1, 2048, 2048, Prefix::Full, true);
+    for (int width : {2, 3, 16}) add(boundary, width, width == 3 ? 8 : 1, 2048, Prefix::Full, true);
     {
         const Recipe legacy{4096, false};
-        add(legacy, 1, 1, 0, 0, Prefix::Full, false);
-        add(legacy, 16, 1, 1, 1, Prefix::Full, false);
-        add(legacy, 8, 1, 96, 4096, Prefix::Full, true);
-        add(legacy, 16, 1, 4096, 4096, Prefix::Full, true);
-        add(legacy, 2, 2, 8194, 8194, Prefix::Mixed, true);
-        add(legacy, 8, 1, 65, 96, Prefix::Zero, true);
-        add(legacy, 8, 1, 4096, 4096, Prefix::Zero, true);
+        add(legacy, 1, 1, 0, Prefix::Full, false);
+        add(legacy, 16, 1, 1, Prefix::Full, false);
+        add(legacy, 8, 1, 96, Prefix::Full, true, ContextBucket::K8);
+        add(legacy, 16, 1, 4096, Prefix::Full, true);
+        add(legacy, 2, 2, 8194, Prefix::Mixed, true);
+        add(legacy, 8, 1, 65, Prefix::Zero, true);
+        add(legacy, 8, 1, 4096, Prefix::Zero, true, ContextBucket::K8);
         const Recipe edge{4096, true};
-        add(edge, 2, 1, 4096, 4096, Prefix::Full, true);
+        add(edge, 2, 1, 4096, Prefix::Full, true);
     }
     const Recipe glm{2048, false, 4};
     for (int batch = 1; batch <= 8; ++batch)
         for (int width = 1; width <= 16; ++width)
-            add(glm, width, batch, -1, batch % 2 ? 96 : 2048, Prefix::Mixed,
-                batch == 1 || batch == 8);
+            add(glm, width, batch, -1, Prefix::Mixed, batch == 1 || batch == 8);
     for (int width : {1, 4, 8, 16})
         for (int batch : {1, 2, 4, 8}) {
-            add(glm, width, batch, 1'048'570, 1'048'640, Prefix::Mixed, true);
-            add(glm, width, batch, 2048, 1'048'640, Prefix::Zero, true);
+            add(glm, width, batch, 1'048'576 - width, Prefix::Mixed, true);
+            add(glm, width, batch, 2048, Prefix::Zero, true, ContextBucket::M1);
         }
     for (int width : {4, 8, 16})
         for (int batch : {1, 4, 8})
             for (int length : {96, 97, 128, 129, 2047, 2048, 2049})
-                add(glm, width, batch, length, length, Prefix::Mixed, false);
+                add(glm, width, batch, length, Prefix::Mixed, false);
     for (int width : {2, 8, 16})
-        add({2048, true, 4}, width, width == 8 ? 8 : 1, 1'048'576, 1'048'640, Prefix::Full, true);
+        add({2048, true, 4}, width, width == 8 ? 8 : 1, 1'048'576 - 2048, Prefix::Full, true);
     for (const auto recipe : {cache, glm}) {
-        add(recipe, 4, 17, 128, 2048, Prefix::Mixed, true);
-        add(recipe, 1, 129, 2048, 2048, Prefix::Zero, false);
+        add(recipe, 4, 17, 128, Prefix::Mixed, true);
+        add(recipe, 1, 129, 2048, Prefix::Zero, false);
     }
 
     for (const auto& [recipe, cases] : groups) {
@@ -454,9 +483,9 @@ int main(int argc, char** argv) {
             catalogue.push_back(
                 {"swa/window" + std::to_string(window) + (boundary ? "/boundary" : "/random") +
                      (heads == 4 ? "/q16" : "") + "/w" + std::to_string(c.width) + "/b" +
-                     std::to_string(c.batch) + "/context" + std::to_string(c.context) + "/bound" +
-                     std::to_string(c.envelope) + "/prefix" + std::to_string(int(c.prefix)) +
-                     (c.graph ? "/graph" : "/eager"),
+                     std::to_string(c.batch) + "/context" + std::to_string(c.context) + "/bucket" +
+                     std::string(ops::context_bucket_name(c.bucket)) + "/prefix" +
+                     std::to_string(int(c.prefix)) + (c.graph ? "/graph" : "/eager"),
                  {{"suite", c.batch > 8 ? "concurrency" : "swa"},
                   {"execution", c.graph ? "graph" : "eager"}}});
         suite.add(std::move(catalogue), [=](auto selected) {
@@ -465,39 +494,61 @@ int main(int argc, char** argv) {
             for (auto i : selected) {
                 auto c = cases[i];
                 failures +=
-                    run_case(cache, c.width, c.batch, c.context, c.envelope, c.prefix, c.graph);
+                    run_case(cache, c.width, c.batch, c.context, c.bucket, c.prefix, c.graph);
             }
             return failures + cache.verify();
         });
     }
-    for (int heads : {4, 8})
-        suite.add("swa/child-update/h" + std::to_string(heads),
+    for (const auto& [window, heads] : {std::pair{2048, 4}, {2048, 8}, {4096, 8}})
+        suite.add("swa/cross-bucket/window" + std::to_string(window) + "/h" + std::to_string(heads),
                   [=] {
-                      Cache cache(2048, false, heads);
-                      return run_case(cache, 8, 4, 96, 1048576, Prefix::Mixed, true, true);
+                      Cache cache(window, false, heads);
+                      const auto failures =
+                          run_case(cache, 8, 4, 64, ContextBucket::K2, Prefix::Mixed, true, true);
+                      return failures + cache.verify();
                   },
                   {{"execution", "graph"}});
     suite.add("swa/capacity", [] {
         int failures = 0;
+        constexpr ContextBucketRange buckets{ContextBucket::K2, ContextBucket::M1};
         for (int heads : {4, 8})
             for (int batch = 1; batch <= 8; ++batch) {
                 const ops::AttentionHeadGeometry geometry{D, heads * 4, heads};
-                ops::SlidingWindowAttentionExecutionEnvelope envelope{0, batch % 2 ? 96U : 2048U};
                 for (auto [lo, hi] : {std::pair{1, 16}, {4, 5}, {8, 9}}) {
                     std::size_t peak = 0;
-                    for (int width = lo; width <= hi; ++width)
-                        peak =
-                            std::max(peak, ops::sliding_window_attention_workspace_capacity_bytes(
-                                               geometry, 2048, envelope, width, width, batch));
+                    buckets.for_each([&](ContextBucket bucket) {
+                        for (int width = lo; width <= hi; ++width)
+                            peak = std::max(peak,
+                                            ops::sliding_window_attention_workspace_capacity_bytes(
+                                                geometry, 2048, bucket, batch, width, width));
+                    });
                     failures += peak != ops::sliding_window_attention_workspace_capacity_bytes(
-                                            geometry, 2048, envelope, lo, hi, batch);
+                                            geometry, 2048, buckets, batch, lo, hi);
                 }
             }
-        try {
+        const auto reject = [&](auto&& fn) {
+            try {
+                fn();
+                ++failures;
+            } catch (const std::invalid_argument&) {}
+        };
+        const ops::AttentionHeadGeometry geometry{D, 32, 8};
+        for (ContextBucketRange invalid : {ContextBucketRange{ContextBucket::K8, ContextBucket::K2},
+                                           ContextBucketRange{static_cast<ContextBucket>(255)}}) {
+            reject([&] {
+                (void)ops::sliding_window_attention_workspace_capacity_bytes(geometry, 2048,
+                                                                             invalid, 1, 1, 16);
+            });
+        }
+        reject([&] {
             (void)ops::sliding_window_attention_workspace_capacity_bytes({128, 16, 4}, 4096,
-                                                                         {0, 4096}, 1, 16, 1);
-            ++failures;
-        } catch (const std::invalid_argument&) {}
+                                                                         buckets, 1, 1, 16);
+        });
+        reject([&] {
+            (void)ops::sliding_window_attention_graph_profile(
+                geometry, 2048, static_cast<ContextBucket>(255), 1, 8);
+        });
+        if (failures) std::cerr << "SWA workspace or profile validation failed\n";
         return failures;
     });
     return suite.main(argc, argv);

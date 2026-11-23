@@ -1,6 +1,7 @@
 #include "ninfer/ops/sliding_window_attention.h"
 
 #include "core/layout.h"
+#include "ops/common/host/graph_profile.h"
 #include "ops/common/host/operands.h"
 #include "ops/softmax_attention/sliding_window/launch.h"
 
@@ -57,6 +58,7 @@ template <class Allocator>
 PartialWorkspace allocate_workspace(Allocator& workspace, AttentionHeadGeometry geometry,
                                     std::int32_t tokens, std::int32_t splits,
                                     std::int32_t batch_size) {
+    if (splits == 1) return {};
     return {
         workspace.alloc(DType::FP32, {kHeadDim, geometry.query_heads, tokens, splits * batch_size}),
         workspace.alloc(DType::FP32, {geometry.query_heads, tokens, splits * batch_size}),
@@ -66,60 +68,50 @@ PartialWorkspace allocate_workspace(Allocator& workspace, AttentionHeadGeometry 
 
 } // namespace
 
-SlidingWindowAttentionGraphProfile
-sliding_window_attention_graph_profile(AttentionHeadGeometry geometry, std::uint32_t window,
-                                       SlidingWindowAttentionExecutionEnvelope envelope,
-                                       std::int32_t tokens, std::int32_t batch) {
+OpGraphProfile sliding_window_attention_graph_profile(AttentionHeadGeometry geometry,
+                                                      std::uint32_t window, ContextBucket bucket,
+                                                      std::int32_t batch_size,
+                                                      std::int32_t tokens) {
     require_profile(geometry, window, "sliding_window_attention graph");
-    const auto p =
-        detail::select_sliding_window_attention_plan(geometry, window, tokens, batch, envelope);
-    SlidingWindowAttentionGraphProfile out;
-    out.words_ = {geometry.head_dim,
-                  geometry.query_heads,
-                  geometry.kv_heads,
-                  tokens,
-                  batch,
-                  static_cast<int>(p.route),
-                  p.key_block,
-                  p.reduce_warps,
-                  p.split_capacity,
-                  p.max_context,
-                  p.window};
-    return out;
+    const auto plan =
+        detail::select_sliding_window_attention_plan(geometry, window, bucket, batch_size, tokens);
+    const std::uint64_t words[]{
+        std::uint64_t(geometry.head_dim), std::uint64_t(geometry.query_heads),
+        std::uint64_t(geometry.kv_heads), std::uint64_t(batch_size),
+        std::uint64_t(plan.tokens),       std::uint64_t(plan.window),
+        std::uint64_t(plan.reduce_warps), std::uint64_t(plan.split_capacity),
+        std::uint64_t(plan.max_context)};
+    return detail::make_op_graph_profile(words);
 }
 
 std::size_t sliding_window_attention_workspace_capacity_bytes(
-    AttentionHeadGeometry geometry, std::uint32_t window,
-    SlidingWindowAttentionExecutionEnvelope envelope, std::int32_t min_tokens,
-    std::int32_t max_tokens, std::int32_t batch_size) {
+    AttentionHeadGeometry geometry, std::uint32_t window, ContextBucketRange buckets,
+    std::int32_t batch_size, std::int32_t min_tokens, std::int32_t max_tokens) {
     require_profile(geometry, window, "sliding_window_attention workspace");
-    if (min_tokens < 1 || max_tokens < min_tokens || max_tokens > 16 || batch_size < 1 ||
-        envelope.min_context > envelope.max_context ||
-        envelope.max_context >
-            static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
-        throw std::invalid_argument(
-            "sliding_window_attention workspace: invalid envelope or token interval");
+    buckets.validate(ContextBucket::M1, "sliding_window_attention");
+    if (min_tokens < 1 || max_tokens < min_tokens || max_tokens > 16 || batch_size < 1) {
+        throw std::invalid_argument("sliding_window_attention workspace: invalid B/T interval");
     }
     // Split capacity depends on the query width. The largest width need not have the
     // largest allocation (for example, a wider block can use fewer splits).
     std::size_t capacity = 0;
-    for (int tokens = min_tokens; tokens <= max_tokens; ++tokens) {
-        const auto plan = detail::select_sliding_window_attention_plan(geometry, window, tokens,
-                                                                       batch_size, envelope);
-        if (plan.route == detail::SlidingWindowAttentionRoute::Direct) continue;
-        WorkspaceLayoutBuilder layout;
-        (void)allocate_workspace(layout, geometry, tokens, plan.split_capacity,
-                                 std::min(batch_size, kMaximumGridRows));
-        capacity = std::max(capacity, layout.peak_bytes(1));
-    }
+    buckets.for_each([&](ContextBucket bucket) {
+        for (int tokens = min_tokens; tokens <= max_tokens; ++tokens) {
+            const auto plan = detail::select_sliding_window_attention_plan(geometry, window, bucket,
+                                                                           batch_size, tokens);
+            WorkspaceLayoutBuilder layout;
+            (void)allocate_workspace(layout, geometry, tokens, plan.split_capacity,
+                                     std::min(batch_size, kMaximumGridRows));
+            capacity = std::max(capacity, layout.peak_bytes(1));
+        }
+    });
     return capacity;
 }
 
 void sliding_window_attention(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
                               const Tensor& positions, const Tensor& valid_columns,
                               AttentionHeadGeometry geometry, std::uint32_t window, float scale,
-                              const ConstCyclicKVCacheLayerView& context,
-                              SlidingWindowAttentionExecutionEnvelope envelope,
+                              const ConstCyclicKVCacheLayerView& context, ContextBucket bucket,
                               MemoryArena& workspace, Tensor& out, CudaExecutionView execution) {
     if (workspace.device() != execution.device()) {
         throw std::invalid_argument(
@@ -139,10 +131,8 @@ void sliding_window_attention(const Tensor& q, const Tensor& query_k, const Tens
     }
     const std::int32_t tokens = q.ne[2];
     const std::int32_t batch  = q.ne[3];
-    if (tokens < 1 || tokens > 16) {
-        throw std::invalid_argument("sliding_window_attention: optimized domain is T=1..16");
-    }
-    if (batch < 1) { throw std::invalid_argument("sliding_window_attention: B must be positive"); }
+    const auto plan =
+        detail::select_sliding_window_attention_plan(geometry, window, bucket, batch, tokens);
     common::operand::shape(q, {kHeadDim, kQHeads, tokens, batch}, op, "q");
     common::operand::shape(query_k, {kHeadDim, kKVHeads, tokens, batch}, op, "query k");
     common::operand::shape(query_v, {kHeadDim, kKVHeads, tokens, batch}, op, "query v");
@@ -158,25 +148,15 @@ void sliding_window_attention(const Tensor& q, const Tensor& query_k, const Tens
     validate_context(context, geometry, window, op, execution.device());
     common::operand::shape(context.k.records.byte_offsets, {batch, 1, 1, 1}, op, "K offsets");
     common::operand::shape(context.v.records.byte_offsets, {batch, 1, 1, 1}, op, "V offsets");
-    if (envelope.min_context > envelope.max_context ||
-        envelope.max_context >
-            static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
-        throw std::invalid_argument("sliding_window_attention: invalid execution envelope");
-    }
     if (!std::isfinite(scale) || std::abs(scale - kExpectedScale) > 1e-7f) {
         throw std::invalid_argument("sliding_window_attention: scale must be 1/sqrt(128)");
     }
 
-    const auto plan =
-        detail::select_sliding_window_attention_plan(geometry, window, tokens, batch, envelope);
     for (std::int64_t begin = 0; begin < batch; begin += kMaximumGridRows) {
         const int rows = std::min<std::int64_t>(kMaximumGridRows, batch - begin);
         auto scope     = workspace.scope();
-        PartialWorkspace partial{};
-        if (plan.route == detail::SlidingWindowAttentionRoute::SplitKv) {
-            partial = allocate_workspace(workspace, geometry, tokens, plan.split_capacity, rows);
-        }
-        auto selected                   = context;
+        auto partial   = allocate_workspace(workspace, geometry, tokens, plan.split_capacity, rows);
+        auto selected  = context;
         selected.k.records.byte_offsets = context.k.records.byte_offsets.slice(0, begin, rows);
         selected.v.records.byte_offsets = context.v.records.byte_offsets.slice(0, begin, rows);
         auto output                     = out.slice(3, begin, rows);

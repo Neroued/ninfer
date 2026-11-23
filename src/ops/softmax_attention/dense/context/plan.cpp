@@ -1,47 +1,25 @@
 #include "ops/softmax_attention/dense/context/plan.h"
 
-#include <algorithm>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
 
-ContextAttentionPlan select_context_attention_plan(std::int32_t tokens, std::int32_t batch,
-                                                   ContextAttentionExecutionEnvelope envelope) {
+ContextAttentionPlan select_context_attention_plan(ContextBucket bucket, std::int32_t batch,
+                                                   std::int32_t tokens) {
+    ContextBucketRange{bucket}.validate(kContextAttentionMaxBucket, "context_softmax_attention");
     if (tokens < 1 || tokens > 16 || batch < 1) {
         throw std::invalid_argument(
             "context_softmax_attention plan: T must be 1..16 and B must be positive");
     }
-    if (envelope.min_context > envelope.max_context) {
-        throw std::invalid_argument("context_softmax_attention plan: invalid envelope");
-    }
-    const std::int32_t warps = (tokens + 3) / 4;
-    const bool direct        = envelope.max_context == 0;
-    const std::int32_t key_block =
-        direct || tokens <= 8 || envelope.max_context <= 65536u ? 32 : 64;
-    std::int32_t split_limit = 32;
-    if (tokens <= 8) {
-        split_limit =
-            envelope.max_context <= 131072u ? 32 : (envelope.max_context <= 196608u ? 48 : 64);
-    } else if (key_block == 64) {
-        split_limit =
-            envelope.max_context <= 131072u ? 32 : (envelope.max_context <= 196608u ? 38 : 40);
-    }
-    if (batch > 8) {
-        split_limit =
-            static_cast<int>((static_cast<std::int64_t>(split_limit) * 8 + batch - 1) / batch);
-    }
-    const std::uint32_t envelope_tiles =
-        (envelope.max_context + static_cast<std::uint32_t>(key_block) - 1u) /
-        static_cast<std::uint32_t>(key_block);
-    const std::int32_t splits =
-        direct ? 1 : std::min(split_limit, std::max(1, static_cast<std::int32_t>(envelope_tiles)));
+    const int key_block = tokens > 8 && bucket >= ContextBucket::K128 ? 64 : 32;
+    // Bucket capacities always cover at least this many tiles. Live lengths gate active splits.
+    int splits = bucket == ContextBucket::K256 ? (tokens <= 8 ? 64 : 40) : 32;
+    if (batch > 8) { splits = static_cast<int>((std::int64_t(splits) * 8 + batch - 1) / batch); }
     return {
         .route     = splits == 1 ? ContextAttentionRoute::Direct : ContextAttentionRoute::SplitKv,
         .tokens    = tokens,
-        .warps     = warps,
         .key_block = splits == 1 ? 32 : key_block,
-        .split_capacity   = splits,
-        .keep_reduce_slot = envelope.max_context != 0,
+        .split_capacity = splits,
     };
 }
 

@@ -19,7 +19,7 @@ inline constexpr int kContextQueryHeadDim  = 128;
 inline constexpr int kContextQueryQHeads   = 32;
 inline constexpr int kContextQueryKVHeads  = 8;
 inline constexpr int kContextQueryGroup    = 4;
-inline constexpr int kContextQueryMaxSplit = 85;
+inline constexpr int kContextQueryMaxSplit = 64;
 
 template <int QHeads = kContextQueryQHeads>
 __device__ __forceinline__ std::int64_t context_query_q_index(int q_head, int d, int token) {
@@ -120,7 +120,7 @@ template <typename ContextPolicy, int Tokens, int WarpsPerCta, int KeyBlock, boo
           typename Partial, int KVHeads = kContextQueryKVHeads>
 __device__ __forceinline__ void context_query_split_partial_body(
     const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ query_k,
-    const __nv_bfloat16* __restrict__ query_v, const std::int32_t* __restrict__ valid_columns,
+    const __nv_bfloat16* __restrict__ query_v, int valid,
     const __nv_bfloat16* __restrict__ context_k, const __half* __restrict__ context_v,
     ContextPolicy policy, int length, int max_context, int split_capacity, float scale,
     Partial* __restrict__ partial_acc, float* __restrict__ partial_m, float* __restrict__ partial_l,
@@ -166,11 +166,7 @@ __device__ __forceinline__ void context_query_split_partial_body(
         partial_m += StatElements * split_capacity * batch;
         partial_l += StatElements * split_capacity * batch;
     }
-    const int valid = valid_columns[batch];
-    if (kv_head >= KVHeads || split >= split_capacity || length < 0 || length > max_context ||
-        valid < 0 || valid > Tokens) {
-        return;
-    }
+    if (length < 0 || length > max_context || valid < 0 || valid > Tokens) { return; }
     if (valid == 0) {
         if constexpr (DirectOutput) {
             constexpr int VecsPerKVHead = D * kContextQueryGroup / 8;
@@ -194,15 +190,25 @@ __device__ __forceinline__ void context_query_split_partial_body(
     const int active_splits = context_tiles > 0 ? min(context_tiles, split_capacity) : 1;
     if (split >= active_splits) { return; }
 
-    const int tile_begin =
-        static_cast<int>((static_cast<std::int64_t>(context_tiles) * split) / active_splits);
-    const int tile_end =
-        static_cast<int>((static_cast<std::int64_t>(context_tiles) * (split + 1)) / active_splits);
-    const bool owns_query        = split == active_splits - 1;
-    const int context_tile_count = tile_end - tile_begin;
-    const int iterations         = context_tile_count + (owns_query ? 1 : 0);
+    if constexpr (!ContextPolicy::PageMapped) {
+        if (context_count > 0) policy.bind_record(context_k, context_v);
+    }
 
-    policy.template prime<Tokens, KeyBlock>(context_tile_count, context_start, tile_begin, lane);
+    // With at least one split per tile, each active split owns one tile. The empty history
+    // uses only the query tile. Larger histories partition at most 8192 tiles across 64 splits.
+    int tile_begin         = split;
+    int context_tile_count = context_tiles > 0 ? 1 : 0;
+    if (context_tiles > active_splits) {
+        tile_begin         = context_tiles * split / active_splits;
+        const int tile_end = context_tiles * (split + 1) / active_splits;
+        context_tile_count = tile_end - tile_begin;
+    }
+    const bool owns_query = split == active_splits - 1;
+    const int iterations  = context_tile_count + (owns_query ? 1 : 0);
+    if constexpr (ContextPolicy::PageMapped) {
+        policy.template prime<Tokens, KeyBlock>(context_tile_count, context_start, tile_begin,
+                                                lane);
+    }
 
     extern __shared__ __align__(16) __nv_bfloat16 shared[];
     __nv_bfloat16* k_s = shared;

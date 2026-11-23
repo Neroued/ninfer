@@ -8,6 +8,8 @@ struct SlidingWindowAttentionPolicy {
     static constexpr bool PageMapped = false;
 
     const std::int32_t* positions;
+    const std::int64_t* key_offset;
+    const std::int64_t* value_offset;
     int padded_context;
     int window_mask;
 
@@ -31,8 +33,11 @@ struct SlidingWindowAttentionPolicy {
         return tile + d + static_cast<std::int64_t>(kContextQueryHeadDim) * slot;
     }
 
-    template <int Tokens, int KeyBlock>
-    __device__ __forceinline__ void prime(int, int, int, int) {}
+    __device__ __forceinline__ void bind_record(const __nv_bfloat16* __restrict__& context_k,
+                                                const __half* __restrict__& context_v) const {
+        context_k += *key_offset / 2;
+        context_v += *value_offset / 2;
+    }
 };
 
 template <int Tokens, int WarpsPerCta, int KeyBlock, bool DirectOutput, int KVHeads>
@@ -47,22 +52,21 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__
         int split_capacity, float scale, float* __restrict__ partial_acc,
         float* __restrict__ partial_m, float* __restrict__ partial_l,
         __nv_bfloat16* __restrict__ out) {
-    const int batch = static_cast<int>(blockIdx.z);
-    if (valid_columns[batch] > 0) {
-        context_k += key_offsets[batch] / 2;
-        context_v += value_offsets[batch] / 2;
-    }
+    const int batch                     = static_cast<int>(blockIdx.z);
+    const int valid                     = valid_columns[batch];
     const std::int32_t* batch_positions = positions + static_cast<std::int64_t>(Tokens) * batch;
     SlidingWindowAttentionPolicy policy{
         .positions      = batch_positions,
+        .key_offset     = key_offsets + batch,
+        .value_offset   = value_offsets + batch,
         .padded_context = padded_context,
         .window_mask    = window_mask,
     };
     context_query_split_partial_body<SlidingWindowAttentionPolicy, Tokens, WarpsPerCta, KeyBlock,
                                      DirectOutput, float, KVHeads>(
-        q, query_k, query_v, valid_columns, context_k, context_v, policy,
-        valid_columns[batch] == 0 ? 0 : batch_positions[0], max_context, split_capacity, scale,
-        partial_acc, partial_m, partial_l, out);
+        q, query_k, query_v, valid, context_k, context_v, policy,
+        valid > 0 ? batch_positions[0] : 0, max_context, split_capacity, scale, partial_acc,
+        partial_m, partial_l, out);
 }
 
 template <int Tokens, int KeyBlock, int WarpsPerBlock, int KVHeads>

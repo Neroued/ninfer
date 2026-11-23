@@ -7,6 +7,7 @@
 
 #include "core/device.h"
 #include "core/cyclic_kv_cache.h"
+#include "context_bucket_workload.h"
 #include "op_measurement.cuh"
 
 #include <cuda_profiler_api.h>
@@ -20,19 +21,20 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
-#include <limits>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
 
 using namespace ninfer;
+namespace workload = ninfer::bench::workload;
 
 namespace {
 
-constexpr std::int32_t kHeadDim   = 128;
-constexpr float kScale            = 0.08838834764831844055F;
-constexpr std::size_t kFlushBytes = std::size_t{256} << 20;
+constexpr std::int32_t kHeadDim        = 128;
+constexpr std::int32_t kMaximumContext = ops::context_bucket_tokens(ops::ContextBucket::M1);
+constexpr float kScale                 = 0.08838834764831844055F;
+constexpr std::size_t kFlushBytes      = std::size_t{256} << 20;
 
 enum class Execution : std::uint8_t { Eager, Graph, Both };
 enum class CacheMode : std::uint8_t { Cold, Warm, Both };
@@ -43,27 +45,27 @@ struct Options {
     std::vector<std::int32_t> contexts{0, 128, 2048, 4095, 4096, 8192, 262144};
     std::vector<std::int32_t> batches{1};
     std::int32_t kv_heads = 8;
-    std::string valid = "full", lengths = "uniform";
-    std::int32_t window       = 4096;
-    std::int32_t envelope_max = -1;
-    Execution execution       = Execution::Graph;
-    CacheMode cache           = CacheMode::Cold;
-    int warmup                = 5;
-    int repeat                = 50;
-    int graph_calls           = 1;
-    bool profile              = false;
+    workload::ContextQueryOptions workload;
+    std::int32_t window = 4096;
+    Execution execution = Execution::Graph;
+    CacheMode cache     = CacheMode::Cold;
+    int warmup          = 5;
+    int repeat          = 50;
+    int graph_calls     = 1;
+    bool profile        = false;
     std::string csv_out;
 };
 
 struct Result {
     std::int32_t window;
     std::int32_t kv_heads;
-    std::string valid, lengths;
-    int live_columns;
+    std::string_view valid, lengths;
+    std::int64_t live_columns;
     std::int32_t tokens;
     std::int32_t batch;
     std::int32_t context;
     std::int32_t envelope_max;
+    ops::ContextBucket bucket;
     std::size_t graph_nodes;
     int graph_calls;
     Execution execution;
@@ -79,10 +81,15 @@ struct Result {
                  "error: %s\n"
                  "usage: ninfer_sliding_window_attention_bench "
                  "[--kv-heads 4|8] [--window 2048|4096] [--tokens 1,...,16] [--batches B,...] "
-                 "[--context 0,...,1048576] [--envelope-max N] [--valid full|half|mixed|zero] "
+                 "[--context 0,...,1048576] [--envelope-max N] "
+                 "[--bucket auto|2k|8k|16k|32k|64k|128k|256k|512k|1m] "
+                 "[--length-dist uniform|skewed-1long|staggered|shared-prefix] "
+                 "[--valid-dist full|ragged|with-inert] [--valid full|half|mixed|zero] "
                  "[--lengths uniform|mixed] "
                  "[--execution eager|graph|both] [--cache cold|warm|both] "
-                 "[--warmup N] [--repeat N] [--graph-calls N] [--profile] [--csv-out PATH]\n",
+                 "[--warmup N] [--repeat N] [--graph-calls N] [--profile] [--csv-out PATH]\n"
+                 "--context is committed history. Buckets cover history plus live queries.\n"
+                 "--envelope-max sets the auto bucket input when supplied.\n",
                  message);
     std::exit(2);
 }
@@ -97,7 +104,7 @@ Options parse_options(int argc, char** argv) {
         };
         if (argument == "--tokens") {
             options.tokens = bench::measurement::integers(next("--tokens requires a value"), 1, 16);
-        } else if (argument == "--batches") {
+        } else if (argument == "--batches" || argument == "--batch") {
             options.batches =
                 bench::measurement::integers(next("--batches requires a value"), 1, INT32_MAX);
         } else if (argument == "--kv-heads") {
@@ -105,13 +112,23 @@ Options parse_options(int argc, char** argv) {
                 bench::measurement::integer(next("--kv-heads requires a value"), 4, 8);
             if (options.kv_heads != 4 && options.kv_heads != 8) usage("--kv-heads expects 4 or 8");
         } else if (argument == "--valid") {
-            options.valid = next("--valid requires a value");
-            if (options.valid != "full" && options.valid != "half" && options.valid != "mixed" &&
-                options.valid != "zero")
+            const std::string_view valid(next("--valid requires a value"));
+            if (valid != "full" && valid != "half" && valid != "mixed" && valid != "zero")
                 usage("valid mode");
+            options.workload.valid = valid;
         } else if (argument == "--lengths") {
-            options.lengths = next("--lengths requires a value");
-            if (options.lengths != "uniform" && options.lengths != "mixed") usage("lengths mode");
+            const std::string_view lengths(next("--lengths requires a value"));
+            if (lengths != "uniform" && lengths != "mixed") usage("lengths mode");
+            options.workload.lengths = lengths;
+        } else if (argument == "--valid-dist") {
+            options.workload.valid_dist =
+                workload::parse_valid_dist(next("--valid-dist requires a value"));
+        } else if (argument == "--length-dist") {
+            options.workload.length_dist =
+                workload::parse_length_dist(next("--length-dist requires a value"));
+        } else if (argument == "--bucket") {
+            options.workload.bucket =
+                workload::parse_bucket_override(next("--bucket requires a value"));
         } else if (argument == "--window") {
             options.window =
                 bench::measurement::integer(next("--window requires a value"), 2048, 4096);
@@ -120,10 +137,10 @@ Options parse_options(int argc, char** argv) {
             }
         } else if (argument == "--context") {
             options.contexts = bench::measurement::integers(next("--context requires a value"), 0,
-                                                            std::numeric_limits<int>::max() - 16);
+                                                            kMaximumContext);
         } else if (argument == "--envelope-max") {
-            options.envelope_max = bench::measurement::integer(
-                next("--envelope-max requires a value"), 0, std::numeric_limits<int>::max() - 16);
+            options.workload.envelope_max = bench::measurement::integer(
+                next("--envelope-max requires a value"), 0, kMaximumContext);
         } else if (argument == "--execution") {
             const std::string_view value(next("--execution requires a value"));
             if (value == "eager")
@@ -170,10 +187,6 @@ Options parse_options(int argc, char** argv) {
     }
     if (options.graph_calls > 1 && (options.execution != Execution::Graph || options.profile))
         usage("graph bundles require --execution graph and no --profile");
-    for (const int context : options.contexts) {
-        if (options.envelope_max >= 0 && options.envelope_max < context)
-            usage("envelope max must cover every context");
-    }
     return options;
 }
 
@@ -192,14 +205,6 @@ CyclicKVCacheLayerView make_context_view(DeviceBuffer& k, DeviceBuffer& v, std::
     };
 }
 
-std::size_t workspace_capacity(std::int32_t window, std::int32_t tokens, std::int32_t batch,
-                               std::int32_t maximum, ops::AttentionHeadGeometry geometry) {
-    const ops::SlidingWindowAttentionExecutionEnvelope envelope{
-        0, static_cast<std::uint32_t>(maximum)};
-    return ops::sliding_window_attention_workspace_capacity_bytes(
-        geometry, static_cast<std::uint32_t>(window), envelope, tokens, tokens, batch);
-}
-
 DeviceBuffer make_context_values(std::size_t elements) {
     DeviceBuffer result(ninfer::bench::device_context().device(), elements * sizeof(__half));
     CUDA_CHECK(bench::fixture::fill_values(static_cast<__half*>(result.data()), elements, 311U,
@@ -211,9 +216,13 @@ DeviceBuffer make_context_values(std::size_t elements) {
 class Case {
 public:
     Case(std::int32_t window, std::int32_t tokens, std::int32_t batch, std::int32_t context,
-         std::int32_t maximum, const Options& options)
+         const Options& options)
         : geometry_{128, options.kv_heads * 4, options.kv_heads}, window_(window), tokens_(tokens),
-          batch_(batch), context_(context),
+          batch_(batch), workload_(workload::generate_context_query_workload(context, tokens, batch,
+                                                                             options.workload)),
+          bucket_(options.workload.select_bucket(workload_.max_visible_tokens)),
+          workspace_bytes_(ops::sliding_window_attention_workspace_capacity_bytes(
+              geometry_, window, bucket_, batch, tokens, tokens)),
           q_(bench::make_bf16(
               static_cast<std::size_t>(kHeadDim) * geometry_.query_heads * tokens * batch, 101U)),
           query_k_(bench::make_bf16(
@@ -232,7 +241,6 @@ public:
                                          geometry_.kv_heads * batch)),
           output_(bench::make_zeros(static_cast<std::size_t>(kHeadDim) * geometry_.query_heads *
                                     tokens * batch * 2)),
-          workspace_bytes_(workspace_capacity(window, tokens, batch, maximum, geometry_)),
           workspace_storage_(bench::make_buffer(std::max<std::size_t>(workspace_bytes_, 1))),
           workspace_(workspace_storage_.span()),
           q_tensor_(q_.span(), DType::BF16, {kHeadDim, geometry_.query_heads, tokens, batch}),
@@ -246,32 +254,23 @@ public:
           output_tensor_(output_.span(), DType::BF16,
                          {kHeadDim, geometry_.query_heads, tokens, batch}),
           context_view_(
-              make_context_view(context_k_, context_v_, window, lane_tensor_, geometry_.kv_heads)),
-          envelope_{0, static_cast<std::uint32_t>(maximum)} {
+              make_context_view(context_k_, context_v_, window, lane_tensor_, geometry_.kv_heads)) {
         std::vector<std::int32_t> host_positions(static_cast<std::size_t>(tokens) * batch);
-        valids_.resize(batch);
-        lengths_.resize(batch);
+        const auto& valids  = workload_.valid_columns;
+        const auto& lengths = workload_.lengths;
         std::vector<std::int64_t> host_lanes(static_cast<std::size_t>(batch));
         for (std::int32_t row = 0; row < batch; ++row) {
-            valids_[row]  = options.valid == "zero"    ? 0
-                            : options.valid == "half"  ? (tokens + 1) / 2
-                            : options.valid == "mixed" ? (row * 7 + tokens) % (tokens + 1)
-                                                       : tokens;
-            lengths_[row] = options.lengths == "uniform" || row % 3 == 0 ? context
-                            : row % 3 == 1                               ? std::max(0, context - 63)
-                                                                         : std::min(context, 128);
-            live_columns_ += valids_[row];
-            host_lanes[static_cast<std::size_t>(row)] =
-                valids_[row] ? std::int64_t(row) * kHeadDim * window * geometry_.kv_heads * 2 : -1;
+            live_columns_ += valids[row];
+            host_lanes[row] =
+                valids[row] ? std::int64_t(row) * kHeadDim * window * geometry_.kv_heads * 2 : -1;
             for (std::int32_t token = 0; token < tokens; ++token) {
-                host_positions[static_cast<std::size_t>(row * tokens + token)] =
-                    token < valids_[row] ? lengths_[row] + token : -1234567;
+                host_positions[static_cast<std::size_t>(row) * tokens + token] =
+                    token < valids[row] ? lengths[row] + token : -1234567;
             }
         }
         CUDA_CHECK(cudaMemcpy(positions_.data(), host_positions.data(), positions_.size(),
                               cudaMemcpyHostToDevice));
-        CUDA_CHECK(
-            cudaMemcpy(valid_.data(), valids_.data(), valid_.size(), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(valid_.data(), valids.data(), valid_.size(), cudaMemcpyHostToDevice));
         CUDA_CHECK(
             cudaMemcpy(lane_.data(), host_lanes.data(), lane_.size(), cudaMemcpyHostToDevice));
     }
@@ -280,21 +279,24 @@ public:
         ops::sliding_window_attention(q_tensor_, query_k_tensor_, query_v_tensor_,
                                       positions_tensor_, valid_tensor_, geometry_,
                                       static_cast<std::uint32_t>(window_), kScale, context_view_,
-                                      envelope_, workspace_, output_tensor_, cuda);
+                                      bucket_, workspace_, output_tensor_, cuda);
     }
 
     [[nodiscard]] std::size_t workspace_bytes() const noexcept { return workspace_bytes_; }
 
-    int live_columns() const { return live_columns_; }
+    ops::ContextBucket bucket() const { return bucket_; }
+
+    std::int64_t live_columns() const { return live_columns_; }
 
     double useful_bytes() const {
         double bytes = 2. * 128 * geometry_.query_heads * tokens_ * batch_ + 4. * batch_;
         for (int b = 0; b < batch_; ++b)
-            if (valids_[b]) {
-                bytes += 4. * 128 * geometry_.kv_heads * std::min(lengths_[b], window_ - 1) +
-                         (2. * 128 * geometry_.query_heads + 4. * 128 * geometry_.kv_heads + 4.) *
-                             valids_[b] +
-                         8;
+            if (workload_.valid_columns[b]) {
+                bytes +=
+                    4. * 128 * geometry_.kv_heads * std::min(workload_.lengths[b], window_ - 1) +
+                    (2. * 128 * geometry_.query_heads + 4. * 128 * geometry_.kv_heads + 4.) *
+                        workload_.valid_columns[b] +
+                    8;
             }
         return bytes;
     }
@@ -302,18 +304,20 @@ public:
     double useful_flops() const {
         std::int64_t keys = 0;
         for (int b = 0; b < batch_; ++b)
-            for (int t = 0; t < valids_[b]; ++t)
-                keys += std::min(lengths_[b], std::max(0, window_ - 1 - t)) + valids_[b];
+            for (int t = 0; t < workload_.valid_columns[b]; ++t)
+                keys += std::min(workload_.lengths[b], std::max(0, window_ - 1 - t)) +
+                        workload_.valid_columns[b];
         return 4. * 128 * geometry_.query_heads * keys;
     }
 private:
     ops::AttentionHeadGeometry geometry_;
-    std::vector<int> lengths_, valids_;
-    int live_columns_ = 0;
     std::int32_t window_;
     std::int32_t tokens_;
     std::int32_t batch_;
-    std::int32_t context_;
+    workload::ContextQueryWorkload workload_;
+    ops::ContextBucket bucket_;
+    std::int64_t live_columns_ = 0;
+    std::size_t workspace_bytes_;
     DeviceBuffer q_;
     DeviceBuffer query_k_;
     DeviceBuffer query_v_;
@@ -323,7 +327,6 @@ private:
     DeviceBuffer context_k_;
     DeviceBuffer context_v_;
     DeviceBuffer output_;
-    std::size_t workspace_bytes_;
     DeviceBuffer workspace_storage_;
     MemoryArena workspace_;
     Tensor q_tensor_;
@@ -334,7 +337,6 @@ private:
     Tensor lane_tensor_;
     Tensor output_tensor_;
     CyclicKVCacheLayerView context_view_;
-    ops::SlidingWindowAttentionExecutionEnvelope envelope_;
 };
 
 const char* execution_name(Execution execution) {
@@ -365,13 +367,14 @@ void report(const Result& result) {
     const double gbps    = result.useful_bytes / seconds / 1.0e9;
     const double tflops  = result.useful_flops / seconds / 1.0e12;
     std::printf("entry=sliding_window execution=%-5s cache=%-4s W=%d Hkv=%d T=%2d B=%d L=%6d "
-                "max_L=%d graph_nodes=%zu "
+                "bucket=%s lengths=%s valid=%s graph_nodes=%zu "
                 "graph_calls=%d workspace=%8zu "
                 "median=%9.3f us min=%9.3f us p95=%9.3f us "
                 "useful=%8.1f GB/s ",
                 execution_name(result.execution), cache_name(result.cache, result.graph_calls),
                 result.window, result.kv_heads, result.tokens, result.batch, result.context,
-                result.envelope_max, result.graph_nodes, result.graph_calls, result.workspace_bytes,
+                ops::context_bucket_name(result.bucket).data(), result.lengths.data(),
+                result.valid.data(), result.graph_nodes, result.graph_calls, result.workspace_bytes,
                 result.timing.median_us, result.timing.min_us, result.timing.p95_us, gbps);
     if (result.cache == CacheState::Cold && result.graph_calls == 1) {
         std::printf("logical/DRAM-roof=%5.1f%% of %.0f GB/s ",
@@ -393,7 +396,7 @@ void write_csv(const Options& options, const std::vector<Result>& results) {
     output << "entry,execution,cache,window,kv_heads,valid,lengths,live_columns,T,B,context,"
               "envelope_max,"
               "graph_nodes,graph_calls,"
-              "workspace_bytes,useful_bytes,useful_flops,median_us,min_us,p95_us\n";
+              "workspace_bytes,useful_bytes,useful_flops,median_us,min_us,p95_us,bucket\n";
     for (const Result& result : results) {
         output << "sliding_window," << execution_name(result.execution) << ','
                << cache_name(result.cache, result.graph_calls) << ',' << result.window << ','
@@ -402,7 +405,8 @@ void write_csv(const Options& options, const std::vector<Result>& results) {
                << result.context << ',' << result.envelope_max << ',' << result.graph_nodes << ','
                << result.graph_calls << ',' << result.workspace_bytes << ',' << result.useful_bytes
                << ',' << result.useful_flops << ',' << result.timing.median_us << ','
-               << result.timing.min_us << ',' << result.timing.p95_us << '\n';
+               << result.timing.min_us << ',' << result.timing.p95_us << ','
+               << ops::context_bucket_name(result.bucket) << '\n';
     }
 }
 
@@ -426,8 +430,10 @@ void profile(Case& data, const Options& options, bench::L2FlushBuffer& flush,
         CUDA_CHECK(cudaStreamSynchronize(stream));
     }
 
-    std::printf("PROFILE entry=sliding_window dispatch=public W=%d execution=%s cache=%s\n",
-                options.window, execution_name(execution), cache_name(cache));
+    std::printf(
+        "PROFILE entry=sliding_window dispatch=public W=%d bucket=%s execution=%s cache=%s\n",
+        options.window, ops::context_bucket_name(data.bucket()).data(), execution_name(execution),
+        cache_name(cache));
     std::fflush(stdout);
     CUDA_CHECK(cudaProfilerStart());
     if (execution == Execution::Graph)
@@ -455,9 +461,7 @@ int main(int argc, char** argv) {
 
         if (options.profile) {
             Case data(options.window, options.tokens.front(), options.batches.front(),
-                      options.contexts.front(),
-                      options.envelope_max < 0 ? options.contexts.front() : options.envelope_max,
-                      options);
+                      options.contexts.front(), options);
             profile(data, options, flush, cuda);
             CUDA_CHECK(cudaStreamDestroy(stream));
             return 0;
@@ -467,8 +471,7 @@ int main(int argc, char** argv) {
         for (const std::int32_t context : options.contexts) {
             for (const std::int32_t tokens : options.tokens) {
                 for (const std::int32_t batch : options.batches) {
-                    const int maximum = options.envelope_max < 0 ? context : options.envelope_max;
-                    Case data(options.window, tokens, batch, context, maximum, options);
+                    Case data(options.window, tokens, batch, context, options);
                     bench::TimedGraph graph;
                     if (options.execution != Execution::Eager) {
                         data.launch(cuda);
@@ -493,13 +496,14 @@ int main(int argc, char** argv) {
                             Result result{
                                 options.window,
                                 options.kv_heads,
-                                options.valid,
-                                options.lengths,
+                                options.workload.valid_name(),
+                                options.workload.length_name(),
                                 data.live_columns(),
                                 tokens,
                                 batch,
                                 context,
-                                maximum,
+                                options.workload.envelope_max,
+                                data.bucket(),
                                 execution == Execution::Graph ? graph.nodes() : 0,
                                 options.graph_calls,
                                 execution,

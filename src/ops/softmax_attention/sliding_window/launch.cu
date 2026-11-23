@@ -3,8 +3,6 @@
 #include "core/device.h"
 #include "ops/common/host/operands.h"
 #include "ops/softmax_attention/kernels/context_query/cyclic.cuh"
-
-#include <algorithm>
 #include <cstdint>
 #include <stdexcept>
 
@@ -56,19 +54,17 @@ void launch_sliding_window_attention(const Tensor& q, const Tensor& query_k, con
                                      const SlidingWindowAttentionPlan& plan, Tensor& partial_acc,
                                      Tensor& partial_m, Tensor& partial_l, Tensor& out,
                                      cudaStream_t stream) {
-    const bool direct = plan.route == SlidingWindowAttentionRoute::Direct;
+    const bool direct = plan.split_capacity == 1;
     if ((plan.window != 2048 && plan.window != 4096) ||
-        context.capacity != static_cast<std::uint32_t>(plan.window) || plan.key_block != 32 ||
+        context.capacity != static_cast<std::uint32_t>(plan.window) ||
         (plan.reduce_warps != 1 && plan.reduce_warps != 4) || plan.split_capacity < 1 ||
-        plan.split_capacity > kSlidingWindowMaxSplits || (direct && plan.split_capacity != 1))
+        plan.split_capacity > kSlidingWindowMaxSplits)
         throw std::invalid_argument("sliding_window_attention: inconsistent plan");
     const auto geometry = [&]<int KVHeads>() {
         dispatch_tokens(plan.tokens, [&]<int Tokens, int Warps>() {
             constexpr int KeyBlock = 32;
             constexpr std::size_t SmemBytes =
                 2u * KeyBlock * kContextQueryHeadDim * sizeof(__nv_bfloat16);
-            if (plan.warps != Warps)
-                throw std::invalid_argument("sliding_window_attention: inconsistent query layout");
             // Window determines visibility and ring addressing, not the MMA storage layout.
             const auto partial = [&]<bool Direct>() {
                 const dim3 grid(KVHeads, Direct ? 1 : plan.split_capacity, q.ne[3]);
@@ -92,7 +88,7 @@ void launch_sliding_window_attention(const Tensor& q, const Tensor& query_k, con
             };
             if (direct) {
                 partial.template operator()<true>();
-                // Keep the reduction slot for child-node updates when the context grows.
+                // Preserve the reduction slot for graph updates.
                 sliding_window_attention_idle_kernel<<<1, 1, 0, stream>>>();
                 CUDA_CHECK(cudaGetLastError());
                 return;

@@ -1,14 +1,11 @@
 #pragma once
 
-#include <map>
-
-#include "models/qwen4_exp/program/text_graph.h"
+#include "core/buffer.h"
 #include "core/context_pool.h"
+#include "models/qwen4_exp/execution/batch.h"
 
 namespace ninfer::models::qwen4_exp::detail {
 class RankProgramImpl;
-
-[[nodiscard]] std::vector<ops::ContextBucket> decode_context_buckets(std::uint32_t capacity);
 
 class GraphInputs {
 public:
@@ -19,6 +16,7 @@ public:
     void batch(execution::BatchView, std::uint32_t visible);
     void stage();
     void stage_proposal(std::uint32_t rows, std::uint32_t depth, std::uint32_t visible);
+    void stage_commit(std::uint32_t rows, std::uint32_t width);
 
 private:
     RankProgramImpl& owner_;
@@ -26,74 +24,6 @@ private:
     std::vector<AllocationId> allocations_;
     std::vector<std::int64_t> state_offsets_;
     std::array<PinnedHostBuffer, 2> mappings_;
-};
-
-class Graphs {
-public:
-    explicit Graphs(RankProgramImpl&);
-    void prepare(GraphInputs&, GraphPreparation&);
-    [[nodiscard]] TextGraph& main(std::uint32_t batch, bool verify, std::uint32_t visible,
-                                  bool head);
-    void draft(std::uint32_t batch, std::span<const execution::BatchView>, ple::Ticket,
-               std::span<const std::uint32_t> extents);
-    void sample(std::uint32_t batch);
-    void accept(std::uint32_t batch);
-
-    [[nodiscard]] std::size_t workspace_peak() const { return workspace_peak_; }
-
-    void reset_workspace_peak() { workspace_peak_ = 0; }
-
-private:
-    struct DraftStep {
-        QsaGraphReadout readout;
-        std::size_t workspace_bytes = 0;
-        std::array<DecodeGraphDefinition, 2> handoffs;
-    };
-
-    struct DraftChain {
-        GraphSegment graph;
-        std::vector<DecodeGraphChild> steps, handoffs;
-        std::vector<std::size_t> installed;
-        std::uint32_t slot = 0;
-    };
-
-    struct Batch {
-        TextGraph main, verify;
-        GraphSegment sample, accept;
-        std::vector<DraftStep> drafts;
-        std::vector<DraftChain> chains;
-        std::size_t sample_workspace = 0, accept_workspace = 0;
-    };
-
-    void prepare_main(Batch&, std::uint32_t batch, bool verify, GraphPreparation&);
-    void prepare_drafts(Batch&, std::uint32_t batch, GraphInputs&, GraphPreparation&);
-    RankProgramImpl& owner_;
-    std::vector<ops::ContextBucket> buckets_;
-    std::map<std::uint32_t, Batch> batches_;
-    std::size_t workspace_peak_ = 0;
-};
-
-class MtpCommitGraphs {
-public:
-    explicit MtpCommitGraphs(RankProgramImpl& owner) : owner_(owner) {}
-
-    void prepare(GraphInputs&, GraphPreparation&);
-    void replay(std::uint32_t batch, std::uint32_t width, bool rebuild_history, bool count_tokens);
-
-    [[nodiscard]] std::size_t workspace_peak() const { return workspace_peak_; }
-
-    void reset_workspace_peak() { workspace_peak_ = 0; }
-
-private:
-    struct Batch {
-        GraphSegment graph;
-        DecodeGraphSection repair, counts;
-        std::size_t workspace_bytes = 0;
-    };
-
-    RankProgramImpl& owner_;
-    std::map<std::pair<std::uint32_t, std::uint32_t>, Batch> batches_;
-    std::size_t workspace_peak_ = 0;
 };
 
 } // namespace ninfer::models::qwen4_exp::detail

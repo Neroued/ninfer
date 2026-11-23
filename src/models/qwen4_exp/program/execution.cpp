@@ -1,5 +1,4 @@
 #include "models/qwen4_exp/program/internal.h"
-#include "models/qwen4_exp/program/device_graphs.h"
 #include "core/transfer.h"
 #include "core/nvtx.h"
 #include "ninfer/ops/indexing.h"
@@ -153,8 +152,8 @@ void RankProgramImpl::prepare_forward() {
         if (!f.ple) return;
     }
     prepare_main_inputs(f.rows, f.tokens);
-    if (!f.sequence && !(f.graphable && (device_graphs || graphs))) install_decode(f.physical.rows);
-    if (!host_ple && (!device_graphs || !f.graphable || f.sequence)) prepare_device_ple(f.batch);
+    if (!f.sequence && !f.graph_route) install_decode(f.physical.rows);
+    if (!host_ple && (!f.graph_route || f.sequence)) prepare_device_ple(f.batch);
     prepare_main();
     request_decision();
 }
@@ -209,17 +208,35 @@ void RankProgramImpl::prepare_main() {
         for (auto extent : f.verify->extents) f.attention.valid_positions += extent + 1;
     else
         for (const auto& row : f.rows) f.attention.valid_positions += row.ids.size();
-    if (device_graphs && f.graphable && !f.sequence) {
-        const auto* forward    = std::get_if<ForwardWork>(&f.request.work.operation);
-        const bool control     = forward && forward->sample == SampleKind::None;
-        const bool constrained = std::any_of(f.rows.begin(), f.rows.end(),
-                                             [](const auto& row) { return row.constrained; });
-        const auto depth =
-            f.verify ? std::get<MtpWork>(f.request.work.operation).speculative->mtp_steps : 0;
-        device_graphs->replay(batch, depth, f.draft_visible, f.visible, !control, constrained);
-        request_decision();
-        f.graph_main = true;
-        f.phase      = ComputePhase::AfterMain;
+    if (f.graph_route && !f.sequence) {
+        const auto* forward = std::get_if<ForwardWork>(&f.request.work.operation);
+        const auto& route   = *f.graph_route;
+        f.graph             = &graphs->target(route);
+        f.target_replay     = {.bucket        = ops::select_context_bucket(f.visible),
+                               .head          = f.verify || forward->sample != SampleKind::None,
+                               .active_tokens = dimension(f.batch.active_tokens)};
+        if (!host_ple) {
+            if (f.verify) {
+                f.target_replay.readback = std::ranges::any_of(f.rows, &WorkRow::constrained);
+                const ProposalReplay proposal{.buckets = f.draft_buckets};
+                if (graphs->topology() == ProposalTopology::SplitProposal)
+                    graphs->launch_proposal(route, proposal);
+                else
+                    f.target_replay.proposal = proposal;
+            }
+            (void)graphs->start_target(route, f.target_replay);
+            request_decision();
+            f.graph_main = true;
+            f.phase      = ComputePhase::AfterMain;
+        } else {
+            gpu_timer.begin_target();
+            if (f.graph->hook_layer()) {
+                f.graph->begin_prefix(cuda, f.target_replay);
+                f.phase = ComputePhase::Prefix;
+            } else {
+                f.phase = ComputePhase::AwaitPle;
+            }
+        }
         return;
     }
     if (!f.sequence) gpu_timer.begin_target();
@@ -240,18 +257,10 @@ void RankProgramImpl::prepare_main() {
         update = execution::SequenceState{
             f.rows[0].states.at(parameters.profile->local.rank).source,
             f.rows[0].states.at(parameters.profile->local.rank).destination};
-    f.run = std::make_unique<execution::TextRun>(parameters, execution, f.batch, update, cuda);
-    if (graphs && host_ple && f.graphable && !f.sequence) {
-        const auto* forward = std::get_if<ForwardWork>(&f.request.work.operation);
-        f.graph             = &graphs->main(batch, f.verify.has_value(), f.visible,
-                                            f.verify || forward->sample != SampleKind::None);
-    }
+    f.run   = std::make_unique<execution::TextRun>(parameters, execution, f.batch, update, cuda);
     f.layer = 0;
-    if (!f.graph)
-        f.run->stem(f.visual);
-    else if (!f.graph->resident())
-        f.graph->begin_prefix(cuda);
-    f.phase = f.graph && f.graph->resident() ? ComputePhase::AwaitPle : ComputePhase::Prefix;
+    f.run->stem(f.visual);
+    f.phase = ComputePhase::Prefix;
 }
 
 bool RankProgramImpl::advance_layers(std::uint32_t end) {
@@ -429,37 +438,21 @@ void RankProgramImpl::prepare_decision() {
     install_sampling(f.verify.has_value());
     const auto& buffers = resources.buffers();
     const auto batch    = f.sequence ? 1U : f.physical.rows;
-    if (device_graphs && f.graph_main) {
-        device_graphs->decide(batch, f.verify.has_value());
-        gpu_timer.record_result();
-        compute_done.record(cuda.stream());
-        f.phase = ComputePhase::AwaitResult;
-        return;
-    }
-    if (f.verify) {
-        if (graphs && host_ple)
-            graphs->accept(batch);
-        else
-            accept_forward(batch, f.verify->width);
-        const auto begin = buffers.sampled_ids->region.offset;
-        const auto bytes =
-            buffers.output_counts->region.offset + buffers.output_counts->region.bytes - begin;
-        copy_bytes_async(resources.egress().subspan(0, bytes),
-                         resources.persistent().subspan(begin, bytes), cuda);
+    if (f.graph && !f.first_sample) {
+        graphs->decide(*f.graph_route);
     } else {
-        if (f.first_sample) {
-            auto sample = f.tokens ? f.sample.slice(1, f.tokens - 1, 1) : f.sample;
-            auto logits = device_tensor(*buffers.logits).slice(1, 0, batch);
-            execution::project_head(sample, parameters.text.head, logits, resources.workspace,
-                                    cuda);
-        }
-        if (graphs && host_ple && f.graphable && !f.first_sample)
-            graphs->sample(batch);
-        else
+        if (f.verify) {
+            accept_forward(batch, f.verify->width);
+        } else {
+            if (f.first_sample) {
+                auto sample = f.tokens ? f.sample.slice(1, f.tokens - 1, 1) : f.sample;
+                auto logits = device_tensor(*buffers.logits).slice(1, 0, batch);
+                execution::project_head(sample, parameters.text.head, logits, resources.workspace,
+                                        cuda);
+            }
             sample_forward(batch, f.first_sample);
-        auto sampled = device_tensor(*buffers.sampled_ids);
-        copy_bytes_async(resources.egress().subspan(0, batch * sizeof(TokenId)),
-                         {sampled.data, batch * sizeof(TokenId), cuda.device()}, cuda);
+        }
+        copy_sample_result(batch, f.verify.has_value());
     }
     gpu_timer.record_result();
     compute_done.record(cuda.stream());
@@ -474,24 +467,6 @@ void RankProgramImpl::copy_sample_result(std::int32_t batch, bool verify) {
                : std::size_t(batch) * sizeof(TokenId);
     copy_bytes_async(resources.egress().subspan(0, bytes),
                      resources.persistent().subspan(begin, bytes), cuda);
-}
-
-void RankProgramImpl::copy_verify_inputs(std::int32_t batch, std::int32_t width,
-                                         DecodeGraphSection* section) {
-    const auto ids      = resources.main_batch(width, batch, 1).ids;
-    const auto transfer = resources.ple_transfer();
-    const auto copy = [&] {
-        copy_bytes_async(draft_output.span().subspan(0, ids.bytes()),
-                         {ids.data, ids.bytes(), cuda.device()}, transfer);
-    };
-    if (section)
-        section->capture(transfer.stream(), copy);
-    else
-        copy();
-    if (section)
-        draft_copied.record_external(transfer.stream());
-    else
-        draft_copied.record(transfer.stream());
 }
 
 } // namespace ninfer::models::qwen4_exp::detail

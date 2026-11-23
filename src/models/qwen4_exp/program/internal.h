@@ -8,6 +8,7 @@
 #include "models/qwen4_exp/program/graphs.h"
 #include "models/qwen4_exp/execution/text.h"
 #include "models/qwen4_exp/execution/mtp.h"
+#include "models/common/graph/suite.h"
 #include "models/common/qwen/vision/vision.h"
 #include "models/common/vocabulary.h"
 #include "ninfer/ops/sampling.h"
@@ -15,8 +16,6 @@
 #include <deque>
 
 namespace ninfer::models::qwen4_exp::detail {
-
-class DeviceGraphs;
 
 struct ResidentBinding {
     runtime::ExecutionMember member;
@@ -56,7 +55,9 @@ struct ComputeFrame {
     std::optional<ple::Ticket> ple;
     std::optional<VerifyRound> verify;
     std::unique_ptr<execution::TextRun> run;
-    TextGraph* graph = nullptr;
+    models::TargetGraphBody* graph = nullptr;
+    std::optional<speculative::RoundRoute> graph_route;
+    TargetReplay target_replay;
     execution::BatchView batch;
     Tensor sample, conditioning, previous_conditioning;
     std::optional<models::vision::EmbeddingView> visual;
@@ -64,8 +65,8 @@ struct ComputeFrame {
     bool decision_requested = false, sequence = false;
     bool release_vision = false;
     bool first_sample = false, timer_started = false;
-    bool graph_main = false, graphable = false;
-    std::vector<std::uint32_t> draft_visible;
+    bool graph_main = false;
+    std::vector<ops::ContextBucket> draft_buckets;
     std::uint32_t tokens = 0, visible = 0, layer = 0;
     std::uint32_t score_at = 0, score_count = 0;
     std::vector<float> logprobs;
@@ -108,7 +109,7 @@ public:
     void prepare_mtp();
     void prepare_main();
     void prepare_device_ple(const execution::BatchView&, bool read_drafts = false,
-                            DecodeGraphSection* = nullptr);
+                            const StreamSectionRecorder& readback = {});
     [[nodiscard]] Tensor device_embedding(std::int32_t tokens, std::int32_t batch);
     void after_main();
     void prepare_decision();
@@ -126,8 +127,8 @@ public:
                    const Tensor& conditioning, std::optional<models::vision::EmbeddingView>);
     void commit_mtp(const Commit&);
     void execute_mtp_commit(std::int32_t batch, std::int32_t width, bool rebuild_history,
-                            bool count_tokens, DecodeGraphSection* = nullptr,
-                            DecodeGraphSection* captured_counts = nullptr);
+                            bool count_tokens, const SectionRecorder& repair = {},
+                            const SectionRecorder& counts = {});
     [[nodiscard]] execution::MtpRun draft_run(std::uint32_t step, std::int32_t batch,
                                               std::uint32_t visible);
     void draft_forward(std::uint32_t step, std::int32_t batch, std::uint32_t visible,
@@ -142,7 +143,6 @@ public:
     void vocabulary_draft(const Tensor& logits, const Tensor& valid_columns, Tensor& ids);
     void vocabulary_accept(std::int32_t batch, std::int32_t width);
     void copy_sample_result(std::int32_t batch, bool verify);
-    void copy_verify_inputs(std::int32_t batch, std::int32_t width, DecodeGraphSection* = nullptr);
     [[nodiscard]] execution::BatchView mtp_inputs(const MtpBatchLayout&, std::span<const WorkRow>,
                                                   std::uint32_t tokens,
                                                   std::span<const MtpInputRow>, bool history);
@@ -172,9 +172,7 @@ public:
     CudaCompletionEvent ple_inputs, ple_ready, draft_copied;
     PinnedHostBuffer draft_output;
     const ExecutionShape& shape;
-    std::unique_ptr<Graphs> graphs;
-    std::unique_ptr<DeviceGraphs> device_graphs;
-    std::unique_ptr<MtpCommitGraphs> commit_graphs;
+    std::unique_ptr<models::DecodeGraphSuite> graphs;
     std::unique_ptr<GraphInputs> graph_inputs;
     std::optional<GraphMemorySummary> graph_memory;
     std::size_t workspace_lifetime_peak = 0;

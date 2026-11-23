@@ -21,8 +21,13 @@ void RankProgramImpl::start(runtime::ExecutionRequest<ExecutionTypes>&& request)
     f.request           = std::move(request);
     f.physical          = work_shape(f.request.work);
     const auto* forward = std::get_if<ForwardWork>(&f.request.work.operation);
-    f.graphable         = std::holds_alternative<MtpWork>(f.request.work.operation) ||
-                  (forward && forward->kind == ForwardKind::Ordinary);
+    const auto* mtp     = std::get_if<MtpWork>(&f.request.work.operation);
+    if (graphs && (mtp || (forward && forward->kind == ForwardKind::Ordinary))) {
+        const auto& geometry = mtp ? mtp->speculative : forward->speculative;
+        f.graph_route        = resources.plan.decode_routes->select_route(
+            f.physical, geometry ? SpeculativeBackend::Mtp : SpeculativeBackend::None,
+            geometry ? geometry->mtp_steps : 0);
+    }
     resources.select_batch(f.physical.rows);
     f.retirement = f.request.command;
     std::visit(
@@ -52,7 +57,7 @@ void RankProgramImpl::advance_compute() {
             if (f.phase == ComputePhase::Prepare) return;
             break;
         case ComputePhase::Prefix:
-            if (f.graph ? !f.graph->advance_prefix(cuda)
+            if (f.graph ? f.graph->advance_until(*f.graph->hook_layer()) != TargetProgress::Complete
                         : !advance_layers(parameters.profile->config.text.ple.layer))
                 return;
             f.phase = ComputePhase::AwaitPle;
@@ -71,10 +76,12 @@ void RankProgramImpl::advance_compute() {
             if (f.graph) {
                 std::optional<nvtx::ScopedRange> range;
                 if (f.verify) range.emplace(nvtx::Name::DecodeMtpTarget, nvtx::Category::Mtp);
-                if (f.graph->resident())
-                    f.graph->replay(f.ple->slot, cuda);
-                else
-                    f.graph->consume_ple(f.ple->slot, cuda);
+                if (f.graph->hook_layer()) {
+                    f.graph->launch_hook(f.ple->slot);
+                } else {
+                    f.target_replay.slot = f.ple->slot;
+                    (void)graphs->start_target(*f.graph_route, f.target_replay);
+                }
             } else {
                 embedding->ready.wait(cuda.stream());
                 f.run->consume_ple(embedding->values);
@@ -91,12 +98,12 @@ void RankProgramImpl::advance_compute() {
                 host_ple->prefetch(next.ids.size(), {&input, 1});
             }
             f.phase =
-                f.graph && f.graph->resident() ? ComputePhase::AfterMain : ComputePhase::Suffix;
+                f.graph && !f.graph->hook_layer() ? ComputePhase::AfterMain : ComputePhase::Suffix;
             break;
         }
         case ComputePhase::Suffix:
             if (f.graph) {
-                if (!f.graph->advance_suffix(cuda)) return;
+                if (f.graph->poll() != TargetProgress::Complete) return;
             } else {
                 if (!advance_layers(parameters.text.layers.size())) return;
                 Tensor logits;
@@ -294,10 +301,9 @@ void RankProgramImpl::retire_compute() {
     observation.gpu = compute->gpu;
     const auto work = ExecutionTypes::describe_work(compute->request.work);
     if (compute->attention.forwards) observation.attention = {work.kind, compute->attention};
-    observation.path = compute->graph_main || (compute->graph && compute->graph->resident())
-                           ? ExecutionPath::Graph
-                       : compute->graph ? ExecutionPath::Mixed
-                                        : ExecutionPath::Eager;
+    observation.path = !compute->graph     ? ExecutionPath::Eager
+                       : resources.experts ? ExecutionPath::Mixed
+                                           : ExecutionPath::Graph;
     compute.reset();
     events.emplace_back(runtime::DeviceRetired{ticket, command, observation});
 }

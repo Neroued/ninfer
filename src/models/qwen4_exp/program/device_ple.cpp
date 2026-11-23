@@ -1,4 +1,5 @@
 #include "models/qwen4_exp/program/internal.h"
+#include "core/transfer.h"
 
 namespace ninfer::models::qwen4_exp::detail {
 
@@ -8,7 +9,7 @@ Tensor RankProgramImpl::device_embedding(std::int32_t tokens, std::int32_t batch
 }
 
 void RankProgramImpl::prepare_device_ple(const execution::BatchView& batch, bool read_drafts,
-                                         DecodeGraphSection* readback) {
+                                         const StreamSectionRecorder& readback) {
     const auto& table    = std::get<DevicePleTable>(parameters.model.ple_table());
     const auto& controls = parameters.model.definition().ple_parameters().hash;
     ops::NgramHashParameters hash;
@@ -30,7 +31,19 @@ void RankProgramImpl::prepare_device_ple(const execution::BatchView& batch, bool
     const auto producer = resources.ple_transfer();
     ple_inputs.record(cuda.stream());
     ple_inputs.wait(producer.stream());
-    if (read_drafts) copy_verify_inputs(batch.batch, batch.tokens, readback);
+    if (read_drafts) {
+        const auto copy = [&] {
+            copy_bytes_async(draft_output.span().subspan(0, batch.ids.bytes()),
+                             {batch.ids.data, batch.ids.bytes(), cuda.device()}, producer);
+        };
+        if (readback) {
+            readback(producer.stream(), copy);
+            draft_copied.record_external(producer.stream());
+        } else {
+            copy();
+            draft_copied.record(producer.stream());
+        }
+    }
     ops::ngram_embedding_lookup(batch.ids, batch.valid_columns, {tail_field}, hash,
                                 parameters.profile->config.text.ple.eos, table.shards, embedding,
                                 producer);

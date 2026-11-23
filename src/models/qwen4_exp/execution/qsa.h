@@ -22,7 +22,6 @@ struct QsaReadout {
     void indexer(ops::ContextBucket, CudaExecutionView) const;
     void attention(ops::ContextBucket, CudaExecutionView) const;
     void execute(ops::ContextBucket, MemoryArena&, CudaExecutionView) const;
-    void execute(ops::ContextBucket, CudaExecutionView) const;
 
 private:
     void indexer(ops::ContextBucket, MemoryArena&, CudaExecutionView) const;

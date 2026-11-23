@@ -1,5 +1,4 @@
 #include "models/qwen4_exp/program/internal.h"
-#include "models/qwen4_exp/program/device_graphs.h"
 #include "core/startup.h"
 
 #include <algorithm>
@@ -44,8 +43,6 @@ RankProgramImpl::~RankProgramImpl() {
     } catch (const std::logic_error&) { std::terminate(); } catch (...) {
     }
     graphs.reset();
-    device_graphs.reset();
-    commit_graphs.reset();
     for (auto& resident : bindings)
         if (resident) retire_vision(*resident);
 }

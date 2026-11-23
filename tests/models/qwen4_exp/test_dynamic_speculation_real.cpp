@@ -53,7 +53,7 @@ public:
         history.compare(*this);
     }
 private:
-    std::map<unsigned, const q::TextGraph*> targets;
+    std::map<unsigned, const models::TargetGraphBody*> targets;
     HistoryReference history;
 };
 

@@ -135,11 +135,6 @@ void QsaReadout::execute(ops::ContextBucket bucket, MemoryArena& arena,
     attention(bucket, arena, cuda);
 }
 
-void QsaReadout::execute(ops::ContextBucket bucket, CudaExecutionView cuda) const {
-    MemoryArena arena(scratch);
-    execute(bucket, arena, cuda);
-}
-
 void QsaRun::finish() {
     ops::linear(
         buffers_.output.view({dimension(config_.query_width()), batch_.tokens * batch_.batch}),

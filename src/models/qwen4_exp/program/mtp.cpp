@@ -146,8 +146,8 @@ void RankProgramImpl::install_decode(std::int32_t batch) {
     copy_bytes_async(io.ingress.bind(resources.persistent()),
                      resources.ingress().subspan(0, io.ingress.bytes), cuda);
     if (!io.mtp) return;
-    const auto& mtp    = *io.mtp;
-    const int channels = dimension(parameters.profile->config.text.residual_width());
+    const auto& mtp      = *io.mtp;
+    const int channels   = dimension(parameters.profile->config.text.residual_width());
     const auto source    = device_tensor(io.batch.source_offsets).slice(0, 0, batch);
     const auto live      = device_tensor(io.batch.live_rows).slice(0, 0, batch);
     auto tail            = resources.states->mtp_tail(source);
@@ -285,7 +285,7 @@ void RankProgramImpl::prepare_mtp() {
     const auto& frame   = *buffers.mtp;
     const auto batch    = static_cast<std::int32_t>(f.physical.rows);
     const auto width    = work.speculative->verify_width;
-    auto& inputs = input_rows;
+    auto& inputs        = input_rows;
     for (std::size_t b = 0; b < f.rows.size(); ++b) {
         const auto& row = f.rows[b];
         inputs[b] = {{row.member.sequence.value, row.member.sequence.generation, row.main_frontier,
@@ -309,33 +309,42 @@ void RankProgramImpl::prepare_mtp() {
     };
     auto drafts      = draft_proposals(batch);
     const auto steps = work.speculative->mtp_steps;
-    std::vector<execution::BatchView> calls;
-    calls.reserve(steps);
+    std::vector<std::uint32_t> visible;
+    if (f.graph_route)
+        f.draft_buckets.reserve(steps);
+    else
+        visible.reserve(steps);
     for (std::uint32_t step = 0; step < steps; ++step) {
         auto& step_inputs = mtp_rows;
         for (std::size_t b = 0; b < f.rows.size(); ++b)
             step_inputs[b] = {f.rows[b].mtp_frontier + std::min(step, round.extents[b]),
                               step < round.extents[b] ? std::span<const TokenId>(f.rows[b].ids)
                                                       : std::span<const TokenId>{}};
-        calls.push_back(mtp_inputs(frame.draft_steps[step], f.rows, 1,
-                                   {step_inputs.data(), f.rows.size()}, false));
-        f.draft_visible.push_back(calls.back().max_visible_tokens);
+        const auto call = mtp_inputs(frame.draft_steps[step], f.rows, 1,
+                                     {step_inputs.data(), f.rows.size()}, false);
+        if (f.graph_route)
+            f.draft_buckets.push_back(ops::select_context_bucket(call.max_visible_tokens));
+        else
+            visible.push_back(call.max_visible_tokens);
     }
     for (std::uint32_t step = steps; step < frame.draft_steps.size(); ++step)
         (void)mtp_inputs(frame.draft_steps[step], {}, 1, {}, false);
-    if (device_graphs) {
+    if (f.graph_route && !host_ple) {
         prepare_main();
         return;
     }
-    if (!graphs) install_decode(batch);
+    if (!f.graph_route) install_decode(batch);
     gpu_timer.begin_draft();
     {
         const nvtx::ScopedRange range(nvtx::Name::DecodeMtpDraft, nvtx::Category::Mtp);
-        if (graphs && host_ple)
-            graphs->draft(batch, calls, *f.ple, round.extents);
-        else {
+        if (f.graph_route) {
+            graphs->launch_proposal(*f.graph_route,
+                                    {.buckets = f.draft_buckets, .slot = f.ple->slot});
+            for (std::uint32_t step = 0; step < steps; ++step)
+                host_ple->append_submitted(*f.ple, round.extents, step);
+        } else {
             for (std::uint32_t step = 0; step < steps; ++step) {
-                draft_forward(step, batch, calls[step].max_visible_tokens);
+                draft_forward(step, batch, visible[step]);
                 auto ids = draft_output_ids(step, batch);
                 if (host_ple) {
                     host_ple->append_device(*f.ple, ids, round.extents, step);
@@ -348,7 +357,7 @@ void RankProgramImpl::prepare_mtp() {
     gpu_timer.end_draft();
     for (std::size_t b = 0; b < f.rows.size(); ++b) valid[b] = round.extents[b] + 1;
     if (host_ple) host_ple->seal(*f.ple, {valid.data(), f.rows.size()});
-    if (!graphs)
+    if (!f.graph_route)
         ops::prepare_verify_ids(row_tensor(buffers.anchors), drafts, row_tensor(frame.extents),
                                 f.batch.ids, cuda);
     if (!host_ple) {

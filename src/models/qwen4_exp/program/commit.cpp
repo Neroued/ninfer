@@ -15,8 +15,8 @@ void RankProgramImpl::commit_mtp(const Commit& commit) {
     auto* count_columns = static_cast<std::int32_t*>(host_tensor(buffers.batch.count_columns).data);
     auto* destinations =
         static_cast<std::int64_t*>(host_tensor(buffers.commit_destination_offsets).data);
-    auto* last   = static_cast<std::int32_t*>(host_tensor(buffers.mtp->last_columns).data);
-    auto* active = static_cast<std::int32_t*>(host_tensor(buffers.mtp->active_columns).data);
+    auto* last       = static_cast<std::int32_t*>(host_tensor(buffers.mtp->last_columns).data);
+    auto* active     = static_cast<std::int32_t*>(host_tensor(buffers.mtp->active_columns).data);
     const auto width = compute->tokens;
     auto* skip       = static_cast<std::int32_t*>(host_tensor(buffers.mtp->skip_first).data);
     auto* bases = static_cast<std::int32_t*>(host_tensor(buffers.mtp->history_base_positions).data);
@@ -52,18 +52,18 @@ void RankProgramImpl::commit_mtp(const Commit& commit) {
         resources.ingress().subspan(buffers.commit_ingress.offset - buffers.host_region.offset,
                                     buffers.commit_ingress.bytes),
         cuda);
-    if (commit_graphs)
-        commit_graphs->replay(batch, width, rebuild_history, count_tokens);
+    if (compute->graph)
+        graphs->commit(*compute->graph_route, rebuild_history, count_tokens);
     else
         execute_mtp_commit(batch, width, rebuild_history, count_tokens);
 }
 
 void RankProgramImpl::execute_mtp_commit(std::int32_t batch, std::int32_t width,
                                          bool rebuild_history, bool count_tokens,
-                                         DecodeGraphSection* captured_repair,
-                                         DecodeGraphSection* captured_counts) {
-    const auto& io   = resources.buffers();
-    const auto& mtp  = *io.mtp;
+                                         const SectionRecorder& record_repair,
+                                         const SectionRecorder& record_counts) {
+    const auto& io      = resources.buffers();
+    const auto& mtp     = *io.mtp;
     const auto k        = std::max(1, width - 1);
     const auto channels = dimension(parameters.profile->config.text.residual_width());
     const auto hidden   = dimension(parameters.profile->config.text.hidden);
@@ -74,7 +74,7 @@ void RankProgramImpl::execute_mtp_commit(std::int32_t batch, std::int32_t width,
     auto history       = resources.mtp_batch(history_control_view(mtp.history, k, batch), k, batch,
                                              shape.max_context);
     history.table_rows = row(mtp.draft_steps[0].table_rows);
-    history.base_positions   = row(mtp.history_base_positions);
+    history.base_positions = row(mtp.history_base_positions);
     history.record_offsets = main.record_offsets;
     history.live_rows      = main.live_rows;
     auto last = row(mtp.last_columns), active = row(mtp.active_columns);
@@ -114,8 +114,8 @@ void RankProgramImpl::execute_mtp_commit(std::int32_t batch, std::int32_t width,
                                    *parameters.mtp, {aligned, TokenPartition(k * batch)}, history, tail,
                                    tail, resources.mtp->layer(0), {}, resources.workspace, cuda);
     };
-    if (captured_repair)
-        captured_repair->capture(cuda.stream(), repair);
+    if (record_repair)
+        record_repair(repair);
     else if (rebuild_history)
         repair();
     auto destination     = resources.states->mtp_tail(main.destination_offsets);
@@ -142,8 +142,8 @@ void RankProgramImpl::execute_mtp_commit(std::int32_t batch, std::int32_t width,
                                           row(io.batch.count_columns), row(io.batch.count_slots),
                                           counts, cuda);
     };
-    if (captured_counts)
-        captured_counts->capture(cuda.stream(), update_counts);
+    if (record_counts)
+        record_counts(update_counts);
     else if (count_tokens)
         update_counts();
 }

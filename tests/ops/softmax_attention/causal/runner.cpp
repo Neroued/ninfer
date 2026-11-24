@@ -1,4 +1,5 @@
 #include "fixture.h"
+#include "core/platform.h"
 #include "ops/ragged_fixture.h"
 #include "ops/graph_patch_check.h"
 
@@ -528,61 +529,359 @@ int run_batch_case(CudaExecutionView execution, const Geometry& geometry, KvCach
     return failures;
 }
 
-int run_ragged_case(CudaExecutionView execution, KvCacheStorage storage) {
-    RaggedFixture ragged({1, 3, 17, 65});
-    const std::vector<int> frontiers{4, 63, 7, 61}, table_rows{3, 5, 0, 2};
-    const Geometry geometry{"16/2", 16, 2};
-    constexpr int width = 65, table_slots = 6;
+int run_ragged_case(CudaExecutionView execution, const Geometry& geometry, KvCacheStorage storage,
+                    const RaggedAttentionCase& test_case) {
+    RaggedFixture ragged(test_case.lengths);
     const int n = ragged.tokens(), rows = ragged.segments();
+    const int width       = *std::max_element(ragged.lengths.begin(), ragged.lengths.end());
+    const int table_slots = rows + 2;
     const std::size_t qw = kHeadDim * geometry.q_heads, kvw = kHeadDim * geometry.kv_heads;
-    auto q = make_bf16_values(n * qw, 325, -.25f, .25f);
-    auto k = make_bf16_values(n * kvw, 327, -.25f, .25f);
-    auto v = make_bf16_values(n * kvw, 329, -1.f, 1.f);
-    std::vector<HostCache> expected;
-    for (int slot = 0; slot < table_slots; ++slot)
-        expected.push_back(make_cache(geometry, storage, 130, 393 + slot));
-    BatchDeviceCache cache(expected, MappingPattern::Fragmented, 130);
-    const auto before = cache.snapshot_bytes();
-    std::vector<int> positions(n), padded_positions(width * rows, -1);
-    std::vector<double> reference;
-    for (int s = 0; s < rows; ++s) {
-        const int begin = ragged.prefix[s], len = ragged.lengths[s];
-        std::vector<int> pos(len);
-        std::iota(pos.begin(), pos.end(), frontiers[s]);
-        std::copy(pos.begin(), pos.end(), positions.begin() + begin);
-        std::copy(pos.begin(), pos.end(), padded_positions.begin() + s * width);
-        const auto column_range = [&](const std::vector<float>& data, std::size_t w) {
-            return std::vector<float>(data.begin() + begin * w, data.begin() + (begin + len) * w);
-        };
-        auto& history = expected[table_rows[s]];
-        append_cache(history, column_range(k, kvw), column_range(v, kvw), pos);
-        const auto result = ideal_attention(column_range(q, qw), history, pos);
-        reference.insert(reference.end(), result.begin(), result.end());
+    std::vector<int> table_rows(rows), frontiers            = test_case.histories;
+    if (frontiers.empty()) frontiers.assign(rows, 0);
+    for (int s = 0; s < rows; ++s) table_rows[s] = (rows + 1 - s);
+    table_rows.back() = 0; // Sparse, reversed, with interior holes.
+
+    std::vector<int> capacity(table_slots, std::max(1, test_case.shared_prefix));
+    for (int s = 0; s < rows; ++s) capacity[table_rows[s]] = frontiers[s] + ragged.lengths[s] + 1;
+    if (test_case.replay) {
+        const int largest = *std::max_element(capacity.begin(), capacity.end());
+        std::fill(capacity.begin(), capacity.end(), largest + kPagedKVPageSize);
     }
-    auto dq = to_device_bf16(q), dk = to_device_bf16(k), dv = to_device_bf16(v);
-    auto dp = to_device(positions), dr = to_device(table_rows);
-    Tensor tq(dq.span(), DType::BF16, {256, geometry.q_heads, n});
-    Tensor tk(dk.span(), DType::BF16, {256, geometry.kv_heads, n}),
-        tv(dv.span(), DType::BF16, {256, geometry.kv_heads, n});
-    GuardedDeviceBuffer output(q.size() * 2);
-    Tensor out(output.span(), DType::BF16, {256, geometry.q_heads, n});
-    constexpr auto bucket = ContextBucket::K2;
-    const auto bytes      = ops::causal_softmax_attention_ragged_workspace_capacity_bytes(
-        op_geometry(geometry), storage, bucket, n, n, rows, rows, execution.multiprocessor_count());
-    GuardedDeviceBuffer scratch(std::max<std::size_t>(256, bytes));
+    if (test_case.shared_prefix) {
+        const int largest = *std::max_element(capacity.begin(), capacity.end());
+        std::fill(capacity.begin(), capacity.end(), largest);
+    }
+    std::vector<HostCache> initial;
+    for (int i = 0; i < table_slots; ++i)
+        initial.push_back(
+            make_cache(geometry, storage, capacity[i], 393 + (test_case.shared_prefix ? 0 : i)));
+    BatchDeviceCache cache(initial, MappingPattern::Fragmented, 0, test_case.shared_prefix);
+    const auto device         = execution.device();
+    const std::size_t q_bytes = n * qw * 2, kv_bytes = n * kvw * 2;
+    const std::size_t positions_bytes  = std::size_t(n) * sizeof(int);
+    const std::size_t table_rows_bytes = std::size_t(rows) * sizeof(int);
+    const std::size_t offset           = test_case.offset_bf16 ? sizeof(std::uint16_t) : 0;
+    const auto bytes = ops::causal_softmax_attention_ragged_workspace_capacity_bytes(
+        op_geometry(geometry), storage, test_case.bucket, n, n, rows, rows,
+        execution.multiprocessor_count());
+    const auto prefix_capacity = test_case.arena_operands
+                                     ? 2 * (q_bytes + kv_bytes) +
+                                           2 * (positions_bytes + table_rows_bytes) + sizeof(int) +
+                                           9 * 256
+                                     : 0;
+    GuardedDeviceBuffer scratch(prefix_capacity + bytes);
     MemoryArena arena(scratch.span());
-    ops::causal_softmax_attention(tq, tk, tv, ragged.view, Tensor(dp.span(), DType::I32, {n}),
-                                  Tensor(dr.span(), DType::I32, {rows}), op_geometry(geometry),
-                                  kAttentionScale, cache.view(), bucket, arena, out, execution);
-    cuda_synchronize(execution.stream());
-    const std::string label = std::string("ragged causal ") + cache_name(storage);
-    return verify_attention(label, from_device_bf16(output.data(), q.size()), reference,
-                            attention_criterion(storage)) +
-           cache.verify(label, expected) +
-           cache.verify_untouched(label, before, padded_positions, table_rows, ragged.lengths,
-                                  width) +
-           scratch.verify_guards(label) + output.verify_guards(label) +
-           (arena.used() != 0 || arena.peak_used() > bytes);
+    const auto separate = [&](std::size_t size) { return test_case.arena_operands ? 0 : size; };
+    DeviceBuffer dq(device, separate(q_bytes + offset)), dk(device, separate(kv_bytes + offset)),
+        dv(device, separate(kv_bytes + offset)), dp(device, separate(positions_bytes)),
+        dr(device, separate(table_rows_bytes));
+    GuardedDeviceBuffer output(separate(q_bytes), 256 + offset);
+    const auto operand = [&](MemorySpan standalone, std::size_t size, std::size_t start = 0) {
+        if (test_case.arena_operands) return arena.alloc_bytes(size + start).subspan(start);
+        return standalone.subspan(start);
+    };
+    const Tensor tq(operand(dq.span(), q_bytes, offset), DType::BF16, {256, geometry.q_heads, n});
+    const Tensor tk(operand(dk.span(), kv_bytes, offset), DType::BF16, {256, geometry.kv_heads, n}),
+        tv(operand(dv.span(), kv_bytes, offset), DType::BF16, {256, geometry.kv_heads, n});
+    const Tensor tp(operand(dp.span(), positions_bytes), DType::I32, {n}),
+        tr(operand(dr.span(), table_rows_bytes), DType::I32, {rows});
+    Tensor out(operand(output.span(), q_bytes), DType::BF16, {256, geometry.q_heads, n});
+    const auto upload = [](const Tensor& dst, const void* src) {
+        cuda_check(cudaMemcpy(dst.data, src, dst.bytes(), cudaMemcpyHostToDevice), "ragged upload");
+    };
+    if (test_case.arena_operands) {
+        const auto metadata = [&](const std::vector<int>& host) {
+            const auto tensor = arena.alloc(DType::I32, {static_cast<int>(host.size())});
+            upload(tensor, host.data());
+            return tensor;
+        };
+        ragged.view = {metadata(ragged.prefix), metadata(ragged.lengths), metadata(ragged.mapping),
+                       ragged.prefix};
+    }
+    const auto prefix_used = arena.used();
+    const auto launch      = [&] {
+        ops::causal_softmax_attention(tq, tk, tv, ragged.view, tp, tr, op_geometry(geometry),
+                                           kAttentionScale, cache.view(), test_case.bucket, arena, out,
+                                           execution);
+    };
+
+    DecodeGraphDefinition graph;
+    DecodeGraphExecutable executable;
+    int failures = 0;
+    for (int replay = 0; replay < (test_case.replay ? 2 : 1); ++replay) {
+        const auto label = std::string("ragged ") + test_case.name + " " + geometry.name + " " +
+                           cache_name(storage) + " replay=" + std::to_string(replay);
+        if (replay) {
+            std::reverse(table_rows.begin(), table_rows.end());
+            for (int s = 0; s < rows; ++s) frontiers[s] = (frontiers[s] + 63 + s % 4) % 79;
+        }
+        const unsigned seed = 325 + 100 * replay;
+        const auto q        = make_bf16_values(n * qw, seed, -.25f, .25f);
+        auto k              = make_bf16_values(n * kvw, seed + 2, -.25f, .25f);
+        auto v              = make_bf16_values(n * kvw, seed + 4, -1.f, 1.f);
+        // Adjacent packed rows have sharply different values, including at partial Q-tile tails.
+        for (int s = 0; s < rows; ++s) {
+            const int begin  = ragged.prefix[s];
+            const float sign = (s % 2 == 0) ? 1.f : -1.f;
+            for (std::size_t d = 0; d < kvw; ++d) {
+                k[begin * kvw + d] = sign * 0.5f;
+                v[begin * kvw + d] = sign * (d % 3 == 0 ? 1.f : 0.375f);
+            }
+        }
+        std::vector<int> positions(n);
+        for (int s = 0; s < rows; ++s)
+            std::iota(positions.begin() + ragged.prefix[s],
+                      positions.begin() + ragged.prefix[s + 1], frontiers[s]);
+        const auto upload_bf16 = [&](const Tensor& destination, const std::vector<float>& values) {
+            const auto bits = to_bf16_bits(values);
+            upload(destination, bits.data());
+        };
+        upload_bf16(tq, q);
+        upload_bf16(tk, k);
+        upload_bf16(tv, v);
+        upload(tp, positions.data());
+        upload(tr, table_rows.data());
+        cuda_check(cudaMemsetAsync(out.data, 0xff, out.bytes(), execution.stream()),
+                   "initialize ragged output");
+        const auto before = cache.snapshot_bytes();
+        if (test_case.replay) {
+            if (replay == 0) {
+                graph.capture(execution.stream(), launch);
+                executable.instantiate(graph);
+            }
+            executable.launch(execution.stream());
+        } else {
+            launch();
+        }
+        cuda_synchronize(execution.stream());
+        const auto actual = from_device_bf16(out.data, n * qw);
+        if (std::any_of(actual.begin(), actual.end(),
+                        [](double value) { return !std::isfinite(value); })) {
+            std::cerr << label << ": packed output contains an unwritten or non-finite element\n";
+            ++failures;
+        }
+
+        // Keep previous replay writes in the oracle. Only this replay's append range may change.
+        for (int s = 0; s < rows; ++s) {
+            const int begin = ragged.prefix[s], len = ragged.lengths[s];
+            const auto columns = [&](const auto& data, std::size_t stride) {
+                using T = typename std::decay_t<decltype(data)>::value_type;
+                return std::vector<T>(data.begin() + begin * stride,
+                                      data.begin() + (begin + len) * stride);
+            };
+            const auto pos = columns(positions, 1);
+            auto& history  = initial[table_rows[s]];
+            append_cache(history, columns(k, kvw), columns(v, kvw), pos);
+            std::vector<int> queries;
+            if (len > 96 || frontiers[s] >= 1024) {
+                queries = {0, 1, 63, 64, 127, 128, 255, 256, len / 2, len - 1};
+                std::erase_if(queries, [=](int t) { return t >= len; });
+                std::sort(queries.begin(), queries.end());
+                queries.erase(std::unique(queries.begin(), queries.end()), queries.end());
+            }
+            const auto expected = ideal_attention(select_query_columns(columns(q, qw), qw, queries),
+                                                  history, select_query_columns(pos, 1, queries));
+            failures += verify_attention(label + " segment " + std::to_string(s),
+                                         select_query_columns(columns(actual, qw), qw, queries),
+                                         expected, attention_criterion(storage));
+        }
+        failures += cache.verify(label, initial);
+        failures += cache.verify_untouched(label, before, ragged.unpack(positions, width, 1),
+                                           table_rows, ragged.lengths, width);
+        failures += scratch.verify_guards(label) + output.verify_guards(label);
+    }
+    const auto scratch_begin = (prefix_used + 255) / 256 * 256;
+    if (arena.used() != prefix_used || arena.peak_used() > scratch_begin + bytes) {
+        std::cerr << test_case.name << ": ragged workspace exceeded its envelope\n";
+        ++failures;
+    }
+    return failures;
+}
+
+int verify_ragged_workspace_capacity(CudaExecutionView execution, const Geometry& geometry,
+                                     KvCacheStorage storage) {
+    constexpr int limit = 263;
+    constexpr ContextBucketRange buckets{ContextBucket::K2, ContextBucket::K8};
+    const auto dev = execution.device();
+    const auto g   = op_geometry(geometry);
+    const int sms  = execution.multiprocessor_count();
+    DeviceBuffer q(dev, std::size_t(limit) * 256 * g.query_heads * 2);
+    DeviceBuffer k(dev, std::size_t(limit) * 256 * g.kv_heads * 2);
+    DeviceBuffer v(dev, k.size()), out_buf(dev, q.size());
+    auto positions  = to_device(std::vector<int>(limit));
+    auto table_rows = to_device(std::vector<int>{0, 1, 2});
+    DeviceBuffer cu(dev, 4 * sizeof(int)), lengths(dev, 3 * sizeof(int)),
+        mapping(dev, limit * sizeof(int));
+    const std::vector<HostCache> initial(3, make_cache(geometry, storage, limit, 823));
+    BatchDeviceCache cache(initial, MappingPattern::Identity, limit);
+    int failures = 0;
+    for (const auto& range :
+         {std::array{1, 20, 1, 3}, std::array{31, 40, 2, 3}, std::array{18, 21, 2, 2},
+          std::array{119, 132, 2, 2}, std::array{255, limit, 2, 2}}) {
+        const auto [first_t, last_t, first_s, last_s] = range;
+        const auto capacity = ops::causal_softmax_attention_ragged_workspace_capacity_bytes(
+            g, storage, buckets, first_t, last_t, first_s, last_s, sms);
+        GuardedDeviceBuffer scratch(capacity);
+        MemoryArena arena(scratch.span());
+        std::vector<int> partition;
+        DecodeGraphDefinition graph;
+        const auto capture = [&](int total, ContextBucket bucket) {
+            const int rows = partition.size();
+            std::vector<int> prefix(rows + 1), segment_lengths(rows), token_to_seq(total);
+            ops::populate_ragged_host_metadata(partition, prefix, segment_lengths, token_to_seq);
+            cu.copy_from_host(prefix.data(), prefix.size() * sizeof(int));
+            lengths.copy_from_host(segment_lengths.data(), segment_lengths.size() * sizeof(int));
+            mapping.copy_from_host(token_to_seq.data(), token_to_seq.size() * sizeof(int));
+            std::vector<int> consecutive(total);
+            for (int s = 0; s < rows; ++s)
+                std::iota(consecutive.begin() + prefix[s], consecutive.begin() + prefix[s + 1], 0);
+            positions.copy_from_host(consecutive.data(), consecutive.size() * sizeof(int));
+            // These captures witness host allocation without duplicating the numerical cases.
+            const ops::RaggedSequenceView ragged{Tensor(cu.span(), DType::I32, {rows + 1}),
+                                                 Tensor(lengths.span(), DType::I32, {rows}),
+                                                 Tensor(mapping.span(), DType::I32, {total}),
+                                                 prefix};
+            Tensor out(out_buf.span(), DType::BF16, {256, g.query_heads, total});
+            graph.capture(execution.stream(), [&] {
+                ops::causal_softmax_attention(
+                    Tensor(q.span(), DType::BF16, {256, g.query_heads, total}),
+                    Tensor(k.span(), DType::BF16, {256, g.kv_heads, total}),
+                    Tensor(v.span(), DType::BF16, {256, g.kv_heads, total}), ragged,
+                    Tensor(positions.span(), DType::I32, {total}),
+                    Tensor(table_rows.span(), DType::I32, {rows}), g, kAttentionScale, cache.view(),
+                    bucket, arena, out, execution);
+            });
+        };
+        const auto enumerate = [&](auto&& self, int total, int remaining, int rows, int minimum,
+                                   ContextBucket bucket) -> void {
+            if (rows == 0) {
+                if (remaining == 0) capture(total, bucket);
+                return;
+            }
+            // Permutations have the same allocation, so enumerate sorted partitions.
+            for (int len = minimum; len <= remaining / rows; ++len) {
+                partition.push_back(len);
+                self(self, total, remaining - len, rows - 1, len, bucket);
+                partition.pop_back();
+            }
+        };
+        buckets.for_each([&](ContextBucket bucket) {
+            for (int total = first_t; total <= last_t; ++total)
+                for (int rows = first_s; rows <= last_s; ++rows)
+                    enumerate(enumerate, total, total, rows, 1, bucket);
+        });
+        if (arena.used() || arena.peak_used() != capacity) {
+            std::cerr << geometry.name << ' ' << cache_name(storage) << ": ragged capacity "
+                      << capacity << " vs witnessed " << arena.peak_used() << '\n';
+            ++failures;
+        }
+    }
+    // A packed total above INT_MAX - 1 is possible even with fewer than INT_MAX rows.
+    // With one token per row the launch slices share a single metadata allocation.
+    const int largest = std::numeric_limits<int>::max();
+    const auto huge   = ops::causal_softmax_attention_ragged_workspace_capacity_bytes(
+        g, storage, ContextBucket::K2, largest - 1, largest - 1, largest - 1, largest - 1, sms);
+    constexpr int full_rows = 65535;
+    const int final_rows    = (largest - 1) % full_rows;
+    // At width one the only additional allocation is an I32 segment index. An exact
+    // full-row replay-sized envelope witnesses the full slice's high water.
+    const auto exact = [&](int rows) {
+        return rows <= 1 ? std::size_t{0}
+                         : ops::causal_softmax_attention_ragged_workspace_capacity_bytes(
+                               g, storage, ContextBucket::K2, rows, rows, rows, rows, sms);
+    };
+    if (huge != std::max(exact(full_rows), exact(final_rows))) {
+        std::cerr << "ragged causal workspace overflow or incorrect slicing\n";
+        ++failures;
+    }
+    return failures;
+}
+
+int verify_ragged_workspace_synthetic() {
+    constexpr ops::AttentionHeadGeometry geometry{256, 24, 4};
+    constexpr auto storage = KvCacheStorage::Fp8E4m3fnGroup128Ue8m0;
+    constexpr auto bucket  = ContextBucket::K32;
+    int failures           = 0;
+    const auto check       = [&](int sms, std::array<int, 4> envelope, std::size_t witnessed) {
+        const auto [first_n, last_n, first_s, last_s] = envelope;
+        const auto actual = ops::causal_softmax_attention_ragged_workspace_capacity_bytes(
+            geometry, storage, bucket, first_n, last_n, first_s, last_s, sms);
+        if (actual != witnessed) {
+            std::cerr << "FP8 ragged workspace at " << sms << " SMs, N=[" << first_n << ", "
+                      << last_n << "], S=[" << first_s << ", " << last_s << "]: " << actual
+                      << " bytes vs witnessed " << witnessed << '\n';
+            ++failures;
+        }
+    };
+    // On RTX, twelve 256-token segments use 24 tiles and four splits at 70 SMs.
+    // The Spark cap selects direct output here. Its high water is instead the
+    // dense fallback for a 3061-token segment and eleven one-token segments.
+    check(70, {3072, 3072, 12, 12}, NINFER_TARGET_SPARK ? 303259520 : 304349184);
+
+    const auto align256 = [](std::size_t size) { return (size + 255) / 256 * 256; };
+    for (const int sms : {48, 70, 96, 108, 132, 160, 170, 192, std::numeric_limits<int>::max()}) {
+        const auto dense = [&](int width, int rows) {
+            return ops::causal_softmax_attention_workspace_capacity_bytes(geometry, storage, bucket,
+                                                                          rows, width, width, sms);
+        };
+        for (const auto envelope : {std::array{17, 24, 1, 3}, std::array{125, 132, 2, 4},
+                                    std::array{252, 259, 2, 3}, std::array{65, 70, 65, 67}}) {
+            const auto [first_n, last_n, first_s, last_s] = envelope;
+            std::vector<int> part;
+            std::size_t witnessed = 0;
+            const auto measure    = [&] {
+                const auto longs      = std::upper_bound(part.begin(), part.end(), 16);
+                const int short_count = longs - part.begin(), long_count = part.end() - longs;
+                std::size_t short_bytes = 0, long_bytes = 0;
+                if (short_count) {
+                    const auto partials = dense(longs[-1], short_count);
+                    const auto map      = short_count > 64 ? short_count * sizeof(int) : 0;
+                    short_bytes         = partials ? align256(map) + partials : map;
+                }
+                if (long_count == 1) long_bytes = dense(part.back(), 1);
+                if (long_count >= 2) {
+                    const int tile_rows = part.back() <= 64 ? 64 : 128;
+                    const auto ctas =
+                        24LL * std::accumulate(longs, part.end(), 0, [&](int count, int len) {
+                            return count + (len + tile_rows - 1) / tile_rows;
+                        });
+                    const int waves_for_direct = tile_rows == 64 ? 4
+                                                    : NINFER_TARGET_SPARK
+                                                        ? 8
+                                                        : std::numeric_limits<int>::max();
+                    const int limit            = ctas >= waves_for_direct * std::int64_t(sms) ? 1
+                                                    : ctas >= sms                                ? 4
+                                                                  : 8;
+                    int splits                 = 1;
+                    for (int s = 2; s <= limit; ++s) {
+                        const auto waves = [&](int count) { return (ctas * count - 1) / sms + 1; };
+                        if (waves(s) * splits < waves(splits) * s) splits = s;
+                    }
+                    const auto map = long_count > 64 ? long_count * 3 * sizeof(int) : 0;
+                    const auto stats =
+                        24 * sizeof(float) * splits * std::accumulate(longs, part.end(), 0);
+                    long_bytes =
+                        splits == 1 ? map : align256(map) + 256 * stats + align256(stats) + stats;
+                }
+                witnessed = std::max({witnessed, short_bytes, long_bytes});
+            };
+            const auto enumerate = [&](auto&& self, int remaining, int rows, int min_len) -> void {
+                if (rows == 0) {
+                    if (remaining == 0) measure();
+                    return;
+                }
+                for (int len = min_len; len <= remaining / rows; ++len) {
+                    part.push_back(len);
+                    self(self, remaining - len, rows - 1, len);
+                    part.pop_back();
+                }
+            };
+            for (int n = first_n; n <= last_n; ++n)
+                for (int rows = first_s; rows <= last_s; ++rows) enumerate(enumerate, n, rows, 1);
+            check(sms, envelope, witnessed);
+        }
+    }
+    return failures;
 }
 
 int verify_workspace_capacity_contract(CudaExecutionView execution, KvCacheStorage storage) {

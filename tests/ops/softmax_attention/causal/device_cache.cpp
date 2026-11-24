@@ -250,7 +250,7 @@ int DeviceCache::verify_guards(const std::string& label) const {
 }
 
 BatchDeviceCache::BatchDeviceCache(std::span<const HostCache> rows, MappingPattern mapping,
-                                   std::int32_t table_capacity)
+                                   std::int32_t table_capacity, int shared_prefix)
     : geometry_(rows.front().geometry), storage_(rows.front().storage),
       layout_(test_cache_layout(storage_)), rows_(rows.size()),
       logical_pages_(batch_table_pages(rows, table_capacity)),
@@ -276,7 +276,9 @@ BatchDeviceCache::BatchDeviceCache(std::span<const HostCache> rows, MappingPatte
         }
         for (int logical = 0; logical < cache.logical_capacity / kPagedKVPageSize; ++logical) {
             block_tables_host_[row * static_cast<std::size_t>(logical_pages_) + logical] =
-                mapping == MappingPattern::Fragmented ? 2 * linear + 1 : linear;
+                row && logical < shared_prefix / kPagedKVPageSize
+                    ? block_tables_host_[logical]
+                    : (mapping == MappingPattern::Fragmented ? 2 * linear + 1 : linear);
             ++linear;
         }
     }

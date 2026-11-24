@@ -73,8 +73,10 @@ void launch_quantized(const WriteArguments& a, Metadata metadata, cudaStream_t s
     using KeyScale =
         std::conditional_t<Storage == KvCacheStorage::Int8Group64, __half, std::uint8_t>;
     using ValueScale = KeyScale;
-    const dim3 grid  = Page ? dim3(common::div_up(a.width + 7, 8), G::KVHeads)
-                            : dim3(common::div_up(a.width * G::KVHeads, 8), 1, Batch ? a.batch : 1);
+    const dim3 grid =
+        Page ? dim3(common::div_up(a.width + 7, 8), G::KVHeads)
+             : dim3(common::div_up(std::int64_t(a.width) * G::KVHeads, std::int64_t{8}), 1,
+                    Batch ? a.batch : 1);
     kernel<<<grid, 256, 0, stream>>>(
         a.k, a.v, a.positions, metadata, static_cast<Code*>(a.keys), static_cast<Code*>(a.values),
         static_cast<KeyScale*>(a.key_scales), static_cast<ValueScale*>(a.value_scales), a.width);
@@ -101,10 +103,16 @@ void launch_instance(PagedWriteInstance instance, const WriteArguments& a, Metad
             throw std::logic_error("KV write: invalid BF16 instance");
         const int threads = instance == PagedWriteInstance::Copy128 ? 128 : 96;
         const auto units  = static_cast<std::int64_t>(a.width) * G::KVHeads * (256 / 8);
-        const int blocks  = common::div_up(units, static_cast<std::int64_t>(threads));
-        write_bf16_kernel<G, Metadata><<<blocks, threads, 0, stream>>>(
-            a.k, a.v, a.positions, metadata, static_cast<__nv_bfloat16*>(a.keys),
-            static_cast<__half*>(a.values), a.width);
+        const auto blocks     = common::div_up(units, static_cast<std::int64_t>(threads));
+        constexpr auto kernel = [] {
+            if constexpr (std::is_same_v<Metadata, RaggedMetadata>)
+                return write_bf16_ragged_kernel<G>;
+            else
+                return write_bf16_kernel<G, Metadata>;
+        }();
+        kernel<<<blocks, threads, 0, stream>>>(a.k, a.v, a.positions, metadata,
+                                               static_cast<__nv_bfloat16*>(a.keys),
+                                               static_cast<__half*>(a.values), a.width);
         return;
     } else {
         switch (instance) {
@@ -112,8 +120,10 @@ void launch_instance(PagedWriteInstance instance, const WriteArguments& a, Metad
             return launch_quantized<Storage, G, Metadata, PagedWriteInstance::WarpRows256>(
                 a, metadata, stream);
         case PagedWriteInstance::Page8x256:
-            return launch_quantized<Storage, G, Metadata, PagedWriteInstance::Page8x256>(
-                a, metadata, stream);
+            if constexpr (!std::is_same_v<Metadata, RaggedMetadata>)
+                return launch_quantized<Storage, G, Metadata, PagedWriteInstance::Page8x256>(
+                    a, metadata, stream);
+            break;
         case PagedWriteInstance::BatchRows256:
             if constexpr (requires { Metadata::masked; })
                 return launch_quantized<Storage, G, Metadata, PagedWriteInstance::BatchRows256>(
@@ -182,6 +192,25 @@ void launch_paged_write(PagedWriteInstance instance, const Tensor& k, const Tens
         launch.template operator()<true>();
     else
         launch.template operator()<false>();
+}
+
+void launch_paged_write_ragged(const Tensor& k, const Tensor& v, const Tensor& positions,
+                               const Tensor& token_to_seq, const Tensor& seq_lengths,
+                               const Tensor& table_rows, PagedKVBatchLayerView cache,
+                               int max_length, cudaStream_t stream) {
+    const auto& offsets = cache.k_pages.records.page_offsets;
+    const RaggedMetadata metadata{static_cast<const std::int64_t*>(offsets.data),
+                                  static_cast<const int*>(token_to_seq.data),
+                                  static_cast<const int*>(table_rows.data),
+                                  static_cast<const int*>(seq_lengths.data),
+                                  offsets.ne[0],
+                                  max_length};
+    // Fixed 128 threads keeps the BF16 grid within grid.x even at INT_MAX packed tokens.
+    const auto instance = cache.storage == KvCacheStorage::BFloat16
+                              ? PagedWriteInstance::Copy128
+                              : PagedWriteInstance::WarpRows256;
+    geometry_dispatch(k.ne[1], cache.storage, instance, arguments(k, v, positions, cache), metadata,
+                      stream);
 }
 
 } // namespace ninfer::ops::detail::kv

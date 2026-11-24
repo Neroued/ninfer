@@ -23,4 +23,9 @@ void launch_paged_write(PagedWriteInstance instance, const Tensor& k, const Tens
                         const Tensor& positions, const Tensor& valid_columns,
                         const Tensor& table_rows, PagedKVBatchLayerView cache, cudaStream_t stream);
 
+void launch_paged_write_ragged(const Tensor& k, const Tensor& v, const Tensor& positions,
+                               const Tensor& token_to_seq, const Tensor& seq_lengths,
+                               const Tensor& table_rows, PagedKVBatchLayerView cache,
+                               int max_length, cudaStream_t stream);
+
 } // namespace ninfer::ops::detail::kv

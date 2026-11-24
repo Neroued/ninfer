@@ -33,15 +33,16 @@ __launch_bounds__(256) __global__
     const int tokens            = metadata.valid_tokens(width);
     const int warp              = static_cast<int>(threadIdx.x) >> 5;
     const int lane              = static_cast<int>(threadIdx.x) & 31;
-    const int unit              = static_cast<int>(blockIdx.x) * Warps + warp;
-    const int units             = tokens * Geometry::KVHeads;
+    using Row = std::conditional_t<std::is_same_v<Metadata, RaggedMetadata>, std::int64_t, int>;
+    const Row unit  = static_cast<Row>(blockIdx.x) * Warps + warp;
+    const Row units = Row(tokens) * Geometry::KVHeads;
     if (unit >= units) return;
 
     const int kv_head               = unit % Geometry::KVHeads;
     const int token                 = unit / Geometry::KVHeads;
-    const int position              = positions[0] + token;
-    const std::int64_t* block_table = metadata.block_table();
-    std::int64_t page               = lane == 0 ? lookup_page(block_table, position) : 0;
+    int position                    = 0;
+    std::int64_t page               = 0;
+    if (!write_token_page(metadata, positions, token, lane, position, page)) return;
     const int page_off              = position & kPageMask;
     page                            = __shfl_sync(FullMask, page, 0);
 

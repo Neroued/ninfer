@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ops/softmax_attention/kernels/causal/ragged_launch.cuh"
+
 #include "ops/kv_cache/kernels/layout.cuh"
 #include "core/device.h"
 #include "ops/common/host/launch.h"
@@ -11,13 +13,14 @@
 namespace ninfer::ops::detail {
 
 template <class G, class S, bool MultiBatch, bool Masked, bool Writable, class Input,
-          bool ParallelQueries = false>
+          bool ParallelQueries = false, class... Metadata>
 void launch_int8_kv_grouped_mma(const CausalAttentionOperands& p, Int8KvCacheView<Writable> cache,
                                 Input input, CausalKvPartition partition, CausalPartialView partial,
-                                cudaStream_t stream) {
+                                cudaStream_t stream, Metadata... metadata) {
     static_assert(Writable == Input::writes_cache);
     validate_quantized_causal_operands<G>(p, cache);
-    if ((!ParallelQueries && p.width != S::kTokenTile) || MultiBatch != (p.batch > 1) ||
+    if ((!ParallelQueries && p.width != S::kTokenTile) ||
+        (sizeof...(Metadata) == 0 && MultiBatch != (p.batch > 1)) ||
         Masked != (cache.valid_columns != nullptr) || partition.capacity < 1 ||
         partition.target > CausalKvPartition::kMaxSplits || partition.target < 1 ||
         partition.key_shift < 6 || partition.key_shift > 12 ||
@@ -27,17 +30,23 @@ void launch_int8_kv_grouped_mma(const CausalAttentionOperands& p, Int8KvCacheVie
     if constexpr (Input::writes_cache)
         if (!input.k || !input.v) throw std::invalid_argument("INT8 append requires K/V");
     const auto launch = [&]<bool Direct>() {
-        constexpr auto kernel =
-            int8_kv_grouped_mma_kernel<G, S, MultiBatch, Masked, Input, ParallelQueries, Direct>;
+        constexpr auto kernel = [] {
+            if constexpr (sizeof...(Metadata) == 0)
+                return int8_kv_grouped_mma_kernel<G, S, MultiBatch, Masked, Input, ParallelQueries,
+                                                  Direct>;
+            else
+                return int8_kv_ragged_grouped_mma_kernel<G, S, MultiBatch, Masked, Input,
+                                                         ParallelQueries, Direct>;
+        }();
         constexpr int bytes = S::kDynamicArena ? S::kArenaBytes : 0;
-        (void)common::prepare_shared<bytes, kernel, true>();
+        const int shared    = prepare_causal_shared<bytes, kernel, true>(metadata...);
         const dim3 grid(G::KVHeads * (ParallelQueries ? common::div_up(p.width, S::kTokenTile) : 1),
                         partition.capacity, p.batch);
-        kernel<<<grid, S::kThreads, bytes, stream>>>(
+        kernel<<<grid, S::kThreads, shared, stream>>>(
             p.q, input, p.positions, cache.keys, cache.values, cache.key_scales, cache.value_scales,
             cache.tables, cache.valid_columns, cache.table_rows, cache.table_stride, p.width,
             p.visible_capacity, partition, p.scale, partial.acc, partial.maximum, partial.sum,
-            p.out);
+            p.out, metadata...);
     };
     if (partition.capacity == 1)
         launch.template operator()<true>();
@@ -46,22 +55,36 @@ void launch_int8_kv_grouped_mma(const CausalAttentionOperands& p, Int8KvCacheVie
     CUDA_CHECK(cudaGetLastError());
 }
 
-template <class G, class S>
+template <class G, class S, class... Ragged>
 void launch_int8_kv_tiled_mma(const CausalAttentionOperands& p, Int8KvReadView cache,
-                              cudaStream_t stream) {
+                              cudaStream_t stream, Ragged... ragged) {
     validate_quantized_causal_operands<G>(p, cache);
     if (p.batch != 1)
         throw std::invalid_argument("INT8 tiled attention requires a complete single query row");
+    constexpr bool Packed = sizeof...(Ragged) != 0;
+    const int tiles       = [&] {
+        if constexpr (Packed)
+            return (ragged.tile_count, ...);
+        else
+            return common::div_up(p.width, S::kQueryRows);
+    }();
     const auto invoke = [&]<class Metadata>(Metadata metadata) {
-        constexpr auto kernel = int8_kv_tiled_mma_kernel<G, S, Metadata>;
-        const int shared      = common::prepare_shared<S::kSharedBytes, kernel, true>();
-        const dim3 grid(common::div_up(p.width, S::kQueryRows), G::QHeads);
+        constexpr auto kernel = [] {
+            if constexpr (Packed)
+                return int8_kv_ragged_tiled_mma_kernel<G, S>;
+            else
+                return int8_kv_tiled_mma_kernel<G, S, Metadata>;
+        }();
+        const int shared = prepare_causal_shared<S::kSharedBytes, kernel, true>(ragged...);
+        const dim3 grid(tiles, G::QHeads);
         kernel<<<grid, S::kThreads, shared, stream>>>(
             p.q, cache.keys, cache.values, cache.key_scales, cache.value_scales, metadata,
             p.positions, p.scale, p.out, p.width);
         CUDA_CHECK(cudaGetLastError());
     };
-    if (!cache.table_rows)
+    if constexpr (Packed) {
+        invoke(ragged...);
+    } else if (!cache.table_rows)
         invoke(kv::DirectMetadata{cache.tables});
     else if (cache.valid_columns)
         invoke(kv::BatchMetadata<true>{cache.tables, cache.valid_columns, cache.table_rows,

@@ -325,7 +325,7 @@ private:
 class BatchDeviceCache {
 public:
     BatchDeviceCache(std::span<const HostCache> rows, MappingPattern mapping,
-                     std::int32_t table_capacity);
+                     std::int32_t table_capacity, int shared_prefix = 0);
 
     PagedKVBatchLayerView view();
 
@@ -409,7 +409,21 @@ int run_cached_case(CudaExecutionView execution, const Geometry& geometry, KvCac
 int run_batch_case(CudaExecutionView execution, const Geometry& geometry, KvCacheStorage storage,
                    const BatchAttentionCase& test_case, std::optional<ContextBucket> bucket = {},
                    std::span<const ContextBucket> graph_buckets = {});
-int run_ragged_case(CudaExecutionView, KvCacheStorage);
+
+struct RaggedAttentionCase {
+    std::string name;
+    std::vector<int> lengths;
+    std::vector<int> histories = {};
+    ContextBucket bucket       = ContextBucket::K2;
+    int shared_prefix          = 0;
+    bool replay                = false;
+    bool arena_operands        = false;
+    bool offset_bf16           = false;
+};
+
+int run_ragged_case(CudaExecutionView, const Geometry&, KvCacheStorage, const RaggedAttentionCase&);
+int verify_ragged_workspace_capacity(CudaExecutionView, const Geometry&, KvCacheStorage);
+int verify_ragged_workspace_synthetic();
 int verify_workspace_capacity_contract(CudaExecutionView, KvCacheStorage);
 void add_cases(OpSuite&);
 

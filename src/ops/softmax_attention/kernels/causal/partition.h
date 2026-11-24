@@ -30,6 +30,30 @@ private:
     }
 };
 
+inline constexpr int kCausalTiledMaxSplits = 8;
+
+// Minimize waves per KV partition, retaining fewer partitions on a tie.
+// The bound limits FP32 partial traffic; live rows cap the count at
+// ceil(visible_keys / 512). Count changes work and storage, never kernel topology.
+inline CausalKvPartition select_causal_tiled_partition(int heads, std::int64_t tiles,
+                                                       int visible_capacity,
+                                                       int multiprocessor_count,
+                                                       int split_limit = kCausalTiledMaxSplits) {
+    const std::int64_t ctas = heads * tiles;
+    int selected            = 1;
+    auto waves              = (ctas + multiprocessor_count - 1) / multiprocessor_count;
+    for (int splits = 2; splits <= split_limit; ++splits) {
+        const auto next = (ctas * splits + multiprocessor_count - 1) / multiprocessor_count;
+        if (next * selected < waves * splits) {
+            selected = splits;
+            waves    = next;
+        }
+    }
+    CausalKvPartition partition{1, selected, 9};
+    partition.capacity = partition.active(visible_capacity);
+    return partition;
+}
+
 inline constexpr int causal_partition_target(std::int64_t cta_budget, int independent_tiles) {
     return static_cast<int>(
         std::clamp<std::int64_t>(cta_budget / independent_tiles, 1, CausalKvPartition::kMaxSplits));
@@ -107,16 +131,11 @@ __device__ __forceinline__ int causal_pool_window(const int* positions, const in
 // Every full warp computes the same allocation. The two halves keep batch order
 // in the greedy pass and in the exclusive scan. Producers and merges both use
 // these offsets into the original batch * capacity partial slots.
-template <bool Masked, class Partition>
-__device__ __forceinline__ CausalSplitPool causal_split_pool(const Partition& partition,
-                                                             const int* positions,
-                                                             const int* valid_columns, int width,
-                                                             int batch_size, int logical_capacity) {
+template <class Partition>
+__device__ __forceinline__ CausalSplitPool causal_split_pool_windows(const Partition& partition,
+                                                                     int batch_size, int w0,
+                                                                     int w1) {
     const int lane  = threadIdx.x & 31;
-    const int w0    = causal_pool_window<Masked>(positions, valid_columns, width, lane, batch_size,
-                                                 logical_capacity);
-    const int w1    = causal_pool_window<Masked>(positions, valid_columns, width, lane + 32,
-                                                 batch_size, logical_capacity);
     const int first = __shfl_sync(kCausalPoolWarp, w0, 0);
     if (__all_sync(kCausalPoolWarp, (lane >= batch_size || w0 == first) &&
                                         (lane + 32 >= batch_size || w1 == first))) {
@@ -162,6 +181,19 @@ __device__ __forceinline__ CausalSplitPool causal_split_pool(const Partition& pa
     }
     const int low_slots = __shfl_sync(kCausalPoolWarp, prefix0, 31);
     return {{prefix0 - count0, count0, w0}, {low_slots + prefix1 - count1, count1, w1}};
+}
+
+template <bool Masked, class Partition>
+__device__ __forceinline__ CausalSplitPool causal_split_pool(const Partition& partition,
+                                                             const int* positions,
+                                                             const int* valid_columns, int width,
+                                                             int batch_size, int logical_capacity) {
+    const int lane = threadIdx.x & 31;
+    const int w0   = causal_pool_window<Masked>(positions, valid_columns, width, lane, batch_size,
+                                                logical_capacity);
+    const int w1   = causal_pool_window<Masked>(positions, valid_columns, width, lane + 32,
+                                                batch_size, logical_capacity);
+    return causal_split_pool_windows(partition, batch_size, w0, w1);
 }
 
 __device__ __forceinline__ bool use_causal_split_pool(int batch, int capacity) {

@@ -8,27 +8,11 @@ namespace ninfer::ops::detail {
 namespace {
 constexpr int kGroupedPrefillMaxWidth = 80;
 
-// Minimize waves per KV partition, retaining fewer partitions on a tie.
-// The bound limits FP32 partial traffic; live rows cap the count at
-// ceil(visible_keys / 512). Count changes work and storage, never kernel topology.
 CausalKvPartition select_tiled_partition(int heads, int width, int visible_capacity,
                                          int multiprocessor_count) {
-    const std::int64_t tiles =
-        (static_cast<std::int64_t>(width) + K8V4KvTiledInstance::kQueryRows - 1) /
-        K8V4KvTiledInstance::kQueryRows;
-    const std::int64_t ctas = heads * tiles;
-    int selected            = 1;
-    auto waves              = (ctas + multiprocessor_count - 1) / multiprocessor_count;
-    for (int splits = 2; splits <= 8; ++splits) {
-        const auto next = (ctas * splits + multiprocessor_count - 1) / multiprocessor_count;
-        if (next * selected < waves * splits) {
-            selected = splits;
-            waves    = next;
-        }
-    }
-    CausalKvPartition partition{1, selected, 9};
-    partition.capacity = partition.active(visible_capacity);
-    return partition;
+    constexpr int rows = K8V4KvTiledInstance::kQueryRows;
+    const auto tiles   = (std::int64_t(width) + rows - 1) / rows;
+    return select_causal_tiled_partition(heads, tiles, visible_capacity, multiprocessor_count);
 }
 
 std::size_t tiled_workspace_bytes(int heads, int min_width, int max_width, int visible_capacity,

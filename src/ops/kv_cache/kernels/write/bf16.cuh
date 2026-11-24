@@ -52,4 +52,37 @@ __global__ void write_bf16_kernel(const __nv_bfloat16* __restrict__ k,
     common::store_vec(&cache_v[cache_off], v_value);
 }
 
+template <class Geometry>
+__global__ void write_bf16_ragged_kernel(const __nv_bfloat16* __restrict__ k,
+                                         const __nv_bfloat16* __restrict__ v,
+                                         const int* __restrict__ positions, RaggedMetadata metadata,
+                                         __nv_bfloat16* __restrict__ cache_k,
+                                         __half* __restrict__ cache_v, int width) {
+    constexpr int VecElems = 8;
+    const std::int64_t idx = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::int64_t n =
+        static_cast<std::int64_t>(width) * Geometry::KVHeads * (kHeadDim / VecElems);
+    if (idx >= n) return;
+
+    const int vec       = static_cast<int>(idx % (kHeadDim / VecElems));
+    const auto tmp      = idx / (kHeadDim / VecElems);
+    const int kv_head   = tmp % Geometry::KVHeads;
+    const int token     = tmp / Geometry::KVHeads;
+    const int d         = vec * VecElems;
+    int position        = 0;
+    const int lane      = static_cast<int>(threadIdx.x) & 31;
+    std::int64_t record = 0;
+    if (!write_token_page(metadata, positions, token, lane, position, record)) return;
+    const std::int64_t src_off =
+        static_cast<std::int64_t>(d) +
+        static_cast<std::int64_t>(kHeadDim) * (kv_head + std::int64_t(Geometry::KVHeads) * token);
+    const int4 k_value = common::load_vec<int4>(&k[src_off]);
+    const int4 v_value = common::bf16x8_bits_to_f16x8_bits(common::load_vec<int4>(&v[src_off]));
+    record             = __shfl_sync(0xffffffffu, record, 0);
+    const std::int64_t cache_off =
+        record_offset<kHeadDim, 2>(record, kv_head, position & kPageMask, d);
+    common::store_vec(&cache_k[cache_off], k_value);
+    common::store_vec(&cache_v[cache_off], v_value);
+}
+
 } // namespace ninfer::ops::detail::kv

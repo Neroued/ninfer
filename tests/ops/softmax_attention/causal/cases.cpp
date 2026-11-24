@@ -513,11 +513,81 @@ void add_small_prefill_cases(OpSuite& suite, KvCacheStorage storage) {
     }
 }
 
-void add_storage_cases(OpSuite& suite, KvCacheStorage storage) {
-    suite.add(std::string("causal_ragged/") + cache_name(storage),
-              [=] { return run_ragged_case(cuda_environment().default_execution, storage); },
-              {{"format", kv_cache_storage_name(storage)}});
+void add_ragged_cases(OpSuite& suite, KvCacheStorage storage) {
+    std::vector<RaggedAttentionCase> cases{
+        {"small_grouped", std::vector<int>(8, 3)},
+        {"decode_grouped", std::vector<int>(32, 1)},
+        {"variable_short", {1, 2, 5, 8, 9, 15, 16}, {0, 62, 63, 64, 65, 62, 0}},
+        {"long_first", {4095, 1}, {}, ContextBucket::K8},
+        {"long_last", {1, 4095}, {}, ContextBucket::K8},
+        {"long_small_tail", {127, 2}},
+        {"long_short_prefill", {257, 1, 3, 16}, {61, 0, 62, 63}},
+        {"tiled_80_81", {80, 81}, {62, 65}},
+        {"tiled_192_193", {192, 193}, {63, 64}},
+        {"tiled_256_257", {256, 257}},
+        {"tiled_tail", {65, 129, 257}, {62, 63, 64}},
+        {"tiled_waves", std::vector<int>(16, 64)},
+        {"packed_over_bucket", std::vector<int>(4, 600)},
+        {"different_visible_splits", {257, 1281, 129, 17}, {4096, 0, 129, 17}, ContextBucket::K16},
+        {"shared_prefix", {65, 129, 3, 15}, {64, 65, 127, 128}, ContextBucket::K2, 64},
+    };
+    if (storage == KvCacheStorage::BFloat16)
+        cases.push_back({"many_one_tile", std::vector<int>(64, 17)});
+    else {
+        cases.push_back({.name = "unaligned_grouped", .lengths = {3, 3}, .offset_bf16 = true});
+        cases.push_back({.name        = "unaligned_grouped_direct",
+                         .lengths     = std::vector<int>(96, 3),
+                         .offset_bf16 = true});
+        cases.push_back({.name = "unaligned_tiled", .lengths = {17, 17}, .offset_bf16 = true});
+        RaggedAttentionCase direct{.name        = "unaligned_tiled_direct",
+                                   .lengths     = std::vector<int>(48, 17),
+                                   .offset_bf16 = true};
+        direct.lengths.insert(direct.lengths.begin(), 3);
+        cases.push_back(std::move(direct));
+        if (storage == KvCacheStorage::Int8Group64 ||
+            storage == KvCacheStorage::Fp8E4m3fnGroup128Ue8m0) {
+            cases.push_back({.name = "unaligned_single", .lengths = {257}, .offset_bf16 = true});
+            cases.push_back(
+                {.name = "unaligned_one_long", .lengths = {3, 129, 2}, .offset_bf16 = true});
+        }
+    }
+    for (int len : {1, 8, 16, 80, 81, 192, 193, 256, 257, 512})
+        cases.push_back({"single_" + std::to_string(len), {len}, {63}});
+    RaggedAttentionCase replay{"graph_device_maps", {}, {}, ContextBucket::K2, 0, true};
+    replay.arena_operands = true;
+    // Both compact maps exceed their 64-entry inline capacity.
+    for (int s = 0; s < 68; ++s) {
+        replay.lengths.push_back(1 + s % 3);
+        replay.lengths.push_back(s % 2 ? 17 : 65);
+        replay.histories.push_back(s % 66);
+        replay.histories.push_back((s + 1) % 66);
+    }
+    cases.push_back(std::move(replay));
+    cases.push_back({.name = "arena_operands", .lengths = {3, 129, 131}, .arena_operands = true});
+    for (const auto& geometry : kGeometries) {
+        for (const auto& item : cases)
+            suite.add(std::string("causal_ragged/") + cache_name(storage) + "/" + geometry.name +
+                          "/" + item.name,
+                      [=] {
+                          return run_ragged_case(cuda_environment().context.execution_view(),
+                                                 geometry, storage, item);
+                      },
+                      {{"format", kv_cache_storage_name(storage)}});
+        suite.add(std::string("causal_ragged/") + cache_name(storage) + "/" + geometry.name +
+                      "/workspace_envelope",
+                  [=] {
+                      return verify_ragged_workspace_capacity(
+                          cuda_environment().context.execution_view(), geometry, storage);
+                  },
+                  {{"format", kv_cache_storage_name(storage)}});
+    }
+    if (storage == KvCacheStorage::Fp8E4m3fnGroup128Ue8m0)
+        suite.add("causal_ragged/fp8/synthetic_workspace_envelopes",
+                  verify_ragged_workspace_synthetic, {{"format", kv_cache_storage_name(storage)}});
+}
 
+void add_storage_cases(OpSuite& suite, KvCacheStorage storage) {
+    add_ragged_cases(suite, storage);
     suite.add(std::string("causal_capacity/") + cache_name(storage),
               [=] {
                   return verify_workspace_capacity_contract(

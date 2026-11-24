@@ -1,4 +1,5 @@
 #pragma once
+#include "ops/softmax_attention/kernels/causal/ragged_grouped.cuh"
 #include "core/device.h"
 #include "ops/softmax_attention/kernels/causal/operands.h"
 
@@ -39,92 +40,36 @@ causal_merge_natural_statistics(const float* partial_m, const float* partial_l, 
     return total;
 }
 
-template <class Geometry, int DChunk, bool MultiBatch, bool Masked, bool InverseRotation>
-__launch_bounds__(256) __global__
-    void causal_natural_merge_kernel(const float* partial_acc, const float* partial_m,
-                                     const float* partial_l, const std::int32_t* positions,
-                                     const std::int32_t* valid_columns, std::int32_t tokens,
-                                     std::int32_t batch_size, std::int32_t logical_capacity,
-                                     CausalKvPartition partition, __nv_bfloat16* out) {
-    static_assert(Geometry::kHeadDim == kCausalHeadDim);
-    static_assert(DChunk > 0 && DChunk <= kCausalHeadDim);
-    static_assert(!InverseRotation || DChunk == kCausalHeadDim);
-    const int q_head      = static_cast<int>(blockIdx.x);
-    const int d_start     = static_cast<int>(blockIdx.y) * DChunk;
-    const int flat_column = static_cast<int>(blockIdx.z);
-    int batch             = 0;
-    int token             = flat_column;
-    if constexpr (MultiBatch) {
-        batch = flat_column / tokens;
-        token = flat_column - batch * tokens;
-    }
-    const int tid = static_cast<int>(threadIdx.x);
-    if (q_head >= Geometry::QHeads || token >= tokens) return;
-    if constexpr (MultiBatch) {
-        if (batch >= batch_size) return;
-    }
-    int output_column = token;
-    if constexpr (MultiBatch) output_column += batch * tokens;
-    const int live_columns = Masked ? valid_columns[batch] : tokens;
-    if constexpr (Masked) {
-        if (token >= live_columns) {
-            if (tid < DChunk && d_start + tid < 256)
-                out[causal_q_index<Geometry>(q_head, d_start + tid, output_column)] =
-                    __float2bfloat16(0.0f);
-            return;
-        }
-    }
+#include "ops/softmax_attention/kernels/causal/merge.inl"
 
-    const auto slots =
-        causal_merge_splits<MultiBatch, Masked>(partition, positions, valid_columns, tokens,
-                                                live_columns, batch, batch_size, logical_capacity);
-    if constexpr (MultiBatch) {
-        const auto stat = static_cast<std::int64_t>(slots.offset) * Geometry::QHeads * tokens;
-        partial_acc += stat * Geometry::kHeadDim;
-        partial_m += stat;
-        partial_l += stat;
-    }
-    const int active_splits = slots.count < 0 ? partition.active(slots.window) : slots.count;
-    __shared__ float weights[256], warp_sums[8], scalars[2];
-    const float head_l = causal_merge_natural_statistics<Geometry>(
-        partial_m, partial_l, q_head, token, tokens, active_splits, weights, warp_sums, scalars);
-    const int d = d_start + tid;
-    if (tid >= DChunk || d >= 256) return;
-    float numerator = 0.0f;
-    for (int split = 0; split < active_splits; ++split) {
-        if (weights[split] != 0.0f)
-            numerator +=
-                partial_acc[causal_partial_index<Geometry>(q_head, d, token, split, tokens)] *
-                weights[split];
-    }
+#define NINFER_CAUSAL_RAGGED
+#include "ops/softmax_attention/kernels/causal/merge.inl"
+#undef NINFER_CAUSAL_RAGGED
 
-    const float value = head_l > 0.0F ? numerator / head_l : 0.0F;
-    if constexpr (InverseRotation) {
-        __shared__ float normalized[kCausalHeadDim];
-        normalized[tid] = value;
-        __syncthreads();
-        if (tid < 32)
-            causal_store_inverse_rotated_row<Geometry>(normalized, out, q_head, output_column);
-    } else {
-        causal_store_output(out + causal_q_index<Geometry>(q_head, d, output_column), value);
-    }
-}
-
-template <class G, class S, bool MultiBatch, bool Masked, bool InverseRotation>
+template <class G, class S, bool MultiBatch, bool Masked, bool InverseRotation, class... Metadata>
 void launch_causal_natural_merge(const CausalAttentionOperands& p,
                                  const std::int32_t* valid_columns, CausalKvPartition partition,
-                                 CausalPartialView partial, cudaStream_t stream) {
+                                 CausalPartialView partial, cudaStream_t stream,
+                                 Metadata... metadata) {
     static_assert(S::kThreads == 256);
     if (partition.capacity == 1) {
-        causal_merge_idle_kernel<<<1, 1, 0, stream>>>();
-        CUDA_CHECK(cudaGetLastError());
+        if constexpr (sizeof...(Metadata) == 0) {
+            causal_merge_idle_kernel<<<1, 1, 0, stream>>>();
+            CUDA_CHECK(cudaGetLastError());
+        }
         return;
     }
     const dim3 grid(G::QHeads, common::div_up(G::kHeadDim, S::kDChunk), p.width * p.batch);
-    causal_natural_merge_kernel<G, S::kDChunk, MultiBatch, Masked, InverseRotation>
-        <<<grid, S::kThreads, 0, stream>>>(partial.acc, partial.maximum, partial.sum, p.positions,
-                                           valid_columns, p.width, p.batch, p.visible_capacity,
-                                           partition, p.out);
+    constexpr auto kernel = [] {
+        if constexpr (sizeof...(Metadata) == 0)
+            return causal_natural_merge_kernel<G, S::kDChunk, MultiBatch, Masked, InverseRotation>;
+        else
+            return causal_natural_merge_ragged_kernel<G, S::kDChunk, MultiBatch, Masked,
+                                                      InverseRotation>;
+    }();
+    kernel<<<grid, S::kThreads, 0, stream>>>(partial.acc, partial.maximum, partial.sum, p.positions,
+                                             valid_columns, p.width, p.batch, p.visible_capacity,
+                                             partition, p.out, metadata...);
     CUDA_CHECK(cudaGetLastError());
 }
 

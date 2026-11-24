@@ -1,6 +1,7 @@
 #include "ops/common/numeric/math.h"
 #include "ops/linear_attention/causal_conv/launch.h"
 #include "ops/linear_attention/causal_conv/kernel.cuh"
+#include "ops/linear_attention/causal_conv/ragged.cuh"
 #include "core/device.h"
 #include "core/platform.h"
 #include <algorithm>
@@ -24,6 +25,43 @@ int grid_for(std::int64_t n, int block, const char* label) {
                                   " grid exceeds CUDA limit");
     }
     return static_cast<int>(std::max<std::int64_t>(1, grid));
+}
+
+template <class Element, bool PairsAligned, class Output>
+void launch_ragged(const Tensor& x, const Tensor& weight, const Tensor& state_in, Tensor& state_out,
+                   Output output, CausalConvRagged ragged, bool short_segments,
+                   cudaStream_t stream) {
+    const auto* input    = static_cast<const Element*>(x.data);
+    const auto* w        = static_cast<const Element*>(weight.data);
+    const auto* source   = static_cast<const __nv_bfloat16*>(state_in.data);
+    auto* destination    = static_cast<__nv_bfloat16*>(state_out.data);
+    const auto channels  = x.ne[0] / (sizeof(Element) / sizeof(__nv_bfloat16));
+    constexpr int kBlock = 128, kColumns = 4;
+    const int channel_blocks = grid_for(channels, kBlock, "ragged output");
+    if (short_segments) {
+        causal_conv_ragged_short<Element, PairsAligned>
+            <<<dim3(channel_blocks, ragged.segments), kBlock, 0, stream>>>(
+                input, w, source, destination, output, channels, ragged);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+
+    const int column_groups = std::min(grid_for(ragged.tokens, kColumns, "ragged columns"), 65535);
+    causal_conv_ragged_output<kColumns, PairsAligned>
+        <<<dim3(channel_blocks, column_groups), kBlock, 0, stream>>>(input, w, source, output,
+                                                                     channels, ragged);
+    CUDA_CHECK(cudaGetLastError());
+
+    // All token tiles have finished reading the initial state.
+    using State               = std::conditional_t<PairsAligned, Element, __nv_bfloat16>;
+    constexpr int kStateBlock = 256;
+    const auto state_channels = x.ne[0] / (sizeof(State) / sizeof(__nv_bfloat16));
+    causal_conv_ragged_state<<<dim3(grid_for(state_channels, kStateBlock, "ragged state"),
+                                    std::min(ragged.segments, 65535)),
+                               kStateBlock, 0, stream>>>(
+        static_cast<const State*>(x.data), static_cast<const State*>(state_in.data),
+        static_cast<State*>(state_out.data), state_channels, ragged);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 int prefill_output_grid_for(std::int32_t C, std::int32_t T, int block) {
@@ -263,6 +301,47 @@ void launch_batched_parallel_snapshot(const Tensor& x, const Tensor& weight,
 
 } // namespace
 
+void launch_causal_conv_ragged(const Tensor& x, const Tensor& weight, const Tensor& state_in,
+                               Tensor& state_out, Tensor& out, CausalConvRagged ragged,
+                               bool short_segments, cudaStream_t stream) {
+    const auto addresses = reinterpret_cast<std::uintptr_t>(x.data) |
+                           reinterpret_cast<std::uintptr_t>(weight.data) |
+                           reinterpret_cast<std::uintptr_t>(out.data);
+    if (x.ne[0] % 2 == 0 && addresses % 4 == 0) {
+        const CausalConvContiguousOutput<__nv_bfloat162> output{
+            static_cast<__nv_bfloat162*>(out.data), x.ne[0] / 2};
+        launch_ragged<__nv_bfloat162, false>(x, weight, state_in, state_out, output, ragged,
+                                             short_segments, stream);
+    } else {
+        const CausalConvContiguousOutput<__nv_bfloat16> output{
+            static_cast<__nv_bfloat16*>(out.data), x.ne[0]};
+        launch_ragged<__nv_bfloat16, false>(x, weight, state_in, state_out, output, ragged,
+                                            short_segments, stream);
+    }
+}
+
+void launch_causal_conv_split_ragged(const Tensor& x, const Tensor& weight, const Tensor& state_in,
+                                     Tensor& state_out, Tensor& out0, Tensor& out1, Tensor& out2,
+                                     CausalConvSplitGeometry geometry, CausalConvRagged ragged,
+                                     bool short_segments, cudaStream_t stream) {
+    const auto launch = [&]<int Rows0, int Rows1, int Rows2>() {
+        const CausalConvSplitOutput3<__nv_bfloat162, Rows0 / 2, Rows1 / 2, Rows2 / 2> output{
+            static_cast<__nv_bfloat162*>(out0.data), static_cast<__nv_bfloat162*>(out1.data),
+            static_cast<__nv_bfloat162*>(out2.data)};
+        launch_ragged<__nv_bfloat162, true>(x, weight, state_in, state_out, output, ragged,
+                                            short_segments, stream);
+    };
+    switch (geometry) {
+    case CausalConvSplitGeometry::Rows1024x1024x3072:
+        return launch.template operator()<1024, 1024, 3072>();
+    case CausalConvSplitGeometry::Rows2048x2048x4096:
+        return launch.template operator()<2048, 2048, 4096>();
+    case CausalConvSplitGeometry::Rows2048x2048x6144:
+        return launch.template operator()<2048, 2048, 6144>();
+    }
+    throw std::logic_error("causal_conv1d: unhandled split geometry");
+}
+
 void launch_causal_conv_snapshot(const Tensor& x, const Tensor& weight, ConstStateFieldView source,
                                  Tensor& snapshots, const Tensor& valid_columns,
                                  const Tensor& snapshot_base_slots, Tensor& out,
@@ -365,7 +444,7 @@ void launch_causal_conv_split(const Tensor& x, const Tensor& weight, const Tenso
         return launch_causal_conv_split_10240(x, weight, state_in, state_out, out0, out1, out2,
                                               stream, offsets);
 #endif
-    const auto route = select_causal_conv_split_plan(x.ne[1]);
+    const auto route  = select_causal_conv_split_plan(x.ne[1]);
     const auto submit = [&]<bool Indexed>() {
         if (route == CausalConvRoute::TokenParallel)
             launch_token_parallel_split<Indexed>(x, weight, state_in, state_out, out0, out1, out2,

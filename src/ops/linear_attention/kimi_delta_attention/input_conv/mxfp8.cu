@@ -34,6 +34,13 @@ struct MmaSchedule
     static constexpr int kWarpGridTokens = kWarpsTokens;
 };
 
+// One staging slot and register-decoded weights reduce shared storage for the packed epilogue.
+struct RaggedA16Schedule
+    : ConvolutionSchedule<NativeFp8ScheduleInstance<NativeFp8MmaSchedule<64, 128, 128, 32, 64, 1>,
+                                                    kInputFeatures>> {
+    static constexpr bool kRegisterWeights = true;
+};
+
 } // namespace
 
 Mxfp8Workspace mxfp8_execution_workspace(int width, int batch, bool update, LinearPolicy policy) {
@@ -53,7 +60,13 @@ std::size_t mxfp8_workspace_capacity(int batch, int first, int last, bool update
 
 void launch_mxfp8(const Tensor& x, const Weight& w, LinearPolicy policy, const Arguments& a,
                   void* scratch, cudaStream_t stream) {
-    if (window_route(a.width, a.batch)) {
+    if (a.token_to_seq && policy == LinearPolicy::A16Only) {
+        using Epilogue = PackedConvolutionEpilogue<int, false, false, false, true>;
+        launch_mxfp8_tile_range<RaggedA16Schedule, LinearPolicy::A16Only, Epilogue, int,
+                                /*WholeWindows=*/false, /*Ragged=*/true>(x, w, a, scratch, stream);
+        return;
+    }
+    if (!a.token_to_seq && window_route(a.width, a.batch)) {
         using Window = void (*)(const Mxfp8A16Operands<>&, const Arguments&, cudaStream_t);
         static constexpr Window windows[]{window<1>, window<2>, window<3>, window<4>,
                                           window<5>, window<6>, window<7>, window<8>};

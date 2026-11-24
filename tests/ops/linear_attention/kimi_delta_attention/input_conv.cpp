@@ -1,5 +1,7 @@
 #include "ops/suite.h"
 #include "ops/ragged_fixture.h"
+#include "core/decode_graph.h"
+#include "core/platform.h"
 #include "ops/input_projection_test_common.h"
 #include "ops/state_fixture.h"
 #include "ninfer/ops/kda_input_proj.h"
@@ -78,22 +80,28 @@ int fold_records(const Tensor& conv, const std::vector<std::uint16_t>& words,
     return failures;
 }
 
+void set_unit_projection(quantized_weight::PackedWeight& packed, QType format) {
+    std::fill(packed.payload.begin(), packed.payload.end(), 0);
+    if (format == QType::MXFP8) {
+        std::fill_n(packed.payload.begin() + packed.geometry.scale_offset,
+                    packed.geometry.scale_bytes, 127);
+    } else {
+        for (std::size_t i = 0; i < packed.scale_plane_bytes; i += 2)
+            packed.payload[packed.scale_plane_offset + i + 1] = 0x3c; // FP16 1
+    }
+    const std::uint8_t one = format == QType::MXFP8 ? 0x38 : 1;
+    for (int c = 0; c < C; ++c) {
+        packed.payload[std::size_t(c) * H]     = one;
+        packed.payload[std::size_t(c) * H + 1] = one;
+    }
+}
+
 int run_case(int width, int batch, bool in_place, bool graph, int capacity_last = 0,
              QType format             = QType::Q8_G32_FP16,
              ops::LinearPolicy policy = ops::LinearPolicy::A16Only, bool precision_boundary = false,
              InactiveRows inactive = InactiveRows::None) {
     auto packed = quantized_weight::make_patterned_weight(format, C, H, 1201);
-    if (precision_boundary) {
-        std::fill(packed.payload.begin(), packed.payload.end(), 0);
-        std::fill(packed.payload.begin() + packed.geometry.scale_offset,
-                  packed.payload.begin() + packed.geometry.scale_offset +
-                      packed.geometry.scale_bytes,
-                  127);
-        for (int c = 0; c < C; ++c) {
-            packed.payload[std::size_t(c) * H]     = 0x38;
-            packed.payload[std::size_t(c) * H + 1] = 0x38;
-        }
-    }
+    if (precision_boundary) set_unit_projection(packed, format);
     input_projection::DevicePackedWeight weight(std::move(packed));
     const ops::SingleProjectionWeight projection{weight.view(), policy};
     const auto criterion = policy == ops::LinearPolicy::AllowA8 ? a8_criterion : a16_criterion;
@@ -285,93 +293,211 @@ int run_case(int width, int batch, bool in_place, bool graph, int capacity_last 
     return failures;
 }
 
-int ragged_projection(QType format) {
-    RaggedFixture ragged({1, 3, 17, 65});
-    const int n = ragged.tokens(), rows = ragged.segments();
-    constexpr int slots = 8;
-    const std::vector<int> source{3, 1, 6, 0}, destination{3, 4, 6, 2};
-    const auto xh      = input_projection::make_bf16_activation(H, n, 1273);
+enum class RaggedState { InPlace, Mixed, Shared };
+
+int ragged_projection(std::vector<int> lengths, QType format, ops::LinearPolicy policy,
+                      RaggedState alias, bool graph = false, bool precision = false) {
+    RaggedFixture ragged(std::move(lengths));
+    const int n = ragged.tokens(), rows = ragged.segments(), slots = 2 * rows + 1;
+    std::vector<int> source(rows), destination(rows);
+    for (int s = 0; s < rows; ++s) {
+        source[s] = alias == RaggedState::Shared ? slots - 1 : rows - 1 - s;
+        destination[s] =
+            alias == RaggedState::InPlace || (alias == RaggedState::Mixed && s % 2 == 0) ? source[s]
+                                                                                         : rows + s;
+    }
+    auto xh            = input_projection::make_bf16_activation(H, n, 1273);
     const auto initial = input_projection::make_bf16_activation(C, 3 * slots, 1291);
     const bool mx      = format == QType::MXFP8;
     std::vector<float> wh(C * 4);
     fill_uniform(wh, 1301, -.7F, .7F);
+    auto packed = quantized_weight::make_patterned_weight(format, C, H, 1201);
+    if (precision) {
+        set_unit_projection(packed, format);
+        std::fill(xh.begin(), xh.end(), 0);
+        for (int column = 0; column < n; ++column) xh[std::size_t(column) * H] = 1;
+        // Each impulse produces p = 1 + 1/256, a BF16 tie that rounds to 1. The
+        // two-tap difference exposes the residue at both interior and tile-edge columns.
+        for (int column : {5, 127, 129}) xh[std::size_t(column) * H + 1] = 1.F / 256;
+        std::fill(wh.begin(), wh.begin() + 2 * C, 0);
+        std::fill(wh.begin() + 2 * C, wh.begin() + 3 * C, -1);
+        std::fill(wh.begin() + 3 * C, wh.end(), 1);
+    }
     if (mx) round_to_bf16(wh);
-    input_projection::DevicePackedWeight weight(
-        quantized_weight::make_patterned_weight(format, C, H, 1201));
-    const ops::SingleProjectionWeight projection{weight.view(), ops::LinearPolicy::A16Only};
+    input_projection::DevicePackedWeight weight(std::move(packed));
+    const ops::SingleProjectionWeight projection{weight.view(), policy};
     auto dx = to_device_bf16(xh), dw = mx ? to_device_bf16(wh) : to_device_f32(wh);
     auto history = to_device_bf16(initial);
     RecordStateFixture records(Tensor(history.span(), DType::BF16, {C, 3, slots}), 2);
-    auto so        = to_device(records.record_offsets(source)),
-         dest      = to_device(records.record_offsets(destination));
-    const auto src = records.view(Tensor(so.span(), DType::I64, {rows}));
-    const auto dst = records.view(Tensor(dest.span(), DType::I64, {rows}));
+    const auto so = records.record_offsets(source), ds = records.record_offsets(destination);
+    auto source_offsets = to_device(so), dest_offsets = to_device(ds);
+    const auto src = records.view(Tensor(source_offsets.span(), DType::I64, {rows}));
+    const auto dst = records.view(Tensor(dest_offsets.span(), DType::I64, {rows}));
     Tensor x(dx.span(), DType::BF16, {H, n}), w(dw.span(), mx ? DType::BF16 : DType::FP32, {C, 4});
-    const std::array<std::size_t, 2> sizes{std::size_t(H) * n, std::size_t(C) * 3};
-    GuardedDeviceBuffer q(sizes[0] * 2), k(sizes[0] * 2), v(sizes[0] * 2);
+    const auto output_words           = std::size_t(H) * n;
+    constexpr std::size_t state_words = 3 * C;
+    GuardedDeviceBuffer q(output_words * 2), k(output_words * 2), v(output_words * 2);
+    for (auto* buffer : {&q, &k, &v}) buffer->fill(0xff);
     const auto bytes = ops::kda_input_proj_conv_update_ragged_workspace_capacity_bytes(
         linear_profile(projection), n, n, rows, rows);
-    GuardedDeviceBuffer scratch(std::max<std::size_t>(bytes, 256));
+    GuardedDeviceBuffer scratch(bytes);
     MemoryArena ws(scratch.span());
-    ops::kda_input_proj_conv_update(x, projection, w, {src, dst}, ragged.view,
-                                    {Tensor(q.span(), DType::BF16, {H, n}),
-                                     Tensor(k.span(), DType::BF16, {H, n}),
-                                     Tensor(v.span(), DType::BF16, {H, n})},
-                                    ws, cuda_environment().default_execution);
-    cuda_synchronize();
+    auto& context = cuda_environment().context;
+    CudaStream stream(context);
+    const auto execution = context.execution_view(stream.stream());
+    const auto invoke    = [&] {
+        ops::kda_input_proj_conv_update(x, projection, w, {src, dst}, ragged.view,
+                                           {Tensor(q.span(), DType::BF16, {H, n}),
+                                         Tensor(k.span(), DType::BF16, {H, n}),
+                                         Tensor(v.span(), DType::BF16, {H, n})},
+                                           ws, execution);
+    };
+    if (graph) {
+        const auto reverse_slots = [&](auto selected) {
+            for (auto& s : selected) s = slots - 1 - s;
+            return records.record_offsets(selected);
+        };
+        source_offsets.copy_from_host(reverse_slots(source).data(), source_offsets.size());
+        dest_offsets.copy_from_host(reverse_slots(destination).data(), dest_offsets.size());
+        DecodeGraphDefinition definition;
+        definition.capture(execution.stream(), invoke);
+        DecodeGraphExecutable executable;
+        executable.instantiate(definition);
+        source_offsets.copy_from_host(so.data(), source_offsets.size());
+        dest_offsets.copy_from_host(ds.data(), dest_offsets.size());
+        executable.launch(execution.stream());
+        cuda_synchronize();
+    } else {
+        invoke();
+    }
     records.copy_back();
-    const std::array got{from_device_bf16(q.data(), sizes[0]), from_device_bf16(k.data(), sizes[0]),
-                         from_device_bf16(v.data(), sizes[0])};
+
+    const std::array got{from_device_bf16(q.data(), output_words),
+                         from_device_bf16(k.data(), output_words),
+                         from_device_bf16(v.data(), output_words)};
     const auto state = from_device_bf16(history.data(), initial.size());
     std::vector<double> reference, actual, projected, stored;
-    int failures = 0;
+    const auto sampled = input_projection::sampled_rows(C, n > 512 ? 13 : 31);
+    int failures       = 0;
     for (int s = 0; s < rows; ++s) {
         const int start = ragged.prefix[s], length = ragged.lengths[s];
-        for (int c : input_projection::sampled_rows(C, 31)) {
-            const auto historic = [&](int pos) {
-                return initial[(3 * source[s] + pos + 3) * C + c];
-            };
+        const auto historic = [&](int pos, int c) {
+            return initial[(3LL * source[s] + pos + 3) * C + c];
+        };
+        for (int j = 0; j < 3 - length; ++j)
+            for (int c = 0; c < C; ++c)
+                failures +=
+                    state[(3LL * destination[s] + j) * C + c] != historic(length - 3 + j, c);
+        for (int c : sampled) {
             std::vector<double> dot(length);
             for (int t = 0; t < length; ++t)
-                dot[t] = quantized_weight::dot_fp64(weight.host, c, xh.data() + (start + t) * H, H);
+                dot[t] = quantized_weight::dot_fp64(weight.host, c,
+                                                    xh.data() + std::size_t(start + t) * H, H);
             for (int t = 0; t < length; ++t) {
                 double sum = 0;
                 for (int j = 0; j < 4; ++j) {
                     const int index = t + j - 3;
-                    sum += wh[j * C + c] * (index < 0 ? historic(index) : dot[index]);
+                    sum += wh[j * C + c] * (index < 0 ? historic(index, c) : dot[index]);
                 }
                 reference.push_back(sum / (1.0 + std::exp(-sum)));
-                actual.push_back(got[c / H][(start + t) * H + c % H]);
+                actual.push_back(got[c / H][std::size_t(start + t) * H + c % H]);
             }
-            for (int t = 0; t < 3; ++t) {
-                const int index  = length - 3 + t;
-                const auto value = state[(3 * destination[s] + t) * C + c];
-                if (index < 0)
-                    failures += value != historic(index);
-                else {
-                    projected.push_back(dot[index]);
-                    stored.push_back(value);
-                }
+            for (int j = std::max(0, 3 - length); j < 3; ++j) {
+                projected.push_back(dot[length - 3 + j]);
+                stored.push_back(state[(3LL * destination[s] + j) * C + c]);
             }
         }
     }
     for (int slot = 0; slot < slots; ++slot)
         if (std::find(destination.begin(), destination.end(), slot) == destination.end())
-            for (std::size_t i = slot * sizes[1]; i < (slot + 1) * sizes[1]; ++i)
+            for (std::size_t i = slot * state_words; i < (slot + 1) * state_words; ++i)
                 failures += state[i] != initial[i];
-    failures += verify_reduction("ragged projected convolution", actual, reference, a16_criterion);
-    failures += verify_reduction("ragged projected history", stored, projected, a16_criterion);
+
+    if (precision) {
+        const auto silu_bf16 = [](double x) {
+            return bf16_to_f32(f32_to_bf16(x / (1.0 + std::exp(-x))));
+        };
+        for (const auto& plane : got)
+            for (int column : {5, 127, 128, 129, 130}) {
+                const double residue = (column == 128 || column == 130) ? -1.0 / 256 : 1.0 / 256;
+                if (plane[std::size_t(column) * H] != silu_bf16(residue))
+                    throw std::runtime_error("ragged projection rounded before convolution");
+            }
+    }
+    const auto criterion = policy == ops::LinearPolicy::AllowA8 ? a8_criterion : a16_criterion;
+    failures += verify_reduction("ragged projected convolution", actual, reference, criterion);
+    failures += verify_reduction("ragged projected history", stored, projected, criterion);
     for (const auto* buffer : {&q, &k, &v, &scratch})
         failures += buffer->verify_guards("ragged KDA input");
     return failures + records.verify_guards("ragged KDA histories") +
-           (ws.peak_used() > bytes || ws.used() != 0);
+           (ws.peak_used() != bytes || ws.used() != 0);
 }
+
+int ragged_capacity_intervals() {
+    using namespace ops;
+    constexpr auto query = kda_input_proj_conv_update_ragged_workspace_capacity_bytes;
+    for (const auto profile :
+         {LinearProfile{QType::Q8_G32_FP16, C, H, LinearPolicy::A16Only, QuantLayout::RowSplit},
+          LinearProfile{QType::MXFP8, C, H, LinearPolicy::A16Only, QuantLayout::RowGroupScale},
+          LinearProfile{QType::MXFP8, C, H, LinearPolicy::AllowA8, QuantLayout::RowGroupScale}}) {
+        for (const auto [first, last, min_rows, max_rows] : {std::array{1, 128, 1, 1},
+                                                             {1, 64, 1, 1},
+                                                             {1, 64, 2, 3},
+                                                             {33, 64, 2, 3},
+                                                             {1, 128, 1, 7},
+                                                             {1, 64, 20, 80},
+                                                             {33, 129, 3, 70}}) {
+            std::size_t peak = 0;
+            for (int n = first; n <= last; ++n)
+                for (int s = min_rows; s <= std::min(n, max_rows); ++s)
+                    peak = std::max(peak, query(profile, n, n, s, s));
+            if (peak != query(profile, first, last, min_rows, max_rows))
+                throw std::runtime_error("ragged KDA workspace is not the exact interval peak");
+        }
+    }
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
     OpSuite suite;
-    suite.add("kda/input/ragged/q8", [] { return ragged_projection(QType::Q8_G32_FP16); });
-    suite.add("kda/input/ragged/mxfp8", [] { return ragged_projection(QType::MXFP8); });
+    using enum ops::LinearPolicy;
+    const auto ragged = [&](const char* name, std::vector<int> lengths, QType format,
+                            ops::LinearPolicy policy, RaggedState state, bool graph = false,
+                            bool precision = false) {
+        suite.add(std::string("kda/input/ragged/") + name, [=] {
+            return ragged_projection(lengths, format, policy, state, graph, precision);
+        });
+    };
+    constexpr auto q8 = QType::Q8_G32_FP16, mx = QType::MXFP8;
+    ragged("q8_staged", {5, 7, 11}, q8, A16Only, RaggedState::InPlace, true);
+    suite.add("kda/input/ragged/q8_first_tiled_on_spark", [] {
+        constexpr int tokens = 33, segments = 2;
+        const ops::LinearProfile profile{q8, C, H, A16Only, QuantLayout::RowSplit};
+        const auto bytes = ops::kda_input_proj_conv_update_ragged_workspace_capacity_bytes(
+            profile, tokens, tokens, segments, segments);
+        // One physical tile needs six FP32 edge columns and six BF16 tail columns on Spark.
+        constexpr std::size_t expected = NINFER_TARGET_SPARK
+                                             ? C * (6 * sizeof(float) + 6 * sizeof(std::uint16_t))
+                                             : C * tokens * sizeof(float);
+        if (bytes != expected)
+            throw std::runtime_error("unexpected ragged Q8 workspace at the Spark crossover");
+        return ragged_projection({1, 32}, q8, A16Only, RaggedState::Mixed);
+    });
+    ragged("q8_tiles", {120, 20}, q8, A16Only, RaggedState::Shared);
+    ragged("q8_skew", {4095, 1}, q8, A16Only, RaggedState::Mixed);
+    ragged("q8_no_projection_rounding", {126, 5}, q8, A16Only, RaggedState::Mixed, true, true);
+    ragged("mxfp8_a16_single", {128}, mx, A16Only, RaggedState::InPlace);
+    ragged("mxfp8_a16_tiles", {127, 1, 2, 130}, mx, A16Only, RaggedState::Mixed, true);
+    ragged("mxfp8_a16_no_projection_rounding", {126, 5}, mx, A16Only, RaggedState::Mixed, false,
+           true);
+    ragged("mxfp8_a8_single_window", {1}, mx, AllowA8, RaggedState::InPlace);
+    ragged("mxfp8_a8_skew", {1, 4095}, mx, AllowA8, RaggedState::InPlace);
+    ragged("mxfp8_a8_many_short", std::vector<int>(64, 1), mx, AllowA8, RaggedState::Shared, true);
+    ragged("mxfp8_a8_no_projection_rounding", {126, 5}, mx, AllowA8, RaggedState::Mixed, true,
+           true);
+    suite.add("kda/input/ragged/workspace_intervals", ragged_capacity_intervals);
     suite.add("kda/input/single", [] { return run_case(1, 1, true, false); });
     suite.add("kda/input/window", [] { return run_case(3, 8, false, true); });
     suite.add("kda/input/window_boundary", [] { return run_case(8, 4, true, false); });

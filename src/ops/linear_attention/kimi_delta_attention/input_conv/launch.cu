@@ -28,7 +28,8 @@ void window(const Q8LinearOperands& operands, const Arguments& a, cudaStream_t s
 
 void launch(const Tensor& x, const Weight& w, const Arguments& a, float* projected,
             cudaStream_t stream) {
-    const auto operands = q8_linear_operands(x.view({hidden, a.width * a.batch}), w);
+    const int columns   = a.token_to_seq ? a.width : a.width * a.batch;
+    const auto operands = q8_linear_operands(x.view({hidden, columns}), w);
     using Window        = void (*)(const Q8LinearOperands&, const Arguments&, cudaStream_t);
     static constexpr Window windows[] = {window<1>, window<2>, window<3>, window<4>,
                                          window<5>, window<6>, window<7>, window<8>};
@@ -54,14 +55,6 @@ void launch(const Tensor& x, const Weight& w, const Arguments& a, float* project
         launch_q8_a16_mma<Schedule>(operands, FloatOutput{projected}, LinearIdentityEpilogue{},
                                     stream);
     }
-    conv_kernel<float><<<dim3(channels / 128, std::min<std::int64_t>((a.width + 3LL) / 4, 65535),
-                              std::min(a.batch, 65535)),
-                         128, 0, stream>>>(a, projected);
-    CUDA_CHECK(cudaGetLastError());
-    if (a.destination) {
-        history_kernel<<<dim3(channels / 128, std::min(a.batch, 65535)), 128, 0, stream>>>(
-            a, projected);
-        CUDA_CHECK(cudaGetLastError());
-    }
+    launch_staged_convolution(a, projected, stream);
 }
 } // namespace ninfer::ops::detail::kda_input

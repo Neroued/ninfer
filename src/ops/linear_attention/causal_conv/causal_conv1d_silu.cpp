@@ -1,4 +1,5 @@
 #include "ninfer/ops/causal_conv1d_silu.h"
+#include <algorithm>
 #include <array>
 #include "ops/common/host/operands.h"
 #include "ops/linear_attention/causal_conv/launch.h"
@@ -339,9 +340,19 @@ void ragged_conv(const Tensor& x, const Tensor& weight, const RaggedSequenceView
     in.device = out.device = device;
     const auto* src        = static_cast<const std::int64_t*>(source.records.byte_offsets.data);
     const auto* dst = static_cast<const std::int64_t*>(destination.records.byte_offsets.data);
-    for (int s = 0; s < rows; ++s)
-        launch(in, out, seq.segment_begin(s), seq.segment_length(s),
-               detail::CausalConvOffsets{src + s, dst + s});
+    const detail::CausalConvRagged ragged{{src, dst},
+                                          static_cast<const std::int32_t*>(seq.cu_seqlens.data),
+                                          static_cast<const std::int32_t*>(seq.seq_lengths.data),
+                                          static_cast<const std::int32_t*>(seq.token_to_seq.data),
+                                          n,
+                                          rows};
+    // Fixed-partition capture permits the short route to be selected from the host mirror.
+    const bool short_segments =
+        rows > 1 && rows <= 64 &&
+        std::adjacent_find(seq.host_cu_seqlens.begin(), seq.host_cu_seqlens.end(),
+                           [](int begin, int end) { return end - begin > 16; }) ==
+            seq.host_cu_seqlens.end();
+    launch(in, out, ragged, short_segments);
 }
 } // namespace
 
@@ -353,15 +364,16 @@ void causal_conv1d_silu(const Tensor& x, const Tensor& weight, const RaggedSeque
     const std::array outputs{&out};
     ragged_conv(
         x, weight, seq, source, destination, outputs, 2,
-        [&](const Tensor& src, Tensor& dst, int begin, int len, detail::CausalConvOffsets offsets) {
-            const auto input = x.slice(1, begin, len);
-            auto output      = out.slice(1, begin, len);
-            auto route       = detail::select_causal_conv_plan(input, weight, src, dst, output);
+        [&](const Tensor& src, Tensor& dst, detail::CausalConvRagged ragged, bool short_segments) {
+            if (ragged.segments > 1)
+                return detail::launch_causal_conv_ragged(x, weight, src, dst, out, ragged,
+                                                         short_segments, execution.stream());
+            auto route = detail::select_causal_conv_plan(x, weight, src, dst, out);
             // Device-selected scalar fields only guarantee natural BF16 alignment.
             if (route == detail::CausalConvRoute::PrefillPairs)
                 route = detail::CausalConvRoute::PrefillScalar;
-            detail::launch_causal_conv(input, weight, src, dst, output, route, execution.stream(),
-                                       offsets);
+            detail::launch_causal_conv(x, weight, src, dst, out, route, execution.stream(),
+                                       ragged.offsets);
         },
         execution);
 }
@@ -373,11 +385,13 @@ void causal_conv1d_silu_split(const Tensor& x, const Tensor& weight, const Ragge
     const std::array outputs{&out0, &out1, &out2};
     ragged_conv(
         x, weight, seq, source, destination, outputs, 4,
-        [&](const Tensor& src, Tensor& dst, int begin, int len, detail::CausalConvOffsets offsets) {
-            auto q = out0.slice(1, begin, len), k = out1.slice(1, begin, len);
-            auto v = out2.slice(1, begin, len);
-            detail::launch_causal_conv_split(x.slice(1, begin, len), weight, src, dst, q, k, v,
-                                             geometry, execution.stream(), offsets);
+        [&](const Tensor& src, Tensor& dst, detail::CausalConvRagged ragged, bool short_segments) {
+            if (ragged.segments > 1)
+                return detail::launch_causal_conv_split_ragged(x, weight, src, dst, out0, out1,
+                                                               out2, geometry, ragged,
+                                                               short_segments, execution.stream());
+            detail::launch_causal_conv_split(x, weight, src, dst, out0, out1, out2, geometry,
+                                             execution.stream(), ragged.offsets);
         },
         execution);
 }

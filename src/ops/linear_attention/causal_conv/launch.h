@@ -10,6 +10,20 @@ struct CausalConvOffsets {
     const std::int64_t* destination = nullptr;
 };
 
+struct CausalConvRagged {
+    CausalConvOffsets offsets;
+    const std::int32_t *cu_seqlens, *seq_lengths, *token_to_seq;
+    int tokens, segments;
+};
+
+void launch_causal_conv_ragged(const Tensor& x, const Tensor& weight, const Tensor& state_in,
+                               Tensor& state_out, Tensor& out, CausalConvRagged ragged,
+                               bool short_segments, cudaStream_t stream);
+void launch_causal_conv_split_ragged(const Tensor& x, const Tensor& weight, const Tensor& state_in,
+                                     Tensor& state_out, Tensor& out0, Tensor& out1, Tensor& out2,
+                                     CausalConvSplitGeometry geometry, CausalConvRagged ragged,
+                                     bool short_segments, cudaStream_t stream);
+
 void launch_causal_conv(const Tensor& x, const Tensor& weight, const Tensor& state_in,
                         Tensor& state_out, Tensor& out, CausalConvRoute route, cudaStream_t stream,
                         CausalConvOffsets offsets = {});

@@ -112,7 +112,8 @@ std::size_t mxfp8_workspace_capacity(int batch, int first, int last, bool update
 
 void launch_mxfp8(const Tensor& x, const Weight& w, LinearPolicy policy, const Arguments& a,
                   void* scratch, cudaStream_t stream) {
-    if (window_route(a.width, a.batch, policy)) {
+    const auto columns = a.token_to_seq ? a.width : std::int64_t(a.width) * a.batch;
+    if (!a.token_to_seq && window_route(a.width, a.batch, policy)) {
         using Window = void (*)(const Mxfp8A16Operands<>&, const Arguments&, cudaStream_t);
         static constexpr Window windows[]{window<1>,  window<2>,  window<3>,  window<4>,
                                           window<5>,  window<6>,  window<7>,  window<8>,
@@ -123,19 +124,18 @@ void launch_mxfp8(const Tensor& x, const Weight& w, LinearPolicy policy, const A
             windows[a.width - 1](p, a, stream);
         else
             window<0>(p, a, stream);
-    } else if (single_tile_route(a.width, a.batch, policy)) {
+    } else if (!a.token_to_seq && single_tile_route(a.width, a.batch, policy)) {
         if (std::int64_t(a.width) * a.batch <= 64)
             single_tile<64>(x, w, a, scratch, stream);
         else
             single_tile<128>(x, w, a, scratch, stream);
-    } else if (policy == LinearPolicy::AllowA8 && std::int64_t(a.width) * a.batch > 128) {
-        const auto columns = std::int64_t(a.width) * a.batch;
-        const auto launch  = [&]<class Base>() {
+    } else if (policy == LinearPolicy::AllowA8 && columns > 128) {
+        const auto launch = [&]<class Base>() {
             using Schedule = ConvolutionSchedule<NativeFp8ScheduleInstance<Base, kInputFeatures>>;
             launch_mxfp8_tiled<A16Schedule, Schedule, true, true, true, true>(x, w, policy, a,
-                                                                               scratch, stream);
+                                                                              scratch, stream);
         };
-        const bool short_windows = whole_window_tiles(a.width) && a.width <= 8;
+        const bool short_windows = !a.token_to_seq && whole_window_tiles(a.width) && a.width <= 8;
         if (columns <= 192 || (short_windows && columns <= 256))
             launch.template operator()<Mxfp8A8TmaSchedule<64, 128, 128, 32, 32, 3, 1, 8, true>>();
         else if (columns <= 384 || columns > 2048)
@@ -150,6 +150,9 @@ void launch_mxfp8(const Tensor& x, const Weight& w, LinearPolicy policy, const A
         else
             launch
                 .template operator()<Mxfp8A8TmaSchedule<192, 128, 128, 48, 64, 2, 1, 2, true, 1>>();
+    } else if (a.token_to_seq && policy == LinearPolicy::AllowA8) {
+        launch_mxfp8_tiled<A16Schedule, A8Schedule, true, true, true, true>(x, w, policy, a,
+                                                                            scratch, stream);
     } else {
         launch_mxfp8_tiled<A16Schedule, A8Schedule, true>(x, w, policy, a, scratch, stream);
     }

@@ -15,15 +15,33 @@ struct TiledConvolution {
 template <class ConvWeight = float>
 __device__ inline void write_convolution(const Arguments& a, int channel, std::int64_t column,
                                          float h0, float h1, float h2, float current) {
-    const float value = convolution<ConvWeight>(a.weights, channel, h0, h1, h2, current);
-    auto* out         = channel < kInputFeatures ? a.q : channel < 2 * kInputFeatures ? a.k : a.v;
-    out[std::int64_t(column) * kInputFeatures + channel % kInputFeatures] =
-        __float2bfloat16_rn(value);
+    store_output_column(a, channel, column,
+                        convolution<ConvWeight>(a.weights, channel, h0, h1, h2, current));
+}
+
+template <bool Ragged, class Column>
+__device__ inline int4 column_info(const Arguments& a, Column column) {
+    if constexpr (Ragged) {
+        const int s = a.token_to_seq[column];
+        return make_int4(s, column - a.cu_seqlens[s], a.seq_lengths[s], 0);
+    } else {
+        const int b = column / a.width;
+        return make_int4(b, column % a.width, a.valid ? a.valid[b] : a.width, 0);
+    }
+}
+
+template <bool Ragged>
+__device__ inline std::int64_t tail_column(const Arguments& a, std::int64_t column, int segment,
+                                           int slot) {
+    if constexpr (Ragged)
+        if (a.width < 3LL * a.batch) return column;
+    return std::int64_t(segment) * 3 + slot;
 }
 
 template <class ConvWeight = float, class Column = int, bool SingleTile = false,
-          bool CacheColumns = false, bool WholeWindows = false>
+          bool CacheColumns = false, bool WholeWindows = false, bool Ragged = false>
 struct ConvolutionEpilogue {
+    static_assert(!Ragged || (CacheColumns && !SingleTile && !WholeWindows));
     template <class S>
     static constexpr int kSharedBytes =
         64 * S::kBlockTokens * sizeof(float) + (CacheColumns ? S::kBlockTokens * sizeof(int4) : 0);
@@ -44,12 +62,12 @@ struct ConvolutionEpilogue {
         int wr = warp / S::kWarpGridTokens, wt = warp % S::kWarpGridTokens;
         const auto at  = [&](int r, int t) { return tile + t * 64 + (r ^ ((t & 7) << 3)); };
         auto* metadata = reinterpret_cast<int4*>(scratch + 64 * Block * sizeof(float));
+        if constexpr (Ragged) __syncthreads();
         if constexpr (CacheColumns) {
             for (int local = tid; local < Block; local += S::kThreads) {
                 if (local_token_begin + local < tokens) {
                     const auto column = global_begin + local;
-                    const int b = column / a.width, t = column % a.width;
-                    metadata[local] = make_int4(b, t, a.valid ? a.valid[b] : a.width, 0);
+                    metadata[local]   = column_info<Ragged>(a, column);
                 } else {
                     metadata[local] = make_int4(0, 0, 0, 0);
                 }
@@ -107,8 +125,9 @@ struct ConvolutionEpilogue {
                                      c] = current;
                     }
                     if (output.tail && t >= n - 3)
-                        output.tail[(std::int64_t(b) * 3 + t - (n - 3)) * kProjectionFeatures + c] =
-                            __float2bfloat16_rn(current);
+                        output.tail[tail_column<Ragged>(a, column, b, t - (n - 3)) *
+                                        kProjectionFeatures +
+                                    c] = __float2bfloat16_rn(current);
                     if (local < 3) continue;
                 }
                 float h[3];
@@ -151,12 +170,12 @@ struct ConvolutionEpilogue {
     }
 };
 
-template <int Block, class ConvWeight = float, class Column = int>
+template <int Block, class ConvWeight = float, class Column = int, bool Ragged = false>
 __global__ void convolution_boundaries(TiledConvolution output) {
     const auto& a = output.args;
     const int c   = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= kProjectionFeatures) return;
-    const Column total = Column(a.width) * a.batch;
+    const Column total = Ragged ? a.width : Column(a.width) * a.batch;
     const auto tiles   = total / Block + (total % Block != 0);
     // All old-tail readers for one channel finish before the same channel's
     // in-place update. No CTA consumes another CTA's published history.
@@ -165,7 +184,8 @@ __global__ void convolution_boundaries(TiledConvolution output) {
         for (int j = 0; j < 3; j++) {
             const auto column = tile * Block + j;
             if (column >= total) break;
-            int b = column / a.width, t = column % a.width, n = a.valid ? a.valid[b] : a.width;
+            const int4 info = column_info<Ragged>(a, column);
+            const int b = info.x, t = info.y, n = info.z;
             if (t >= n) continue;
             float h[4];
 #pragma unroll
@@ -186,15 +206,18 @@ __global__ void convolution_boundaries(TiledConvolution output) {
     }
     if (output.tail)
         for (int b = 0; b < a.batch; b++) {
-            int n = a.valid ? a.valid[b] : a.width;
+            const int n = Ragged ? a.seq_lengths[b] : a.valid ? a.valid[b] : a.width;
             if (!n) continue;
+            const int begin = Ragged ? a.cu_seqlens[b] : 0;
             __nv_bfloat16 h[3];
 #pragma unroll
             for (int j = 0; j < 3; j++) {
                 int p = n - 3 + j;
                 h[j]  = p < 0
                             ? a.source[a.source_offsets[b] / 2 + (p + 3LL) * kProjectionFeatures + c]
-                            : output.tail[(std::int64_t(b) * 3 + j) * kProjectionFeatures + c];
+                            : output.tail[tail_column<Ragged>(a, std::int64_t(begin) + p, b, j) *
+                                             kProjectionFeatures +
+                                         c];
             }
 #pragma unroll
             for (int j = 0; j < 3; j++)
@@ -204,8 +227,9 @@ __global__ void convolution_boundaries(TiledConvolution output) {
 }
 
 template <class Column = int, bool SingleTile = false, bool FastSilu = false,
-          bool WholeWindows = false>
+          bool WholeWindows = false, bool Ragged = false>
 struct PackedConvolutionEpilogue {
+    static_assert(!Ragged || (!SingleTile && !WholeWindows));
     template <class S>
     static constexpr int kSharedBytes =
         64 * S::kBlockTokens * sizeof(float) + S::kBlockTokens * sizeof(int4);
@@ -229,13 +253,12 @@ struct PackedConvolutionEpilogue {
             return make_uint2(common::pack_bf16x2(v[0], v[1]), common::pack_bf16x2(v[2], v[3]));
         };
         const bool rolling = (SingleTile || WholeWindows) && S::kBlockRows <= 128 && a.width <= 8;
+        if constexpr (Ragged) __syncthreads();
         if (!rolling)
             for (int t = tid; t < Block; t += S::kThreads) {
                 const Column column = begin + t;
-                const int b = column / a.width, offset = column % a.width;
-                metadata[t] = local_begin + t < tokens
-                                  ? make_int4(b, offset, a.valid ? a.valid[b] : a.width, 0)
-                                  : make_int4(0, 0, 0, 0);
+                metadata[t]         = local_begin + t < tokens ? column_info<Ragged>(a, column)
+                                                               : make_int4(0, 0, 0, 0);
             }
         for (int first = 0; first < S::kBlockRows; first += 64) {
             __syncthreads();
@@ -339,7 +362,8 @@ struct PackedConvolutionEpilogue {
                     }
                     if (output.tail && t >= valid - 3)
                         common::store_vec(
-                            output.tail + (std::int64_t(b) * 3 + t - (valid - 3)) * channels + c,
+                            output.tail +
+                                tail_column<Ragged>(a, column, b, t - (valid - 3)) * channels + c,
                             pack(current));
                     if (local < 3) continue;
                 }

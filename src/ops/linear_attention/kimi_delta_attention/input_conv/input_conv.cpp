@@ -32,11 +32,24 @@ std::size_t capacity(const LinearProfile& p, int batch, int first, int last, boo
                : detail::kda_input::workspace_capacity(batch, first, last, update);
 }
 
+std::size_t ragged_capacity(const LinearProfile& p, int tokens, int segments) {
+    return p.qtype == QType::MXFP8
+               ? detail::kda_input::ragged_mxfp8_workspace(tokens, segments, p.policy).bytes
+               : detail::kda_input::ragged_q8_workspace(tokens, segments);
+}
+
 void execute(const Tensor& x, const SingleProjectionWeight& qkv, const Tensor& weights,
              ConstStateFieldView source, StateFieldView destination, const Tensor& valid,
-             KdaConvOutputs out, Tensor records, MemoryArena& workspace, CudaExecutionView cuda) {
-    const int width = x.ne[1], batch = x.ne[2];
-    const auto bytes = capacity(linear_profile(qkv), batch, width, width, !records.data);
+             KdaConvOutputs out, Tensor records, MemoryArena& workspace, CudaExecutionView cuda,
+             const RaggedSequenceView* ragged = nullptr) {
+    const int width        = ragged ? ragged->total_tokens() : x.ne[1];
+    const int batch        = ragged ? ragged->num_seqs() : x.ne[2];
+    const bool packed      = ragged && batch > 1;
+    const int tensor_batch = ragged ? 1 : batch;
+    const auto profile     = linear_profile(qkv);
+    if (packed) validate_profile(profile);
+    const auto bytes = packed ? ragged_capacity(profile, width, batch)
+                              : capacity(profile, batch, width, width, !records.data);
     const auto& w    = qkv.weight;
     const bool mx    = w.qtype == QType::MXFP8;
     common::operand::device(w.device, cuda.device(), op, "weight");
@@ -46,12 +59,13 @@ void execute(const Tensor& x, const SingleProjectionWeight& qkv, const Tensor& w
          w.shape[0] != channels || w.shape[1] != hidden || w.padded_shape[0] != channels ||
          w.padded_shape[1] != hidden || w.qhigh || w.high_plane_bytes))
         throw std::invalid_argument("KDA input: invalid projection weight geometry");
-    common::operand::tensor(x, DType::BF16, {hidden, width, batch}, 16, op, "input", cuda.device());
+    common::operand::tensor(x, DType::BF16, {hidden, width, tensor_batch}, 16, op, "input",
+                            cuda.device());
     if (mx) {
         (void)common::validate_mxfp8_weight(w, op);
     } else {
         detail::validate_q8_operands(
-            detail::q8_linear_operands(x.view({hidden, width * batch}), w));
+            detail::q8_linear_operands(x.view({hidden, width * tensor_batch}), w));
     }
     const auto code_bytes  = std::size_t(channels) * hidden;
     const auto scale_bytes = code_bytes / (mx ? 32 : 16);
@@ -65,7 +79,7 @@ void execute(const Tensor& x, const SingleProjectionWeight& qkv, const Tensor& w
     if (valid.data)
         common::operand::tensor(valid, DType::I32, {batch}, 4, op, "valid columns", cuda.device());
     for (const auto* t : {&out.query, &out.key, &out.value})
-        common::operand::tensor(*t, DType::BF16, {hidden, width, batch}, 16, op, "output",
+        common::operand::tensor(*t, DType::BF16, {hidden, width, tensor_batch}, 16, op, "output",
                                 cuda.device());
     if (records.data) {
         common::operand::tensor(records, DType::BF16, {channels, width, batch}, 16, op,
@@ -79,8 +93,14 @@ void execute(const Tensor& x, const SingleProjectionWeight& qkv, const Tensor& w
                                "destination offsets");
     }
     const Tensor* outputs[] = {&out.query, &out.key, &out.value, &records};
-    const Tensor* inputs[]  = {&x, &weights, &source.records.byte_offsets,
-                               &destination.records.byte_offsets, &valid};
+    const Tensor* inputs[]  = {&x,
+                               &weights,
+                               &source.records.byte_offsets,
+                               &destination.records.byte_offsets,
+                               &valid,
+                              ragged ? &ragged->cu_seqlens : nullptr,
+                              ragged ? &ragged->seq_lengths : nullptr,
+                              ragged ? &ragged->token_to_seq : nullptr};
     for (std::size_t i = 0; i < std::size(outputs); ++i) {
         if (!outputs[i]->data) continue;
         const auto range = common::operand::range(*outputs[i], op);
@@ -88,7 +108,7 @@ void execute(const Tensor& x, const SingleProjectionWeight& qkv, const Tensor& w
             if (outputs[j]->data)
                 common::operand::disjoint(range, common::operand::range(*outputs[j], op), op);
         for (const auto* input : inputs)
-            if (input->data)
+            if (input && input->data)
                 common::operand::disjoint(range, common::operand::range(*input, op), op);
         common::operand::disjoint(range, common::operand::range(w.qdata, code_bytes, op), op);
         common::operand::disjoint(range, common::operand::range(w.scales, scale_bytes, op), op);
@@ -98,7 +118,7 @@ void execute(const Tensor& x, const SingleProjectionWeight& qkv, const Tensor& w
     if (scratch_data) {
         const auto scratch = common::operand::range(scratch_data, bytes, op);
         for (const auto* tensor : inputs)
-            if (tensor->data)
+            if (tensor && tensor->data)
                 common::operand::disjoint(scratch, common::operand::range(*tensor, op), op);
         for (const auto* tensor : outputs)
             if (tensor->data)
@@ -118,11 +138,15 @@ void execute(const Tensor& x, const SingleProjectionWeight& qkv, const Tensor& w
         static_cast<__nv_bfloat16*>(out.value.data),
         static_cast<__nv_bfloat16*>(records.data),
         width,
-        batch};
+        batch,
+        packed ? static_cast<const std::int32_t*>(ragged->cu_seqlens.data) : nullptr,
+        packed ? static_cast<const std::int32_t*>(ragged->seq_lengths.data) : nullptr,
+        packed ? static_cast<const std::int32_t*>(ragged->token_to_seq.data) : nullptr};
+    const auto input = ragged && !packed ? x.view({hidden, width, 1}) : x;
     if (mx)
-        detail::kda_input::launch_mxfp8(x, w, qkv.policy, a, scratch_data, cuda.stream());
+        detail::kda_input::launch_mxfp8(input, w, qkv.policy, a, scratch_data, cuda.stream());
     else
-        detail::kda_input::launch(x, w, a, static_cast<float*>(scratch_data), cuda.stream());
+        detail::kda_input::launch(input, w, a, static_cast<float*>(scratch_data), cuda.stream());
 }
 } // namespace
 
@@ -133,9 +157,22 @@ std::size_t kda_input_proj_conv_update_workspace_capacity_bytes(const LinearProf
 
 std::size_t kda_input_proj_conv_update_ragged_workspace_capacity_bytes(
     const LinearProfile& p, int min_tokens, int max_tokens, int min_segments, int max_segments) {
-    const auto widths =
-        common::operand::ragged_envelope(min_tokens, max_tokens, min_segments, max_segments, op);
-    return capacity(p, 1, widths.first, widths.last, true);
+    (void)common::operand::ragged_envelope(min_tokens, max_tokens, min_segments, max_segments, op);
+    validate_profile(p);
+    std::size_t peak = 0;
+    if (min_segments == 1) peak = capacity(p, 1, min_tokens, max_tokens, true);
+
+    const int first = std::max({min_tokens, min_segments, 2});
+    if (max_segments >= 2 && first <= max_tokens) {
+        const int segments = std::min(max_segments, max_tokens);
+        // Packed MXFP8 workspace grows with tokens and the largest feasible segment count.
+        const auto packed =
+            p.qtype == QType::MXFP8
+                ? detail::kda_input::ragged_mxfp8_workspace(max_tokens, segments, p.policy).bytes
+                : detail::kda_input::ragged_q8_workspace_capacity(first, max_tokens, segments);
+        peak = std::max(peak, packed);
+    }
+    return peak;
 }
 
 std::size_t kda_input_proj_conv_record_workspace_capacity_bytes(const LinearProfile& p, int b,
@@ -154,57 +191,7 @@ void kda_input_proj_conv_update(const Tensor& x, const SingleProjectionWeight& q
                                 KdaConvOutputs out, MemoryArena& workspace,
                                 CudaExecutionView cuda) {
     common::operand::ragged_sequence(ragged, op, cuda.device());
-    const int num_seqs = ragged.num_seqs(), total_tokens = ragged.total_tokens();
-    common::operand::tensor(x, DType::BF16, {hidden, total_tokens}, 16, op, "input", cuda.device());
-    for (const auto* t : {&out.query, &out.key, &out.value})
-        common::operand::tensor(*t, DType::BF16, {hidden, total_tokens}, 16, op, "output",
-                                cuda.device());
-    common::operand::state_field(s.source, DType::BF16, {channels, 3}, 16, op, "source",
-                                 cuda.device());
-    common::operand::state_field(s.destination, DType::BF16, {channels, 3}, 16, op, "destination",
-                                 cuda.device());
-    if (s.source.field.layers != 1 || s.destination.field.layers != 1)
-        throw std::invalid_argument("KDA input: select one convolution layer");
-    common::operand::shape(s.source.records.byte_offsets, {num_seqs, 1, 1, 1}, op,
-                           "source offsets");
-    common::operand::shape(s.destination.records.byte_offsets, {num_seqs, 1, 1, 1}, op,
-                           "destination offsets");
-    const std::array outputs{&out.query, &out.key, &out.value};
-    const Tensor* metadata[] = {&ragged.cu_seqlens, &ragged.seq_lengths, &ragged.token_to_seq,
-                                &s.source.records.byte_offsets,
-                                &s.destination.records.byte_offsets};
-    std::size_t peak         = 0;
-    for (int seq = 0; seq < num_seqs; ++seq) {
-        const int len = ragged.segment_length(seq);
-        peak          = std::max(peak, capacity(linear_profile(qkv), 1, len, len, true));
-    }
-    common::operand::device(workspace.device(), cuda.device(), op, "workspace");
-    if (peak) {
-        auto scope         = workspace.scope();
-        const auto scratch = common::operand::range(workspace.alloc_bytes(peak).data, peak, op);
-        for (const auto* t : metadata)
-            common::operand::disjoint(scratch, common::operand::range(*t, op), op);
-        for (const auto* t : std::array<const Tensor*, 4>{&x, &out.query, &out.key, &out.value})
-            common::operand::disjoint(scratch, common::operand::range(*t, op), op);
-    }
-    for (std::size_t i = 0; i < outputs.size(); ++i) {
-        const auto range = common::operand::range(*outputs[i], op);
-        for (std::size_t j = 0; j < i; ++j)
-            common::operand::disjoint(range, common::operand::range(*outputs[j], op), op);
-        common::operand::disjoint(range, common::operand::range(x, op), op);
-        for (const auto* m : metadata)
-            common::operand::disjoint(range, common::operand::range(*m, op), op);
-    }
-    for (int seq = 0; seq < num_seqs; ++seq) {
-        const int begin = ragged.segment_begin(seq), len = ragged.segment_length(seq);
-        const auto src = common::operand::state_row(s.source, seq);
-        const auto dst = common::operand::state_row(s.destination, seq);
-        execute(x.slice(1, begin, len).view({hidden, len, 1}), qkv, w, src, dst, {},
-                {out.query.slice(1, begin, len).view({hidden, len, 1}),
-                 out.key.slice(1, begin, len).view({hidden, len, 1}),
-                 out.value.slice(1, begin, len).view({hidden, len, 1})},
-                {}, workspace, cuda);
-    }
+    execute(x, qkv, w, s.source, s.destination, {}, out, {}, workspace, cuda, &ragged);
 }
 
 void kda_input_proj_conv_record(const Tensor& x, const SingleProjectionWeight& qkv, const Tensor& w,

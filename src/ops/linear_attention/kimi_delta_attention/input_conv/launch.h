@@ -1,7 +1,9 @@
 #pragma once
 
 #include <cuda_bf16.h>
+#include <algorithm>
 #include "core/layout.h"
+#include "core/platform.h"
 #include "ninfer/ops/kda_input_proj.h"
 
 namespace ninfer::ops::detail::kda_input {
@@ -15,6 +17,8 @@ struct Arguments {
     const std::int32_t* valid;
     __nv_bfloat16 *q, *k, *v, *records;
     int width, batch;
+    // For ragged calls, width is the total packed token count and batch is the segment count.
+    const std::int32_t *cu_seqlens = nullptr, *seq_lengths = nullptr, *token_to_seq = nullptr;
 };
 
 inline constexpr int kTiledTokens = 128;
@@ -28,13 +32,40 @@ struct TiledWorkspace {
     std::size_t bytes;
 };
 
-inline TiledWorkspace tiled_workspace(int width, int batch, bool update) {
-    const auto columns = std::int64_t(width) * batch;
+inline TiledWorkspace tiled_workspace(std::int64_t columns, std::int64_t tail_columns) {
     const auto edges =
         std::size_t((columns + kTiledTokens - 1) / kTiledTokens) * 6 * kProjectionFeatures;
-    return {edges, edges * sizeof(float) + (update ? std::size_t(batch) * 3 * kProjectionFeatures *
-                                                         sizeof(__nv_bfloat16)
-                                                   : 0)};
+    return {edges, edges * sizeof(float) +
+                       std::size_t(tail_columns) * kProjectionFeatures * sizeof(__nv_bfloat16)};
+}
+
+inline TiledWorkspace tiled_workspace(int width, int batch, bool update) {
+    return tiled_workspace(std::int64_t(width) * batch, update ? 3LL * batch : 0);
+}
+
+inline TiledWorkspace ragged_tiled_workspace(int tokens, int segments) {
+    return tiled_workspace(tokens, std::min<std::int64_t>(tokens, 3LL * segments));
+}
+
+inline constexpr int kQ8StagedTokenLimit = 32;
+
+inline bool ragged_q8_staged(int tokens) {
+    return !NINFER_TARGET_SPARK || tokens <= kQ8StagedTokenLimit;
+}
+
+inline std::size_t ragged_q8_workspace(int tokens, int segments) {
+    return ragged_q8_staged(tokens) ? std::size_t(tokens) * kProjectionFeatures * sizeof(float)
+                                    : ragged_tiled_workspace(tokens, segments).bytes;
+}
+
+// The token interval is feasible for packed execution. The segment ceiling is feasible at last.
+inline std::size_t ragged_q8_workspace_capacity(int first, int last, int max_segments) {
+    auto peak = ragged_q8_workspace(last, max_segments);
+    if (ragged_q8_staged(first) && !ragged_q8_staged(last)) {
+        const int end = kQ8StagedTokenLimit;
+        peak          = std::max(peak, ragged_q8_workspace(end, std::min(max_segments, end)));
+    }
+    return peak;
 }
 
 struct Mxfp8Workspace {
@@ -42,20 +73,28 @@ struct Mxfp8Workspace {
     std::size_t bytes;
 };
 
-inline Mxfp8Workspace mxfp8_workspace(int width, int batch, bool update, LinearPolicy policy,
-                                      bool boundaries) {
+inline Mxfp8Workspace mxfp8_workspace(std::size_t columns, LinearPolicy policy,
+                                      std::size_t convolution_bytes) {
     LayoutBuilder layout;
     Mxfp8Workspace out{};
-    const auto columns = std::size_t(width) * batch;
     if (policy == LinearPolicy::AllowA8) {
         out.codes  = layout.add(columns * kInputFeatures, 256, "MXFP8 activation codes");
         out.scales = layout.add(columns * (kInputFeatures / 32), 256, "MXFP8 activation scales");
     }
-    if (boundaries)
-        out.convolution = layout.add(tiled_workspace(width, batch, update).bytes, 256,
-                                     "KDA convolution boundaries");
+    if (convolution_bytes)
+        out.convolution = layout.add(convolution_bytes, 256, "KDA convolution boundaries");
     out.bytes = layout.finish(1);
     return out;
+}
+
+inline Mxfp8Workspace mxfp8_workspace(int width, int batch, bool update, LinearPolicy policy,
+                                      bool boundaries) {
+    return mxfp8_workspace(std::size_t(width) * batch, policy,
+                           boundaries ? tiled_workspace(width, batch, update).bytes : 0);
+}
+
+inline Mxfp8Workspace ragged_mxfp8_workspace(int tokens, int segments, LinearPolicy policy) {
+    return mxfp8_workspace(tokens, policy, ragged_tiled_workspace(tokens, segments).bytes);
 }
 
 std::size_t workspace_capacity(int batch, int first, int last, bool update);

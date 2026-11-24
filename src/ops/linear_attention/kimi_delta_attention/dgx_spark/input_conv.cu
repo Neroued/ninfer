@@ -46,56 +46,61 @@ void window(const Q8LinearOperands& operands, const Arguments& a, cudaStream_t s
     }
 }
 
-template <int Raster, bool K32, bool Prefetch = false>
+template <int Raster, bool K32, bool Prefetch = false, bool Ragged = false>
 void tiled(const Q8LinearOperands& operands, TiledConvolution output, cudaStream_t stream) {
+    using Epilogue = ConvolutionEpilogue<float, int, false, Ragged, false, Ragged>;
     if constexpr (K32) {
         using S = std::conditional_t<Prefetch, Q8A16TmaK32PrefetchSchedule<Raster, 4096>,
                                      Q8A16TmaK32Schedule<Raster, 4096>>;
-        launch_q8_a16_tma_k32<S>(operands, output, ConvolutionEpilogue<float>{}, stream);
+        launch_q8_a16_tma_k32<S>(operands, output, Epilogue{}, stream);
     } else {
         using S = Q8A16TmaMmaSchedule<64, 128, 64, 16, 2, Raster, 4096>;
-        launch_q8_a16_tma_mma<S>(operands, output, ConvolutionEpilogue<float>{}, stream);
+        launch_q8_a16_tma_mma<S>(operands, output, Epilogue{}, stream);
     }
 }
 } // namespace
 
 void launch(const Tensor& x, const Weight& w, const Arguments& a, float* scratch,
             cudaStream_t stream) {
-    const auto operands = q8_linear_operands(x.view({kInputFeatures, a.width * a.batch}), w);
-    using Window        = void (*)(const Q8LinearOperands&, const Arguments&, cudaStream_t);
+    const bool ragged = a.token_to_seq != nullptr;
+    const auto operands =
+        q8_linear_operands(x.view({kInputFeatures, ragged ? a.width : a.width * a.batch}), w);
+    using Window = void (*)(const Q8LinearOperands&, const Arguments&, cudaStream_t);
     static constexpr Window windows[] = {window<1>, window<2>, window<3>, window<4>,
                                          window<5>, window<6>, window<7>, window<8>};
     if (!scratch) {
         windows[a.width - 1](operands, a, stream);
         return;
     }
-    if (operands.tokens <= 32) {
+    if (ragged ? ragged_q8_staged(a.width) : operands.tokens <= kQ8StagedTokenLimit) {
         using S = Q8A16SlicedKMmaSchedule<32, 4, 1, 1, Q8ScaleAccess::Shared, Cache::ca, Cache::cg,
                                           Q8ActivationStage::PaddedZero, 4096>;
         launch_q8_a16_sliced_k_mma<S>(operands, FloatOutput{scratch}, LinearIdentityEpilogue{},
                                       stream);
-        conv_kernel<float>
-            <<<dim3(kProjectionFeatures / 128, std::min<std::int64_t>((a.width + 3LL) / 4, 65535),
-                    std::min(a.batch, 65535)),
-               128, 0, stream>>>(a, scratch);
-        if (a.destination)
-            history_kernel<<<dim3(kProjectionFeatures / 128, std::min(a.batch, 65535)), 128, 0,
-                             stream>>>(a, scratch);
+        launch_staged_convolution(a, scratch, stream);
     } else {
-        const auto layout = tiled_workspace(a.width, a.batch, a.destination != nullptr);
+        const auto layout = ragged ? ragged_tiled_workspace(a.width, a.batch)
+                                   : tiled_workspace(a.width, a.batch, a.destination != nullptr);
         TiledConvolution output{a, scratch,
                                 a.destination
                                     ? reinterpret_cast<__nv_bfloat16*>(scratch + layout.edge_words)
                                     : nullptr};
-        if (operands.tokens <= 128)
-            tiled<4, true, true>(operands, output, stream);
-        else if (operands.tokens <= 512)
-            tiled<8, false>(operands, output, stream);
-        else if (operands.tokens <= 2048)
-            tiled<4, true>(operands, output, stream);
+        const auto launch_tiled = [&]<bool Ragged>() {
+            if (operands.tokens <= 128)
+                tiled<4, true, true, Ragged>(operands, output, stream);
+            else if (operands.tokens <= 512)
+                tiled<8, false, false, Ragged>(operands, output, stream);
+            else if (operands.tokens <= 2048)
+                tiled<4, true, false, Ragged>(operands, output, stream);
+            else
+                tiled<16, true, false, Ragged>(operands, output, stream);
+            convolution_boundaries<kTiledTokens, float, int, Ragged>
+                <<<kProjectionFeatures / 128, 128, 0, stream>>>(output);
+        };
+        if (ragged)
+            launch_tiled.template operator()<true>();
         else
-            tiled<16, true>(operands, output, stream);
-        convolution_boundaries<kTiledTokens><<<kProjectionFeatures / 128, 128, 0, stream>>>(output);
+            launch_tiled.template operator()<false>();
     }
     CUDA_CHECK(cudaGetLastError());
 }

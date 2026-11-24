@@ -783,83 +783,203 @@ int batched_snapshot_case(std::int32_t C, std::int32_t width,
     return failures;
 }
 
-int ragged_case(int channels, int query_rows, int value_rows) {
-    RaggedFixture ragged({1, 3, 17, 65});
-    const int n = ragged.tokens(), s = ragged.segments();
-    const std::vector<int> source{3, 1, 6, 0}, destination{3, 4, 6, 2};
-    constexpr int slots     = 8;
-    const std::size_t words = channels * 3ULL;
-    const auto input        = make_input(channels, n, 1321);
-    std::vector<float> initial(words * slots);
+enum class RaggedState { InPlace, Mixed, Permuted, Shared };
+
+int ragged_case(std::vector<int> lengths, int channels, int query_rows, RaggedState form,
+                bool unaligned = false, bool captured = false) {
+    RaggedFixture ragged(std::move(lengths));
+    const int n = ragged.tokens(), s = ragged.segments(), slots = 2 * s + 2;
+    const int value_rows       = channels - 2 * query_rows;
+    const std::size_t words    = channels * 3ULL;
+    const std::size_t stride   = ((words + 7) / 8) * 8 + 8;
+    const std::size_t padding  = unaligned ? 1 : 0;
+    const std::size_t io_guard = 256 + 2 * (unaligned && channels % 2 != 0);
+    const auto input           = make_input(channels, n, 1321);
+    std::vector<std::uint16_t> initial(stride * slots, 0xa5a5);
     for (int slot = 0; slot < slots; ++slot) {
-        const auto state = make_state(channels, 1351 + slot);
-        std::copy(state.begin(), state.end(), initial.begin() + slot * words);
+        const auto state = bf16_bits(make_state(channels, 1351 + slot));
+        std::copy(state.begin(), state.end(), initial.begin() + slot * stride + padding);
     }
     auto expected_states = initial;
     std::vector<double> expected_output;
+    expected_output.reserve(std::size_t(channels) * n);
+    std::vector<std::int64_t> source(s), destination(s);
     for (int row = 0; row < s; ++row) {
-        const auto start = input.x.begin() + ragged.prefix[row] * channels;
-        const auto state = initial.begin() + source[row] * words;
+        const int src = form == RaggedState::Shared ? slots - 1 : s - row - 1;
+        const bool alias =
+            form == RaggedState::InPlace || (form == RaggedState::Mixed && row % 2 == 0);
+        const int dst       = alias ? src : s + (form == RaggedState::Permuted ? s - row - 1 : row);
+        const auto src_word = src * stride + padding, dst_word = dst * stride + padding;
+        source[row]      = src_word * 2;
+        destination[row] = dst_word * 2;
+        const auto start = input.x.begin() + std::int64_t(ragged.prefix[row]) * channels;
+        std::vector<float> history(words);
+        std::transform(initial.begin() + src_word, initial.begin() + src_word + words,
+                       history.begin(), bf16_to_f32);
         const auto reference =
-            causal_conv_oracle({start, start + ragged.lengths[row] * channels}, input.weight,
-                               {state, state + words}, channels, ragged.lengths[row], false);
+            causal_conv_oracle({start, start + std::int64_t(ragged.lengths[row]) * channels},
+                               input.weight, history, channels, ragged.lengths[row], false);
         expected_output.insert(expected_output.end(), reference.output.begin(),
                                reference.output.end());
-        std::copy(reference.final_state.begin(), reference.final_state.end(),
-                  expected_states.begin() + destination[row] * words);
+        const auto tail = bf16_bits(reference.final_state);
+        std::copy(tail.begin(), tail.end(), expected_states.begin() + dst_word);
     }
 
-    auto dx = to_device_bf16(input.x), dw = to_device_bf16(input.weight);
+    const auto input_bits = bf16_bits(input.x), weight_bits = bf16_bits(input.weight);
+    GuardedDeviceBuffer dx(input_bits.size() * 2, io_guard);
+    GuardedDeviceBuffer dw(weight_bits.size() * 2, io_guard);
+    dx.copy_from_host(input_bits.data(), dx.bytes());
+    dw.copy_from_host(weight_bits.data(), dw.bytes());
     GuardedDeviceBuffer states(initial.size() * 2);
-    const auto bits = bf16_bits(initial);
-    states.copy_from_host(bits.data(), bits.size() * 2);
-    RecordStateFixture history(Tensor(states.span(), DType::BF16, {channels, 3, slots}), 2);
-    auto ds        = to_device(history.record_offsets(source)),
-         dd        = to_device(history.record_offsets(destination));
-    const auto src = history.view(Tensor(ds.span(), DType::I64, {s}));
-    const auto dst = history.view(Tensor(dd.span(), DType::I64, {s}));
+    states.copy_from_host(initial.data(), states.bytes());
+    auto ds = to_device(source), dd = to_device(destination);
+    const auto field = [&](DeviceBuffer& offsets) {
+        return StateFieldView{
+            {states.span(), Tensor(offsets.span(), DType::I64, {s})},
+            {TensorRegion{{0, words * 2, 2}, DType::BF16, {channels, 3, 1, 1}}, 1, 0}};
+    };
+    const auto src = field(ds), dst = field(dd);
     Tensor x(dx.span(), DType::BF16, {channels, n}), w(dw.span(), DType::BF16, {channels, 4});
-    const auto execution = cuda_environment().default_execution;
-    int failures         = 0;
+    auto& context = cuda_environment().context;
+    CudaStream stream(context);
+    const auto execution = context.execution_view(stream.stream());
+    const auto run       = [&](auto invoke) {
+        if (captured) {
+            // Capture with different physical slots, then publish the selectors for replay.
+            const auto swap_slots = [&](auto offsets) {
+                for (auto& a : offsets) a = 2 * ((slots - 1) * stride + 2 * padding) - a;
+                return offsets;
+            };
+            ds.copy_from_host(swap_slots(source).data(), ds.size());
+            dd.copy_from_host(swap_slots(destination).data(), dd.size());
+            DecodeGraphDefinition definition;
+            definition.capture(execution.stream(), invoke);
+            DecodeGraphExecutable graph;
+            graph.instantiate(definition);
+            ds.copy_from_host(source.data(), ds.size());
+            dd.copy_from_host(destination.data(), dd.size());
+            graph.launch(execution.stream());
+            cuda_synchronize();
+        } else {
+            invoke();
+            cuda_synchronize();
+        }
+    };
+
+    int failures = 0;
     if (!query_rows) {
-        GuardedDeviceBuffer buffer(channels * n * 2ULL);
+        GuardedDeviceBuffer buffer(channels * n * 2ULL, io_guard);
+        buffer.fill(kOutputPoison);
         Tensor out(buffer.span(), DType::BF16, {channels, n});
-        ops::causal_conv1d_silu(x, w, ragged.view, src, dst, out, execution);
-        cuda_synchronize();
+        run([&] { ops::causal_conv1d_silu(x, w, ragged.view, src, dst, out, execution); });
         failures += verify_output("ragged convolution",
-                                  from_device_bf16(buffer.data(), channels * n), expected_output);
+                                  from_device_bf16(buffer.data(), std::size_t(channels) * n),
+                                  expected_output);
         failures += buffer.verify_guards("ragged convolution");
     } else {
         GuardedDeviceBuffer oq(query_rows * n * 2ULL), ok(query_rows * n * 2ULL),
             ov(value_rows * n * 2ULL);
+        oq.fill(kOutputPoison);
+        ok.fill(kOutputPoison);
+        ov.fill(kOutputPoison);
         Tensor q(oq.span(), DType::BF16, {query_rows, n}),
             k(ok.span(), DType::BF16, {query_rows, n}), v(ov.span(), DType::BF16, {value_rows, n});
-        ops::causal_conv1d_silu_split(x, w, ragged.view, src, dst, q, k, v, execution);
-        cuda_synchronize();
+        run([&] {
+            ops::causal_conv1d_silu_split(x, w, ragged.view, src, dst, q, k, v, execution);
+        });
         for (const auto& [buffer, first, width] :
              {std::tuple{&oq, 0, query_rows}, std::tuple{&ok, query_rows, query_rows},
               std::tuple{&ov, 2 * query_rows, value_rows}}) {
             const auto reference = oracle_slice(expected_output, channels, n, first, width);
-            failures += verify_output("ragged split convolution",
-                                      from_device_bf16(buffer->data(), width * n), reference);
+            failures +=
+                verify_output("ragged split convolution",
+                              from_device_bf16(buffer->data(), std::size_t(width) * n), reference);
             failures += buffer->verify_guards("ragged split convolution");
         }
     }
-    history.copy_back();
-    failures += verify_bits("ragged final history and untouched slots", states.data(),
-                            bf16_bits(expected_states));
-    return failures + history.verify_guards("ragged history") +
-           states.verify_guards("ragged state");
+    failures +=
+        verify_bits("ragged final history and untouched slots", states.data(), expected_states);
+    failures += verify_bits("ragged input preserved", dx.data(), input_bits);
+    failures += verify_bits("ragged weight preserved", dw.data(), weight_bits);
+    return failures + states.verify_guards("ragged state") + dx.verify_guards("ragged input") +
+           dw.verify_guards("ragged weight");
+}
+
+int ragged_output_grid_stride_case() {
+    constexpr int channels = 64, boundary = 4 * 65535, window = 8, tokens = boundary + window;
+    RaggedFixture ragged({boundary, window});
+    // Probe the final two groups of the first grid pass and the two groups of the second.
+    const auto input      = make_input(channels, 2 * window, 1411);
+    const auto input_bits = bf16_bits(input.x);
+    constexpr auto bytes  = std::size_t(channels) * tokens * sizeof(std::uint16_t);
+    constexpr auto start  = std::size_t(channels) * (boundary - window);
+    GuardedDeviceBuffer x(bytes), out(bytes);
+    x.fill(0);
+    x.copy_from_host(input_bits.data(), input_bits.size() * sizeof(std::uint16_t),
+                     start * sizeof(std::uint16_t));
+    out.fill(kOutputPoison);
+    auto dw = to_device_bf16(input.weight);
+
+    const std::vector<float> zeros(3 * channels);
+    const auto initial      = make_state(channels, 1413);
+    auto history_bits       = bf16_bits(zeros);
+    const auto initial_bits = bf16_bits(initial);
+    history_bits.insert(history_bits.end(), initial_bits.begin(), initial_bits.end());
+    auto dh      = to_device(history_bits);
+    auto offsets = to_device(std::vector<std::int64_t>{0, 3 * channels * sizeof(std::uint16_t)});
+    Tensor history(dh.span(), DType::BF16, {channels, 3, 2});
+    Tensor selectors(offsets.span(), DType::I64, {2});
+    const auto state = dense_record_field(history, 2, selectors);
+    const Tensor tx(x.span(), DType::BF16, {channels, tokens});
+    const Tensor weight(dw.span(), DType::BF16, {channels, 4});
+    Tensor output(out.span(), DType::BF16, {channels, tokens});
+    ops::causal_conv1d_silu(tx, weight, ragged.view, state, state, output,
+                            cuda_environment().default_execution);
+    cuda_synchronize();
+
+    const auto mid = input.x.begin() + channels * window;
+    auto left =
+        causal_conv_oracle({input.x.begin(), mid}, input.weight, zeros, channels, window, false);
+    const auto right =
+        causal_conv_oracle({mid, input.x.end()}, input.weight, initial, channels, window, false);
+    left.output.insert(left.output.end(), right.output.begin(), right.output.end());
+    left.final_state.insert(left.final_state.end(), right.final_state.begin(),
+                            right.final_state.end());
+    const auto* probe = static_cast<const std::uint16_t*>(out.data()) + start;
+    return verify_output("ragged grid-stride output", from_device_bf16(probe, left.output.size()),
+                         left.output) +
+           verify_bits("ragged grid-stride history", dh.data(), bf16_bits(left.final_state)) +
+           x.verify_guards("ragged grid-stride input") +
+           out.verify_guards("ragged grid-stride output");
 }
 
 } // namespace
 
 int main(int argc, char** argv) {
     OpSuite suite;
-    suite.add("causal_conv/ragged/scalar", [] { return ragged_case(37, 0, 0); });
-    suite.add("causal_conv/ragged/split5120", [] { return ragged_case(5120, 1024, 3072); });
-    suite.add("causal_conv/ragged/split8192", [] { return ragged_case(8192, 2048, 4096); });
-    suite.add("causal_conv/ragged/split10240", [] { return ragged_case(10240, 2048, 6144); });
+    const auto ragged = [&](const char* name, std::vector<int> lengths, int channels, int query,
+                            RaggedState state, bool unaligned = false, bool captured = false) {
+        suite.add(std::string("causal_conv/ragged/") + name, [=] {
+            return ragged_case(lengths, channels, query, state, unaligned, captured);
+        });
+    };
+    const std::vector<int> varied{1, 2, 3, 4, 15, 16, 17, 65, 130};
+    ragged("scalar_odd", varied, 19, 0, RaggedState::Mixed, true, true);
+    ragged("scalar_single_unaligned", {65}, 8192, 0, RaggedState::InPlace, true);
+    ragged("scalar_aligned", varied, 8192, 0, RaggedState::Permuted);
+    ragged("scalar_unaligned", {4095, 1}, 8192, 0, RaggedState::InPlace, true);
+    ragged("scalar_unaligned_state_pairs", varied, 8192, 0, RaggedState::Mixed, true);
+    ragged("scalar_short_unaligned_state_pairs", {1, 2}, 8192, 0, RaggedState::Mixed, true);
+    ragged("scalar_all_short", std::vector<int>(32, 1), 19, 0, RaggedState::Shared);
+    suite.add("causal_conv/ragged/scalar_output_grid_stride", ragged_output_grid_stride_case);
+    ragged("scalar_state_grid_stride", std::vector<int>(65536, 1), 1, 0, RaggedState::Mixed);
+    ragged("split5120_single", {130}, 5120, 1024, RaggedState::InPlace);
+    ragged("split5120", varied, 5120, 1024, RaggedState::Mixed, false, true);
+    ragged("split8192_skew", {1, 4095}, 8192, 2048, RaggedState::Shared);
+    ragged("split8192_short", std::vector<int>(8, 3), 8192, 2048, RaggedState::InPlace, false,
+           true);
+    ragged("split10240_single", {257}, 10240, 2048, RaggedState::InPlace);
+    ragged("split10240", varied, 10240, 2048, RaggedState::Permuted);
     const auto ordinary = [&](int channels, int t, StateCall call, unsigned seed) {
         suite.add("causal_conv/ordinary/c" + std::to_string(channels) + "/t" + std::to_string(t) +
                       "/form" + std::to_string(int(call)),

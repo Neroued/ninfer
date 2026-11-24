@@ -41,22 +41,38 @@ __host__ __device__ constexpr int square_index(int row, int col) {
     return row * kChunkSize + (col ^ (((row >> 1) & 3) * 4));
 }
 
+inline constexpr int kInlineSeqs = 64;
+
+struct ChunkIndexEntry {
+    int segment;
+    int first_chunk;
+};
+
 struct WorkspaceLayout {
     TensorRegion qk;
     TensorRegion control;
+    LayoutRegion index;
     std::size_t total_bytes;
 };
 
-inline WorkspaceLayout workspace_layout(int qk_heads, int value_heads, int tokens) {
+inline WorkspaceLayout packed_workspace_layout(int qk_heads, int value_heads, int chunks,
+                                               int chunked_segments) {
     LayoutBuilder builder;
-    const int chunks = chunk_count(tokens);
-    WorkspaceLayout layout;
+    WorkspaceLayout layout{};
     layout.qk =
         builder.add_tensor(DType::U8, {int(sizeof(QkChunk)), chunks, qk_heads}, 256, "gdn.qk");
     layout.control = builder.add_tensor(DType::U8, {int(sizeof(ControlChunk)), chunks, value_heads},
                                         256, "gdn.control");
-    layout.total_bytes = builder.finish(256, "GDN chunk workspace");
+    if (chunked_segments > kInlineSeqs) {
+        layout.index = builder.add(std::size_t(chunked_segments) * sizeof(ChunkIndexEntry),
+                                   alignof(ChunkIndexEntry), "gdn.chunk_index");
+    }
+    layout.total_bytes = builder.finish(1, "GDN chunk workspace");
     return layout;
+}
+
+inline WorkspaceLayout workspace_layout(int qk_heads, int value_heads, int tokens) {
+    return packed_workspace_layout(qk_heads, value_heads, chunk_count(tokens), 1);
 }
 
 } // namespace ninfer::ops::detail::gated_delta_net::chunked

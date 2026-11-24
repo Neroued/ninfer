@@ -5,6 +5,9 @@
 #include "ops/common/cuda/mma.cuh"
 #include "ops/common/cuda/memory.cuh"
 
+#include "ops/common/host/launch.h"
+#include "ops/linear_attention/gated_delta_net/recurrence/chunked/packed.cuh"
+
 namespace ninfer::ops::detail::gated_delta_net::chunked {
 namespace {
 
@@ -16,18 +19,53 @@ struct PrepareShared {
     float lower[kChunkSize * kChunkSize];
 };
 
-template <bool Normalize>
+__device__ __forceinline__ ChunkIndexEntry sequence_for_chunk(const ChunkIndexEntry* index,
+                                                              int segments, int chunk) {
+    int first = 0, last = segments;
+    while (first + 1 < last) {
+        const int mid = first + (last - first) / 2;
+        if (index[mid].first_chunk <= chunk)
+            first = mid;
+        else
+            last = mid;
+    }
+    return index[first];
+}
+
+template <bool Normalize, class... Metadata>
 __global__ __launch_bounds__(256,
                              2) void prepare_kernel(RecurrenceOperands args,
                                                     QkChunk* __restrict__ qk_workspace,
-                                                    ControlChunk* __restrict__ control_workspace) {
+                                                    ControlChunk* __restrict__ control_workspace,
+                                                    const __grid_constant__ Metadata... metadata) {
+    constexpr bool Packed = sizeof...(Metadata) != 0;
     __shared__ PrepareShared sm;
     const int tid = threadIdx.x, lane = tid & 31;
-    const int head = blockIdx.x % args.value_heads, chunk = blockIdx.x / args.value_heads;
-    const int start = chunk * kChunkSize, length = min(kChunkSize, args.tokens - start);
+    int head, chunk, start, length;
+    int packed_chunks = 0;
+    if constexpr (Packed) {
+        const auto& packed = (..., metadata);
+        const unsigned c   = blockIdx.y + blockIdx.z * gridDim.y;
+        if (c >= static_cast<unsigned>(packed.total_chunks)) return;
+        const auto [s, first] = sequence_for_chunk(packed.index(), packed.chunked_segments, int(c));
+        const int local_start = (int(c) - first) * kChunkSize;
+        head                  = blockIdx.x;
+        chunk                 = c;
+        start                 = packed.segments.cu_seqlens[s] + local_start;
+        length                = min(kChunkSize, packed.segments.lengths[s] - local_start);
+        packed_chunks         = packed.total_chunks;
+    } else {
+        head   = blockIdx.x % args.value_heads;
+        chunk  = blockIdx.x / args.value_heads;
+        start  = chunk * kChunkSize;
+        length = min(kChunkSize, args.tokens - start);
+    }
     const int group = args.value_heads / args.qk_heads, qh = head / group;
     const int row = tid / 16, col = (tid & 15) * 8;
-    const auto qo = (static_cast<std::int64_t>(start + row) * args.qk_heads + qh) * kStateDim;
+    const auto qo =
+        (static_cast<std::int64_t>(start + (Packed && row >= length ? 0 : row)) * args.qk_heads +
+         qh) *
+        kStateDim;
 
     float q[8]{}, k[8]{};
     if (row < length) {
@@ -64,7 +102,9 @@ __global__ __launch_bounds__(256,
     }
     if (tid < 32) sm.control.padding[tid] = 0;
     if (tid < kChunkSize) {
-        const auto off = static_cast<std::int64_t>(start + tid) * args.value_heads + head;
+        const auto off = static_cast<std::int64_t>(start + (Packed && tid >= length ? 0 : tid)) *
+                             args.value_heads +
+                         head;
         float g        = tid < length ? args.g[off] : 0.0F;
         sm.beta[tid]   = tid < length ? args.beta[off] : 0.0F;
 #pragma unroll
@@ -137,7 +177,7 @@ __global__ __launch_bounds__(256,
     sm.control.solve[square_index(row, tid & 15)] *= sm.beta[tid & 15];
     __syncthreads();
 
-    const int chunks = chunk_count(args.tokens);
+    const int chunks = Packed ? packed_chunks : chunk_count(args.tokens);
     auto* ctrl       = reinterpret_cast<uint4*>(control_workspace +
                                                 static_cast<std::int64_t>(head) * chunks + chunk);
     const auto* src  = reinterpret_cast<const uint4*>(&sm.control);
@@ -152,7 +192,32 @@ __global__ __launch_bounds__(256,
         for (int i = tid; i < sizeof(QkChunk) / 16; i += 256) dst[i] = data[i];
     }
 }
+
+constexpr int kScanThreads = 256;
+
+__global__ void build_chunk_index_kernel(RaggedSegments segments, int first_chunked,
+                                         ChunkIndexEntry* index) {
+    build_chunk_index<kScanThreads>(segments, first_chunked, index);
+}
+
 } // namespace
+
+void launch_build_chunk_index(RaggedSegments segments, int first_chunked, ChunkIndexEntry* index,
+                              cudaStream_t stream) {
+    build_chunk_index_kernel<<<1, kScanThreads, 0, stream>>>(segments, first_chunked, index);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void launch_prepare_ragged(const RecurrenceOperands& args, const PackedChunks& packed, QkChunk* qk,
+                           ControlChunk* control, bool normalize_qk, cudaStream_t stream) {
+    const int rows = std::min(packed.total_chunks, common::kCudaGridYLimit);
+    const dim3 grid(args.value_heads, rows, common::div_up(packed.total_chunks, rows));
+    if (normalize_qk)
+        prepare_kernel<true, PackedChunks><<<grid, 256, 0, stream>>>(args, qk, control, packed);
+    else
+        prepare_kernel<false, PackedChunks><<<grid, 256, 0, stream>>>(args, qk, control, packed);
+    CUDA_CHECK(cudaGetLastError());
+}
 
 void launch_prepare(const RecurrenceOperands& args, QkChunk* qk, ControlChunk* control,
                     bool normalize_qk, cudaStream_t stream) {

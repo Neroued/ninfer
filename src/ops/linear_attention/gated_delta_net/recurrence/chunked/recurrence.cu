@@ -5,6 +5,9 @@
 #include "ops/common/cuda/mma.cuh"
 #include "ops/common/cuda/memory.cuh"
 
+#include <atomic>
+#include <climits>
+
 namespace ninfer::ops::detail::gated_delta_net::chunked {
 namespace {
 
@@ -65,21 +68,28 @@ struct RecurrenceShared {
     float delta[kChunkSize * DV];
 };
 
-template <int DV>
+struct SegmentPackets {
+    const QkChunk* qk;
+    const ControlChunk* control;
+};
+
+template <int DV, bool Packed>
 __device__ __forceinline__ void
 load_stage(typename RecurrenceShared<DV>::Stage& stage, const RecurrenceOperands& args,
            const QkChunk* qk_workspace, const ControlChunk* control_workspace, int head,
-           int value_start, int chunk, int tid) {
+           int value_start, int chunk, int tid, SegmentPackets packets) {
     const int qh       = head / (args.value_heads / args.qk_heads);
     const int chunks   = chunk_count(args.tokens);
     const auto* qk_src = reinterpret_cast<const uint4*>(
-        qk_workspace + static_cast<std::int64_t>(qh) * chunks + chunk);
+        Packed ? packets.qk + chunk
+               : qk_workspace + static_cast<std::int64_t>(qh) * chunks + chunk);
     auto* qk_dst = reinterpret_cast<uint4*>(&stage.qk);
 #pragma unroll
     for (int i = tid; i < sizeof(QkChunk) / 16; i += kThreads<DV>)
         common::cp_async<16, Cache::cg>(qk_dst + i, qk_src + i);
     const auto* ctrl_src = reinterpret_cast<const uint4*>(
-        control_workspace + static_cast<std::int64_t>(head) * chunks + chunk);
+        Packed ? packets.control + chunk
+               : control_workspace + static_cast<std::int64_t>(head) * chunks + chunk);
     auto* ctrl_dst = reinterpret_cast<uint4*>(&stage.control);
 #pragma unroll
     for (int i = tid; i < sizeof(ControlChunk) / 16; i += kThreads<DV>)
@@ -149,10 +159,12 @@ __device__ __forceinline__ void store_output(const RecurrenceOperands& args, flo
     }
 }
 
-template <int DV>
+template <int DV, class... Metadata>
 __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurrence_kernel(
-    RecurrenceOperands args, const QkChunk* __restrict__ qk_workspace,
-    const ControlChunk* __restrict__ control_workspace) {
+    RecurrenceOperands base_args, const QkChunk* __restrict__ qk_workspace,
+    const ControlChunk* __restrict__ control_workspace,
+    const __grid_constant__ Metadata... metadata) {
+    constexpr bool Packed = sizeof...(Metadata) != 0;
     constexpr int kWarps = kThreads<DV> / 32;
     constexpr int NT     = DV / 8;
     constexpr int MW     = NT < kWarps ? kWarps / NT : 1;
@@ -162,218 +174,292 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
     auto& sm      = *reinterpret_cast<RecurrenceShared<DV>*>(backing);
     const int tid = threadIdx.x, lane = tid & 31, warp = tid / 32;
     const int g = lane / 4, t = lane & 3;
-    const int head        = blockIdx.x / (kStateDim / DV);
-    const int value_start = blockIdx.x % (kStateDim / DV) * DV;
-    const int n_start     = warp % NT;
-    const int m_start     = NT < kWarps ? warp / NT : 0;
-    const int chunks      = chunk_count(args.tokens);
-    const auto state_base = static_cast<std::int64_t>(head) * kStateDim * kStateDim;
-    const auto source_base =
-        state_base + (args.source_offset ? *args.source_offset / std::int64_t(sizeof(float)) : 0);
-    const auto destination_base =
-        state_base +
-        (args.destination_offset ? *args.destination_offset / std::int64_t(sizeof(float)) : 0);
-
-    // MMA accumulators describe S^T[key,value]. External state remains [value,key].
-    float state[NPW][MPW][4];
-#pragma unroll
-    for (int ni = 0; ni < NPW; ++ni) {
-        const int n = n_start + ni * kWarps;
-#pragma unroll
-        for (int mi = 0; mi < MPW; ++mi) {
-            const int key    = (m_start + mi * MW) * 16 + g;
-            const int value  = value_start + n * 8 + t * 2;
-            state[ni][mi][0] = args.state_in[source_base + value * kStateDim + key];
-            state[ni][mi][1] = args.state_in[source_base + (value + 1) * kStateDim + key];
-            state[ni][mi][2] = args.state_in[source_base + value * kStateDim + key + 8];
-            state[ni][mi][3] = args.state_in[source_base + (value + 1) * kStateDim + key + 8];
+    const PackedChunks* packed = nullptr;
+    if constexpr (Packed) packed = &(..., metadata);
+    unsigned i = Packed ? blockIdx.y : 0;
+    do {
+        auto args = base_args;
+        int head, value_start, chunks;
+        SegmentPackets packets{};
+        if constexpr (Packed) {
+            constexpr int stripes = kStateDim / DV;
+            head                  = gridDim.z == 1 ? blockIdx.x / stripes : blockIdx.x;
+            value_start           = (gridDim.z == 1 ? blockIdx.x % stripes : blockIdx.z) * DV;
+            const auto* index     = packed->index();
+            const auto [s, first] = index[i];
+            const auto start      = static_cast<std::int64_t>(packed->segments.cu_seqlens[s]) *
+                               args.value_heads * kStateDim;
+            // Use segment-local tokens in load_stage and store_output, including their padding
+            // predicates. Rebase the shared packets independently of the physical token rows.
+            args.v += start;
+            args.out += start;
+            args.tokens = packed->segments.lengths[s];
+            args.source_offset += s;
+            args.destination_offset += s;
+            const int end =
+                i + 1 < packed->chunked_segments ? index[i + 1].first_chunk : packed->total_chunks;
+            chunks       = end - first;
+            const int qh = head / (args.value_heads / args.qk_heads);
+            packets = {qk_workspace + static_cast<std::int64_t>(qh) * packed->total_chunks + first,
+                       control_workspace + static_cast<std::int64_t>(head) * packed->total_chunks +
+                           first};
+        } else {
+            head        = blockIdx.x / (kStateDim / DV);
+            value_start = blockIdx.x % (kStateDim / DV) * DV;
+            chunks      = chunk_count(args.tokens);
         }
-    }
-    load_stage<DV>(sm.stage[0], args, qk_workspace, control_workspace, head, value_start, 0, tid);
-    if (chunks > 1)
-        load_stage<DV>(sm.stage[1], args, qk_workspace, control_workspace, head, value_start, 1,
-                       tid);
+        const int n_start     = warp % NT;
+        const int m_start     = NT < kWarps ? warp / NT : 0;
+        const auto state_base = static_cast<std::int64_t>(head) * kStateDim * kStateDim;
+        const auto source_base =
+            state_base +
+            (args.source_offset ? *args.source_offset / std::int64_t(sizeof(float)) : 0);
+        const auto destination_base =
+            state_base +
+            (args.destination_offset ? *args.destination_offset / std::int64_t(sizeof(float)) : 0);
 
-    for (int chunk = 0; chunk < chunks; ++chunk) {
-        if (chunk + 1 < chunks)
-            common::cp_wait<1>();
-        else
-            common::cp_wait<0>();
+        // MMA accumulators describe S^T[key,value]. External state remains [value,key].
+        float state[NPW][MPW][4];
 #pragma unroll
         for (int ni = 0; ni < NPW; ++ni) {
             const int n = n_start + ni * kWarps;
 #pragma unroll
             for (int mi = 0; mi < MPW; ++mi) {
-                const int key = (m_start + mi * MW) * 16 + g;
-                const int col = n * 8 + t * 2;
-                common::store_vec(sm.snapshot + value_index<DV>(key, col),
-                                  make_float2(state[ni][mi][0], state[ni][mi][1]));
-                common::store_vec(sm.snapshot + value_index<DV>(key + 8, col),
-                                  make_float2(state[ni][mi][2], state[ni][mi][3]));
+                const int key    = (m_start + mi * MW) * 16 + g;
+                const int value  = value_start + n * 8 + t * 2;
+                state[ni][mi][0] = args.state_in[source_base + value * kStateDim + key];
+                state[ni][mi][1] = args.state_in[source_base + (value + 1) * kStateDim + key];
+                state[ni][mi][2] = args.state_in[source_base + value * kStateDim + key + 8];
+                state[ni][mi][3] = args.state_in[source_base + (value + 1) * kStateDim + key + 8];
             }
         }
-        __syncthreads();
-        const auto& stage     = sm.stage[chunk & 1];
-        const ControlChunk& p = stage.control;
-        const QkChunk& qk     = stage.qk;
-        float history[NPW][4]{};
+        load_stage<DV, Packed>(sm.stage[0], args, qk_workspace, control_workspace, head,
+                               value_start, 0, tid, packets);
+        if (chunks > 1)
+            load_stage<DV, Packed>(sm.stage[1], args, qk_workspace, control_workspace, head,
+                                   value_start, 1, tid, packets);
 
-        if constexpr (NT >= kWarps) {
-            float prediction[NPW][4]{};
+        for (int chunk = 0; chunk < chunks; ++chunk) {
+            if (chunk + 1 < chunks)
+                common::cp_wait<1>();
+            else
+                common::cp_wait<0>();
 #pragma unroll
-            for (int k = 0; k < kStateDim; k += 16) {
-                unsigned ka0[4], ka1[4], qa[4];
-                load_vector_tf32_a(qk.k, k, lane, ka0);
-                load_vector_tf32_a(qk.k, k + 8, lane, ka1);
-                load_vector_bf16_a(qk.q, k, lane, qa);
+            for (int ni = 0; ni < NPW; ++ni) {
+                const int n = n_start + ni * kWarps;
+#pragma unroll
+                for (int mi = 0; mi < MPW; ++mi) {
+                    const int key = (m_start + mi * MW) * 16 + g;
+                    const int col = n * 8 + t * 2;
+                    common::store_vec(sm.snapshot + value_index<DV>(key, col),
+                                      make_float2(state[ni][mi][0], state[ni][mi][1]));
+                    common::store_vec(sm.snapshot + value_index<DV>(key + 8, col),
+                                      make_float2(state[ni][mi][2], state[ni][mi][3]));
+                }
+            }
+            __syncthreads();
+            const auto& stage     = sm.stage[chunk & 1];
+            const ControlChunk& p = stage.control;
+            const QkChunk& qk     = stage.qk;
+            float history[NPW][4]{};
+
+            if constexpr (NT >= kWarps) {
+                float prediction[NPW][4]{};
+#pragma unroll
+                for (int k = 0; k < kStateDim; k += 16) {
+                    unsigned ka0[4], ka1[4], qa[4];
+                    load_vector_tf32_a(qk.k, k, lane, ka0);
+                    load_vector_tf32_a(qk.k, k + 8, lane, ka1);
+                    load_vector_bf16_a(qk.q, k, lane, qa);
+#pragma unroll
+                    for (int ni = 0; ni < NPW; ++ni) {
+                        const int n    = warp + ni * kWarps;
+                        const float b0 = sm.snapshot[value_index<DV>(k + 2 * t, n * 8 + g)];
+                        const float b1 = sm.snapshot[value_index<DV>(k + 2 * t + 1, n * 8 + g)];
+                        const float b2 = sm.snapshot[value_index<DV>(k + 2 * t + 8, n * 8 + g)];
+                        const float b3 = sm.snapshot[value_index<DV>(k + 2 * t + 9, n * 8 + g)];
+                        common::mma_tf32_bits(prediction[ni][0], prediction[ni][1],
+                                              prediction[ni][2], prediction[ni][3], ka0[0], ka0[1],
+                                              ka0[2], ka0[3], __float_as_uint(b0),
+                                              __float_as_uint(b1));
+                        common::mma_tf32_bits(prediction[ni][0], prediction[ni][1],
+                                              prediction[ni][2], prediction[ni][3], ka1[0], ka1[1],
+                                              ka1[2], ka1[3], __float_as_uint(b2),
+                                              __float_as_uint(b3));
+                        common::mma_bf16(history[ni][0], history[ni][1], history[ni][2],
+                                         history[ni][3], qa[0], qa[1], qa[2], qa[3],
+                                         common::pack_bf16x2(b0, b1), common::pack_bf16x2(b2, b3));
+                    }
+                }
 #pragma unroll
                 for (int ni = 0; ni < NPW; ++ni) {
-                    const int n    = warp + ni * kWarps;
-                    const float b0 = sm.snapshot[value_index<DV>(k + 2 * t, n * 8 + g)];
-                    const float b1 = sm.snapshot[value_index<DV>(k + 2 * t + 1, n * 8 + g)];
-                    const float b2 = sm.snapshot[value_index<DV>(k + 2 * t + 8, n * 8 + g)];
-                    const float b3 = sm.snapshot[value_index<DV>(k + 2 * t + 9, n * 8 + g)];
-                    common::mma_tf32_bits(prediction[ni][0], prediction[ni][1], prediction[ni][2],
-                                          prediction[ni][3], ka0[0], ka0[1], ka0[2], ka0[3],
-                                          __float_as_uint(b0), __float_as_uint(b1));
-                    common::mma_tf32_bits(prediction[ni][0], prediction[ni][1], prediction[ni][2],
-                                          prediction[ni][3], ka1[0], ka1[1], ka1[2], ka1[3],
-                                          __float_as_uint(b2), __float_as_uint(b3));
-                    common::mma_bf16(history[ni][0], history[ni][1], history[ni][2], history[ni][3],
-                                     qa[0], qa[1], qa[2], qa[3], common::pack_bf16x2(b0, b1),
-                                     common::pack_bf16x2(b2, b3));
+                    store_residual<DV>(sm.delta, stage.value, prediction[ni], p.prefix,
+                                       warp + ni * kWarps, lane);
+                }
+            } else {
+                if (warp < 2 * NT) {
+                    const bool query = warp >= NT;
+                    const int n      = warp % NT;
+                    if (query) {
+#pragma unroll
+                        for (int k = 0; k < kStateDim; k += 16) {
+                            unsigned af[4], b0, b1;
+                            load_vector_bf16_a(qk.q, k, lane, af);
+                            load_bf16_b<DV>(sm.snapshot, k, n, lane, b0, b1);
+                            common::mma_bf16(history[0][0], history[0][1], history[0][2],
+                                             history[0][3], af[0], af[1], af[2], af[3], b0, b1);
+                        }
+                    } else {
+#pragma unroll
+                        for (int k = 0; k < kStateDim; k += 8) {
+                            unsigned af[4];
+                            load_vector_tf32_a(qk.k, k, lane, af);
+                            common::mma_tf32_bits(
+                                history[0][0], history[0][1], history[0][2], history[0][3], af[0],
+                                af[1], af[2], af[3],
+                                __float_as_uint(sm.snapshot[value_index<DV>(k + 2 * t, n * 8 + g)]),
+                                __float_as_uint(
+                                    sm.snapshot[value_index<DV>(k + 2 * t + 1, n * 8 + g)]));
+                        }
+                        store_residual<DV>(sm.delta, stage.value, history[0], p.prefix, n, lane);
+                    }
                 }
             }
+            __syncthreads();
+
+            // Each value tile reads only its own R columns, so R can become Delta in place.
+#pragma unroll
+            for (int n = warp; n < NT; n += kWarps) {
+                float delta[4]{};
+                matrix_delta<DV>(delta, p.solve, sm.delta, n, lane);
+                const int col = n * 8 + t * 2;
+                __syncwarp();
+                common::store_vec(sm.delta + value_index<DV>(g, col),
+                                  make_float2(delta[0], delta[1]));
+                common::store_vec(sm.delta + value_index<DV>(g + 8, col),
+                                  make_float2(delta[2], delta[3]));
+            }
+            __syncthreads();
+
+            if constexpr (NT >= kWarps) {
+#pragma unroll
+                for (int ni = 0; ni < NPW; ++ni) {
+                    const int n = warp + ni * kWarps;
+                    history[ni][0] *= p.prefix[g];
+                    history[ni][1] *= p.prefix[g];
+                    history[ni][2] *= p.prefix[g + 8];
+                    history[ni][3] *= p.prefix[g + 8];
+                    matrix_delta<DV>(history[ni], p.mqk, sm.delta, n, lane);
+                    store_output(args, history[ni], chunk, head, value_start, n, lane);
+                }
+            } else if (warp >= NT && warp < 2 * NT) {
+                const int n = warp - NT;
+                history[0][0] *= p.prefix[g];
+                history[0][1] *= p.prefix[g];
+                history[0][2] *= p.prefix[g + 8];
+                history[0][3] *= p.prefix[g + 8];
+                matrix_delta<DV>(history[0], p.mqk, sm.delta, n, lane);
+                store_output(args, history[0], chunk, head, value_start, n, lane);
+            }
+
+            // S^T = gamma S^T + K^T diag(suffix) Delta. The master state stays FP32.
+            // Convert Delta only for this MMA and reuse its fragment across all key tiles.
+            // The output branch above consumes the original FP32 Delta through TF32 MMA.
+            unsigned delta_b[NPW][2];
 #pragma unroll
             for (int ni = 0; ni < NPW; ++ni) {
-                store_residual<DV>(sm.delta, stage.value, prediction[ni], p.prefix,
-                                   warp + ni * kWarps, lane);
+                const int col  = (n_start + ni * kWarps) * 8 + g;
+                delta_b[ni][0] = common::pack_bf16x2(
+                    p.suffix[2 * t] * sm.delta[value_index<DV>(2 * t, col)],
+                    p.suffix[2 * t + 1] * sm.delta[value_index<DV>(2 * t + 1, col)]);
+                delta_b[ni][1] = common::pack_bf16x2(
+                    p.suffix[2 * t + 8] * sm.delta[value_index<DV>(2 * t + 8, col)],
+                    p.suffix[2 * t + 9] * sm.delta[value_index<DV>(2 * t + 9, col)]);
             }
-        } else {
-            if (warp < 2 * NT) {
-                const bool query = warp >= NT;
-                const int n      = warp % NT;
-                if (query) {
 #pragma unroll
-                    for (int k = 0; k < kStateDim; k += 16) {
-                        unsigned af[4], b0, b1;
-                        load_vector_bf16_a(qk.q, k, lane, af);
-                        load_bf16_b<DV>(sm.snapshot, k, n, lane, b0, b1);
-                        common::mma_bf16(history[0][0], history[0][1], history[0][2], history[0][3],
-                                         af[0], af[1], af[2], af[3], b0, b1);
-                    }
-                } else {
+            for (int mi = 0; mi < MPW; ++mi) {
+                const int key     = (m_start + mi * MW) * 16 + g;
+                const float decay = p.prefix[kChunkSize - 1];
 #pragma unroll
-                    for (int k = 0; k < kStateDim; k += 8) {
-                        unsigned af[4];
-                        load_vector_tf32_a(qk.k, k, lane, af);
-                        common::mma_tf32_bits(
-                            history[0][0], history[0][1], history[0][2], history[0][3], af[0],
-                            af[1], af[2], af[3],
-                            __float_as_uint(sm.snapshot[value_index<DV>(k + 2 * t, n * 8 + g)]),
-                            __float_as_uint(
-                                sm.snapshot[value_index<DV>(k + 2 * t + 1, n * 8 + g)]));
-                    }
-                    store_residual<DV>(sm.delta, stage.value, history[0], p.prefix, n, lane);
+                for (int ni = 0; ni < NPW; ++ni) {
+                    state[ni][mi][0] *= decay;
+                    state[ni][mi][1] *= decay;
+                    state[ni][mi][2] *= decay;
+                    state[ni][mi][3] *= decay;
+                }
+                unsigned af[4];
+                load_transposed_bf16_a(qk.k, key - g, lane, af);
+#pragma unroll
+                for (int ni = 0; ni < NPW; ++ni) {
+                    common::mma_bf16(state[ni][mi][0], state[ni][mi][1], state[ni][mi][2],
+                                     state[ni][mi][3], af[0], af[1], af[2], af[3], delta_b[ni][0],
+                                     delta_b[ni][1]);
                 }
             }
-        }
-        __syncthreads();
-
-        // Each value tile reads only its own R columns, so R can become Delta in place.
-#pragma unroll
-        for (int n = warp; n < NT; n += kWarps) {
-            float delta[4]{};
-            matrix_delta<DV>(delta, p.solve, sm.delta, n, lane);
-            const int col = n * 8 + t * 2;
-            __syncwarp();
-            common::store_vec(sm.delta + value_index<DV>(g, col), make_float2(delta[0], delta[1]));
-            common::store_vec(sm.delta + value_index<DV>(g + 8, col),
-                              make_float2(delta[2], delta[3]));
-        }
-        __syncthreads();
-
-        if constexpr (NT >= kWarps) {
-#pragma unroll
-            for (int ni = 0; ni < NPW; ++ni) {
-                const int n = warp + ni * kWarps;
-                history[ni][0] *= p.prefix[g];
-                history[ni][1] *= p.prefix[g];
-                history[ni][2] *= p.prefix[g + 8];
-                history[ni][3] *= p.prefix[g + 8];
-                matrix_delta<DV>(history[ni], p.mqk, sm.delta, n, lane);
-                store_output(args, history[ni], chunk, head, value_start, n, lane);
+            __syncthreads();
+            if (chunk + 2 < chunks) {
+                load_stage<DV, Packed>(sm.stage[chunk & 1], args, qk_workspace, control_workspace,
+                                       head, value_start, chunk + 2, tid, packets);
             }
-        } else if (warp >= NT && warp < 2 * NT) {
-            const int n = warp - NT;
-            history[0][0] *= p.prefix[g];
-            history[0][1] *= p.prefix[g];
-            history[0][2] *= p.prefix[g + 8];
-            history[0][3] *= p.prefix[g + 8];
-            matrix_delta<DV>(history[0], p.mqk, sm.delta, n, lane);
-            store_output(args, history[0], chunk, head, value_start, n, lane);
         }
-
-        // S^T = gamma S^T + K^T diag(suffix) Delta. The master state stays FP32.
-        // Convert Delta only for this MMA and reuse its fragment across all key tiles.
-        // The output branch above consumes the original FP32 Delta through TF32 MMA.
-        unsigned delta_b[NPW][2];
 #pragma unroll
         for (int ni = 0; ni < NPW; ++ni) {
-            const int col  = (n_start + ni * kWarps) * 8 + g;
-            delta_b[ni][0] = common::pack_bf16x2(
-                p.suffix[2 * t] * sm.delta[value_index<DV>(2 * t, col)],
-                p.suffix[2 * t + 1] * sm.delta[value_index<DV>(2 * t + 1, col)]);
-            delta_b[ni][1] = common::pack_bf16x2(
-                p.suffix[2 * t + 8] * sm.delta[value_index<DV>(2 * t + 8, col)],
-                p.suffix[2 * t + 9] * sm.delta[value_index<DV>(2 * t + 9, col)]);
-        }
+            const int n = n_start + ni * kWarps;
 #pragma unroll
-        for (int mi = 0; mi < MPW; ++mi) {
-            const int key     = (m_start + mi * MW) * 16 + g;
-            const float decay = p.prefix[kChunkSize - 1];
-#pragma unroll
-            for (int ni = 0; ni < NPW; ++ni) {
-                state[ni][mi][0] *= decay;
-                state[ni][mi][1] *= decay;
-                state[ni][mi][2] *= decay;
-                state[ni][mi][3] *= decay;
-            }
-            unsigned af[4];
-            load_transposed_bf16_a(qk.k, key - g, lane, af);
-#pragma unroll
-            for (int ni = 0; ni < NPW; ++ni) {
-                common::mma_bf16(state[ni][mi][0], state[ni][mi][1], state[ni][mi][2],
-                                 state[ni][mi][3], af[0], af[1], af[2], af[3], delta_b[ni][0],
-                                 delta_b[ni][1]);
+            for (int mi = 0; mi < MPW; ++mi) {
+                const int key   = (m_start + mi * MW) * 16 + g;
+                const int value = value_start + n * 8 + t * 2;
+                args.state_out[destination_base + value * kStateDim + key]       = state[ni][mi][0];
+                args.state_out[destination_base + (value + 1) * kStateDim + key] = state[ni][mi][1];
+                args.state_out[destination_base + value * kStateDim + key + 8]   = state[ni][mi][2];
+                args.state_out[destination_base + (value + 1) * kStateDim + key + 8] =
+                    state[ni][mi][3];
             }
         }
-        __syncthreads();
-        if (chunk + 2 < chunks) {
-            load_stage<DV>(sm.stage[chunk & 1], args, qk_workspace, control_workspace, head,
-                           value_start, chunk + 2, tid);
+        if constexpr (Packed) i += gridDim.y;
+    } while (Packed && i < packed->chunked_segments);
+}
+
+template <int DV, class... Metadata>
+void opt_in_shared_memory() {
+    constexpr int shared_bytes = sizeof(RecurrenceShared<DV>);
+    if constexpr (shared_bytes > 48 * 1024) {
+        static std::atomic<std::uint64_t> configured{0};
+        int device;
+        CUDA_CHECK(cudaGetDevice(&device));
+        // CUDA's device ordinal is nonnegative. Fall back to opting in at launch
+        // for ordinals beyond the mask.
+        const auto bit = device < 64 ? std::uint64_t{1} << device : 0;
+        if ((configured.load(std::memory_order_acquire) & bit) == 0) {
+            // NVCC's host stub retains the const qualification on the argument pack.
+            CUDA_CHECK(cudaFuncSetAttribute(
+                reinterpret_cast<const void*>(chunk_recurrence_kernel<DV, Metadata...>),
+                cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes));
+            if (bit) configured.fetch_or(bit, std::memory_order_release);
         }
     }
-#pragma unroll
-    for (int ni = 0; ni < NPW; ++ni) {
-        const int n = n_start + ni * kWarps;
-#pragma unroll
-        for (int mi = 0; mi < MPW; ++mi) {
-            const int key                                        = (m_start + mi * MW) * 16 + g;
-            const int value                                      = value_start + n * 8 + t * 2;
-            args.state_out[destination_base + value * kStateDim + key]       = state[ni][mi][0];
-            args.state_out[destination_base + (value + 1) * kStateDim + key] = state[ni][mi][1];
-            args.state_out[destination_base + value * kStateDim + key + 8]   = state[ni][mi][2];
-            args.state_out[destination_base + (value + 1) * kStateDim + key + 8] = state[ni][mi][3];
-        }
-    }
+}
+
+template <int DV>
+void launch_ragged(const RecurrenceOperands& args, const PackedChunks& packed, const QkChunk* qk,
+                   const ControlChunk* control, cudaStream_t stream) {
+    constexpr int stripes      = kStateDim / DV;
+    constexpr int shared_bytes = sizeof(RecurrenceShared<DV>);
+    opt_in_shared_memory<DV, PackedChunks>();
+    const int segment_grid = std::min(packed.chunked_segments, common::kCudaGridYLimit);
+    const dim3 grid        = args.value_heads <= INT_MAX / stripes
+                                 ? dim3(args.value_heads * stripes, segment_grid)
+                                 : dim3(args.value_heads, segment_grid, stripes);
+    chunk_recurrence_kernel<DV, PackedChunks>
+        <<<grid, kThreads<DV>, shared_bytes, stream>>>(args, qk, control, packed);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 template <int DV>
 void launch(const RecurrenceOperands& args, const QkChunk* qk, const ControlChunk* control,
             cudaStream_t stream) {
     constexpr int shared_bytes = sizeof(RecurrenceShared<DV>);
-    (void)common::prepare_shared<shared_bytes, chunk_recurrence_kernel<DV>, true>();
+    opt_in_shared_memory<DV>();
     chunk_recurrence_kernel<DV>
         <<<args.value_heads*(kStateDim / DV), kThreads<DV>, shared_bytes, stream>>>(args, qk,
                                                                                     control);
@@ -381,6 +467,22 @@ void launch(const RecurrenceOperands& args, const QkChunk* qk, const ControlChun
 }
 
 } // namespace
+
+void launch_recurrence_ragged(const RecurrenceOperands& args, const PackedChunks& packed,
+                              const QkChunk* qk, const ControlChunk* control, int value_tile,
+                              cudaStream_t stream) {
+    switch (value_tile) {
+    case 64:
+        return launch_ragged<64>(args, packed, qk, control, stream);
+    case 32:
+        return launch_ragged<32>(args, packed, qk, control, stream);
+    case 16:
+        return launch_ragged<16>(args, packed, qk, control, stream);
+    case 8:
+        return launch_ragged<8>(args, packed, qk, control, stream);
+    }
+    throw std::logic_error("linear attention: invalid recurrence value tile");
+}
 
 void launch_recurrence(const RecurrenceOperands& args, const QkChunk* qk,
                        const ControlChunk* control, int value_tile, cudaStream_t stream) {

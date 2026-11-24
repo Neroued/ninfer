@@ -1,39 +1,31 @@
 #include "ops/linear_attention/gated_delta_net/recurrence/plan.h"
-#include <climits>
 
 namespace ninfer::ops::detail::gated_delta_net {
-RecurrenceRoute select_recurrence_route(int qk_heads, int value_heads, int tokens) {
-    const int chunked_first = qk_heads == 8 && value_heads == 24 ? 11 : 16;
-    return tokens < chunked_first ? RecurrenceRoute::Recurrent : RecurrenceRoute::Chunked;
+int first_chunked_tokens(int qk_heads, int value_heads) {
+    return qk_heads == 8 && value_heads == 24 ? 11 : 16;
 }
 
-int select_value_tile(int qk_heads, int value_heads, int tokens, int multiprocessor_count) {
-    if (qk_heads == 8 && value_heads == 24) return tokens <= 128 ? 32 : 64;
-    if (value_heads == 32 || value_heads == 48) {
-        if (tokens <= 128) return 16;
-        return value_heads == 48 ? 64 : 32;
-    }
-    // Small grids need the narrowest stripe. Otherwise use fixed relative tile costs
-    // to weight the SM-wave count. These are launch-heuristic weights, not measured latency.
-    // Wider stripes reduce replicated packet reads but retain more state per CTA.
-    if (static_cast<std::int64_t>(value_heads) * 16 <= multiprocessor_count) return 8;
-    int best               = 64;
-    std::int64_t best_work = INT64_MAX;
+int max_packed_window_chunks(int qk_heads, int value_heads) {
+    // Bound packet traffic within the 24 MiB L2 and leave room for inputs and state.
+    constexpr int default_chunks = 64;
+    static_assert(default_chunks <= chunked::kInlineSeqs);
+    if (qk_heads == 16 && value_heads == 32) return 48;
+    if (qk_heads == 16 && value_heads == 48) return 32;
+    if (qk_heads == 8 && value_heads == 24) return 40;
+    return default_chunks;
+}
 
-    struct Choice {
-        int tile, cost;
-    };
-
-    for (const auto [tile, cost] : {Choice{64, 34}, Choice{32, 20}, Choice{16, 13}}) {
-        const auto blocks = static_cast<std::int64_t>(value_heads) * (kStateDim / tile);
-        const auto waves  = (blocks + multiprocessor_count - 1) / multiprocessor_count;
-        const auto work   = waves * cost;
-        if (work < best_work) {
-            best      = tile;
-            best_work = work;
+int select_ragged_value_tile(int qk_heads, int value_heads, int tokens, int segments,
+                             int total_chunks, int multiprocessor_count) {
+    if (segments == 1) {
+        if (qk_heads == 8 && value_heads == 24) return tokens <= 128 ? 32 : 64;
+        if (value_heads == 32 || value_heads == 48) {
+            if (tokens <= 128) return 16;
+            return value_heads == 48 ? 64 : 32;
         }
     }
-    return best;
+    return select_value_tile_by_waves(value_heads, tokens, segments, total_chunks,
+                                      multiprocessor_count);
 }
 
 } // namespace ninfer::ops::detail::gated_delta_net

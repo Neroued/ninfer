@@ -5,6 +5,7 @@
 #include "cuda_fixture.h"
 #include "core/buffer.h"
 #include "core/decode_graph.h"
+#include "core/platform.h"
 
 #include "gdn_ref.h"
 #include "ops/op_tester.h"
@@ -16,6 +17,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
+#include <limits>
 #include <numeric>
 #include <random>
 #include <span>
@@ -796,90 +798,308 @@ int contract_rejection_cases() {
     return failures;
 }
 
-int ragged_recurrence() {
-    RaggedFixture ragged({1, 3, 17, 65});
-    constexpr int heads = 2, qk_heads = 1, slots = 8;
-    const int n = ragged.tokens(), rows = ragged.segments();
-    const std::vector<int> source{3, 1, 6, 0}, destination{3, 4, 6, 2};
-    const std::size_t state_elements = 128 * 128 * heads;
-    const std::size_t out_column     = 128 * heads;
-    const float scale                = 1.0f / std::sqrt(128.0f);
-    Case c{"ragged", qk_heads, heads, 1, true};
-    gdn_ref::Inputs packed;
+enum class RaggedStateMode { InPlace, Mixed, Permuted, SharedSource };
 
-    std::vector<gdn_ref::Result> reference;
-    std::vector<float> initial(state_elements * slots, -.0625f);
-    const auto append = [](auto& dest, const auto& src) {
-        dest.insert(dest.end(), src.begin(), src.end());
+int ragged_recurrence(Case c, std::vector<int> lengths, RaggedStateMode mode, bool captured = false,
+                      bool adversarial = false, bool poison = false,
+                      bool capacity_witness = false) {
+    RaggedFixture ragged(std::move(lengths));
+    const int rows = ragged.segments(), heads = c.value_heads;
+    const int slots                  = 2 * rows + 1;
+    c.tokens                         = ragged.tokens();
+    const std::size_t state_elements = std::size_t(kStateDim) * kStateDim * heads;
+    const std::size_t out_column     = kStateDim * heads;
+    const float scale                = 1.0F / std::sqrt(float(kStateDim));
+    const auto make_packed_inputs    = [&](unsigned seed) {
+        auto packed = make_inputs(c, seed);
+        for (int row = 1; adversarial && row < rows; ++row) {
+            const int token    = ragged.prefix[row];
+            const auto amplify = [token](std::vector<float>& values, int width, float factor) {
+                auto first = values.begin() + token * width;
+                for (auto it = first; it != first + width; ++it) *it *= factor;
+            };
+            amplify(packed.q, kStateDim * c.qk_heads, 32.0F);
+            amplify(packed.k, kStateDim * c.qk_heads, c.normalize_qk ? 32.0F : 2.0F);
+            amplify(packed.v, kStateDim * heads, 32.0F);
+            std::fill_n(packed.g.begin() + token * heads, heads, -1.5F);
+            std::fill_n(packed.beta.begin() + token * heads, heads, 0.20F);
+        }
+        if (poison) {
+            // A finite nonzero V in padding can be hidden by the zero solver column. An infinity
+            // in the neighboring segment exposes a missed zfill through the matrix product.
+            std::fill_n(packed.v.begin() + ragged.prefix[1] * out_column, out_column,
+                           std::numeric_limits<float>::infinity());
+        }
+        return packed;
     };
-    for (int row = 0; row < rows; ++row) {
-        c.tokens   = ragged.lengths[row];
-        auto input = make_inputs(c, 937 + row * 41);
+    auto packed = make_packed_inputs(937U);
 
-        append(packed.q, input.q);
-        append(packed.k, input.k);
-        append(packed.v, input.v);
-        append(packed.g, input.g);
-        append(packed.beta, input.beta);
-        std::copy(input.state.begin(), input.state.end(),
-                  initial.begin() + source[row] * state_elements);
-        reference.push_back(gdn_ref::evaluate(input, scale, c.normalize_qk));
+    std::vector<float> initial(state_elements * slots);
+    for (int slot = 0; slot < slots; ++slot) {
+        const float factor = slot % 2 == 0 ? 1.0F : -1.0F;
+        const auto first   = initial.begin() + slot * state_elements;
+        for (std::size_t i = 0; i < state_elements; ++i)
+            first[i] = factor * packed.state[(i + slot * 97U) % state_elements];
     }
     DeviceInputs device(packed);
-    GuardedDeviceBuffer states(initial.size() * 4), output(packed.v.size() * 2);
-    states.copy_from_host(initial.data(), initial.size() * 4);
+    GuardedDeviceBuffer states(initial.size() * sizeof(float));
+    GuardedDeviceBuffer output(packed.v.size() * sizeof(std::uint16_t));
+    states.copy_from_host(initial.data(), states.bytes());
     RecordStateFixture history(Tensor(states.span(), DType::FP32, {128, 128, heads, slots}), 3);
-    auto so  = to_device(history.record_offsets(source)),
-         do_ = to_device(history.record_offsets(destination));
-    auto src = history.view(Tensor(so.span(), DType::I64, {rows}));
-    auto dst = history.view(Tensor(do_.span(), DType::I64, {rows}));
-    Tensor q(device.q.span(), DType::BF16, {128, qk_heads, n});
-    Tensor k(device.k.span(), DType::BF16, {128, qk_heads, n});
-    Tensor v(device.v.span(), DType::BF16, {128, heads, n});
-    Tensor g(device.g.span(), DType::FP32, {heads, n}),
-        beta(device.beta.span(), DType::FP32, {heads, n});
-    Tensor out(output.span(), DType::BF16, {128, heads, n});
-    const auto bytes =
-        ops::gated_delta_net_ragged_workspace_capacity_bytes(qk_heads, heads, n, n, rows, rows);
+    auto device_source      = to_device(std::vector<std::int64_t>(rows));
+    auto device_destination = to_device(std::vector<std::int64_t>(rows));
+    const auto src          = history.view(Tensor(device_source.span(), DType::I64, {rows}));
+    const auto dst          = history.view(Tensor(device_destination.span(), DType::I64, {rows}));
+    Tensor q(device.q.span(), DType::BF16, {128, c.qk_heads, c.tokens});
+    Tensor k(device.k.span(), DType::BF16, {128, c.qk_heads, c.tokens});
+    Tensor v(device.v.span(), DType::BF16, {128, heads, c.tokens});
+    Tensor g(device.g.span(), DType::FP32, {heads, c.tokens});
+    Tensor beta(device.beta.span(), DType::FP32, {heads, c.tokens});
+    Tensor out(output.span(), DType::BF16, {128, heads, c.tokens});
+    const auto bytes = ops::gated_delta_net_ragged_workspace_capacity_bytes(
+        c.qk_heads, heads, c.tokens, c.tokens, rows, rows);
     GuardedDeviceBuffer scratch(bytes);
     MemoryArena ws(scratch.span());
-    const auto ex = cuda_environment().default_execution;
-    ops::gated_delta_net(q, k, v, g, beta, scale, c.normalize_qk, ragged.view, ws, src, dst, out,
-                         ex);
-    cuda_synchronize();
-    history.copy_back();
-    const auto actual = from_device_bf16(output.data(), packed.v.size());
-    const auto after  = from_device<float>(states.data(), initial.size());
-    int failures =
-        output.verify_guards("ragged output") + scratch.verify_guards("ragged workspace") +
-        states.verify_guards("ragged state") + history.verify_guards("ragged selected fields");
-    for (int row = 0; row < rows; ++row) {
-        const std::size_t begin = destination[row] * state_elements;
-        const auto first        = actual.begin() + ragged.prefix[row] * out_column;
-        const auto last         = first + ragged.lengths[row] * out_column;
-        failures += verify_heads("ragged GDN output", std::span<const double>(first, last),
-                                 reference[row].out, heads, ragged.lengths[row], false);
-        const auto state = doubles(
-            std::vector<float>(after.begin() + begin, after.begin() + begin + state_elements));
+    auto& context        = cuda_environment().context;
+    const auto execution = context.execution_view();
+    const auto launch    = [&] {
+        ops::gated_delta_net(q, k, v, g, beta, scale, c.normalize_qk, ragged.view, ws, src, dst,
+                                out, execution);
+    };
+
+    DecodeGraphDefinition definition;
+    DecodeGraphExecutable graph;
+    int failures = 0;
+    for (int replay = 0; replay <= static_cast<int>(captured); ++replay) {
+        std::vector<int> source(rows), destination(rows);
+        std::vector<bool> written(slots);
+        for (int row = 0; row < rows; ++row) {
+            source[row]      = 2 * row + replay;
+            destination[row] = source[row];
+            switch (mode) {
+            case RaggedStateMode::InPlace:
+                break;
+            case RaggedStateMode::Mixed:
+                if (row % 2) destination[row] ^= 1;
+                break;
+            case RaggedStateMode::Permuted:
+                destination[row] = 2 * (rows - 1 - row) + (1 - replay);
+                break;
+            case RaggedStateMode::SharedSource:
+                source[row]      = 2 * rows - replay;
+                destination[row] = row;
+                break;
+            }
+            written[destination[row]] = true;
+        }
+        const auto source_offsets      = history.record_offsets(source);
+        const auto destination_offsets = history.record_offsets(destination);
+        device_source.copy_from_host(source_offsets.data(), device_source.size());
+        device_destination.copy_from_host(destination_offsets.data(), device_destination.size());
+        output.fill(0xff);
+        scratch.fill(0xff);
+        if (replay > 0) {
+            packed                 = make_packed_inputs(1147U);
+            const auto upload_bf16 = [](DeviceBuffer& buffer, const std::vector<float>& values) {
+                const auto bits = bf16_bits(values);
+                buffer.copy_from_host(bits.data(), buffer.size());
+            };
+            upload_bf16(device.q, packed.q);
+            upload_bf16(device.k, packed.k);
+            upload_bf16(device.v, packed.v);
+            device.g.copy_from_host(packed.g.data(), device.g.size());
+            device.beta.copy_from_host(packed.beta.data(), device.beta.size());
+            states.copy_from_host(initial.data(), states.bytes());
+            history.upload();
+        }
+        if (captured) {
+            if (!graph.ready()) {
+                definition.capture(execution.stream(), launch);
+                graph.instantiate(definition);
+            }
+            graph.launch(execution.stream());
+        } else {
+            launch();
+        }
+        context.synchronize();
+        history.copy_back();
+        const auto actual = from_device_bf16(output.data(), packed.v.size());
+        const auto after  = from_device<float>(states.data(), initial.size());
+        for (int row = 0; row < rows; ++row) {
+            if (poison && row == 1) continue;
+            const auto segment = [&](const std::vector<float>& values, std::size_t width) {
+                return std::vector<float>(values.begin() + ragged.prefix[row] * width,
+                                          values.begin() + ragged.prefix[row + 1] * width);
+            };
+            const auto state_begin = initial.begin() + source[row] * state_elements;
+            const auto reference   = gdn_ref::evaluate(
+                {kStateDim, c.qk_heads, heads, ragged.lengths[row],
+                   segment(packed.q, kStateDim * c.qk_heads),
+                   segment(packed.k, kStateDim * c.qk_heads), segment(packed.v, out_column),
+                   segment(packed.g, heads), segment(packed.beta, heads),
+                   std::vector<float>(state_begin, state_begin + state_elements)},
+                scale, c.normalize_qk);
+            const std::string label = std::string(c.name) + "/replay=" + std::to_string(replay) +
+                                      "/segment=" + std::to_string(row);
+            failures += verify_heads(label + "/output",
+                                     std::span(actual).subspan(ragged.prefix[row] * out_column,
+                                                               ragged.lengths[row] * out_column),
+                                     reference.out, heads, ragged.lengths[row], false);
+            const auto state = after.begin() + destination[row] * state_elements;
+            failures +=
+                verify_heads(label + "/state", std::vector<double>(state, state + state_elements),
+                             reference.final_state, heads, 1, true);
+        }
+        for (int slot = 0; slot < slots; ++slot) {
+            if (written[slot]) continue;
+            const auto begin = slot * state_elements;
+            failures += verify_exact(
+                "ragged unselected state",
+                std::vector<float>(after.begin() + begin, after.begin() + begin + state_elements),
+                std::vector<float>(initial.begin() + begin,
+                                   initial.begin() + begin + state_elements));
+        }
         failures +=
-            verify_heads("ragged GDN state", state, reference[row].final_state, heads, 1, true);
+            output.verify_guards("ragged output") + scratch.verify_guards("ragged workspace") +
+            states.verify_guards("ragged state") + history.verify_guards("ragged selected fields");
     }
-    for (int slot = 0; slot < slots; ++slot) {
-        if (std::find(destination.begin(), destination.end(), slot) != destination.end()) continue;
-        const auto begin = slot * state_elements;
-        failures += verify_exact(
-            "ragged unselected state",
-            std::vector<float>(after.begin() + begin, after.begin() + begin + state_elements),
-            std::vector<float>(initial.begin() + begin, initial.begin() + begin + state_elements));
+    const bool all_recurrent =
+        std::all_of(ragged.lengths.begin(), ragged.lengths.end(), [&](int t) {
+            return ops::gated_delta_net_workspace_capacity_bytes(c.qk_heads, heads, t, t) == 0;
+        });
+    if (ws.used() != 0 || ws.peak_used() > bytes || (all_recurrent && ws.peak_used() != 0) ||
+        (capacity_witness && ws.peak_used() != bytes)) {
+        std::cerr << "ragged workspace peak=" << ws.peak_used() << " capacity=" << bytes << '\n';
+        ++failures;
     }
-    return failures + (ws.used() != 0 || ws.peak_used() > bytes);
+    return failures;
+}
+
+int ragged_capacity_enumeration() {
+    constexpr int max_tokens = 37, max_segments = 5;
+    int failures = 0;
+    for (const auto [qk, heads] : {std::pair{4, 4}, std::pair{8, 24}}) {
+        const auto packet = ops::gated_delta_net_workspace_capacity_bytes(qk, heads, 16, 16);
+        const auto count  = [&](int tokens) {
+            int packets = 0;
+            if (ops::gated_delta_net_workspace_capacity_bytes(qk, heads, tokens, tokens) != 0)
+                for (int start = 0; start < tokens; start += 16) ++packets;
+            return packets;
+        };
+        const auto partitions = [&](auto&& self, int tokens, int segments, int packets) -> int {
+            if (segments == 1) return packets + count(tokens);
+            int best = 0;
+            for (int length = 1; length <= tokens - segments + 1; ++length)
+                best = std::max(best,
+                                self(self, tokens - length, segments - 1, packets + count(length)));
+            return best;
+        };
+        int peaks[max_tokens + 1][max_segments + 1]{};
+        for (int n = 1; n <= max_tokens; ++n)
+            for (int s = 1; s <= std::min(n, max_segments); ++s)
+                peaks[n][s] = partitions(partitions, n, s, 0);
+
+        for (int n = 1; n <= max_tokens; ++n) {
+            for (int s = 1; s <= std::min(n, max_segments); ++s) {
+                for (int min_n : {1, n}) {
+                    for (int upper_s = s; upper_s <= max_segments; ++upper_s) {
+                        int max_packets = 0;
+                        for (int t = min_n; t <= n; ++t)
+                            for (int rows = s; rows <= std::min(t, upper_s); ++rows)
+                                max_packets = std::max(max_packets, peaks[t][rows]);
+                        const auto expected = packet * max_packets;
+                        const auto got      = ops::gated_delta_net_ragged_workspace_capacity_bytes(
+                            qk, heads, min_n, n, s, upper_s);
+                        if (got != expected) {
+                            std::cerr << "ragged capacity T=[" << min_n << ',' << n << "] S=[" << s
+                                      << ',' << upper_s << "] expected=" << expected
+                                      << " actual=" << got << '\n';
+                            ++failures;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    try {
+        (void)ops::gated_delta_net_ragged_workspace_capacity_bytes(4, 6, 1, 50, 1, 2);
+        std::cerr << "ragged capacity accepted an invalid head map\n";
+        ++failures;
+    } catch (const std::invalid_argument&) {}
+    try {
+        (void)ops::gated_delta_net_ragged_workspace_capacity_bytes(4, 4, 1, 10, 11, 12);
+        std::cerr << "ragged capacity accepted an empty envelope\n";
+        ++failures;
+    } catch (const std::invalid_argument&) {}
+    if (NINFER_TARGET_SPARK) {
+        // S=16, T=4096 admits {4081, 15x1}. Its direct window is larger than the
+        // packed window used by a uniform payload with the same N and S.
+        const auto expected = ops::gated_delta_net_workspace_capacity_bytes(16, 32, 4081, 4081);
+        const auto got =
+            ops::gated_delta_net_ragged_workspace_capacity_bytes(16, 32, 4096, 4096, 16, 16);
+        if (got != expected) {
+            std::cerr << "ragged capacity for a direct oversize window is not tight\n";
+            ++failures;
+        }
+    }
+    try {
+        constexpr int max = std::numeric_limits<int>::max();
+        (void)ops::gated_delta_net_ragged_workspace_capacity_bytes(max, max, 1, max, 1, max);
+        std::cerr << "ragged capacity accepted a workspace size overflow\n";
+        ++failures;
+    } catch (const std::overflow_error&) {}
+    return failures;
 }
 
 } // namespace
 
 int main(int argc, char** argv) {
     OpSuite suite;
-    suite.add("gated_delta_net/ragged", ragged_recurrence);
+    using Mode            = RaggedStateMode;
+    const auto add_ragged = [&](Case c, std::vector<int> lengths, Mode mode, bool graph = false,
+                                bool adversarial = false, bool poison = false,
+                                bool capacity_witness = false) {
+        suite.add(std::string("gated_delta_net/ragged/") + c.name,
+                  [=] {
+                      return ragged_recurrence(c, lengths, mode, graph, adversarial, poison,
+                                               capacity_witness);
+                  },
+                  {{"execution", graph ? "graph" : "eager"}});
+    };
+    for (int tokens : {10, 11, 15, 16, 65}) {
+        for (bool normalize : {false, true}) {
+            const auto name =
+                "single/t" + std::to_string(tokens) + (normalize ? "/normalized" : "/raw");
+            suite.add("gated_delta_net/ragged/" + name, [=] {
+                return ragged_recurrence({name.c_str(), 8, 24, tokens, normalize}, {tokens},
+                                         normalize ? Mode::InPlace : Mode::Permuted,
+                                         normalize && tokens == 16);
+            });
+        }
+    }
+    add_ragged({"boundaries", 16, 32, 0, true}, {1, 2, 10, 11, 15, 16, 17, 31, 32, 33, 65},
+               Mode::Mixed, false, true);
+    add_ragged({"long-first", 4, 4, 0, true}, {4095, 1}, Mode::InPlace);
+    add_ragged({"long-last", 8, 24, 0, false}, {1, 4095}, Mode::Permuted);
+    add_ragged({"recurrent-multitoken", 16, 48, 0, false}, std::vector<int>(8, 3), Mode::Mixed,
+               true);
+    add_ragged({"all-singletons", 16, 32, 0, true}, std::vector<int>(32, 1), Mode::SharedSource);
+    add_ragged({"sparse-chunked", 16, 48, 0, false}, {256, 1, 1, 1, 256}, Mode::Permuted, true);
+    add_ragged({"boundary-isolation", 4, 4, 0, false}, {17, 17, 15, 17, 1, 17}, Mode::Mixed, false,
+               true);
+    add_ragged({"value-padding-isolation", 4, 4, 0, true}, {17, 17}, Mode::InPlace, true, false,
+               true);
+    add_ragged({"windowed-capacity", 4, 4, 0, true}, std::vector<int>(33, 17), Mode::Mixed, true,
+               false, false, true);
+    add_ragged({"oversize-window", 4, 4, 0, false}, {17, 15, 1201, 17, 1, 17}, Mode::Permuted, true,
+               true);
+    std::vector<int> overflow(160);
+    for (int s = 0; s < static_cast<int>(overflow.size()); ++s) overflow[s] = s % 2 ? 17 : 1;
+    add_ragged({"large-mixed-batch", 4, 4, 0, true}, overflow, Mode::SharedSource, true, false,
+               false, !NINFER_TARGET_SPARK);
+    add_ragged({"large-all-chunked-batch", 1, 1, 0, false}, std::vector<int>(65, 17), Mode::InPlace,
+               true, false, false, !NINFER_TARGET_SPARK);
+    suite.add("gated_delta_net/ragged/capacity-enumeration", ragged_capacity_enumeration);
     suite.add("gdn/contract", [] {
         int failures               = 0;
         const std::size_t interval = ops::gated_delta_net_workspace_capacity_bytes(16, 48, 15, 17);

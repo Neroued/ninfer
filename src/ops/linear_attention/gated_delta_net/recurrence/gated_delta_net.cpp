@@ -4,7 +4,7 @@
 #include "ops/linear_attention/gated_delta_net/recurrence/chunked/launch.h"
 #include "ops/linear_attention/gated_delta_net/recurrence/plan.h"
 #include "ops/linear_attention/gated_delta_net/recurrence/launch.h"
-#include <cmath>
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
@@ -13,7 +13,9 @@
 namespace ninfer::ops {
 namespace {
 
-using detail::gated_delta_net::RecurrenceGeometry;
+namespace gdn     = detail::gated_delta_net;
+namespace chunked = gdn::chunked;
+using gdn::RecurrenceGeometry;
 
 RecurrenceGeometry require_geometry(const Tensor& q, const Tensor& v) {
     const RecurrenceGeometry geometry{q.ne[1], v.ne[1], q.ne[2]};
@@ -148,6 +150,27 @@ void validate_recurrence(const Tensor& q, const Tensor& k, const Tensor& v, cons
     common::operand::contiguous_nonnull(ssm_state_in, "gated_delta_net", "ssm_state_in", device);
 }
 
+gdn::RecurrenceOperands make_operands(const Tensor& q, const Tensor& k, const Tensor& v,
+                                      const Tensor& g, const Tensor& beta, float scale,
+                                      const Tensor& ssm_state_in, Tensor& ssm_state_out,
+                                      Tensor& out, const std::int64_t* source_offset,
+                                      const std::int64_t* destination_offset) {
+    return {static_cast<const __nv_bfloat16*>(q.data),
+            static_cast<const __nv_bfloat16*>(k.data),
+            static_cast<const __nv_bfloat16*>(v.data),
+            static_cast<const float*>(g.data),
+            static_cast<const float*>(beta.data),
+            static_cast<const float*>(ssm_state_in.data),
+            static_cast<float*>(ssm_state_out.data),
+            static_cast<__nv_bfloat16*>(out.data),
+            q.ne[1],
+            v.ne[1],
+            q.ne[2],
+            scale,
+            source_offset,
+            destination_offset};
+}
+
 void execute(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g, const Tensor& beta,
              float scale, bool normalize_qk, MemoryArena& ws, const Tensor& ssm_state_in,
              Tensor& ssm_state_out, Tensor& out, CudaExecutionView execution,
@@ -206,8 +229,7 @@ void execute(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
              float scale, bool normalize_qk, MemoryArena& ws, const Tensor& ssm_state_in,
              Tensor& ssm_state_out, Tensor& out, CudaExecutionView execution,
              const std::int64_t* source_offset, const std::int64_t* destination_offset) {
-    namespace chunked = detail::gated_delta_net::chunked;
-    const auto plan   = detail::gated_delta_net::select_recurrence_plan(
+    const auto plan = detail::gated_delta_net::select_recurrence_plan(
         q.ne[1], v.ne[1], q.ne[2], execution.multiprocessor_count());
     if (plan.route == detail::gated_delta_net::RecurrenceRoute::Recurrent) {
         detail::gated_delta_net::launch_recurrent_inout(
@@ -220,33 +242,78 @@ void execute(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
     const auto backing = ws.alloc_bytes(layout.total_bytes);
     auto* qk           = static_cast<chunked::QkChunk*>(layout.qk.bind(backing).data);
     auto* control      = static_cast<chunked::ControlChunk*>(layout.control.bind(backing).data);
-    const detail::gated_delta_net::RecurrenceOperands args{
-        static_cast<const __nv_bfloat16*>(q.data),
-        static_cast<const __nv_bfloat16*>(k.data),
-        static_cast<const __nv_bfloat16*>(v.data),
-        static_cast<const float*>(g.data),
-        static_cast<const float*>(beta.data),
-        static_cast<const float*>(ssm_state_in.data),
-        static_cast<float*>(ssm_state_out.data),
-        static_cast<__nv_bfloat16*>(out.data),
-        q.ne[1],
-        v.ne[1],
-        q.ne[2],
-        scale,
-        source_offset,
-        destination_offset};
+    const auto args    = make_operands(q, k, v, g, beta, scale, ssm_state_in, ssm_state_out, out,
+                                       source_offset, destination_offset);
     chunked::launch_prepare(args, qk, control, normalize_qk, execution.stream());
     chunked::launch_recurrence(args, qk, control, plan.value_tile, execution.stream());
+}
+
+template <class Visit>
+void for_each_chunk_window(const RaggedSequenceView& seq, gdn::RaggedSegments segments,
+                           int first_chunked, int cap, Visit&& visit) {
+    chunked::PackedChunks window{segments};
+    int longest = 0;
+    for (int s = 0; s < segments.count; ++s) {
+        const int length = seq.segment_length(s);
+        if (length < first_chunked) continue;
+        const int chunks = chunked::chunk_count(length);
+        if (window.chunked_segments && chunks > cap - window.total_chunks) {
+            visit(window, longest);
+            window.chunked_segments = 0;
+            window.total_chunks     = 0;
+            longest                 = 0;
+        }
+        window.inline_index[window.chunked_segments++] = {s, window.total_chunks};
+        window.total_chunks += chunks;
+        longest = std::max(longest, length);
+    }
+    if (window.chunked_segments) visit(window, longest);
+}
+
+void launch_chunk_window(const gdn::RecurrenceOperands& args, const RaggedSequenceView& seq,
+                         const chunked::PackedChunks& window, int longest, chunked::QkChunk* qk,
+                         chunked::ControlChunk* control, bool normalize_qk,
+                         CudaExecutionView execution) {
+    const auto stream = execution.stream();
+    const int tile    = gdn::select_ragged_value_tile(args.qk_heads, args.value_heads, longest,
+                                                      window.chunked_segments, window.total_chunks,
+                                                      execution.multiprocessor_count());
+    if (window.chunked_segments == 1) {
+        // A sole segment can exceed the packed cap and uses the direct chunked kernels.
+        const int s            = window.inline_index[0].segment;
+        const int begin        = seq.segment_begin(s);
+        const auto qk_start    = static_cast<std::int64_t>(begin) * args.qk_heads * gdn::kStateDim;
+        const auto gate_start  = static_cast<std::int64_t>(begin) * args.value_heads;
+        const auto value_start = gate_start * gdn::kStateDim;
+        auto local             = args;
+        local.q += qk_start;
+        local.k += qk_start;
+        local.v += value_start;
+        local.out += value_start;
+        local.g += gate_start;
+        local.beta += gate_start;
+        local.tokens = longest;
+        local.source_offset += s;
+        local.destination_offset += s;
+        chunked::launch_prepare(local, qk, control, normalize_qk, stream);
+        chunked::launch_recurrence(local, qk, control, tile, stream);
+    } else {
+        chunked::launch_prepare_ragged(args, window, qk, control, normalize_qk, stream);
+        chunked::launch_recurrence_ragged(args, window, qk, control, tile, stream);
+    }
 }
 } // namespace
 
 std::size_t gated_delta_net_ragged_workspace_capacity_bytes(int qk_heads, int value_heads,
                                                             int min_tokens, int max_tokens,
                                                             int min_segments, int max_segments) {
-    const auto widths = common::operand::ragged_envelope(min_tokens, max_tokens, min_segments,
-                                                         max_segments, "gated_delta_net");
-    return gated_delta_net_workspace_capacity_bytes(qk_heads, value_heads, widths.first,
-                                                    widths.last);
+    (void)common::operand::ragged_envelope(min_tokens, max_tokens, min_segments, max_segments,
+                                           "gated_delta_net");
+    if (!gdn::are_head_counts_valid(qk_heads, value_heads)) {
+        throw std::invalid_argument("gated_delta_net workspace: invalid head counts");
+    }
+    return gdn::ragged_workspace_capacity(qk_heads, value_heads, max_tokens, min_segments,
+                                          max_segments);
 }
 
 void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
@@ -283,25 +350,88 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
                               &destination.records.byte_offsets};
     const auto output      = operand::range(out, op);
     for (const auto* in : inputs) operand::disjoint(output, operand::range(*in, op), op);
-    int longest = 0;
-    for (int s = 0; s < seq.num_seqs(); ++s) longest = std::max(longest, seq.segment_length(s));
-    const auto peak = gated_delta_net_workspace_capacity_bytes(q.ne[1], h, 1, longest);
-    if (peak) {
-        auto scope         = ws.scope();
-        const auto scratch = operand::range(ws.alloc_bytes(peak).data, peak, op);
+    const auto check_workspace = [&](MemorySpan backing) {
+        const auto scratch = operand::range(backing.data, backing.bytes, op);
         for (const auto* in : inputs) operand::disjoint(scratch, operand::range(*in, op), op);
         operand::disjoint(scratch, output, op);
-    }
+    };
     const auto* src_offsets = static_cast<const std::int64_t*>(source.records.byte_offsets.data);
     const auto* dst_offsets =
         static_cast<const std::int64_t*>(destination.records.byte_offsets.data);
-    for (int s = 0; s < seq.num_seqs(); ++s) {
-        const int begin = seq.segment_begin(s), len = seq.segment_length(s);
-        auto result = out.slice(2, begin, len);
-        execute(q.slice(2, begin, len), k.slice(2, begin, len), v.slice(2, begin, len),
-                g.slice(1, begin, len), beta.slice(1, begin, len), scale, normalize_qk, ws, src,
-                dst, result, execution, src_offsets + s, dst_offsets + s);
+    const int segments = seq.num_seqs();
+    if (segments == 1) {
+        const auto bytes = gdn::recurrence_workspace_layout(geometry.qk_heads, h, n).total_bytes;
+        if (bytes) {
+            auto scope = ws.scope();
+            check_workspace(ws.alloc_bytes(bytes));
+        }
+        execute(q, k, v, g, beta, scale, normalize_qk, ws, src, dst, out, execution, src_offsets,
+                dst_offsets);
+        return;
     }
+
+    const int first = gdn::first_chunked_tokens(geometry.qk_heads, h);
+    chunked::PackedChunks packed{};
+    packed.segments = {static_cast<const int*>(seq.cu_seqlens.data),
+                       static_cast<const int*>(seq.seq_lengths.data), segments};
+    int longest     = 0;
+    for (int s = 0; s < segments; ++s) {
+        const int length = seq.segment_length(s);
+        if (length < first) continue;
+        longest = std::max(longest, length);
+        if (packed.chunked_segments < chunked::kInlineSeqs)
+            packed.inline_index[packed.chunked_segments] = {s, packed.total_chunks};
+        ++packed.chunked_segments;
+        packed.total_chunks += chunked::chunk_count(length);
+    }
+    auto args = make_operands(q, k, v, g, beta, scale, src, dst, out, src_offsets, dst_offsets);
+    const auto stream = execution.stream();
+    if (packed.chunked_segments == 0) {
+        gdn::launch_recurrent_ragged(args, packed.segments, normalize_qk, 0, nullptr, stream);
+        return;
+    }
+    const int cap       = gdn::max_packed_window_chunks(geometry.qk_heads, h);
+    const bool windowed = packed.chunked_segments >= 2 && packed.total_chunks > cap;
+    int peak_chunks = packed.total_chunks, peak_segments = packed.chunked_segments;
+    if (windowed) {
+        peak_chunks   = 0;
+        peak_segments = 0;
+        for_each_chunk_window(seq, packed.segments, first, cap,
+                              [&](const chunked::PackedChunks& window, int) {
+                                  peak_chunks   = std::max(peak_chunks, window.total_chunks);
+                                  peak_segments = std::max(peak_segments, window.chunked_segments);
+                              });
+    }
+    const auto layout =
+        chunked::packed_workspace_layout(geometry.qk_heads, h, peak_chunks, peak_segments);
+    auto scope         = ws.scope();
+    const auto backing = ws.alloc_bytes(layout.total_bytes);
+    check_workspace(backing);
+    if (layout.index.bytes)
+        packed.device_index =
+            static_cast<chunked::ChunkIndexEntry*>(layout.index.bind(backing).data);
+    auto* qk             = static_cast<chunked::QkChunk*>(layout.qk.bind(backing).data);
+    auto* control        = static_cast<chunked::ControlChunk*>(layout.control.bind(backing).data);
+    const bool has_short = packed.chunked_segments != segments;
+    if (packed.device_index) {
+        if (has_short) {
+            gdn::launch_recurrent_ragged(args, packed.segments, normalize_qk, first,
+                                         packed.device_index, stream);
+        } else {
+            chunked::launch_build_chunk_index(packed.segments, first, packed.device_index, stream);
+        }
+    }
+    if (windowed) {
+        for_each_chunk_window(seq, packed.segments, first, cap,
+                              [&](const chunked::PackedChunks& window, int longest_in_window) {
+                                  launch_chunk_window(args, seq, window, longest_in_window, qk,
+                                                      control, normalize_qk, execution);
+                              });
+    } else {
+        launch_chunk_window(args, seq, packed, longest, qk, control, normalize_qk, execution);
+    }
+    if (has_short && !packed.device_index)
+        gdn::launch_recurrent_ragged(args, packed.segments, normalize_qk, first, nullptr, stream);
 }
 
 } // namespace ninfer::ops

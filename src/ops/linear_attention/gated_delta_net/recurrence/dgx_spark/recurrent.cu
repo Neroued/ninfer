@@ -3,6 +3,8 @@
 #include "ops/linear_attention/gated_delta_net/kernels/recurrent_subgroup.cuh"
 #include "core/device.h"
 #include "ops/common/host/operands.h"
+#include "ops/common/host/launch.h"
+#include "ops/linear_attention/gated_delta_net/recurrence/chunked/packed.cuh"
 
 #include <algorithm>
 
@@ -44,7 +46,56 @@ void launch_direct(const DirectAccess& access, cudaStream_t stream) {
     }
 }
 
+template <bool Normalize, bool Prefetch>
+__global__ __launch_bounds__(common::kWarpSize* kNumWarps, 2) void recurrent_ragged_kernel(
+    RecurrenceOperands args, RaggedSegments segments, HeadMap heads, int recurrent_before,
+    chunked::ChunkIndexEntry* build_index) {
+    extern __shared__ __align__(16) char backing[];
+    if (build_index && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) {
+        chunked::build_chunk_index<common::kWarpSize, kNumWarps>(segments, recurrent_before,
+                                                                 build_index);
+    }
+    for (std::int64_t s = blockIdx.y; s < segments.count; s += gridDim.y) {
+        const int length = segments.lengths[s];
+        if (recurrent_before && length >= recurrent_before) continue;
+        const auto access = ragged_access(args, heads, int(s), segments.cu_seqlens[s], length);
+        subgroup::run<16, Normalize, subgroup::Mode::Update, Prefetch>(
+            access, access.coordinates(), length,
+            reinterpret_cast<subgroup::Window<subgroup::kWindowSize>*>(backing));
+        if constexpr (Prefetch) {
+            if (s + gridDim.y < segments.count) __syncthreads();
+        }
+    }
+}
+
 } // namespace
+
+void launch_recurrent_ragged(const RecurrenceOperands& args, RaggedSegments segments,
+                             bool normalize_qk, int recurrent_before,
+                             chunked::ChunkIndexEntry* build_index, cudaStream_t stream) {
+    const auto heads = HeadMap::of(args.qk_heads, args.value_heads);
+    const dim3 grid(args.value_heads, std::min(segments.count, common::kCudaGridYLimit),
+                    kStateDim / kBlockDv);
+    const dim3 block(common::kWarpSize, kNumWarps);
+    const auto alignment = reinterpret_cast<std::uintptr_t>(args.q) |
+                           reinterpret_cast<std::uintptr_t>(args.k) |
+                           reinterpret_cast<std::uintptr_t>(args.v);
+    const auto launch = [&]<bool Normalize> {
+        if ((alignment & 15) == 0) {
+            recurrent_ragged_kernel<Normalize, true>
+                <<<grid, block, sizeof(subgroup::Window<subgroup::kWindowSize>), stream>>>(
+                    args, segments, heads, recurrent_before, build_index);
+        } else {
+            recurrent_ragged_kernel<Normalize, false>
+                <<<grid, block, 0, stream>>>(args, segments, heads, recurrent_before, build_index);
+        }
+    };
+    if (normalize_qk)
+        launch.template operator()<true>();
+    else
+        launch.template operator()<false>();
+    CUDA_CHECK(cudaGetLastError());
+}
 
 void launch_recurrent_inout(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
                             const Tensor& beta, float scale, bool normalize_qk,

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ops/common/cuda/reduce.cuh"
+#include "ops/linear_attention/gated_delta_net/recurrence/launch.h"
 #include "ops/linear_attention/gated_delta_net/kernels/transition.cuh"
 
 namespace ninfer::ops::detail::gated_delta_net {
@@ -68,6 +69,26 @@ struct DirectAccess {
         return out + (column(coord, token) * heads.H_v + coord.value_head) * kStateDim;
     }
 };
+
+__device__ __forceinline__ DirectAccess ragged_access(const RecurrenceOperands& args, HeadMap heads,
+                                                      int segment, int begin, int length) {
+    const auto qk = static_cast<std::int64_t>(begin) * args.qk_heads * kStateDim;
+    const auto gb = static_cast<std::int64_t>(begin) * args.value_heads;
+    const auto v  = gb * kStateDim;
+    return {args.q + qk,
+            args.k + qk,
+            args.v + v,
+            args.g + gb,
+            args.beta + gb,
+            args.state_in,
+            args.state_out,
+            args.out + v,
+            heads,
+            length,
+            args.scale,
+            args.source_offset + segment,
+            args.destination_offset + segment};
+}
 
 struct BatchUpdateAccess {
     const __nv_bfloat16* q;

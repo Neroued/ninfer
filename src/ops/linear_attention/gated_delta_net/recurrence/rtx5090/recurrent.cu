@@ -3,6 +3,8 @@
 #include "ops/linear_attention/gated_delta_net/recurrence/recurrent_io.cuh"
 #include "core/device.h"
 #include "ops/common/host/operands.h"
+#include "ops/common/host/launch.h"
+#include "ops/linear_attention/gated_delta_net/recurrence/chunked/packed.cuh"
 #include <cuda_bf16.h>
 #include <algorithm>
 #include <cstdint>
@@ -60,7 +62,43 @@ void launch_recurrent_batch_update_fixed(const Tensor& q, const Tensor& k, const
     CUDA_CHECK(cudaGetLastError());
 }
 
+template <bool Normalize>
+__global__ __launch_bounds__(common::kWarpSize* kNumWarps, 2) void recurrent_ragged_kernel(
+    RecurrenceOperands args, RaggedSegments segments, HeadMap heads, int recurrent_before,
+    chunked::ChunkIndexEntry* build_index) {
+    if (build_index && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) {
+        chunked::build_chunk_index<common::kWarpSize, kNumWarps>(segments, recurrent_before,
+                                                                 build_index);
+    }
+    for (std::int64_t s = blockIdx.y; s < segments.count; s += gridDim.y) {
+        const int length = segments.lengths[s];
+        if (recurrent_before && length >= recurrent_before) continue;
+        const auto access = ragged_access(args, heads, int(s), segments.cu_seqlens[s], length);
+        const auto coord  = access.coordinates();
+        __align__(16) float state[kDvPerWarp][kQkPerLane];
+        load_state_tile(state, access.state_read_base(coord), coord);
+        run_recurrent_sequence<Normalize, OutputEffects>(state, access, coord, length);
+        store_state_tile(state, access.state_write_base(coord), coord);
+    }
+}
+
 } // namespace
+
+void launch_recurrent_ragged(const RecurrenceOperands& args, RaggedSegments segments,
+                             bool normalize_qk, int recurrent_before,
+                             chunked::ChunkIndexEntry* build_index, cudaStream_t stream) {
+    const auto heads = HeadMap::of(args.qk_heads, args.value_heads);
+    const dim3 grid(args.value_heads, std::min(segments.count, common::kCudaGridYLimit),
+                    kStateDim / kBlockDv);
+    const dim3 block(common::kWarpSize, kNumWarps);
+    if (normalize_qk)
+        recurrent_ragged_kernel<true>
+            <<<grid, block, 0, stream>>>(args, segments, heads, recurrent_before, build_index);
+    else
+        recurrent_ragged_kernel<false>
+            <<<grid, block, 0, stream>>>(args, segments, heads, recurrent_before, build_index);
+    CUDA_CHECK(cudaGetLastError());
+}
 
 void launch_recurrent_inout(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
                             const Tensor& beta, float scale, bool normalize_qk,

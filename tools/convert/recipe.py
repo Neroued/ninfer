@@ -26,7 +26,7 @@ from .methods import (
     PreparedMethod,
     METHODS,
     cast_direct,
-    grouped_absmax,
+    grouped_mse,
     fp8_block_maxabs,
     fp8_row_maxabs,
     import_encoded,
@@ -569,7 +569,7 @@ class Recipe:
             used.update(names)
         standard = (
             cast_direct,
-            grouped_absmax,
+            grouped_mse,
             fp8_row_maxabs,
             fp8_block_maxabs,
             import_encoded,

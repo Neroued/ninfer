@@ -294,8 +294,8 @@ private:
                   std::vector<std::uint8_t>(static_cast<std::size_t>(groups_) * 16),
                   std::vector<std::uint8_t>(static_cast<std::size_t>(groups_) * 2)};
         for (std::int32_t group = 0; group < groups_; ++group) {
-            const std::uint16_t scale =
-                f32_to_f16(0.0013f + 0.00037f * static_cast<float>((id + group * 3) % 11));
+            const float magnitude = 0.0013f + 0.00037f * static_cast<float>((id + group * 3) % 11);
+            const std::uint16_t scale = f32_to_f16((group & 1) ? -magnitude : magnitude);
             store_u16_le(row.scales, static_cast<std::size_t>(group) * 2, scale);
             for (std::int32_t lane = 0; lane < kQ6Group; ++lane) {
                 int code = ((id % 61 + group * 17 + lane * 11) & 63) - 32;
@@ -412,15 +412,16 @@ private:
         Q8Row row{id, std::vector<std::uint8_t>(d_),
                   std::vector<std::uint8_t>(static_cast<std::size_t>(groups_) * 2)};
         for (std::int32_t group = 0; group < groups_; ++group) {
-            const std::uint16_t scale =
-                id == kDFlash2MaskToken && group == 0 ? std::uint16_t{0x3c04}
-                : id == kDFlash2MaskToken && group == 1
-                    ? std::uint16_t{1}
-                    : f32_to_f16(0.00091f + 0.00023f * static_cast<float>((id + group * 5) % 13));
+            const float magnitude = 0.00091f + 0.00023f * static_cast<float>((id + group * 5) % 13);
+            const std::uint16_t scale = id == kDFlash2MaskToken && group == 0
+                                            ? std::uint16_t{0x3c04}
+                                        : id == kDFlash2MaskToken && group == 1
+                                            ? std::uint16_t{0x8001}
+                                            : f32_to_f16((group & 1) ? -magnitude : magnitude);
             store_u16_le(row.scales, static_cast<std::size_t>(group) * 2, scale);
             for (std::int32_t lane = 0; lane < kQ8Group; ++lane) {
-                int code = ((id % 251 + group * 29 + lane * 17) % 255) - 127;
-                if (lane == 0) code = -127;
+                int code = ((id % 251 + group * 29 + lane * 17) & 255) - 128;
+                if (lane == 0) code = -128;
                 if (lane == 1) code = 127;
                 if (lane == 2) code = 0;
                 if (lane == 3) code = -1;

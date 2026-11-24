@@ -34,8 +34,9 @@ void rejects(F&& f) {
 
 double half(std::uint16_t word) {
     const int exponent = (word >> 10) & 31, fraction = word & 1023;
-    return exponent ? std::ldexp(1024.0 + fraction, exponent - 25)
-                    : std::ldexp(static_cast<double>(fraction), -24);
+    const double magnitude = exponent ? std::ldexp(1024.0 + fraction, exponent - 25)
+                                      : std::ldexp(static_cast<double>(fraction), -24);
+    return word & 0x8000 ? -magnitude : magnitude;
 }
 
 double bf16(std::uint16_t word) {
@@ -88,6 +89,7 @@ struct Matrix {
             if (group % 31 == 0) scale = 0;
             if (corners && group % 7 == 1) scale = 1;
             if (corners && group % 257 == 2) scale = 0x7bff;
+            if (scale && (group % 3 == 2)) scale |= 0x8000;
             base[code_bytes + high_bytes + 2 * group]     = scale & 255;
             base[code_bytes + high_bytes + 2 * group + 1] = scale >> 8;
             for (unsigned k = 0; k < 64; ++k) {

@@ -10,7 +10,11 @@ from tools.artifact.layouts import (
 )
 from tools.artifact.codecs.direct import decode_direct, encode_direct
 from tools.artifact.codecs.nvfp4 import decode_nvfp4_words, encode_nvfp4
-from tools.artifact.codecs.row_split import decode_row_split_codes, encode_row_split
+from tools.artifact.codecs.row_split import (
+    decode_row_split_codes,
+    dequantize_row_split,
+    encode_row_split,
+)
 
 
 def _signed_word(word: int, bits: int) -> int:
@@ -117,8 +121,8 @@ def test_direct_layout_preserves_exact_little_endian_words(
             32,
             128,
             256,
-            (-127, -1, 0, 1, 127),
-            b"\x81\xff\x00\x01\x7f",
+            (-128, -127, -1, 0, 1, 127),
+            b"\x80\x81\xff\x00\x01\x7f",
             b"",
             id="q8",
         ),
@@ -131,14 +135,14 @@ def test_row_split_matches_known_packed_bytes(
     codes = torch.zeros((1, groups, group_size), dtype=torch.int8)
     codes[0, 0, : len(prefix)] = torch.tensor(prefix, dtype=torch.int8)
     scales = torch.zeros((1, groups), dtype=torch.float16)
-    scales[0, :2] = torch.tensor([1.5, 0.25], dtype=torch.float16)
+    scales[0, :2] = torch.tensor([1.5, -0.25], dtype=torch.float16)
 
     # Literal wire positions and words come from the format, independently of layout helpers.
     expected = bytearray(scale_offset + groups * 2)
     expected[: len(base_prefix)] = base_prefix
     expected[256 : 256 + len(high_prefix)] = high_prefix
     expected[scale_offset:] = struct.pack(
-        "<" + "H" * groups, 0x3E00, 0x3400, *([0] * (groups - 2))
+        "<" + "H" * groups, 0x3E00, 0xB400, *([0] * (groups - 2))
     )
     assert encode_row_split(codes, scales, format_name, (1, k)) == expected
     decoded_scales, decoded_codes = decode_row_split_codes(
@@ -146,6 +150,36 @@ def test_row_split_matches_known_packed_bytes(
     )
     assert torch.equal(decoded_scales, scales)
     assert torch.equal(decoded_codes, codes)
+    dequant = dequantize_row_split(expected, format_name, (1, k), dtype=torch.float32)
+    assert torch.equal(
+        dequant[0, : len(prefix)],
+        torch.tensor(prefix, dtype=torch.float32) * 1.5,
+    )
+
+    # Signed FP16 scales apply directly to asymmetric endpoints as well.
+    codes_neg = codes.clone()
+    codes_neg[0, 1, 0] = prefix[0]
+    payload_neg = encode_row_split(codes_neg, scales, format_name, (1, k))
+    dequant_neg = dequantize_row_split(
+        payload_neg, format_name, (1, k), dtype=torch.float32
+    )
+    assert dequant_neg[0, group_size].item() == float(prefix[0]) * (-0.25)
+
+    bad_scales = scales.clone()
+    bad_scales[0, 0] = float("inf")
+    with pytest.raises(ValueError, match="finite"):
+        encode_row_split(codes, bad_scales, format_name, (1, k))
+    if format_name != "q8_g32_fp16":
+        bad_codes = codes.clone()
+        bad_codes[0, 0, 0] = 127
+        with pytest.raises(ValueError, match="must lie in"):
+            encode_row_split(bad_codes, scales, format_name, (1, k))
+    zero_scales = scales.clone()
+    zero_scales[0, 1] = 0.0
+    zero_mismatch = codes.clone()
+    zero_mismatch[0, 1, 0] = 1
+    with pytest.raises(ValueError, match="zero"):
+        encode_row_split(zero_mismatch, zero_scales, format_name, (1, k))
 
 
 def test_nvfp4_known_vector_geometry_swizzle_tail_and_round_trip():

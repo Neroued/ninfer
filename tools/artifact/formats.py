@@ -19,7 +19,7 @@ class DirectFormat:
 
 @dataclass(frozen=True, slots=True)
 class QuantFormat:
-    """Signed grouped codes with one binary16 multiplier per group."""
+    """Signed grouped codes with one finite signed binary16 multiplier per group."""
 
     name: str
     bits: int
@@ -92,7 +92,7 @@ INT32 = DirectFormat("int32", 4)
 Q4_G64_FP16 = QuantFormat("q4_g64_fp16", 4, 64, -8, 7)
 Q5_G64_FP16 = QuantFormat("q5_g64_fp16", 5, 64, -16, 15)
 Q6_G64_FP16 = QuantFormat("q6_g64_fp16", 6, 64, -32, 31)
-Q8_G32_FP16 = QuantFormat("q8_g32_fp16", 8, 32, -127, 127)
+Q8_G32_FP16 = QuantFormat("q8_g32_fp16", 8, 32, -128, 127)
 NVFP4 = Nvfp4Format("nvfp4", 16)
 NVFP4_MUL = Nvfp4Format("nvfp4_mul", 16, "multiply")
 MXFP8 = Mxfp8Format("mxfp8")

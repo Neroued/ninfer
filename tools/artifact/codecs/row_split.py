@@ -103,6 +103,14 @@ def encode_row_split(
         raise TypeError(f"scales must be float16 with shape {expected_scales}")
     if codes.device != scales.device:
         raise ValueError("codes and scales must be on the same device")
+    if not bool(torch.isfinite(scales).all()):
+        raise ValueError("row-split scales must be finite binary16 values")
+    if bool(((codes < spec.qmin) | (codes > spec.qmax)).any()):
+        raise ValueError(
+            f"row-split codes must lie in [{spec.qmin}, {spec.qmax}] for {spec.name}"
+        )
+    if bool(((scales == 0).unsqueeze(-1) & (codes != 0)).any()):
+        raise ValueError("a zero row-split scale requires only zero codes")
     grouped = codes.reshape(-1, spec.group_size)
     base, high = _pack_codes(grouped, spec)
     planes = RowPlanes(

@@ -48,7 +48,7 @@ def configure(model, recipe, sources):
         recipe.assign(name, source=array_source(value, "my-importer"))
     recipe.assign(("text/token_embedding", "text/layers/0/mlp/gate", "text/layers/0/mlp/up"), method=custom)
     for role, format in zip(("query", "key", "gate", "value"), ("q4_g64_fp16", "q5_g64_fp16", "q6_g64_fp16", "q8_g32_fp16")):
-        recipe.assign("text/layers/0/attention/" + role, format=format, method="grouped_absmax")
+        recipe.assign("text/layers/0/attention/" + role, format=format, method="grouped_mse")
 """)
     output = tmp_path / "custom.ninfer"
     command = [

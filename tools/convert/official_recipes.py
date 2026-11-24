@@ -7,7 +7,7 @@ from .methods import (
     cast_direct,
     fp8_row_maxabs,
     fp8_block_maxabs,
-    grouped_absmax,
+    grouped_mse,
     import_encoded,
     stored_scale_mse,
 )
@@ -24,7 +24,7 @@ FP8 = "fp8_e4m3fn_row_bf16"
 
 
 def _assign(recipe, name, format, *, source=None):
-    method = grouped_absmax if format in (Q4, Q5, Q6, Q8) else cast_direct
+    method = grouped_mse if format in (Q4, Q5, Q6, Q8) else cast_direct
     recipe.assign(name, format=format, method=method, source=source)
 
 

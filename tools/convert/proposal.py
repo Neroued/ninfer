@@ -90,7 +90,7 @@ def add_proposal(
     recipe.assign(
         "proposal/head",
         format=format,
-        method="grouped_absmax",
+        method="grouped_mse",
         activation_policy="A16Only",
     )
     if ids is not None:

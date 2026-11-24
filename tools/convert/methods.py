@@ -227,13 +227,13 @@ def cast_direct(request: PrepareRequest) -> PreparedMethod:
     return request.job(produce=produce)
 
 
-def grouped_absmax(request: PrepareRequest) -> PreparedMethod:
-    """Use the existing grouped max-abs, FP16-scale and code-rounding algorithm."""
+def grouped_mse(request: PrepareRequest) -> PreparedMethod:
+    """Use the grouped 1D discrete FP16-scale MSE optimization algorithm."""
     if (
         not isinstance(get_format(request.target.format), QuantFormat)
         or len(request.target.shape) != 2
     ):
-        raise ValueError("grouped_absmax requires a grouped-integer matrix target")
+        raise ValueError("grouped_mse requires a grouped-integer matrix target")
     _preflight(request)
     n, k = request.target.shape
     chunk = request.chunk_rows(k * 4)
@@ -243,7 +243,7 @@ def grouped_absmax(request: PrepareRequest) -> PreparedMethod:
             values = values.reshape((end - begin) // k, k)
             if not values.dtype.is_floating_point:
                 raise TypeError(
-                    "grouped_absmax source must provide floating-point values"
+                    "grouped_mse source must provide floating-point values"
                 )
             encoded = quantize_matrix(
                 values, request.target.format, device=request.device
@@ -463,7 +463,7 @@ def stored_scale_mse(request: PrepareRequest) -> PreparedMethod:
 
 METHODS: dict[str, Method] = {
     "cast_direct": cast_direct,
-    "grouped_absmax": grouped_absmax,
+    "grouped_mse": grouped_mse,
     "fp8_row_maxabs": fp8_row_maxabs,
     "fp8_block_maxabs": fp8_block_maxabs,
     "import_encoded": import_encoded,

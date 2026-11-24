@@ -7,11 +7,11 @@ import pytest
 import torch
 
 from tools.artifact.reader import Artifact
-from tools.artifact.codecs.row_split import decode_row_split_codes
+from tools.artifact.codecs.row_split import dequantize_row_split
 from tools.artifact.codecs.nvfp4 import encode_nvfp4
 from tools.artifact.schema import binding_parts
 from tools.artifact.writer import ArtifactWriter
-from tools.convert.methods import grouped_absmax, import_encoded
+from tools.convert.methods import grouped_mse, import_encoded
 from tools.convert.model import Model, Parameter
 from tools.artifact.tensor_output import TensorOutput
 from tools.convert.recipe import Recipe
@@ -58,19 +58,16 @@ def _assert_quantized_rows(artifact, part, amplitudes, format):
     object_id, begin, end = part
     obj = artifact.object(object_id)
     assert obj.format == format and end - begin == len(amplitudes) * 128
-    scales, codes = decode_row_split_codes(
-        artifact.read_object(object_id), format, obj.shape
+    decoded = dequantize_row_split(
+        artifact.read_object(object_id), format, obj.shape, dtype=torch.float32
     )
     first, last = begin // 128, end // 128
-    maximum = {"q4_g64_fp16": 7, "q5_g64_fp16": 15}[format]
-    assert bool((codes[first:last] == maximum).all())
-    expected = [
-        struct.unpack("<H", struct.pack("<e", value / maximum))[0]
-        for value in amplitudes
-    ]
-    assert scales[first:last].view(torch.int16).tolist() == [
-        [word, word] for word in expected
-    ]
+    expected = (
+        torch.tensor(amplitudes, dtype=torch.float32)[:, None]
+        .expand(len(amplitudes), 128)
+        .contiguous()
+    )
+    assert torch.equal(decoded[first:last], expected)
 
 
 def test_expert_parents_preserve_bank_order_and_shared_auxiliary(tmp_path):
@@ -138,13 +135,13 @@ def test_mixed_attention_uses_two_parents_and_distinct_permissions(tmp_path):
     recipe.assign(
         ("query", "key"),
         format="q4_g64_fp16",
-        method=grouped_absmax,
+        method=grouped_mse,
         activation_policy="AllowA4",
     )
     recipe.assign(
         ("gate", "value"),
         format="q5_g64_fp16",
-        method=grouped_absmax,
+        method=grouped_mse,
         activation_policy="AllowA8",
     )
     prepared = recipe.prepare(device="cpu", rows_per_chunk=3)
@@ -183,7 +180,7 @@ def test_row_overrides_preserve_binding_order_and_coverage(tmp_path):
     model = _model(("weight",))
     model.packing_groups = []
     recipe = Recipe(model)
-    recipe.assign("weight", format="q4_g64_fp16", method=grouped_absmax)
+    recipe.assign("weight", format="q4_g64_fp16", method=grouped_mse)
     recipe.assign("weight", rows=(1, 3), format="q5_g64_fp16")
     prepared = recipe.prepare(device="cpu", rows_per_chunk=1)
     path = tmp_path / "parts.ninfer"
@@ -201,7 +198,7 @@ def test_shared_weight_keeps_use_independent_and_can_be_overridden():
     model = _model(("key", "context_key"))
     model.packing_groups = []
     recipe = Recipe(model)
-    recipe.assign("*", format="q8_g32_fp16", method=grouped_absmax)
+    recipe.assign("*", format="q8_g32_fp16", method=grouped_mse)
     recipe.share("context_key", "key")
     recipe.use("context_key", "input", activation_policy="AllowA8")
     shared = recipe.prepare(device="cpu")

@@ -26,14 +26,15 @@ std::size_t linear(const ops::LinearProfile& p, int first, int last) {
 }
 
 std::size_t body(const ModelProfile& p, const EngineOptions& options, int first, int last,
-                 int batch, bool prefill, bool mtp, int sm_count, const moe::Plan* offload) {
+                 int batch, bool prefill, bool mtp, int sm_count, const moe::Plan* offload,
+                 bool ragged = false) {
     const auto policy = sequence_parallel_policy(p.local.size);
     if (prefill && !mtp && policy.minimum_columns && first < policy.minimum_columns &&
         last >= policy.minimum_columns)
-        return std::max(
-            body(p, options, first, policy.minimum_columns - 1, batch, prefill, mtp, sm_count,
-                 offload),
-            body(p, options, policy.minimum_columns, last, batch, prefill, mtp, sm_count, offload));
+        return std::max(body(p, options, first, policy.minimum_columns - 1, batch, prefill, mtp,
+                             sm_count, offload, ragged),
+                        body(p, options, policy.minimum_columns, last, batch, prefill, mtp,
+                             sm_count, offload, ragged));
     WorkspaceLayoutBuilder a;
     const auto columns = dimension(std::uint64_t(last) * batch),
                minimum = dimension(std::uint64_t(first) * batch);
@@ -71,9 +72,12 @@ std::size_t body(const ModelProfile& p, const EngineOptions& options, int first,
                 if (prefill) {
                     scratch(ops::linear_split_workspace_capacity_bytes(g->input, g->input_rows,
                                                                        first, last));
-                    scratch(ops::gated_delta_net_workspace_capacity_bytes(
-                        dimension(p.local.gdn.key_heads), dimension(p.local.gdn.value_heads), first,
-                        last));
+                    const auto kh = dimension(p.local.gdn.key_heads);
+                    const auto vh = dimension(p.local.gdn.value_heads);
+                    scratch(ragged ? ops::gated_delta_net_ragged_workspace_capacity_bytes(
+                                         kh, vh, 1, last, 1, options.max_concurrency)
+                                   : ops::gated_delta_net_workspace_capacity_bytes(kh, vh, first,
+                                                                                   last));
                 } else if (last == 1) {
                     scratch(ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
                         g->input, batch, 1, 1));
@@ -84,13 +88,24 @@ std::size_t body(const ModelProfile& p, const EngineOptions& options, int first,
                 scratch(linear(g->output, minimum, columns));
             } else {
                 const auto& q = std::get<QsaProfile>(layer.mixer);
-                (void)workspace::qsa(a, p.local.qsa, columns, prefill || mtp);
+                (void)workspace::qsa(a, p.local.qsa, columns, (prefill || mtp) && !ragged);
                 scratch(qsa_projection_workspace_bytes(q, minimum, columns));
                 const auto buckets = ops::ContextBucketRange::through(options.max_context);
-                scratch(ops::qsa_indexer_workspace_capacity_bytes(buckets, batch, first, last));
-                scratch(ops::qsa_sparse_gqa_workspace_capacity_bytes(
-                    options.kv_cache, dimension(p.local.qsa.query_heads),
-                    dimension(p.local.qsa.kv_heads), buckets, batch, first, last, sm_count));
+                const auto qh      = dimension(p.local.qsa.query_heads);
+                const auto kh      = dimension(p.local.qsa.kv_heads);
+                if (ragged) {
+                    const auto segments = dimension(options.max_concurrency);
+                    scratch(ops::qsa_prepare_update_ragged_workspace_capacity_bytes(1, last, 1,
+                                                                                    segments));
+                    scratch(ops::qsa_indexer_ragged_workspace_capacity_bytes(buckets, 1, last, 1,
+                                                                             segments));
+                    scratch(ops::qsa_sparse_gqa_ragged_workspace_capacity_bytes(
+                        options.kv_cache, qh, kh, buckets, 1, last, 1, segments, sm_count));
+                } else {
+                    scratch(ops::qsa_indexer_workspace_capacity_bytes(buckets, batch, first, last));
+                    scratch(ops::qsa_sparse_gqa_workspace_capacity_bytes(
+                        options.kv_cache, qh, kh, buckets, batch, first, last, sm_count));
+                }
                 scratch(linear(q.output, minimum, columns));
             }
         }
@@ -113,8 +128,8 @@ std::size_t body(const ModelProfile& p, const EngineOptions& options, int first,
     return a.peak_bytes();
 }
 
-std::size_t history(const ModelProfile& p, int first, int last, int batch,
-                    bool partitioned = false) {
+std::size_t history(const ModelProfile& p, int first, int last, int batch, bool partitioned = false,
+                    int ragged_segments = 0) {
     WorkspaceLayoutBuilder a;
     const auto columns = dimension(std::uint64_t(last) * batch),
                minimum = dimension(std::uint64_t(first) * batch);
@@ -138,9 +153,12 @@ std::size_t history(const ModelProfile& p, int first, int last, int batch,
     scratch(ops::hc_mix_workspace_capacity_bytes(mtp.history.mix, local_minimum, partition.count));
     {
         auto scope = a.scope();
-        (void)workspace::qsa_history(a, p.local.qsa, columns);
+        (void)workspace::qsa_history(a, p.local.qsa, columns, !ragged_segments);
         scratch(ops::linear_split_workspace_capacity_bytes(
             {mtp.history.input, {}}, mtp.history.output_rows, minimum, columns));
+        if (ragged_segments)
+            scratch(ops::qsa_prepare_kv_update_ragged_workspace_capacity_bytes(1, last, 1,
+                                                                               ragged_segments));
     }
     return a.peak_bytes();
 }
@@ -150,6 +168,9 @@ WorkspacePlan plan_workspace(const ModelProfile& p, const EngineOptions& o, std:
                              std::int32_t sm_count, const moe::Plan* offload) {
     WorkspacePlan out;
     out.prefill = body(p, o, 1, chunk, 1, true, false, sm_count, offload);
+    if (o.purpose == EnginePurpose::Generation)
+        out.prefill =
+            std::max(out.prefill, body(p, o, 1, chunk, 1, true, false, sm_count, offload, true));
     for (std::uint32_t b = 1; b <= o.max_concurrency; ++b) {
         out.ordinary = std::max(out.ordinary, body(p, o, 1, 1, b, false, false, sm_count, offload));
         if (p.mtp) {
@@ -165,9 +186,14 @@ WorkspacePlan plan_workspace(const ModelProfile& p, const EngineOptions& o, std:
                                    ? std::min(dimension(chunk), policy.minimum_columns - 1)
                                    : dimension(chunk);
         out.history          = std::max(out.history, history(p, 1, replicated, 1));
+        const auto segments  = dimension(o.max_concurrency);
+        out.history          = std::max(out.history, history(p, 1, replicated, 1, false, segments));
         if (policy.minimum_columns && chunk >= std::uint32_t(policy.minimum_columns))
             out.history =
                 std::max(out.history, history(p, policy.minimum_columns - 1, chunk, 1, true));
+        if (policy.minimum_columns && chunk >= std::uint32_t(policy.minimum_columns))
+            out.history =
+                std::max(out.history, history(p, policy.minimum_columns, chunk, 1, true, segments));
     }
     const auto head_columns =
         o.purpose == EnginePurpose::CausalScoring

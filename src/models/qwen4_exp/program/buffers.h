@@ -35,6 +35,14 @@ struct MtpBufferLayout {
     TensorRegion last_columns, active_columns, skip_first, previous_rope, history_base_positions;
 };
 
+struct PackedInputLayout {
+    TensorRegion ids, positions, rope_positions;
+    TensorRegion cu_seqlens, seq_lengths, token_to_seq;
+    TensorRegion source_offsets, destination_offsets, table_rows;
+    std::optional<TensorRegion> raw_tail, raw_tail_offsets;
+    LayoutRegion ingress;
+};
+
 struct BufferLayout {
     BatchLayout batch, decode;
     TensorRegion anchors;
@@ -42,6 +50,8 @@ struct BufferLayout {
     TensorRegion commit_destination_offsets;
     TensorRegion prefill_sample;
     std::optional<TensorRegion> prefill_conditioning;
+    std::optional<PackedInputLayout> packed_main, packed_history;
+    std::optional<TensorRegion> prefill_sampled_hidden, prefill_aligned;
     TensorRegion pending_sample;
     std::optional<TensorRegion> pending_conditioning;
     QsaRecordLayout main_qsa;
@@ -58,6 +68,8 @@ struct BufferLayout {
 
 [[nodiscard]] MtpBatchLayout history_control_view(const MtpBatchLayout&, std::uint32_t tokens,
                                                   std::uint32_t rows);
+[[nodiscard]] PackedInputLayout packed_input_view(const PackedInputLayout&, std::int32_t tokens,
+                                                  std::int32_t segments);
 
 void select_buffer_rows(BufferLayout&, const BufferLayout& backing, std::uint32_t rows);
 

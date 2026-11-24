@@ -21,29 +21,39 @@ void gdn(const Tensor& input, const GdnConfig& c, const GdnParameters& p, const 
     auto scope           = arena.scope();
     const auto m         = batch.tokens * batch.batch;
     const auto* sequence = std::get_if<SequenceState>(&update);
-    auto b               = workspace::gdn(arena, c, m, sequence != nullptr);
+    const auto* packed   = std::get_if<PackedPrefillState>(&update);
+    auto b               = workspace::gdn(arena, c, m, sequence_update(update));
     {
         auto scratch = arena.scope();
         ops::gdn_control_proj(input, p.control, p.a_log, p.dt_bias, {b.g, b.beta}, arena, cuda);
     }
-    if (sequence) {
+    if (sequence || packed) {
         {
             auto scratch = arena.scope();
             const std::array outputs{b.qkv, b.z};
             ops::linear_split(input, p.input, outputs, arena, cuda);
         }
-        auto before = states.conv_tensor(layer, sequence->source);
-        auto after  = states.conv_tensor(layer, sequence->destination);
-        auto q      = b.query.view({kw, m});
-        auto k      = b.key.view({kw, m});
-        auto v      = b.value.view({vw, m});
-        ops::causal_conv1d_silu_split(b.qkv, p.convolution, before, after, q, k, v, cuda);
-        auto initial   = states.recurrent_tensor(layer, sequence->source);
-        auto final     = states.recurrent_tensor(layer, sequence->destination);
+        auto q         = b.query.view({kw, m});
+        auto k         = b.key.view({kw, m});
+        auto v         = b.value.view({vw, m});
         auto recurrent = b.recurrent.view({vd, vh, m});
         auto scratch   = arena.scope();
-        ops::gated_delta_net(b.query, b.key, b.value, b.g, b.beta, scale, true, arena, initial,
-                             final, recurrent, cuda);
+        if (packed) {
+            const auto before = states.layer_view(layer, batch.source_offsets);
+            const auto after  = states.layer_view(layer, batch.destination_offsets);
+            ops::causal_conv1d_silu_split(b.qkv, p.convolution, packed->ragged, before.conv,
+                                          after.conv, q, k, v, cuda);
+            ops::gated_delta_net(b.query, b.key, b.value, b.g, b.beta, scale, true, packed->ragged,
+                                 arena, before.recurrent, after.recurrent, recurrent, cuda);
+        } else {
+            auto before = states.conv_tensor(layer, sequence->source);
+            auto after  = states.conv_tensor(layer, sequence->destination);
+            ops::causal_conv1d_silu_split(b.qkv, p.convolution, before, after, q, k, v, cuda);
+            auto initial = states.recurrent_tensor(layer, sequence->source);
+            auto final   = states.recurrent_tensor(layer, sequence->destination);
+            ops::gated_delta_net(b.query, b.key, b.value, b.g, b.beta, scale, true, arena, initial,
+                                 final, recurrent, cuda);
+        }
     } else if (const auto* record = std::get_if<VerifyRecords>(&update)) {
         auto state         = states.layer_view(layer, batch.source_offsets);
         const auto records = record->gdn.layer(layer, batch.batch);

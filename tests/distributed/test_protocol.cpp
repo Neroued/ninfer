@@ -217,7 +217,7 @@ void cache_profiles_roundtrip() {
                          KvCacheStorage::Fp8E4m3fnGroup128Ue8m0, KvCacheStorage::Nvfp4Group16,
                          KvCacheStorage::Fp8KeyNvfp4Value}) {
         q::RankLoadRequest request{};
-        request.options.kv_cache = storage;
+        request.options.kv_cache                  = storage;
         request.options.speculative.length_policy = SpeculativeLengthPolicy::Fixed;
         request.batches = models::make_batch_execution_spec(request.options.max_concurrency, 1,
                                                             request.options.use_cuda_graph);
@@ -548,6 +548,7 @@ void native_work() {
     auto prefill_row           = original;
     prefill_row.ids            = {23, 24};
     prefill_row.rope_positions = {7, 8, 9, 10, 11, 12};
+    prefill_row.sample         = true;
     q::Work forward{{},
                     q::ForwardWork{q::ForwardKind::Prefill,
                                    q::SampleKind::FirstToken,

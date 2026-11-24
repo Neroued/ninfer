@@ -48,6 +48,7 @@ void mtp_forward(const TextConfig&, const QsaConfig&, const MtpParameters&,
 struct MtpHistoryInput {
     Tensor conditioning;
     TokenPartition columns;
+    const ops::RaggedSequenceView* ragged = nullptr;
 };
 
 void mtp_history(const TextConfig&, const QsaConfig&, const MtpParameters&, MtpHistoryInput,

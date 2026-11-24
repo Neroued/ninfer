@@ -23,6 +23,9 @@ public:
                                                        std::uint32_t tokens,
                                                        std::uint32_t physical_rows,
                                                        std::span<const ple::InputRow>);
+    [[nodiscard]] std::optional<ple::Ticket> try_require_ragged(runtime::ExecutionTicket,
+                                                                std::uint32_t total_tokens,
+                                                                std::span<const ple::InputRow>);
     void append_device(ple::Ticket, const Tensor& ids, std::span<const std::uint32_t> extents,
                        std::uint32_t step);
     // Capture only the CUDA handoff. Host bookkeeping follows the submitted chain replay.
@@ -59,6 +62,7 @@ private:
         std::vector<std::uint32_t> known, valid;
         void reset();
         bool seal_requested = false, sealed = false;
+        bool ragged                = false;
         std::uint32_t append_count = 0, next_append = 0;
         bool uploaded = false, acquired = false, consumed = false, cancelled = false;
         std::exception_ptr error;

@@ -127,7 +127,10 @@ runtime::WorkPayloadCapacity WorkContract::payload_capacity(std::uint32_t rank_c
     // Presence, physical width, proposal depth, path and optional graph entry.
     constexpr std::size_t route_bytes = 1 + 4 + 4 + 1 + 1 + 4;
     const auto work =
-        std::max({payload(1, chunk, 20 * chunk), payload(batch, width, 16) + route_bytes,
+        std::max({payload(1, chunk, 20 * chunk),
+                  header + context::ragged_write_action_capacity(batch, pools, chunk) + 136 +
+                      batch * 208 + 20 * chunk,
+                  payload(batch, width, 16) + route_bytes,
                   payload(batch, control_token_limit, 8ULL * control_token_limit)});
     const auto context = header + context::action_batch_capacity() + 128 + 88 +
                          TokenCounts::encoded_capacity(public_tokens) + 16 * batch;
@@ -244,12 +247,14 @@ void WorkContract::validate(const Work& work, runtime::FrameKind kind) const {
                 const auto count = rows.front().ids.size();
                 if (operation.kind != ForwardKind::Control && count > shape.prefill_chunk)
                     throw std::invalid_argument("Qwen4Exp forward window exceeds its frame");
-                for (const auto& row : rows)
-                    if (row.ids.size() != count)
-                        throw std::invalid_argument("Qwen4Exp forward rows have different lengths");
+                if (operation.kind != ForwardKind::Prefill)
+                    for (const auto& row : rows)
+                        if (row.ids.size() != count)
+                            throw std::invalid_argument(
+                                "Qwen4Exp forward rows have different lengths");
                 if (operation.visual) {
                     const auto& use = operation.visual->window;
-                    if (!vision || rows.size() != 1 || !use.id || !use.plan ||
+                    if (!vision || rows.size() != 1 || !count || !use.id || !use.plan ||
                         use.owner.sequence != rows.front().member.sequence ||
                         use.owner.residency != rows.front().member.residency ||
                         (operation.kind != ForwardKind::Prefill &&
@@ -260,12 +265,35 @@ void WorkContract::validate(const Work& work, runtime::FrameKind kind) const {
                 }
                 const bool sampling = operation.sample != SampleKind::None;
                 switch (operation.kind) {
-                case ForwardKind::Prefill:
-                    if (rows.size() != 1 || operation.sample == SampleKind::NextToken ||
-                        (!count && (operation.sample != SampleKind::FirstToken ||
-                                    !rows.front().main_frontier)))
+                case ForwardKind::Prefill: {
+                    std::size_t total = 0;
+                    bool any_sample   = false;
+                    std::unordered_map<std::uint32_t, std::unordered_set<std::int64_t>> reads,
+                        writes;
+                    for (const auto& row : rows) {
+                        total += row.ids.size();
+                        any_sample |= row.sample;
+                        if ((row.ids.empty() && (!row.sample || !row.main_frontier)) ||
+                            (row.constrained && !row.sample))
+                            throw std::invalid_argument("invalid Qwen4Exp prefill row");
+                        for (const auto& [rank, offsets] : row.states) {
+                            auto& rank_reads  = reads[rank];
+                            auto& rank_writes = writes[rank];
+                            if (rank_writes.contains(offsets.destination) ||
+                                rank_writes.contains(offsets.source) ||
+                                rank_reads.contains(offsets.destination))
+                                throw std::invalid_argument(
+                                    "Qwen4Exp prefill rows have overlapping State writes");
+                            rank_reads.insert(offsets.source);
+                            rank_writes.insert(offsets.destination);
+                        }
+                    }
+                    if (total > shape.prefill_chunk ||
+                        operation.sample !=
+                            (any_sample ? SampleKind::FirstToken : SampleKind::None))
                         throw std::invalid_argument("invalid Qwen4Exp prefill work");
                     break;
+                }
                 case ForwardKind::Replay:
                     if (rows.size() != 1 || !count || sampling)
                         throw std::invalid_argument("invalid Qwen4Exp replay work");
@@ -290,9 +318,13 @@ void WorkContract::validate(const Work& work, runtime::FrameKind kind) const {
                     member(next.member, shape.max_concurrency);
                     if ((operation.kind != ForwardKind::Prefill &&
                          operation.kind != ForwardKind::Replay) ||
-                        rows.size() != 1 || !same_member(next.member, rows.front().member) ||
-                        next.frontier != rows.front().main_frontier + count || next.ids.empty() ||
-                        next.ids.size() > shape.prefill_chunk ||
+                        !std::ranges::any_of(rows,
+                                             [&](const WorkRow& row) {
+                                                 return same_member(next.member, row.member) &&
+                                                        next.frontier ==
+                                                            row.main_frontier + row.ids.size();
+                                             }) ||
+                        next.ids.empty() || next.ids.size() > shape.prefill_chunk ||
                         next.frontier > shape.max_context ||
                         next.ids.size() > shape.max_context - next.frontier)
                         throw std::invalid_argument("invalid Qwen4Exp PLE prefetch window");
@@ -378,11 +410,16 @@ void WorkContract::validate(const Work& work, const runtime::DecisionRequest& re
                             const runtime::DecisionInput& input) const {
     const auto rows = work_rows(work);
     std::vector<std::uint32_t> positions(rows.size());
-    const auto* mtp_work = std::get_if<MtpWork>(&work.operation);
+    const auto* mtp_work   = std::get_if<MtpWork>(&work.operation);
+    const auto* forward    = std::get_if<ForwardWork>(&work.operation);
+    const bool prefill     = forward && forward->kind == ForwardKind::Prefill;
+    const auto constrained = [&](std::size_t b) {
+        return rows[b].constrained && (!prefill || rows[b].sample);
+    };
     if (request.vocabulary != public_tokens)
         throw std::invalid_argument("Qwen4Exp decision request differs from its work");
     for (const auto& row : request.rows) {
-        if (row.member >= rows.size() || !rows[row.member].constrained || positions[row.member])
+        if (row.member >= rows.size() || !constrained(row.member) || positions[row.member])
             throw std::invalid_argument("Qwen4Exp decision request has an unexpected member");
         const auto verified = mtp_work ? mtp_work->draft_extents.at(row.member) : 0U;
         if (row.drafts.size() != verified)
@@ -391,7 +428,7 @@ void WorkContract::validate(const Work& work, const runtime::DecisionRequest& re
         positions[row.member] = verified + 1;
     }
     for (std::size_t i = 0; i < rows.size(); ++i)
-        if (rows[i].constrained != bool(positions[i]))
+        if (constrained(i) != bool(positions[i]))
             throw std::invalid_argument("incomplete Qwen4Exp decision request");
     validate_decision_rows(input, request.stage, public_tokens, {positions.data(), rows.size()});
 }
@@ -413,6 +450,7 @@ void WorkContract::validate_commit(const Work& work, std::span<const RowResult> 
     const auto* mtp_work = std::get_if<MtpWork>(&work.operation);
     const bool scoring   = std::holds_alternative<ScoreWork>(work.operation);
     const bool sampled   = mtp_work || (forward && forward->sample != SampleKind::None);
+    const bool prefill   = forward && forward->kind == ForwardKind::Prefill;
     if (commit.rows.size() != rows.size() || (!scoring && results.size() != rows.size()))
         throw std::logic_error("Qwen4Exp commit rows differ from its result");
     std::unordered_map<std::uint32_t, std::unordered_set<std::int64_t>> reads, writes;
@@ -443,7 +481,9 @@ void WorkContract::validate_commit(const Work& work, std::span<const RowResult> 
                          results[b].tokens.size() != std::uint64_t(results[b].accepted_drafts) + 1))
             throw std::invalid_argument(
                 "Qwen4Exp acceptance result differs from its verified prefix");
-        if (sampled) {
+        if (prefill && results[b].tokens.size() != std::size_t(source.sample))
+            throw std::invalid_argument("Qwen4Exp prefill result changed its sampling membership");
+        if (prefill ? source.sample : sampled) {
             const auto& output  = results[b];
             const auto produced = output.tokens.size();
             const auto reached  = produced < 32 ? (std::uint32_t(1) << produced) - 1 : UINT32_MAX;

@@ -4,6 +4,7 @@
 #include "core/transfer.h"
 
 #include <algorithm>
+#include <numeric>
 #include <string>
 #include <thread>
 
@@ -43,15 +44,15 @@ void PlePipeline::Window::reset() {
     allocated = false;
     owner.reset();
     rows.clear();
-    seal_requested = sealed = uploaded = acquired = consumed = cancelled = false;
+    seal_requested = sealed = ragged = uploaded = acquired = consumed = cancelled = false;
     append_count = next_append = 0;
     error                      = {};
 }
 
 bool PlePipeline::matches(const Window& w, std::uint32_t tokens, std::uint32_t physical_rows,
                           std::span<const ple::InputRow> rows) const {
-    if (w.cancelled || w.acquired || w.tokens != tokens || w.physical_rows != physical_rows ||
-        w.rows.size() != rows.size())
+    if (w.ragged || w.cancelled || w.acquired || w.tokens != tokens ||
+        w.physical_rows != physical_rows || w.rows.size() != rows.size())
         return false;
     std::size_t offset = 0;
     for (std::size_t b = 0; b < rows.size(); ++b) {
@@ -140,11 +141,44 @@ std::optional<ple::Ticket> PlePipeline::try_require(runtime::ExecutionTicket own
     return ticket;
 }
 
+std::optional<ple::Ticket> PlePipeline::try_require_ragged(runtime::ExecutionTicket owner,
+                                                           std::uint32_t tokens,
+                                                           std::span<const ple::InputRow> rows) {
+    // A single packed segment can claim the existing single-row next-window prefetch.
+    if (rows.size() == 1 && rows.front().ids.size() == tokens)
+        return try_require(owner, tokens, 1, rows);
+    if (drained_) throw std::logic_error("PLE pipeline is shut down");
+    nvtx::ScopedRange prepare(nvtx::Name::PlePrepare, nvtx::Category::Runtime, tokens);
+    progress();
+    const auto ticket = resources_.ple_prepare->prepare_ragged(tokens, rows);
+    if (!ticket) {
+        for (auto& w : windows_)
+            if (w.allocated && !w.owner) cancel(w);
+        return {};
+    }
+    auto& w = windows_.at(ticket->slot);
+    if (w.allocated) throw std::logic_error("PLE producer reused a live window");
+    w.reset();
+    w.allocated = w.ragged = w.seal_requested = w.sealed = true;
+    w.owner                                              = owner;
+    w.tokens                                             = tokens;
+    w.physical_rows                                      = 1;
+    w.ticket                                             = *ticket;
+    std::size_t offset                                   = 0;
+    for (std::size_t b = 0; b < rows.size(); ++b) {
+        w.rows.push_back(rows[b].identity);
+        w.known[b] = w.valid[b] = rows[b].ids.size();
+        std::copy(rows[b].ids.begin(), rows[b].ids.end(), w.ids.begin() + offset);
+        offset += w.known[b];
+    }
+    return ticket;
+}
+
 void PlePipeline::append_device(ple::Ticket ticket, const Tensor& ids,
                                 std::span<const std::uint32_t> extents, std::uint32_t step) {
     auto& w      = window(ticket);
     const auto k = resources_.plan.shape.draft_tokens;
-    if (step >= k || extents.size() != w.rows.size() ||
+    if (w.ragged || step >= k || extents.size() != w.rows.size() ||
         ids.numel() != static_cast<std::int64_t>(w.physical_rows) || ids.dtype != DType::I32 ||
         !ids.is_contiguous())
         throw std::logic_error("invalid PLE draft handoff");
@@ -227,7 +261,9 @@ std::span<const std::int32_t> PlePipeline::input(ple::Ticket ticket, std::uint32
     if (w.error) std::rethrow_exception(w.error);
     if (!w.sealed || w.cancelled || row >= w.rows.size())
         throw std::logic_error("PLE IDs are not complete");
-    return std::span<const std::int32_t>(w.ids).subspan(row * w.tokens, w.valid[row]);
+    const auto offset =
+        w.ragged ? std::accumulate(w.valid.begin(), w.valid.begin() + row, 0U) : row * w.tokens;
+    return std::span<const std::int32_t>(w.ids).subspan(offset, w.valid[row]);
 }
 
 void PlePipeline::prefetch(std::uint32_t tokens, std::span<const ple::InputRow> rows) {

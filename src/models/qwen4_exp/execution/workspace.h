@@ -104,12 +104,12 @@ struct QsaHistoryBuffers {
 };
 
 template <class Arena>
-QsaHistoryBuffers qsa_history(Arena& a, const QsaConfig& c, std::int32_t m) {
+QsaHistoryBuffers qsa_history(Arena& a, const QsaConfig& c, std::int32_t m, bool records = true) {
     const auto d = dimension(c.head_dim), kh = dimension(c.kv_heads);
     const auto ik = dimension(c.index_key_width());
     return {a.alloc(DType::BF16, {d, kh, m}), a.alloc(DType::BF16, {d, kh, m}),
-            a.alloc(DType::BF16, {ik, m}), a.alloc(DType::BF16, {ik, m}),
-            a.alloc(DType::I32, {3, m})};
+            a.alloc(DType::BF16, {ik, m}), records ? a.alloc(DType::BF16, {ik, m}) : Tensor{},
+            records ? a.alloc(DType::I32, {3, m}) : Tensor{}};
 }
 
 struct PleBuffers {

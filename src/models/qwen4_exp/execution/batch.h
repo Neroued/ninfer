@@ -4,6 +4,7 @@
 
 #include "core/tensor.h"
 #include "core/gdn_replay_records.h"
+#include "ninfer/ops/ragged.h"
 
 #include <variant>
 #include <vector>
@@ -24,13 +25,22 @@ struct SequenceState {
     std::int64_t source, destination;
 };
 
+struct PackedPrefillState {
+    ops::RaggedSequenceView ragged;
+};
+
 struct StepUpdate {};
 
 struct VerifyRecords {
     const GdnReplayRecords& gdn;
 };
 
-using StateUpdate = std::variant<SequenceState, StepUpdate, VerifyRecords>;
+using StateUpdate = std::variant<SequenceState, StepUpdate, VerifyRecords, PackedPrefillState>;
+
+inline bool sequence_update(const StateUpdate& update) {
+    return std::holds_alternative<SequenceState>(update) ||
+           std::holds_alternative<PackedPrefillState>(update);
+}
 
 struct TextOutputs {
     Tensor sample;

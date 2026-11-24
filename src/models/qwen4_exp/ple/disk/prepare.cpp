@@ -47,7 +47,7 @@ struct PrepareService::Impl {
         MemorySpan output;
         std::vector<std::int32_t> ids;
         std::vector<SequenceIdentity> identities;
-        std::vector<std::uint32_t> known, planned, valid;
+        std::vector<std::uint32_t> known, planned, valid, offsets;
         std::vector<std::uint8_t> seen;
         std::uint64_t generation = 0;
         std::uint32_t tokens = 0, batch = 0, logical_rows = 0;
@@ -55,6 +55,7 @@ struct PrepareService::Impl {
         std::exception_ptr error;
         bool allocated = false, released = false, bound = false, required = true, promoted = false;
         bool sealed = false, seal_applied = false, cancelled = false, cancel_applied = false;
+        bool ragged  = false;
         bool drained = true;
     };
 
@@ -81,6 +82,7 @@ struct PrepareService::Impl {
             windows[i].known.resize(this->options.max_rows);
             windows[i].planned.resize(this->options.max_rows);
             windows[i].valid.resize(this->options.max_rows);
+            windows[i].offsets.resize(this->options.max_rows);
             windows[i].seen.resize(this->options.max_rows);
         }
         std::optional<CpuTopology> topology;
@@ -114,6 +116,9 @@ struct PrepareService::Impl {
     }
 
     static WindowSnapshot snapshot(const Window& w) { return {w.status, w.drained, w.error}; }
+
+    std::optional<Ticket> prepare(std::uint32_t tokens, std::uint32_t physical_rows,
+                                  std::span<const InputRow> rows, bool required, bool ragged);
 
     bool tick() {
         // This bounded critical section serializes control changes with all E writers.
@@ -164,12 +169,14 @@ struct PrepareService::Impl {
             for (std::uint32_t i = 0; i < windows.size() && budget; ++i) {
                 auto& w = windows[i];
                 if (!w.allocated || w.released || w.cancelled || w.required != required) continue;
-                for (std::uint32_t b = 0; b < w.batch && budget; ++b) {
+                const auto segments = w.ragged ? w.logical_rows : w.batch;
+                for (std::uint32_t b = 0; b < segments && budget; ++b) {
                     const auto end   = w.sealed ? w.valid[b] : w.known[b];
                     const auto start = w.planned[b];
                     if (start >= end) continue;
-                    const auto count = std::min<std::size_t>(budget, end - start);
-                    const auto* ids  = w.ids.data() + b * w.tokens;
+                    const auto count  = std::min<std::size_t>(budget, end - start);
+                    const auto offset = w.ragged ? w.offsets[b] : b * w.tokens;
+                    const auto* ids   = w.ids.data() + offset;
                     const std::array tail{start >= 2 ? ids[start - 2]
                                                      : (start == 1 ? w.identities[b].raw_tail[1]
                                                                    : w.identities[b].raw_tail[0]),
@@ -178,7 +185,7 @@ struct PrepareService::Impl {
                     hash_tokens({ids + start, count}, tail, eos, table.parameters().hash,
                                 std::span(rows).first(count * kHeads));
                     for (std::size_t r = 0; r < count * kHeads; ++r)
-                        reader.request(i, (b * w.tokens + start) * kHeads + r, rows[r]);
+                        reader.request(i, (offset + start) * kHeads + r, rows[r]);
                     w.planned[b] += count;
                     budget -= count;
                 }
@@ -197,7 +204,8 @@ struct PrepareService::Impl {
             }
             w.drained    = (!w.cancelled || w.cancel_applied) && (!w.bound || reader.drained(i));
             bool planned = true;
-            for (std::uint32_t b = 0; b < w.batch; ++b)
+            const auto segments = w.ragged ? w.logical_rows : w.batch;
+            for (std::uint32_t b = 0; b < segments; ++b)
                 planned &= w.planned[b] >= (w.sealed ? w.valid[b] : w.known[b]);
             if (!w.cancelled && w.sealed && planned && !reader.pending(i))
                 w.status = PrepareStatus::HostReady;
@@ -244,48 +252,71 @@ PrepareService::~PrepareService() = default;
 
 std::optional<Ticket> PrepareService::prepare(std::uint32_t tokens, std::uint32_t physical_rows,
                                               std::span<const InputRow> rows, bool required) {
-    auto& p = *impl_;
-    std::lock_guard lock(p.mutex);
-    if (p.fatal) std::rethrow_exception(p.fatal);
-    if (!tokens || rows.empty() || rows.size() > physical_rows ||
-        physical_rows > p.options.max_rows ||
-        std::uint64_t(tokens) * physical_rows > p.options.max_positions)
+    return impl_->prepare(tokens, physical_rows, rows, required, false);
+}
+
+std::optional<Ticket> PrepareService::prepare_ragged(std::uint32_t tokens,
+                                                     std::span<const InputRow> rows,
+                                                     bool required) {
+    return impl_->prepare(tokens, 1, rows, required, true);
+}
+
+std::optional<Ticket> PrepareService::Impl::prepare(std::uint32_t tokens,
+                                                    std::uint32_t physical_rows,
+                                                    std::span<const InputRow> rows, bool required,
+                                                    bool ragged) {
+    std::lock_guard lock(mutex);
+    if (fatal) std::rethrow_exception(fatal);
+    if (!tokens || rows.empty() || rows.size() > (ragged ? options.max_rows : physical_rows) ||
+        physical_rows > options.max_rows ||
+        std::uint64_t(tokens) * physical_rows > options.max_positions)
         throw std::invalid_argument("invalid PLE window shape");
+    std::size_t total = 0;
     for (const auto& row : rows) {
-        if (row.ids.size() > tokens || row.identity.raw_tail[0] < 0 || row.identity.raw_tail[1] < 0)
+        if (row.ids.size() > tokens || (ragged && row.ids.empty()) ||
+            row.identity.raw_tail[0] < 0 || row.identity.raw_tail[1] < 0)
             throw std::invalid_argument("invalid PLE input prefix");
+        total += row.ids.size();
         check_ids(row.ids);
     }
+    if (ragged && total != tokens)
+        throw std::invalid_argument("PLE segment lengths differ from their packed window");
     std::size_t free  = 0;
     bool has_required = false;
-    for (const auto& w : p.windows) {
+    for (const auto& w : windows) {
         free += !w.allocated;
         has_required |= w.allocated && !w.released && !w.cancelled && w.required;
     }
     if (!free || (!required && !has_required && free < 2)) return {};
-    for (std::uint32_t slot = 0; slot < p.windows.size(); ++slot) {
-        auto& w = p.windows[slot];
+    for (std::uint32_t slot = 0; slot < windows.size(); ++slot) {
+        auto& w = windows[slot];
         if (w.allocated) continue;
         ++w.generation;
         w.tokens       = tokens;
         w.batch        = physical_rows;
         w.logical_rows = rows.size();
         w.allocated    = true;
-        w.released = w.bound = w.promoted = w.sealed = w.seal_applied = false;
+        w.released = w.bound = w.promoted = false;
+        w.ragged = w.sealed = w.seal_applied = ragged;
         w.cancelled = w.cancel_applied = false;
         w.required                     = required;
         w.drained                      = false;
         w.status                       = PrepareStatus::Preparing;
         w.error                        = {};
-        std::fill_n(w.known.begin(), w.batch, 0);
-        std::fill_n(w.planned.begin(), w.batch, 0);
-        std::fill_n(w.valid.begin(), w.batch, 0);
+        const auto segments            = ragged ? w.logical_rows : w.batch;
+        std::fill_n(w.known.begin(), segments, 0);
+        std::fill_n(w.planned.begin(), segments, 0);
+        std::fill_n(w.valid.begin(), segments, 0);
+        std::uint32_t offset = 0;
         for (std::size_t b = 0; b < rows.size(); ++b) {
             w.identities[b] = rows[b].identity;
             w.known[b]      = rows[b].ids.size();
-            std::copy(rows[b].ids.begin(), rows[b].ids.end(), w.ids.begin() + b * tokens);
+            w.offsets[b]    = offset;
+            std::copy(rows[b].ids.begin(), rows[b].ids.end(), w.ids.begin() + offset);
+            if (ragged) w.valid[b] = w.known[b];
+            offset += ragged ? w.known[b] : tokens;
         }
-        p.reader.wake();
+        reader.wake();
         return Ticket{slot, w.generation};
     }
     throw std::logic_error("PLE free slot disappeared");
@@ -359,10 +390,12 @@ HostEmbedding PrepareService::embedding(Ticket ticket) const {
     const auto& w = impl_->get(ticket);
     if (w.cancelled || w.status != PrepareStatus::HostReady)
         throw std::logic_error("PLE embedding is not HostReady");
-    return {ticket,
-            w.output.subspan(0, std::size_t(w.tokens) * w.batch * kEmbeddingBytes),
-            {w.tokens, w.batch, std::span(w.valid).first(w.batch),
-             std::span(w.identities).first(w.logical_rows)}};
+    return {
+        ticket,
+        w.output.subspan(0, std::size_t(w.tokens) * w.batch * kEmbeddingBytes),
+        {w.tokens, w.batch, w.ragged ? std::span(&w.tokens, 1) : std::span(w.valid).first(w.batch),
+         std::span(w.identities).first(w.logical_rows),
+         w.ragged ? std::span(w.offsets).first(w.logical_rows) : std::span<const std::uint32_t>{}}};
 }
 
 void PrepareService::release(Ticket ticket) {
@@ -388,7 +421,7 @@ std::size_t PrepareService::memory_bytes() const noexcept {
            p.windows.size() *
                (sizeof(Impl::Window) + std::size_t(p.options.max_positions) * sizeof(std::int32_t) +
                 std::size_t(p.options.max_rows) *
-                    (sizeof(SequenceIdentity) + 3 * sizeof(std::uint32_t) + sizeof(std::uint8_t))) +
+                    (sizeof(SequenceIdentity) + 4 * sizeof(std::uint32_t) + sizeof(std::uint8_t))) +
            p.reader.memory_bytes();
 }
 
@@ -401,7 +434,7 @@ std::size_t PrepareService::memory_bytes(TableGeometry table, const PrepareOptio
            std::size_t(slots) *
                (sizeof(Impl::Window) + std::size_t(options.max_positions) * sizeof(std::int32_t) +
                 std::size_t(options.max_rows) *
-                    (sizeof(SequenceIdentity) + 3 * sizeof(std::uint32_t) + sizeof(std::uint8_t))) +
+                    (sizeof(SequenceIdentity) + 4 * sizeof(std::uint32_t) + sizeof(std::uint8_t))) +
            RowReader::memory_bytes(table, slots, options.max_positions * kHeads, options.io_depth,
                                    options.cache_bytes);
 }

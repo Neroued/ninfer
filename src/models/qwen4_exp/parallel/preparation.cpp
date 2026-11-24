@@ -84,8 +84,8 @@ std::vector<distributed::GroupRequirements> RankPreparation::communication_requi
         if (profile_->mtp) {
             const auto conditioning = std::size_t(profile_->config.text.residual_width());
             for (std::uint32_t owner = 0; owner < profile_->local.size; ++owner)
-                work.push_back({Collective::Broadcast, DType::BF16, conditioning, conditioning, 1,
-                                Reduction::Sum, owner});
+                work.push_back({Collective::Broadcast, DType::BF16, conditioning,
+                                conditioning * batch, 1, Reduction::Sum, owner});
         }
     }
     if (plan.persistent.buffers.ple_embedding) {

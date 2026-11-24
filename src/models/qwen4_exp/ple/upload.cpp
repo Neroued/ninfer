@@ -5,7 +5,9 @@
 #include "core/transfer.h"
 #include "ninfer/types.h"
 
+#include <algorithm>
 #include <exception>
+#include <functional>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -137,10 +139,20 @@ std::span<const MemorySpan> UploadSlots::host_slots() const noexcept { return im
 void UploadSlots::upload(const HostEmbedding& input, CudaExecutionView transfer) {
     auto& p = *impl_;
     p.validate(transfer);
-    const auto bytes = p.bytes(input.window.tokens, input.window.batch);
-    if (input.window.valid_columns.size() != input.window.batch ||
-        input.window.identities.empty() || input.window.identities.size() > input.window.batch)
+    const auto bytes   = p.bytes(input.window.tokens, input.window.batch);
+    const auto offsets = input.window.segment_offsets;
+    if (input.window.valid_columns.size() != input.window.batch || input.window.identities.empty())
         throw std::invalid_argument("invalid PLE window metadata");
+    if (!offsets.empty()) {
+        if (input.window.batch != 1 || input.window.valid_columns.front() != input.window.tokens ||
+            offsets.size() != input.window.identities.size() || offsets.front() != 0 ||
+            offsets.back() >= input.window.tokens ||
+            std::adjacent_find(offsets.begin(), offsets.end(), std::greater_equal{}) !=
+                offsets.end())
+            throw std::invalid_argument("invalid packed PLE window metadata");
+    } else if (input.window.identities.size() > input.window.batch) {
+        throw std::invalid_argument("invalid PLE window metadata");
+    }
     for (std::size_t row = 0; row < input.window.batch; ++row)
         if (input.window.valid_columns[row] > input.window.tokens ||
             (row >= input.window.identities.size() && input.window.valid_columns[row]))

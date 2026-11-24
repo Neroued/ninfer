@@ -43,6 +43,10 @@ public:
     [[nodiscard]] std::optional<Ticket> prepare(std::uint32_t tokens, std::uint32_t physical_rows,
                                                 std::span<const InputRow> rows,
                                                 bool required = true);
+    // Complete positive-length segments packed into one physical row. Already sealed.
+    [[nodiscard]] std::optional<Ticket> prepare_ragged(std::uint32_t total_tokens,
+                                                       std::span<const InputRow> rows,
+                                                       bool required = true);
     void prioritize(Ticket);
     void append(Ticket, std::span<const Append>);
     // Final lengths do not exceed known prefixes. Sealing truncates candidates for this

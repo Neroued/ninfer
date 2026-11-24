@@ -20,11 +20,11 @@ void extract(const ops::QsaTailStateView& before, ops::QsaTailStateView after,
 QsaRun::QsaRun(const Tensor& input, const QsaConfig& c, const QsaParameters& p, BatchView batch,
                ops::QsaTailStateView before, std::optional<ops::QsaTailStateView> after,
                ops::QsaCacheView cache, ops::QsaRawRecordWriteView records, Tensor output,
-               MemoryArena& arena, CudaExecutionView cuda)
+               MemoryArena& arena, CudaExecutionView cuda, const PackedPrefillState* packed)
     : input_(input), output_(output), config_(c), parameters_(p), batch_(batch), before_(before),
-      after_(after), cache_(cache), records_(records), arena_(arena), cuda_(cuda),
-      scope_(arena.scope()),
-      buffers_(workspace::qsa(arena, c, batch.tokens * batch.batch, !records.raw_keys.data)) {}
+      after_(after), cache_(cache), records_(records), arena_(arena), cuda_(cuda), packed_(packed),
+      scope_(arena.scope()), buffers_(workspace::qsa(arena, c, batch.tokens * batch.batch,
+                                                     !packed && !records.raw_keys.data)) {}
 
 void QsaRun::prepare() {
     const auto d = dimension(config_.head_dim), qh = dimension(config_.query_heads),
@@ -34,7 +34,7 @@ void QsaRun::prepare() {
     const auto iq = dimension(config_.index_query_width()),
                ik = dimension(config_.index_key_width());
     const auto t = batch_.tokens, b = batch_.batch, m = t * b;
-    if (!records_.raw_keys.data)
+    if (!packed_ && !records_.raw_keys.data)
         records_ = {buffers_.raw_records.view({ik, t, b}),
                     buffers_.coordinate_records.view({3, t, b}), batch_.record_offsets};
     {
@@ -58,11 +58,19 @@ void QsaRun::prepare() {
     }
     auto query       = buffers_.query.view({d, qh, t, b});
     auto index_query = buffers_.index_query.view({id, ih, t, b});
+    const ops::QsaProjectionView projected{query, buffers_.key.view({d, kh, t, b}),
+                                           buffers_.value.view({d, kh, t, b}), index_query,
+                                           buffers_.index_key.view({ik, t, b})};
+    if (packed_) {
+        auto scratch = arena_.scope();
+        ops::qsa_prepare_update(
+            projected, parameters_.prepare, {packed_->ragged, batch_.positions, batch_.table_rows},
+            batch_.rope_positions, before_, cache_, *after_, query, index_query, arena_, cuda_);
+        return;
+    }
     const ops::QsaBatchView metadata{batch_.positions, batch_.valid_columns, batch_.table_rows};
-    ops::qsa_prepare({query, buffers_.key.view({d, kh, t, b}), buffers_.value.view({d, kh, t, b}),
-                      index_query, buffers_.index_key.view({ik, t, b})},
-                     parameters_.prepare, metadata, batch_.rope_positions, before_, cache_,
-                     records_, query, index_query, cuda_);
+    ops::qsa_prepare(projected, parameters_.prepare, metadata, batch_.rope_positions, before_,
+                     cache_, records_, query, index_query, cuda_);
 }
 
 QsaReadout QsaRun::bind_readout() const {
@@ -139,12 +147,27 @@ void QsaRun::finish() {
     ops::linear(
         buffers_.output.view({dimension(config_.query_width()), batch_.tokens * batch_.batch}),
         parameters_.output.weight, output_, parameters_.output.policy, arena_, cuda_);
-    if (after_) extract(before_, *after_, records_, batch_, cuda_);
+    if (after_ && !packed_) extract(before_, *after_, records_, batch_, cuda_);
 }
 
 void QsaRun::execute(const QsaSubmit& submit) {
     prepare();
-    if (submit) {
+    if (packed_) {
+        const auto bucket = ops::select_context_bucket(batch_.max_visible_tokens);
+        const auto call   = bind_readout();
+        const ops::QsaRaggedBatchView batch{packed_->ragged, batch_.positions, batch_.table_rows};
+        auto selected = call.selection;
+        auto output   = call.output;
+        {
+            auto scratch = arena_.scope();
+            ops::qsa_indexer(call.index_query, call.index, batch, bucket, arena_, selected, cuda_);
+        }
+        {
+            auto scratch = arena_.scope();
+            ops::qsa_sparse_gqa(call.query, call.gate, call.cache, batch, selected, bucket, arena_,
+                                output, cuda_);
+        }
+    } else if (submit) {
         const auto pages =
             static_cast<std::uint32_t>(cache_.main.k_pages.records.page_offsets.ne[0]);
         submit(readout(ops::ContextBucketRange::through(pages * kPagedKVPageSize)));
@@ -158,24 +181,32 @@ void QsaRun::execute(const QsaSubmit& submit) {
 void qsa_history(const Tensor& input, const QsaConfig& c, const QsaHistoryParameters& p,
                  const BatchView& batch, const ops::QsaTailStateView& before,
                  ops::QsaTailStateView after, ops::QsaCacheView cache, MemoryArena& arena,
-                 CudaExecutionView cuda) {
+                 CudaExecutionView cuda, const ops::RaggedSequenceView* ragged) {
     auto scope   = arena.scope();
     const auto t = batch.tokens, b = batch.batch, m = t * b;
     const auto d = dimension(c.head_dim), kh = dimension(c.kv_heads);
     const auto kw = dimension(c.kv_width()), ik = dimension(c.index_key_width());
-    auto buffers = workspace::qsa_history(arena, c, m);
+    auto buffers = workspace::qsa_history(arena, c, m, !ragged);
     {
         auto scratch = arena.scope();
         const std::array outputs{buffers.key.view({kw, m}), buffers.value.view({kw, m}),
                                  buffers.index_key};
         ops::linear_split(input, p.input, outputs, arena, cuda);
     }
+    const ops::QsaKvProjectionView projected{buffers.key.view({d, kh, t, b}),
+                                             buffers.value.view({d, kh, t, b}),
+                                             buffers.index_key.view({ik, t, b})};
+    if (ragged) {
+        ops::qsa_prepare_kv_update(projected, p.prepare,
+                                   {*ragged, batch.positions, batch.table_rows},
+                                   batch.rope_positions, before, cache, after, arena, cuda);
+        return;
+    }
     const ops::QsaRawRecordWriteView records{buffers.raw_records.view({ik, t, b}),
                                              buffers.coordinate_records.view({3, t, b}),
                                              batch.record_offsets};
-    ops::qsa_prepare_kv({buffers.key.view({d, kh, t, b}), buffers.value.view({d, kh, t, b}),
-                         buffers.index_key.view({ik, t, b})},
-                        p.prepare, {batch.positions, batch.valid_columns, batch.table_rows},
+    ops::qsa_prepare_kv(projected, p.prepare,
+                        {batch.positions, batch.valid_columns, batch.table_rows},
                         batch.rope_positions, before, cache, records, cuda);
     extract(before, after, records, batch, cuda);
 }

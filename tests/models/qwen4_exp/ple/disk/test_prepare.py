@@ -86,15 +86,22 @@ def main():
         path = Path(directory) / "small.ninfer"
         fixture(path, hash_controls=CONTROLS)
         decoded, hashes, expected = reference(path)
+        words = [
+            word
+            for b, length in ((0, 5), (1, 2), (3, 1))
+            for row in row_ids(IDS[b][:length], TAILS[b])
+            for word in decoded[row]
+        ]
+        packed = struct.pack(f"<{len(words)}H", *words)
         if mode == "--gpu":
-            assert run(executable, path, mode) == expected * 2
+            assert run(executable, path, mode) == expected * 2 + packed
         else:
             prefix = struct.pack("<160H", *decoded[44]) * 2
             prefix += struct.pack(f"<{B*T*16}I", *(x for row in hashes for x in row))
-            assert run(executable, path, mode) == prefix + expected * 2
+            assert run(executable, path, mode) == prefix + expected * 2 + packed
             split = Path(directory) / "split.ninfer"
             resegment(path, split)
-            assert run(executable, split, mode) == prefix + expected * 2
+            assert run(executable, split, mode) == prefix + expected * 2 + packed
             # Corrupt one requested row without growing the fixture or creating another artifact.
             with Artifact(path) as artifact:
                 target = artifact.by_id["shard-0"].offset + 80

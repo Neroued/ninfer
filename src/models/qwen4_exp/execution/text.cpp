@@ -12,18 +12,16 @@ namespace ninfer::models::qwen4_exp::execution {
 TextRun::TextRun(const Parameters& p, TextExecution execution, BatchView batch, StateUpdate update,
                  CudaExecutionView cuda)
     : parameters_(p), execution_(execution), batch_(batch), update_(update), cuda_(cuda),
-      partition_(std::holds_alternative<SequenceState>(update)
-                     ? sequence_parallel_policy(p.profile->local.size)
-                           .partition(batch.tokens, p.profile->local.rank)
-                     : TokenPartition(batch.tokens * batch.batch)),
+      partition_(sequence_update(update) ? sequence_parallel_policy(p.profile->local.size)
+                                               .partition(batch.tokens, p.profile->local.rank)
+                                         : TokenPartition(batch.tokens * batch.batch)),
       scope_(execution.workspace.scope()),
       roots_(workspace::roots(execution.workspace, p.profile->config.text,
                               batch.tokens * batch.batch, partition_.padded)),
       expert_activity_(execution.experts ? execution.experts->begin(batch.tokens * batch.batch,
                                                                     batch.active_tokens)
                                          : std::nullopt) {
-    if (batch.tokens <= 0 || batch.batch < 1 ||
-        (std::holds_alternative<SequenceState>(update) && batch.batch != 1) ||
+    if (batch.tokens <= 0 || batch.batch < 1 || (sequence_update(update) && batch.batch != 1) ||
         (std::holds_alternative<StepUpdate>(update) && batch.tokens != 1) ||
         (std::holds_alternative<VerifyRecords>(update) && batch.tokens < 2))
         throw std::invalid_argument("invalid Qwen4Exp sequence/step window");
@@ -74,9 +72,11 @@ bool TextRun::advance_layer(std::uint32_t i) {
         if (execution_.experts && !execution_.experts->try_before_layer(p.moe.bank)) return false;
         mixer(i);
         if (execution_.experts) {
+            const auto valid = std::holds_alternative<PackedPrefillState>(update_)
+                                   ? Tensor{}
+                                   : batch_.valid_columns;
             if (!execution_.experts->start(p.moe.bank, roots_.input, roots_.output,
-                                           {batch_.valid_columns, batch_.tokens},
-                                           execution_.workspace, {})) {
+                                           {valid, batch_.tokens}, execution_.workspace, {})) {
                 waiting_moe_ = true;
                 return false;
             }
@@ -92,7 +92,7 @@ QsaRun TextRun::local_qsa(std::uint32_t i) {
     const auto& p     = parameters_.text.layers[i];
     auto& arena       = execution_.workspace;
     ops::QsaRawRecordWriteView records;
-    if (!std::holds_alternative<SequenceState>(update_)) {
+    if (!sequence_update(update_)) {
         records = {
             execution_.qsa_raw_records.slice(3, state.state_index, 1).slice(2, 0, batch_.batch),
             execution_.qsa_coordinate_records.slice(3, state.state_index, 1)
@@ -106,7 +106,7 @@ QsaRun TextRun::local_qsa(std::uint32_t i) {
     return QsaRun(roots_.input, parameters_.profile->local.qsa, std::get<QsaParameters>(p.mixer),
                   batch_, execution_.states.main_tail(state.state_index, batch_.source_offsets),
                   after, execution_.cache.layer(state.state_index), records, roots_.output, arena,
-                  cuda_);
+                  cuda_, std::get_if<PackedPrefillState>(&update_));
 }
 
 void TextRun::mixer(std::uint32_t i, const QsaSubmit& submit) {
@@ -159,14 +159,15 @@ void TextRun::consume_ple(const Tensor& embedding) {
     const auto& p    = parameters_.text;
     const auto start = parameters_.profile->config.text.ple.layer;
     ops::PleConvRecordWindowView records;
-    if (!std::holds_alternative<SequenceState>(update_))
+    if (!sequence_update(update_))
         records = {execution_.ple_records.slice(2, 0, batch_.batch), batch_.record_offsets};
     const auto after = std::holds_alternative<VerifyRecords>(update_)
                            ? std::nullopt
                            : std::optional{execution_.states.ple(batch_.destination_offsets)};
     ple(embedding, parameters_.profile->config.text, p.ple, batch_,
         execution_.states.ple(batch_.source_offsets), after, records, p.layers[start].attention_hc,
-        roots_.residual, roots_.normalized, execution_.workspace, cuda_);
+        roots_.residual, roots_.normalized, execution_.workspace, cuda_,
+        std::get_if<PackedPrefillState>(&update_));
     if (partition_.split()) {
         roots_.residual   = partition_.local(roots_.residual, 2);
         roots_.normalized = partition_.local(roots_.normalized, 2);

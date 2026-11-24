@@ -129,8 +129,8 @@ void mtp_history(const TextConfig& c, const QsaConfig& qsa_config, const MtpPara
     }
     if (columns.split()) parallel->gather(columns.exchange(roots.input, 1), roots.input, cuda);
     const auto gathered = roots.input.slice(1, 0, columns.columns);
-    qsa_history(gathered, qsa_config, p.history.attention, batch, before, after, cache, arena,
-                cuda);
+    qsa_history(gathered, qsa_config, p.history.attention, batch, before, after, cache, arena, cuda,
+                input.ragged);
 }
 
 } // namespace ninfer::models::qwen4_exp::execution

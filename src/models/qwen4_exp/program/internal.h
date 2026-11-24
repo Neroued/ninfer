@@ -47,6 +47,12 @@ enum class ComputePhase : std::uint8_t {
     Retiring,
 };
 
+struct PackedPrefill {
+    std::vector<std::uint32_t> segments, sampled_members;
+    std::vector<std::int32_t> last_columns;
+    ops::RaggedSequenceView ragged;
+};
+
 struct ComputeFrame {
     runtime::ExecutionRequest<ExecutionTypes> request;
     ComputePhase phase = ComputePhase::Prepare;
@@ -54,6 +60,7 @@ struct ComputeFrame {
     PhysicalBatchShape physical;
     std::optional<ple::Ticket> ple;
     std::optional<VerifyRound> verify;
+    std::optional<PackedPrefill> packed;
     std::unique_ptr<execution::TextRun> run;
     models::TargetGraphBody* graph = nullptr;
     std::optional<speculative::RoundRoute> graph_route;
@@ -123,6 +130,13 @@ public:
     void request_decision();
     void install_sampling(bool speculative);
     void prepare_main_inputs(std::span<const WorkRow>, std::uint32_t tokens);
+    void prepare_packed_prefill();
+    [[nodiscard]] execution::BatchView prepare_packed_inputs(const PackedInputLayout&,
+                                                             std::span<const std::uint32_t> members,
+                                                             std::int32_t tokens, bool history,
+                                                             ops::RaggedSequenceView&);
+    void prepare_packed_device_ple(const PackedInputLayout&);
+    void align_packed_mtp();
     void align_mtp(std::span<const WorkRow>, std::uint32_t tokens, const Tensor& previous,
                    const Tensor& conditioning, std::optional<models::vision::EmbeddingView>);
     void commit_mtp(const Commit&);

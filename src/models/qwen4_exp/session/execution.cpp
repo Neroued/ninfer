@@ -37,6 +37,7 @@ runtime::PrefillBudgetPolicy Session::prefill_budget_policy() const noexcept {
     const auto& shape = impl_->shape;
     return {.max_tokens_global           = shape.prefill_chunk,
             .max_tokens_per_placement    = shape.prefill_chunk,
+            .max_sequences_per_step      = shape.max_concurrency,
             .max_sequences_per_placement = shape.max_concurrency};
 }
 
@@ -78,7 +79,8 @@ Session::start_prefill(std::span<const SequenceHandle> members,
         throw std::logic_error("invalid prefill membership");
     std::vector<std::uint32_t> ends;
     ends.reserve(members.size());
-    const auto mark = p.next_membership_mark();
+    const auto mark         = p.next_membership_mark();
+    std::uint32_t remaining = p.shape.prefill_chunk;
     for (std::size_t b = 0; b < members.size(); ++b) {
         auto& s = p.sequence(members[b]);
         if (s.phase != detail::Phase::Prefill || !s.permit ||
@@ -92,6 +94,9 @@ Session::start_prefill(std::span<const SequenceHandle> members,
         const auto end    = std::min(s.permitted_frontier, begin + tokens);
         if ((info.exclusive && members.size() > 1) || (end == begin && !info.zero_token_sample))
             throw std::logic_error("prefill grant has no executable window");
+        if (end - begin > remaining)
+            throw std::logic_error("prefill grants exceed the shared token budget");
+        remaining -= end - begin;
         ends.push_back(end);
     }
     auto reservation = p.executor->try_reserve(runtime::FrameKind::Compute);

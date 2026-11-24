@@ -39,6 +39,17 @@ void RankProgramImpl::start(runtime::ExecutionRequest<ExecutionTypes>&& request)
                 f.rows = {&work.row, 1};
         },
         f.request.work.operation);
+    if (forward && forward->kind == ForwardKind::Prefill && !forward->visual) {
+        auto& packed = f.packed.emplace();
+        packed.last_columns.reserve(f.rows.size());
+        for (std::uint32_t b = 0; b < f.rows.size(); ++b) {
+            const auto& row = f.rows[b];
+            f.tokens += row.ids.size();
+            if (!row.ids.empty()) packed.segments.push_back(b);
+            if (row.sample) packed.sampled_members.push_back(b);
+            packed.last_columns.push_back(row.ids.empty() ? -1 : dimension(f.tokens) - 1);
+        }
+    }
     resources.compute_actions->submit(
         local_actions(f.request.work.actions, parameters.profile->local.rank));
     advance_compute();
@@ -204,7 +215,7 @@ void RankProgramImpl::finish_result() {
         if (top1) row.target_top1_probability = top1[b];
         for (std::uint32_t step = 0; step < row.drafts; ++step)
             row.draft_confidences.push_back(confidence[step * f.physical.rows + b]);
-        if (sampled) {
+        if (sampled && !f.packed) {
             const auto count = counts ? counts[b] : 1;
             if (count < 1 || static_cast<std::uint32_t>(count) > row.drafts + 1)
                 throw std::logic_error("Qwen4Exp generated prefix exceeds its licensed extent");
@@ -215,6 +226,14 @@ void RankProgramImpl::finish_result() {
         }
         if (auto ns = collect_vision_timing(binding(f.rows[b].member.residency)))
             f.gpu.add_vision(*ns);
+    }
+    if (f.packed) {
+        const auto& members = f.packed->sampled_members;
+        for (std::size_t i = 0; i < members.size(); ++i) {
+            auto& row          = result.rows[members[i]];
+            row.tokens         = {ids[i]};
+            row.dead_positions = f.dead_positions[members[i]];
+        }
     }
     if (f.timer_started)
         f.gpu.add_prefill(
@@ -239,14 +258,16 @@ void RankProgramImpl::commit(runtime::ExecutionTicket ticket, runtime::CommandSe
         commit_mtp(commit);
     else if (const auto* work = std::get_if<ForwardWork>(&f.request.work.operation);
              work && work->sample != SampleKind::None) {
-        const auto& io  = resources.buffers();
-        const int batch = commit.rows.size();
-        auto* lengths   = static_cast<std::int32_t*>(host_tensor(io.batch.count_columns).data);
-        bool any        = false;
+        const auto& io = resources.buffers();
+        const int batch =
+            f.packed ? dimension(f.packed->sampled_members.size()) : dimension(commit.rows.size());
+        auto* lengths = static_cast<std::int32_t*>(host_tensor(io.batch.count_columns).data);
+        bool any      = false;
         for (int b = 0; b < batch; ++b) {
-            const auto& sampling = f.rows[b].sampling;
+            const auto member    = f.packed ? f.packed->sampled_members[b] : b;
+            const auto& sampling = f.rows[member].sampling;
             lengths[b]           = sampling.presence_penalty || sampling.frequency_penalty
-                                       ? commit.rows[b].accepted
+                                       ? commit.rows[member].accepted
                                        : 0;
             any |= lengths[b] != 0;
         }

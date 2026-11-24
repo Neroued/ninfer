@@ -250,6 +250,133 @@ void RankProgramImpl::align_mtp(std::span<const WorkRow> rows, std::uint32_t tok
                  compute->batch.live_rows, cuda);
 }
 
+void RankProgramImpl::align_packed_mtp() {
+    const auto& f       = *compute;
+    const auto& packed  = *f.packed;
+    const auto& buffers = resources.buffers();
+    const auto rank     = parameters.profile->local.rank;
+    const auto policy   = execution::sequence_parallel_policy(parameters.profile->local.size);
+    const auto main     = policy.partition(f.tokens, rank);
+    const auto copy     = [&](const Tensor& destination, const Tensor& source) {
+        copy_bytes_async({destination.data, destination.bytes(), cuda.device()},
+                             {source.data, source.bytes(), cuda.device()}, cuda);
+    };
+    const auto state = [&](std::uint32_t b, bool destination) {
+        const auto& offsets = f.rows[b].states.at(rank);
+        return resources.states->conditioning(destination ? offsets.destination : offsets.source);
+    };
+
+    std::vector<std::uint32_t> members;
+    members.reserve(packed.segments.size());
+    std::int32_t total = 0;
+    for (const auto b : packed.segments) {
+        const auto& row   = f.rows[b];
+        const auto length = dimension(row.ids.size()) - (row.main_frontier == 0);
+        if (!length) continue;
+        members.push_back(b);
+        total += length;
+    }
+    const auto history =
+        main.split() && total ? policy.partition(total, rank) : TokenPartition(std::max(1, total));
+    Tensor aligned;
+    if (total) aligned = device_tensor(*buffers.prefill_aligned).slice(1, 0, history.count);
+
+    // Main columns used for causal pairs and segment-final States are disjoint. Both ranks
+    // derive the same ordered transfer list, including when MTP history is replicated.
+    struct PeerColumn {
+        std::int32_t main, history;
+        std::uint32_t member;
+    };
+
+    std::array<std::vector<PeerColumn>, 2> peer;
+    std::int32_t history_start = 0;
+    for (const auto b : packed.segments) {
+        const auto& row     = f.rows[b];
+        const auto length   = dimension(row.ids.size());
+        const auto last     = packed.last_columns[b];
+        const auto first    = last + 1 - length;
+        const auto previous = row.main_frontier > 0;
+        const auto end      = history_start + length - !previous;
+        if (previous && history_start >= history.begin &&
+            history_start < history.begin + history.count)
+            copy(aligned.slice(1, history_start - history.begin, 1), state(b, false));
+
+        const auto start       = history_start + previous;
+        const auto local_begin = std::max({start, history.begin, start + main.begin - first});
+        const auto local_end =
+            std::min({end, history.begin + history.count, start + main.begin + main.count - first});
+        if (local_begin < local_end) {
+            const auto count = local_end - local_begin;
+            copy(aligned.slice(1, local_begin - history.begin, count),
+                 f.conditioning.slice(1, first + local_begin - start - main.begin, count));
+        }
+        if (main.split()) {
+            for (auto h = start; h < end; ++h) {
+                const auto column = first + h - start;
+                const auto owner  = column / main.segment;
+                if (!history.split() || h / history.segment != owner)
+                    peer[owner].push_back({column, h, b});
+            }
+        }
+        const auto owner = static_cast<std::uint32_t>(last / main.segment);
+        if (!main.split() || owner == rank)
+            copy(state(b, true), f.conditioning.slice(1, last - main.begin, 1));
+        if (main.split()) peer[owner].push_back({last, -1, b});
+        history_start = end;
+    }
+
+    if (main.split()) {
+        const auto scratch  = device_tensor(buffers.mtp->base_conditioning);
+        const auto capacity = static_cast<std::size_t>(scratch.ne[1]);
+        for (std::uint32_t owner = 0; owner < main.ranks; ++owner) {
+            const auto& columns = peer[owner];
+            for (std::size_t begin = 0; begin < columns.size(); begin += capacity) {
+                const auto count = std::min(capacity, columns.size() - begin);
+                auto transfer    = scratch.slice(1, 0, dimension(count));
+                if (rank == owner) {
+                    for (std::size_t i = 0; i < count;) {
+                        const auto first = columns[begin + i].main;
+                        std::size_t run  = 1;
+                        while (i + run < count &&
+                               columns[begin + i + run].main == first + dimension(run))
+                            ++run;
+                        copy(transfer.slice(1, i, run),
+                             f.conditioning.slice(1, first - main.begin, run));
+                        i += run;
+                    }
+                }
+                parallel->broadcast(transfer, owner, cuda);
+                if (rank != owner) {
+                    for (std::size_t i = 0; i < count;) {
+                        const auto& column = columns[begin + i];
+                        std::size_t run    = 1;
+                        if (column.history < 0) {
+                            copy(state(column.member, true), transfer.slice(1, i, 1));
+                        } else {
+                            while (i + run < count && columns[begin + i + run].history ==
+                                                          column.history + dimension(run))
+                                ++run;
+                            copy(aligned.slice(1, column.history - history.begin, run),
+                                 transfer.slice(1, i, run));
+                        }
+                        i += run;
+                    }
+                }
+            }
+        }
+    }
+    if (!total) return;
+    ops::RaggedSequenceView ragged;
+    const auto layout =
+        packed_input_view(*buffers.packed_history, total, dimension(members.size()));
+    const auto batch = prepare_packed_inputs(layout, members, total, true, ragged);
+    execution::mtp_history(
+        parameters.profile->config.text, parameters.profile->local.qsa, *parameters.mtp,
+        {aligned, history, &ragged}, batch, resources.states->mtp_tail(batch.source_offsets),
+        resources.states->mtp_tail(batch.destination_offsets), resources.mtp->layer(0), {},
+        resources.workspace, cuda, parallel ? &*parallel : nullptr);
+}
+
 void RankProgramImpl::accept_forward(std::int32_t batch, std::int32_t width) {
     if (parallel) {
         vocabulary_accept(batch, width);

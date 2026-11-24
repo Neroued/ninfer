@@ -24,6 +24,26 @@ public:
 private:
     LayoutBuilder builder_;
 };
+
+PackedInputLayout packed_input_layout(std::size_t begin, int tokens, int segments, bool ple) {
+    ControlLayout controls(begin);
+    PackedInputLayout out;
+    out.ids                 = controls.plane(DType::I32, {tokens});
+    out.positions           = controls.plane(DType::I32, {tokens});
+    out.rope_positions      = controls.plane(DType::I32, {tokens, 3});
+    out.cu_seqlens          = controls.plane(DType::I32, {segments + 1});
+    out.seq_lengths         = controls.plane(DType::I32, {segments});
+    out.token_to_seq        = controls.plane(DType::I32, {tokens});
+    out.source_offsets      = controls.plane(DType::I64, {segments});
+    out.destination_offsets = controls.plane(DType::I64, {segments});
+    out.table_rows          = controls.plane(DType::I32, {segments});
+    if (ple) {
+        out.raw_tail         = controls.plane(DType::I32, {2, segments});
+        out.raw_tail_offsets = controls.plane(DType::I64, {segments});
+    }
+    out.ingress = {begin, controls.end() - begin, alignof(void*)};
+    return out;
+}
 } // namespace
 
 BufferLayout plan_buffers(LayoutBuilder& b, const Config& c, const EngineOptions& o,
@@ -125,6 +145,22 @@ BufferLayout plan_buffers(LayoutBuilder& b, const Config& c, const EngineOptions
     }
     out.host_region = {out.ingress.offset,
                        last_host.region.offset + last_host.region.bytes - out.ingress.offset, 256};
+    if (!scoring) {
+        const auto packed = [&](bool ple) {
+            const auto capacity   = packed_input_layout(0, dimension(chunk), batch, ple);
+            const auto region     = b.add(capacity.ingress.bytes, capacity.ingress.alignment,
+                                          "packed prefill metadata");
+            out.host_region.bytes = region.offset + region.bytes - out.host_region.offset;
+            return packed_input_layout(region.offset, dimension(chunk), batch, ple);
+        };
+        out.packed_main = packed(device_ple);
+        if (c.mtp) out.packed_history = packed(false);
+        out.prefill_sampled_hidden = tensor(DType::BF16, {hidden, batch}, "prefill sampled hidden");
+        if (c.mtp)
+            out.prefill_aligned =
+                tensor(DType::BF16, {channels, sequence.local_capacity(dimension(chunk))},
+                       "packed MTP conditioning");
+    }
     if (out.mtp) out.mtp->verify_ids = tensor(DType::I32, {width * batch}, "verify IDs");
     out.prefill_sample = tensor(
         DType::BF16, {hidden, sequence.partition(dimension(chunk), 0).padded}, "prefill sample");
@@ -232,6 +268,15 @@ MtpBatchLayout history_control_view(const MtpBatchLayout& backing, std::uint32_t
     if (layout.end() > backing.ingress.offset + backing.ingress.bytes)
         throw std::logic_error("Qwen4Exp history view exceeds its backing");
     return out;
+}
+
+PackedInputLayout packed_input_view(const PackedInputLayout& backing, std::int32_t tokens,
+                                    std::int32_t segments) {
+    if (tokens < 1 || tokens > backing.ids.shape[0] || segments < 1 ||
+        segments > backing.seq_lengths.shape[0])
+        throw std::invalid_argument("Qwen4Exp packed metadata exceeds frame capacity");
+    return packed_input_layout(backing.ingress.offset, tokens, segments,
+                               backing.raw_tail.has_value());
 }
 
 void select_buffer_rows(BufferLayout& out, const BufferLayout& backing, std::uint32_t rows) {

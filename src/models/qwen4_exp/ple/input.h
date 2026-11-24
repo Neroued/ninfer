@@ -36,6 +36,8 @@ struct InputWindow {
     std::uint32_t tokens, batch;
     std::span<const std::uint32_t> valid_columns;
     std::span<const SequenceIdentity> identities;
+    // For a packed window, one starting column per logical segment in the single physical row.
+    std::span<const std::uint32_t> segment_offsets{};
 };
 
 // Ready BF16 [2560,T,P] words, dimension zero fastest; inactive columns are exact +0.

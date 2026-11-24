@@ -35,7 +35,7 @@ public:
     QsaRun(const Tensor&, const QsaConfig&, const QsaParameters&, BatchView,
            ops::QsaTailStateView before, std::optional<ops::QsaTailStateView> after,
            ops::QsaCacheView, ops::QsaRawRecordWriteView, Tensor output, MemoryArena&,
-           CudaExecutionView);
+           CudaExecutionView, const PackedPrefillState* = nullptr);
     void prepare();
     [[nodiscard]] QsaReadout readout(ops::ContextBucketRange);
     void finish();
@@ -54,12 +54,14 @@ private:
     ops::QsaRawRecordWriteView records_;
     MemoryArena& arena_;
     CudaExecutionView cuda_;
+    const PackedPrefillState* packed_;
     MemoryArena::Scope scope_;
     workspace::QsaBuffers buffers_;
 };
 
 void qsa_history(const Tensor& input, const QsaConfig&, const QsaHistoryParameters&,
                  const BatchView&, const ops::QsaTailStateView& before, ops::QsaTailStateView after,
-                 ops::QsaCacheView, MemoryArena&, CudaExecutionView);
+                 ops::QsaCacheView, MemoryArena&, CudaExecutionView,
+                 const ops::RaggedSequenceView* = nullptr);
 
 } // namespace ninfer::models::qwen4_exp::execution

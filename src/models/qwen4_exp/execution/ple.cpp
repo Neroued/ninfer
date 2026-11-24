@@ -7,7 +7,7 @@ void ple(const Tensor& embedding, const TextConfig& c, const PleParameters& p,
          const BatchView& batch, const ops::PleConvStateView& before,
          std::optional<ops::PleConvStateView> after, ops::PleConvRecordWindowView records,
          const HcParameters& next, Tensor& residual, Tensor& normalized, MemoryArena& arena,
-         CudaExecutionView cuda) {
+         CudaExecutionView cuda, const PackedPrefillState* packed) {
     const auto h = dimension(c.hidden), streams = dimension(c.hc.streams);
     const auto channels = dimension(c.residual_width());
     auto scope          = arena.scope();
@@ -29,6 +29,13 @@ void ple(const Tensor& embedding, const TextConfig& c, const PleParameters& p,
     auto normalized_view = normalized.view({h, streams, t, b});
     auto gated           = buffers.gated.view({h, streams, t, b});
     ops::ple_gate({key, value}, residual_view, p.gate, {batch.valid_columns}, records, gated, cuda);
+    if (packed) {
+        const auto values = records.values.view({channels, m});
+        ops::ple_conv_add_norm(residual_view, gated, p.convolution, packed->ragged, before, values,
+                               next.norm, p.gate.rms_epsilon, residual_view, normalized_view, cuda);
+        ops::ple_state_extract(before, values, packed->ragged, *after, cuda);
+        return;
+    }
     ops::ple_conv_add_norm(residual_view, gated, p.convolution, {batch.valid_columns}, before,
                            records, next.norm, p.gate.rms_epsilon, residual_view, normalized_view,
                            cuda);

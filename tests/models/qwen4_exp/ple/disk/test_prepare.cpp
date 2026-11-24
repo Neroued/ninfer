@@ -327,6 +327,47 @@ void padded_host(const disk::Table& source, const Input& input) {
     service.release(*ticket);
 }
 
+constexpr std::uint32_t ragged_tokens = 8;
+
+Ticket prepare_ragged(disk::PrepareService& service, const Input& input) {
+    const std::array rows{input.rows[0],
+                          InputRow{input.rows[1].identity, input.rows[1].ids.first(2)},
+                          InputRow{input.rows[3].identity, input.rows[3].ids.first(1)}};
+    rejects([&] { (void)service.prepare_ragged(ragged_tokens - 1, rows); });
+    std::optional<Ticket> ticket;
+    until([&] {
+        ticket = service.prepare_ragged(ragged_tokens, rows);
+        return ticket.has_value();
+    });
+    rejects([&] { service.append(*ticket, {}); });
+    ready(service, *ticket);
+    const auto embedding = service.embedding(*ticket);
+    const auto& window   = embedding.window;
+    require(window.tokens == ragged_tokens && window.batch == 1 &&
+                std::ranges::equal(window.valid_columns, std::array{ragged_tokens}) &&
+                std::ranges::equal(window.segment_offsets, std::array{0U, 5U, 7U}) &&
+                window.identities.size() == rows.size() &&
+                embedding.values.bytes == ragged_tokens * kEmbeddingBytes,
+            "ragged PLE changed its physical slab or segment boundaries");
+    for (std::size_t s = 0; s < rows.size(); ++s)
+        require(window.identities[s].sequence == rows[s].identity.sequence &&
+                    window.identities[s].raw_tail == rows[s].identity.raw_tail,
+                "ragged PLE changed a segment identity");
+    return *ticket;
+}
+
+void ragged_host(const disk::Table& source, const Input& input) {
+    HostBuffer output(ragged_tokens * kEmbeddingBytes);
+    const std::array outputs{output.span()};
+    disk::PrepareService service(
+        source, input.eos, {.max_positions = ragged_tokens, .max_rows = 3, .io_depth = 4}, outputs);
+    // The same lengths would require 5 * 3 physical positions in a rectangular window.
+    const auto ticket    = prepare_ragged(service, input);
+    const auto embedding = service.embedding(ticket);
+    emit(embedding.values.data, embedding.values.bytes);
+    service.release(ticket);
+}
+
 class StreamGate {
 public:
     explicit StreamGate(cudaStream_t stream) : stream_(stream) {
@@ -460,6 +501,20 @@ void gpu(const disk::Table& source, const Input& input) {
     until([&] { return try_release(again); });
     copied.copy_to_host(actual.data(), input.bytes());
     emit(actual.data(), input.bytes());
+
+    const auto ragged = prepare_ragged(service, input);
+    uploads.upload(service.embedding(ragged), context.transfer_view());
+    const auto packed = uploads.acquire(ragged, context.execution_view());
+    packed.ready.wait(context.stream());
+    const auto& values = packed.values;
+    require(values.ne[1] == ragged_tokens && values.ne[2] == 1, "packed upload padded its slab");
+    copy_bytes_async(copied.span().subspan(0, values.bytes()),
+                     {values.data, values.bytes(), values.device}, context.execution_view());
+    packed.consumed.record(context.stream());
+    uploads.consumer_submitted(ragged, context.execution_view());
+    until([&] { return try_release(ragged); });
+    copied.copy_to_host(actual.data(), values.bytes());
+    emit(actual.data(), values.bytes());
 }
 } // namespace
 
@@ -502,6 +557,7 @@ int main(int argc, char** argv) {
             hashes(source, input);
             host(source, input, false);
             padded_host(source, input);
+            ragged_host(source, input);
         } else if (mode == "--gpu")
             gpu(source, input);
         else

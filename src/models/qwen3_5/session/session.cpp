@@ -339,8 +339,26 @@ bool Session::recovery_pending(SequenceHandle sequence) const noexcept {
 
 bool Session::has_context_operation() const noexcept { return impl_->has_context_operation(); }
 
-std::optional<runtime::ExecutionTicket> Session::start_prefill(SequenceHandle h, bool c) {
-    return impl_->start_prefill(h, c);
+runtime::PrefillBudgetPolicy Session::prefill_budget_policy() const noexcept {
+    return {.max_tokens_global           = impl_->prefill_chunk,
+            .max_tokens_per_placement    = impl_->prefill_chunk,
+            .max_sequences_per_placement = impl_->max_concurrency};
+}
+
+runtime::PrefillCandidateInfo Session::prefill_candidate(SequenceHandle handle) const {
+    auto info      = impl_->prefill_candidate(handle);
+    info.placement = placement(handle);
+    return info;
+}
+
+std::optional<runtime::ExecutionTicket> Session::start_prefill(SequenceHandle h, bool constrained) {
+    return impl_->start_prefill(h, constrained);
+}
+
+std::optional<runtime::ExecutionTicket>
+Session::start_prefill(std::span<const SequenceHandle> members,
+                       std::span<const runtime::PrefillGrant> grants) {
+    return impl_->start_prefill(members, grants);
 }
 
 std::optional<runtime::ExecutionTicket> Session::start_replay(SequenceHandle h) {

@@ -376,8 +376,11 @@ public:
     [[nodiscard]] bool execution_pending(SequenceHandle sequence) const noexcept;
     // A resumed binding retains its complete recovery capacity until committed new progress.
     [[nodiscard]] bool recovery_pending(SequenceHandle sequence) const noexcept;
+    [[nodiscard]] runtime::PrefillCandidateInfo prefill_candidate(SequenceHandle) const;
     [[nodiscard]] std::optional<runtime::ExecutionTicket> start_prefill(SequenceHandle,
                                                                         bool constrained = false);
+    [[nodiscard]] std::optional<runtime::ExecutionTicket>
+        start_prefill(std::span<const SequenceHandle>, std::span<const runtime::PrefillGrant>);
     [[nodiscard]] std::optional<runtime::ExecutionTicket> start_replay(SequenceHandle);
     [[nodiscard]] std::optional<runtime::ExecutionTicket>
     start_decode_round(std::span<const SequenceHandle>, speculative::DecodeRoundRequest,
@@ -485,6 +488,7 @@ public:
         std::vector<Continuation> bases;
         std::vector<ContinuationMetadata> completed;
         std::vector<std::uint32_t> columns;
+        std::vector<std::uint8_t> sampled;
         std::vector<std::vector<TokenId>> inputs;
         std::unique_ptr<context::ContextTransaction> preparation;
         std::unique_ptr<context::ContextTransaction> settlement;

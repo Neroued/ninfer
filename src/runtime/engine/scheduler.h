@@ -82,6 +82,30 @@ public:
         }
     };
 
+    struct PrefillMembership {
+        std::vector<std::uint32_t> lanes;
+        std::vector<SequenceHandle> sequences;
+        std::vector<PrefillGrant> grants;
+        bool is_replay = false;
+
+        explicit PrefillMembership(std::uint32_t capacity) {
+            lanes.reserve(capacity);
+            sequences.reserve(capacity);
+            grants.reserve(capacity);
+        }
+
+        void clear() noexcept {
+            lanes.clear();
+            sequences.clear();
+            grants.clear();
+            is_replay = false;
+        }
+
+        [[nodiscard]] bool empty() const noexcept { return lanes.empty(); }
+
+        [[nodiscard]] std::size_t size() const noexcept { return lanes.size(); }
+    };
+
     template <class Slots, class Eligible>
     void build_round_membership(const Slots& slots, Eligible eligible,
                                 RoundMembership& membership) const {
@@ -133,18 +157,138 @@ public:
         }
     }
 
-    template <class Slots>
-    [[nodiscard]] std::optional<std::uint32_t>
-    next_prefill(const Slots& slots, std::uint32_t concurrency) const noexcept {
-        for (std::uint32_t offset = 0; offset < concurrency; ++offset) {
-            const std::uint32_t lane = (prefill_cursor_ + offset) % concurrency;
-            const auto& request      = slots[lane];
-            if (request && (request->is_prefilling() || request->is_replaying()) &&
-                !request->capture_pending) {
-                return lane;
+    template <class Slots, class Eligible, class Describe>
+    void build_prefill_membership(const Slots& slots, const PrefillBudgetPolicy& policy,
+                                  std::optional<SequenceHandle> preferred, Eligible eligible,
+                                  Describe describe, PrefillMembership& membership) const {
+        membership.clear();
+
+        struct Candidate {
+            std::uint32_t lane;
+            PrefillCandidateInfo info;
+            bool replay;
+        };
+
+        const auto owner = progress_owner();
+        const auto token_limit =
+            std::min(policy.max_tokens_global, policy.max_tokens_per_placement);
+        const auto candidate_at = [&](std::uint32_t lane) -> std::optional<Candidate> {
+            const auto& request = slots[lane];
+            if (!request || (owner && request->id != owner) || request->capture_pending ||
+                !(request->is_prefilling() || request->is_replaying()) || !eligible(lane))
+                return {};
+            if (!request->sequence) throw std::logic_error("prefill candidate has no sequence");
+            const bool replay = request->is_replaying();
+            const auto info   = replay ? PrefillCandidateInfo{} : describe(*request->sequence);
+            if (replay || info.zero_token_sample || (token_limit && info.unit_max_tokens))
+                return Candidate{lane, info, replay};
+            return {};
+        };
+
+        const auto append = [&](const Candidate& candidate, std::uint32_t tokens) {
+            membership.lanes.push_back(candidate.lane);
+            membership.sequences.push_back(*slots[candidate.lane]->sequence);
+            membership.grants.push_back({.max_tokens = tokens});
+        };
+        auto start = prefill_cursor_;
+        std::optional<Candidate> continuation;
+        if (preferred && !owner) {
+            for (std::uint32_t lane = 0; lane < slots.size(); ++lane) {
+                if (slots[lane] && slots[lane]->sequence == preferred) {
+                    continuation = candidate_at(lane);
+                    if (continuation) start = lane;
+                    break;
+                }
             }
         }
-        return std::nullopt;
+        std::vector<Candidate> candidates;
+        for (std::size_t offset = 0; offset < slots.size(); ++offset) {
+            const auto lane      = static_cast<std::uint32_t>((start + offset) % slots.size());
+            const auto candidate = offset == 0 && continuation ? continuation : candidate_at(lane);
+            if (!candidate) continue;
+            if (candidates.empty()) {
+                if (owner || candidate->replay || candidate->info.exclusive ||
+                    policy.max_sequences_per_step <= 1) {
+                    membership.is_replay = candidate->replay;
+                    append(*candidate, std::min(candidate->info.unit_max_tokens, token_limit));
+                    return;
+                }
+                candidates.reserve(slots.size());
+            }
+            candidates.push_back(*candidate);
+        }
+        if (candidates.empty()) return;
+
+        struct PlacementBudget {
+            std::uint32_t tokens    = 0;
+            std::uint32_t sequences = 0;
+            bool has_tokens         = false;
+        };
+
+        std::map<std::uint32_t, PlacementBudget> placements;
+        std::uint32_t active = 0;
+        for (const auto& candidate : candidates) {
+            if (candidate.replay || candidate.info.exclusive) continue;
+            auto& placement = placements[candidate.info.placement.value];
+            if (!candidate.info.zero_token_sample && !placement.has_tokens) {
+                placement.has_tokens = true;
+                ++active;
+            }
+        }
+        const auto alignment = std::max(1U, policy.chunk_alignment);
+        const auto raw_fair  = policy.max_tokens_global / std::max(1U, active);
+        const auto fair_cap  = std::min(policy.max_tokens_per_placement,
+                                       raw_fair >= alignment ? raw_fair / alignment * alignment
+                                                              : std::max(1U, raw_fair));
+        auto remaining       = policy.max_tokens_global;
+        std::vector<const Candidate*> admitted, deferred;
+        admitted.reserve(candidates.size());
+        deferred.reserve(candidates.size());
+        const auto admit = [&](const Candidate& candidate, std::uint32_t cap) {
+            auto& placement = placements.at(candidate.info.placement.value);
+            if (placement.sequences >= policy.max_sequences_per_placement) return false;
+            std::uint32_t tokens = 0;
+            if (!candidate.info.zero_token_sample) {
+                const auto available = std::min(remaining, cap - placement.tokens);
+                if (candidate.info.unit_max_tokens <= available)
+                    tokens = candidate.info.unit_max_tokens;
+                else if (available >= alignment)
+                    tokens = available / alignment * alignment;
+                else if (membership.empty())
+                    tokens = available;
+                if (!tokens) return false;
+            }
+            append(candidate, tokens);
+            admitted.push_back(&candidate);
+            placement.tokens += tokens;
+            ++placement.sequences;
+            remaining -= tokens;
+            return true;
+        };
+        for (const auto& candidate : candidates) {
+            if (membership.size() >= policy.max_sequences_per_step) break;
+            if (!candidate.replay && !candidate.info.exclusive && !admit(candidate, fair_cap))
+                deferred.push_back(&candidate);
+        }
+        for (std::size_t row = 0; row < admitted.size() && remaining; ++row) {
+            const auto& info = admitted[row]->info;
+            auto& grant      = membership.grants[row].max_tokens;
+            if (grant >= info.unit_max_tokens) continue;
+            auto& placement = placements.at(info.placement.value);
+            const auto room =
+                std::min(remaining, policy.max_tokens_per_placement - placement.tokens);
+            const auto total = grant + room;
+            const auto next  = info.unit_max_tokens <= total ? info.unit_max_tokens
+                               : total >= alignment          ? total / alignment * alignment
+                                                             : grant;
+            placement.tokens += next - grant;
+            remaining -= next - grant;
+            grant = next;
+        }
+        for (const auto* candidate : deferred) {
+            if (!remaining || membership.size() >= policy.max_sequences_per_step) break;
+            (void)admit(*candidate, policy.max_tokens_per_placement);
+        }
     }
 
     void prefill_executed(std::uint32_t lane, std::uint32_t concurrency) noexcept {
@@ -300,18 +444,6 @@ public:
         std::sort(candidates.begin(), candidates.end(),
                   [&](auto a, auto b) { return slots[a]->id > slots[b]->id; });
         return candidates;
-    }
-
-    template <class Slots>
-    void append_prefill_candidates(const Slots& slots, std::vector<std::uint32_t>& candidates,
-                                   std::uint32_t excluded) const {
-        for (std::size_t offset = 0; offset < slots.size(); ++offset) {
-            const auto lane     = (prefill_cursor_ + offset) % slots.size();
-            const auto& request = slots[lane];
-            if (lane != excluded && request &&
-                (request->is_prefilling() || request->is_replaying()) && !request->capture_pending)
-                candidates.push_back(lane);
-        }
     }
 
     // Grant at least one second of useful execution. An expensive restore earns up to

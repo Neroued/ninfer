@@ -58,6 +58,7 @@ public:
     using Scheduling         = Scheduler<Request>;
     using RoundMembership    = typename Scheduling::RoundMembership;
     using ControlMembership  = typename Scheduling::ControlMembership;
+    using PrefillMembership  = typename Scheduling::PrefillMembership;
     using ResourceManagement = ResourceManager<ModelContract>;
     using Clock              = std::chrono::steady_clock;
 
@@ -76,6 +77,7 @@ public:
           execution_decisions_(max_concurrency_), control_executed_(max_concurrency_),
           reserved_units_(max_concurrency_), current_decode_requests_(max_concurrency_),
           round_membership_(max_concurrency_), control_membership_(max_concurrency_),
+          prefill_membership_(max_concurrency_), prefill_excluded_(max_concurrency_),
           cancellation_snapshot_(max_concurrency_), row_flags_(max_concurrency_),
           commit_decisions_(max_concurrency_), commit_preview_(max_concurrency_) {
         if (max_concurrency_ == 0 || options.max_pending_requests == 0 ||
@@ -83,7 +85,6 @@ public:
             throw std::invalid_argument("Engine core bounds are invalid");
         }
         current_decode_lanes_.reserve(max_concurrency_);
-        candidate_slots_.reserve(max_concurrency_);
         reservation_candidates_.reserve(max_concurrency_);
         cumulative_stats_.context_transfers.kv.resize(instance_.session->kv_pools().size());
         for (const auto& pool : instance_.session->kv_pools()) {
@@ -648,10 +649,10 @@ private:
 
     void reserve_active_capture(const std::shared_ptr<Request>& request, EngineRequestState next);
 
-    bool prepare_semantic_capture(const std::shared_ptr<Request>& request);
+    bool prepare_semantic_capture(const std::shared_ptr<Request>& request,
+                                  bool allow_reclaim = true);
 
-    void resolve_prefill_progress(const std::shared_ptr<Request>& request,
-                                  typename ModelContract::PrefillProgress&& progress,
+    void resolve_prefill_progress(typename ModelContract::PrefillProgress&& progress,
                                   ComputeFlight flight);
 
     void ensure_base_plan(const std::shared_ptr<Request>& request);
@@ -695,15 +696,19 @@ private:
 
     void update_recovery(const std::shared_ptr<Request>& request, bool released = false);
 
-    enum class ReservationScope { Round, Prefill };
     enum class ResidentReservation { Ready, Unavailable, Pending };
 
     [[nodiscard]] ExecutionUnit execution_unit(const Request& request) const;
 
-    [[nodiscard]] ResidentReservation reserve_resident_unit(std::uint32_t lane);
-    void reserve_resident_units(ReservationScope scope = ReservationScope::Round);
-    [[nodiscard]] std::optional<std::uint32_t>
-        next_prefill(std::span<const std::shared_ptr<Request>>) const;
+    [[nodiscard]] ResidentReservation reserve_resident_unit(std::uint32_t lane, ExecutionUnit unit,
+                                                            bool allow_reclaim = true);
+    void reserve_resident_units();
+    void build_prefill_membership(const PrefillBudgetPolicy& policy,
+                                  std::optional<SequenceHandle> primary    = {},
+                                  std::optional<std::uint32_t> primary_cap = {});
+    void release_unused_prefill_units(std::optional<std::uint32_t> primary = {});
+    [[nodiscard]] bool resident_runnable(std::uint32_t lane) const;
+    [[nodiscard]] bool schedule_prefill();
 
     // Admission can pin an existing writer's tail after its reservation. Membership must
     // observe current context dependencies, including pauses selected during reclamation.
@@ -712,7 +717,7 @@ private:
     [[nodiscard]] ComputeFlight freeze_members(std::span<const std::uint32_t> lanes,
                                                UnitKind kind) const;
 
-    [[nodiscard]] bool start_prefill(std::uint32_t lane);
+    [[nodiscard]] bool start_prefill(const PrefillMembership& membership);
 
     [[nodiscard]] bool start_decode(const RoundMembership& membership);
 
@@ -794,7 +799,8 @@ private:
     Scheduling scheduler_;
     std::optional<ComputeFlight> compute_;
     std::optional<ComputeFlight> retiring_;
-    CycleStep cycle_step_ = CycleStep::Boundary;
+    CycleStep cycle_step_                 = CycleStep::Boundary;
+    std::uint32_t prefill_coalesce_waits_ = 0;
     std::vector<std::uint8_t> control_executed_;
     std::vector<std::optional<UnitPermit>> reserved_units_;
     std::atomic<bool> admission_check_pending_{false};
@@ -812,7 +818,8 @@ private:
     std::vector<PendingCompletion> pending_completions_;
     RoundMembership round_membership_;
     ControlMembership control_membership_;
-    std::vector<std::shared_ptr<Request>> candidate_slots_;
+    PrefillMembership prefill_membership_;
+    std::vector<std::uint8_t> prefill_excluded_;
     std::vector<std::uint32_t> reservation_candidates_;
     std::vector<std::uint64_t> cancellation_snapshot_;
     std::vector<std::uint8_t> row_flags_;

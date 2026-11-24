@@ -93,7 +93,7 @@ struct Driver {
             check(bool(session.reserve_units({&unit, 1})) && bool(session.start_prefill(h, true)),
                   "prefill admission failed");
             auto p = wait<glm::PrefillProgress>(decide);
-            if (p.capture_ready) session.skip_capture(h);
+            if (p.rows.at(0).capture_ready) session.skip_capture(h);
             if (!p.pending) continue;
             check(p.pending->tokens()[0] == anchor, "teacher-forced anchor differs");
             const runtime::CommitDecision first{.accepted_tokens = 1};

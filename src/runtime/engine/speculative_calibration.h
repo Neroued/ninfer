@@ -125,6 +125,9 @@ private:
             const auto ticket = session_.start_prefill(sequence);
             if (!ticket) return false;
             auto result = wait<typename Model::PrefillProgress>(*ticket);
+            if (result.rows.size() != 1)
+                throw std::logic_error("speculative calibration prefill changed membership");
+            if (result.rows.front().capture_ready) session_.skip_capture(sequence);
             if (result.pending) commit(std::move(*result.pending), terminal);
             drain();
             if (result.pending) return true;

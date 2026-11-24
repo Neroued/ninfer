@@ -154,7 +154,7 @@ void exercise_rounds(NativeRankFixture& fixture, models::qwen::Frontend& fronten
         for (;;) {
             check(bool(session.reserve_units(units)), "prefill permit failed");
             auto prefill = driver.prefill(h);
-            if (prefill.capture_ready) session.skip_capture(h);
+            if (prefill.rows.at(0).capture_ready) session.skip_capture(h);
             if (!prefill.pending) continue;
             const std::array decisions{runtime::CommitDecision{.accepted_tokens = 1}};
             (void)driver.commit(std::move(*prefill.pending), decisions);

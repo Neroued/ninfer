@@ -100,6 +100,7 @@ void row(Encoder& out, const WorkRow& r, std::uint32_t rank) {
     sampling(out, r.sampling);
     out.u32(r.sampling_position);
     out.boolean(r.constrained);
+    out.boolean(r.sample);
 }
 
 WorkRow row(Decoder& in, std::uint32_t rank) {
@@ -119,6 +120,7 @@ WorkRow row(Decoder& in, std::uint32_t rank) {
     r.sampling          = sampling(in);
     r.sampling_position = in.u32();
     r.constrained       = in.boolean();
+    r.sample            = in.boolean();
     return r;
 }
 
@@ -128,7 +130,7 @@ void rows(Encoder& out, const std::vector<WorkRow>& values, std::uint32_t rank) 
 }
 
 std::vector<WorkRow> rows(Decoder& in, std::uint32_t rank) {
-    std::vector<WorkRow> result(in.count(149));
+    std::vector<WorkRow> result(in.count(150));
     for (auto& value : result) value = row(in, rank);
     return result;
 }

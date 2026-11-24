@@ -48,6 +48,7 @@ struct WorkRow {
     ResolvedSamplingParameters sampling;
     std::uint32_t sampling_position = 0;
     bool constrained                = false;
+    bool sample                     = false;
 };
 
 struct PlePrefetch {

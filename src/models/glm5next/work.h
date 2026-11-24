@@ -31,6 +31,7 @@ struct WorkRow {
     ResolvedSamplingParameters sampling;
     std::uint32_t sampling_position = 0;
     bool constrained                = false;
+    bool sample                     = false;
 };
 
 // Physical rows are owner-contiguous; all public results and decisions retain logical order.

@@ -35,8 +35,11 @@ std::uint32_t SessionImpl::unit_end(const Sequence& s, ExecutionUnitKind kind,
                                     std::uint32_t tokens) const {
     const auto frontier = s.continuation.metadata.main_frontier;
     switch (kind) {
-    case ExecutionUnitKind::Prefill:
-        return window_end(s, frontier, s.request->summary.prompt_tokens);
+    case ExecutionUnitKind::Prefill: {
+        const auto prompt = s.request->summary.prompt_tokens;
+        const auto limit  = tokens ? frontier + std::min(tokens, prompt - frontier) : prompt;
+        return window_end(s, frontier, limit);
+    }
     case ExecutionUnitKind::Replay:
         return window_end(s, frontier, s.replay_target);
     case ExecutionUnitKind::Decode:

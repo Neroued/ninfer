@@ -1,5 +1,6 @@
 #pragma once
 
+#include "runtime/contract/placement.h"
 #include "runtime/contract/request.h"
 #include <array>
 #include <compare>
@@ -53,6 +54,28 @@ struct BeginSummary {
 
 struct RoundBudget {
     std::uint32_t generated_tokens_remaining = 0;
+};
+
+struct PrefillBudgetPolicy {
+    // Forward-token and sequence limits for one step, independent of physical ranks.
+    std::uint32_t max_tokens_global           = 0;
+    std::uint32_t max_tokens_per_placement    = 0;
+    std::uint32_t max_sequences_per_step      = 1;
+    std::uint32_t max_sequences_per_placement = 1;
+    std::uint32_t chunk_alignment             = 64; // Alignment for a truncated model unit.
+};
+
+struct PrefillCandidateInfo {
+    PlacementId placement{};
+    std::uint32_t remaining_tokens = 0;     // Entire unprocessed prompt suffix.
+    std::uint32_t unit_max_tokens  = 0;     // Current model window, including semantic boundaries.
+    bool exclusive                 = false; // This window needs the whole step.
+    bool zero_token_sample         = false; // The committed prompt tail needs its first sample.
+};
+
+struct PrefillGrant {
+    std::uint32_t max_tokens = 0; // Forward-token cap for this row.
+    bool constrained         = false;
 };
 
 } // namespace ninfer::runtime

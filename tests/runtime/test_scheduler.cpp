@@ -331,28 +331,145 @@ void test_bounded_service_under_continuous_contention() {
             "continuous contention starved a request");
 }
 
-void test_prefill_replay_round_robin() {
+using ninfer::runtime::PrefillBudgetPolicy;
+using ninfer::runtime::PrefillCandidateInfo;
+
+struct PrefillFixture {
     Scheduler scheduler;
-    Slots slots(4);
-    slots[0] = request(1, Request::Phase::Decode);
-    slots[1] = request(2, Request::Phase::Prefill);
-    slots[2] = request(3, Request::Phase::Replay);
-    slots[3] = request(4, Request::Phase::Prefill);
-    for (const std::uint32_t expected : {1U, 2U, 3U, 1U}) {
-        const auto lane = scheduler.next_prefill(slots, 4);
-        require(lane == expected, "prefill and replay did not receive rotating execution units");
-        scheduler.prefill_executed(*lane, 4);
+    Slots slots;
+    std::vector<PrefillCandidateInfo> infos;
+    Scheduler::PrefillMembership membership;
+    PrefillBudgetPolicy policy;
+
+    explicit PrefillFixture(std::uint32_t capacity)
+        : slots(capacity), infos(capacity), membership(capacity),
+          policy{4096, 4096, capacity, capacity, 64} {}
+
+    void text(std::uint32_t lane, std::uint32_t tokens, std::uint32_t placement = 0) {
+        slots[lane] = request(lane + 1, Request::Phase::Prefill);
+        infos[lane] = {{placement}, tokens, tokens};
     }
-    slots[2]->capture_pending = true;
-    require(scheduler.next_prefill(slots, 4) == 3,
-            "capture dependency blocked unrelated ready prefill work");
-    scheduler.prefill_executed(3, 4);
-    slots[1]->phase = Request::Phase::Decode;
-    slots[3]->phase = Request::Phase::Finished;
-    require(!scheduler.next_prefill(slots, 4), "unready prefill member was scheduled");
-    slots[2]->capture_pending = false;
-    require(scheduler.next_prefill(slots, 4) == 2,
-            "completed capture did not restore replay eligibility");
+
+    void build(std::optional<Request::SequenceHandle> preferred = {}) {
+        scheduler.build_prefill_membership(
+            slots, policy, preferred, [](auto) { return true; },
+            [&](auto sequence) { return infos.at(sequence - 1); }, membership);
+    }
+
+    void check(std::initializer_list<std::uint32_t> lanes,
+               std::initializer_list<std::uint32_t> grants, bool replay = false) const {
+        require(std::ranges::equal(membership.lanes, lanes) &&
+                    membership.sequences.size() == lanes.size() &&
+                    membership.grants.size() == grants.size() && membership.is_replay == replay,
+                "prefill membership or execution kind differs");
+        std::size_t row = 0;
+        for (auto grant : grants) {
+            require(membership.grants[row].max_tokens == grant &&
+                        membership.sequences[row] == membership.lanes[row] + 1,
+                    "prefill token grant or sequence alignment differs");
+            ++row;
+        }
+    }
+};
+
+void test_prefill_replay_round_robin() {
+    PrefillFixture f(4);
+    f.policy.max_sequences_per_step = 1;
+    f.slots[0]                      = request(1, Request::Phase::Decode);
+    f.text(1, 512);
+    f.slots[2] = request(3, Request::Phase::Replay);
+    f.text(3, 700);
+    for (const std::uint32_t expected : {1U, 2U, 3U, 1U}) {
+        f.build();
+        f.check({expected}, {f.infos[expected].unit_max_tokens}, expected == 2);
+        f.scheduler.prefill_executed(expected, 4);
+    }
+    f.slots[2]->capture_pending = true;
+    f.build(3);
+    f.check({3}, {700});
+    f.scheduler.prefill_executed(3, 4);
+    f.slots[1]->phase = Request::Phase::Decode;
+    f.slots[3]->phase = Request::Phase::Finished;
+    f.build();
+    f.check({}, {});
+    f.slots[2]->capture_pending = false;
+    f.build();
+    f.check({2}, {0}, true);
+}
+
+void test_prefill_packing_and_alignment() {
+    PrefillFixture f(4);
+    f.text(0, 300);
+    f.text(1, 500);
+    f.text(2, 1200);
+    f.build();
+    f.check({0, 1, 2}, {300, 500, 1200});
+    f.text(3, 8192);
+    f.build();
+    f.check({0, 1, 2, 3}, {300, 500, 1200, 2048});
+
+    f.policy.max_sequences_per_placement = 2;
+    f.build();
+    f.check({0, 1}, {300, 500});
+    f.policy.max_sequences_per_placement = 4;
+    f.policy.max_tokens_global           = 32;
+    f.build();
+    f.check({0}, {32});
+}
+
+void test_prefill_water_filling() {
+    PrefillFixture f(4);
+    f.text(0, 8192, 0);
+    f.text(1, 8192, 42);
+    f.build();
+    f.check({0, 1}, {2048, 2048});
+    f.text(1, 512, 42);
+    f.build();
+    f.check({0, 1}, {3584, 512});
+    f.slots[1].reset();
+    f.build();
+    f.check({0}, {4096});
+
+    f.text(0, 2048);
+    f.text(1, 600);
+    f.text(2, 512, 42);
+    f.build();
+    f.check({0, 2, 1}, {2048, 512, 600});
+
+    PrefillFixture dp(8);
+    dp.policy.max_tokens_global           = 32768;
+    dp.policy.max_sequences_per_placement = 1;
+    for (std::uint32_t lane = 0; lane < 8; ++lane) dp.text(lane, 8192, lane);
+    dp.build();
+    dp.check({0, 1, 2, 3, 4, 5, 6, 7}, {4096, 4096, 4096, 4096, 4096, 4096, 4096, 4096});
+}
+
+void test_prefill_exclusive_pressure_and_zero_token() {
+    PrefillFixture f(4);
+    f.text(0, 8192);
+    f.text(1, 320);
+    f.infos[1].exclusive = true;
+    f.slots[2]           = request(3, Request::Phase::Replay);
+    f.text(3, 0, 99);
+    f.infos[3].zero_token_sample = true;
+    f.build();
+    f.check({0, 3}, {4096, 0});
+    f.scheduler.prefill_executed(f.membership.lanes.front(), 4);
+    f.build();
+    f.check({1}, {320});
+    f.scheduler.prefill_executed(f.membership.lanes.front(), 4);
+    f.build();
+    f.check({2}, {0}, true);
+    f.build(4);
+    f.check({3, 0}, {0, 4096});
+
+    for (const auto& value : f.slots) admit(f.scheduler, value);
+    f.scheduler.require_progress(1);
+    f.build(4);
+    f.check({0}, {4096});
+    f.slots[0]->capture_pending = true;
+    f.build(4);
+    f.check({}, {});
 }
 
 void test_decode_and_control_membership() {
@@ -454,6 +571,9 @@ int main() {
         test_bounded_service_under_continuous_contention();
         test_recovery_cost_has_a_bounded_service_allowance();
         test_prefill_replay_round_robin();
+        test_prefill_packing_and_alignment();
+        test_prefill_water_filling();
+        test_prefill_exclusive_pressure_and_zero_token();
         test_decode_and_control_membership();
         test_large_sparse_membership_and_reuse();
         test_control_membership_groups_eligible_widths();

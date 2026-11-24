@@ -27,6 +27,13 @@ inline std::size_t write_action_capacity(std::size_t rows, std::size_t pools, st
     return action_capacity(pages + rows, rows * pools, pages);
 }
 
+inline std::size_t ragged_write_action_capacity(std::size_t rows, std::size_t pools,
+                                                std::size_t total_tokens) {
+    const std::size_t page = kPagedKVPageSize;
+    const auto pages       = total_tokens ? pools * (total_tokens / page + 2 * rows) : 0;
+    return action_capacity(pages + rows, rows * pools, pages);
+}
+
 void encode_directory(distributed::wire::Encoder&, const ContextDirectorySpec&);
 [[nodiscard]] ContextDirectorySpec decode_directory(distributed::wire::Decoder&);
 

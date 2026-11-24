@@ -20,6 +20,7 @@ void EngineCore<Instance>::commit_pending(PendingBatch&& pending, ComputeFlight 
 
     auto decisions = std::span(commit_decisions_).first(row_count);
     auto preview   = std::span(commit_preview_).first(row_count);
+    auto sampled   = std::span(row_flags_).first(row_count);
     std::fill(decisions.begin(), decisions.end(), CommitDecision{});
     std::fill(preview.begin(), preview.end(), CommitPreview{});
     bool generated_staged         = false;
@@ -45,11 +46,14 @@ void EngineCore<Instance>::commit_pending(PendingBatch&& pending, ComputeFlight 
                 throw std::logic_error("pending row has no active Engine request");
             }
             if (decode_round) { ++request->host_timing.decode_rounds; }
+            sampled[row]           = pending.row_sampled(row);
             preview[row].cancelled = flight.cancelled[row];
-            preview[row].failed    = !preview[row].cancelled && pending.constraint_failed(row);
+            preview[row].failed =
+                sampled[row] && !preview[row].cancelled && pending.constraint_failed(row);
             const std::int32_t raw_count =
                 pending.row_counts().empty() ? 1 : pending.row_counts()[row];
-            if (raw_count <= 0 || raw_count > static_cast<std::int32_t>(pending.row_stride())) {
+            if (raw_count < 0 || raw_count > static_cast<std::int32_t>(pending.row_stride()) ||
+                sampled[row] != (raw_count != 0) || (decode_round && !sampled[row])) {
                 throw std::logic_error("pending row has an invalid licensed extent");
             }
             const std::uint32_t count   = static_cast<std::uint32_t>(raw_count);
@@ -70,6 +74,7 @@ void EngineCore<Instance>::commit_pending(PendingBatch&& pending, ComputeFlight 
                 preview[row].reason = FinishReason::Cancelled;
                 continue;
             }
+            if (!sampled[row]) continue;
             const OutputDecision decision = request->output.preview_model(
                 row_tokens, request->budget->remaining(), request->budget->limit_reason());
             if (decision.accepted_tokens == 0 || decision.accepted_tokens > count ||
@@ -140,10 +145,6 @@ void EngineCore<Instance>::commit_pending(PendingBatch&& pending, ComputeFlight 
             throw std::logic_error("Runtime exposed a capture outside a committed Begin row");
         }
     }
-    const bool terminal_in_batch =
-        std::any_of(decisions.begin(), decisions.begin() + static_cast<std::ptrdiff_t>(row_count),
-                    [](const CommitDecision& decision) { return decision.terminal; });
-
     for (std::size_t row = 0; row < row_count; ++row) {
         const auto& request  = flight.requests[row];
         auto& observed       = request->speculative_stats;
@@ -201,13 +202,24 @@ void EngineCore<Instance>::commit_pending(PendingBatch&& pending, ComputeFlight 
             continue;
         }
         if (!preview[row].cancelled) {
-            flight.progressed[row] = accepted != 0;
-            request->budget->commit(accepted);
+            if (sampled[row]) {
+                flight.progressed[row] |= accepted != 0;
+                request->budget->commit(accepted);
+            }
             set_placement_load(*request, request->placement,
                                instance_.session->load_tokens(*request->sequence));
         }
         request->consumed_by_commit = preview[row].cancelled;
         update_recovery(request, preview[row].cancelled);
+        if (!sampled[row] && !preview[row].cancelled) {
+            if (committed.rows[row].capture_ready ||
+                (!request->cancelled.load(std::memory_order_acquire) &&
+                 instance_.session->retry_capture(*request->sequence))) {
+                reserve_active_capture(request, EngineRequestState::Prefill);
+            }
+            if (!request->capture_pending) request->model_state = EngineRequestState::Prefill;
+            continue;
+        }
         auto published = request->output.commit_preview();
         auto timing    = record_committed_output(request, accepted);
         append_output(request, std::move(published), std::move(timing), &phase);
@@ -233,12 +245,7 @@ void EngineCore<Instance>::commit_pending(PendingBatch&& pending, ComputeFlight 
                 preview[row].continuation == ContinuationAction::ApplyTargetControl
                     ? EngineRequestState::ControlReady
                     : EngineRequestState::DecodeReady;
-            if (terminal_in_batch) {
-                instance_.session->skip_capture(*request->sequence);
-                request->model_state = post_capture_state;
-            } else {
-                reserve_active_capture(request, post_capture_state);
-            }
+            reserve_active_capture(request, post_capture_state);
             committed.rows[row].capture_ready = false;
             if (!request->capture_pending) {
                 request->model_state =
@@ -260,64 +267,66 @@ void EngineCore<Instance>::commit_pending(PendingBatch&& pending, ComputeFlight 
 
 template <class Instance>
 void EngineCore<Instance>::resolve_prefill_progress(
-    const std::shared_ptr<Request>& request, typename ModelContract::PrefillProgress&& progress,
-    ComputeFlight flight) {
+    typename ModelContract::PrefillProgress&& progress, ComputeFlight flight) {
     EnginePhaseScope phase(*this, EngineHostPhase::CommitOutput);
-    ++request->host_timing.prefill_units;
-    cumulative_stats_.computed_prefill_tokens += progress.processed_prompt_tokens;
-    if (!request->admitted_begin) {
-        throw std::logic_error("prefill progress has no committed admission summary");
+    if (progress.rows.size() != flight.requests.size() ||
+        (progress.pending && progress.pending->row_count() != progress.rows.size())) {
+        throw std::logic_error("prefill progress changed its frozen membership");
     }
-    const BeginSummary& begin = *request->admitted_begin;
-    if (begin.reused_prompt_tokens > begin.prompt_tokens) {
-        throw std::logic_error("admitted prefix exceeds its prompt");
-    }
-    const std::uint32_t suffix_tokens = begin.prompt_tokens - begin.reused_prompt_tokens;
-    if (request->computed_prompt_tokens > suffix_tokens ||
-        progress.processed_prompt_tokens > suffix_tokens - request->computed_prompt_tokens) {
-        throw std::logic_error("prefill unit exceeded the admitted prompt suffix");
-    }
-    const auto computed_begin = begin.reused_prompt_tokens + request->computed_prompt_tokens;
-    request->computed_prompt_tokens += progress.processed_prompt_tokens;
-    flight.progressed.front() = progress.processed_prompt_tokens != 0;
-    record_service(flight);
-    if (!request->cancelled.load(std::memory_order_acquire)) {
-        resources_.observe_committed(
-            *request->base_plan, request->id, computed_begin,
-            computed_begin + progress.processed_prompt_tokens,
-            instance_.session->capture_frontiers(*request->sequence, computed_begin,
-                                                 computed_begin + progress.processed_prompt_tokens),
-            request->continuation_owner);
-    }
-    if (progress.complete && request->computed_prompt_tokens != suffix_tokens) {
-        throw std::logic_error("completed prefill did not reach the admitted prompt frontier");
-    }
-    if (progress.processed_prompt_tokens != 0) {
-        request->last_progress = Clock::now();
-        publish_prompt_progress(request);
-    }
-    if (progress.capture_ready) {
-        if (progress.complete || progress.pending) {
-            throw std::logic_error("prefill capture offer overlaps prompt completion");
+    for (std::size_t row = 0; row < flight.requests.size(); ++row) {
+        const auto& request = flight.requests[row];
+        const auto& step    = progress.rows[row];
+        ++request->host_timing.prefill_units;
+        cumulative_stats_.computed_prefill_tokens += step.processed_prompt_tokens;
+        if (!request->admitted_begin) {
+            throw std::logic_error("prefill progress has no committed admission summary");
         }
-        reserve_active_capture(request, EngineRequestState::Prefill);
-        return;
+        const auto& begin = *request->admitted_begin;
+        if (begin.reused_prompt_tokens > begin.prompt_tokens) {
+            throw std::logic_error("admitted prefix exceeds its prompt");
+        }
+        const auto suffix_tokens = begin.prompt_tokens - begin.reused_prompt_tokens;
+        if (request->computed_prompt_tokens > suffix_tokens ||
+            step.processed_prompt_tokens > suffix_tokens - request->computed_prompt_tokens) {
+            throw std::logic_error("prefill unit exceeded the admitted prompt suffix");
+        }
+        const auto computed_begin = begin.reused_prompt_tokens + request->computed_prompt_tokens;
+        const auto computed_end   = computed_begin + step.processed_prompt_tokens;
+        request->computed_prompt_tokens += step.processed_prompt_tokens;
+        flight.progressed[row] = step.processed_prompt_tokens != 0;
+        const bool cancelled   = request->cancelled.load(std::memory_order_acquire);
+        if (!cancelled) {
+            resources_.observe_committed(*request->base_plan, request->id, computed_begin,
+                                         computed_end,
+                                         instance_.session->capture_frontiers(
+                                             *request->sequence, computed_begin, computed_end),
+                                         request->continuation_owner);
+        }
+        if (flight.progressed[row]) {
+            request->last_progress = Clock::now();
+            publish_prompt_progress(request);
+        }
+        if (step.complete != (progress.pending && progress.pending->row_sampled(row))) {
+            throw std::logic_error("prefill completion differs from its sampled rows");
+        }
+        if (step.complete) {
+            if (request->computed_prompt_tokens != suffix_tokens || step.summary != begin) {
+                throw std::logic_error("completed prefill differs from committed admission");
+            }
+        } else if (!progress.pending) {
+            if (step.capture_ready ||
+                (!cancelled && instance_.session->retry_capture(*request->sequence))) {
+                reserve_active_capture(request, EngineRequestState::Prefill);
+            }
+            update_recovery(request);
+        }
     }
-    if (!progress.complete && !request->cancelled.load(std::memory_order_acquire) &&
-        instance_.session->retry_capture(*request->sequence)) {
-        reserve_active_capture(request, EngineRequestState::Prefill);
-        return;
+    if (progress.pending) {
+        phase.finish();
+        commit_pending(std::move(*progress.pending), std::move(flight));
+    } else {
+        record_service(flight);
     }
-    if (!progress.complete) { return; }
-    if (!request->lane || !progress.pending) {
-        throw std::logic_error("completed prefill has no lane or pending token");
-    }
-    if (!request->admitted_begin || progress.summary != *request->admitted_begin) {
-        throw std::logic_error("runtime Begin summary differs from committed admission");
-    }
-    phase.finish();
-    commit_pending(std::move(*progress.pending), std::move(flight));
-    progress.pending.reset();
 }
 
 template <class Instance>
@@ -346,23 +355,21 @@ EngineCore<Instance>::freeze_members(std::span<const std::uint32_t> lanes, UnitK
 }
 
 template <class Instance>
-[[nodiscard]] bool EngineCore<Instance>::start_prefill(std::uint32_t lane) {
-    const std::array<std::uint32_t, 1> lanes{lane};
-    const auto& request = slots_[lane];
-    auto flight =
-        freeze_members(lanes, request->is_replaying() ? UnitKind::Replay : UnitKind::Prefill);
+[[nodiscard]] bool EngineCore<Instance>::start_prefill(const PrefillMembership& membership) {
+    auto flight = freeze_members(membership.lanes,
+                                 membership.is_replay ? UnitKind::Replay : UnitKind::Prefill);
     ExecutionCallScope call(*this);
-    const auto ticket = request->is_replaying()
+    const auto ticket = membership.is_replay
                             ? instance_.session->start_replay(flight.sequences.front())
-                            : instance_.session->start_prefill(flight.sequences.front(),
-                                                               request->output.constrained());
+                            : instance_.session->start_prefill(flight.sequences, membership.grants);
     call.finish();
     if (!ticket) return false;
     flight.ticket = *ticket;
     for (const auto& member : flight.requests) member->execution_in_flight = true;
+    for (const auto lane : flight.lanes) reserved_units_[lane].reset();
+    scheduler_.prefill_executed(flight.lanes.front(), max_concurrency_);
+    prefill_coalesce_waits_ = 0;
     compute_.emplace(std::move(flight));
-    reserved_units_[lane].reset();
-    scheduler_.prefill_executed(lane, max_concurrency_);
     return true;
 }
 
@@ -588,9 +595,7 @@ template <class Instance>
             commit_pending(std::move(*pending), std::move(flight));
         } else if (auto* prefill =
                        std::get_if<typename ModelContract::PrefillProgress>(&event->result)) {
-            const auto request = flight.requests.front();
-            resolve_prefill_progress(request, std::move(*prefill), std::move(flight));
-            update_recovery(request);
+            resolve_prefill_progress(std::move(*prefill), std::move(flight));
         } else if (auto* replay =
                        std::get_if<typename ModelContract::ReplayProgress>(&event->result)) {
             const auto& request = flight.requests.front();

@@ -21,35 +21,94 @@ void submit(detail::SessionImpl& session, runtime::ExecutionReservation reservat
 
 } // namespace
 
+runtime::PrefillBudgetPolicy Session::prefill_budget_policy() const noexcept {
+    const auto& shape = impl_->shape;
+    return {.max_tokens_global           = shape.prefill_chunk,
+            .max_tokens_per_placement    = shape.prefill_chunk,
+            .max_sequences_per_placement = shape.max_concurrency};
+}
+
+runtime::PrefillCandidateInfo Session::prefill_candidate(SequenceHandle handle) const {
+    const auto& p = *impl_;
+    const auto& s = p.sequence(handle);
+    if (s.phase != detail::Phase::Prefill)
+        throw std::logic_error("prefill candidate is outside prefill");
+    const auto begin   = s.continuation.metadata.main_frontier;
+    const auto prompt  = s.request->summary.prompt_tokens;
+    const auto end     = p.unit_end(s, ExecutionUnitKind::Prefill, 0);
+    const bool capture = s.capture && s.captures[s.next_capture].frontier == begin;
+    const bool exclusive =
+        s.request->vision && begin < end &&
+        std::ranges::any_of(s.request->vision->units, [&](const models::vision::Unit& unit) {
+            return unit.token_begin < end && begin < unit.end();
+        });
+    return {.placement         = s.continuation.metadata.placement,
+            .remaining_tokens  = prompt - begin,
+            .unit_max_tokens   = end - begin,
+            .exclusive         = exclusive,
+            .zero_token_sample = begin == prompt && !capture};
+}
+
 std::optional<runtime::ExecutionTicket> Session::start_prefill(SequenceHandle handle,
                                                                bool constrained) {
+    if (impl_->compute) return {};
+    const runtime::PrefillGrant grant{prefill_candidate(handle).unit_max_tokens, constrained};
+    return start_prefill({&handle, 1}, {&grant, 1});
+}
+
+std::optional<runtime::ExecutionTicket>
+Session::start_prefill(std::span<const SequenceHandle> members,
+                       std::span<const runtime::PrefillGrant> grants) {
     auto& p = *impl_;
-    auto& s = p.sequence(handle);
     if (p.compute) return {};
-    if (s.phase != detail::Phase::Prefill || !s.permit || s.capture_pending)
-        throw std::logic_error("prefill has no executable unit");
-    const auto frontier = s.continuation.metadata.main_frontier;
-    const auto end =
-        p.window_end(s, frontier, std::min(s.permitted_frontier, s.request->summary.prompt_tokens));
-    const bool capture = s.capture && s.captures[s.next_capture].frontier == end;
-    const bool sample  = end == s.request->summary.prompt_tokens && !capture;
-    auto reservation   = p.executor->try_reserve(runtime::FrameKind::Compute);
+    if (members.empty() || members.size() > p.shape.max_concurrency ||
+        grants.size() != members.size())
+        throw std::logic_error("invalid prefill membership");
+    std::vector<std::uint32_t> ends;
+    ends.reserve(members.size());
+    const auto mark = p.next_membership_mark();
+    for (std::size_t b = 0; b < members.size(); ++b) {
+        auto& s = p.sequence(members[b]);
+        if (s.phase != detail::Phase::Prefill || !s.permit ||
+            s.permit->kind != ExecutionUnitKind::Prefill || s.capture_pending ||
+            s.membership_mark == mark)
+            throw std::logic_error("prefill has no distinct executable unit");
+        s.membership_mark = mark;
+        const auto info   = prefill_candidate(members[b]);
+        const auto begin  = s.continuation.metadata.main_frontier;
+        const auto tokens = std::min(grants[b].max_tokens, info.unit_max_tokens);
+        const auto end    = std::min(s.permitted_frontier, begin + tokens);
+        if ((info.exclusive && members.size() > 1) || (end == begin && !info.zero_token_sample))
+            throw std::logic_error("prefill grant has no executable window");
+        ends.push_back(end);
+    }
+    auto reservation = p.executor->try_reserve(runtime::FrameKind::Compute);
     if (!reservation) return {};
     p.compute = std::make_unique<detail::ComputeTransaction>(Kind::Prefill, p.directory);
     auto& tx  = *p.compute;
-    tx.members.push_back(handle);
     try {
-        if (end > frontier) p.prepare_write(s, end, tx.context);
-        auto row              = p.work_row(s, end - frontier);
-        row.constrained       = constrained;
-        row.sampling_position = end;
-        tx.rows.push_back(row);
+        tx.members.assign(members.begin(), members.end());
+        tx.rows.reserve(members.size());
         ForwardWork forward;
-        forward.kind   = ForwardKind::Prefill;
-        forward.sample = sample ? SampleKind::FirstToken : SampleKind::None;
-        forward.rows.push_back(std::move(row));
-        forward.visual = p.prepare_visual(s, frontier, end);
-        if (forward.visual) tx.vision_id = forward.visual->window.id;
+        forward.kind = ForwardKind::Prefill;
+        for (std::size_t b = 0; b < members.size(); ++b) {
+            auto& s            = p.sequence(members[b]);
+            const auto begin   = s.continuation.metadata.main_frontier;
+            const auto end     = ends[b];
+            const bool capture = s.capture && s.captures[s.next_capture].frontier == end;
+            if (end > begin) p.prepare_write(s, end, tx.context);
+            auto row              = p.work_row(s, end - begin);
+            row.sample            = end == s.request->summary.prompt_tokens && !capture;
+            row.constrained       = row.sample && grants[b].constrained;
+            row.sampling_position = end;
+            if (row.sample) forward.sample = SampleKind::FirstToken;
+            tx.rows.push_back(std::move(row));
+            if (auto visual = p.prepare_visual(s, begin, end)) {
+                tx.vision_id   = visual->window.id;
+                forward.visual = std::move(visual);
+            }
+        }
+        forward.rows = tx.rows;
         submit(p, std::move(*reservation), {{}, std::move(forward)});
         return tx.ticket;
     } catch (const std::exception& error) {

@@ -121,6 +121,7 @@ void row(Encoder& out, const WorkRow& r) {
     sampling(out, r.sampling);
     out.u32(r.sampling_position);
     out.boolean(r.constrained);
+    out.boolean(r.sample);
 }
 
 WorkRow row(Decoder& in) {
@@ -140,6 +141,7 @@ WorkRow row(Decoder& in) {
     r.sampling          = sampling(in);
     r.sampling_position = in.u32();
     r.constrained       = in.boolean();
+    r.sample            = in.boolean();
     return r;
 }
 
@@ -149,7 +151,7 @@ void rows(Encoder& out, const std::vector<WorkRow>& values) {
 }
 
 std::vector<WorkRow> rows(Decoder& in) {
-    std::vector<WorkRow> result(in.count(96));
+    std::vector<WorkRow> result(in.count(97));
     for (auto& value : result) value = row(in);
     return result;
 }

@@ -277,7 +277,7 @@ void masked_decode(EngineOptions options, bool expect_offload) {
         const std::array prefill{q::ExecutionUnit{members[lane], q::ExecutionUnitKind::Prefill, 0}};
         check(bool(session.reserve_units(prefill)), "masked graph prefill permit failed");
         auto progress = driver.prefill(members[lane]);
-        if (progress.capture_ready) session.skip_capture(members[lane]);
+        if (progress.rows.at(0).capture_ready) session.skip_capture(members[lane]);
         (void)driver.commit(std::move(*progress.pending), std::array{runtime::CommitDecision{1}});
     }
     const std::array decode{q::ExecutionUnit{members[0], q::ExecutionUnitKind::Decode, 1},
@@ -338,7 +338,7 @@ void masked_decode(EngineOptions options, bool expect_offload) {
                 q::ExecutionUnit{member.front(), q::ExecutionUnitKind::Prefill, 0}};
             check(bool(session.reserve_units(prefill)), "split-narrow prefill permit failed");
             auto progress = driver.prefill(member.front());
-            if (progress.capture_ready) session.skip_capture(member.front());
+            if (progress.rows.at(0).capture_ready) session.skip_capture(member.front());
             (void)driver.commit(std::move(*progress.pending),
                                 std::array{runtime::CommitDecision{1}});
             session.fit_speculative_cost_model(anchors, 0.0);

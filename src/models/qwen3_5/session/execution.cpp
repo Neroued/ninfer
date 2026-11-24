@@ -26,45 +26,101 @@ SessionImpl::submit_execution(Execution&& pending, runtime::ExecutionReservation
     }
 }
 
+runtime::PrefillCandidateInfo SessionImpl::prefill_candidate(SequenceHandle handle) const {
+    const auto l        = lane(handle);
+    const auto& state   = sequences[l];
+    const auto& request = requests[l];
+    if (request.lifecycle != Lifecycle::Prefilling || !request.prefill)
+        throw std::logic_error("prefill candidate is outside prefill");
+    const auto begin  = state.continuation.metadata.execution_frontier;
+    const auto prompt = request.prefill->prompt_tokens;
+    const auto end    = window_end(state, request, begin, prompt, vision_window);
+    const bool capture =
+        request.capture_reservation && request.capture_reservation->frontier == begin;
+    const bool exclusive =
+        request.base->vision && begin < end &&
+        std::ranges::any_of(request.base->vision->units, [&](const models::vision::Unit& unit) {
+            return unit.token_begin < end && begin < unit.end();
+        });
+    return {.remaining_tokens  = prompt - begin,
+            .unit_max_tokens   = end - begin,
+            .exclusive         = exclusive,
+            .zero_token_sample = begin == prompt && !capture};
+}
+
 std::optional<runtime::ExecutionTicket> SessionImpl::start_prefill(SequenceHandle handle,
                                                                    bool constrained) {
     if (execution) return {};
-    const auto l  = lane(handle);
-    auto& state   = sequences[l];
-    auto& request = requests[l];
-    if (request.lifecycle != Lifecycle::Prefilling || !request.prefill || request.capture_pending)
-        throw std::logic_error("sequence has no executable prefill window");
-    require_unit(l, ExecutionUnitKind::Prefill);
+    const runtime::PrefillGrant grant{prefill_candidate(handle).unit_max_tokens, constrained};
+    return start_prefill({&handle, 1}, {&grant, 1});
+}
+
+std::optional<runtime::ExecutionTicket>
+SessionImpl::start_prefill(std::span<const SequenceHandle> members,
+                           std::span<const runtime::PrefillGrant> grants) {
+    if (execution) return {};
+    if (members.empty() || members.size() > max_concurrency || grants.size() != members.size())
+        throw std::logic_error("invalid prefill membership");
+    const auto mark = next_lane_mark();
+    for (std::size_t b = 0; b < members.size(); ++b) {
+        const auto l        = lane(members[b]);
+        const auto& request = requests[l];
+        const auto info     = prefill_candidate(members[b]);
+        if (!request.permit || request.permit->kind != ExecutionUnitKind::Prefill ||
+            request.capture_pending || lane_marks[l] == mark ||
+            (info.exclusive && members.size() > 1) ||
+            (!info.zero_token_sample && (!grants[b].max_tokens || !info.unit_max_tokens ||
+                                         request.permit->main_frontier == request.prefill->cursor)))
+            throw std::logic_error("prefill has no distinct executable window");
+        lane_marks[l] = mark;
+    }
     auto reservation = executor().try_reserve(runtime::FrameKind::Compute);
     if (!reservation) return {};
     try {
-        prepare_capture_boundary(l);
-        const auto begin = state.continuation.metadata.execution_frontier;
-        const auto end =
-            window_end(state, request, begin,
-                       std::min(request.permit->main_frontier, request.base->summary.prompt_tokens),
-                       vision_window);
-        const bool sample = end == request.base->summary.prompt_tokens;
         Execution pending{.kind = OperationKind::Prefill};
-        pending.members     = {handle};
-        pending.bases       = {state.continuation};
-        pending.columns     = {end - begin};
+        pending.members.assign(members.begin(), members.end());
         pending.preparation = std::make_unique<context::ContextTransaction>(directory);
-        ensure_sequence_kv_mapped(state, end,
-                                  speculative_backend == SpeculativeBackend::Mtp
-                                      ? (end ? end - 1 : 0)
-                                  : has_backend_pool() ? end
-                                                       : 0,
-                                  *pending.preparation);
+        pending.bases.reserve(members.size());
+        pending.columns.reserve(members.size());
+        pending.sampled.reserve(members.size());
         ForwardWork forward;
         forward.purpose = ForwardPurpose::Prefill;
-        forward.rows.push_back(execution_row(state));
-        forward.inputs.push_back(input_window(state, begin, end));
-        forward.inputs.back().visual = prepare_visual(state, begin, end);
-        if (forward.inputs.back().visual)
-            pending.vision_id = forward.inputs.back().visual->window.id;
-        forward.sample = sample ? SamplePurpose::FirstToken : SamplePurpose::None;
-        forward.sampling.push_back({request.sampling_host, constrained});
+        forward.rows.reserve(members.size());
+        forward.inputs.reserve(members.size());
+        forward.sampling.reserve(members.size());
+        for (std::size_t b = 0; b < members.size(); ++b) {
+            const auto l  = lane(members[b]);
+            auto& state   = sequences[l];
+            auto& request = requests[l];
+            prepare_capture_boundary(l);
+            const auto begin = state.continuation.metadata.execution_frontier;
+            const auto limit =
+                begin + std::min(grants[b].max_tokens, request.prefill->prompt_tokens - begin);
+            const auto end =
+                window_end(state, request, begin, std::min(limit, request.permit->main_frontier),
+                           vision_window);
+            const bool capture =
+                request.capture_reservation && request.capture_reservation->frontier == end;
+            const bool sample = end == request.prefill->prompt_tokens && !capture;
+            pending.bases.push_back(state.continuation);
+            pending.columns.push_back(end - begin);
+            pending.sampled.push_back(sample);
+            ensure_sequence_kv_mapped(state, end,
+                                      speculative_backend == SpeculativeBackend::Mtp
+                                          ? (end ? end - 1 : 0)
+                                      : has_backend_pool() ? end
+                                                           : 0,
+                                      *pending.preparation);
+            forward.rows.push_back(execution_row(state));
+            forward.inputs.push_back(input_window(state, begin, end));
+            forward.inputs.back().visual = prepare_visual(state, begin, end);
+            if (forward.inputs.back().visual)
+                pending.vision_id = forward.inputs.back().visual->window.id;
+            if (sample) forward.sample = SamplePurpose::FirstToken;
+            forward.sampling.push_back(
+                {request.sampling_host, sample && grants[b].constrained, sample});
+        }
+        if (forward.sample == SamplePurpose::None) forward.sampling.clear();
         return submit_execution(std::move(pending), std::move(*reservation),
                                 Work{.operation = std::move(forward)});
     } catch (const std::exception& error) {

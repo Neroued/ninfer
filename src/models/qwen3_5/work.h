@@ -41,6 +41,7 @@ struct ExecutionRow {
 struct SamplingInput {
     ResolvedSamplingParameters parameters;
     bool constrained = false;
+    bool sample      = false;
 };
 
 struct InputWindow {

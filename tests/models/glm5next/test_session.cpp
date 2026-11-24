@@ -44,7 +44,10 @@ public:
     std::uint64_t unit_time_ns          = 0;
     unsigned defer_binding = 0, bindings = 0;
     std::optional<rt::DeviceRetired> deferred_context;
-    bool compute_retired = false;
+    bool compute_retired           = false;
+    unsigned deferred_bind_flushes = 0;
+    bool simulate_ragged_prefill   = false;
+    std::vector<glm::CommitRow> ragged_commit;
     std::function<void()> replay_submitted;
     std::vector<std::uint32_t> accept;
     glm::ComputeResult computed;
@@ -67,7 +70,10 @@ public:
     }
 
     rt::ExecutionTicket submit(rt::ExecutionReservation reservation, glm::Work work) override {
-        contract.validate(work, reservation.frame().kind);
+        const auto* forward = std::get_if<glm::ForwardWork>(&work.operation);
+        const bool ragged   = simulate_ragged_prefill && forward &&
+                            forward->kind == glm::ForwardKind::Prefill && forward->rows.size() > 1;
+        if (!ragged) contract.validate(work, reservation.frame().kind);
 #if NINFER_ENABLE_DISTRIBUTED
         for (std::uint32_t rank = 0; rank < contract.ranks; ++rank) {
             distributed::wire::Encoder out;
@@ -76,12 +82,13 @@ public:
             distributed::wire::Decoder in(bytes);
             const auto decoded = glm::decode_work(in);
             in.finish();
-            contract.validate(decoded, reservation.frame().kind);
+            if (!ragged) contract.validate(decoded, reservation.frame().kind);
             const auto original_rows = glm::work_rows(work), decoded_rows = glm::work_rows(decoded);
             require(original_rows.size() == decoded_rows.size(), "wire changed logical membership");
             for (std::size_t row = 0; row < original_rows.size(); ++row)
                 require(original_rows[row].member.sequence == decoded_rows[row].member.sequence &&
                             original_rows[row].ids == decoded_rows[row].ids &&
+                            original_rows[row].sample == decoded_rows[row].sample &&
                             original_rows[row].attention_rank == decoded_rows[row].attention_rank,
                         "wire changed inputs or attention ownership");
         }
@@ -113,7 +120,7 @@ public:
                     r.accepted_drafts = accept.empty() ? r.drafts : std::min(accept[b], r.drafts);
                     r.tokens.resize(r.accepted_drafts + 1, 0);
                     r.draft_confidences.resize(r.drafts, 0.75f);
-                } else if (forward->sample != glm::SampleKind::None) {
+                } else if (row.sample || forward->sample == glm::SampleKind::NextToken) {
                     r.tokens = {static_cast<TokenId>(row.member.sequence.value % 2)};
                     if (forward->sample == glm::SampleKind::NextToken &&
                         contract.shape.draft_tokens)
@@ -137,7 +144,12 @@ public:
     }
 
     rt::CommitReceipt commit(rt::ExecutionTicket ticket, glm::Commit commit) override {
-        contract.validate_commit(last, computed.rows, commit);
+        const auto* forward = std::get_if<glm::ForwardWork>(&last.operation);
+        if (simulate_ragged_prefill && forward && forward->kind == glm::ForwardKind::Prefill &&
+            forward->rows.size() > 1)
+            ragged_commit = commit.rows;
+        else
+            contract.validate_commit(last, computed.rows, commit);
         events.emplace_back(rt::DeviceRetired{ticket, {++next}, {}});
         return {ticket, {next}};
     }
@@ -163,9 +175,10 @@ public:
     }
 
     void flush() override {
-        // Model an asynchronous binding retiring after resident compute has progressed.
-        // Publishing at flush keeps the new lane unavailable until the next scheduling boundary.
-        if (deferred_context && compute_retired) {
+        if (!deferred_context) return;
+        // A bind retires at a flush either after a delay or after resident work progresses.
+        const bool ready = deferred_bind_flushes ? --deferred_bind_flushes == 0 : compute_retired;
+        if (ready) {
             events.emplace_back(std::move(*deferred_context));
             deferred_context.reset();
             compute_retired = false;
@@ -684,7 +697,7 @@ void long_input_replacement(std::shared_ptr<const glm::ModelDefinition> definiti
         auto progress = f.event<glm::PrefillProgress>();
         f.idle();
         if (capture) {
-            require(capture->reserved && progress.capture_ready && !progress.pending,
+            require(capture->reserved && progress.rows.at(0).capture_ready && !progress.pending,
                     "long input capture was not prepared before execution");
             require(f.session.start_capture(sequence) == rt::ContextStart::Started,
                     "long input capture did not start");
@@ -724,6 +737,59 @@ void retired_quotes_do_not_block_new_inputs(
     const auto usage = f.session.physical_usage();
     require(!usage.state_objects && !usage.history_objects,
             "retired quotes retained physical context");
+}
+
+void mixed_prefill_transaction(std::shared_ptr<const glm::ModelDefinition> definition) {
+    Fixture f(definition);
+    f.executor.simulate_ragged_prefill = true;
+    const auto short_prompt            = f.bind(f.request(8), 0, 0);
+    const auto continuing              = f.bind(f.request(60), 1, 1);
+    const auto cancelled               = f.bind(f.request(50), 2, 0);
+    const std::array members{short_prompt, continuing, cancelled};
+    const std::array units{
+        glm::ExecutionUnit{short_prompt, glm::ExecutionUnitKind::Prefill, 8},
+        glm::ExecutionUnit{continuing, glm::ExecutionUnitKind::Prefill, 16},
+        glm::ExecutionUnit{cancelled, glm::ExecutionUnitKind::Prefill, 24},
+    };
+    const std::array grants{rt::PrefillGrant{8}, rt::PrefillGrant{16}, rt::PrefillGrant{24}};
+    require(f.session.prefill_budget_policy().max_sequences_per_step == 1 &&
+                f.session.reserve_units(units) && f.session.start_prefill(members, grants),
+            "synthetic mixed prefill could not reserve and start its rows");
+    auto progress = f.event<glm::PrefillProgress>();
+    require(progress.rows.size() == 3 && progress.pending && progress.rows[0].complete &&
+                !progress.rows[1].complete && !progress.rows[2].complete &&
+                progress.rows[0].processed_prompt_tokens == 8 &&
+                progress.rows[1].processed_prompt_tokens == 16 &&
+                progress.rows[2].processed_prompt_tokens == 24 &&
+                progress.pending->row_sampled(0) && !progress.pending->row_sampled(1) &&
+                !progress.pending->row_sampled(2) &&
+                std::ranges::equal(progress.pending->row_counts(), std::array{1, 0, 0}),
+            "mixed prefill lost its row extents or sampled membership");
+    const std::array decisions{
+        rt::CommitDecision{.accepted_tokens = 1, .terminal = true},
+        rt::CommitDecision{},
+        rt::CommitDecision{.terminal = true, .cancelled = true},
+    };
+    const auto result = f.session.commit(std::move(*progress.pending), decisions);
+    require(result.rows[0].disposition == rt::CommitDisposition::Finishable &&
+                result.rows[1].disposition == rt::CommitDisposition::Active &&
+                result.rows[2].disposition == rt::CommitDisposition::CancelledReleased &&
+                f.executor.ragged_commit.size() == 3 && f.executor.ragged_commit[0].accepted == 1 &&
+                f.executor.ragged_commit[1].accepted == 16 &&
+                f.executor.ragged_commit[2].accepted == 0 && f.executor.ragged_commit[2].cancelled,
+            "mixed prefill confused generated, processed and discarded tokens");
+    f.idle();
+    require(f.session.prefill_candidate(continuing).remaining_tokens == 44 &&
+                f.session.abort(cancelled).status != rt::ConsumeStatus::Consumed,
+            "mixed commit lost the prompt frontier or retained a cancelled row");
+    f.commit(f.prefill(continuing), true);
+    for (const auto sequence : {short_prompt, continuing}) {
+        const auto finished = f.session.finish(sequence);
+        require(finished.status == rt::ConsumeStatus::Consumed && finished.checkpoint &&
+                    f.session.release_checkpoint(*finished.checkpoint),
+                "mixed prefill left an invalid finishable row");
+    }
+    f.idle();
 }
 
 void fragmented_capture(std::shared_ptr<const glm::ModelDefinition> definition) {
@@ -789,7 +855,7 @@ void fragmented_capture(std::shared_ptr<const glm::ModelDefinition> definition) 
     const auto ready = f.session.prepare_capture(sequence);
     require(ready && ready->reserved, "capture did not become ready after compaction");
     require(f.session.start_prefill(sequence).has_value(), "compacted prefill did not execute");
-    require(f.event<glm::PrefillProgress>().capture_ready,
+    require(f.event<glm::PrefillProgress>().rows.at(0).capture_ready,
             "compacted prefill lost its checkpoint boundary");
     f.idle();
     require(f.session.start_capture(sequence) == runtime::ContextStart::Started,
@@ -915,7 +981,7 @@ void transactions(std::shared_ptr<const glm::ModelDefinition> definition) {
         require(capture && capture->reserved, "input checkpoint was not reserved");
         (void)f.session.start_prefill(sequence);
         const auto progress = f.event<glm::PrefillProgress>();
-        require(progress.capture_ready && !progress.pending,
+        require(progress.rows.at(0).capture_ready && !progress.pending,
                 "input checkpoint boundary not honored");
         f.idle();
         require(f.session.start_capture(sequence) == runtime::ContextStart::Started,
@@ -984,7 +1050,7 @@ void capture_replacement_and_retry(std::shared_ptr<const glm::ModelDefinition> d
     f.session.skip_capture(first);
     require(f.session.start_prefill(first).has_value(), "retry prefill start");
     auto result = f.event<glm::PrefillProgress>();
-    require(result.complete && result.pending && !result.capture_ready,
+    require(result.rows.at(0).complete && result.pending && !result.rows.at(0).capture_ready,
             "skipped capture changed the normal prefill boundary");
     f.commit(std::move(*result.pending));
     require(f.session.retry_capture(first), "completed prefill lost its retryable input frontier");
@@ -1192,7 +1258,10 @@ void engine_pressure(std::shared_ptr<const glm::ModelDefinition> definition, boo
     std::array<std::exception_ptr, 3> errors;
     std::array<std::vector<GenerationSchedulingObservation>, 3> observations;
     for (unsigned row = 0; row < submitted.size(); ++row) {
-        auto prompt        = f.frontend.prepare_tokens(std::vector<TokenId>(128, row), true);
+        // The first two rows reach Decode after one chunk. Their next pages force
+        // pressure before the newest binding can process any prompt tokens.
+        auto prompt =
+            f.frontend.prepare_tokens(std::vector<TokenId>(row == 2 ? 128 : 64, row), true);
         const auto summary = prompt.summary();
         rt::ResolvedRequestOptions request;
         request.execution.requested_output_tokens = 120;
@@ -1470,6 +1539,94 @@ struct WaitingCaptureRuntime : glm::RuntimeTypes {
     using Session = WaitingCaptureSession;
 };
 
+class PackedPrefillSession : public glm::Session {
+public:
+    using glm::Session::Session;
+
+    rt::PrefillBudgetPolicy prefill_budget_policy() const noexcept {
+        auto policy                   = glm::Session::prefill_budget_policy();
+        policy.max_sequences_per_step = 3;
+        return policy;
+    }
+
+    glm::FinishResult finish(glm::SequenceHandle sequence) {
+        auto result = glm::Session::finish(sequence);
+        if (result.status == rt::ConsumeStatus::Consumed) ++finished;
+        return result;
+    }
+
+    rt::ContextStart start_capture(glm::SequenceHandle sequence) {
+        const auto result = glm::Session::start_capture(sequence);
+        if (result == rt::ContextStart::Started) {
+            ++captures;
+            finished_before_capture = finished;
+        }
+        return result;
+    }
+
+    unsigned finished = 0, captures = 0, finished_before_capture = 0;
+};
+
+struct PackedPrefillRuntime : glm::RuntimeTypes {
+    using Session = PackedPrefillSession;
+};
+
+void engine_packed_prefill(std::shared_ptr<const glm::ModelDefinition> definition) {
+    auto layout                = plan(*definition);
+    layout.shape.prefill_chunk = 128;
+    auto frontend              = make_frontend();
+    Executor executor({layout.shape, layout.batches, definition->config().text.vocabulary,
+                       definition->resources().text.public_token_count, 2});
+    PackedPrefillSession session(
+        glm::prepare_session(definition, layout,
+                             std::make_unique<ctx::ContextDirectory>(layout.context)),
+        executor);
+
+    struct Instance {
+        using ModelContract = PackedPrefillRuntime;
+        glm::Frontend& frontend;
+        Executor* executor;
+        PackedPrefillSession* session;
+    } instance{frontend, &executor, &session};
+
+    EngineOptions options;
+    options.max_context              = 256;
+    options.max_concurrency          = 3;
+    options.context_cache.enabled    = true;
+    executor.simulate_ragged_prefill = true;
+    executor.hold_poll               = true;
+    executor.defer_binding           = 2;
+    executor.deferred_bind_flushes   = 1;
+    rt::EngineCore<Instance> engine(instance, options, {});
+    const auto submit = [&](std::uint32_t length, TokenId token, bool cache) {
+        auto prompt        = frontend.prepare_tokens(std::vector<TokenId>(length, token), cache);
+        const auto summary = prompt.summary();
+        rt::ResolvedRequestOptions request;
+        request.execution.requested_output_tokens = 1;
+        request.execution.allow_prefix_reuse      = cache;
+        request.output.raw                        = true;
+        request.stop.include_model_defaults       = false;
+        return engine.submit(std::move(prompt), summary, 0, request, OutputConsumerMode::Aggregate,
+                             {});
+    };
+    auto short_prompt   = submit(8, 0, false);
+    auto capture_prompt = submit(96, 1, true);
+    executor.hold_poll  = false;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    const CancellationView timeout([&] { return std::chrono::steady_clock::now() >= deadline; });
+    const auto a = short_prompt.wait(nullptr, timeout);
+    const auto b = capture_prompt.wait(nullptr, timeout);
+    require(a.finish_reason == FinishReason::OutputLimit &&
+                b.finish_reason == FinishReason::OutputLimit && a.generated_token_ids.size() == 1 &&
+                b.generated_token_ids.size() == 1,
+            "mixed Engine prefill did not produce exactly one token for each request");
+    require(executor.ragged_commit.size() == 2 && executor.ragged_commit[0].terminal &&
+                executor.ragged_commit[0].accepted == 1 &&
+                executor.ragged_commit[1].accepted == 96 && session.captures == 1 &&
+                session.finished_before_capture == 1,
+            "lightweight bind or terminal row prevented the co-batched input capture");
+}
+
 void independent_prefill(std::shared_ptr<const glm::ModelDefinition> definition) {
     auto layout   = plan(*definition);
     auto frontend = make_frontend();
@@ -1594,10 +1751,12 @@ int main(int argc, char** argv) {
         relocation_preflight_includes_destination_victims(glm::read_definition(reader, {}));
         transactions(glm::read_definition(reader, {}));
         capture_replacement_and_retry(glm::read_definition(reader, {}));
+        mixed_prefill_transaction(glm::read_definition(reader, {}));
         fragmented_capture(glm::read_definition(reader, {}));
         engine_pressure(glm::read_definition(reader, {}), false);
         engine_pressure(glm::read_definition(reader, {}), true);
         engine_stop(glm::read_definition(reader, {}));
+        engine_packed_prefill(glm::read_definition(reader, {}));
         independent_prefill(glm::read_definition(reader, {}));
         cancelled_prefix_statistics(glm::read_definition(reader, {}));
         engine_pressure(glm::read_definition(reader, {}), false, true);

@@ -161,6 +161,10 @@ public:
 
     [[nodiscard]] std::uint32_t row_stride() const noexcept { return stride_; }
 
+    [[nodiscard]] bool row_sampled(std::size_t row) const {
+        return sampled_.empty() ? counts_.at(row) > 0 : sampled_.at(row);
+    }
+
     [[nodiscard]] bool constraint_failed(std::size_t row) const { return failed_.at(row); }
 
     [[nodiscard]] const ExecutionSample& execution_sample() const noexcept { return execution_; }
@@ -172,19 +176,22 @@ private:
     std::vector<std::int32_t> counts_;
     std::uint32_t stride_ = 1;
     bool decode_          = false;
-    std::vector<std::uint8_t> failed_;
+    std::vector<std::uint8_t> failed_, sampled_;
     ExecutionSample execution_;
     friend class detail::SessionImpl;
     friend class Session;
 };
 
-struct PrefillProgress {
+struct PrefillRowProgress {
     runtime::BeginSummary summary;
     std::uint32_t processed_prompt_tokens = 0;
     bool complete                         = false;
+    bool capture_ready                    = false;
+};
 
+struct PrefillProgress {
+    std::vector<PrefillRowProgress> rows;
     std::optional<PendingBatch> pending;
-    bool capture_ready = false;
 };
 
 struct CommitRowResult {
@@ -299,6 +306,8 @@ public:
                     runtime::CaptureStorage = runtime::CaptureStorage::Device) const;
     [[nodiscard]] std::vector<runtime::ContextTransferRequirement>
     demotion_work(const ContextDemotion&, std::span<const CheckpointHandle> victims = {}) const;
+    [[nodiscard]] runtime::PrefillBudgetPolicy prefill_budget_policy() const noexcept;
+    [[nodiscard]] runtime::PrefillCandidateInfo prefill_candidate(SequenceHandle) const;
     [[nodiscard]] std::optional<SequenceHandle> prefill_continuation() const;
     void yield_prefill(SequenceHandle);
 
@@ -415,6 +424,9 @@ public:
     [[nodiscard]] bool execution_pending(SequenceHandle) const noexcept;
     void cancel_context();
 
+    [[nodiscard]] std::optional<runtime::ExecutionTicket>
+    start_prefill(std::span<const SequenceHandle> members,
+                  std::span<const runtime::PrefillGrant> grants);
     [[nodiscard]] std::optional<runtime::ExecutionTicket> start_prefill(SequenceHandle,
                                                                         bool constrained = false);
     [[nodiscard]] std::optional<runtime::ExecutionTicket> start_replay(SequenceHandle);

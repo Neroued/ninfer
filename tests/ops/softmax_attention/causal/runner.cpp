@@ -1,4 +1,5 @@
 #include "fixture.h"
+#include "ops/ragged_fixture.h"
 #include "ops/graph_patch_check.h"
 
 namespace ninfer::test::causal_attention {
@@ -525,6 +526,63 @@ int run_batch_case(CudaExecutionView execution, const Geometry& geometry, KvCach
         }
     }
     return failures;
+}
+
+int run_ragged_case(CudaExecutionView execution, KvCacheStorage storage) {
+    RaggedFixture ragged({1, 3, 17, 65});
+    const std::vector<int> frontiers{4, 63, 7, 61}, table_rows{3, 5, 0, 2};
+    const Geometry geometry{"16/2", 16, 2};
+    constexpr int width = 65, table_slots = 6;
+    const int n = ragged.tokens(), rows = ragged.segments();
+    const std::size_t qw = kHeadDim * geometry.q_heads, kvw = kHeadDim * geometry.kv_heads;
+    auto q = make_bf16_values(n * qw, 325, -.25f, .25f);
+    auto k = make_bf16_values(n * kvw, 327, -.25f, .25f);
+    auto v = make_bf16_values(n * kvw, 329, -1.f, 1.f);
+    std::vector<HostCache> expected;
+    for (int slot = 0; slot < table_slots; ++slot)
+        expected.push_back(make_cache(geometry, storage, 130, 393 + slot));
+    BatchDeviceCache cache(expected, MappingPattern::Fragmented, 130);
+    const auto before = cache.snapshot_bytes();
+    std::vector<int> positions(n), padded_positions(width * rows, -1);
+    std::vector<double> reference;
+    for (int s = 0; s < rows; ++s) {
+        const int begin = ragged.prefix[s], len = ragged.lengths[s];
+        std::vector<int> pos(len);
+        std::iota(pos.begin(), pos.end(), frontiers[s]);
+        std::copy(pos.begin(), pos.end(), positions.begin() + begin);
+        std::copy(pos.begin(), pos.end(), padded_positions.begin() + s * width);
+        const auto column_range = [&](const std::vector<float>& data, std::size_t w) {
+            return std::vector<float>(data.begin() + begin * w, data.begin() + (begin + len) * w);
+        };
+        auto& history = expected[table_rows[s]];
+        append_cache(history, column_range(k, kvw), column_range(v, kvw), pos);
+        const auto result = ideal_attention(column_range(q, qw), history, pos);
+        reference.insert(reference.end(), result.begin(), result.end());
+    }
+    auto dq = to_device_bf16(q), dk = to_device_bf16(k), dv = to_device_bf16(v);
+    auto dp = to_device(positions), dr = to_device(table_rows);
+    Tensor tq(dq.span(), DType::BF16, {256, geometry.q_heads, n});
+    Tensor tk(dk.span(), DType::BF16, {256, geometry.kv_heads, n}),
+        tv(dv.span(), DType::BF16, {256, geometry.kv_heads, n});
+    GuardedDeviceBuffer output(q.size() * 2);
+    Tensor out(output.span(), DType::BF16, {256, geometry.q_heads, n});
+    constexpr auto bucket = ContextBucket::K2;
+    const auto bytes      = ops::causal_softmax_attention_ragged_workspace_capacity_bytes(
+        op_geometry(geometry), storage, bucket, n, n, rows, rows, execution.multiprocessor_count());
+    GuardedDeviceBuffer scratch(std::max<std::size_t>(256, bytes));
+    MemoryArena arena(scratch.span());
+    ops::causal_softmax_attention(tq, tk, tv, ragged.view, Tensor(dp.span(), DType::I32, {n}),
+                                  Tensor(dr.span(), DType::I32, {rows}), op_geometry(geometry),
+                                  kAttentionScale, cache.view(), bucket, arena, out, execution);
+    cuda_synchronize(execution.stream());
+    const std::string label = std::string("ragged causal ") + cache_name(storage);
+    return verify_attention(label, from_device_bf16(output.data(), q.size()), reference,
+                            attention_criterion(storage)) +
+           cache.verify(label, expected) +
+           cache.verify_untouched(label, before, padded_positions, table_rows, ragged.lengths,
+                                  width) +
+           scratch.verify_guards(label) + output.verify_guards(label) +
+           (arena.used() != 0 || arena.peak_used() > bytes);
 }
 
 int verify_workspace_capacity_contract(CudaExecutionView execution, KvCacheStorage storage) {

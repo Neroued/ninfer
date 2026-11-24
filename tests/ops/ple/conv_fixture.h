@@ -94,8 +94,12 @@ struct ConvFixture {
                               state_view(), record_view(), y, execution);
     }
 
-    int verify(bool with_norm, const std::string& label) const {
-        const auto words = from_device<std::uint16_t>(y.data, std::size_t(D) * tokens * batch);
+    int verify(bool with_norm, const std::string& label,
+               const std::vector<std::uint16_t>* observed      = nullptr,
+               const std::vector<std::uint16_t>* observed_norm = nullptr) const {
+        const auto words =
+            observed ? *observed
+                     : from_device<std::uint16_t>(y.data, std::size_t(D) * tokens * batch);
         std::vector<double> got(words.size()), reference(words.size());
         int failures = 0;
         for (int b = 0; b < batch; ++b)
@@ -130,7 +134,9 @@ struct ConvFixture {
                             reference[base + d] =
                                 t < valid[b] ? got[base + d] * inv * (1. + value(norm, d, s)) : 0.;
                     }
-            const auto z = from_device<std::uint16_t>(normalized.tensor.data, words.size());
+            const auto z = observed_norm
+                               ? *observed_norm
+                               : from_device<std::uint16_t>(normalized.tensor.data, words.size());
             for (std::size_t i = 0; i < z.size(); ++i) {
                 got[i]      = bf16_to_f32(z[i]);
                 const int b = i / (std::size_t(tokens) * D), t = i / D % tokens;

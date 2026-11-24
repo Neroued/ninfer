@@ -53,6 +53,77 @@ __global__ void pair_kernel(const __grid_constant__ Pairs a) {
     }
 }
 
+struct RaggedPairs {
+    View<const uint4> hidden, previous;
+    View<uint4> paired;
+    View<const int> ids, positions, rope, previous_rope;
+    View<int> paired_ids, paired_positions, paired_rope;
+    const int *in_cu, *out_cu, *out_tok2seq;
+    const int *input_segments, *previous_rows, *skip;
+    int total_out, vectors, axes;
+};
+
+__global__ void ragged_pair_kernel(const __grid_constant__ RaggedPairs a, int col_offset) {
+    const int out_col = col_offset + static_cast<int>(blockIdx.x);
+    if (out_col >= a.total_out) return;
+    const int m        = a.out_tok2seq[out_col];
+    const int j        = out_col - a.out_cu[m];
+    const int in_seg   = a.input_segments ? a.input_segments[m] : m;
+    const int prev_row = a.previous_rows ? a.previous_rows[m] : in_seg;
+    const int skip     = a.skip[m];
+    const int i        = j + skip;
+    const int in_col   = a.in_cu[in_seg] + i;
+    for (int d = threadIdx.x; d < a.vectors; d += blockDim.x) {
+        const uint4 value = i > 0 ? a.hidden.at(d, in_col - 1, 0) : a.previous.at(d, prev_row, 0);
+        a.paired.at(d, out_col, 0) = value;
+    }
+    if (threadIdx.x == 0) {
+        a.paired_ids.at(out_col, 0)       = a.ids.at(in_col, 0);
+        a.paired_positions.at(out_col, 0) = a.positions.at(in_col, 0) - 1;
+    }
+    if (threadIdx.x < a.axes) {
+        const int axis = threadIdx.x;
+        a.paired_rope.at(out_col, axis, 0) =
+            i > 0 ? a.rope.at(in_col - 1, axis, 0) : a.previous_rope.at(axis, prev_row, 0);
+    }
+}
+
+// Each Ragged operand has at most two active axes. Traverse physical rows in order,
+// comparing just their addressed elements when row spans intersect.
+struct PairRows {
+    operand::Blocks row;
+    std::size_t stride;
+    int count;
+};
+
+PairRows pair_rows(const Tensor& t, const char* op) {
+    const int inner   = t.ne[1] > 1 && (t.ne[0] == 1 || t.nb[1] < t.nb[0]) ? 1 : 0;
+    const int outer   = 1 - inner;
+    const auto word   = dtype_size(t.dtype);
+    const auto stride = static_cast<std::size_t>(t.nb[inner]);
+    const auto count  = static_cast<std::size_t>(t.ne[inner]);
+    const auto width  = stride == word ? word * count : word;
+    return {{operand::range(t.data, width, op), stride, stride == word ? 1 : count},
+            static_cast<std::size_t>(t.nb[outer]),
+            t.ne[outer]};
+}
+
+bool pair_overlap(const Tensor& a, const Tensor& b, const char* op) {
+    if (!operand::overlaps(operand::strided_range(a, op), operand::strided_range(b, op)))
+        return false;
+    auto x = pair_rows(a, op), y = pair_rows(b, op);
+    for (int i = 0, j = 0; i < x.count && j < y.count;) {
+        if (operand::overlaps(x.row, y.row)) return true;
+        const auto x_end = x.row.first.end + (x.row.count - 1) * x.row.stride;
+        const auto y_end = y.row.first.end + (y.row.count - 1) * y.row.stride;
+        auto& next       = x_end <= y_end ? x : y;
+        ++(x_end <= y_end ? i : j);
+        next.row.first.begin += next.stride;
+        next.row.first.end += next.stride;
+    }
+    return false;
+}
+
 void check_hidden(const Tensor& value, std::initializer_list<int> shape, const char* name,
                   CudaExecutionView cuda) {
     constexpr const char* op = "prepare_causal_pairs";
@@ -144,6 +215,97 @@ void prepare_causal_pairs(const CausalPairInputs& in, const CausalPairOutputs& o
             slice.skip += offset;
         }
         pair_kernel<<<dim3(p, count), 128, 0, cuda.stream()>>>(slice);
+    });
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void prepare_causal_pairs(const RaggedCausalPairInputs& in, const RaggedCausalPairOutputs& out,
+                          CudaExecutionView cuda) {
+    constexpr const char* op = "prepare_causal_pairs";
+    operand::ragged_sequence(in.ragged, op, cuda.device());
+    operand::ragged_sequence(out.ragged, op, cuda.device());
+    const int s_in = in.ragged.num_seqs(), n_in = in.ragged.total_tokens();
+    const int s_out = out.ragged.num_seqs(), n_out = out.ragged.total_tokens();
+    const int d = in.hidden.ne[0], b_prev = in.previous_hidden.ne[1];
+    if (d <= 0 || d % 8 || b_prev < 1 || (!in.input_segments.data && s_out != s_in) ||
+        (!in.previous_rows.data && !in.input_segments.data && b_prev < s_out)) {
+        throw std::invalid_argument("prepare_causal_pairs: invalid ragged shape");
+    }
+    check_hidden(in.hidden, {d, n_in}, "hidden", cuda);
+    check_hidden(in.previous_hidden, {d, b_prev}, "previous hidden", cuda);
+    check_hidden(out.hidden, {d, n_out}, "paired hidden", cuda);
+    for (const auto* value : {&in.ids, &in.positions})
+        operand::strided_tensor(*value, DType::I32, {n_in}, 4, op, "input metadata", cuda.device());
+    for (const auto* value : {&out.ids, &out.positions})
+        operand::strided_tensor(*value, DType::I32, {n_out}, 4, op, "output metadata",
+                                cuda.device());
+    operand::tensor(in.skip_first, DType::I32, {s_out}, 4, op, "skip_first", cuda.device());
+    if (in.input_segments.data)
+        operand::tensor(in.input_segments, DType::I32, {s_out}, 4, op, "input_segments",
+                        cuda.device());
+    if (in.previous_rows.data)
+        operand::tensor(in.previous_rows, DType::I32, {s_out}, 4, op, "previous_rows",
+                        cuda.device());
+    int axes = 0;
+    if (in.rope.data || in.previous_rope.data || out.rope.data) {
+        axes = in.rope.ne[1];
+        if (axes != 1 && axes != 3)
+            throw std::invalid_argument("prepare_causal_pairs: invalid coordinate axes");
+        operand::strided_tensor(in.rope, DType::I32, {n_in, axes}, 4, op, "rope", cuda.device());
+        operand::strided_tensor(in.previous_rope, DType::I32, {axes, b_prev}, 4, op,
+                                "previous rope", cuda.device());
+        operand::strided_tensor(out.rope, DType::I32, {n_out, axes}, 4, op, "paired rope",
+                                cuda.device());
+    }
+    const std::array outputs{&out.hidden, &out.ids, &out.positions, &out.rope};
+    const std::array inputs{&in.hidden,
+                            &in.previous_hidden,
+                            &in.ids,
+                            &in.positions,
+                            &in.rope,
+                            &in.previous_rope,
+                            &in.input_segments,
+                            &in.previous_rows,
+                            &in.skip_first,
+                            &in.ragged.cu_seqlens,
+                            &in.ragged.seq_lengths,
+                            &in.ragged.token_to_seq,
+                            &out.ragged.cu_seqlens,
+                            &out.ragged.seq_lengths,
+                            &out.ragged.token_to_seq};
+    for (std::size_t i = 0; i < outputs.size(); ++i) {
+        if (!outputs[i]->data) continue;
+        for (std::size_t j = 0; j < i; ++j)
+            if (outputs[j]->data && pair_overlap(*outputs[i], *outputs[j], op))
+                throw std::invalid_argument("prepare_causal_pairs: outputs overlap");
+        for (const auto* input : inputs)
+            if (input->data && pair_overlap(*outputs[i], *input, op))
+                throw std::invalid_argument("prepare_causal_pairs: input and output overlap");
+    }
+    auto h = view<const uint4>(in.hidden), previous = view<const uint4>(in.previous_hidden);
+    auto result = view<uint4>(out.hidden);
+    h.x = previous.x = result.x = 1;
+    const RaggedPairs args{h,
+                           previous,
+                           result,
+                           view<const int>(in.ids),
+                           view<const int>(in.positions),
+                           view<const int>(in.rope),
+                           view<const int>(in.previous_rope),
+                           view<int>(out.ids),
+                           view<int>(out.positions),
+                           view<int>(out.rope),
+                           static_cast<const int*>(in.ragged.cu_seqlens.data),
+                           static_cast<const int*>(out.ragged.cu_seqlens.data),
+                           static_cast<const int*>(out.ragged.token_to_seq.data),
+                           static_cast<const int*>(in.input_segments.data),
+                           static_cast<const int*>(in.previous_rows.data),
+                           static_cast<const int*>(in.skip_first.data),
+                           n_out,
+                           d / 8,
+                           axes};
+    common::for_each_token_slice(n_out, 1, [&](int offset, int count) {
+        ragged_pair_kernel<<<dim3(count, 1), 128, 0, cuda.stream()>>>(args, offset);
     });
     CUDA_CHECK(cudaGetLastError());
 }

@@ -1,5 +1,6 @@
 #include "core/platform.h"
 #include "ops/suite.h"
+#include "ops/ragged_fixture.h"
 #include "kv_cache_storage.h"
 #include "prepare_fixture.h"
 #include "cuda_fixture.h"
@@ -69,7 +70,7 @@ struct Error {
     }
 };
 
-int verify(Fixture& f, const std::string& label) {
+int verify(Fixture& f, const std::string& label, bool updates_tail = false) {
     const auto actual_q  = f.kv_only
                                ? std::vector<std::uint16_t>{}
                                : from_device<std::uint16_t>(f.query_output.data, f.q.host.size());
@@ -212,14 +213,18 @@ int verify(Fixture& f, const std::string& label) {
     failures += verify_exact("V words", f.values.download(), expected_v);
     failures += verify_exact("K scales untouched", actual_ks, expected_ks);
     failures += verify_exact("V scales", f.value_scales.download(), expected_vs);
-    failures += verify_exact("raw records", f.records.download(), expected_raw);
-    failures += verify_exact("coordinate records", f.record_rope.download(), expected_rope);
+    if (!updates_tail) {
+        failures += verify_exact("raw records", f.records.download(), expected_raw);
+        failures += verify_exact("coordinate records", f.record_rope.download(), expected_rope);
+        failures += f.tail.preserved("raw tail");
+        failures += f.first.preserved("tail coordinates");
+    }
     if (f.kv_only || !(f.alias & 1)) failures += f.q.preserved("raw Q");
     if (f.kv_only || !(f.alias & 2)) failures += f.iq.preserved("raw IQ");
-    for (auto* x : {&f.k, &f.v, &f.ik, &f.wq, &f.wk, &f.wiq, &f.wik, &f.tail})
+    for (auto* x : {&f.k, &f.v, &f.ik, &f.wq, &f.wk, &f.wiq, &f.wik})
         failures += x->preserved("input");
-    for (auto* x : {&f.first, &f.positions, &f.rope, &f.valid, &f.table_rows, &f.slots, &f.offsets,
-                    &f.tables})
+    for (auto* x :
+         {&f.positions, &f.rope, &f.valid, &f.table_rows, &f.slots, &f.offsets, &f.tables})
         failures += x->preserved("metadata/state");
     for (auto* x : {&f.q, &f.iq, &f.out_q, &f.out_iq, &f.compressed, &f.records})
         failures += x->guards(label);
@@ -229,6 +234,94 @@ int verify(Fixture& f, const std::string& label) {
     if (failures) std::cerr << label << ": " << failures << " failures\n";
     failures += !f.packed->guards_intact();
     return failures;
+}
+
+int ragged_prepare(bool kv_only) {
+    RaggedFixture ragged({1, 3, 17});
+    constexpr int width = 17;
+    const int n = ragged.tokens(), s = ragged.segments(), axes = kv_only ? 1 : 3;
+    Fixture f(width, s, axes);
+    f.kv_only = kv_only;
+    f.reset(1, true);
+    f.valid.host = ragged.lengths;
+    f.valid.upload();
+    const std::vector<int> destinations{3, 4, 1};
+    std::vector<std::int64_t> after_raw(s), after_rope(s);
+    for (int b = 0; b < s; ++b) {
+        after_raw[b]  = destinations[b] * f.tail.view.nb[2];
+        after_rope[b] = destinations[b] * f.first.view.nb[1];
+    }
+    auto dr = to_device(after_raw), dc = to_device(after_rope);
+    auto after                            = f.before;
+    after.raw_keys.records.byte_offsets   = Tensor(dr.span(), DType::I64, {s});
+    after.first_rope.records.byte_offsets = Tensor(dc.span(), DType::I64, {s});
+    auto expected_tail                    = f.tail.host;
+    auto expected_rope                    = f.first.host;
+    std::vector<int> coords(n * axes), pos = ragged.pack(f.positions.host, width, 1);
+    for (int b = 0; b < s; ++b) {
+        const int base = f.bases[b], count = ragged.lengths[b], src = f.slots.at(b),
+                  dst       = destinations[b];
+        const int remainder = (base + count) % 4, first = base + count - remainder - base;
+        for (int a = 0; a < axes; ++a)
+            for (int t = 0; t < count; ++t)
+                coords[a * n + ragged.prefix[b] + t] = f.rope.at(t, a, b);
+        for (int a = 0; a < 3; ++a)
+            expected_rope[f.first.index(a, dst)] =
+                !remainder
+                    ? 0
+                    : (first < 0 ? f.first.at(a, src) : f.rope.at(first, axes == 1 ? 0 : a, b));
+        for (int j = 0; j < 3; ++j)
+            for (int c = 0; c < 128; ++c)
+                expected_tail[f.tail.index(c, j, dst)] =
+                    j >= remainder ? 0
+                                   : (first + j < 0 ? f.tail.at(c, base % 4 + first + j, src)
+                                                    : f.ik.at(c, first + j, b));
+    }
+    auto dq  = to_device(ragged.pack(f.q.host, width, 256 * f.query_heads));
+    auto dk  = to_device(ragged.pack(f.k.host, width, 256 * f.kv_heads));
+    auto dv  = to_device(ragged.pack(f.v.host, width, 256 * f.kv_heads));
+    auto diq = to_device(ragged.pack(f.iq.host, width, 128 * 4));
+    auto dik = to_device(ragged.pack(f.ik.host, width, 128));
+    auto dp = to_device(pos), rope = to_device(coords);
+    const ops::QsaRaggedBatchView batch{ragged.view, Tensor(dp.span(), DType::I32, {n}),
+                                        f.batch.table_rows};
+    const Tensor rope_positions(rope.span(), DType::I32, {n, axes});
+    const ops::QsaProjectionView projected{Tensor(dq.span(), DType::BF16, {256, f.query_heads, n}),
+                                           Tensor(dk.span(), DType::BF16, {256, f.kv_heads, n}),
+                                           Tensor(dv.span(), DType::BF16, {256, f.kv_heads, n}),
+                                           Tensor(diq.span(), DType::BF16, {128, 4, n}),
+                                           Tensor(dik.span(), DType::BF16, {128, n})};
+    const auto bytes = kv_only
+                           ? ops::qsa_prepare_kv_update_ragged_workspace_capacity_bytes(n, n, s, s)
+                           : ops::qsa_prepare_update_ragged_workspace_capacity_bytes(n, n, s, s);
+    GuardedDeviceBuffer scratch(bytes), iq(128 * 4 * n * 2ULL);
+    MemoryArena arena(scratch.span());
+    auto query = projected.query; // Exact in-place Q, with a disjoint index-query.
+    Tensor index_query(iq.span(), DType::BF16, {128, 4, n});
+    const auto execution = cuda_environment().default_execution;
+    if (kv_only)
+        ops::qsa_prepare_kv_update({projected.key, projected.value, projected.index_key},
+                                   f.parameters.kv, batch, rope_positions, f.before, f.cache, after,
+                                   arena, execution);
+    else
+        ops::qsa_prepare_update(projected, f.parameters, batch, rope_positions, f.before, f.cache,
+                                after, query, index_query, arena, execution);
+    cuda_synchronize();
+    if (!kv_only) {
+        const auto padded_q  = ragged.unpack(from_device<std::uint16_t>(query.data, query.numel()),
+                                             width, 256 * f.query_heads);
+        const auto padded_iq = ragged.unpack(
+            from_device<std::uint16_t>(iq.data(), index_query.numel()), width, 128 * 4);
+        f.out_q.device->copy_from_host(padded_q.data(), padded_q.size() * 2);
+        f.out_iq.device->copy_from_host(padded_iq.data(), padded_iq.size() * 2);
+    }
+    return verify(f, "ragged QSA prepare", true) +
+           verify_exact("ragged raw tails and untouched slots", f.tail.download(), expected_tail) +
+           verify_exact("ragged tail coordinates and untouched slots", f.first.download(),
+                        expected_rope) +
+           f.tail.guards("ragged raw tail") + f.first.guards("ragged coordinates") +
+           iq.verify_guards("ragged query") + scratch.verify_guards("ragged prepare workspace") +
+           (arena.used() != 0 || arena.peak_used() > bytes);
 }
 
 int run(DeviceContext& device, int t, int b, int axes, int alias, int layout, int capacity = 0,
@@ -598,6 +691,10 @@ int scale_edges(DeviceContext& device, KvCacheStorage storage, bool kv_only = fa
 
 int main(int argc, char** argv) {
     OpSuite suite;
+    suite.add("qsa_prepare/bf16/ragged", [] { return ragged_prepare(false); },
+              {{"format", "bf16"}});
+    suite.add("qsa_prepare_kv/bf16/ragged", [] { return ragged_prepare(true); },
+              {{"format", "bf16"}});
     for (auto storage : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64,
                          KvCacheStorage::Fp8E4m3fnGroup128Ue8m0, KvCacheStorage::Nvfp4Group16,
                          KvCacheStorage::Fp8KeyNvfp4Value}) {

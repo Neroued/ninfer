@@ -2,6 +2,7 @@
 
 #include "core/record_view.h"
 #include "ninfer/ops/projection_weights.h"
+#include "ninfer/ops/ragged.h"
 
 namespace ninfer::ops {
 struct KdaConvOutputs {
@@ -43,6 +44,18 @@ void kda_input_proj_conv_update(const Tensor& x, const SingleProjectionWeight& q
                                 MemoryArena& workspace, CudaExecutionView execution);
 
 /**
+ * Packed ragged prefill form over S = ragged.num_seqs() non-empty segments and
+ * N = ragged.total_tokens() columns. x is contiguous BF16 [K,N], Q/K/V are contiguous
+ * BF16 [N_proj/3,N], and source/destination select S independent BF16 [N_proj,3] histories.
+ * Each segment independently applies the exact formula and trailing-3 history update above,
+ * with zero cross-segment convolution carry.
+ */
+void kda_input_proj_conv_update(const Tensor& x, const SingleProjectionWeight& qkv,
+                                const Tensor& conv_weight, KdaConvUpdateState state,
+                                const RaggedSequenceView& ragged, KdaConvOutputs outputs,
+                                MemoryArena& workspace, CudaExecutionView execution);
+
+/**
  * Same physical computation and readouts as update, but source stays read-only and each
  * valid newest BF16 projected column is stored in conv_record [N,T,B]. Record suffixes remain
  * unchanged. These words define tail restoration for accepted prefixes of this physical call;
@@ -57,6 +70,9 @@ void kda_input_proj_conv_record(const Tensor& x, const SingleProjectionWeight& q
 [[nodiscard]] std::size_t
 kda_input_proj_conv_update_workspace_capacity_bytes(const LinearProfile& qkv, int batch,
                                                     int min_tokens, int max_tokens);
+[[nodiscard]] std::size_t kda_input_proj_conv_update_ragged_workspace_capacity_bytes(
+    const LinearProfile& qkv, std::int32_t min_tokens, std::int32_t max_tokens,
+    std::int32_t min_segments, std::int32_t max_segments);
 [[nodiscard]] std::size_t
 kda_input_proj_conv_record_workspace_capacity_bytes(const LinearProfile& qkv, int batch,
                                                     int min_tokens, int max_tokens);

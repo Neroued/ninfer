@@ -49,7 +49,8 @@ void launch_direct(const DirectAccess& access, cudaStream_t stream) {
 void launch_recurrent_inout(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
                             const Tensor& beta, float scale, bool normalize_qk,
                             const Tensor& state_in, Tensor& state_out, Tensor& out,
-                            cudaStream_t stream) {
+                            cudaStream_t stream, const std::int64_t* source_offset,
+                            const std::int64_t* destination_offset) {
     const DirectAccess access{static_cast<const __nv_bfloat16*>(q.data),
                               static_cast<const __nv_bfloat16*>(k.data),
                               static_cast<const __nv_bfloat16*>(v.data),
@@ -60,7 +61,9 @@ void launch_recurrent_inout(const Tensor& q, const Tensor& k, const Tensor& v, c
                               static_cast<__nv_bfloat16*>(out.data),
                               HeadMap::of(q.ne[1], v.ne[1]),
                               q.ne[2],
-                              scale};
+                              scale,
+                              source_offset,
+                              destination_offset};
     if (normalize_qk)
         launch_direct<true>(access, stream);
     else

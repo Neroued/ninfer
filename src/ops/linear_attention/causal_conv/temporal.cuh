@@ -6,10 +6,13 @@ namespace ninfer::ops::detail {
 
 // One thread owns a channel pair across a token tile. State publication requires a
 // disjoint destination, or ownership of that channel pair's entire sequence.
-template <int Channels, int TokensPerTile, int Block, bool Publish, class Output>
+template <int Channels, int TokensPerTile, int Block, bool Publish, bool Indexed, class Output>
 __global__ __launch_bounds__(Block) void causal_conv_temporal_kernel(
     const __nv_bfloat162* __restrict__ input, const __nv_bfloat162* __restrict__ weight,
-    const __nv_bfloat162* state, __nv_bfloat162* final_state, Output output, int tokens) {
+    const __nv_bfloat162* state, __nv_bfloat162* final_state, Output output, int tokens,
+    const std::int64_t* source_offset) {
+    static_assert(!Indexed || !Publish);
+    state                        = conv_history<Indexed>(state, source_offset);
     constexpr int kPairs         = Channels / 2;
     constexpr int kChannelBlocks = (kPairs + Block - 1) / Block;
     const std::int64_t first     = std::int64_t(blockIdx.x / kChannelBlocks) * TokensPerTile;

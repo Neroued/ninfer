@@ -13,7 +13,8 @@ template <bool NormalizeQK>
 void launch_recurrent_direct_fixed(const Tensor& q, const Tensor& k, const Tensor& v,
                                    const Tensor& g, const Tensor& beta, float scale,
                                    const Tensor& state_read, Tensor& state_write, Tensor& out,
-                                   cudaStream_t stream) {
+                                   cudaStream_t stream, const std::int64_t* source_offset,
+                                   const std::int64_t* destination_offset) {
     const auto heads = HeadMap::of(q.ne[1], v.ne[1]);
     const dim3 grid(static_cast<unsigned>(v.ne[1]), 1, static_cast<unsigned>(kStateDim / kBlockDv));
     const dim3 block(common::kWarpSize, kNumWarps, 1);
@@ -22,7 +23,7 @@ void launch_recurrent_direct_fixed(const Tensor& q, const Tensor& k, const Tenso
         static_cast<const __nv_bfloat16*>(v.data), static_cast<const float*>(g.data),
         static_cast<const float*>(beta.data), static_cast<const float*>(state_read.data),
         static_cast<float*>(state_write.data), static_cast<__nv_bfloat16*>(out.data), q.ne[2],
-        heads, scale);
+        heads, scale, source_offset, destination_offset);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -64,13 +65,14 @@ void launch_recurrent_batch_update_fixed(const Tensor& q, const Tensor& k, const
 void launch_recurrent_inout(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
                             const Tensor& beta, float scale, bool normalize_qk,
                             const Tensor& ssm_state_in, Tensor& ssm_state_out, Tensor& out,
-                            cudaStream_t stream) {
+                            cudaStream_t stream, const std::int64_t* source_offset,
+                            const std::int64_t* destination_offset) {
     if (normalize_qk) {
         launch_recurrent_direct_fixed<true>(q, k, v, g, beta, scale, ssm_state_in, ssm_state_out,
-                                            out, stream);
+                                            out, stream, source_offset, destination_offset);
     } else {
         launch_recurrent_direct_fixed<false>(q, k, v, g, beta, scale, ssm_state_in, ssm_state_out,
-                                             out, stream);
+                                             out, stream, source_offset, destination_offset);
     }
 }
 

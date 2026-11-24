@@ -121,4 +121,63 @@ void ple_conv_add_norm(const Tensor& residual, const Tensor& gated_value, const 
                               execution);
 }
 
+namespace {
+void ragged_conv(const Tensor& residual, const Tensor& gated, const Tensor& kernel,
+                 const RaggedSequenceView& ragged, const ConstPleConvStateView& before,
+                 const Tensor& current, Tensor& updated, const Tensor* norm, float epsilon,
+                 Tensor* normalized, CudaExecutionView execution) {
+    namespace operand        = common::operand;
+    constexpr const char* op = "ple_conv_add";
+    const auto device        = execution.device();
+    operand::ragged_sequence(ragged, op, device);
+    const int n = ragged.total_tokens();
+    for (const auto* t : std::array<const Tensor*, 4>{&residual, &gated, &updated, normalized}) {
+        if (!t) continue;
+        operand::tensor(*t, DType::BF16, {detail::ple::kFeatures, detail::ple::kStreams, n}, 16, op,
+                        "activation", device);
+    }
+    operand::tensor(current, DType::BF16, {detail::ple::kChannels, n}, 2, op, "records", device);
+    operand::shape(before.history.records.byte_offsets, {ragged.num_seqs(), 1, 1, 1}, op,
+                   "state offsets");
+    for (const auto* out : {&updated, normalized}) {
+        if (!out) continue;
+        for (const auto* src :
+             {&residual, &gated, &current, &ragged.cu_seqlens, &ragged.seq_lengths,
+              &ragged.token_to_seq, &before.history.records.byte_offsets}) {
+            if (out == &updated && src == &residual && out->data == src->data) continue;
+            operand::disjoint(operand::range(*out, op), operand::range(*src, op), op);
+        }
+    }
+    if (normalized)
+        operand::disjoint(operand::range(updated, op), operand::range(*normalized, op), op);
+    for (int s = 0; s < ragged.num_seqs(); ++s) {
+        const int begin = ragged.segment_begin(s), len = ragged.segment_length(s);
+        auto out      = updated.slice(2, begin, len);
+        auto norm_out = normalized ? normalized->slice(2, begin, len) : Tensor{};
+        detail::ple::execute_conv(residual.slice(2, begin, len), gated.slice(2, begin, len), kernel,
+                                  {ragged.seq_lengths.slice(0, s, 1)},
+                                  {operand::state_row(before.history, s)},
+                                  {current.slice(1, begin, len), ragged.cu_seqlens.slice(0, 0, 1)},
+                                  out, norm, epsilon, normalized ? &norm_out : nullptr, execution);
+    }
+}
+} // namespace
+
+void ple_conv_add(const Tensor& residual, const Tensor& gated_value, const Tensor& kernel,
+                  const RaggedSequenceView& ragged, const ConstPleConvStateView& before,
+                  const Tensor& current_values, Tensor& updated_residual,
+                  CudaExecutionView execution) {
+    ragged_conv(residual, gated_value, kernel, ragged, before, current_values, updated_residual,
+                nullptr, 0, nullptr, execution);
+}
+
+void ple_conv_add_norm(const Tensor& residual, const Tensor& gated_value, const Tensor& kernel,
+                       const RaggedSequenceView& ragged, const ConstPleConvStateView& before,
+                       const Tensor& current_values, const Tensor& next_hc_norm_weight,
+                       float next_hc_epsilon, Tensor& updated_residual, Tensor& normalized,
+                       CudaExecutionView execution) {
+    ragged_conv(residual, gated_value, kernel, ragged, before, current_values, updated_residual,
+                &next_hc_norm_weight, next_hc_epsilon, &normalized, execution);
+}
+
 } // namespace ninfer::ops

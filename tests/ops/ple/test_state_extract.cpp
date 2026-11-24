@@ -1,4 +1,5 @@
 #include "ops/suite.h"
+#include "ops/ragged_fixture.h"
 #include "fixture.h"
 #include "cuda_fixture.h"
 #include "core/buffer.h"
@@ -104,9 +105,42 @@ int run(DeviceContext& device, int batch, int layout, bool inplace, bool sliced,
     }
     return failures;
 }
+
+int ragged_extract() {
+    RaggedFixture ragged({1, 3, 17, 65});
+    constexpr int slots = 8;
+    const std::vector<int> source{3, 1, 6, 0}, destination{3, 4, 6, 2};
+    Words history({D, 9, slots}, 1, history_strides(slots, 1)), values({D, ragged.tokens()});
+    history.fill(1001, 1.0f, true);
+    values.fill(1013, 1.0f, true);
+    history.upload();
+    values.upload();
+    auto src          = to_device(history_offsets(history.tensor, source));
+    auto dst          = to_device(history_offsets(history.tensor, destination));
+    const auto input  = history_field(history.tensor, history.device->span(),
+                                      Tensor(src.span(), DType::I64, {ragged.segments()}));
+    const auto output = history_field(history.tensor, history.device->span(),
+                                      Tensor(dst.span(), DType::I64, {ragged.segments()}));
+    auto expected     = history.host;
+    for (int s = 0; s < ragged.segments(); ++s)
+        for (int h = 0; h < 9; ++h) {
+            const int local  = ragged.lengths[s] - 9 + h;
+            const auto* from = local < 0
+                                   ? history.host.data() + history.index(0, local + 9, source[s])
+                                   : values.host.data() + values.index(0, ragged.prefix[s] + local);
+            std::copy_n(from, D, expected.begin() + history.index(0, h, destination[s]));
+        }
+    ops::ple_state_extract(ops::PleConvStateView{input}, values.tensor, ragged.view, {output},
+                           cuda_environment().default_execution);
+    cuda_synchronize();
+    return verify_exact("ragged updated histories and neighbours", history.download(), expected) +
+           history.device->verify_guards("ragged PLE state") +
+           values.preserved("ragged state records");
+}
 } // namespace
 
 void add_ple_state_extract_cases(ninfer::test::OpSuite& suite) {
+    suite.add("ple_state_extract/ragged", ragged_extract);
     const auto add = [&](int batch, int layout, bool inplace, bool sliced) {
         suite.add("ple_state_extract/b" + std::to_string(batch) + "/layout" +
                       std::to_string(layout) + (inplace ? "/alias" : "/disjoint") +

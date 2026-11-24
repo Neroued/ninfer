@@ -204,4 +204,30 @@ void ngram_embedding_lookup(const Tensor& token_ids, const Tensor& valid_columns
     }
     CUDA_CHECK(cudaGetLastError());
 }
+
+void ngram_embedding_lookup(const Tensor& token_ids, const RaggedSequenceView& ragged,
+                            const NgramTokenTailView& before, const NgramHashParameters& hash,
+                            std::int32_t eos, std::span<const Nf4EmbeddingShard> shards,
+                            Tensor& embedding, CudaExecutionView execution) {
+    namespace operand        = common::operand;
+    constexpr const char* op = "ngram_embedding_lookup";
+    const auto device        = execution.device();
+    operand::ragged_sequence(ragged, op, device);
+    const int n = ragged.total_tokens(), rows = ragged.num_seqs();
+    operand::tensor(token_ids, DType::I32, {n}, 4, op, "token IDs", device);
+    operand::tensor(embedding, DType::BF16, {2560, n}, 16, op, "embedding", device);
+    operand::state_field(before.token_ids, DType::I32, {2}, 4, op, "token history", device);
+    operand::shape(before.token_ids.records.byte_offsets, {rows, 1, 1, 1}, op, "state offsets");
+    for (const auto* input : {&token_ids, &ragged.cu_seqlens, &ragged.seq_lengths,
+                              &ragged.token_to_seq, &before.token_ids.records.byte_offsets})
+        operand::disjoint(operand::range(embedding, op), operand::range(*input, op), op);
+    for (int s = 0; s < rows; ++s) {
+        const int begin = ragged.segment_begin(s), len = ragged.segment_length(s);
+        auto out = embedding.slice(1, begin, len);
+        ngram_embedding_lookup(token_ids.slice(0, begin, len), ragged.seq_lengths.slice(0, s, 1),
+                               {operand::state_row(before.token_ids, s)}, hash, eos, shards, out,
+                               execution);
+    }
+}
+
 } // namespace ninfer::ops

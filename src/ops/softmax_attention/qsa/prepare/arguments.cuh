@@ -55,5 +55,6 @@ struct PrepareArguments {
     float epsilon;
     double frequency[32];
     int token_begin = 0, row_begin = 0;
+    std::int64_t rope_axis_stride = 0, rope_row_stride = 0;
 };
 } // namespace ninfer::ops::detail::qsa

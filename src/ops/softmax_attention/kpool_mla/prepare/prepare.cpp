@@ -213,4 +213,67 @@ std::size_t kpool_mla_prepare_update_workspace_capacity_bytes(const KpoolMlaPrep
     const auto g = detail::kpool::prepare_geometry(p, storage, index_format, batch, lo, hi, sms);
     return detail::kpool::prepare_capacity(g, true, lo, hi, batch);
 }
+
+std::size_t kpool_mla_prepare_update_ragged_workspace_capacity_bytes(
+    const KpoolMlaPrepareProfile& profile, KpoolMlaStorage storage, KvCacheVectorFormat format,
+    int min_tokens, int max_tokens, int min_segments, int max_segments, int sm_count) {
+    const auto widths = common::operand::ragged_envelope(min_tokens, max_tokens, min_segments,
+                                                         max_segments, "kpool_mla_prepare_update");
+    return kpool_mla_prepare_update_workspace_capacity_bytes(profile, storage, format, 1,
+                                                             widths.first, widths.last, sm_count);
+}
+
+void kpool_mla_prepare_update(const Tensor& x, const KpoolMlaPrepareParameters& parameters,
+                              const KpoolMlaRaggedBatchView& batch, ConstKpoolTailStateView before,
+                              KpoolMlaCacheView cache, KpoolTailStateView after,
+                              KpoolMlaPrepareOutputs outputs, MemoryArena& workspace,
+                              CudaExecutionView execution) {
+    using namespace detail::kpool;
+    constexpr const char* op = "kpool_mla_prepare_update";
+    const auto& seq          = batch.ragged;
+    const auto device        = execution.device();
+    operand::ragged_batch(seq, batch.positions, batch.table_rows, op, device);
+    const int n = seq.total_tokens(), rows = seq.num_seqs();
+    operand::tensor(x, DType::BF16, {4096, n}, 16, op, "input", device);
+    for (const auto& f : std::array<ConstStateFieldView, 4>{before.raw_keys, before.raw_gates,
+                                                            after.raw_keys, after.raw_gates})
+        tail_field(f, 128, rows, 1, device);
+    const Tensor* inputs[] = {&x,
+                              &batch.positions,
+                              &batch.table_rows,
+                              &seq.cu_seqlens,
+                              &seq.seq_lengths,
+                              &seq.token_to_seq,
+                              &before.raw_keys.records.byte_offsets,
+                              &before.raw_gates.records.byte_offsets,
+                              &after.raw_keys.records.byte_offsets,
+                              &after.raw_gates.records.byte_offsets};
+    if (outputs.q_r.data)
+        operand::tensor(outputs.q_r, DType::BF16, {1536, n}, 16, op, "query output", device);
+    if (outputs.head_coeff.data)
+        operand::tensor(outputs.head_coeff, DType::FP32, {32, n}, 16, op, "head coefficients",
+                        device);
+    for (const auto* out : {&outputs.q_r, &outputs.head_coeff})
+        if (out->data)
+            for (const auto* in : inputs)
+                operand::disjoint(operand::range(*out, op), operand::range(*in, op), op);
+    if (outputs.q_r.data && outputs.head_coeff.data)
+        operand::disjoint(operand::range(outputs.q_r, op), operand::range(outputs.head_coeff, op),
+                          op);
+    for (int s = 0; s < rows; ++s) {
+        const int begin = seq.segment_begin(s), len = seq.segment_length(s);
+        const KpoolMlaBatchView segment{batch.positions.slice(0, begin, len),
+                                        seq.seq_lengths.slice(0, s, 1),
+                                        batch.table_rows.slice(0, s, 1)};
+        const auto columns = [&](const Tensor& t) {
+            return t.data ? t.slice(1, begin, len) : Tensor{};
+        };
+        kpool_mla_prepare_update(
+            x.slice(1, begin, len), parameters, segment,
+            {operand::state_row(before.raw_keys, s), operand::state_row(before.raw_gates, s)},
+            cache, {operand::state_row(after.raw_keys, s), operand::state_row(after.raw_gates, s)},
+            {columns(outputs.q_r), columns(outputs.head_coeff)}, workspace, execution);
+    }
+}
+
 } // namespace ninfer::ops

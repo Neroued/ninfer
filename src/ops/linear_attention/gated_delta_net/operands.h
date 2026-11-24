@@ -26,6 +26,8 @@ struct RecurrenceOperands {
     __nv_bfloat16* out;
     int qk_heads, value_heads, tokens;
     float scale;
+    const std::int64_t* source_offset      = nullptr;
+    const std::int64_t* destination_offset = nullptr;
 };
 
 inline void require_scale(float scale, const char* op) {

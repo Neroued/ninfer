@@ -1,4 +1,5 @@
 #include "ops/suite.h"
+#include "ops/ragged_fixture.h"
 #include "ops/graph_patch_check.h"
 #include "core/platform.h"
 #include "kv_cache_storage.h"
@@ -112,6 +113,45 @@ int run(DeviceContext& device, int t, int b, int history, bool padded = false, i
         if (failures) return failures;
     }
     return failures;
+}
+
+int ragged_sparse(KvCacheStorage storage) {
+    RaggedFixture ragged({1, 17, 3});
+    constexpr int width = 17;
+    const int n = ragged.tokens(), s = ragged.segments();
+    Fixture f(width, s, 112, false, storage);
+    f.reset();
+    f.valid = ragged.lengths;
+    f.lengths.copy_from_host(f.valid.data(), s * 4);
+    for (int b = 0; b < s; ++b)
+        for (int t = f.valid[b]; t < width; ++t) f.visible[b * width + t].clear();
+    const int elements = 256 * f.q_heads;
+    auto q             = to_device(ragged.pack(f.qhost, width, elements));
+    auto gate          = to_device(ragged.pack(f.ghost, width, elements));
+    auto pos           = to_device(ragged.pack(f.positions, width, 1));
+    auto ids           = to_device(ragged.pack(f.ids, width, 512));
+    auto counts        = to_device(ragged.pack(f.counts, width, 1));
+    const ops::QsaRaggedBatchView batch{ragged.view, Tensor(pos.span(), DType::I32, {n}),
+                                        f.batch.table_rows};
+    const ops::QsaBlockSelection selected{Tensor(ids.span(), DType::I32, {512, n}),
+                                          Tensor(counts.span(), DType::I32, {n})};
+    GuardedDeviceBuffer output(n * elements * 2ULL);
+    Tensor out(output.span(), DType::BF16, {256, f.q_heads, n});
+    const auto execution = cuda_environment().default_execution;
+    const auto bytes     = ops::qsa_sparse_gqa_ragged_workspace_capacity_bytes(
+        storage, f.q_heads, f.kv_heads, f.bucket, n, n, s, s, execution.multiprocessor_count());
+    GuardedDeviceBuffer scratch(std::max<std::size_t>(256, bytes));
+    MemoryArena arena(scratch.span());
+    ops::qsa_sparse_gqa(Tensor(q.span(), DType::BF16, {256, f.q_heads, n}),
+                        Tensor(gate.span(), DType::BF16, {256, f.q_heads, n}), f.cache, batch,
+                        selected, f.bucket, arena, out, execution);
+    cuda_synchronize();
+    const auto padded =
+        ragged.unpack(from_device<std::uint16_t>(output.data(), n * elements), width, elements);
+    f.out.copy_from_host(padded.data(), padded.size() * 2);
+    return verify(f, "ragged QSA sparse attention") + output.verify_guards("ragged output") +
+           scratch.verify_guards("ragged workspace") +
+           (arena.used() != 0 || arena.peak_used() > bytes);
 }
 
 int gate_rounding(DeviceContext& device, KvCacheStorage storage = KvCacheStorage::BFloat16,
@@ -529,6 +569,8 @@ void add_case(OpSuite& suite, int t, int b, int history, bool padded = false, in
 }
 
 void add_cases(OpSuite& suite, KvCacheStorage storage) {
+    suite.add(std::string("sparse_gqa/") + kv_cache_storage_name(storage) + "/ragged",
+              [=] { return ragged_sparse(storage); }, {{"format", kv_cache_storage_name(storage)}});
     const std::string prefix = std::string("sparse_gqa/") + kv_cache_storage_name(storage);
     const auto special       = [&](std::string id, auto run, const char* execution = "eager") {
         suite.add(prefix + "/" + id, [=] { return run(cuda_environment().context); },

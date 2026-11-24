@@ -514,6 +514,10 @@ void add_small_prefill_cases(OpSuite& suite, KvCacheStorage storage) {
 }
 
 void add_storage_cases(OpSuite& suite, KvCacheStorage storage) {
+    suite.add(std::string("causal_ragged/") + cache_name(storage),
+              [=] { return run_ragged_case(cuda_environment().default_execution, storage); },
+              {{"format", kv_cache_storage_name(storage)}});
+
     suite.add(std::string("causal_capacity/") + cache_name(storage),
               [=] {
                   return verify_workspace_capacity_contract(

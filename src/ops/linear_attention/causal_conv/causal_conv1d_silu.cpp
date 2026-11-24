@@ -295,4 +295,91 @@ void causal_conv1d_silu_snapshot(const Tensor& x, const Tensor& weight, ConstSta
         detail::select_causal_conv_snapshot_plan(x.ne[1], batch, masked), execution.stream());
 }
 
+namespace {
+namespace operand                    = common::operand;
+constexpr const char* ragged_conv_op = "causal_conv1d";
+
+template <class Launch>
+void ragged_conv(const Tensor& x, const Tensor& weight, const RaggedSequenceView& seq,
+                 ConstStateFieldView source, StateFieldView destination,
+                 std::span<Tensor* const> outputs, std::size_t alignment, Launch launch,
+                 CudaExecutionView execution) {
+    const auto device       = execution.device();
+    constexpr const auto op = ragged_conv_op;
+    operand::ragged_sequence(seq, op, device);
+    const int c = x.ne[0], n = seq.total_tokens(), rows = seq.num_seqs();
+    operand::tensor(x, DType::BF16, {c, n}, alignment, op, "input", device);
+    operand::tensor(weight, DType::BF16, {c, 4}, alignment, op, "weight", device);
+    for (const auto& field : std::array<ConstStateFieldView, 2>{source, destination}) {
+        operand::state_field(field, DType::BF16, {c, 3}, alignment, op, "state", device);
+        operand::shape(field.records.byte_offsets, {rows, 1, 1, 1}, op, "state offsets");
+        if (field.field.layers != 1)
+            throw std::invalid_argument("causal_conv1d: select one convolution layer");
+    }
+    const Tensor* inputs[] = {&x,
+                              &weight,
+                              &seq.cu_seqlens,
+                              &seq.seq_lengths,
+                              &seq.token_to_seq,
+                              &source.records.byte_offsets,
+                              &destination.records.byte_offsets};
+    for (std::size_t i = 0; i < outputs.size(); ++i) {
+        const auto& out = *outputs[i];
+        operand::tensor(out, DType::BF16, {out.ne[0], n}, alignment, op, "output", device);
+        for (const auto* input : inputs)
+            operand::disjoint(operand::range(out, op), operand::range(*input, op), op);
+        for (std::size_t j = 0; j < i; ++j)
+            operand::disjoint(operand::range(out, op), operand::range(*outputs[j], op), op);
+    }
+
+    auto in = source.field.metadata(), out = destination.field.metadata();
+    // These are field bases; only the kernels resolve the selected records.
+    in.data   = const_cast<std::byte*>(operand::state_field_base<const std::byte>(source));
+    out.data  = operand::state_field_base<std::byte>(destination);
+    in.device = out.device = device;
+    const auto* src        = static_cast<const std::int64_t*>(source.records.byte_offsets.data);
+    const auto* dst = static_cast<const std::int64_t*>(destination.records.byte_offsets.data);
+    for (int s = 0; s < rows; ++s)
+        launch(in, out, seq.segment_begin(s), seq.segment_length(s),
+               detail::CausalConvOffsets{src + s, dst + s});
+}
+} // namespace
+
+void causal_conv1d_silu(const Tensor& x, const Tensor& weight, const RaggedSequenceView& seq,
+                        ConstStateFieldView source, StateFieldView destination, Tensor& out,
+                        CudaExecutionView execution) {
+    require_x_shape(x);
+    require_out_shape(x, out);
+    const std::array outputs{&out};
+    ragged_conv(
+        x, weight, seq, source, destination, outputs, 2,
+        [&](const Tensor& src, Tensor& dst, int begin, int len, detail::CausalConvOffsets offsets) {
+            const auto input = x.slice(1, begin, len);
+            auto output      = out.slice(1, begin, len);
+            auto route       = detail::select_causal_conv_plan(input, weight, src, dst, output);
+            // Device-selected scalar fields only guarantee natural BF16 alignment.
+            if (route == detail::CausalConvRoute::PrefillPairs)
+                route = detail::CausalConvRoute::PrefillScalar;
+            detail::launch_causal_conv(input, weight, src, dst, output, route, execution.stream(),
+                                       offsets);
+        },
+        execution);
+}
+
+void causal_conv1d_silu_split(const Tensor& x, const Tensor& weight, const RaggedSequenceView& seq,
+                              ConstStateFieldView source, StateFieldView destination, Tensor& out0,
+                              Tensor& out1, Tensor& out2, CudaExecutionView execution) {
+    const auto geometry = require_split_geometry(x, out0, out1, out2);
+    const std::array outputs{&out0, &out1, &out2};
+    ragged_conv(
+        x, weight, seq, source, destination, outputs, 4,
+        [&](const Tensor& src, Tensor& dst, int begin, int len, detail::CausalConvOffsets offsets) {
+            auto q = out0.slice(1, begin, len), k = out1.slice(1, begin, len);
+            auto v = out2.slice(1, begin, len);
+            detail::launch_causal_conv_split(x.slice(1, begin, len), weight, src, dst, q, k, v,
+                                             geometry, execution.stream(), offsets);
+        },
+        execution);
+}
+
 } // namespace ninfer::ops

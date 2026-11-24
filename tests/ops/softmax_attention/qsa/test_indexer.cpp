@@ -1,4 +1,5 @@
 #include "ops/suite.h"
+#include "ops/ragged_fixture.h"
 #include "ops/graph_patch_check.h"
 #include "kv_cache_storage.h"
 #include "indexer_fixture.h"
@@ -168,6 +169,36 @@ int run(DeviceContext& device, int t, int b, int history, int layout, Pattern pa
         if (failures) return failures;
     }
     return failures;
+}
+
+int ragged_indexer() {
+    RaggedFixture ragged({1, 3, 17});
+    constexpr int width = 17;
+    const int n = ragged.tokens(), s = ragged.segments();
+    Fixture f(width, s, 2081, 0, Pattern::Dense);
+    const std::vector<int> ends{67, 66, 2081};
+    f.reset(0, ends, ragged.lengths);
+    auto q   = to_device(ragged.pack(f.q_host, width, 128 * 4));
+    auto pos = to_device(ragged.pack(f.positions, width, 1));
+    const ops::QsaRaggedBatchView batch{ragged.view, Tensor(pos.span(), DType::I32, {n}),
+                                        f.batch.table_rows};
+    GuardedDeviceBuffer ids(512 * n * 4ULL), counts(n * 4ULL);
+    ops::QsaBlockSelection selection{Tensor(ids.span(), DType::I32, {512, n}),
+                                     Tensor(counts.span(), DType::I32, {n})};
+    const auto bytes = ops::qsa_indexer_ragged_workspace_capacity_bytes(f.bucket, n, n, s, s);
+    GuardedDeviceBuffer scratch(std::max<std::size_t>(256, bytes));
+    MemoryArena arena(scratch.span());
+    ops::qsa_indexer(Tensor(q.span(), DType::BF16, {128, 4, n}), f.cache, batch, f.bucket, arena,
+                     selection, cuda_environment().default_execution);
+    cuda_synchronize();
+    const auto padded_ids    = ragged.unpack(from_device<int>(ids.data(), 512 * n), width, 512);
+    const auto padded_counts = ragged.unpack(from_device<int>(counts.data(), n), width, 1);
+    f.ids.copy_from_host(padded_ids.data(), padded_ids.size() * 4);
+    f.counts.copy_from_host(padded_counts.data(), padded_counts.size() * 4);
+    return verify(f, "ragged QSA indexer") + ids.verify_guards("ragged indices") +
+           counts.verify_guards("ragged counts") +
+           scratch.verify_guards("ragged indexer workspace") +
+           (arena.used() != 0 || arena.peak_used() > bytes);
 }
 
 int flat_graph_patch(DeviceContext& device) {
@@ -425,6 +456,7 @@ int single_partition_workspace(DeviceContext& device) {
 
 int main(int argc, char** argv) {
     OpSuite suite;
+    suite.add("qsa_indexer/ragged", ragged_indexer);
     suite.add("qsa_indexer/flat_graph_patch",
               [] { return flat_graph_patch(cuda_environment().context); },
               {{"execution", "graph"}});

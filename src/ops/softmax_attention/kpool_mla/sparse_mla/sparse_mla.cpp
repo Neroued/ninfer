@@ -140,4 +140,39 @@ void kpool_sparse_mla(const Tensor& query, const KpoolMlaFactors& factors,
     }
     launch_sparse_mla(a, scratch, profile, cache.storage, bucket, sms, execution.stream());
 }
+
+std::size_t kpool_sparse_mla_ragged_workspace_capacity_bytes(
+    const KpoolSparseMlaProfile& profile, KpoolMlaStorage storage, ContextBucketRange buckets,
+    int min_tokens, int max_tokens, int min_segments, int max_segments, int sm_count) {
+    const auto widths = operand::ragged_envelope(min_tokens, max_tokens, min_segments, max_segments,
+                                                 "kpool_sparse_mla");
+    return kpool_sparse_mla_workspace_capacity_bytes(profile, storage, buckets, 1, widths.first,
+                                                     widths.last, sm_count);
+}
+
+void kpool_sparse_mla(const Tensor& query, const KpoolMlaFactors& factors,
+                      const ConstKpoolMlaLatentCacheView& cache,
+                      const KpoolMlaRaggedBatchView& batch, const KpoolBlockSelection& selected,
+                      const Tensor& selection_rows, float attention_scale, ContextBucket bucket,
+                      MemoryArena& workspace, Tensor& out, CudaExecutionView execution) {
+    constexpr const char* op = "kpool_sparse_mla";
+    const auto& seq          = batch.ragged;
+    const auto device        = execution.device();
+    operand::ragged_batch(seq, batch.positions, batch.table_rows, op, device);
+    const int n = seq.total_tokens();
+    operand::tensor(query, DType::BF16, {256, 64, n}, 16, op, "query", device);
+    operand::tensor(out, DType::BF16, {256, 64, n}, 16, op, "output", device);
+    operand::tensor(selection_rows, DType::I32, {n}, 4, op, "selection rows", device);
+    for (int s = 0; s < seq.num_seqs(); ++s) {
+        const int begin = seq.segment_begin(s), len = seq.segment_length(s);
+        const KpoolMlaBatchView segment{batch.positions.slice(0, begin, len),
+                                        seq.seq_lengths.slice(0, s, 1),
+                                        batch.table_rows.slice(0, s, 1)};
+        auto result = out.slice(2, begin, len);
+        kpool_sparse_mla(query.slice(2, begin, len), factors, cache, segment, selected,
+                         selection_rows.slice(0, begin, len).view({len, 1}), attention_scale,
+                         bucket, workspace, result, execution);
+    }
+}
+
 } // namespace ninfer::ops

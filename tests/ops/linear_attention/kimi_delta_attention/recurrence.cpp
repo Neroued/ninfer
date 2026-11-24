@@ -1,8 +1,10 @@
 #include "ops/suite.h"
+#include "ops/ragged_fixture.h"
 #include "ops/state_fixture.h"
 #include "ninfer/ops/kimi_delta_attention.h"
 #include "cuda_fixture.h"
 #include "core/buffer.h"
+#include "core/platform.h"
 
 #include "ops/linear_attention/kda_ref.h"
 #include "ops/op_tester.h"
@@ -736,10 +738,102 @@ int contract_rejection_cases() {
     return failures;
 }
 
+int ragged_recurrence(bool multi_window) {
+    RaggedFixture ragged({1, 3, 17, multi_window ? 257 : 65});
+    const int heads = multi_window ? 32 : 2, qk_heads = heads / 2;
+    constexpr int slots = 8;
+    const int n = ragged.tokens(), rows = ragged.segments();
+    const std::vector<int> source{3, 1, 6, 0}, destination{3, 4, 6, 2};
+    const std::size_t state_elements = 128 * 128 * heads;
+    const std::size_t out_column     = 128 * heads;
+    const float scale                = 1.0f / std::sqrt(128.0f);
+    Case c{"ragged", heads, 1};
+    kda_ref::Inputs packed;
+    c.qk_heads = qk_heads;
+    std::vector<kda_ref::Result> reference;
+    std::vector<float> initial(state_elements * slots, -.0625f);
+    const auto append = [](auto& dest, const auto& src) {
+        dest.insert(dest.end(), src.begin(), src.end());
+    };
+    for (int row = 0; row < rows; ++row) {
+        c.tokens   = ragged.lengths[row];
+        auto input = make_inputs(c, 937 + row * 41);
+        if (row == 0) {
+            packed.a_log   = input.a_log;
+            packed.dt_bias = input.dt_bias;
+        }
+        input.a_log   = packed.a_log;
+        input.dt_bias = packed.dt_bias;
+        append(packed.q, input.q);
+        append(packed.k, input.k);
+        append(packed.v, input.v);
+        append(packed.g, input.g);
+        append(packed.beta, input.beta);
+        std::copy(input.state.begin(), input.state.end(),
+                  initial.begin() + source[row] * state_elements);
+        reference.push_back(kda_ref::evaluate(input, c.lower_bound, scale));
+    }
+    DeviceInputs device(packed);
+    GuardedDeviceBuffer states(initial.size() * 4), output(packed.v.size() * 2);
+    states.copy_from_host(initial.data(), initial.size() * 4);
+    RecordStateFixture history(Tensor(states.span(), DType::FP32, {128, 128, heads, slots}), 3);
+    auto so  = to_device(history.record_offsets(source)),
+         do_ = to_device(history.record_offsets(destination));
+    auto src = history.view(Tensor(so.span(), DType::I64, {rows}));
+    auto dst = history.view(Tensor(do_.span(), DType::I64, {rows}));
+    Tensor q(device.q.span(), DType::BF16, {128, qk_heads, n});
+    Tensor k(device.k.span(), DType::BF16, {128, qk_heads, n});
+    Tensor v(device.v.span(), DType::BF16, {128, heads, n});
+    Tensor g(device.g.span(), DType::BF16, {128, heads, n});
+    Tensor beta(device.beta.span(), DType::BF16, {heads, n});
+    Tensor a(device.a_log.span(), DType::FP32, {heads}),
+        dt(device.dt_bias.span(), DType::FP32, {128, heads});
+    Tensor out(output.span(), DType::BF16, {128, heads, n});
+    const auto bytes = ops::kimi_delta_attention_ragged_workspace_capacity_bytes(qk_heads, heads, n,
+                                                                                 n, rows, rows);
+    GuardedDeviceBuffer scratch(bytes);
+    MemoryArena ws(scratch.span());
+    const auto ex = cuda_environment().default_execution;
+    ops::kimi_delta_attention(q, k, v, g, beta, a, dt, c.lower_bound, scale, ragged.view, ws, src,
+                              dst, out, ex);
+    cuda_synchronize();
+    history.copy_back();
+    const auto actual = from_device_bf16(output.data(), packed.v.size());
+    const auto after  = from_device<float>(states.data(), initial.size());
+    int failures =
+        output.verify_guards("ragged output") + scratch.verify_guards("ragged workspace") +
+        states.verify_guards("ragged state") + history.verify_guards("ragged selected fields");
+    for (int row = 0; row < rows; ++row) {
+        const std::size_t begin = destination[row] * state_elements;
+        const auto first        = actual.begin() + ragged.prefix[row] * out_column;
+        const auto last         = first + ragged.lengths[row] * out_column;
+        failures += verify_reduction("ragged KDA output", std::vector<double>(first, last),
+                                     reference[row].out, output_criterion());
+        const auto state = doubles(
+            std::vector<float>(after.begin() + begin, after.begin() + begin + state_elements));
+        failures += verify_reduction("ragged KDA state", state, reference[row].final_state,
+                                     state_criterion());
+    }
+    for (int slot = 0; slot < slots; ++slot) {
+        if (std::find(destination.begin(), destination.end(), slot) != destination.end()) continue;
+        const auto begin = slot * state_elements;
+        failures += verify_exact(
+            "ragged unselected state",
+            std::vector<float>(after.begin() + begin, after.begin() + begin + state_elements),
+            std::vector<float>(initial.begin() + begin, initial.begin() + begin + state_elements));
+    }
+    return failures + (ws.used() != 0 || ws.peak_used() > bytes);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
     OpSuite suite;
+    suite.add("kimi_delta_attention/ragged", [] { return ragged_recurrence(false); });
+#if NINFER_TARGET_SPARK
+    suite.add("kimi_delta_attention/ragged/window_transition",
+              [] { return ragged_recurrence(true); });
+#endif
     suite.add("kda/contract", contract_rejection_cases);
     suite.add("kda/batch_contract", batch_contract_rejection_cases);
     suite.add("kda/graph_updates", graph_replay_case, {{"execution", "graph"}});

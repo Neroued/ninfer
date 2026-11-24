@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ninfer/ops/ragged.h"
+
 #include "core/arena.h"
 #include "core/device.h"
 #include "core/paged_kv_cache.h"
@@ -66,6 +68,18 @@ struct KpoolMlaBatchView {
     Tensor positions;     // Device I32 [T,B], original-token ordinals.
     Tensor valid_columns; // Device I32 [B], 0<=n[b]<=T.
     Tensor table_rows;    // Device I32 [B], row of the page-offset table.
+};
+
+// Flat packed positions are consecutive per segment. Table rows select one page table per segment.
+struct KpoolMlaRaggedBatchView {
+    RaggedSequenceView ragged;
+    Tensor positions;  // Device I32 [N].
+    Tensor table_rows; // Device I32 [S].
+
+    KpoolMlaRaggedBatchView() = default;
+
+    KpoolMlaRaggedBatchView(RaggedSequenceView ragged, Tensor positions, Tensor table_rows)
+        : ragged(ragged), positions(positions), table_rows(table_rows) {}
 };
 
 // A layer borrows planes of one page-group record. The data plane is BF16 or E4M3FN [Dc,64,1]
@@ -464,5 +478,36 @@ kpool_indexer_graph_profile(const KpoolIndexerProfile& profile, KvCacheVectorFor
 kpool_sparse_mla_graph_profile(const KpoolSparseMlaProfile& profile, KpoolMlaStorage storage,
                                ContextBucket bucket, std::int32_t batch_size, std::int32_t tokens,
                                std::int32_t sm_count);
+
+
+// Packed forms use a flat N-token axis and select one tail or table row per segment.
+// Prepare emits BF16 q_r [1536,N] when requested and FP32 head_coeff [32,N] for Full.
+// Indexer writes one selection per packed column. Sparse MLA uses global selection_rows [N].
+void kpool_mla_prepare_update(const Tensor& x, const KpoolMlaPrepareParameters& parameters,
+                              const KpoolMlaRaggedBatchView& batch, ConstKpoolTailStateView before,
+                              KpoolMlaCacheView cache, KpoolTailStateView after,
+                              KpoolMlaPrepareOutputs outputs, MemoryArena& workspace,
+                              CudaExecutionView execution);
+void kpool_indexer(const Tensor& index_query, const Tensor& head_coeff,
+                   const ConstKpoolIndexCacheView& cache, const KpoolMlaRaggedBatchView& batch,
+                   ContextBucket bucket, MemoryArena& workspace, KpoolBlockSelection& out,
+                   CudaExecutionView execution);
+void kpool_sparse_mla(const Tensor& query, const KpoolMlaFactors& factors,
+                      const ConstKpoolMlaLatentCacheView& cache,
+                      const KpoolMlaRaggedBatchView& batch, const KpoolBlockSelection& selected,
+                      const Tensor& selection_rows, float attention_scale, ContextBucket bucket,
+                      MemoryArena& workspace, Tensor& out, CudaExecutionView execution);
+
+[[nodiscard]] std::size_t kpool_mla_prepare_update_ragged_workspace_capacity_bytes(
+    const KpoolMlaPrepareProfile& profile, KpoolMlaStorage latent_storage,
+    KvCacheVectorFormat index_format, int min_tokens, int max_tokens, int min_segments,
+    int max_segments, int sm_count);
+[[nodiscard]] std::size_t kpool_indexer_ragged_workspace_capacity_bytes(
+    const KpoolIndexerProfile& profile, KvCacheVectorFormat index_format,
+    ContextBucketRange buckets, int min_tokens, int max_tokens, int min_segments, int max_segments,
+    int sm_count);
+[[nodiscard]] std::size_t kpool_sparse_mla_ragged_workspace_capacity_bytes(
+    const KpoolSparseMlaProfile& profile, KpoolMlaStorage storage, ContextBucketRange buckets,
+    int min_tokens, int max_tokens, int min_segments, int max_segments, int sm_count);
 
 } // namespace ninfer::ops

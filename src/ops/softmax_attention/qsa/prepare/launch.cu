@@ -32,6 +32,7 @@ PrepareState<T> prepare_state(const ConstStateFieldView& view) {
             view.field.tensor.shape[0]};
 }
 
+template <bool StridedRope>
 PrepareArguments prepare_arguments(const QsaKvProjectionView& p,
                                    const QsaKvPrepareParameters& params, const QsaBatchView& batch,
                                    const Tensor& rope, const ConstQsaTailStateView& before,
@@ -72,6 +73,10 @@ PrepareArguments prepare_arguments(const QsaKvProjectionView& p,
         p.key.ne[1],
         params.rms_epsilon,
         {}};
+    if constexpr (StridedRope) {
+        a.rope_axis_stride = rope.nb[1] / std::int64_t(sizeof(std::int32_t));
+        a.rope_row_stride  = rope.nb[2] / std::int64_t(sizeof(std::int32_t));
+    }
     // Default model frequencies are constructed once on Host, with no Device allocation.
     static const auto default_frequency = [] {
         std::array<double, 32> result{};
@@ -102,7 +107,8 @@ PreparePlan select_prepare_plan(const PrepareArguments& args, float theta, bool 
                 common::operand::aligned(args.wiq, 8)};
 }
 
-template <KvCacheStorage Storage, bool BoundedPhase, bool VectorWeights, int KvHeads, bool Queries>
+template <KvCacheStorage Storage, bool BoundedPhase, bool VectorWeights, int KvHeads, bool Queries,
+          bool StridedRope>
 void submit(const PrepareArguments& args, PreparePlan plan, cudaStream_t stream) {
     constexpr int groups = PrepareGeometry<KvHeads, Queries>::groups;
     const auto launch    = [&]<bool TokenMajor>() {
@@ -118,7 +124,7 @@ void submit(const PrepareArguments& args, PreparePlan plan, cudaStream_t stream)
                 const dim3 grid =
                     TokenMajor ? dim3(tokens * groups, rows) : dim3(tokens, rows, groups);
                 prepare_kernel<Storage, BoundedPhase, VectorWeights, TokenMajor, KvHeads, Queries,
-                                  vector_kv><<<grid, 128, 0, stream>>>(window);
+                               vector_kv, StridedRope><<<grid, 128, 0, stream>>>(window);
             }
         }
     };
@@ -130,57 +136,60 @@ void submit(const PrepareArguments& args, PreparePlan plan, cudaStream_t stream)
         launch.template operator()<false>();
 }
 
-template <KvCacheStorage Storage, int KvHeads, bool Queries>
+template <KvCacheStorage Storage, int KvHeads, bool Queries, bool StridedRope>
 void dispatch_geometry(const PrepareArguments& args, PreparePlan plan, cudaStream_t stream) {
     // For theta>=1 every phase is bounded by the nonnegative-I32 coordinate domain.
     if constexpr (!Queries) {
         if (plan.bounded_phase)
-            submit<Storage, true, false, KvHeads, false>(args, plan, stream);
+            submit<Storage, true, false, KvHeads, false, StridedRope>(args, plan, stream);
         else
-            submit<Storage, false, false, KvHeads, false>(args, plan, stream);
+            submit<Storage, false, false, KvHeads, false, StridedRope>(args, plan, stream);
     } else if (plan.bounded_phase) {
         if (plan.vector_weights)
-            submit<Storage, true, true, KvHeads, true>(args, plan, stream);
+            submit<Storage, true, true, KvHeads, true, StridedRope>(args, plan, stream);
         else
-            submit<Storage, true, false, KvHeads, true>(args, plan, stream);
+            submit<Storage, true, false, KvHeads, true, StridedRope>(args, plan, stream);
     } else {
         if (plan.vector_weights)
-            submit<Storage, false, true, KvHeads, true>(args, plan, stream);
+            submit<Storage, false, true, KvHeads, true, StridedRope>(args, plan, stream);
         else
-            submit<Storage, false, false, KvHeads, true>(args, plan, stream);
+            submit<Storage, false, false, KvHeads, true, StridedRope>(args, plan, stream);
     }
 }
 
-template <KvCacheStorage Storage, bool Queries>
+template <KvCacheStorage Storage, bool Queries, bool StridedRope>
 void dispatch(const PrepareArguments& args, PreparePlan plan, cudaStream_t stream) {
-    if (args.kv_heads == 1) dispatch_geometry<Storage, 1, Queries>(args, plan, stream);
+    if (args.kv_heads == 1) dispatch_geometry<Storage, 1, Queries, StridedRope>(args, plan, stream);
 
 #if NINFER_TARGET_RTX5090
     else if (args.kv_heads == 4)
-        dispatch_geometry<Storage, 4, Queries>(args, plan, stream);
+        dispatch_geometry<Storage, 4, Queries, StridedRope>(args, plan, stream);
 #endif
     else
-        dispatch_geometry<Storage, 2, Queries>(args, plan, stream);
+        dispatch_geometry<Storage, 2, Queries, StridedRope>(args, plan, stream);
 }
 
-template <bool Queries>
+template <bool Queries, bool StridedRope>
 void launch(const PrepareArguments& args, PreparePlan plan, KvCacheStorage storage,
             CudaExecutionView execution) {
     switch (storage) {
     case KvCacheStorage::BFloat16:
-        dispatch<KvCacheStorage::BFloat16, Queries>(args, plan, execution.stream());
+        dispatch<KvCacheStorage::BFloat16, Queries, StridedRope>(args, plan, execution.stream());
         break;
     case KvCacheStorage::Int8Group64:
-        dispatch<KvCacheStorage::Int8Group64, Queries>(args, plan, execution.stream());
+        dispatch<KvCacheStorage::Int8Group64, Queries, StridedRope>(args, plan, execution.stream());
         break;
     case KvCacheStorage::Fp8E4m3fnGroup128Ue8m0:
-        dispatch<KvCacheStorage::Fp8E4m3fnGroup128Ue8m0, Queries>(args, plan, execution.stream());
+        dispatch<KvCacheStorage::Fp8E4m3fnGroup128Ue8m0, Queries, StridedRope>(args, plan,
+                                                                               execution.stream());
         break;
     case KvCacheStorage::Nvfp4Group16:
-        dispatch<KvCacheStorage::Nvfp4Group16, Queries>(args, plan, execution.stream());
+        dispatch<KvCacheStorage::Nvfp4Group16, Queries, StridedRope>(args, plan,
+                                                                     execution.stream());
         break;
     case KvCacheStorage::Fp8KeyNvfp4Value:
-        dispatch<KvCacheStorage::Fp8KeyNvfp4Value, Queries>(args, plan, execution.stream());
+        dispatch<KvCacheStorage::Fp8KeyNvfp4Value, Queries, StridedRope>(args, plan,
+                                                                         execution.stream());
         break;
     default:
         throw std::invalid_argument("qsa_prepare: unsupported KV storage");
@@ -190,32 +199,53 @@ void launch(const PrepareArguments& args, PreparePlan plan, KvCacheStorage stora
 
 } // namespace
 
+template <bool StridedRope>
 void launch_prepare(const QsaProjectionView& projected, const QsaPrepareParameters& parameters,
                     const QsaBatchView& batch, const Tensor& rope_positions,
                     const ConstQsaTailStateView& before, QsaCacheView cache,
                     QsaRawRecordWriteView records, Tensor& query, Tensor& index_query,
                     CudaExecutionView execution) {
-    auto args   = prepare_arguments({projected.key, projected.value, projected.index_key},
-                                    parameters.kv, batch, rope_positions, before, cache, records);
+    auto args = prepare_arguments<StridedRope>(
+        {projected.key, projected.value, projected.index_key}, parameters.kv, batch, rope_positions,
+        before, cache, records);
     args.q      = static_cast<const __nv_bfloat16*>(projected.query.data);
     args.iq     = static_cast<const __nv_bfloat16*>(projected.index_query.data);
     args.wq     = static_cast<const __nv_bfloat16*>(parameters.query_norm.data);
     args.wiq    = static_cast<const __nv_bfloat16*>(parameters.index_query_norm.data);
     args.out_q  = static_cast<__nv_bfloat16*>(query.data);
     args.out_iq = static_cast<__nv_bfloat16*>(index_query.data);
-    launch<true>(args, select_prepare_plan(args, parameters.kv.rope_theta, true),
-                 cache.main.storage, execution);
+    launch<true, StridedRope>(args, select_prepare_plan(args, parameters.kv.rope_theta, true),
+                              cache.main.storage, execution);
 }
 
+template <bool StridedRope>
 void launch_prepare_kv(const QsaKvProjectionView& projected,
                        const QsaKvPrepareParameters& parameters, const QsaBatchView& batch,
                        const Tensor& rope_positions, const ConstQsaTailStateView& before,
                        QsaCacheView cache, QsaRawRecordWriteView records,
                        CudaExecutionView execution) {
-    const auto args =
-        prepare_arguments(projected, parameters, batch, rope_positions, before, cache, records);
-    launch<false>(args, select_prepare_plan(args, parameters.rope_theta, false), cache.main.storage,
-                  execution);
+    const auto args = prepare_arguments<StridedRope>(projected, parameters, batch, rope_positions,
+                                                     before, cache, records);
+    launch<false, StridedRope>(args, select_prepare_plan(args, parameters.rope_theta, false),
+                               cache.main.storage, execution);
 }
+
+template void launch_prepare<false>(const QsaProjectionView&, const QsaPrepareParameters&,
+                                    const QsaBatchView&, const Tensor&,
+                                    const ConstQsaTailStateView&, QsaCacheView,
+                                    QsaRawRecordWriteView, Tensor&, Tensor&, CudaExecutionView);
+template void launch_prepare_kv<false>(const QsaKvProjectionView&, const QsaKvPrepareParameters&,
+                                       const QsaBatchView&, const Tensor&,
+                                       const ConstQsaTailStateView&, QsaCacheView,
+                                       QsaRawRecordWriteView, CudaExecutionView);
+
+template void launch_prepare<true>(const QsaProjectionView&, const QsaPrepareParameters&,
+                                   const QsaBatchView&, const Tensor&, const ConstQsaTailStateView&,
+                                   QsaCacheView, QsaRawRecordWriteView, Tensor&, Tensor&,
+                                   CudaExecutionView);
+template void launch_prepare_kv<true>(const QsaKvProjectionView&, const QsaKvPrepareParameters&,
+                                      const QsaBatchView&, const Tensor&,
+                                      const ConstQsaTailStateView&, QsaCacheView,
+                                      QsaRawRecordWriteView, CudaExecutionView);
 
 } // namespace ninfer::ops::detail::qsa

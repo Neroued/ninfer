@@ -89,4 +89,24 @@ void ple_state_extract(const ConstPleConvStateView& before, const PleConvRecordR
                                                                   execution.stream());
 }
 
+void ple_state_extract(const ConstPleConvStateView& before, const Tensor& records,
+                       const RaggedSequenceView& ragged, PleConvStateView after,
+                       CudaExecutionView execution) {
+    namespace operand        = common::operand;
+    constexpr const char* op = "ple_state_extract";
+    operand::ragged_sequence(ragged, op, execution.device());
+    operand::tensor(records, DType::BF16, {detail::ple::kChannels, ragged.total_tokens()}, 2, op,
+                    "records", execution.device());
+    for (const auto& state : std::array<ConstStateFieldView, 2>{before.history, after.history})
+        operand::shape(state.records.byte_offsets, {ragged.num_seqs(), 1, 1, 1}, op,
+                       "state offsets");
+    for (int s = 0; s < ragged.num_seqs(); ++s) {
+        const int begin = ragged.segment_begin(s), len = ragged.segment_length(s);
+        const auto valid = ragged.seq_lengths.slice(0, s, 1);
+        ple_state_extract({operand::state_row(before.history, s)},
+                          {records.slice(1, begin, len), valid}, valid,
+                          {operand::state_row(after.history, s)}, {}, execution);
+    }
+}
+
 } // namespace ninfer::ops

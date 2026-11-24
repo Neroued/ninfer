@@ -1,4 +1,5 @@
 #include "reference.h"
+#include "ops/ragged_fixture.h"
 #include "cuda_fixture.h"
 #include "core/decode_graph.h"
 #include "../../../../tools/support/kpool_prepare_fixture.h"
@@ -19,7 +20,7 @@ int exact(const std::vector<T>& a, const std::vector<T>& b, const char* label) {
     return 1;
 }
 
-int verify(kp::Fixture& f) {
+int verify(kp::Fixture& f, bool check_workspace = true) {
     const auto& w         = f.w;
     const bool fp8        = f.cache.index.format == KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0;
     const bool fp8_latent = f.cache.latent.storage == ops::KpoolMlaStorage::Fp8E4m3fnGroup128Ue8m0;
@@ -224,11 +225,12 @@ int verify(kp::Fixture& f) {
         failures += !w.encoded->unchanged() || w.auxiliary->download() != w.auxiliary->host;
     const auto capacity = f.update ? ops::kpool_mla_prepare_update_workspace_capacity_bytes
                                    : ops::kpool_mla_prepare_record_workspace_capacity_bytes;
-    failures +=
-        f.workspace->used() != 0 || f.workspace->peak_used() > f.workspace_bytes ||
-        f.workspace->peak_used() !=
-            capacity(w.profile(), f.cache.latent.storage, f.cache.index.format, f.B, f.T, f.T,
-                     cuda_environment().context.execution_view().multiprocessor_count());
+    if (check_workspace)
+        failures +=
+            f.workspace->used() != 0 || f.workspace->peak_used() > f.workspace_bytes ||
+            f.workspace->peak_used() !=
+                capacity(w.profile(), f.cache.latent.storage, f.cache.index.format, f.B, f.T, f.T,
+                         cuda_environment().context.execution_view().multiprocessor_count());
     return failures;
 }
 
@@ -291,6 +293,46 @@ int run(kp::Projection mode, int T, int B, bool update, bool graph, int phase, b
         device.synchronize();
     }
     return verify(f);
+}
+
+int ragged_prepare() {
+    RaggedFixture ragged({1, 3, 17});
+    constexpr int width = 17;
+    const int n = ragged.tokens(), s = ragged.segments();
+    const auto execution = cuda_environment().default_execution;
+    kp::Weights weights(execution.device(), kp::Projection::Full);
+    kp::Fixture f(weights, execution, width, s, true, false, true, false, 2);
+    f.after_offsets.at(0) = f.before_offsets.at(0);
+    f.after_offsets.at(2) = f.before_offsets.at(2);
+    f.after_offsets.upload();
+    f.valid.host = ragged.lengths;
+    f.valid.upload();
+    for (int b = 0; b < s; ++b)
+        for (int t = 0; t < width; ++t)
+            for (int k = 0; k < 4096; ++k)
+                f.x.at(k, t, b) = kp::sample(k + 4096 * (t % 7) + 9397 * b + 317, 1.F / 256);
+    f.x.upload();
+    auto x   = to_device(ragged.pack(f.x.host, width, 4096));
+    auto pos = to_device(ragged.pack(f.positions.host, width, 1));
+    const ops::KpoolMlaRaggedBatchView batch{ragged.view, Tensor(pos.span(), DType::I32, {n}),
+                                             f.selectors.view};
+    const auto bytes = ops::kpool_mla_prepare_update_ragged_workspace_capacity_bytes(
+        weights.profile(), f.cache.latent.storage, f.cache.index.format, n, n, s, s,
+        execution.multiprocessor_count());
+    GuardedDeviceBuffer scratch(bytes), query(1536 * n * 2ULL), coeff(32 * n * 4ULL);
+    MemoryArena arena(scratch.span());
+    ops::kpool_mla_prepare_update(
+        Tensor(x.span(), DType::BF16, {4096, n}), weights.params, batch, f.before, f.cache, f.after,
+        {Tensor(query.span(), DType::BF16, {1536, n}), Tensor(coeff.span(), DType::FP32, {32, n})},
+        arena, execution);
+    cuda_synchronize();
+    const auto q = ragged.unpack(from_device<std::uint16_t>(query.data(), 1536 * n), width, 1536);
+    const auto c = ragged.unpack(from_device<float>(coeff.data(), 32 * n), width, 32);
+    f.q.storage.copy_from_host(q.data(), q.size() * 2, 256);
+    f.coeff.storage.copy_from_host(c.data(), c.size() * 4, 256);
+    return verify(f, false) + query.verify_guards("ragged query") +
+           coeff.verify_guards("ragged coefficients") + scratch.verify_guards("ragged workspace") +
+           (arena.used() != 0 || arena.peak_used() > bytes);
 }
 
 int inert(bool update, bool fp8 = false, bool fp8_latent = false,
@@ -387,6 +429,7 @@ int admission() {
 
 int main(int argc, char** argv) {
     OpSuite suite;
+    suite.add("kpool_prepare/ragged", ragged_prepare);
     suite.add("kpool_prepare/admission", admission);
     suite.add("kpool_prepare/large_batch/workspace_interval", workspace_interval,
               {{"suite", "concurrency"}});

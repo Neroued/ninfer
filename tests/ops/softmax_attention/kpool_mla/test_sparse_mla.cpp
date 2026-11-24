@@ -1,5 +1,6 @@
 #include "reference.h"
 #include "ops/suite.h"
+#include "ops/ragged_fixture.h"
 #include "ops/graph_patch_check.h"
 #include "ops/op_tester.h"
 #include "cuda_fixture.h"
@@ -105,6 +106,40 @@ int run(int T, int B, int E, int cap = 512, bool ragged = false, bool frozen = f
     f.launch(d.execution_view());
     d.synchronize();
     return verify(f);
+}
+
+int ragged_sparse() {
+    RaggedFixture ragged({1, 3, 17});
+    constexpr int width = 17, features = 256 * 64;
+    const int n = ragged.tokens(), s = ragged.segments();
+    const auto execution = cuda_environment().default_execution;
+    const std::array shape{kp::SparseMlaBatch{width, {67, 66, 79}, ragged.lengths}};
+    kp::SparseMlaFixture f(execution, width, s, 79, 2, 1, false, false, 1, 1,
+                           ops::KpoolMlaStorage::BFloat16, KvCacheVectorFormat::BFloat16, 0,
+                           std::nullopt, shape);
+    auto q    = to_device(ragged.pack(f.query.host, width, features));
+    auto pos  = to_device(ragged.pack(f.positions.host, width, 1));
+    auto rows = to_device(ragged.pack(f.selection_rows.host, width, 1));
+    const ops::KpoolMlaRaggedBatchView batch{ragged.view, Tensor(pos.span(), DType::I32, {n}),
+                                             f.selectors.view};
+    const auto factors = f.factors();
+    const auto bytes   = ops::kpool_sparse_mla_ragged_workspace_capacity_bytes(
+        ops::kpool_sparse_mla_profile(factors, 64), f.cache.storage, f.buckets, n, n, s, s,
+        execution.multiprocessor_count());
+    GuardedDeviceBuffer scratch(std::max<std::size_t>(256, bytes)), output(n * features * 2ULL);
+    MemoryArena arena(scratch.span());
+    Tensor out(output.span(), DType::BF16, {256, 64, n});
+    ops::kpool_sparse_mla(Tensor(q.span(), DType::BF16, {256, 64, n}), factors, f.cache, batch,
+                          {f.ids.view, f.counts.view, f.ends.view},
+                          Tensor(rows.span(), DType::I32, {n}), f.scale, f.bucket, arena, out,
+                          execution);
+    cuda_synchronize();
+    const auto padded =
+        ragged.unpack(from_device<std::uint16_t>(output.data(), n * features), width, features);
+    f.output.storage.copy_from_host(padded.data(), padded.size() * 2, 256);
+    return verify(f) + output.verify_guards("ragged output") +
+           scratch.verify_guards("ragged workspace") +
+           (arena.used() != 0 || arena.peak_used() > bytes);
 }
 
 int token_sweep(bool fp8, bool mx) {
@@ -343,10 +378,10 @@ int merge_graph(bool fp8 = false) {
     DecodeGraphExecutable executable;
     int failures = 0;
     for (int bound : {1, 129, 8192, 0, 129}) {
-        f.bucket                      = ops::select_context_bucket(bound);
-        f.valid.at(0)                 = std::min(f.T, bound);
-        f.selectors.at(0)             = bound ? 0 : -1;
-        const int end                 = bound ? bound - f.valid.at(0) + 1 : 0;
+        f.bucket          = ops::select_context_bucket(bound);
+        f.valid.at(0)     = std::min(f.T, bound);
+        f.selectors.at(0) = bound ? 0 : -1;
+        const int end     = bound ? bound - f.valid.at(0) + 1 : 0;
         if (end % 4) f.tables.at(end / 64, 0) = f.tables.at(0, 0);
         for (int t = 0; t < f.T; ++t) {
             f.positions.at(t, 0)      = t < f.valid.at(0) ? end - 1 + t : -1;
@@ -532,7 +567,7 @@ int admission() {
                                                                  1, 2, 48);
         });
     f.bucket = ContextBucket::K8;
-    f.scale = 0;
+    f.scale  = 0;
     failures += rejects([&] { f.launch(d.execution_view()); });
     f.scale       = 1.F / 16;
     f.output.view = f.query.view;
@@ -544,6 +579,7 @@ int admission() {
 
 int main(int argc, char** argv) {
     OpSuite suite;
+    suite.add("kpool_sparse_mla/packed_prefill", ragged_sparse);
     for (bool fp8 : {false, true})
         for (bool mx : {false, true})
             suite.add("kpool_sparse_mla/token_sweep/" + std::to_string(fp8) + "/" +

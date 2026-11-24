@@ -36,6 +36,14 @@ std::size_t kimi_delta_attention_workspace_capacity_bytes(int qk, int value, int
     return kda::recurrence_workspace_capacity(value, first, last);
 }
 
+std::size_t kimi_delta_attention_ragged_workspace_capacity_bytes(int qk, int value, int min_tokens,
+                                                                 int max_tokens, int min_segments,
+                                                                 int max_segments) {
+    const auto widths =
+        common::operand::ragged_envelope(min_tokens, max_tokens, min_segments, max_segments, op);
+    return kimi_delta_attention_workspace_capacity_bytes(qk, value, widths.first, widths.last);
+}
+
 void kimi_delta_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
                           const Tensor& beta, const Tensor& a_log, const Tensor& dt_bias,
                           float lower_bound, float scale, MemoryArena& workspace, Tensor& state,
@@ -89,9 +97,80 @@ void kimi_delta_attention(const Tensor& q, const Tensor& k, const Tensor& v, con
         window.g += begin * p.value_heads * kda::kStateDim;
         window.beta += begin * p.value_heads;
         window.out += begin * p.value_heads * kda::kStateDim;
-        if (begin) window.state_in = args.state_out;
+        if (begin) {
+            window.state_in      = args.state_out;
+            window.source_offset = args.destination_offset;
+        }
         kda::launch_prepare(window, packets, execution.stream());
         kda::launch_chunk_recurrence(window, packets, plan.value_tile, execution.stream());
+    }
+}
+
+void kimi_delta_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
+                          const Tensor& beta, const Tensor& a_log, const Tensor& dt_bias,
+                          float lower_bound, float scale, const RaggedSequenceView& ragged,
+                          MemoryArena& workspace, ConstStateFieldView source,
+                          StateFieldView destination, Tensor& out, CudaExecutionView execution) {
+    common::operand::device(workspace.device(), execution.device(), op, "workspace");
+    common::operand::ragged_sequence(ragged, op, execution.device());
+    const auto p = kda::validate_inputs(q, k, v, g, beta, a_log, dt_bias, lower_bound, scale, out,
+                                        execution.device());
+    if (p.batch != 1 || p.tokens != ragged.total_tokens())
+        throw std::invalid_argument("kimi_delta_attention: ragged shape mismatch");
+    const kda::Geometry state_geometry{p.qk_heads, p.value_heads, 1, ragged.num_seqs()};
+    kda::validate_state(source, state_geometry, execution.device());
+    kda::validate_state(destination, state_geometry, execution.device());
+    const Tensor* metadata[] = {&ragged.cu_seqlens, &ragged.seq_lengths, &ragged.token_to_seq,
+                                &source.records.byte_offsets, &destination.records.byte_offsets};
+    for (const auto* meta : metadata)
+        common::operand::disjoint(common::operand::range(out, op),
+                                  common::operand::range(*meta, op), op);
+
+    const auto* src_base    = common::operand::state_field_base<const float>(source);
+    auto* dst_base          = common::operand::state_field_base<float>(destination);
+    const auto* src_offsets = static_cast<const std::int64_t*>(source.records.byte_offsets.data);
+    const auto* dst_offsets =
+        static_cast<const std::int64_t*>(destination.records.byte_offsets.data);
+    const int num_seqs = ragged.num_seqs();
+    for (int seq = 0; seq < num_seqs; ++seq) {
+        const int begin = ragged.segment_begin(seq), len = ragged.segment_length(seq);
+        auto out_seg = out.slice(2, begin, len);
+        auto args =
+            arguments(q.slice(2, begin, len), k.slice(2, begin, len), v.slice(2, begin, len),
+                      g.slice(2, begin, len), beta.slice(1, begin, len), a_log, dt_bias,
+                      lower_bound, scale, src_base, dst_base, out_seg);
+        args.source_offset      = src_offsets + seq;
+        args.destination_offset = dst_offsets + seq;
+        const auto plan =
+            kda::select_recurrence_plan(p.value_heads, len, execution.multiprocessor_count());
+        if (plan.route == kda::RecurrenceRoute::Recurrent) {
+            kda::launch_recurrent(args, execution.stream());
+            continue;
+        }
+        auto scope    = workspace.scope();
+        auto* packets = static_cast<kda::Chunk*>(workspace.alloc_bytes(plan.workspace_bytes).data);
+        const auto scratch = common::operand::range(packets, plan.workspace_bytes, op);
+        for (const auto* tensor :
+             {&q, &k, &v, &g, &beta, &a_log, &dt_bias, static_cast<const Tensor*>(&out)})
+            common::operand::disjoint(scratch, common::operand::range(*tensor, op), op);
+        for (const auto* tensor : metadata)
+            common::operand::disjoint(scratch, common::operand::range(*tensor, op), op);
+        for (std::int64_t w_begin = 0; w_begin < len; w_begin += plan.window_tokens) {
+            auto window   = args;
+            window.tokens = std::min<std::int64_t>(plan.window_tokens, len - w_begin);
+            window.q += w_begin * p.qk_heads * kda::kStateDim;
+            window.k += w_begin * p.qk_heads * kda::kStateDim;
+            window.v += w_begin * p.value_heads * kda::kStateDim;
+            window.g += w_begin * p.value_heads * kda::kStateDim;
+            window.beta += w_begin * p.value_heads;
+            window.out += w_begin * p.value_heads * kda::kStateDim;
+            if (w_begin) {
+                window.state_in      = args.state_out;
+                window.source_offset = args.destination_offset;
+            }
+            kda::launch_prepare(window, packets, execution.stream());
+            kda::launch_chunk_recurrence(window, packets, plan.value_tile, execution.stream());
+        }
     }
 }
 

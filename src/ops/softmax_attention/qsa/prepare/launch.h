@@ -4,12 +4,14 @@
 
 namespace ninfer::ops::detail::qsa {
 
+template <bool StridedRope>
 void launch_prepare(const QsaProjectionView& projected, const QsaPrepareParameters& parameters,
                     const QsaBatchView& batch, const Tensor& rope_positions,
                     const ConstQsaTailStateView& before, QsaCacheView cache,
                     QsaRawRecordWriteView records, Tensor& query, Tensor& index_query,
                     CudaExecutionView execution);
 
+template <bool StridedRope>
 void launch_prepare_kv(const QsaKvProjectionView& projected,
                        const QsaKvPrepareParameters& parameters, const QsaBatchView& batch,
                        const Tensor& rope_positions, const ConstQsaTailStateView& before,

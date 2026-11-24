@@ -453,4 +453,42 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
     detail::k8v4_kv_cached_attention(q, positions, scale, cache, bucket, workspace, out, execution);
 }
 
+std::size_t causal_softmax_attention_ragged_workspace_capacity_bytes(
+    AttentionHeadGeometry geometry, KvCacheStorage storage, ContextBucketRange buckets,
+    int min_tokens, int max_tokens, int min_segments, int max_segments, int sm_count) {
+    const auto widths = common::operand::ragged_envelope(min_tokens, max_tokens, min_segments,
+                                                         max_segments, "causal_softmax_attention");
+    return causal_softmax_attention_workspace_capacity_bytes(geometry, storage, buckets, 1,
+                                                             widths.first, widths.last, sm_count);
+}
+
+void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
+                              const RaggedSequenceView& ragged, const Tensor& positions,
+                              const Tensor& kv_table_rows, AttentionHeadGeometry geometry,
+                              float scale, PagedKVBatchLayerView cache, ContextBucket bucket,
+                              MemoryArena& workspace, Tensor& out, CudaExecutionView execution) {
+    constexpr const char* op = "causal_softmax_attention";
+    namespace operand        = common::operand;
+    const auto device        = execution.device();
+    operand::ragged_batch(ragged, positions, kv_table_rows, op, device);
+    require_causal_geometry(geometry, op);
+    const auto n = ragged.total_tokens();
+    operand::tensor(q, DType::BF16, {256, geometry.query_heads, n}, 2, op, "query", device);
+    operand::tensor(k, DType::BF16, {256, geometry.kv_heads, n}, 2, op, "key", device);
+    operand::tensor(v, DType::BF16, {256, geometry.kv_heads, n}, 2, op, "value", device);
+    operand::tensor(out, DType::BF16, {256, geometry.query_heads, n}, 2, op, "output", device);
+    const auto output = operand::range(out, op);
+    for (const auto* in : {&q, &k, &v, &positions, &kv_table_rows, &ragged.cu_seqlens,
+                           &ragged.seq_lengths, &ragged.token_to_seq})
+        operand::disjoint(output, operand::range(*in, op), op);
+    for (int s = 0; s < ragged.num_seqs(); ++s) {
+        const int begin = ragged.segment_begin(s), len = ragged.segment_length(s);
+        auto result = out.slice(2, begin, len);
+        causal_softmax_attention(q.slice(2, begin, len), k.slice(2, begin, len),
+                                 v.slice(2, begin, len), positions.slice(0, begin, len), Tensor{},
+                                 kv_table_rows.slice(0, s, 1), geometry, scale, cache, bucket,
+                                 workspace, result, execution);
+    }
+}
+
 } // namespace ninfer::ops

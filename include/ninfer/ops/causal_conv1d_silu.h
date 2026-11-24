@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ninfer/ops/ragged.h"
+
 #include "core/device.h"
 #include "core/tensor.h"
 #include "core/record_view.h"
@@ -62,5 +64,18 @@ void causal_conv1d_silu_snapshot(const Tensor& x, const Tensor& weight, ConstSta
                                  Tensor& snapshots, const Tensor& valid_columns,
                                  const Tensor& snapshot_base_slots, Tensor& out,
                                  CudaExecutionView execution);
+
+
+// Packed prefill with a flat token axis and one BF16 [C,3] history per segment, selected
+// by Device I64 [S] byte offsets. The caller guarantees in-bounds 2-byte alignment
+// (4 bytes for the split form) and disjoint writes, with exact same-segment in-place
+// history allowed. The convolution and split contracts above apply independently per segment.
+void causal_conv1d_silu(const Tensor& x, const Tensor& weight, const RaggedSequenceView& ragged,
+                        ConstStateFieldView source, StateFieldView destination, Tensor& out,
+                        CudaExecutionView execution);
+void causal_conv1d_silu_split(const Tensor& x, const Tensor& weight,
+                              const RaggedSequenceView& ragged, ConstStateFieldView source,
+                              StateFieldView destination, Tensor& out0, Tensor& out1, Tensor& out2,
+                              CudaExecutionView execution);
 
 } // namespace ninfer::ops

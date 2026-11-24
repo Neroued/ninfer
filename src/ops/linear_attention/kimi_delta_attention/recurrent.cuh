@@ -26,7 +26,9 @@ __global__ void __launch_bounds__(common::kWarpSize* kNumWarps, 2)
         return;
     }
     const auto state_head = static_cast<std::int64_t>(head) * kStateDim * kStateDim;
-    const auto source     = state_head + (Batched ? source_offsets[batch] / sizeof(float) : 0);
+    const auto src_bytes =
+        Batched ? source_offsets[batch] : (args.source_offset ? *args.source_offset : 0);
+    const auto source = state_head + src_bytes / static_cast<std::int64_t>(sizeof(float));
     __align__(16) float state[Rows][kQkPerLane];
     load_state(state, args.state_in + source, dv_base, dqk_base);
     float a_scale = lane == 0 ? expf(args.a_log[head]) : 0.0F;
@@ -58,8 +60,9 @@ __global__ void __launch_bounds__(common::kWarpSize* kNumWarps, 2)
             args.out[offset] = __float2bfloat16(0.0F);
         }
     if constexpr (!Record) {
-        const auto destination =
-            state_head + (Batched ? destination_offsets[batch] / sizeof(float) : 0);
+        const auto dst_bytes   = Batched ? destination_offsets[batch]
+                                         : (args.destination_offset ? *args.destination_offset : 0);
+        const auto destination = state_head + dst_bytes / static_cast<std::int64_t>(sizeof(float));
         store_state(state, args.state_out + destination, dv_base, dqk_base);
     }
 }

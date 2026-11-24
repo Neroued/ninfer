@@ -107,4 +107,36 @@ void qsa_indexer(const Tensor& query, const ConstQsaIndexCacheView& cache,
     }
     detail::qsa::launch_indexer(query, cache, batch, plan, scratch, out, execution);
 }
+
+std::size_t qsa_indexer_ragged_workspace_capacity_bytes(ContextBucketRange buckets, int min_tokens,
+                                                        int max_tokens, int min_segments,
+                                                        int max_segments) {
+    const auto widths = common::operand::ragged_envelope(min_tokens, max_tokens, min_segments,
+                                                         max_segments, "qsa_indexer");
+    return qsa_indexer_workspace_capacity_bytes(buckets, 1, widths.first, widths.last);
+}
+
+void qsa_indexer(const Tensor& query, const ConstQsaIndexCacheView& cache,
+                 const QsaRaggedBatchView& batch, ContextBucket bucket, MemoryArena& workspace,
+                 QsaBlockSelection& out, CudaExecutionView execution) {
+    namespace operand        = common::operand;
+    constexpr const char* op = "qsa_indexer";
+    const auto& seq          = batch.ragged;
+    const auto device        = execution.device();
+    operand::ragged_batch(seq, batch.positions, batch.table_rows, op, device);
+    const int n = seq.total_tokens();
+    operand::tensor(query, DType::BF16, {128, 4, n}, 16, op, "query", device);
+    operand::tensor(out.block_ids, DType::I32, {512, n}, 4, op, "block ids", device);
+    operand::tensor(out.block_counts, DType::I32, {n}, 4, op, "block counts", device);
+    for (int s = 0; s < seq.num_seqs(); ++s) {
+        const int begin = seq.segment_begin(s), len = seq.segment_length(s);
+        const QsaBatchView segment{batch.positions.slice(0, begin, len),
+                                   seq.seq_lengths.slice(0, s, 1), batch.table_rows.slice(0, s, 1)};
+        QsaBlockSelection result{out.block_ids.slice(1, begin, len),
+                                 out.block_counts.slice(0, begin, len)};
+        qsa_indexer(query.slice(2, begin, len), cache, segment, bucket, workspace, result,
+                    execution);
+    }
+}
+
 } // namespace ninfer::ops

@@ -424,6 +424,7 @@ int run_cached_case(CudaExecutionView execution, const Geometry& geometry, KvCac
 int run_batch_case(CudaExecutionView execution, const Geometry& geometry, KvCacheStorage storage,
                    const BatchAttentionCase& test_case, std::optional<ContextBucket> bucket = {},
                    std::span<const ContextBucket> graph_buckets = {});
+int run_ragged_case(CudaExecutionView, KvCacheStorage);
 int verify_workspace_capacity_contract(CudaExecutionView, KvCacheStorage);
 void add_cases(OpSuite&);
 

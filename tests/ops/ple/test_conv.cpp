@@ -1,4 +1,5 @@
 #include "ops/suite.h"
+#include "ops/ragged_fixture.h"
 #include "conv_fixture.h"
 #include "core/decode_graph.h"
 
@@ -154,9 +155,48 @@ int short_record_view(DeviceContext& device, bool norm) {
     device.synchronize();
     return f.verify(norm, "PLE padded T with R=3");
 }
+
+int ragged_conv(bool norm) {
+    RaggedFixture ragged({2, 15, 34});
+    const int n = ragged.tokens(), width = 34, rows = ragged.segments();
+    ConvFixture f(width, rows);
+    f.prepare(0, false);
+    f.valid = ragged.lengths;
+    upload_i32(f.d_valid, f.valid);
+    Words residual({H, C, n}), gated({H, C, n}), current({D, n}), updated({H, C, n}),
+        normalized({H, C, n});
+    residual.host = ragged.pack(f.residual.host, width, D);
+    gated.host    = ragged.pack(f.gated.host, width, D);
+    for (int s = 0; s < rows; ++s)
+        for (int t = 0; t < ragged.lengths[s]; ++t)
+            std::copy_n(f.records.host.begin() + f.records.index(0, t + f.offset[s], s), D,
+                        current.host.begin() + (ragged.prefix[s] + t) * D);
+    for (const auto* data : {&residual, &gated, &current}) data->upload();
+    const auto ex = cuda_environment().default_execution;
+    auto y        = norm ? residual.tensor : updated.tensor;
+    if (norm)
+        ops::ple_conv_add_norm(residual.tensor, gated.tensor, f.kernel.tensor, ragged.view,
+                               f.state_view(), current.tensor, f.norm.tensor, epsilon, y,
+                               normalized.tensor, ex);
+    else
+        ops::ple_conv_add(residual.tensor, gated.tensor, f.kernel.tensor, ragged.view,
+                          f.state_view(), current.tensor, y, ex);
+    cuda_synchronize();
+    const auto unpack = [&](const Tensor& tensor) {
+        return ragged.unpack(from_device<std::uint16_t>(tensor.data, D * n), width, D);
+    };
+    const auto out = unpack(y), z = norm ? unpack(normalized.tensor) : std::vector<std::uint16_t>{};
+    int failures = f.verify(norm, "ragged PLE convolution", &out, norm ? &z : nullptr);
+    for (const auto* data : {&residual, &updated, &normalized})
+        failures += data->device->verify_guards("ragged PLE convolution");
+    return failures + gated.preserved("ragged gated values") +
+           current.preserved("ragged current values");
+}
 } // namespace
 
 void add_ple_conv_cases(ninfer::test::OpSuite& suite) {
+    suite.add("ple_conv/ragged/plain", [] { return ragged_conv(false); });
+    suite.add("ple_conv/ragged/norm", [] { return ragged_conv(true); });
     suite.add("ple_conv/contract", [] { return validation(cuda_environment().context); });
     suite.add("ple_conv/history_gap",
               [] { return output_in_history_gap(cuda_environment().context); });

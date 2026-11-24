@@ -174,4 +174,42 @@ void qsa_sparse_gqa(const Tensor& query, const Tensor& gate,
     }
     launch_sparse_gqa(query, gate, cache, batch, selected, bucket, plan, scratch, out, execution);
 }
+
+std::size_t qsa_sparse_gqa_ragged_workspace_capacity_bytes(KvCacheStorage storage, int query_heads,
+                                                           int kv_heads, ContextBucketRange buckets,
+                                                           int min_tokens, int max_tokens,
+                                                           int min_segments, int max_segments,
+                                                           int sm_count) {
+    const auto widths = common::operand::ragged_envelope(min_tokens, max_tokens, min_segments,
+                                                         max_segments, "qsa_sparse_gqa");
+    return qsa_sparse_gqa_workspace_capacity_bytes(storage, query_heads, kv_heads, buckets, 1,
+                                                   widths.first, widths.last, sm_count);
+}
+
+void qsa_sparse_gqa(const Tensor& query, const Tensor& gate,
+                    const ConstPagedKVBatchLayerView& cache, const QsaRaggedBatchView& batch,
+                    const QsaBlockSelection& selected, ContextBucket bucket, MemoryArena& workspace,
+                    Tensor& out, CudaExecutionView execution) {
+    namespace operand        = common::operand;
+    constexpr const char* op = "qsa_sparse_gqa";
+    const auto& seq          = batch.ragged;
+    const auto device        = execution.device();
+    operand::ragged_batch(seq, batch.positions, batch.table_rows, op, device);
+    const int n = seq.total_tokens(), h = query.ne[1];
+    for (const auto* t : std::array<const Tensor*, 3>{&query, &gate, &out})
+        operand::tensor(*t, DType::BF16, {256, h, n}, 16, op, "activation", device);
+    operand::tensor(selected.block_ids, DType::I32, {512, n}, 4, op, "block ids", device);
+    operand::tensor(selected.block_counts, DType::I32, {n}, 4, op, "block counts", device);
+    for (int s = 0; s < seq.num_seqs(); ++s) {
+        const int begin = seq.segment_begin(s), len = seq.segment_length(s);
+        const QsaBatchView segment{batch.positions.slice(0, begin, len),
+                                   seq.seq_lengths.slice(0, s, 1), batch.table_rows.slice(0, s, 1)};
+        auto result = out.slice(2, begin, len);
+        qsa_sparse_gqa(
+            query.slice(2, begin, len), gate.slice(2, begin, len), cache, segment,
+            {selected.block_ids.slice(1, begin, len), selected.block_counts.slice(0, begin, len)},
+            bucket, workspace, result, execution);
+    }
+}
+
 } // namespace ninfer::ops

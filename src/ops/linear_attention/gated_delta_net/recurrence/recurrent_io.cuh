@@ -16,6 +16,8 @@ struct DirectAccess {
     HeadMap heads;
     std::int32_t width;
     float scale;
+    const std::int64_t* source_offset      = nullptr;
+    const std::int64_t* destination_offset = nullptr;
 
     __device__ __forceinline__ RecurrentCoordinates coordinates() const {
         return make_coordinates(0, 0, static_cast<std::int32_t>(blockIdx.z), heads);
@@ -29,11 +31,16 @@ struct DirectAccess {
 
     __device__ __forceinline__ const float*
     state_read_base(const RecurrentCoordinates& coord) const {
-        return state_read + static_cast<std::int64_t>(coord.value_head) * kStateDim * kStateDim;
+        const auto offset = source_offset ? *source_offset / std::int64_t(sizeof(float)) : 0;
+        return state_read + offset +
+               static_cast<std::int64_t>(coord.value_head) * kStateDim * kStateDim;
     }
 
     __device__ __forceinline__ float* state_write_base(const RecurrentCoordinates& coord) const {
-        return state_write + static_cast<std::int64_t>(coord.value_head) * kStateDim * kStateDim;
+        const auto offset =
+            destination_offset ? *destination_offset / std::int64_t(sizeof(float)) : 0;
+        return state_write + offset +
+               static_cast<std::int64_t>(coord.value_head) * kStateDim * kStateDim;
     }
 
     __device__ __forceinline__ const __nv_bfloat16* key_ptr(const RecurrentCoordinates& coord,
@@ -131,11 +138,14 @@ __global__ void __launch_bounds__(common::kWarpSize* kNumWarps, 2)
     recurrent_bf16_direct_kernel(const __nv_bfloat16* __restrict__ q,
                                  const __nv_bfloat16* __restrict__ k,
                                  const __nv_bfloat16* __restrict__ v, const float* __restrict__ g,
-                                 const float* __restrict__ beta,
-                                 const float* __restrict__ state_read,
-                                 float* __restrict__ state_write, __nv_bfloat16* __restrict__ out,
-                                 std::int32_t width, HeadMap heads, float scale) {
-    const DirectAccess access{q, k, v, g, beta, state_read, state_write, out, heads, width, scale};
+                                 const float* __restrict__ beta, const float* state_read,
+                                 float* state_write, __nv_bfloat16* __restrict__ out,
+                                 std::int32_t width, HeadMap heads, float scale,
+                                 const std::int64_t* source_offset,
+                                 const std::int64_t* destination_offset) {
+    const DirectAccess access{
+        q,   k,     v,     g,     beta,          state_read,        state_write,
+        out, heads, width, scale, source_offset, destination_offset};
     const RecurrentCoordinates coord = access.coordinates();
     __align__(16) float state[kDvPerWarp][kQkPerLane];
     load_state_tile(state, access.state_read_base(coord), coord);

@@ -9,6 +9,12 @@
 
 namespace ninfer::ops::detail {
 
+template <bool Indexed, class T>
+__device__ __forceinline__ T* conv_history(T* base, const std::int64_t* offset) {
+    if constexpr (Indexed) return base + *offset / static_cast<std::int64_t>(sizeof(T));
+    return base;
+}
+
 __device__ __forceinline__ void causal_conv1d_acc_pair(__nv_bfloat162 w, __nv_bfloat162 x,
                                                        float& acc0, float& acc1) {
     acc0 += __low2float(w) * __low2float(x);

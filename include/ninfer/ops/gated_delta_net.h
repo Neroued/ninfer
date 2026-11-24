@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ninfer/ops/ragged.h"
+
 #include "core/arena.h"
 #include "core/device.h"
 #include "core/tensor.h"
@@ -102,5 +104,20 @@ void gated_delta_net_replay_record(const Tensor& q, const Tensor& k, const Tenso
                                    ConstStateFieldView initial_state, const Tensor& valid_columns,
                                    GdnRecurrenceRecords records, Tensor& out,
                                    CudaExecutionView execution);
+
+
+// Packed recurrence. Q/K are BF16 [128,Hqk,N], V/out BF16 [128,Hv,N], and G/beta
+// FP32 [Hv,N]. Device I64 [S] byte offsets select independent FP32 [128,128,Hv]
+// fields. The caller guarantees alignment to 16 bytes and disjoint destination fields.
+// A destination may exactly alias its own source. Other selected state and write
+// relationships follow gated_delta_net_batch_update.
+void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
+                     const Tensor& beta, float scale, bool normalize_qk,
+                     const RaggedSequenceView& ragged, MemoryArena& ws,
+                     ConstStateFieldView source_state, StateFieldView destination_state,
+                     Tensor& out, CudaExecutionView execution);
+[[nodiscard]] std::size_t gated_delta_net_ragged_workspace_capacity_bytes(
+    std::int32_t qk_heads, std::int32_t value_heads, std::int32_t min_tokens,
+    std::int32_t max_tokens, std::int32_t min_segments, std::int32_t max_segments);
 
 } // namespace ninfer::ops

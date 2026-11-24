@@ -4,6 +4,7 @@
 #include "core/record_view.h"
 #include "core/paged_kv_cache.h"
 #include "core/weight.h"
+#include "ninfer/ops/ragged.h"
 
 #include <array>
 #include <algorithm>
@@ -328,6 +329,56 @@ inline void slotted_tensor(const Tensor& value, DType dtype,
         value.nb[slot_axis] % static_cast<std::int64_t>(alignment) != 0)
         throw std::invalid_argument(std::string(op) + ": invalid slot stride for " + name);
     (void)blocks(value, op);
+}
+
+struct SegmentWidths {
+    int first, last;
+};
+
+// Over the feasible part of the envelope, one segment can take all tokens except
+// the one token required by each of the other segments.
+inline SegmentWidths ragged_envelope(std::int32_t min_tokens, std::int32_t max_tokens,
+                                     std::int32_t min_segments, std::int32_t max_segments,
+                                     const char* op) {
+    if (min_tokens < 1 || max_tokens < min_tokens || min_segments < 1 ||
+        max_segments < min_segments || min_segments > max_tokens) {
+        throw std::invalid_argument(std::string(op) + ": invalid ragged (T,S) envelope");
+    }
+    return {max_segments == 1 ? min_tokens : 1, max_tokens - min_segments + 1};
+}
+
+inline void ragged_sequence(const RaggedSequenceView& ragged, const char* op,
+                            Device expected_device) {
+    const auto host = ragged.host_cu_seqlens;
+    if (host.size() < 2 ||
+        host.size() > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max()) ||
+        host.front() != 0) {
+        throw std::invalid_argument(std::string(op) + ": invalid host_cu_seqlens");
+    }
+    const auto num_seqs = static_cast<std::int32_t>(host.size() - 1);
+    for (std::int32_t s = 0; s < num_seqs; ++s) {
+        if (host[static_cast<std::size_t>(s + 1)] <= host[static_cast<std::size_t>(s)]) {
+            throw std::invalid_argument(std::string(op) +
+                                        ": host_cu_seqlens must be strictly increasing");
+        }
+    }
+    const auto total_tokens = host.back();
+    tensor(ragged.cu_seqlens, DType::I32, {num_seqs + 1}, 4, op, "cu_seqlens", expected_device);
+    tensor(ragged.seq_lengths, DType::I32, {num_seqs}, 4, op, "seq_lengths", expected_device);
+    tensor(ragged.token_to_seq, DType::I32, {total_tokens}, 4, op, "token_to_seq", expected_device);
+}
+
+inline void ragged_batch(const RaggedSequenceView& ragged, const Tensor& positions,
+                         const Tensor& table_rows, const char* op, Device device) {
+    ragged_sequence(ragged, op, device);
+    tensor(positions, DType::I32, {ragged.total_tokens()}, 4, op, "positions", device);
+    tensor(table_rows, DType::I32, {ragged.num_seqs()}, 4, op, "table rows", device);
+}
+
+template <class FieldView>
+[[nodiscard]] FieldView state_row(FieldView field, int row) {
+    field.records.byte_offsets = field.records.byte_offsets.slice(0, row, 1);
+    return field;
 }
 
 } // namespace ninfer::ops::common::operand

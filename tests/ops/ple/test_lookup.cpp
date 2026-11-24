@@ -1,4 +1,5 @@
 #include "ops/suite.h"
+#include "ops/ragged_fixture.h"
 #include "ops/op_tester.h"
 #include "cuda_fixture.h"
 #include "core/decode_graph.h"
@@ -241,6 +242,27 @@ int run(int tokens, int batch, int partition, bool padded, bool wide = false) {
     return failures;
 }
 
+int ragged_lookup() {
+    RaggedFixture ragged({1, 3, 15, 13});
+    const int n = ragged.tokens();
+    Fixture f(17, ragged.segments(), true);
+    f.reset(1);
+    f.valid          = ragged.lengths;
+    auto ids         = to_device(ragged.pack(f.ids, f.stride, 1));
+    const auto local = f.views(0);
+    GuardedDeviceBuffer output(2560 * n * 2ULL);
+    Tensor result(output.span(), DType::BF16, {2560, n});
+    ops::ngram_embedding_lookup(Tensor(ids.span(), DType::I32, {n}), ragged.view, f.before, f.hash,
+                                f.eos, local, result, cuda_environment().default_execution);
+    cuda_synchronize();
+    int failures =
+        verify_exact("ragged lookup", from_device<std::uint16_t>(output.data(), 2560 * n),
+                     ragged.pack(f.reference(local), f.t, 2560));
+    failures += verify_exact("ragged untouched token tails",
+                             from_device<int>(f.d_tail.data(), f.tail.size()), f.tail);
+    return failures + output.verify_guards("ragged lookup") + f.d_tail.verify_guards("token tails");
+}
+
 int combine() {
     Fixture f(6, 4, true);
     auto& device     = cuda_environment().context;
@@ -293,6 +315,7 @@ void add_ple_lookup_cases(ninfer::test::OpSuite& suite) {
               {{"format", "nf4"}, {"execution", "graph"}, {"suite", "concurrency"}});
     suite.add("ngram_embedding_lookup/wide_hash", [] { return run(3, 1, 0, true, true); },
               {{"format", "nf4"}, {"execution", "graph"}});
+    suite.add("ngram_embedding_lookup/ragged", ragged_lookup);
     suite.add("ngram_embedding_lookup/combine_words", combine, {{"format", "nf4"}});
     suite.add("ngram_embedding_lookup/contract", invalid, {{"format", "nf4"}});
 }

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ninfer/ops/ragged.h"
+
 #include "ninfer/ops/attention_geometry.h"
 #include "ninfer/ops/context_bucket.h"
 
@@ -192,5 +194,22 @@ void context_softmax_attention(const Tensor& q, const Tensor& query_k, const Ten
 [[nodiscard]] std::size_t context_softmax_attention_workspace_capacity_bytes(
     AttentionHeadGeometry geometry, ContextBucketRange buckets, std::int32_t batch_size,
     std::int32_t min_tokens, std::int32_t max_tokens);
+
+
+/**
+ * Packed causal append and attention. Q/out are BF16 [256,Hq,N], K/V are BF16 [256,Hkv,N].
+ * positions is Device I32 [N], consecutive within each segment. Table rows are Device I32 [S].
+ * The batch cache, per-segment context bucket and disjoint writes follow the append contract.
+ */
+void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
+                              const RaggedSequenceView& ragged, const Tensor& positions,
+                              const Tensor& kv_table_rows, AttentionHeadGeometry geometry,
+                              float scale, PagedKVBatchLayerView cache, ContextBucket bucket,
+                              MemoryArena& workspace, Tensor& out, CudaExecutionView execution);
+
+[[nodiscard]] std::size_t causal_softmax_attention_ragged_workspace_capacity_bytes(
+    AttentionHeadGeometry geometry, KvCacheStorage cache_storage, ContextBucketRange buckets,
+    std::int32_t min_tokens, std::int32_t max_tokens, std::int32_t min_segments,
+    std::int32_t max_segments, std::int32_t multiprocessor_count);
 
 } // namespace ninfer::ops

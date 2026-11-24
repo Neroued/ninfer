@@ -154,6 +154,13 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
     const int m_start     = NT < kWarps ? warp / NT : 0;
     const int chunks      = chunk_count(args.tokens);
     const auto state_base = static_cast<std::int64_t>(head) * kStateDim * kStateDim;
+    const auto src_base =
+        state_base +
+        (args.source_offset ? *args.source_offset / static_cast<std::int64_t>(sizeof(float)) : 0);
+    const auto dst_base =
+        state_base + (args.destination_offset
+                          ? *args.destination_offset / static_cast<std::int64_t>(sizeof(float))
+                          : 0);
 
     // MMA accumulators describe S^T[key,value]. External state remains [value,key].
     float state[NPW][MPW][4];
@@ -164,10 +171,10 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
         for (int mi = 0; mi < MPW; ++mi) {
             const int key    = (m_start + mi * MW) * 16 + g;
             const int value  = value_start + n * 8 + t * 2;
-            state[ni][mi][0] = args.state_in[state_base + value * kStateDim + key];
-            state[ni][mi][1] = args.state_in[state_base + (value + 1) * kStateDim + key];
-            state[ni][mi][2] = args.state_in[state_base + value * kStateDim + key + 8];
-            state[ni][mi][3] = args.state_in[state_base + (value + 1) * kStateDim + key + 8];
+            state[ni][mi][0] = args.state_in[src_base + value * kStateDim + key];
+            state[ni][mi][1] = args.state_in[src_base + (value + 1) * kStateDim + key];
+            state[ni][mi][2] = args.state_in[src_base + value * kStateDim + key + 8];
+            state[ni][mi][3] = args.state_in[src_base + (value + 1) * kStateDim + key + 8];
         }
     }
     load_stage<DV>(sm.stage[0], args, workspace, head, value_start, 0, tid);
@@ -321,12 +328,12 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
         const int n = n_start + ni * kWarps;
 #pragma unroll
         for (int mi = 0; mi < MPW; ++mi) {
-            const int key                                        = (m_start + mi * MW) * 16 + g;
-            const int value                                      = value_start + n * 8 + t * 2;
-            args.state_out[state_base + value * kStateDim + key] = state[ni][mi][0];
-            args.state_out[state_base + (value + 1) * kStateDim + key]     = state[ni][mi][1];
-            args.state_out[state_base + value * kStateDim + key + 8]       = state[ni][mi][2];
-            args.state_out[state_base + (value + 1) * kStateDim + key + 8] = state[ni][mi][3];
+            const int key                                            = (m_start + mi * MW) * 16 + g;
+            const int value                                          = value_start + n * 8 + t * 2;
+            args.state_out[dst_base + value * kStateDim + key]       = state[ni][mi][0];
+            args.state_out[dst_base + (value + 1) * kStateDim + key] = state[ni][mi][1];
+            args.state_out[dst_base + value * kStateDim + key + 8]   = state[ni][mi][2];
+            args.state_out[dst_base + (value + 1) * kStateDim + key + 8] = state[ni][mi][3];
         }
     }
 }

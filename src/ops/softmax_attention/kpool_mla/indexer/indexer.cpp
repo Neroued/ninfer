@@ -143,4 +143,41 @@ void kpool_indexer(const Tensor& query, const Tensor& coefficients,
         launch_indexer(a, execution.multiprocessor_count(), execution.stream());
     }
 }
+
+std::size_t kpool_indexer_ragged_workspace_capacity_bytes(
+    const KpoolIndexerProfile& profile, KvCacheVectorFormat format, ContextBucketRange buckets,
+    int min_tokens, int max_tokens, int min_segments, int max_segments, int sm_count) {
+    const auto widths = common::operand::ragged_envelope(min_tokens, max_tokens, min_segments,
+                                                         max_segments, "kpool_indexer");
+    return kpool_indexer_workspace_capacity_bytes(profile, format, buckets, 1, widths.first,
+                                                  widths.last, sm_count);
+}
+
+void kpool_indexer(const Tensor& query, const Tensor& coeff, const ConstKpoolIndexCacheView& cache,
+                   const KpoolMlaRaggedBatchView& batch, ContextBucket bucket,
+                   MemoryArena& workspace, KpoolBlockSelection& out, CudaExecutionView execution) {
+    namespace operand        = common::operand;
+    constexpr const char* op = "kpool_indexer";
+    const auto& seq          = batch.ragged;
+    const auto device        = execution.device();
+    operand::ragged_batch(seq, batch.positions, batch.table_rows, op, device);
+    const int n = seq.total_tokens();
+    operand::tensor(query, DType::BF16, {128, 32, n}, 16, op, "query", device);
+    operand::tensor(coeff, DType::FP32, {32, n}, 4, op, "head coefficients", device);
+    operand::tensor(out.pool_ids, DType::I32, {512, n}, 4, op, "pool IDs", device);
+    operand::tensor(out.pool_counts, DType::I32, {n}, 4, op, "pool counts", device);
+    operand::tensor(out.selection_end, DType::I32, {n}, 4, op, "selection end", device);
+    for (int s = 0; s < seq.num_seqs(); ++s) {
+        const int begin = seq.segment_begin(s), len = seq.segment_length(s);
+        const KpoolMlaBatchView segment{batch.positions.slice(0, begin, len),
+                                        seq.seq_lengths.slice(0, s, 1),
+                                        batch.table_rows.slice(0, s, 1)};
+        KpoolBlockSelection result{out.pool_ids.slice(1, begin, len),
+                                   out.pool_counts.slice(0, begin, len),
+                                   out.selection_end.slice(0, begin, len)};
+        kpool_indexer(query.slice(2, begin, len), coeff.slice(1, begin, len), cache, segment,
+                      bucket, workspace, result, execution);
+    }
+}
+
 } // namespace ninfer::ops

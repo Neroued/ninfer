@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ninfer/ops/ragged.h"
+
 #include "core/device.h"
 #include "core/paged_kv_cache.h"
 #include "core/tensor.h"
@@ -41,6 +43,18 @@ struct QsaBatchView {
     Tensor positions;     // I32 [T,B], original-token ordinals.
     Tensor valid_columns; // I32 [B].
     Tensor table_rows;    // I32 [B].
+};
+
+// Flat ordinal positions are consecutive within each segment.
+struct QsaRaggedBatchView {
+    RaggedSequenceView ragged;
+    Tensor positions;  // Device I32 [N].
+    Tensor table_rows; // Device I32 [S].
+
+    QsaRaggedBatchView() = default;
+
+    QsaRaggedBatchView(RaggedSequenceView ragged, Tensor positions, Tensor table_rows)
+        : ragged(ragged), positions(positions), table_rows(table_rows) {}
 };
 
 struct QsaProjectionView {
@@ -384,5 +398,43 @@ void qsa_prepare_kv(const QsaKvProjectionView& projected, const QsaKvPreparePara
 void qsa_tail_extract(const ConstQsaTailStateView& before, const QsaRawRecordReadView& records,
                       const Tensor& accepted_columns, QsaTailStateView after,
                       const Tensor& live_rows, CudaExecutionView execution);
+
+
+// Packed prepare publishes a new tail for each segment and writes the same cache planes as
+// qsa_prepare. Projections and outputs use a flat N-token axis, and rope_positions is I32
+// [N,A], A=1 or 3, with contiguous tokens and non-overlapping axes.
+void qsa_prepare_update(const QsaProjectionView& projected, const QsaPrepareParameters& parameters,
+                        const QsaRaggedBatchView& batch, const Tensor& rope_positions,
+                        const ConstQsaTailStateView& before, QsaCacheView cache,
+                        QsaTailStateView after, Tensor& query, Tensor& index_query,
+                        MemoryArena& workspace, CudaExecutionView execution);
+void qsa_prepare_kv_update(const QsaKvProjectionView& projected,
+                           const QsaKvPrepareParameters& parameters,
+                           const QsaRaggedBatchView& batch, const Tensor& rope_positions,
+                           const ConstQsaTailStateView& before, QsaCacheView cache,
+                           QsaTailStateView after, MemoryArena& workspace,
+                           CudaExecutionView execution);
+void qsa_indexer(const Tensor& index_query, const ConstQsaIndexCacheView& cache,
+                 const QsaRaggedBatchView& batch, ContextBucket bucket, MemoryArena& workspace,
+                 QsaBlockSelection& out, CudaExecutionView execution);
+void qsa_sparse_gqa(const Tensor& query, const Tensor& output_gate,
+                    const ConstPagedKVBatchLayerView& cache, const QsaRaggedBatchView& batch,
+                    const QsaBlockSelection& selected, ContextBucket bucket, MemoryArena& workspace,
+                    Tensor& out, CudaExecutionView execution);
+
+[[nodiscard]] std::size_t qsa_prepare_update_ragged_workspace_capacity_bytes(int min_tokens,
+                                                                             int max_tokens,
+                                                                             int min_segments,
+                                                                             int max_segments);
+[[nodiscard]] std::size_t qsa_prepare_kv_update_ragged_workspace_capacity_bytes(int min_tokens,
+                                                                                int max_tokens,
+                                                                                int min_segments,
+                                                                                int max_segments);
+[[nodiscard]] std::size_t
+qsa_indexer_ragged_workspace_capacity_bytes(ContextBucketRange buckets, int min_tokens,
+                                            int max_tokens, int min_segments, int max_segments);
+[[nodiscard]] std::size_t qsa_sparse_gqa_ragged_workspace_capacity_bytes(
+    KvCacheStorage storage, int query_heads, int kv_heads, ContextBucketRange buckets,
+    int min_tokens, int max_tokens, int min_segments, int max_segments, int sm_count);
 
 } // namespace ninfer::ops

@@ -16,6 +16,8 @@ struct Arguments {
     __nv_bfloat16* out;
     int qk_heads, value_heads, tokens;
     float lower_bound, scale;
+    const std::int64_t* source_offset      = nullptr;
+    const std::int64_t* destination_offset = nullptr;
 };
 
 struct RecurrenceRecords {

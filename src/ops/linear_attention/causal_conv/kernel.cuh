@@ -5,10 +5,12 @@
 namespace ninfer::ops::detail {
 inline constexpr int kCausalConvChannelTile = 32;
 
-template <class Output>
+template <class Output, bool Indexed = false>
 __global__ void causal_conv1d_prefill_kernel(const __nv_bfloat16* x, const __nv_bfloat16* weight,
                                              const __nv_bfloat16* conv_state, Output out,
-                                             std::int32_t C, std::int32_t T) {
+                                             std::int32_t C, std::int32_t T,
+                                             const std::int64_t* source_offset = nullptr) {
+    conv_state                  = conv_history<Indexed>(conv_state, source_offset);
     const std::int64_t C64      = static_cast<std::int64_t>(C);
     const std::int64_t c_blocks = common::div_up(C64, static_cast<std::int64_t>(blockDim.x));
     const std::int64_t block    = static_cast<std::int64_t>(blockIdx.x);
@@ -34,11 +36,12 @@ __global__ void causal_conv1d_prefill_kernel(const __nv_bfloat16* x, const __nv_
     *out.column(c64).at(t) = result;
 }
 
-template <class Output>
-__global__ void causal_conv1d_prefill_pairs_kernel(const __nv_bfloat16* x,
-                                                   const __nv_bfloat16* weight,
-                                                   const __nv_bfloat16* conv_state, Output out,
-                                                   std::int32_t C, std::int32_t T) {
+template <class Output, bool Indexed = false>
+__global__ void
+causal_conv1d_prefill_pairs_kernel(const __nv_bfloat16* x, const __nv_bfloat16* weight,
+                                   const __nv_bfloat16* conv_state, Output out, std::int32_t C,
+                                   std::int32_t T, const std::int64_t* source_offset = nullptr) {
+    conv_state                   = conv_history<Indexed>(conv_state, source_offset);
     const std::int64_t C2        = static_cast<std::int64_t>(C / 2);
     const std::int64_t c_blocks  = common::div_up(C2, static_cast<std::int64_t>(blockDim.x));
     const std::int64_t block     = static_cast<std::int64_t>(blockIdx.x);
@@ -76,10 +79,14 @@ __global__ void causal_conv1d_prefill_pairs_kernel(const __nv_bfloat16* x,
 // selected GDN snapshot slot while always publishing the running state to slot 0.
 // The initial values are loaded into registers before any store, so overlapping
 // in/out (in == out) has no read/write hazard.
-__global__ void causal_conv1d_prefill_state_kernel(const __nv_bfloat16* x,
-                                                   const __nv_bfloat16* conv_state_in,
-                                                   __nv_bfloat16* conv_state_out, std::int32_t C,
-                                                   std::int32_t T) {
+template <bool Indexed = false>
+__global__ void
+causal_conv1d_prefill_state_kernel(const __nv_bfloat16* x, const __nv_bfloat16* conv_state_in,
+                                   __nv_bfloat16* conv_state_out, std::int32_t C, std::int32_t T,
+                                   const std::int64_t* source_offset      = nullptr,
+                                   const std::int64_t* destination_offset = nullptr) {
+    conv_state_in             = conv_history<Indexed>(conv_state_in, source_offset);
+    conv_state_out            = conv_history<Indexed>(conv_state_out, destination_offset);
     const std::int64_t start  = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
     const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
     const std::int64_t C64    = static_cast<std::int64_t>(C);
@@ -110,11 +117,15 @@ __global__ void causal_conv1d_prefill_state_kernel(const __nv_bfloat16* x,
 // Small-T ordinary form parallelized across both channels and tokens. Each CTA owns one channel
 // tile for the full sequence. Loading history into shared memory before any state publication makes
 // the exact-alias state form safe without a second kernel.
-template <class Output>
+template <class Output, bool Indexed = false>
 __global__ void causal_conv1d_smallt_kernel(const __nv_bfloat16* x, const __nv_bfloat16* weight,
                                             const __nv_bfloat16* conv_state_in,
                                             __nv_bfloat16* conv_state_out, Output out,
-                                            std::int32_t C, std::int32_t T) {
+                                            std::int32_t C, std::int32_t T,
+                                            const std::int64_t* source_offset      = nullptr,
+                                            const std::int64_t* destination_offset = nullptr) {
+    conv_state_in  = conv_history<Indexed>(conv_state_in, source_offset);
+    conv_state_out = conv_history<Indexed>(conv_state_out, destination_offset);
     __shared__ __nv_bfloat16 history[3][kCausalConvChannelTile];
     __shared__ __nv_bfloat16 weights[4][kCausalConvChannelTile];
 
@@ -190,10 +201,14 @@ __global__ void causal_conv1d_decode_kernel(const __nv_bfloat16* x, const __nv_b
     }
 }
 
+template <bool Indexed = false>
 __global__ void causal_conv1d_decode_distinct_kernel(
     const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ weight,
-    const __nv_bfloat16* __restrict__ conv_state_in, __nv_bfloat16* __restrict__ conv_state_out,
-    __nv_bfloat16* __restrict__ out, std::int32_t C) {
+    const __nv_bfloat16* conv_state_in, __nv_bfloat16* conv_state_out,
+    __nv_bfloat16* __restrict__ out, std::int32_t C, const std::int64_t* source_offset = nullptr,
+    const std::int64_t* destination_offset = nullptr) {
+    conv_state_in             = conv_history<Indexed>(conv_state_in, source_offset);
+    conv_state_out            = conv_history<Indexed>(conv_state_out, destination_offset);
     const std::int64_t start  = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
     const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
     const std::int64_t C64    = static_cast<std::int64_t>(C);

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ninfer/ops/ragged.h"
+
 #include "core/device.h"
 #include "core/tensor.h"
 #include "core/record_view.h"
@@ -243,5 +245,26 @@ void ple_conv_add_norm(const Tensor& residual, const Tensor& gated_value, const 
 void ple_state_extract(const ConstPleConvStateView& before, const PleConvRecordReadView& records,
                        const Tensor& accepted_columns, PleConvStateView after,
                        const Tensor& live_rows, CudaExecutionView execution);
+
+
+// Packed PLE forms reset history at segment boundaries and use no workspace. Each segment
+// selects one token tail or convolution history. x-like tensors keep their feature axes
+// with a flat N-column token axis. Extraction publishes the complete segment's final history.
+void ngram_embedding_lookup(const Tensor& token_ids, const RaggedSequenceView& ragged,
+                            const NgramTokenTailView& before, const NgramHashParameters& hash,
+                            std::int32_t eos, std::span<const Nf4EmbeddingShard> shards,
+                            Tensor& embedding, CudaExecutionView execution);
+void ple_conv_add(const Tensor& residual, const Tensor& gated_value, const Tensor& kernel,
+                  const RaggedSequenceView& ragged, const ConstPleConvStateView& before,
+                  const Tensor& current_values, Tensor& updated_residual,
+                  CudaExecutionView execution);
+void ple_conv_add_norm(const Tensor& residual, const Tensor& gated_value, const Tensor& kernel,
+                       const RaggedSequenceView& ragged, const ConstPleConvStateView& before,
+                       const Tensor& current_values, const Tensor& next_hc_norm_weight,
+                       float next_hc_epsilon, Tensor& updated_residual, Tensor& normalized,
+                       CudaExecutionView execution);
+void ple_state_extract(const ConstPleConvStateView& before, const Tensor& record_values,
+                       const RaggedSequenceView& ragged, PleConvStateView after,
+                       CudaExecutionView execution);
 
 } // namespace ninfer::ops

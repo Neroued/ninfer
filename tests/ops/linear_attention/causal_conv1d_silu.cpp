@@ -1,4 +1,5 @@
 #include "ops/suite.h"
+#include "ops/ragged_fixture.h"
 #include "ops/state_fixture.h"
 #include "ninfer/ops/causal_conv1d_silu.h"
 #include "cuda_fixture.h"
@@ -782,10 +783,83 @@ int batched_snapshot_case(std::int32_t C, std::int32_t width,
     return failures;
 }
 
+int ragged_case(int channels, int query_rows, int value_rows) {
+    RaggedFixture ragged({1, 3, 17, 65});
+    const int n = ragged.tokens(), s = ragged.segments();
+    const std::vector<int> source{3, 1, 6, 0}, destination{3, 4, 6, 2};
+    constexpr int slots     = 8;
+    const std::size_t words = channels * 3ULL;
+    const auto input        = make_input(channels, n, 1321);
+    std::vector<float> initial(words * slots);
+    for (int slot = 0; slot < slots; ++slot) {
+        const auto state = make_state(channels, 1351 + slot);
+        std::copy(state.begin(), state.end(), initial.begin() + slot * words);
+    }
+    auto expected_states = initial;
+    std::vector<double> expected_output;
+    for (int row = 0; row < s; ++row) {
+        const auto start = input.x.begin() + ragged.prefix[row] * channels;
+        const auto state = initial.begin() + source[row] * words;
+        const auto reference =
+            causal_conv_oracle({start, start + ragged.lengths[row] * channels}, input.weight,
+                               {state, state + words}, channels, ragged.lengths[row], false);
+        expected_output.insert(expected_output.end(), reference.output.begin(),
+                               reference.output.end());
+        std::copy(reference.final_state.begin(), reference.final_state.end(),
+                  expected_states.begin() + destination[row] * words);
+    }
+
+    auto dx = to_device_bf16(input.x), dw = to_device_bf16(input.weight);
+    GuardedDeviceBuffer states(initial.size() * 2);
+    const auto bits = bf16_bits(initial);
+    states.copy_from_host(bits.data(), bits.size() * 2);
+    RecordStateFixture history(Tensor(states.span(), DType::BF16, {channels, 3, slots}), 2);
+    auto ds        = to_device(history.record_offsets(source)),
+         dd        = to_device(history.record_offsets(destination));
+    const auto src = history.view(Tensor(ds.span(), DType::I64, {s}));
+    const auto dst = history.view(Tensor(dd.span(), DType::I64, {s}));
+    Tensor x(dx.span(), DType::BF16, {channels, n}), w(dw.span(), DType::BF16, {channels, 4});
+    const auto execution = cuda_environment().default_execution;
+    int failures         = 0;
+    if (!query_rows) {
+        GuardedDeviceBuffer buffer(channels * n * 2ULL);
+        Tensor out(buffer.span(), DType::BF16, {channels, n});
+        ops::causal_conv1d_silu(x, w, ragged.view, src, dst, out, execution);
+        cuda_synchronize();
+        failures += verify_output("ragged convolution",
+                                  from_device_bf16(buffer.data(), channels * n), expected_output);
+        failures += buffer.verify_guards("ragged convolution");
+    } else {
+        GuardedDeviceBuffer oq(query_rows * n * 2ULL), ok(query_rows * n * 2ULL),
+            ov(value_rows * n * 2ULL);
+        Tensor q(oq.span(), DType::BF16, {query_rows, n}),
+            k(ok.span(), DType::BF16, {query_rows, n}), v(ov.span(), DType::BF16, {value_rows, n});
+        ops::causal_conv1d_silu_split(x, w, ragged.view, src, dst, q, k, v, execution);
+        cuda_synchronize();
+        for (const auto& [buffer, first, width] :
+             {std::tuple{&oq, 0, query_rows}, std::tuple{&ok, query_rows, query_rows},
+              std::tuple{&ov, 2 * query_rows, value_rows}}) {
+            const auto reference = oracle_slice(expected_output, channels, n, first, width);
+            failures += verify_output("ragged split convolution",
+                                      from_device_bf16(buffer->data(), width * n), reference);
+            failures += buffer->verify_guards("ragged split convolution");
+        }
+    }
+    history.copy_back();
+    failures += verify_bits("ragged final history and untouched slots", states.data(),
+                            bf16_bits(expected_states));
+    return failures + history.verify_guards("ragged history") +
+           states.verify_guards("ragged state");
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
     OpSuite suite;
+    suite.add("causal_conv/ragged/scalar", [] { return ragged_case(37, 0, 0); });
+    suite.add("causal_conv/ragged/split5120", [] { return ragged_case(5120, 1024, 3072); });
+    suite.add("causal_conv/ragged/split8192", [] { return ragged_case(8192, 2048, 4096); });
+    suite.add("causal_conv/ragged/split10240", [] { return ragged_case(10240, 2048, 6144); });
     const auto ordinary = [&](int channels, int t, StateCall call, unsigned seed) {
         suite.add("causal_conv/ordinary/c" + std::to_string(channels) + "/t" + std::to_string(t) +
                       "/form" + std::to_string(int(call)),

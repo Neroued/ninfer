@@ -4,6 +4,7 @@
 #include "core/device.h"
 #include "core/tensor.h"
 #include "core/record_view.h"
+#include "ninfer/ops/ragged.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -18,6 +19,10 @@ namespace ninfer::ops {
                                                                         std::int32_t value_heads,
                                                                         std::int32_t min_tokens,
                                                                         std::int32_t max_tokens);
+
+[[nodiscard]] std::size_t kimi_delta_attention_ragged_workspace_capacity_bytes(
+    std::int32_t qk_heads, std::int32_t value_heads, std::int32_t min_tokens,
+    std::int32_t max_tokens, std::int32_t min_segments, std::int32_t max_segments);
 
 /**
  * Kimi Delta Attention, independently for every value head h. Its shared query/key head is
@@ -58,6 +63,21 @@ void kimi_delta_attention(const Tensor& q, const Tensor& k, const Tensor& v, con
                           const Tensor& beta, const Tensor& A_log, const Tensor& dt_bias,
                           float lower_bound, float scale, MemoryArena& workspace,
                           const Tensor& state_in, Tensor& state_out, Tensor& out,
+                          CudaExecutionView execution);
+
+/**
+ * Packed ragged form over S = ragged.num_seqs() non-empty segments and N = ragged.total_tokens()
+ * columns. q/k are BF16 [128,Hqk,N], v/g/out are BF16 [128,Hv,N], beta is BF16 [Hv,N], and
+ * source_state/destination_state select S independent FP32 [128,128,Hv] state records by Device
+ * I64 [S] byte offsets. Alignment, bounds, and selected-state alias relationships are
+ * caller guarantees, with the same rules as batch update. Same-segment exact in-place alias
+ * is allowed, and workspace may be reused between segments on the execution stream.
+ */
+void kimi_delta_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
+                          const Tensor& beta, const Tensor& A_log, const Tensor& dt_bias,
+                          float lower_bound, float scale, const RaggedSequenceView& ragged,
+                          MemoryArena& workspace, ConstStateFieldView source_state,
+                          StateFieldView destination_state, Tensor& out,
                           CudaExecutionView execution);
 
 /**

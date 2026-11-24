@@ -1,5 +1,6 @@
 #include "reference.h"
 #include "ops/suite.h"
+#include "ops/ragged_fixture.h"
 #include "ops/graph_patch_check.h"
 #include "cuda_fixture.h"
 #include "core/decode_graph.h"
@@ -249,6 +250,47 @@ int request_groups(bool fp8) {
     return verify(f);
 }
 
+int ragged_indexer() {
+    RaggedFixture ragged({1, 3, 17});
+    constexpr int width = 17;
+    const int n = ragged.tokens(), s = ragged.segments();
+    const auto execution = cuda_environment().default_execution;
+    kp::IndexerCase shape;
+    shape.ends  = {67, 66, 2081};
+    shape.valid = ragged.lengths;
+    kp::IndexerFixture f(execution, width, s, 2081, 1, false, ops::KpoolMlaStorage::BFloat16,
+                         shape);
+    auto q     = to_device(ragged.pack(f.query.host, width, 128 * 32));
+    auto coeff = to_device(ragged.pack(f.coeff.host, width, 32));
+    auto pos   = to_device(ragged.pack(f.positions.host, width, 1));
+    const ops::KpoolMlaRaggedBatchView batch{ragged.view, Tensor(pos.span(), DType::I32, {n}),
+                                             f.selectors.view};
+    const auto bytes = ops::kpool_indexer_ragged_workspace_capacity_bytes(
+        {32, 128}, f.cache.format, f.bucket, n, n, s, s, execution.multiprocessor_count());
+    GuardedDeviceBuffer scratch(std::max<std::size_t>(256, bytes)), ids(512 * n * 4ULL),
+        counts(n * 4ULL), ends(n * 4ULL);
+    MemoryArena arena(scratch.span());
+    ops::KpoolBlockSelection selected{Tensor(ids.span(), DType::I32, {512, n}),
+                                      Tensor(counts.span(), DType::I32, {n}),
+                                      Tensor(ends.span(), DType::I32, {n})};
+    ops::kpool_indexer(Tensor(q.span(), DType::BF16, {128, 32, n}),
+                       Tensor(coeff.span(), DType::FP32, {32, n}), f.cache, batch, f.bucket, arena,
+                       selected, execution);
+    cuda_synchronize();
+    const auto unpack = [&](auto& dst, const auto& buffer, int features) {
+        const auto padded =
+            ragged.unpack(from_device<int>(buffer.data(), n * features), width, features);
+        dst.storage.copy_from_host(padded.data(), padded.size() * 4, 256);
+    };
+    unpack(f.ids, ids, 512);
+    unpack(f.counts, counts, 1);
+    unpack(f.ends, ends, 1);
+    int failures = verify(f) + (arena.used() != 0 || arena.peak_used() > bytes);
+    for (const auto* buffer : {&scratch, &ids, &counts, &ends})
+        failures += buffer->verify_guards("ragged Kpool indexer");
+    return failures;
+}
+
 int small_page_table(bool fp8) {
     auto& d = cuda_environment().context;
     kp::IndexerFixture f(d.execution_view(), 4, 1, 96, 1, false, ops::KpoolMlaStorage::BFloat16, {},
@@ -452,6 +494,7 @@ int admission() {
 
 int main(int argc, char** argv) {
     OpSuite suite;
+    suite.add("kpool_indexer/ragged", ragged_indexer);
     for (auto [T, B, E] :
          {std::tuple{1, 1, 1}, {3, 1, 3},       {1, 1, 2051},     {1, 1, 2052},     {1, 1, 8192},
           {2, 1, 16384},       {3, 1, 16388},   {4, 1, 32768},    {7, 1, 32768},    {8, 1, 32768},

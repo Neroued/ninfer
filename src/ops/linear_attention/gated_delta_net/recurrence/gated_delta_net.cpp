@@ -148,6 +148,12 @@ void validate_recurrence(const Tensor& q, const Tensor& k, const Tensor& v, cons
     common::operand::contiguous_nonnull(ssm_state_in, "gated_delta_net", "ssm_state_in", device);
 }
 
+void execute(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g, const Tensor& beta,
+             float scale, bool normalize_qk, MemoryArena& ws, const Tensor& ssm_state_in,
+             Tensor& ssm_state_out, Tensor& out, CudaExecutionView execution,
+             const std::int64_t* source_offset      = nullptr,
+             const std::int64_t* destination_offset = nullptr);
+
 } // namespace
 
 std::size_t gated_delta_net_workspace_capacity_bytes(std::int32_t qk_heads,
@@ -192,13 +198,21 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
     }
     validate_recurrence(q, k, v, g, beta, scale, ssm_state_in, ssm_state_out, out,
                         execution.device());
+    execute(q, k, v, g, beta, scale, normalize_qk, ws, ssm_state_in, ssm_state_out, out, execution);
+}
+
+namespace {
+void execute(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g, const Tensor& beta,
+             float scale, bool normalize_qk, MemoryArena& ws, const Tensor& ssm_state_in,
+             Tensor& ssm_state_out, Tensor& out, CudaExecutionView execution,
+             const std::int64_t* source_offset, const std::int64_t* destination_offset) {
     namespace chunked = detail::gated_delta_net::chunked;
     const auto plan   = detail::gated_delta_net::select_recurrence_plan(
         q.ne[1], v.ne[1], q.ne[2], execution.multiprocessor_count());
     if (plan.route == detail::gated_delta_net::RecurrenceRoute::Recurrent) {
-        detail::gated_delta_net::launch_recurrent_inout(q, k, v, g, beta, scale, normalize_qk,
-                                                        ssm_state_in, ssm_state_out, out,
-                                                        execution.stream());
+        detail::gated_delta_net::launch_recurrent_inout(
+            q, k, v, g, beta, scale, normalize_qk, ssm_state_in, ssm_state_out, out,
+            execution.stream(), source_offset, destination_offset);
         return;
     }
     auto scope         = ws.scope();
@@ -218,9 +232,76 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
         q.ne[1],
         v.ne[1],
         q.ne[2],
-        scale};
+        scale,
+        source_offset,
+        destination_offset};
     chunked::launch_prepare(args, qk, control, normalize_qk, execution.stream());
     chunked::launch_recurrence(args, qk, control, plan.value_tile, execution.stream());
+}
+} // namespace
+
+std::size_t gated_delta_net_ragged_workspace_capacity_bytes(int qk_heads, int value_heads,
+                                                            int min_tokens, int max_tokens,
+                                                            int min_segments, int max_segments) {
+    const auto widths = common::operand::ragged_envelope(min_tokens, max_tokens, min_segments,
+                                                         max_segments, "gated_delta_net");
+    return gated_delta_net_workspace_capacity_bytes(qk_heads, value_heads, widths.first,
+                                                    widths.last);
+}
+
+void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
+                     const Tensor& beta, float scale, bool normalize_qk,
+                     const RaggedSequenceView& seq, MemoryArena& ws, ConstStateFieldView source,
+                     StateFieldView destination, Tensor& out, CudaExecutionView execution) {
+    namespace operand        = common::operand;
+    constexpr const char* op = "gated_delta_net";
+    const auto device        = execution.device();
+    operand::ragged_sequence(seq, op, device);
+    operand::device(ws.device(), device, op, "workspace");
+    const int n = seq.total_tokens(), h = v.ne[1];
+    for (const auto& state : std::array<ConstStateFieldView, 2>{source, destination}) {
+        operand::state_field(state, DType::FP32, {128, 128, h}, 16, op, "state", device);
+        operand::shape(state.records.byte_offsets, {seq.num_seqs(), 1, 1, 1}, op, "state offsets");
+        if (state.field.layers != 1)
+            throw std::invalid_argument("gated_delta_net: select one recurrent state layer");
+    }
+    auto src = source.field.metadata(), dst = destination.field.metadata();
+    src.data   = const_cast<float*>(operand::state_field_base<const float>(source));
+    dst.data   = operand::state_field_base<float>(destination);
+    src.device = dst.device = device;
+    const auto geometry     = validate_recurrent(q, k, v, g, beta, scale, dst, out, device);
+    if (n != geometry.tokens) throw std::invalid_argument("gated_delta_net: ragged token count");
+    const Tensor* inputs[] = {&q,
+                              &k,
+                              &v,
+                              &g,
+                              &beta,
+                              &seq.cu_seqlens,
+                              &seq.seq_lengths,
+                              &seq.token_to_seq,
+                              &source.records.byte_offsets,
+                              &destination.records.byte_offsets};
+    const auto output      = operand::range(out, op);
+    for (const auto* in : inputs) operand::disjoint(output, operand::range(*in, op), op);
+    int longest = 0;
+    for (int s = 0; s < seq.num_seqs(); ++s) longest = std::max(longest, seq.segment_length(s));
+    const auto peak = gated_delta_net_workspace_capacity_bytes(q.ne[1], h, 1, longest);
+    if (peak) {
+        auto scope         = ws.scope();
+        const auto scratch = operand::range(ws.alloc_bytes(peak).data, peak, op);
+        for (const auto* in : inputs) operand::disjoint(scratch, operand::range(*in, op), op);
+        operand::disjoint(scratch, output, op);
+    }
+    const auto* src_offsets = static_cast<const std::int64_t*>(source.records.byte_offsets.data);
+    const auto* dst_offsets =
+        static_cast<const std::int64_t*>(destination.records.byte_offsets.data);
+    for (int s = 0; s < seq.num_seqs(); ++s) {
+        const int begin = seq.segment_begin(s), len = seq.segment_length(s);
+        auto result = out.slice(2, begin, len);
+        execute(q.slice(2, begin, len), k.slice(2, begin, len), v.slice(2, begin, len),
+                g.slice(1, begin, len), beta.slice(1, begin, len), scale, normalize_qk, ws, src,
+                dst, result, execution, src_offsets + s, dst_offsets + s);
+    }
 }
 
 } // namespace ninfer::ops

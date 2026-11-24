@@ -5,19 +5,26 @@
 #include "core/record_view.h"
 
 namespace ninfer::ops::detail {
+struct CausalConvOffsets {
+    const std::int64_t* source      = nullptr;
+    const std::int64_t* destination = nullptr;
+};
+
 void launch_causal_conv(const Tensor& x, const Tensor& weight, const Tensor& state_in,
-                        Tensor& state_out, Tensor& out, CausalConvRoute route, cudaStream_t stream);
+                        Tensor& state_out, Tensor& out, CausalConvRoute route, cudaStream_t stream,
+                        CausalConvOffsets offsets = {});
 void launch_causal_conv_split(const Tensor& x, const Tensor& weight, const Tensor& state_in,
                               Tensor& state_out, Tensor& out0, Tensor& out1, Tensor& out2,
-                              CausalConvSplitGeometry geometry, cudaStream_t stream);
+                              CausalConvSplitGeometry geometry, cudaStream_t stream,
+                              CausalConvOffsets offsets = {});
 void launch_causal_conv_state(const Tensor& x, const Tensor& state_in, Tensor& state_out,
-                              cudaStream_t stream);
+                              cudaStream_t stream, CausalConvOffsets offsets = {});
 void launch_causal_conv_split_10240(const Tensor& x, const Tensor& weight, const Tensor& state_in,
                                     Tensor& state_out, Tensor& out0, Tensor& out1, Tensor& out2,
-                                    cudaStream_t stream);
+                                    cudaStream_t stream, CausalConvOffsets offsets = {});
 void launch_causal_conv_split_5120(const Tensor& x, const Tensor& weight, const Tensor& state_in,
                                    Tensor& state_out, Tensor& out0, Tensor& out1, Tensor& out2,
-                                   cudaStream_t stream);
+                                   cudaStream_t stream, CausalConvOffsets offsets = {});
 void launch_causal_conv_snapshot(const Tensor& x, const Tensor& weight, ConstStateFieldView source,
                                  Tensor& snapshots, const Tensor& valid,
                                  const Tensor& snapshot_slots, Tensor& out,

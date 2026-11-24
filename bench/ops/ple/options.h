@@ -1,8 +1,10 @@
 #pragma once
 
 #include "op_measurement.cuh"
+#include "ragged_workload.h"
 
 #include <limits>
+#include <optional>
 
 namespace ninfer::bench::ple {
 
@@ -11,13 +13,16 @@ struct Options {
     std::string op = "conv-add-norm", valid = "dense", accepted = "dense";
     std::string lookup_shards = "lower";
     std::vector<int> tokens{1};
+    std::vector<ragged::SegmentSpec> ragged_specs;
+    ragged::StateOffsetForm state_form = ragged::StateOffsetForm::Distinct;
     int batch = 1, offset = 0;
     bool inplace = false;
 };
 
 inline Options parse_options(int argc, char** argv) {
     Options o;
-    bool explicit_tokens = false, lookup_option = false;
+    bool explicit_tokens = false, lookup_option = false, explicit_state = false;
+    std::optional<std::string_view> ragged_text;
     for (int i = 1; i < argc; ++i) {
         const std::string_view flag = argv[i];
         if (flag == "--help" || flag == "-h") {
@@ -27,6 +32,9 @@ inline Options parse_options(int argc, char** argv) {
                          "  --tokens T[,T...] or --sweep START:END[:STEP] --batch B\n"
                          "  --valid dense|mixed|N[,N...] --offset N (gate/convolution)\n"
                          "  --accepted dense|mixed|N[,N...] (state extraction) --inplace\n"
+                         "  --ragged-segments SPEC (lookup, convolution and extraction)\n"
+                         "  --state-form distinct|alias|mixed|permuted|shared-source (ragged)\n"
+                         "  alias and mixed state forms require state-extract.\n"
                          "H=2560, streams=4, history=9, B>=1. Defaults: conv-add-norm, T=B=1.\n";
             measurement::help();
             std::exit(0);
@@ -43,6 +51,11 @@ inline Options parse_options(int argc, char** argv) {
             explicit_tokens = true;
             o.tokens =
                 flag == "--tokens" ? measurement::integers(value) : measurement::sweep(value);
+        } else if (flag == "--ragged-segments")
+            ragged_text = value;
+        else if (flag == "--state-form") {
+            o.state_form   = ragged::parse_state_form(value);
+            explicit_state = true;
         } else if (flag == "--batch")
             o.batch = measurement::integer(value);
         else if (flag == "--offset")
@@ -60,6 +73,26 @@ inline Options parse_options(int argc, char** argv) {
     if (o.op != "gate" && o.op != "conv-add" && o.op != "conv-add-norm" &&
         o.op != "state-extract" && o.op != "lookup")
         throw std::invalid_argument("unsupported Op");
+    if (ragged_text) {
+        if (explicit_tokens)
+            throw std::invalid_argument(
+                "--ragged-segments is mutually exclusive with --tokens and --sweep");
+        if (o.op == "gate" || o.offset || o.batch != 1 || o.valid != "dense" ||
+            o.accepted != "dense")
+            throw std::invalid_argument("ragged segments require lookup, convolution or "
+                                        "extraction, offset 0, batch 1 and dense prefixes");
+        if (o.op != "state-extract" && (o.state_form == ragged::StateOffsetForm::Alias ||
+                                        o.state_form == ragged::StateOffsetForm::Mixed))
+            throw std::invalid_argument(
+                "read-only PLE history supports distinct, permuted and shared-source state forms");
+        if (o.op == "state-extract" && o.inplace) {
+            if (explicit_state && o.state_form != ragged::StateOffsetForm::Alias)
+                throw std::invalid_argument("state-extract --inplace requires alias state form");
+            o.state_form = ragged::StateOffsetForm::Alias;
+        }
+        o.ragged_specs = ragged::parse_ragged_specs(*ragged_text);
+    } else if (explicit_state)
+        throw std::invalid_argument("state-form requires ragged segments");
     if (o.op == "gate" && o.inplace) throw std::invalid_argument("gate has no in-place output");
     if ((lookup_option && o.op != "lookup") ||
         (o.op == "lookup" && (o.inplace || o.offset || o.accepted != "dense")))

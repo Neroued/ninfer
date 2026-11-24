@@ -121,9 +121,9 @@ std::vector<BenchRow> run_batch_update(const Options& options, std::int32_t toke
     Tensor beta = operands.beta_tensor();
     Tensor out  = operands.output();
     Tensor source_table(source_offsets.span(), DType::I64, {problem.batch});
-    Tensor destinations = options.state_form == "alias"
-                              ? source_table
-                              : Tensor(destination_offsets.span(), DType::I64, {problem.batch});
+    const bool alias = options.state_form == ragged::StateOffsetForm::Alias;
+    Tensor destinations =
+        alias ? source_table : Tensor(destination_offsets.span(), DType::I64, {problem.batch});
     TensorRegion state_region{
         {0, state_elements * sizeof(float), 16}, DType::FP32, {128, 128, problem.value_heads, 1}};
     StateFieldView source_state{{states.span(), source_table},
@@ -150,8 +150,8 @@ std::vector<BenchRow> run_batch_update(const Options& options, std::int32_t toke
         const Tensor& q_input = composed ? q_norm : q;
         const Tensor& k_input = composed ? k_norm : k;
         ops::gated_delta_net_batch_update(q_input, k_input, v, g, beta, gated_delta_net_scale(),
-                                          !composed, source_state, destination_state, {}, out,
-                                          cuda);
+                                                  !composed, source_state, destination_state, {}, out,
+                                                  cuda);
     };
     BenchRow row;
     row.normalization  = composed ? "composed" : "fused";
@@ -159,8 +159,7 @@ std::vector<BenchRow> run_batch_update(const Options& options, std::int32_t toke
                                   : "public.batch_update.qk_fused";
     row.traffic        = gdn::running_traffic(problem);
     // Alias shares the read-only selector tensor; distinct form uses two arrays.
-    row.traffic.logical.read +=
-        sizeof(std::int64_t) * problem.batch * (options.state_form == "alias" ? 1 : 2);
+    row.traffic.logical.read += sizeof(std::int64_t) * problem.batch * (alias ? 1 : 2);
     if (composed) {
         row.workspace_bytes = row.workspace_peak = 2 * problem.qk_bytes();
         row.traffic.workspace_requests           = {row.workspace_bytes, row.workspace_bytes};
@@ -188,10 +187,11 @@ std::vector<BenchRow> run_prefill(const Options& options, std::int32_t tokens,
     Tensor q = operands.query(), k = operands.key(), v = operands.value();
     Tensor g = operands.gate(), beta = operands.beta_tensor(), out = operands.output();
     Tensor si(state_in.span(), DType::FP32, {state_dim, state_dim, problem.value_heads});
-    Tensor so(options.state_form == "alias" ? state_in.span() : state_out.span(), DType::FP32,
+    const bool alias = options.state_form == ragged::StateOffsetForm::Alias;
+    Tensor so(alias ? state_in.span() : state_out.span(), DType::FP32,
               {state_dim, state_dim, problem.value_heads});
     std::optional<SavedBuffer> saved;
-    if (options.state_form == "alias") saved.emplace(state_in);
+    if (alias) saved.emplace(state_in);
     const launch_fn restore = [&](CudaExecutionView cuda) {
         if (saved) saved->restore(cuda);
     };
@@ -283,6 +283,67 @@ std::vector<BenchRow> run_prefill(const Options& options, std::int32_t tokens,
     return rows;
 }
 
+void run_ragged(const Options& options, const ragged::SegmentSpec& lengths, L2FlushBuffer& flush,
+                CudaExecutionView cuda, measurement::Csv& csv) {
+    const ragged::RaggedDeviceFixture workload(lengths, cuda.device());
+    const auto seq = workload.view();
+    const int n = seq.total_tokens(), s = seq.num_seqs();
+    const Problem p{options.qk_heads, options.value_heads, n};
+    Operands operands(p, false);
+    const auto state_bytes = p.state_bytes();
+    const auto offsets     = ragged::make_state_offsets(s, options.state_form, state_bytes, 16, 16);
+    auto sources           = ragged::upload_offsets(cuda.device(), offsets.source_offsets_host);
+    auto destinations = ragged::upload_offsets(cuda.device(), offsets.destination_offsets_host);
+    auto states       = make_f32(offsets.backing_bytes() / sizeof(float), 211U, -.02F, .02F);
+    const StateFieldLayout layout{
+        {{0, state_bytes, 16}, DType::FP32, {128, 128, p.value_heads, 1}}, 1, 0};
+    const ConstStateFieldView src{{states.span(), ragged::offset_tensor(sources)}, layout};
+    const StateFieldView dst{{states.span(), ragged::offset_tensor(destinations)}, layout};
+    std::optional<SavedBuffer> initial;
+    if (offsets.mutates_source) initial.emplace(states);
+    const auto bytes =
+        ops::gated_delta_net_ragged_workspace_capacity_bytes(p.qk_heads, p.value_heads, n, n, s, s);
+    DeviceBuffer backing(cuda.device(), std::max<std::size_t>(256, bytes));
+    MemoryArena workspace(backing.span());
+    auto q            = operands.query().view({128, p.qk_heads, n});
+    auto k            = operands.key().view({128, p.qk_heads, n});
+    auto v            = operands.value().view({128, p.value_heads, n});
+    auto g            = operands.gate().view({p.value_heads, n});
+    auto beta         = operands.beta_tensor().view({p.value_heads, n});
+    auto out          = operands.output().view({128, p.value_heads, n});
+    const auto launch = [&](CudaExecutionView execution) {
+        ops::gated_delta_net(q, k, v, g, beta, gated_delta_net_scale(), true, seq, workspace, src,
+                             dst, out, execution);
+    };
+    const auto restore = [&](CudaExecutionView execution) {
+        if (initial) initial->restore(execution);
+    };
+    gdn::Traffic traffic;
+    traffic.workspace_requests_modeled = false;
+    traffic.active_rows                = s;
+    traffic.valid_tokens               = n;
+    traffic.state   = {state_bytes * offsets.num_source_records, state_bytes * s};
+    traffic.logical = {2 * p.qk_bytes() + p.value_bytes() + 2 * p.gate_bytes() + traffic.state.read,
+                       p.value_bytes() + traffic.state.write};
+    measurement::Row row;
+    row.op              = "public.ragged";
+    row.tokens          = n;
+    row.batch           = s;
+    row.valid           = ragged::format_segments(lengths);
+    row.qk_heads        = p.qk_heads;
+    row.value_heads     = p.value_heads;
+    row.workspace_bytes = bytes;
+    const auto extra = "fused,,,," + std::string(ragged::state_form_name(options.state_form)) + ',';
+    for (const auto& execution :
+         measurement::selections(options.timing.execution, "graph", "eager"))
+        for (const auto& cache : measurement::selections(options.timing.cache, "cold", "warm")) {
+            const auto measured = measurement::measure(launch, restore, flush, cuda, options.timing,
+                                                       execution, cache);
+            row.workspace_peak  = workspace.peak_used();
+            csv.write(row, measured, execution, cache, extra + traffic.csv(measured.gpu.median_us));
+        }
+}
+
 } // namespace ninfer::bench::gdn_recurrence
 
 int main(int argc, char** argv) {
@@ -298,6 +359,11 @@ int main(int argc, char** argv) {
             requested.timing.csv_out,
             std::string("normalization,full_chunks,tail_tokens,value_tile,state_form,") +
                 gdn::Traffic::columns);
+        if (!requested.ragged_specs.empty()) {
+            for (const auto& lengths : requested.ragged_specs)
+                run_ragged(requested, lengths, flush, device.execution_view(), csv);
+            return 0;
+        }
         for (const auto& execution :
              measurement::selections(requested.timing.execution, "graph", "eager"))
             for (const auto& cache :
@@ -319,11 +385,12 @@ int main(int argc, char** argv) {
                         row.value_heads     = options.value_heads;
                         row.workspace_bytes = r.workspace_bytes;
                         row.workspace_peak  = r.workspace_peak;
-                        const auto extra    = std::string(r.normalization) + "," +
-                                           std::to_string(r.full_chunks) + "," +
-                                           std::to_string(r.tail_tokens) + "," +
-                                           std::to_string(r.value_tile) + "," + options.state_form +
-                                           "," + r.traffic.csv(r.measured.gpu.median_us);
+                        const auto extra =
+                            std::string(r.normalization) + "," + std::to_string(r.full_chunks) +
+                            "," + std::to_string(r.tail_tokens) + "," +
+                            std::to_string(r.value_tile) + "," +
+                            std::string(ragged::state_form_name(options.state_form)) + "," +
+                            r.traffic.csv(r.measured.gpu.median_us);
                         csv.write(row, r.measured, execution, cache, extra);
                     }
                 }

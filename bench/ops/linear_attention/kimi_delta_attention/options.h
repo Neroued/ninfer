@@ -1,5 +1,8 @@
 #pragma once
 #include "op_measurement.cuh"
+#include "ragged_workload.h"
+
+#include <optional>
 
 namespace ninfer::bench::kda {
 struct Options {
@@ -7,12 +10,16 @@ struct Options {
     std::string op = "record", valid = "dense", commits = "dense";
     std::string format = "q8", policy = "default";
     std::vector<int> tokens{4};
+    std::vector<ragged::SegmentSpec> ragged_specs;
+    ragged::StateOffsetForm state_form = ragged::StateOffsetForm::Distinct;
     int heads = 32, qk_heads = 32, batch = 1, layers = 34;
     bool alias_records = true;
 };
 
 inline Options parse(int argc, char** argv) {
     Options o;
+    bool explicit_tokens = false, explicit_state = false;
+    std::optional<std::string_view> ragged_text;
     for (int i = 1; i < argc; ++i) {
         const std::string_view flag(argv[i]);
         if (flag == "--help") {
@@ -20,8 +27,11 @@ inline Options parse(int argc, char** argv) {
                 << "KDA public Ops benchmark\n"
                    "  --op core|update|record|fold|input-update|input-record|chain\n"
                    "       layer-update|layer-record|layer-prefill|layer-chain\n"
-                   "  --tokens T[,T...] --batch B --layers L --qk-heads H --value-heads H\n"
+                   "  --tokens T[,T...] or --sweep START:END[:STEP]\n"
+                   "  --batch B --layers L --qk-heads H --value-heads H\n"
                    "  --valid dense|N[,N...] --commits dense|N[,N...]\n"
+                   "  --ragged-segments SPEC (core or input-update)\n"
+                   "  --state-form distinct|alias|mixed|permuted|shared-source (ragged)\n"
                    "  --kv-records alias|copy (record only; default alias)\n"
                    "  --format q8|mxfp8 --policy a16|a8 (input projection; default follows "
                    "format)\n"
@@ -37,9 +47,16 @@ inline Options parse(int argc, char** argv) {
         const auto value = measurement::take(argc, argv, i);
         if (flag == "--op")
             o.op = value;
-        else if (flag == "--tokens")
-            o.tokens = measurement::integers(value);
-        else if (flag == "--batch")
+        else if (flag == "--tokens" || flag == "--sweep") {
+            o.tokens =
+                flag == "--tokens" ? measurement::integers(value) : measurement::sweep(value);
+            explicit_tokens = true;
+        } else if (flag == "--ragged-segments")
+            ragged_text = value;
+        else if (flag == "--state-form") {
+            o.state_form   = ragged::parse_state_form(value);
+            explicit_state = true;
+        } else if (flag == "--batch")
             o.batch = measurement::integer(value);
         else if (flag == "--layers")
             o.layers = measurement::integer(value);
@@ -69,6 +86,16 @@ inline Options parse(int argc, char** argv) {
         o.op != "layer-update" && o.op != "layer-record" && o.op != "layer-prefill" &&
         o.op != "layer-chain")
         throw std::invalid_argument("invalid op");
+    if (ragged_text) {
+        if (explicit_tokens)
+            throw std::invalid_argument(
+                "--ragged-segments is mutually exclusive with --tokens and --sweep");
+        if ((o.op != "input-update" && o.op != "core") || o.batch != 1 || o.valid != "dense")
+            throw std::invalid_argument(
+                "ragged segments require input-update or core, batch 1 and dense validity");
+        o.ragged_specs = ragged::parse_ragged_specs(*ragged_text);
+    } else if (explicit_state)
+        throw std::invalid_argument("state-form requires ragged segments");
     if (o.heads < o.qk_heads || o.heads % o.qk_heads ||
         ((o.op == "core" || o.op == "layer-prefill") && o.batch != 1))
         throw std::invalid_argument("invalid geometry");

@@ -6,6 +6,7 @@
 
 #include <memory>
 #include <numeric>
+#include <optional>
 
 namespace ninfer::bench::ple {
 
@@ -195,6 +196,122 @@ struct ExtractFixture {
              Tensor(valid.span(), DType::I32, {b})},
             a, {history_view(options.inplace ? history.span() : after.span(), indices)}, {},
             execution);
+    }
+};
+
+struct RaggedHistory {
+    static constexpr std::size_t record_bytes = std::size_t(D) * 9 * 2;
+    ragged::StateOffsets offsets;
+    DeviceBuffer history, sources, destinations;
+    std::optional<SavedBuffer> initial;
+
+    RaggedHistory(int segments, ragged::StateOffsetForm form, bool writes_history)
+        : offsets(ragged::make_state_offsets(segments, form, record_bytes, 16)),
+          history(make_bf16((writes_history ? offsets.backing_bytes() : offsets.source_bytes()) / 2,
+                            writes_history ? 211 : 113, -1, 1)),
+          sources(ragged::upload_offsets(device_context().device(), offsets.source_offsets_host)) {
+        if (writes_history) {
+            destinations =
+                ragged::upload_offsets(device_context().device(), offsets.destination_offsets_host);
+            if (offsets.mutates_source) initial.emplace(history);
+        }
+    }
+
+    ops::ConstPleConvStateView before() {
+        return {history_view(history.span(), ragged::offset_tensor(sources))};
+    }
+
+    ops::PleConvStateView after() {
+        return {history_view(history.span(), ragged::offset_tensor(destinations))};
+    }
+};
+
+struct RaggedConvFixture {
+    const ops::RaggedSequenceView seq;
+    const int n;
+    const bool inplace, with_norm;
+    RaggedHistory history;
+    DeviceBuffer residual, gated, kernel, norm, current, updated, normalized;
+    std::optional<SavedBuffer> initial;
+
+    RaggedConvFixture(const Options& options, ops::RaggedSequenceView ragged_view)
+        : seq(ragged_view), n(seq.total_tokens()), inplace(options.inplace),
+          with_norm(options.op == "conv-add-norm"),
+          history(seq.num_seqs(), options.state_form, false),
+          residual(make_bf16(std::size_t(D) * n, 101, -1, 1)),
+          gated(make_bf16(std::size_t(D) * n, 103, -1, 1)),
+          kernel(make_bf16(D * 4, 107, -.25F, .25F)),
+          norm(with_norm ? make_bf16(D, 109) : DeviceBuffer{}),
+          current(make_bf16(std::size_t(D) * n, 127, -1, 1)),
+          updated(inplace ? DeviceBuffer{} : make_zeros(residual.size())),
+          normalized(with_norm ? make_zeros(residual.size()) : DeviceBuffer{}) {
+        if (inplace) initial.emplace(residual);
+    }
+
+    void restore(CudaExecutionView cuda) const {
+        if (initial) initial->restore(cuda);
+    }
+
+    std::size_t logical_bytes() const {
+        std::size_t history_columns = 0, max_columns = 0;
+        for (int s = 0; s < seq.num_seqs(); ++s) {
+            const auto cols = std::size_t(3 * std::min(seq.segment_length(s), 3));
+            history_columns += cols;
+            max_columns = std::max(max_columns, cols);
+        }
+        if (history.offsets.num_source_records == 1) history_columns = max_columns;
+        return std::size_t(n) * D * (with_norm ? 10 : 8) + kernel.size() + norm.size() +
+               history_columns * D * 2 + seq.seq_lengths.bytes() + sizeof(std::int32_t) +
+               sizeof(std::int64_t) * seq.num_seqs();
+    }
+
+    void launch(CudaExecutionView cuda) {
+        const Tensor h(residual.span(), DType::BF16, {H, C, n}),
+            u(gated.span(), DType::BF16, {H, C, n}), w(kernel.span(), DType::BF16, {D, 4}),
+            values(current.span(), DType::BF16, {D, n});
+        Tensor y(inplace ? residual.span() : updated.span(), DType::BF16, {H, C, n});
+        if (with_norm) {
+            const Tensor weight(norm.span(), DType::BF16, {H, C});
+            Tensor z(normalized.span(), DType::BF16, {H, C, n});
+            ops::ple_conv_add_norm(h, u, w, seq, history.before(), values, weight, 1e-6F, y, z,
+                                   cuda);
+        } else {
+            ops::ple_conv_add(h, u, w, seq, history.before(), values, y, cuda);
+        }
+    }
+};
+
+struct RaggedExtractFixture {
+    const ops::RaggedSequenceView seq;
+    RaggedHistory history;
+    DeviceBuffer records;
+
+    RaggedExtractFixture(const Options& options, ops::RaggedSequenceView ragged_view)
+        : seq(ragged_view), history(seq.num_seqs(), options.state_form, true),
+          records(make_bf16(std::size_t(D) * seq.total_tokens(), 223)) {}
+
+    void restore(CudaExecutionView cuda) const {
+        if (history.initial) history.initial->restore(cuda);
+    }
+
+    std::size_t logical_bytes() const {
+        std::size_t current_columns = 0, old_columns = 0, max_old_columns = 0;
+        for (int s = 0; s < seq.num_seqs(); ++s) {
+            const auto cols = std::size_t(std::min(seq.segment_length(s), 9));
+            current_columns += cols;
+            old_columns += 9 - cols;
+            max_old_columns = std::max(max_old_columns, 9 - cols);
+        }
+        if (history.offsets.num_source_records == 1) old_columns = max_old_columns;
+        return (current_columns + old_columns) * D * 2 +
+               (RaggedHistory::record_bytes + 2 * sizeof(std::int64_t)) * seq.num_seqs() +
+               seq.seq_lengths.bytes();
+    }
+
+    void launch(CudaExecutionView cuda) {
+        ops::ple_state_extract(history.before(),
+                               Tensor(records.span(), DType::BF16, {D, seq.total_tokens()}), seq,
+                               history.after(), cuda);
     }
 };
 

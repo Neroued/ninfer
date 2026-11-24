@@ -10,6 +10,7 @@
 #include "core/buffer.h"
 #include "core/device.h"
 #include "op_measurement.cuh"
+#include "ragged_workload.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -38,13 +39,15 @@ struct Options {
     std::int32_t batch        = 1;
     std::vector<std::int32_t> valid_columns;
     std::vector<std::int32_t> token_list;
-    bool decode   = false;
-    bool prefill  = false;
-    bool distinct = false;
-    bool snapshot = false;
-    bool split    = false;
-    bool cold     = false;
-    bool in_place = false;
+    std::vector<ragged::SegmentSpec> ragged_specs;
+    std::optional<ragged::StateOffsetForm> state_form;
+    int scalar_state_align = 16;
+    bool decode            = false;
+    bool prefill           = false;
+    bool distinct          = false;
+    bool snapshot          = false;
+    bool split             = false;
+    bool in_place          = false;
 };
 
 // The split-output fixture uses two key ranges followed by the remaining value rows; the
@@ -57,9 +60,14 @@ bool split_partition(std::int32_t channels, std::int32_t& key_dim, std::int32_t&
     return value_dim > 0;
 }
 
+std::string csv_fields(std::uint64_t bytes, int calls, std::string_view form, int state_align) {
+    return std::to_string(bytes) + ',' + std::to_string(calls) + ',' + std::string(form) + ',' +
+           std::to_string(state_align);
+}
+
 Result time_stage(const Options& options, const launch_fn& launch, double bytes_moved,
                   const launch_fn& restore = {}, const measurement::Row* row = nullptr,
-                  measurement::Csv* csv = nullptr) {
+                  measurement::Csv* csv = nullptr, std::string_view form = {}) {
     bench::L2FlushBuffer flush(kFlushBytes);
     const auto cuda     = device_context().execution_view();
     const auto measured = measurement::measure(
@@ -67,12 +75,10 @@ Result time_stage(const Options& options, const launch_fn& launch, double bytes_
         [&](CudaExecutionView execution) {
             if (restore) restore(execution);
         },
-        flush, cuda, options.timing, options.timing.execution, options.cold ? "cold" : "warm");
+        flush, cuda, options.timing, options.timing.execution, options.timing.cache);
     if (csv && row) {
-        csv->write(*row, measured, options.timing.execution, options.cold ? "cold" : "warm",
-                   std::to_string(static_cast<std::uint64_t>(bytes_moved)) + ',' +
-                       std::to_string(options.batch) + ',' +
-                       (options.in_place ? "alias" : "distinct"));
+        csv->write(*row, measured, options.timing.execution, options.timing.cache,
+                   csv_fields(static_cast<std::uint64_t>(bytes_moved), row->batch, form, 16));
     }
     const auto& timing = measured.gpu;
     Result result;
@@ -86,7 +92,7 @@ Result time_stage(const Options& options, const launch_fn& launch, double bytes_
 }
 
 std::string cache_tag(const Options& options, const char* entry) {
-    return std::string(entry) + (options.cold ? "-cold-" : "-warm-") + options.timing.execution;
+    return std::string(entry) + '-' + options.timing.cache + '-' + options.timing.execution;
 }
 
 DeviceBuffer make_varied_bf16(std::size_t n, std::uint32_t seed) {
@@ -98,7 +104,7 @@ DeviceBuffer make_varied_bf16(std::size_t n, std::uint32_t seed) {
         h[i]          = f32_to_bf16(2.0f * u - 1.0f);
     }
     DeviceBuffer d(ninfer::bench::device_context().device(), n * 2u);
-    cudaMemcpy(d.data(), h.data(), n * 2u, cudaMemcpyHostToDevice);
+    d.copy_from_host(h.data(), d.size());
     return d;
 }
 
@@ -108,7 +114,7 @@ std::string shape_tag(const char* mode, std::int32_t channels, std::int32_t toke
            std::to_string(tokens) + "," + std::to_string(batch) + "]";
 }
 
-void run_prefill(const Options& options, bool distinct) {
+void run_prefill(const Options& options, bool distinct, measurement::Csv* csv) {
     const std::size_t n       = static_cast<std::size_t>(options.channels) * options.tokens;
     const std::size_t state_n = static_cast<std::size_t>(options.channels) * 3u;
 
@@ -130,7 +136,13 @@ void run_prefill(const Options& options, bool distinct) {
     // Informational compulsory traffic: x/out, the four-tap weight, and state read/write. NCU
     // counters remain the performance authority.
     const double bytes = 4.0 * static_cast<double>(n) + 20.0 * options.channels;
-    const Result r     = time_stage(
+    measurement::Row row;
+    row.op            = "causal_conv";
+    row.format        = "bf16";
+    row.policy        = "a16";
+    row.conv_channels = options.channels;
+    row.tokens        = options.tokens;
+    const Result r    = time_stage(
         options,
         [&](CudaExecutionView cuda) {
             if (distinct) {
@@ -139,7 +151,7 @@ void run_prefill(const Options& options, bool distinct) {
                 ops::causal_conv1d_silu(tx, tw, tin, tout, cuda);
             }
         },
-        bytes, restore);
+        bytes, restore, &row, csv, distinct ? "distinct" : "alias");
     const std::string tag = shape_tag(cache_tag(options, distinct ? "distinct" : "prefill").c_str(),
                                       options.channels, options.tokens);
     print_result(tag.c_str(), r);
@@ -216,11 +228,82 @@ void run_split(const Options& options, measurement::Csv* csv) {
                 ops::causal_conv1d_silu_split(views.x, tw, views.state_in, views.state_out, views.q,
                                               views.k, views.v, cuda);
         },
-        bytes, restore, &row, csv);
+        bytes, restore, &row, csv, options.in_place ? "alias" : "distinct");
     const std::string tag =
         shape_tag(cache_tag(options, options.in_place ? "split-alias" : "split").c_str(),
                   options.channels, options.tokens, options.batch);
     print_result(tag.c_str(), r);
+}
+
+void run_ragged(const Options& options, const ragged::SegmentSpec& lengths, measurement::Csv& csv,
+                L2FlushBuffer& flush) {
+    const auto cuda = device_context().execution_view();
+    const ragged::RaggedDeviceFixture workload(lengths, cuda.device());
+    const auto seq = workload.view();
+    const int n = seq.total_tokens(), s = seq.num_seqs(), c = options.channels;
+    int key_dim = 0, value_dim = c;
+    if (options.split && !split_partition(c, key_dim, value_dim))
+        throw std::invalid_argument("split channels leave no value rows");
+
+    const auto form = options.state_form.value_or(
+        options.in_place ? ragged::StateOffsetForm::Alias : ragged::StateOffsetForm::Distinct);
+    const auto history_bytes       = std::size_t(c) * 6;
+    const std::size_t field_offset = options.scalar_state_align == 2 ? 2 : 0;
+    const auto offsets = ragged::make_state_offsets(s, form, history_bytes + field_offset, 16);
+    auto sources       = ragged::upload_offsets(cuda.device(), offsets.source_offsets_host);
+    auto destinations  = ragged::upload_offsets(cuda.device(), offsets.destination_offsets_host);
+    auto states        = make_varied_bf16(offsets.backing_bytes() / 2, 0x31415926U);
+    std::optional<SavedBuffer> initial;
+    if (offsets.mutates_source) initial.emplace(states);
+    const StateFieldLayout layout{
+        {{field_offset, history_bytes, std::size_t(options.scalar_state_align)},
+         DType::BF16,
+         {c, 3, 1, 1}},
+        1,
+        0};
+    const ConstStateFieldView source{{states.span(), ragged::offset_tensor(sources)}, layout};
+    const StateFieldView destination{{states.span(), ragged::offset_tensor(destinations)}, layout};
+    auto x      = make_varied_bf16(std::size_t(c) * n, 0x12345678U);
+    auto weight = make_varied_bf16(std::size_t(c) * 4, 0x87654321U);
+    auto out    = make_zeros(std::size_t(value_dim) * n * 2);
+    const Tensor tx(x.span(), DType::BF16, {c, n}), tw(weight.span(), DType::BF16, {c, 4});
+    Tensor y(out.span(), DType::BF16, {value_dim, n});
+    DeviceBuffer q, k;
+    Tensor tq, tk;
+    if (options.split) {
+        q  = make_zeros(std::size_t(key_dim) * n * 2);
+        k  = make_zeros(q.size());
+        tq = Tensor(q.span(), DType::BF16, {key_dim, n});
+        tk = Tensor(k.span(), DType::BF16, {key_dim, n});
+    }
+    const auto launch = [&](CudaExecutionView execution) {
+        if (options.split)
+            ops::causal_conv1d_silu_split(tx, tw, seq, source, destination, tq, tk, y, execution);
+        else
+            ops::causal_conv1d_silu(tx, tw, seq, source, destination, y, execution);
+    };
+    const auto restore = [&](CudaExecutionView execution) {
+        if (initial) initial->restore(execution);
+    };
+    const auto bytes =
+        4ULL * c * n + 8ULL * c + std::uint64_t(history_bytes) * (offsets.num_source_records + s);
+    measurement::Row row;
+    row.op            = options.split ? "causal_conv_split" : "causal_conv";
+    row.format        = "bf16";
+    row.policy        = "a16";
+    row.conv_channels = c;
+    row.tokens        = n;
+    row.batch         = s;
+    row.valid         = ragged::format_segments(lengths);
+    const auto extra =
+        csv_fields(bytes, 1, ragged::state_form_name(form), options.scalar_state_align);
+    for (const auto& execution :
+         measurement::selections(options.timing.execution, "graph", "eager"))
+        for (const auto& cache : measurement::selections(options.timing.cache, "cold", "warm"))
+            csv.write(row,
+                      measurement::measure(launch, restore, flush, cuda, options.timing, execution,
+                                           cache),
+                      execution, cache, extra);
 }
 
 void run_decode(const Options& options) {
@@ -335,17 +418,22 @@ void run_snapshot(const Options& options) {
 }
 
 void print_usage(const char* program) {
-    std::fprintf(stderr,
-                 "usage: %s [--decode] [--prefill] [--distinct] [--snapshot] [--split] "
-                 "[--inplace] [--cache warm|cold] [--execution graph|eager] "
-                 "[--warmup N] [--repeat N] [--channels C] [--tokens T[,T...]] "
-                 "[--batch B] [--valid-columns V0,V1,...] [--slots S] "
-                 "[--initial-slot I] [--csv-out PATH (split only)]\n"
-                 "Split --batch B measures B native 2D calls with independent histories.\n",
-                 program);
+    std::fprintf(
+        stderr,
+        "usage: %s [--decode] [--prefill] [--distinct] [--snapshot] [--split] "
+        "[--inplace] [--cache warm|cold|both] [--execution graph|eager|both] "
+        "[--warmup N] [--repeat N] [--channels C] [--tokens T[,T...] | --sweep START:END[:STEP]] "
+        "[--batch B] [--valid-columns V0,V1,...] [--slots S] "
+        "[--initial-slot I] [--csv-out PATH (prefill or split)]\n"
+        "  --ragged-segments SPEC --state-form distinct|alias|mixed|permuted|shared-source\n"
+        "  --scalar-state-align 2|16 (ragged scalar prefill; default 16)\n"
+        "Split --batch B measures B native 2D calls with independent histories.\n",
+        program);
 }
 
 bool parse_options(int argc, char** argv, Options& options) try {
+    bool explicit_tokens = false;
+    std::optional<std::string_view> ragged_text;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--decode")) {
             options.decode = true;
@@ -357,34 +445,35 @@ bool parse_options(int argc, char** argv, Options& options) try {
             options.snapshot = true;
         } else if (!std::strcmp(argv[i], "--split")) {
             options.split = true;
-        } else if (!std::strcmp(argv[i], "--inplace")) {
+        } else if (!std::strcmp(argv[i], "--inplace") || !std::strcmp(argv[i], "--in-place")) {
             options.in_place = true;
+        } else if (!std::strcmp(argv[i], "--ragged-segments") && i + 1 < argc) {
+            ragged_text = argv[++i];
+        } else if (!std::strcmp(argv[i], "--state-form") && i + 1 < argc) {
+            options.state_form = ragged::parse_state_form(argv[++i]);
+        } else if (!std::strcmp(argv[i], "--scalar-state-align") && i + 1 < argc) {
+            options.scalar_state_align = measurement::integer(argv[++i]);
+            if (options.scalar_state_align != 2 && options.scalar_state_align != 16) return false;
         } else if ((!std::strcmp(argv[i], "--execution") || !std::strcmp(argv[i], "--warmup") ||
-                    !std::strcmp(argv[i], "--repeat") || !std::strcmp(argv[i], "--csv-out")) &&
+                    !std::strcmp(argv[i], "--repeat") || !std::strcmp(argv[i], "--csv-out") ||
+                    !std::strcmp(argv[i], "--cache")) &&
                    i + 1 < argc) {
             const std::string_view flag = argv[i++];
             if (!measurement::parse(options.timing, flag, argv[i])) return false;
-            if (options.timing.execution == "both") return false;
-        } else if (!std::strcmp(argv[i], "--cache") && i + 1 < argc) {
-            const char* value = argv[++i];
-            if (!std::strcmp(value, "cold")) {
-                options.cold = true;
-            } else if (!std::strcmp(value, "warm")) {
-                options.cold = false;
-            } else {
-                return false;
-            }
         } else if (!std::strcmp(argv[i], "--valid-columns") && i + 1 < argc) {
             options.valid_columns = measurement::integers(argv[++i], 0);
-        } else if ((!std::strcmp(argv[i], "--channels") || !std::strcmp(argv[i], "--tokens") ||
-                    !std::strcmp(argv[i], "--slots") || !std::strcmp(argv[i], "--initial-slot") ||
-                    !std::strcmp(argv[i], "--batch")) &&
+        } else if ((!std::strcmp(argv[i], "--tokens") || !std::strcmp(argv[i], "--sweep")) &&
+                   i + 1 < argc) {
+            const std::string_view flag = argv[i++];
+            options.token_list =
+                flag == "--tokens" ? measurement::integers(argv[i]) : measurement::sweep(argv[i]);
+            explicit_tokens = true;
+        } else if ((!std::strcmp(argv[i], "--channels") || !std::strcmp(argv[i], "--slots") ||
+                    !std::strcmp(argv[i], "--initial-slot") || !std::strcmp(argv[i], "--batch")) &&
                    i + 1 < argc) {
             const char* flag = argv[i++];
             if (!std::strcmp(flag, "--initial-slot")) {
                 options.initial_slot = measurement::integer(argv[i], 0);
-            } else if (!std::strcmp(flag, "--tokens")) {
-                options.token_list = measurement::integers(argv[i]);
             } else {
                 std::int32_t* destination = !std::strcmp(flag, "--channels") ? &options.channels
                                             : !std::strcmp(flag, "--batch")  ? &options.batch
@@ -395,9 +484,26 @@ bool parse_options(int argc, char** argv, Options& options) try {
             return false;
         }
     }
+    if (!options.timing.csv_out.empty() && (options.decode || options.snapshot))
+        throw std::invalid_argument("--decode and --snapshot are incompatible with --csv-out");
+    if (ragged_text) {
+        if (explicit_tokens)
+            throw std::invalid_argument(
+                "--ragged-segments is mutually exclusive with --tokens and --sweep");
+        if (options.decode || options.snapshot || options.batch != 1 ||
+            !options.valid_columns.empty())
+            throw std::invalid_argument(
+                "ragged convolution requires prefill, batch 1 and dense columns");
+        if (options.split && options.scalar_state_align == 2)
+            throw std::invalid_argument("ragged split requires --scalar-state-align 16");
+        options.ragged_specs = ragged::parse_ragged_specs(*ragged_text);
+        return true;
+    }
+    if (options.state_form || options.scalar_state_align != 16) return false;
     if (!options.decode && !options.prefill && !options.distinct && !options.snapshot &&
         !options.split) {
-        options.decode = options.prefill = true;
+        options.prefill = true;
+        options.decode  = options.timing.csv_out.empty();
     }
     if ((options.in_place && !options.split) ||
         (!options.snapshot && !options.split && options.batch != 1) ||
@@ -406,9 +512,6 @@ bool parse_options(int argc, char** argv, Options& options) try {
          options.valid_columns.size() != static_cast<std::size_t>(options.batch))) {
         return false;
     }
-    if (!options.timing.csv_out.empty() && (!options.split || options.decode || options.prefill ||
-                                            options.distinct || options.snapshot))
-        return false;
     for (const std::int32_t tokens : options.token_list.empty()
                                          ? std::vector<std::int32_t>{options.tokens}
                                          : options.token_list) {
@@ -419,36 +522,57 @@ bool parse_options(int argc, char** argv, Options& options) try {
         }
     }
     return !options.snapshot || options.batch > 1 || options.initial_slot < options.slots;
-} catch (const std::invalid_argument&) { return false; }
+} catch (const std::invalid_argument& error) {
+
+    std::fprintf(stderr, "%s\n", error.what());
+    return false;
+}
 
 } // namespace
 
-int main(int argc, char** argv) {
+int main(int argc, char** argv) try {
+    Options options;
+    options.timing.cache = "warm";
+    if (!parse_options(argc, argv, options)) {
+        print_usage(argv[0]);
+        return 2;
+    }
+
     int count = 0;
     if (cudaGetDeviceCount(&count) != cudaSuccess || count == 0) {
         std::printf("SKIP: no usable CUDA device\n");
         return 0;
     }
 
-    Options options;
-    if (!parse_options(argc, argv, options)) {
-        print_usage(argv[0]);
-        return 2;
-    }
-
     std::optional<measurement::Csv> csv;
-    if (!options.timing.csv_out.empty())
-        csv.emplace(options.timing.csv_out, "logical_bytes,calls,state_form");
+    if (!options.timing.csv_out.empty() || !options.ragged_specs.empty())
+        csv.emplace(options.timing.csv_out, "logical_bytes,calls,state_form,state_align");
+    if (!options.ragged_specs.empty()) {
+        L2FlushBuffer flush(kFlushBytes);
+        for (const auto& lengths : options.ragged_specs) run_ragged(options, lengths, *csv, flush);
+        return 0;
+    }
     std::vector<std::int32_t> tokens = options.token_list;
     if (tokens.empty()) { tokens.push_back(options.tokens); }
     for (const std::int32_t t : tokens) {
         Options point = options;
         point.tokens  = t;
-        if (point.decode) run_decode(point);
-        if (point.prefill) run_prefill(point, false);
-        if (point.distinct) run_prefill(point, true);
-        if (point.snapshot) run_snapshot(point);
-        if (point.split) run_split(point, csv ? &*csv : nullptr);
+        for (const auto& execution :
+             measurement::selections(options.timing.execution, "graph", "eager"))
+            for (const auto& cache :
+                 measurement::selections(options.timing.cache, "cold", "warm")) {
+                point.timing.execution = execution;
+                point.timing.cache     = cache;
+                if (point.decode) run_decode(point);
+                if (point.prefill) run_prefill(point, false, csv ? &*csv : nullptr);
+                if (point.distinct) run_prefill(point, true, csv ? &*csv : nullptr);
+                if (point.snapshot) run_snapshot(point);
+                if (point.split) run_split(point, csv ? &*csv : nullptr);
+            }
     }
     return 0;
+} catch (const std::exception& error) {
+
+    std::fprintf(stderr, "%s\n", error.what());
+    return 1;
 }

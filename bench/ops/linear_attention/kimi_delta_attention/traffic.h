@@ -15,6 +15,7 @@ struct Traffic {
     double projection_flops = 0;
     double matrix_tensor_us = 0;
     bool mxfp8_reference    = false;
+    bool route_modeled      = true;
 
     std::string csv(double us) const {
         const auto bytes = read + write;
@@ -27,9 +28,15 @@ struct Traffic {
         s << ',';
         if (mxfp8_reference && projection_flops)
             s << projection_flops / (kRoofline.mxfp8_f32_tflops * 1e6);
-        s << ',' << workspace_read << ',' << workspace_write << ',' << projection_flops / us / 1e6
-          << ',' << bytes / (us * 1000) / kRoofline.sustained_read_gbs * 100 << ','
-          << bytes / (us * 1000) / kRoofline.memory_gbs * 100 << ',' << matrix_tensor_us;
+        s << ',';
+        if (route_modeled)
+            s << workspace_read << ',' << workspace_write;
+        else
+            s << ',';
+        s << ',' << projection_flops / us / 1e6 << ','
+          << bytes / (us * 1000) / kRoofline.sustained_read_gbs * 100 << ','
+          << bytes / (us * 1000) / kRoofline.memory_gbs * 100 << ',';
+        if (route_modeled) s << matrix_tensor_us;
         return s.str();
     }
 
@@ -41,6 +48,26 @@ struct Traffic {
         "useful_matrix_TF_s,logical_read_reference_pct,logical_nominal_pct,matrix_tensor_"
         "reference_us";
 };
+
+inline Traffic traffic(const RaggedFixture& f) {
+    Traffic out;
+    out.route_modeled = false;
+    out.state_read    = f.state_bytes * f.offsets.num_source_records;
+    out.state_write   = f.state_bytes * f.s;
+    if (f.input_update) {
+        out.read = f.weights.projection.model_weight_bytes() + f.weights.conv.size() + f.x.size() +
+                   out.state_read;
+        out.write            = f.q.size() + f.k.size() + f.v.size() + out.state_write;
+        out.projection_flops = 2.0 * f.channels * 4096 * f.n;
+        out.mxfp8_reference  = f.weights.projection.weight.qtype == QType::MXFP8 &&
+                              f.weights.policy == ops::LinearPolicy::AllowA8;
+    } else {
+        out.read = f.q.size() + f.k.size() + f.v.size() + f.g.size() + f.beta.size() +
+                   f.weights.a_log.size() + f.weights.bias.size() + out.state_read;
+        out.write = f.out.size() + out.state_write;
+    }
+    return out;
+}
 
 inline Traffic traffic(Fixture& f, const std::string& op) {
     const auto n = std::accumulate(f.valid_counts.begin(), f.valid_counts.end(), std::uint64_t(0));

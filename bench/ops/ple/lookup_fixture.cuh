@@ -6,6 +6,7 @@
 
 #include <bit>
 #include <bitset>
+#include <optional>
 #include <unordered_set>
 
 namespace ninfer::bench::ple {
@@ -64,41 +65,46 @@ struct LookupFixture {
     Tensor input, counts_view, embedding;
     ops::NgramTokenTailView before;
     const lookup::Table& table;
+    const std::optional<ops::RaggedSequenceView> seq;
     std::vector<int> counts;
     std::uint64_t bytes = 0, selected_rows = 0, unique_rows = 0, lookup_bytes = 0;
 
-    LookupFixture(const Options& options, int tokens, const lookup::Table& weights)
-        : ids(make_buffer(std::size_t(tokens) * options.batch * 4)),
-          valid(make_buffer(options.batch * 4)), tail(make_buffer(options.batch * 2 * 4)),
-          state_offsets(make_buffer(options.batch * 8)),
-          output(make_buffer(std::size_t(tokens) * options.batch * 5120)),
-          input(ids.span(), DType::I32, {tokens, options.batch}),
-          counts_view(valid.span(), DType::I32, {options.batch}),
-          embedding(output.span(), DType::BF16, {2560, tokens, options.batch}),
-          before{{{tail.span(), Tensor(state_offsets.span(), DType::I64, {options.batch})},
-                  {{{0, 8, 4}, DType::I32, {2, 1, 1, 1}}, 1, 8}}},
-          table(weights), counts(extents(options.valid, tokens, options.batch)) {
-        std::vector<int> host(std::size_t(tokens) * options.batch), history(options.batch * 2);
-        std::vector<std::int64_t> select(options.batch);
+    LookupFixture(const Options& options, int tokens, const lookup::Table& weights,
+                  std::optional<ops::RaggedSequenceView> ragged_view = std::nullopt)
+        : table(weights), seq(ragged_view) {
+        const auto device  = device_context().device();
+        const auto rows    = seq ? seq->num_seqs() : options.batch;
+        const auto offsets = ragged::make_state_offsets(rows, options.state_form, 8, 4);
+        if (seq) {
+            for (int s = 0; s < rows; ++s) counts.push_back(seq->segment_length(s));
+        } else {
+            counts      = extents(options.valid, tokens, rows);
+            valid       = measurement::make_i32(counts);
+            counts_view = Tensor(valid.span(), DType::I32, {rows});
+        }
+        std::vector<int> host(std::size_t(tokens) * options.batch);
+        std::vector<int> history(offsets.source_bytes() / sizeof(int));
+        for (std::size_t t = 0; t < host.size(); ++t) host[t] = fixture::bits(t, 721) % 248000;
+        for (std::size_t r = 0; r < offsets.num_source_records; ++r) {
+            history[2 * r]     = 11 + r % 248000;
+            history[2 * r + 1] = 19 + r % 248000;
+        }
         std::unordered_set<std::uint32_t> visited;
         std::array<std::bitset<2048>, lookup::kShardCount> used_lut;
-        for (int b = 0; b < options.batch; ++b) {
-            select[b]          = b * 8;
-            history[2 * b]     = 11 + b;
-            history[2 * b + 1] = 19 + b;
-            for (int t = 0; t < tokens; ++t)
-                host[b * tokens + t] = fixture::bits(b * tokens + t, 721) % 248000;
+        for (int b = 0; b < rows; ++b) {
             if (!counts[b]) continue;
-            bytes += std::uint64_t(counts[b]) * 4 + 16;
+            const auto start = seq ? std::size_t(seq->segment_begin(b)) : std::size_t(b) * tokens;
+            const auto* input_ids = host.data() + start;
+            const auto* tail_ids  = history.data() + offsets.source_offsets_host[b] / sizeof(int);
+            bytes += std::uint64_t(counts[b]) * 4 + sizeof(std::int64_t);
+            if (!seq) bytes += 8;
             for (int t = 0; t < counts[b]; ++t) {
-                const auto previous =
-                    std::uint64_t(t ? host[b * tokens + t - 1] : history[2 * b + 1]);
-                const auto older = std::uint64_t(previous == 7 ? 7
-                                                 : t >= 2      ? host[b * tokens + t - 2]
-                                                               : history[2 * b + (t == 1)]);
-                const auto pair =
-                    std::uint64_t(host[b * tokens + t]) * weights.hash.multipliers[0] ^
-                    previous * weights.hash.multipliers[1];
+                const auto previous = std::uint64_t(t ? input_ids[t - 1] : tail_ids[1]);
+                const auto older    = std::uint64_t(previous == 7 ? 7
+                                                    : t >= 2      ? input_ids[t - 2]
+                                                                  : tail_ids[t == 1]);
+                const auto pair     = std::uint64_t(input_ids[t]) * weights.hash.multipliers[0] ^
+                                  previous * weights.hash.multipliers[1];
                 for (int h = 0; h < 16; ++h) {
                     const auto word    = h < 8 ? pair : pair ^ older * weights.hash.multipliers[2];
                     const auto modulus = weights.hash.vocab_sizes[h];
@@ -123,17 +129,28 @@ struct LookupFixture {
         }
         unique_rows  = visited.size();
         lookup_bytes = unique_rows * 90;
-        bytes += output.size() + options.batch * 4 + lookup_bytes;
+        if (seq) bytes += offsets.num_source_records * 8;
+        ids           = ragged::upload(device, std::span<const int>(host));
+        tail          = ragged::upload(device, std::span<const int>(history));
+        state_offsets = ragged::upload_offsets(device, offsets.source_offsets_host);
+        output        = make_buffer(host.size() * 5120);
+        input         = seq ? Tensor(ids.span(), DType::I32, {tokens})
+                            : Tensor(ids.span(), DType::I32, {tokens, rows});
+        embedding     = seq ? Tensor(output.span(), DType::BF16, {2560, tokens})
+                            : Tensor(output.span(), DType::BF16, {2560, tokens, rows});
+        before        = {{{tail.span(), ragged::offset_tensor(state_offsets)},
+                          {{{0, 8, 4}, DType::I32, {2, 1, 1, 1}}, 1, 8}}};
+        bytes += output.size() + std::uint64_t(rows) * sizeof(int) + lookup_bytes;
         for (const auto& lut : used_lut) bytes += lut.count() * 2;
-        ids.copy_from_host(host.data(), ids.size());
-        tail.copy_from_host(history.data(), tail.size());
-        valid.copy_from_host(counts.data(), valid.size());
-        state_offsets.copy_from_host(select.data(), state_offsets.size());
     }
 
     void launch(CudaExecutionView execution) {
-        ops::ngram_embedding_lookup(input, counts_view, before, table.hash, 7, table.shards,
-                                    embedding, execution);
+        if (seq)
+            ops::ngram_embedding_lookup(input, *seq, before, table.hash, 7, table.shards, embedding,
+                                        execution);
+        else
+            ops::ngram_embedding_lookup(input, counts_view, before, table.hash, 7, table.shards,
+                                        embedding, execution);
     }
 
     void restore(CudaExecutionView) {}

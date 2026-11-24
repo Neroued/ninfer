@@ -49,6 +49,7 @@ struct Traffic {
     // Complete global operand-request model, when the measured implementation has one.
     // Never substitute unique logical bytes for an unavailable request model.
     std::optional<std::uint64_t> modeled_request_bytes;
+    bool workspace_requests_modeled = true;
     int active_rows = 0, valid_tokens = 0;
 
     static constexpr const char* columns =
@@ -64,8 +65,12 @@ struct Traffic {
         std::ostringstream out;
         out << std::fixed << std::setprecision(6) << active_rows << ',' << valid_tokens << ','
             << logical.read << ',' << logical.write << ',' << logical.total() << ',' << state.read
-            << ',' << state.write << ',' << records.read << ',' << records.write << ','
-            << workspace_requests.read << ',' << workspace_requests.write << ',';
+            << ',' << state.write << ',' << records.read << ',' << records.write << ',';
+        if (workspace_requests_modeled)
+            out << workspace_requests.read << ',' << workspace_requests.write;
+        else
+            out << ',';
+        out << ',';
         if (modeled_request_bytes) out << *modeled_request_bytes;
         out << ',' << rate(logical.total()) << ',';
         if (modeled_request_bytes) out << rate(*modeled_request_bytes);

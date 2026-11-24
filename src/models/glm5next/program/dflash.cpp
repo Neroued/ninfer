@@ -3,11 +3,33 @@
 #include "core/nvtx.h"
 
 namespace ninfer::models::glm5next::detail {
-Tensor RankProgramImpl::draft_features(const execution::BatchView& call) {
+namespace {
+Tensor gather_feature_range(const Tensor& features, const TokenPartition& columns, int begin,
+                            int end, MemoryArena& workspace, ParallelExecution& parallel,
+                            CudaExecutionView cuda) {
+    auto gathered = workspace.alloc(DType::BF16, {features.ne[0], end - begin});
+    for (std::uint32_t rank = 0; rank < columns.ranks; ++rank) {
+        const TokenPartition part(columns.columns, columns.ranks, rank);
+        const int first = std::max(begin, part.begin);
+        const int last  = std::min(end, part.begin + part.count);
+        if (first >= last) continue;
+        auto destination = gathered.slice(1, first - begin, last - first);
+        if (rank == columns.rank) {
+            const auto source = features.slice(1, first - part.begin, last - first);
+            copy_bytes_async({destination.data, destination.bytes(), cuda.device()},
+                             {source.data, source.bytes(), cuda.device()}, cuda);
+        }
+        parallel.broadcast(destination, rank, cuda);
+    }
+    return gathered;
+}
+} // namespace
+
+Tensor RankProgramImpl::draft_features(const execution::BatchView& call, bool packed) {
     const auto& field = frame.dflash->features;
     const auto& p     = *parameters.profile;
     const auto columns =
-        call.sequence_owner
+        call.sequence_owner || packed
             ? execution::sequence_parallel_policy(p.local.size).partition(call.tokens, p.local.rank)
             : TokenPartition(call.tokens * call.rows);
     return resources.packed(field, {field.shape[0], columns.count / call.rows, call.rows});
@@ -57,23 +79,9 @@ void RankProgramImpl::append_dflash_context(const execution::BatchView& call, co
             : TokenPartition(call.tokens * call.rows);
     const int retained = std::min(std::uint32_t(call.tokens), capacity);
     const int begin    = call.tokens - retained;
-    if (columns.split()) {
-        auto gathered = resources.workspace.alloc(DType::BF16, {features.ne[0], retained});
-        for (std::uint32_t rank = 0; rank < columns.ranks; ++rank) {
-            const TokenPartition part(call.tokens, columns.ranks, rank);
-            const int first = std::max(begin, part.begin);
-            const int last  = std::min(call.tokens, part.begin + part.count);
-            if (first >= last) continue;
-            auto destination = gathered.slice(1, first - begin, last - first);
-            if (rank == p.local.rank) {
-                const auto source = features.slice(1, first - part.begin, last - first);
-                copy_bytes_async({destination.data, destination.bytes(), cuda.device()},
-                                 {source.data, source.bytes(), cuda.device()}, cuda);
-            }
-            parallel->broadcast(destination, rank, cuda);
-        }
-        features = gathered;
-    }
+    if (columns.split())
+        features = gather_feature_range(features, columns, begin, call.tokens, resources.workspace,
+                                        *parallel, cuda);
     if (std::uint32_t(call.tokens) > capacity) {
         if (call.rows != 1 || envelope.min_count != std::uint32_t(call.tokens) ||
             envelope.max_count != std::uint32_t(call.tokens))
@@ -87,6 +95,34 @@ void RankProgramImpl::append_dflash_context(const execution::BatchView& call, co
     execution::draft_append_context(parameters, {resources.workspace, resources.states, *parallel},
                                     features, positions, live, call.destination_offsets, envelope,
                                     cuda);
+}
+
+void RankProgramImpl::append_packed_dflash_context(const execution::BatchView& call,
+                                                   const ops::RaggedSequenceView& ragged) {
+    const auto& p = *parameters.profile;
+    const auto columns =
+        execution::sequence_parallel_policy(p.local.size).partition(call.tokens, p.local.rank);
+    const auto features = draft_features(call, true);
+    const auto capacity = p.draft->context.capacity;
+    // Draft context is TP-sharded, so both ranks materialize every segment in the same order.
+    for (int s = 0; s < ragged.num_seqs(); ++s) {
+        auto scope          = resources.workspace.scope();
+        const auto len      = std::uint32_t(ragged.segment_length(s));
+        const auto retained = std::min(len, capacity);
+        const int end       = ragged.host_cu_seqlens[s + 1];
+        const int begin     = end - dimension(retained);
+        const auto tail     = columns.split()
+                                  ? gather_feature_range(features, columns, begin, end,
+                                                         resources.workspace, *parallel, cuda)
+                                  : features.slice(1, begin, retained);
+        const auto positions =
+            call.positions.slice(0, begin, retained).view({dimension(retained), 1});
+        const auto counts = len > capacity ? resources.tensor(frame.dflash->window_count)
+                                           : ragged.seq_lengths.slice(0, s, 1);
+        execution::draft_append_context(
+            parameters, {resources.workspace, resources.states, *parallel}, tail, positions, counts,
+            call.destination_offsets.slice(0, s, 1), {retained, retained}, cuda);
+    }
 }
 
 void RankProgramImpl::accept_dflash(int b, int w, int steps) {

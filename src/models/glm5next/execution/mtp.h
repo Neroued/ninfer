@@ -38,5 +38,7 @@ private:
 // History consumes owner-local rows and conditioning; it performs no row redistribution.
 void mtp_history(const Parameters&, MtpExecution, const BatchView&, const Tensor& conditioning,
                  CudaExecutionView);
+void mtp_history(const Parameters&, MtpExecution, const ops::KpoolMlaRaggedBatchView&,
+                 const Tensor& ids, const Tensor& conditioning, CudaExecutionView);
 
 } // namespace ninfer::models::glm5next::execution

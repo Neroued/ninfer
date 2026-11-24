@@ -92,6 +92,44 @@ void RankProgramImpl::align_history(const execution::BatchView& main, Tensor hid
     }
 }
 
+void RankProgramImpl::align_packed_history(const execution::BatchView& main,
+                                           const PackedPrefill& packed, const Tensor& hidden) {
+    const auto& ragged = packed.mtp_ragged;
+    const int segments = ragged.num_seqs();
+    if (!segments) return;
+    const auto& layout = *frame.packed_prefill->mtp;
+    const auto& m      = *frame.mtp;
+    const int h = hidden.ne[0], n = ragged.total_tokens();
+    const auto source      = row(layout.source_offsets, segments);
+    const auto destination = row(layout.destination_offsets, segments);
+    auto previous          = resources.packed(m.previous_hidden, {h, segments});
+    ops::gather(resources.states.hidden(source), row(layout.base_positions, segments), previous,
+                cuda);
+    auto conditioning         = resources.packed(m.conditioning, {h, n});
+    const auto ids            = row(m.history.ids, n);
+    const auto positions      = row(m.history.positions, n);
+    const auto input_segments = row(layout.input_segments, segments);
+    // Previous hidden is compact, while input segments index the global pack.
+    const auto previous_rows = row(frame.attention.selection_rows, segments);
+    ops::prepare_causal_pairs({packed.update.ragged,
+                               hidden,
+                               previous,
+                               main.ids,
+                               main.positions,
+                               {},
+                               {},
+                               input_segments,
+                               previous_rows,
+                               row(layout.skip_first, segments)},
+                              {ragged, conditioning, ids, positions, {}}, cuda);
+    execution::mtp_history(
+        parameters,
+        {resources.workspace, *resources.mtp, resources.states.mtp_tail(source),
+         resources.states.mtp_tail(destination)},
+        ops::KpoolMlaRaggedBatchView{ragged, positions, row(layout.table_rows, segments)}, ids,
+        conditioning, cuda);
+}
+
 execution::MtpRun RankProgramImpl::mtp_run(std::uint32_t step, const execution::BatchView& call) {
     const int c       = call.attention.rows;
     const auto before = step ? resources.mtp_tail(step == 1 ? 0 : 1 + (step - 2) % 2, c)

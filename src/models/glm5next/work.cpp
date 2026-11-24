@@ -139,10 +139,12 @@ runtime::WorkPayloadCapacity WorkContract::payload_capacity(std::uint32_t rank_c
     // Optional geometry tag, W/d/g, path, graph tag and entry ID.
     constexpr std::size_t route_bytes = 3 + 4 * sizeof(std::uint32_t);
     const std::size_t width           = shape.draft_tokens + 1;
+    const auto prefill = header + context::ragged_write_action_capacity(batch, pools, chunk) + 128 +
+                         batch * (196 + 20 * rank_count) + 4 * chunk;
     const auto work =
         shape.purpose == EnginePurpose::CausalScoring
             ? payload(1, chunk, 8 * chunk)
-            : std::max({payload(1, chunk, 4 * chunk), payload(batch, width, 4) + route_bytes,
+            : std::max({prefill, payload(batch, width, 4) + route_bytes,
                         payload(batch, control_token_limit, 8ULL * control_token_limit)});
     const auto context = header + context::action_batch_capacity() + 128 + 88 +
                          TokenCounts::encoded_capacity(public_tokens) + 16 * batch;
@@ -188,6 +190,7 @@ void WorkContract::validate(const Work& work, runtime::FrameKind kind) const {
         return;
     }
     const auto* forward = std::get_if<ForwardWork>(&work.operation);
+    const bool prefill  = forward && forward->kind == ForwardKind::Prefill;
     const bool control  = forward && forward->kind == ForwardKind::Control;
     const auto rows     = work_rows(work);
     require(kind == runtime::FrameKind::Compute && !rows.empty() &&
@@ -272,13 +275,15 @@ void WorkContract::validate(const Work& work, runtime::FrameKind kind) const {
                      mtp_tables.insert(r.mtp_table.index).second),
                 "overlapping batch owners");
         for (const auto& [rank, offsets] : r.states) {
-            auto& reads  = state_reads[rank];
-            auto& writes = state_writes[rank];
-            require(!writes.contains(offsets.destination) && !writes.contains(offsets.source) &&
-                        !reads.contains(offsets.destination),
+            auto& reads        = state_reads[rank];
+            auto& writes       = state_writes[rank];
+            const bool updates = !prefill || !r.ids.empty();
+            require(!writes.contains(offsets.source) &&
+                        (!updates || (!writes.contains(offsets.destination) &&
+                                      !reads.contains(offsets.destination))),
                     "overlapping State writes");
             reads.insert(offsets.source);
-            writes.insert(offsets.destination);
+            if (updates) writes.insert(offsets.destination);
         }
     }
     if (const auto* f = std::get_if<ForwardWork>(&work.operation)) {
@@ -295,25 +300,36 @@ void WorkContract::validate(const Work& work, runtime::FrameKind kind) const {
                         use.plan->consume_end <= shape.max_context,
                     "Vision window exceeds prepared capacity");
         }
-        for (const auto& r : rows) require(r.ids.size() == n, "unequal forward widths");
-        require(f->kind == ForwardKind::Control || n <= shape.prefill_chunk,
-                "window exceeds frame");
+        if (f->kind == ForwardKind::Ordinary || control)
+            for (const auto& r : rows) require(r.ids.size() == n, "unequal forward widths");
         switch (f->kind) {
-        case ForwardKind::Prefill:
-            require(rows.size() == 1 &&
-                        (f->sample == SampleKind::None || f->sample == SampleKind::FirstToken) &&
-                        (n || (f->sample == SampleKind::FirstToken && rows[0].main_frontier)),
-                    "prefill extent");
+        case ForwardKind::Prefill: {
+            std::uint64_t total = 0;
+            bool sampled        = false;
+            for (const auto& r : rows) {
+                require(!r.ids.empty() || (r.sample && r.main_frontier), "empty prefill row");
+                require(r.sample || !r.constrained, "constraint on unsampled prefill row");
+                total += r.ids.size();
+                sampled |= r.sample;
+            }
+            require(total <= shape.prefill_chunk &&
+                        f->sample == (sampled ? SampleKind::FirstToken : SampleKind::None),
+                    "prefill extent or sampling kind");
             break;
+        }
         case ForwardKind::Replay:
-            require(rows.size() == 1 && n && f->sample == SampleKind::None, "replay extent");
+            require(rows.size() == 1 && n && n <= shape.prefill_chunk &&
+                        f->sample == SampleKind::None && !rows[0].sample,
+                    "replay extent");
             break;
         case ForwardKind::Ordinary:
-            require(n == 1 && f->sample == SampleKind::NextToken, "ordinary extent");
+            require(n == 1 && n <= shape.prefill_chunk && f->sample == SampleKind::NextToken,
+                    "ordinary extent");
             break;
         case ForwardKind::Control:
             require(n && n <= control_token_limit && f->sample == SampleKind::None,
                     "control extent");
+            for (const auto& r : rows) require(!r.sample, "sampling on control row");
             break;
         default:
             require(false, "unknown forward kind");
@@ -348,12 +364,17 @@ void WorkContract::validate(const Work& work, runtime::FrameKind kind) const {
 
 void WorkContract::validate(const Work& work, const runtime::DecisionRequest& request,
                             const runtime::DecisionInput& input) const {
-    const auto rows = work_rows(work);
+    const auto rows       = work_rows(work);
+    const auto* forward   = std::get_if<ForwardWork>(&work.operation);
+    const auto needs_mask = [&](std::size_t i) {
+        return rows[i].constrained &&
+               (!forward || forward->kind != ForwardKind::Prefill || rows[i].sample);
+    };
     require(request.vocabulary == public_tokens && request.stage == input.stage,
             "decision identity");
     std::vector<std::uint8_t> requested(rows.size()), seen(rows.size());
     for (const auto& r : request.rows) {
-        require(r.member < rows.size() && rows[r.member].constrained && !requested[r.member] &&
+        require(r.member < rows.size() && needs_mask(r.member) && !requested[r.member] &&
                     r.drafts.size() ==
                         (std::holds_alternative<SpeculativeWork>(work.operation)
                              ? std::get<SpeculativeWork>(work.operation).draft_extents.at(r.member)
@@ -375,7 +396,7 @@ void WorkContract::validate(const Work& work, const runtime::DecisionRequest& re
         seen[r.member] = true;
     }
     for (std::size_t i = 0; i < rows.size(); ++i)
-        require(rows[i].constrained == requested[i] && requested[i] == seen[i],
+        require(needs_mask(i) == requested[i] && requested[i] == seen[i],
                 "missing decision member");
 }
 
@@ -394,12 +415,13 @@ void WorkContract::validate_commit(const Work& work, std::span<const RowResult> 
     const auto rows    = work_rows(work);
     const auto* f      = std::get_if<ForwardWork>(&work.operation);
     const auto* m      = std::get_if<SpeculativeWork>(&work.operation);
-    const bool sampled = m || (f && f->sample != SampleKind::None);
+    const bool prefill = f && f->kind == ForwardKind::Prefill;
     require(commit.rows.size() == rows.size() &&
                 (std::holds_alternative<ScoreWork>(work.operation) || result.size() == rows.size()),
             "commit membership");
     for (std::size_t i = 0; i < rows.size(); ++i) {
-        const auto& c = commit.rows[i];
+        const auto& c      = commit.rows[i];
+        const bool sampled = prefill ? rows[i].sample : m || (f && f->sample != SampleKind::None);
         require(same_member(c.member, rows[i].member) && c.states.size() == rows[i].states.size(),
                 "commit identity");
         for (const auto& [rank, s] : c.states) {
@@ -421,6 +443,8 @@ void WorkContract::validate_commit(const Work& work, std::span<const RowResult> 
                     "result probabilities differ from work");
         }
         require(!(c.cancelled && c.failed), "conflicting terminal disposition");
+        if (prefill && !sampled)
+            require(result[i].tokens.empty() && !c.failed, "unexpected unsampled prefill result");
         if (c.cancelled || c.failed) {
             require(c.terminal && c.accepted == 0 &&
                         (!c.failed || (sampled && result[i].dead_positions)),

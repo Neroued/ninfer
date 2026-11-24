@@ -65,4 +65,12 @@ private:
 void mla_history(const Tensor&, const MlaParameters&, const ops::KpoolMlaBatchView&,
                  ops::ConstKpoolTailStateView, ops::KpoolTailStateView, ops::KpoolMlaCacheView,
                  MemoryArena&, CudaExecutionView);
+void mla_history(const Tensor&, const MlaParameters&, const ops::KpoolMlaRaggedBatchView&,
+                 ops::ConstKpoolTailStateView, ops::KpoolTailStateView, ops::KpoolMlaCacheView,
+                 MemoryArena&, CudaExecutionView);
+
+void mla_prefill(const Tensor&, const TextConfig&, const MlaParameters&,
+                 const ops::KpoolMlaRaggedBatchView&, ops::ConstKpoolTailStateView,
+                 ops::KpoolTailStateView, ops::KpoolMlaCacheView, const Tensor& selection_rows,
+                 ops::ContextBucket, Tensor&, MemoryArena&, CudaExecutionView);
 } // namespace ninfer::models::glm5next::execution

@@ -20,16 +20,17 @@ void RankProgramImpl::commit(runtime::ExecutionTicket ticket, runtime::CommandSe
         (forward && forward->speculative))
         commit_speculative(commit);
     else if (forward && forward->sample != SampleKind::None) {
-        const auto& io = frame;
-        const int b    = commit.rows.size();
-        auto* values   = static_cast<std::int32_t*>(host(io.rows.count_columns).data);
-        bool any       = false;
+        const auto& io     = frame;
+        const auto members = f.sampling_members();
+        const int b        = dimension(members.size());
+        auto* values       = static_cast<std::int32_t*>(host(io.rows.count_columns).data);
+        bool any           = false;
         for (int i = 0; i < b; ++i) {
-            const auto logical   = f.physical.members[i];
+            const auto logical   = members[i];
             const auto& sampling = forward->rows[logical].sampling;
-            values[i]            = sampling.presence_penalty || sampling.frequency_penalty
-                                       ? commit.rows[logical].accepted
-                                       : 0;
+            values[i] = f.packed || sampling.presence_penalty || sampling.frequency_penalty
+                            ? commit.rows[logical].accepted
+                            : 0;
             any |= values[i] != 0;
         }
         if (any) {

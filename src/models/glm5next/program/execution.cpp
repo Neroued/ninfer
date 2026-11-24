@@ -107,6 +107,10 @@ void RankProgramImpl::forward() {
     const auto& work    = f.request.work;
     auto rows           = work_rows(work);
     const auto* forward = std::get_if<ForwardWork>(&work.operation);
+    if (forward && forward->kind == ForwardKind::Prefill && !forward->visual) {
+        forward_packed_prefill(*forward);
+        return;
+    }
     const bool control =
         forward && forward->kind == ForwardKind::Control && rows.front().ids.size() > 1;
     f.sequence = std::holds_alternative<ScoreWork>(work.operation) || control ||
@@ -165,14 +169,7 @@ void RankProgramImpl::forward() {
     }
     if (!f.sequence) upload_region(io.ingress, io.ingress.bytes);
     if (parameters.mtp && f.tokens) stage_conditioning(f.batch.rows);
-    if (!f.tokens) {
-        const auto offset = rows[0].states.at(parameters.profile->local.rank).source;
-        const auto source =
-            resources.states.image(rows[0].attention_rank == parameters.profile->local.rank)
-                .tensor(resources.plan.state.hidden, offset);
-        copy_bytes_async({f.hidden.data, f.hidden.bytes(), cuda.device()},
-                         {source.data, source.bytes(), cuda.device()}, cuda);
-    } else {
+    {
         auto visual     = forward ? prepare_vision(forward->visual, rows[0].main_frontier, f.tokens)
                                   : std::nullopt;
         f.timed_prefill = f.sequence && prefill_timer.has_value();
@@ -212,6 +209,51 @@ void RankProgramImpl::forward() {
     }
 }
 
+void RankProgramImpl::forward_packed_prefill(const ForwardWork& work) {
+    auto& f    = *compute;
+    f.physical = work.batch;
+    prepare_packed_inputs(work);
+    const auto& packed = *f.packed;
+    const auto& layout = *frame.packed_prefill;
+    const int h        = dimension(parameters.profile->config.text.hidden);
+    if (f.tokens) {
+        f.hidden        = resources.tensor(frame.prefill_hidden).slice(1, 0, f.tokens);
+        f.timed_prefill = prefill_timer.has_value();
+        if (f.timed_prefill) prefill_timer->start();
+        main_forward(f.batch, packed.update, f.hidden);
+        if (parameters.mtp) align_packed_history(f.batch, packed, f.hidden);
+        if (parameters.draft) append_packed_dflash_context(f.batch, packed.update.ragged);
+
+        const auto& ragged = packed.update.ragged;
+        const auto own     = packed.update.owner_tokens[parameters.profile->local.rank];
+        const auto* offsets =
+            static_cast<const std::int64_t*>(host(layout.destination_offsets).data);
+        for (int s = 0; s < ragged.num_seqs(); ++s) {
+            const auto last   = ragged.host_cu_seqlens[s + 1] - 1;
+            const auto source = f.hidden.slice(1, last, 1);
+            const bool local =
+                last >= dimension(own.begin) && last < dimension(own.begin + own.size);
+            const auto destination =
+                resources.states.image(local).tensor(resources.plan.state.hidden, offsets[s]);
+            copy_bytes_async({destination.data, destination.bytes(), cuda.device()},
+                             {source.data, source.bytes(), cuda.device()}, cuda);
+        }
+        if (f.timed_prefill) prefill_timer->record_stop();
+    }
+    const int sampled = dimension(packed.sampled_members.size());
+    if (sampled) {
+        f.sampled_hidden = resources.packed(frame.pending_hidden, {h, sampled});
+        ops::gather(resources.states.hidden(row(layout.sampled_offsets, sampled)),
+                    row(frame.rows.live_rows, sampled), f.sampled_hidden, cuda);
+        f.phase = ComputePhase::Decision;
+        decide();
+    } else {
+        timer.record_result();
+        compute_done.record(cuda.stream());
+        f.phase = ComputePhase::AwaitForward;
+    }
+}
+
 execution::TextRun RankProgramImpl::text_run(const execution::BatchView& call,
                                              execution::StateUpdate update) {
     const auto& io     = frame;
@@ -220,12 +262,14 @@ execution::TextRun RankProgramImpl::text_run(const execution::BatchView& call,
                    ? resources.raw_record(region, call.tokens, call.attention.rows)
                    : Tensor{};
     };
-    return execution::TextRun(parameters,
-                              {resources.workspace, resources.states, resources.main,
-                               records(io.main_records.raw_keys),
-                               records(io.main_records.raw_gates), parallel ? &*parallel : nullptr,
-                               parameters.draft ? draft_features(call) : Tensor{}},
-                              call, update, cuda);
+    return execution::TextRun(
+        parameters,
+        {resources.workspace, resources.states, resources.main, records(io.main_records.raw_keys),
+         records(io.main_records.raw_gates), parallel ? &*parallel : nullptr,
+         parameters.draft
+             ? draft_features(call, std::holds_alternative<execution::PackedPrefillUpdate>(update))
+             : Tensor{}},
+        call, update, cuda);
 }
 
 void RankProgramImpl::main_forward(const execution::BatchView& call, execution::StateUpdate update,
@@ -241,14 +285,11 @@ void RankProgramImpl::main_forward(const execution::BatchView& call, execution::
         run.ffn(i);
         run.finish_layer(i);
     }
-    const auto& p = *parameters.profile;
-    const auto columns =
-        std::holds_alternative<execution::SequenceUpdate>(update)
-            ? execution::sequence_parallel_policy(p.local.size).partition(call.tokens, p.local.rank)
-            : TokenPartition(call.tokens * call.rows);
-    auto output = columns.split()
-                      ? resources.tensor(frame.prefill_hidden).slice(1, 0, columns.padded)
-                      : hidden.view({dimension(p.config.text.hidden), columns.columns});
+    const auto& p       = *parameters.profile;
+    const auto& columns = run.columns();
+    auto output         = columns.split()
+                              ? resources.tensor(frame.prefill_hidden).slice(1, 0, columns.padded)
+                              : hidden.view({dimension(p.config.text.hidden), columns.columns});
     run.finish(output);
 }
 
@@ -306,7 +347,7 @@ void RankProgramImpl::decide() {
     if (verify && !f.decision) request_decision();
     if (!f.decision) return;
     upload_sampling();
-    const int b = f.batch.rows;
+    const int b = f.packed ? dimension(f.sampling_members().size()) : f.batch.rows;
     if (f.graph_route) {
         graphs->decide(*f.graph_route);
     } else if (verify) {
@@ -315,7 +356,9 @@ void RankProgramImpl::decide() {
         copy_result(b, true);
     } else {
         if (!f.head_ready) {
-            auto hidden = f.sequence ? f.hidden.slice(1, f.tokens ? f.tokens - 1 : 0, 1) : f.hidden;
+            const auto hidden = f.packed     ? f.sampled_hidden
+                                : f.sequence ? f.hidden.slice(1, f.tokens - 1, 1)
+                                             : f.hidden;
             project_head(hidden);
         }
         const auto kind = std::get<ForwardWork>(f.request.work.operation).sample;
@@ -337,12 +380,13 @@ void RankProgramImpl::result() {
     }
     const auto* forward = std::get_if<ForwardWork>(&f.request.work.operation);
     if (forward && forward->sample != SampleKind::None) {
-        const auto* ids  = static_cast<const TokenId*>(resources.egress().data);
-        const auto* top1 = forward->sample == SampleKind::NextToken && frame.top1_probabilities
-                               ? static_cast<const float*>(output(*frame.top1_probabilities).data)
-                               : nullptr;
-        for (std::size_t b = 0; b < f.physical.members.size(); ++b) {
-            auto& row  = f.result.rows[f.physical.members[b]];
+        const auto* ids    = static_cast<const TokenId*>(resources.egress().data);
+        const auto* top1   = forward->sample == SampleKind::NextToken && frame.top1_probabilities
+                                 ? static_cast<const float*>(output(*frame.top1_probabilities).data)
+                                 : nullptr;
+        const auto members = f.sampling_members();
+        for (std::size_t b = 0; b < members.size(); ++b) {
+            auto& row  = f.result.rows[members[b]];
             row.tokens = {ids[b]};
             if (top1) row.target_top1_probability = top1[b];
         }

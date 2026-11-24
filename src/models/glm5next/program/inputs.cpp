@@ -140,26 +140,8 @@ void RankProgramImpl::prepare_inputs(std::span<const WorkRow> rows, const BatchP
     if (layout.sampling) {
         auto* configs = static_cast<ops::SamplingConfig*>(host(*layout.sampling).data);
         std::fill_n(configs, b, ops::SamplingConfig{.temperature = 0, .top_k = 1, .top_p = 1});
-        for (std::size_t i = 0; i < plan.members.size(); ++i) {
-            const auto& row = rows[plan.members[i]];
-            const auto& p   = row.sampling;
-            configs[i]      = {.temperature       = p.temperature,
-                               .top_k             = p.top_k,
-                               .top_p             = p.top_p,
-                               .min_p             = p.min_p,
-                               .presence_penalty  = p.presence_penalty,
-                               .frequency_penalty = p.frequency_penalty,
-                               .seed              = p.seed};
-            if (p.presence_penalty || p.frequency_penalty)
-                configs[i].token_counts =
-                    static_cast<const int*>(resources.tensor(*layout.token_counts)
-                                                .slice(1, row.member.residency.lane.value, 1)
-                                                .data);
-            if (row.constrained)
-                configs[i].mask = {static_cast<const std::uint32_t*>(
-                                       resources.tensor(*layout.grammar_masks).slice(2, i, 1).data),
-                                   static_cast<int>((parameters.profile->public_tokens + 31) / 32)};
-        }
+        for (std::size_t i = 0; i < plan.members.size(); ++i)
+            set_sampling_config(rows[plan.members[i]], i);
     }
     if (f.sequence) {
         upload_region(io.ingress, io.ingress.bytes);
@@ -177,6 +159,166 @@ void RankProgramImpl::prepare_inputs(std::span<const WorkRow> rows, const BatchP
                                                                   i32(io.valid_columns)[j]));
     f.batch = f.sequence ? batch(io, t, b, c, local_visible, rows.front().attention_rank)
                          : decode_batch(t, b, c, local_visible);
+}
+
+void RankProgramImpl::set_sampling_config(const WorkRow& row, int slot) {
+    auto& config  = static_cast<ops::SamplingConfig*>(host(*frame.sampling).data)[slot];
+    const auto& p = row.sampling;
+    config        = {.temperature       = p.temperature,
+                     .top_k             = p.top_k,
+                     .top_p             = p.top_p,
+                     .min_p             = p.min_p,
+                     .presence_penalty  = p.presence_penalty,
+                     .frequency_penalty = p.frequency_penalty,
+                     .seed              = p.seed};
+    if (p.presence_penalty || p.frequency_penalty)
+        config.token_counts =
+            static_cast<const int*>(resources.tensor(*frame.token_counts)
+                                        .slice(1, row.member.residency.lane.value, 1)
+                                        .data);
+    if (row.constrained)
+        config.mask = {static_cast<const std::uint32_t*>(
+                           resources.tensor(*frame.grammar_masks).slice(2, slot, 1).data),
+                       dimension((parameters.profile->public_tokens + 31ULL) / 32)};
+}
+
+ops::RaggedSequenceView RankProgramImpl::upload_ragged(const RaggedLayout& layout, int segments) {
+    if (!segments) return {};
+    const auto buffer = [&](const TensorRegion& region) {
+        return std::span(static_cast<std::int32_t*>(host(region).data),
+                         std::size_t(region.shape[0]));
+    };
+    const auto lengths = buffer(layout.seq_lengths).first(segments);
+    const auto cu      = buffer(layout.cu_seqlens).first(segments + 1);
+    ops::populate_ragged_host_metadata(lengths, cu, lengths, buffer(layout.token_to_seq));
+    upload_region(layout.cu_seqlens.region, cu.size_bytes());
+    upload_region(layout.seq_lengths.region, lengths.size_bytes());
+    upload_region(layout.token_to_seq.region, cu.back() * sizeof(std::int32_t));
+    return {row(layout.cu_seqlens, segments + 1), row(layout.seq_lengths, segments),
+            row(layout.token_to_seq, cu.back()), cu};
+}
+
+void RankProgramImpl::prepare_packed_inputs(const ForwardWork& work) {
+    auto& f          = *compute;
+    const auto& plan = work.batch;
+    select_frame(plan.shape);
+    auto& packed = f.packed.emplace();
+    packed.sampled_members.reserve(work.rows.size());
+    const auto& layout = *frame.packed_prefill;
+    const auto& global = frame.rows;
+    const auto rank    = parameters.profile->local.rank;
+    const auto i32     = [&](const TensorRegion& r) {
+        return static_cast<std::int32_t*>(host(r).data);
+    };
+    const auto i64 = [&](const TensorRegion& r) {
+        return static_cast<std::int64_t*>(host(r).data);
+    };
+    const auto upload = [&](const TensorRegion& r, int count) {
+        upload_region(r.region, count * dtype_size(r.dtype));
+    };
+    int tokens = 0, segments = 0, local_begin = 0, local_segments = 0, mtp_segments = 0;
+    std::uint32_t visible = 0;
+    for (std::uint32_t owner = 0; owner < plan.owners.size(); ++owner) {
+        const auto rows  = plan.owners[owner];
+        const int begin  = tokens;
+        const bool local = owner == rank;
+        if (local) local_begin = segments;
+        for (std::uint32_t b = rows.begin; b < rows.begin + rows.size; ++b) {
+            const auto member               = plan.members[b];
+            const auto& input               = work.rows[member];
+            const auto offsets              = input.states.at(rank);
+            const int len                   = dimension(input.ids.size());
+            f.result.rows[member].processed = len;
+            if (input.sample) {
+                const int slot = dimension(packed.sampled_members.size());
+                packed.sampled_members.push_back(member);
+                i64(layout.sampled_offsets)[slot]    = len ? offsets.destination : offsets.source;
+                i32(global.live_rows)[slot]          = 1;
+                i32(global.sampling_columns)[slot]   = 1;
+                i32(global.sampling_positions)[slot] = input.sampling_position;
+                i32(global.count_slots)[slot]        = input.member.residency.lane.value;
+                set_sampling_config(input, slot);
+            }
+            if (!len) continue;
+            std::copy(input.ids.begin(), input.ids.end(), i32(frame.main.ids) + tokens);
+            for (int t = 0; t < len; ++t)
+                i32(frame.main.positions)[tokens + t] = input.main_frontier + t;
+            i32(layout.global.seq_lengths)[segments]  = len;
+            i64(layout.source_offsets)[segments]      = offsets.source;
+            i64(layout.destination_offsets)[segments] = offsets.destination;
+            if (local) {
+                i32(layout.local.seq_lengths)[local_segments] = len;
+                i32(layout.local_tables)[local_segments++]    = input.main_table.index;
+                visible        = std::max(visible, input.main_frontier + len);
+                const int skip = input.main_frontier == 0;
+                if (layout.mtp && len > skip) {
+                    const auto& mtp                              = *layout.mtp;
+                    i32(mtp.ragged.seq_lengths)[mtp_segments]    = len - skip;
+                    i32(mtp.input_segments)[mtp_segments]        = segments;
+                    i32(mtp.skip_first)[mtp_segments]            = skip;
+                    i32(mtp.base_positions)[mtp_segments]        = input.main_frontier;
+                    i32(mtp.table_rows)[mtp_segments]            = input.mtp_table.index;
+                    i64(mtp.source_offsets)[mtp_segments]        = offsets.source;
+                    i64(mtp.destination_offsets)[mtp_segments++] = offsets.destination;
+                }
+            }
+            tokens += len;
+            ++segments;
+        }
+        packed.update.owner_tokens[owner] = {std::uint32_t(begin), std::uint32_t(tokens - begin)};
+    }
+    const int sampled = dimension(packed.sampled_members.size());
+    if (sampled) {
+        upload(layout.sampled_offsets, sampled);
+        upload(global.live_rows, sampled);
+        upload(global.sampling_columns, sampled);
+        upload(global.sampling_positions, sampled);
+        upload(global.count_slots, sampled);
+        upload_region(frame.sampling->region, sampled * sizeof(ops::SamplingConfig));
+    }
+    f.tokens = tokens;
+    if (!tokens) return;
+
+    upload(frame.main.ids, tokens);
+    upload(frame.main.positions, tokens);
+    upload(layout.source_offsets, segments);
+    upload(layout.destination_offsets, segments);
+    packed.update.ragged = upload_ragged(layout.global, segments);
+    f.batch              = {.tokens              = tokens,
+                            .rows                = 1,
+                            .ids                 = row(frame.main.ids, tokens),
+                            .positions           = row(frame.main.positions, tokens),
+                            .valid_columns       = {},
+                            .source_offsets      = row(layout.source_offsets, segments),
+                            .destination_offsets = row(layout.destination_offsets, segments),
+                            .live_rows           = {},
+                            .attention           = {},
+                            .sequence_owner      = {}};
+    if (local_segments) {
+        packed.update.local_mla_ragged = upload_ragged(layout.local, local_segments);
+        upload(layout.local_tables, local_segments);
+        const auto own           = packed.update.owner_tokens[rank];
+        auto& attention          = f.batch.attention;
+        attention.rows           = local_segments;
+        attention.positions      = f.batch.positions.slice(0, own.begin, own.size);
+        attention.source_offsets = f.batch.source_offsets.slice(0, local_begin, local_segments);
+        attention.destination_offsets =
+            f.batch.destination_offsets.slice(0, local_begin, local_segments);
+        attention.table_rows         = row(layout.local_tables, local_segments);
+        attention.selection_rows     = row(frame.attention.selection_rows, own.size);
+        attention.max_visible_tokens = visible;
+        ++f.attention.forwards;
+        f.attention.rows += local_segments;
+        f.attention.scheduled_positions += own.size;
+        f.attention.valid_positions += own.size;
+    }
+    if (mtp_segments) {
+        const auto& mtp   = *layout.mtp;
+        packed.mtp_ragged = upload_ragged(mtp.ragged, mtp_segments);
+        for (const auto* r : {&mtp.input_segments, &mtp.skip_first, &mtp.base_positions,
+                              &mtp.table_rows, &mtp.source_offsets, &mtp.destination_offsets})
+            upload(*r, mtp_segments);
+    }
 }
 
 execution::BatchView RankProgramImpl::batch(const BatchLayout& io, int t, int g, int c,
@@ -238,7 +380,9 @@ void RankProgramImpl::request_decision() {
     const auto& members = work_batch(f.request.work).members;
     for (std::size_t physical = 0; physical < members.size(); ++physical) {
         const auto i = members[physical];
-        if (!rows[i].constrained) continue;
+        if (!rows[i].constrained ||
+            (forward && forward->kind == ForwardKind::Prefill && !rows[i].sample))
+            continue;
         runtime::DecisionRequest::Row input{i, {}};
         if (speculative) {
             const auto* drafts =
@@ -269,8 +413,9 @@ void RankProgramImpl::upload_sampling() {
     runtime::DecisionConsumed consumed{f.request.ticket, f.decision->stage, {}};
     std::vector<const runtime::DecisionInput::Row*> masks(rows.size());
     for (const auto& mask : f.decision->rows) masks.at(mask.member) = &mask;
-    for (std::size_t b = 0; b < f.physical.members.size(); ++b) {
-        const auto logical = f.physical.members[b];
+    const auto members = f.sampling_members();
+    for (std::size_t b = 0; b < members.size(); ++b) {
+        const auto logical = members[b];
         const auto& row    = rows[logical];
         if (row.constrained) {
             const auto* mask = masks[logical];

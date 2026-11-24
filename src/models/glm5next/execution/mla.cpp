@@ -116,8 +116,7 @@ void MlaRun::execute(const MlaSubmit& submit) {
     if (submit) {
         const auto& records = cache_.latent.data.records;
         const auto capacity = static_cast<std::uint32_t>(std::min<std::uint64_t>(
-            config_.max_context,
-            std::uint64_t(records.page_offsets.ne[0]) * records.page_tokens));
+            config_.max_context, std::uint64_t(records.page_offsets.ne[0]) * records.page_tokens));
         submit(readout(ops::ContextBucketRange::through(capacity)));
     } else {
         const auto call = readout(bucket_);
@@ -138,5 +137,39 @@ void mla_history(const Tensor& input, const MlaParameters& p, const ops::KpoolMl
     ops::kpool_mla_prepare_update(
         input, p.prepare[static_cast<std::size_t>(ops::KpoolMlaPrepareProjection::History)], batch,
         before, cache, after, {}, arena, cuda);
+}
+
+void mla_history(const Tensor& input, const MlaParameters& p,
+                 const ops::KpoolMlaRaggedBatchView& batch, ops::ConstKpoolTailStateView before,
+                 ops::KpoolTailStateView after, ops::KpoolMlaCacheView cache, MemoryArena& arena,
+                 CudaExecutionView cuda) {
+    ops::kpool_mla_prepare_update(
+        input, p.prepare[static_cast<std::size_t>(ops::KpoolMlaPrepareProjection::History)], batch,
+        before, cache, after, {}, arena, cuda);
+}
+
+void mla_prefill(const Tensor& input, const TextConfig& config, const MlaParameters& p,
+                 const ops::KpoolMlaRaggedBatchView& batch, ops::ConstKpoolTailStateView before,
+                 ops::KpoolTailStateView after, ops::KpoolMlaCacheView cache,
+                 const Tensor& selection_rows, ops::ContextBucket bucket, Tensor& output,
+                 MemoryArena& arena, CudaExecutionView cuda) {
+    const auto& m       = config.mla;
+    const int n         = batch.ragged.total_tokens();
+    auto scope          = arena.scope();
+    auto buffers        = workspace::mla(arena, config, n, false);
+    const auto& prepare = p.prepare[static_cast<std::size_t>(ops::KpoolMlaPrepareProjection::Full)];
+    ops::kpool_mla_prepare_update(input, prepare, batch, before, cache, after,
+                                  {buffers.query_lowrank, buffers.coefficients}, arena, cuda);
+    const std::array projections{buffers.query, buffers.index_query};
+    ops::linear_split(buffers.query_lowrank, p.query_index, projections, arena, cuda);
+    ops::kpool_indexer(
+        buffers.index_query.view({dimension(m.index_dim), dimension(m.index_heads), n}),
+        buffers.coefficients, cache.index, batch, bucket, arena, buffers.selection, cuda);
+    auto attended     = buffers.output.view({dimension(m.value_dim), dimension(m.heads), n});
+    const float scale = float(1.0 / std::sqrt(double(m.query_dim)));
+    ops::kpool_sparse_mla(buffers.query.view({dimension(m.query_dim), dimension(m.heads), n}),
+                          p.factors, cache.latent, batch, buffers.selection, selection_rows, scale,
+                          bucket, arena, attended, cuda);
+    ops::linear(buffers.output, p.output.weight, output, p.output.policy, arena, cuda);
 }
 } // namespace ninfer::models::glm5next::execution

@@ -24,6 +24,12 @@ enum class ComputePhase {
     Retiring
 };
 
+struct PackedPrefill {
+    execution::PackedPrefillUpdate update;
+    ops::RaggedSequenceView mtp_ragged;
+    std::vector<std::uint32_t> sampled_members;
+};
+
 struct ComputeFrame {
     runtime::ExecutionRequest<ExecutionTypes> request;
     runtime::CommandSequence retirement;
@@ -32,6 +38,7 @@ struct ComputeFrame {
     std::optional<runtime::DecisionRequest> requested;
     std::optional<runtime::DecisionInput> decision;
     std::optional<WorkRow> window;
+    std::optional<PackedPrefill> packed;
     BatchPlan physical;
     std::optional<speculative::RoundRoute> graph_route;
     std::vector<std::uint32_t> draft_visible;
@@ -40,11 +47,16 @@ struct ComputeFrame {
     std::vector<float> logprobs;
     execution::BatchView batch;
     Tensor hidden;
+    Tensor sampled_hidden;
     GpuExecutionObservation gpu;
     AttentionWorkCounters attention;
     bool sequence = false, timed_prefill = false, counts_pending = false;
     bool head_ready     = false;
     bool release_vision = false;
+
+    [[nodiscard]] std::span<const std::uint32_t> sampling_members() const noexcept {
+        return packed ? packed->sampled_members : physical.members;
+    }
 };
 
 struct ContextFrame {
@@ -74,6 +86,7 @@ public:
     void collect_vision_timing();
     void retire_vision(runtime::ResidencyId) noexcept;
     void forward();
+    void forward_packed_prefill(const ForwardWork&);
     GraphPreparationSample prepare_graphs(GraphPreparationMode);
     void release_graphs();
     void execute_proposal(const execution::BatchView&, std::span<const std::uint32_t> draft_bounds,
@@ -104,9 +117,10 @@ public:
     [[nodiscard]] execution::DFlashRun dflash_run(int rows, ops::ContextBucket, int head_columns);
     void dflash_forward(int rows, ops::ContextBucket, int head_columns,
                         const execution::DraftSubmit& = {});
-    [[nodiscard]] Tensor draft_features(const execution::BatchView&);
+    [[nodiscard]] Tensor draft_features(const execution::BatchView&, bool packed = false);
     void append_dflash_context(const execution::BatchView&, const Tensor& counts,
                                ops::ContextKVMaterializeExecutionEnvelope);
+    void append_packed_dflash_context(const execution::BatchView&, const ops::RaggedSequenceView&);
     void execute_speculative_commit(const execution::BatchView&, bool repair_history,
                                     bool count_tokens, const SectionRecorder& repair = {},
                                     const SectionRecorder& counts = {});
@@ -121,6 +135,7 @@ public:
     [[nodiscard]] Tensor draft_proposals(int batch, int columns);
     [[nodiscard]] Tensor mtp_output_ids(int step, int batch);
     void align_history(const execution::BatchView&, Tensor hidden, std::int32_t width);
+    void align_packed_history(const execution::BatchView&, const PackedPrefill&, const Tensor&);
     void prepare_history_metadata(std::span<const WorkRow>);
     [[nodiscard]] execution::BatchView batch(const BatchLayout&, int tokens, int rows,
                                              int attention_rows, std::uint32_t visible,
@@ -136,6 +151,9 @@ public:
     void result();
     void prepare_inputs(std::span<const WorkRow>, const BatchPlan&, std::uint32_t tokens,
                         std::span<const std::uint32_t> valid_columns = {});
+    void prepare_packed_inputs(const ForwardWork&);
+    [[nodiscard]] ops::RaggedSequenceView upload_ragged(const RaggedLayout&, int segments);
+    void set_sampling_config(const WorkRow&, int slot);
     void upload_sampling();
     void control_counts();
     [[nodiscard]] MemorySpan host_region(const LayoutRegion&);

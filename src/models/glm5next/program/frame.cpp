@@ -175,6 +175,24 @@ FrameLayout plan_frame(LayoutBuilder& b, const execution::ModelProfile& p,
     };
     out.main = metadata(columns, true);
     local_batch(out.main, columns, local.main_tables);
+    if (s.purpose == EnginePurpose::Generation) {
+        auto& packed      = out.packed_prefill.emplace();
+        const int chunk   = dimension(s.prefill_chunk);
+        const auto ragged = [&] {
+            return RaggedLayout{tensor(DType::I32, {batch + 1}, "ragged prefix lengths"), rows(),
+                                tensor(DType::I32, {chunk}, "ragged token segments")};
+        };
+        const auto offsets    = [&] { return tensor(DType::I64, {batch}, "packed State offsets"); };
+        packed.global         = ragged();
+        packed.local          = ragged();
+        packed.source_offsets = offsets();
+        packed.destination_offsets = offsets();
+        packed.local_tables        = rows();
+        packed.sampled_offsets     = offsets();
+        if (p.mtp)
+            packed.mtp =
+                PackedMtpLayout{ragged(), rows(), rows(), rows(), rows(), offsets(), offsets()};
+    }
     if (p.vision) out.visual_indices = tensor(DType::I32, {columns}, "visual embedding indices");
     const auto host_end = b.finish(256);
     out.host_ingress    = {out.ingress.offset, host_end - out.ingress.offset, 256};

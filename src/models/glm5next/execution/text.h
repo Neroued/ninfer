@@ -27,12 +27,15 @@ public:
     void ffn(std::uint32_t layer);
     void finish_layer(std::uint32_t layer);
     void finish(Tensor& hidden);
+
+    [[nodiscard]] const TokenPartition& columns() const noexcept { return columns_; }
 private:
     void next_pre(const ops::MhcPreWeights&, const Tensor& feature = {},
-                  std::optional<std::uint32_t> owner = {});
-    void gather_input(std::optional<std::uint32_t> owner);
+                  std::optional<std::uint32_t> next_mixer = {});
+    void gather_input(std::optional<std::uint32_t> next_mixer);
+    void broadcast_mla_columns(Tensor&, int begin, int end, std::uint32_t root);
+    void exchange_packed_mla(const PackedPrefillUpdate&, Tensor& exchange, bool input);
     void reduce_output();
-    [[nodiscard]] std::optional<std::uint32_t> attention_owner(std::uint32_t layer) const;
     const Parameters& parameters_;
     TextExecution execution_;
     BatchView batch_;

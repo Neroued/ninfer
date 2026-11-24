@@ -55,6 +55,22 @@ struct MtpFrameLayout {
     std::array<TensorRegion, 3> tail_offsets;
 };
 
+struct RaggedLayout {
+    TensorRegion cu_seqlens, seq_lengths, token_to_seq;
+};
+
+struct PackedMtpLayout {
+    RaggedLayout ragged;
+    TensorRegion input_segments, skip_first, base_positions, table_rows;
+    TensorRegion source_offsets, destination_offsets;
+};
+
+struct PackedPrefillLayout {
+    RaggedLayout global, local;
+    TensorRegion source_offsets, destination_offsets, local_tables, sampled_offsets;
+    std::optional<PackedMtpLayout> mtp;
+};
+
 struct FrameLayout {
     BatchLayout main, decode;
     RowLayout rows;
@@ -66,6 +82,7 @@ struct FrameLayout {
     std::optional<SpeculativeFrameLayout> speculative;
     std::optional<MtpFrameLayout> mtp;
     std::optional<DFlashFrameLayout> dflash;
+    std::optional<PackedPrefillLayout> packed_prefill;
     std::optional<TensorRegion> logits, token_counts, sampling, grammar_masks;
     std::optional<TensorRegion> candidates, gathered_candidates, sampled_ids, output_counts;
     std::optional<TensorRegion> top1_probabilities, draft_confidences;

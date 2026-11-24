@@ -1,6 +1,5 @@
 #include "ops/suite.h"
-#include "ops/ragged_fixture.h"
-#include "ops/op_tester.h"
+#include "fixture.h"
 #include "cuda_fixture.h"
 #include "core/decode_graph.h"
 #include "core/nf4.h"
@@ -242,25 +241,70 @@ int run(int tokens, int batch, int partition, bool padded, bool wide = false) {
     return failures;
 }
 
-int ragged_lookup() {
-    RaggedFixture ragged({1, 3, 15, 13});
-    const int n = ragged.tokens();
-    Fixture f(17, ragged.segments(), true);
-    f.reset(1);
-    f.valid          = ragged.lengths;
-    auto ids         = to_device(ragged.pack(f.ids, f.stride, 1));
-    const auto local = f.views(0);
+int ragged_lookup(std::vector<int> lengths, bool graph, bool permuted_ids = false) {
+    RaggedFixture ragged(std::move(lengths));
+    const int n = ragged.tokens(), rows = ragged.segments();
+    Fixture f(*std::max_element(ragged.lengths.begin(), ragged.lengths.end()), rows, true);
+    const auto local = f.views(3);
+    GuardedDeviceBuffer ids(n * sizeof(int));
     GuardedDeviceBuffer output(2560 * n * 2ULL);
+    const auto input = permuted_ids ? Tensor(ids.span(), DType::I32, {1, n}).permute({1, 0, 2, 3})
+                                    : Tensor(ids.span(), DType::I32, {n});
     Tensor result(output.span(), DType::BF16, {2560, n});
-    ops::ngram_embedding_lookup(Tensor(ids.span(), DType::I32, {n}), ragged.view, f.before, f.hash,
-                                f.eos, local, result, cuda_environment().default_execution);
-    cuda_synchronize();
-    int failures =
-        verify_exact("ragged lookup", from_device<std::uint16_t>(output.data(), 2560 * n),
-                     ragged.pack(f.reference(local), f.t, 2560));
-    failures += verify_exact("ragged untouched token tails",
-                             from_device<int>(f.d_tail.data(), f.tail.size()), f.tail);
-    return failures + output.verify_guards("ragged lookup") + f.d_tail.verify_guards("token tails");
+    auto& device      = cuda_environment().context;
+    const auto launch = [&] {
+        ops::ngram_embedding_lookup(input, ragged.view, f.before, f.hash, f.eos, local, result,
+                                    device.execution_view());
+    };
+    DecodeGraphDefinition definition;
+    DecodeGraphExecutable executable;
+    int failures = 0;
+    for (int phase = 0; phase < (graph ? 2 : 1); ++phase) {
+        if (phase) ple::rotate_replay_partition(ragged);
+        f.reset(phase);
+        f.valid = ragged.lengths;
+        for (int s = 0; s < rows; ++s) {
+            // Permute the record order and share the first source with the final segment.
+            f.selected[s] = (rows - 1 - s + phase) % f.slots;
+            for (int t = 0; t < f.valid[s]; ++t)
+                f.ids[s * f.stride + t] = t % 4 == (s + phase) % 2
+                                              ? f.eos
+                                              : INT32_MAX - ((t * 97 + s * 31 + phase) % 1009);
+        }
+        f.selected.back()     = f.selected.front();
+        const auto offsets    = f.selected_offsets();
+        const auto packed_ids = ragged.pack(f.ids, f.stride, 1);
+        f.d_selected.copy_from_host(offsets.data(), offsets.size() * sizeof(std::int64_t));
+        ids.copy_from_host(packed_ids.data(), packed_ids.size() * sizeof(int));
+        CUDA_CHECK(cudaMemset(output.data(), 0xa5, output.bytes()));
+        cuda_synchronize();
+        if (graph && phase == 0) {
+            definition.capture(device.stream(), launch);
+            executable.instantiate(definition);
+        }
+        if (graph)
+            executable.launch(device.stream());
+        else
+            launch();
+        device.synchronize();
+        const auto expected = ragged.pack(f.reference(local), f.t, 2560);
+        failures += verify_exact(
+            "ragged lookup", from_device<std::uint16_t>(output.data(), expected.size()), expected);
+        bool hit = false, miss = false;
+        for (std::size_t i = 0; i < expected.size(); i += 160) {
+            hit |= expected[i] == 0x8000;
+            miss |= expected[i] == 0;
+        }
+        failures += !hit + !miss;
+        failures += verify_exact("ragged lookup IDs", from_device<int>(ids.data(), n), packed_ids);
+        failures += verify_exact("ragged lookup tails",
+                                 from_device<int>(f.d_tail.data(), f.tail.size()), f.tail);
+        failures += verify_exact("ragged lookup tail offsets",
+                                 from_device<std::int64_t>(f.d_selected.data(), rows), offsets);
+    }
+    for (const auto& shard : f.table) failures += shard->preserved();
+    return failures + output.verify_guards("ragged lookup") + ids.verify_guards("ragged IDs") +
+           f.d_tail.verify_guards("token tails") + f.d_selected.verify_guards("tail offsets");
 }
 
 int combine() {
@@ -301,6 +345,32 @@ int invalid() {
            rejects([](auto& views) { views[0].pages.bytes = 4096; }) +
            rejects([](auto& views) { views[0].decode.ne[0] = 8; });
 }
+
+int invalid_ragged() {
+    const RaggedFixture ragged({1, 1});
+    Fixture f(1, 2, false);
+    f.reset(1);
+    const auto input   = f.input.view({2});
+    auto result        = f.result.view({2560, 2});
+    const auto cuda    = cuda_environment().context.execution_view();
+    auto local         = f.views(0);
+    const auto rejects = [&](int eos, auto before, const auto& hash) {
+        try {
+            ops::ngram_embedding_lookup(input, ragged.view, before, hash, eos, local, result, cuda);
+        } catch (const std::invalid_argument&) { return 0; }
+        cuda_synchronize();
+        return 1;
+    };
+    int failures                  = rejects(-1, f.before, f.hash);
+    auto before                   = f.before;
+    before.token_ids.field.layers = 2;
+    failures += rejects(f.eos, before, f.hash);
+    auto hash               = f.hash;
+    hash.vocab_sizes.back() = 0;
+    failures += rejects(f.eos, f.before, hash);
+    local.back().decode.data = result.data;
+    return failures + rejects(f.eos, f.before, f.hash);
+}
 } // namespace
 
 void add_ple_lookup_cases(ninfer::test::OpSuite& suite) {
@@ -315,7 +385,18 @@ void add_ple_lookup_cases(ninfer::test::OpSuite& suite) {
               {{"format", "nf4"}, {"execution", "graph"}, {"suite", "concurrency"}});
     suite.add("ngram_embedding_lookup/wide_hash", [] { return run(3, 1, 0, true, true); },
               {{"format", "nf4"}, {"execution", "graph"}});
-    suite.add("ngram_embedding_lookup/ragged", ragged_lookup);
+    suite.add("ngram_embedding_lookup/ragged/single", [] { return ragged_lookup({9}, false); });
+    suite.add("ngram_embedding_lookup/ragged/permuted_ids",
+              [] { return ragged_lookup({1, 1}, false, true); });
+    suite.add("ngram_embedding_lookup/ragged/small", [] { return ragged_lookup({1, 2, 4}, true); },
+              {{"execution", "graph"}});
+    suite.add("ngram_embedding_lookup/ragged/varied",
+              [] { return ragged_lookup({1, 2, 3, 17, 65}, true); }, {{"execution", "graph"}});
+    suite.add("ngram_embedding_lookup/ragged/short_last",
+              [] { return ragged_lookup({4095, 1}, false); });
+    suite.add("ngram_embedding_lookup/ragged/short_first",
+              [] { return ragged_lookup({1, 4095}, false); });
     suite.add("ngram_embedding_lookup/combine_words", combine, {{"format", "nf4"}});
     suite.add("ngram_embedding_lookup/contract", invalid, {{"format", "nf4"}});
+    suite.add("ngram_embedding_lookup/ragged/contract", invalid_ragged, {{"format", "nf4"}});
 }

@@ -3,7 +3,9 @@
 #include "core/buffer.h"
 #include "core/record_view.h"
 #include "ops/op_tester.h"
+#include "ops/ragged_fixture.h"
 
+#include <algorithm>
 #include <array>
 #include <memory>
 
@@ -103,6 +105,15 @@ inline double value(const Words& words, int x, int y = 0, int z = 0, int w = 0) 
 
 inline void upload_i32(DeviceBuffer& dst, const std::vector<int>& src) {
     dst.copy_from_host(src.data(), src.size() * sizeof(int));
+}
+
+inline void rotate_replay_partition(RaggedFixture& ragged) {
+    std::rotate(ragged.lengths.begin(), ragged.lengths.begin() + 1, ragged.lengths.end());
+    ops::populate_ragged_host_metadata(ragged.lengths, ragged.prefix, ragged.lengths,
+                                       ragged.mapping);
+    upload_i32(ragged.d_prefix, ragged.prefix);
+    upload_i32(ragged.d_lengths, ragged.lengths);
+    upload_i32(ragged.d_mapping, ragged.mapping);
 }
 
 template <class F>

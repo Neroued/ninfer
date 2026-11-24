@@ -81,19 +81,26 @@ bool overlaps_columns(Range a, const Columns& b) {
     return false;
 }
 
+Columns ragged_columns(const Tensor& records, int tokens, Device device) {
+    require(records.nb[1] >= kChannels * 2 && records.nb[1] % 2 == 0, "record column stride");
+    return columns(records, tokens, 1, "records", device);
+}
+
 void metadata(const Tensor& t, int batch, const char* label, Device device) {
     contiguous(t, DType::I32, {batch}, 4, label, device);
 }
 
 void validate_batch_extent(int batch) { require(batch >= 1, "batch extent"); }
 
-} // namespace
-
-common::operand::Range ragged_record_range(const Tensor& records, int tokens, Device device) {
-    require(records.nb[1] >= kChannels * 2 && records.nb[1] % 2 == 0, "record column stride");
-    if (!tokens) return {};
-    return columns(records, tokens, 1, "records", device).bounds;
+void validate_history(const ConstStateFieldView& state, int rows, Device device) {
+    require(state.field.layers == 1, "history layer");
+    common::operand::state_field(state, DType::BF16, {kChannels, kHistory}, 2, "PLE", "history",
+                                 device);
+    common::operand::shape(state.records.byte_offsets, {rows, 1, 1, 1}, "PLE",
+                           "state byte offsets");
 }
+
+} // namespace
 
 void validate_gate(const PleProjectionView& projected, const Tensor& residual,
                    const PleGateParameters& parameters, const PleBatchView& batch,
@@ -142,8 +149,9 @@ void validate_conv(const Tensor& residual, const Tensor& gated, const Tensor& ke
                    const PleBatchView& batch, const ConstPleConvStateView& before,
                    const PleConvRecordWindowView& current, const Tensor& updated,
                    const Tensor* norm_weight, float epsilon, const Tensor* normalized,
-                   CudaExecutionView execution) {
-    const int tokens = residual.ne[2], rows = residual.ne[3];
+                   CudaExecutionView execution, const RaggedSequenceView* ragged) {
+    const int tokens = ragged ? ragged->total_tokens() : residual.ne[2];
+    const int rows   = ragged ? 1 : residual.ne[3];
     validate_batch_extent(rows);
     require(tokens > 0, "token extent");
     for (const Tensor* t : {&residual, &gated, &updated})
@@ -153,15 +161,14 @@ void validate_conv(const Tensor& residual, const Tensor& gated, const Tensor& ke
         for (int d = 0; d < 4; ++d)
             require(updated.nb[d] == residual.nb[d], "in-place residual strides");
     contiguous(kernel, DType::BF16, {kChannels, 4}, 2, "convolution kernel", execution.device());
-    metadata(batch.valid_columns, rows, "valid columns", execution.device());
-    require(before.history.field.layers == 1, "history layer");
-    common::operand::state_field(before.history, DType::BF16, {kChannels, kHistory}, 2, "PLE",
-                                 "history", execution.device());
-    common::operand::shape(before.history.records.byte_offsets, {rows, 1, 1, 1}, "PLE",
-                           "source byte offsets");
-    metadata(current.offsets, rows, "record offsets", execution.device());
+    validate_history(before.history, ragged ? ragged->num_seqs() : rows, execution.device());
+    if (!ragged) {
+        metadata(batch.valid_columns, rows, "valid columns", execution.device());
+        metadata(current.offsets, rows, "record offsets", execution.device());
+    }
     const auto records =
-        columns(current.values, current.values.ne[1], rows, "records", execution.device());
+        ragged ? ragged_columns(current.values, tokens, execution.device())
+               : columns(current.values, current.values.ne[1], rows, "records", execution.device());
     if (normalized) {
         contiguous(*normalized, DType::BF16, {kFeatures, kStreams, tokens, rows}, 16, "normalized",
                    execution.device());
@@ -171,15 +178,24 @@ void validate_conv(const Tensor& residual, const Tensor& gated, const Tensor& ke
     }
     for (const Tensor* output : {&updated, normalized}) {
         if (!output) continue;
-        const auto out = common::operand::range(output->data, output->bytes(), "PLE");
+        const auto out      = common::operand::range(output->data, output->bytes(), "PLE");
+        const auto disjoint = [&](const Tensor& input) {
+            require(!common::operand::overlaps(out, common::operand::range(input, "PLE")),
+                    "output/input overlap");
+        };
         for (const Tensor* input :
-             {&residual, &gated, &kernel, &batch.valid_columns,
-              &before.history.records.byte_offsets, &current.offsets, norm_weight}) {
+             {&residual, &gated, &kernel, &before.history.records.byte_offsets, norm_weight}) {
             if (!input || (output == &updated && input == &residual && output->data == input->data))
                 continue;
-            require(!common::operand::overlaps(
-                        out, common::operand::range(input->data, input->bytes(), "PLE")),
-                    "output/input overlap");
+            disjoint(*input);
+        }
+        if (ragged) {
+            for (const auto* input :
+                 {&ragged->cu_seqlens, &ragged->seq_lengths, &ragged->token_to_seq})
+                disjoint(*input);
+        } else {
+            disjoint(batch.valid_columns);
+            disjoint(current.offsets);
         }
         require(!overlaps_columns(out, records), "output/record overlap");
         // State fields are selected by Device offsets. Addressed input/output disjointness
@@ -200,18 +216,24 @@ void validate_extract(const ConstPleConvStateView& before, const PleConvRecordRe
     metadata(accepted, batch, "accepted columns", execution.device());
     if (live_rows.data) metadata(live_rows, batch, "live rows", execution.device());
     metadata(records.valid_columns, batch, "record valid columns", execution.device());
-    const auto validate_history = [&](const ConstStateFieldView& state) {
-        require(state.field.layers == 1, "history layer");
-        common::operand::state_field(state, DType::BF16, {kChannels, kHistory}, 2, "PLE", "history",
-                                     execution.device());
-        common::operand::shape(state.records.byte_offsets, {batch, 1, 1, 1}, "PLE",
-                               "state byte offsets");
-    };
-    validate_history(before.history);
-    validate_history(after.history);
+    validate_history(before.history, batch, execution.device());
+    validate_history(after.history, batch, execution.device());
     (void)columns(records.values, records.values.ne[1], batch, "records", execution.device());
     // Only selected records are read/written. Their cross-row and in-place relationships
     // are Device-index promises; overlapping pool descriptors alone are not an error.
+}
+
+void validate_extract(const ConstPleConvStateView& before, const Tensor& records,
+                      const RaggedSequenceView& ragged, const PleConvStateView& after,
+                      CudaExecutionView execution) {
+    namespace operand        = common::operand;
+    constexpr const char* op = "ple_state_extract";
+    const auto device        = execution.device();
+    operand::ragged_sequence(ragged, op, device);
+    validate_history(before.history, ragged.num_seqs(), device);
+    validate_history(after.history, ragged.num_seqs(), device);
+    (void)ragged_columns(records, ragged.total_tokens(), device);
+    // The caller guarantees disjointness of the writes selected by Device offsets.
 }
 
 } // namespace ninfer::ops::detail::ple

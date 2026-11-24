@@ -34,69 +34,80 @@ inline unsigned conv_grid(std::int64_t count) {
     return static_cast<unsigned>(count < 65535 ? count : 65535);
 }
 
+template <bool Ragged>
 void launch_tiled_conv(const ConvArguments& a, cudaStream_t stream) {
     const auto tiles = (std::int64_t(a.tokens) + 7) / 8;
-    conv_add_tiled_kernel<128, 2, 8>
+    conv_add_tiled_kernel<128, 2, 8, Ragged>
         <<<conv_grid(tiles * a.batch * kChannelTiles), 128, 0, stream>>>(a);
     CUDA_CHECK(cudaGetLastError());
 }
 
-template <int Block, int Width>
+template <int Block, int Width, bool Ragged>
 void launch_conv_add(const ConvArguments& a, cudaStream_t stream) {
     const auto columns = std::int64_t(a.tokens) * a.batch;
-    conv_add_kernel<Block, Width><<<conv_grid(columns * kChannelTiles), Block, 0, stream>>>(a);
+    conv_add_kernel<Block, Width, Ragged>
+        <<<conv_grid(columns * kChannelTiles), Block, 0, stream>>>(a);
     CUDA_CHECK(cudaGetLastError());
 }
 
-template <int Block, int Width, bool WithConv>
+template <int Block, int Width, bool WithConv, bool Ragged>
 void launch_conv_norm(const ConvArguments& a, cudaStream_t stream) {
-    if constexpr (!WithConv) launch_tiled_conv(a, stream);
+    if constexpr (!WithConv) launch_tiled_conv<Ragged>(a, stream);
     const auto groups = std::int64_t(a.tokens) * a.batch * kStreams;
-    conv_norm_kernel<Block, Width, WithConv><<<conv_grid(groups), Block, 0, stream>>>(a);
+    conv_norm_kernel<Block, Width, WithConv, Ragged><<<conv_grid(groups), Block, 0, stream>>>(a);
     CUDA_CHECK(cudaGetLastError());
 }
 
 using ConvLaunch = void (*)(const ConvArguments&, cudaStream_t);
 
+template <bool Ragged>
 ConvLaunch select_conv(const ConvArguments& a, bool paired, bool wide_history,
                        int multiprocessors) {
     const auto columns = std::int64_t(a.tokens) * a.batch;
     if (a.normalized) {
-        if (!paired) return launch_conv_norm<256, 1, true>;
-        if (columns * kStreams <= 2LL * multiprocessors) return launch_conv_norm<512, 2, true>;
+        if (!paired) return launch_conv_norm<256, 1, true, Ragged>;
+        if (columns * kStreams <= 2LL * multiprocessors)
+            return launch_conv_norm<512, 2, true, Ragged>;
 #if NINFER_TARGET_SPARK
         if (columns >= 1024) {
             bool aligned = wide_history;
             for (const auto* p : {a.kernel, a.history, a.records, a.norm})
                 aligned &= reinterpret_cast<std::uintptr_t>(p) % 8 == 0;
-            for (auto stride : {a.history_column, a.record_column, a.record_batch})
-                aligned &= stride % 4 == 0;
-            if (aligned) return launch_conv_norm<512, 4, true>;
+            aligned &= a.history_column % 4 == 0 && a.record_column % 4 == 0;
+            if constexpr (!Ragged) aligned &= a.record_batch % 4 == 0;
+            if (aligned) return launch_conv_norm<512, 4, true, Ragged>;
         }
 #else
         // Reuse across tokens pays for a separate norm launch in this extent range.
-        if (columns >= 1024 && columns <= 2304) return launch_conv_norm<256, 2, false>;
+        if (columns >= 1024 && columns <= 2304) return launch_conv_norm<256, 2, false, Ragged>;
 #endif
-        return launch_conv_norm<256, 2, true>;
+        return launch_conv_norm<256, 2, true, Ragged>;
     }
-    if (paired && a.tokens >= 128) return launch_tiled_conv;
-    return paired ? launch_conv_add<128, 2> : launch_conv_add<256, 1>;
+    if (paired && a.tokens >= 128) return launch_tiled_conv<Ragged>;
+    return paired ? launch_conv_add<128, 2, Ragged> : launch_conv_add<256, 1, Ragged>;
 }
 
 void execute_conv(const Tensor& residual, const Tensor& gated, const Tensor& kernel,
                   const PleBatchView& batch, const ConstPleConvStateView& before,
                   const PleConvRecordWindowView& current, Tensor& updated,
                   const Tensor* norm_weight, float epsilon, Tensor* normalized,
-                  CudaExecutionView execution) {
+                  CudaExecutionView execution, const RaggedSequenceView* ragged = nullptr) {
     validate_conv(residual, gated, kernel, batch, before, current, updated, norm_weight, epsilon,
-                  normalized, execution);
-    const auto args   = conv_arguments(residual, gated, kernel, batch, before, current, updated,
+                  normalized, execution, ragged);
+    auto args         = conv_arguments(residual, gated, kernel, batch, before, current, updated,
                                        norm_weight, epsilon, normalized);
     const bool paired = pair_aligned(kernel) && field_aligned(before.history, 4) &&
                         pair_aligned(current.values) &&
                         (!norm_weight || pair_aligned(*norm_weight));
-    select_conv(args, paired, field_aligned(before.history, 8),
-                execution.multiprocessor_count())(args, execution.stream());
+    if (ragged && ragged->num_seqs() > 1) {
+        args.cu_seqlens   = static_cast<const std::int32_t*>(ragged->cu_seqlens.data);
+        args.token_to_seq = static_cast<const std::int32_t*>(ragged->token_to_seq.data);
+    }
+    const bool wide   = field_aligned(before.history, 8);
+    const int sms     = execution.multiprocessor_count();
+    const auto launch = args.token_to_seq ? select_conv<true>(args, paired, wide, sms)
+                                          : select_conv<false>(args, paired, wide, sms);
+    launch(args, execution.stream());
 }
 } // namespace
 } // namespace ninfer::ops::detail::ple
@@ -126,41 +137,11 @@ void ragged_conv(const Tensor& residual, const Tensor& gated, const Tensor& kern
                  const RaggedSequenceView& ragged, const ConstPleConvStateView& before,
                  const Tensor& current, Tensor& updated, const Tensor* norm, float epsilon,
                  Tensor* normalized, CudaExecutionView execution) {
-    namespace operand        = common::operand;
-    constexpr const char* op = "ple_conv_add";
-    const auto device        = execution.device();
-    operand::ragged_sequence(ragged, op, device);
-    const int n = ragged.total_tokens();
-    for (const auto* t : std::array<const Tensor*, 4>{&residual, &gated, &updated, normalized}) {
-        if (!t) continue;
-        operand::tensor(*t, DType::BF16, {detail::ple::kFeatures, detail::ple::kStreams, n}, 16, op,
-                        "activation", device);
-    }
-    const auto records = detail::ple::ragged_record_range(current, n, device);
-    operand::shape(before.history.records.byte_offsets, {ragged.num_seqs(), 1, 1, 1}, op,
-                   "state offsets");
-    for (const auto* out : {&updated, normalized}) {
-        if (!out) continue;
-        const auto range = operand::range(*out, op);
-        operand::disjoint(range, records, op);
-        for (const auto* src : {&residual, &gated, &ragged.cu_seqlens, &ragged.seq_lengths,
-                                &ragged.token_to_seq, &before.history.records.byte_offsets}) {
-            if (out == &updated && src == &residual && out->data == src->data) continue;
-            operand::disjoint(range, operand::range(*src, op), op);
-        }
-    }
-    if (normalized)
-        operand::disjoint(operand::range(updated, op), operand::range(*normalized, op), op);
-    for (int s = 0; s < ragged.num_seqs(); ++s) {
-        const int begin = ragged.segment_begin(s), len = ragged.segment_length(s);
-        auto out      = updated.slice(2, begin, len);
-        auto norm_out = normalized ? normalized->slice(2, begin, len) : Tensor{};
-        detail::ple::execute_conv(residual.slice(2, begin, len), gated.slice(2, begin, len), kernel,
-                                  {ragged.seq_lengths.slice(0, s, 1)},
-                                  {operand::state_row(before.history, s)},
-                                  {current.slice(1, begin, len), ragged.cu_seqlens.slice(0, 0, 1)},
-                                  out, norm, epsilon, normalized ? &norm_out : nullptr, execution);
-    }
+    common::operand::ragged_sequence(ragged, "ple_conv_add", execution.device());
+    const auto offset = ragged.num_seqs() == 1 ? ragged.cu_seqlens.slice(0, 0, 1) : Tensor{};
+    detail::ple::execute_conv(residual, gated, kernel, {ragged.seq_lengths}, before,
+                              {current, offset}, updated, norm, epsilon, normalized, execution,
+                              &ragged);
 }
 } // namespace
 

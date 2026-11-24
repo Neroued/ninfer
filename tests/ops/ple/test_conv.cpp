@@ -1,5 +1,4 @@
 #include "ops/suite.h"
-#include "ops/ragged_fixture.h"
 #include "conv_fixture.h"
 #include "core/decode_graph.h"
 
@@ -156,50 +155,148 @@ int short_record_view(DeviceContext& device, bool norm) {
     return f.verify(norm, "PLE padded T with R=3");
 }
 
-int ragged_conv(bool norm, bool padded = false) {
-    RaggedFixture ragged({2, 15, 34});
-    const int n = ragged.tokens(), width = 34, rows = ragged.segments();
-    ConvFixture f(width, rows);
+int ragged_validation() {
+    const RaggedFixture ragged({2, 3});
+    const int n = ragged.tokens();
+    ConvFixture f(3, ragged.segments());
     f.prepare(0, false);
-    f.valid = ragged.lengths;
-    upload_i32(f.d_valid, f.valid);
-    Words residual({H, C, n}), gated({H, C, n}),
-        current({D, n}, padded, column_strides(n, 1, padded)), updated({H, C, n}),
+    Words residual({H, C, n}), gated({H, C, n}), records({D, n}), updated({H, C, n}),
         normalized({H, C, n});
-    residual.host = ragged.pack(f.residual.host, width, D);
-    gated.host    = ragged.pack(f.gated.host, width, D);
-    for (int s = 0; s < rows; ++s)
-        for (int t = 0; t < ragged.lengths[s]; ++t)
-            std::copy_n(f.records.host.begin() + f.records.index(0, t + f.offset[s], s), D,
-                        current.host.begin() + current.index(0, ragged.prefix[s] + t));
-    for (const auto* data : {&residual, &gated, &current}) data->upload();
-    const auto ex = cuda_environment().default_execution;
-    auto y        = norm ? residual.tensor : updated.tensor;
-    if (norm)
-        ops::ple_conv_add_norm(residual.tensor, gated.tensor, f.kernel.tensor, ragged.view,
-                               f.state_view(), current.tensor, f.norm.tensor, epsilon, y,
-                               normalized.tensor, ex);
-    else
-        ops::ple_conv_add(residual.tensor, gated.tensor, f.kernel.tensor, ragged.view,
-                          f.state_view(), current.tensor, y, ex);
+    for (const auto* w : {&residual, &gated, &records, &updated, &normalized}) w->upload();
     cuda_synchronize();
+    const auto ex     = cuda_environment().context.execution_view();
+    const auto launch = [&](const Tensor& kernel, const ops::PleConvStateView& before, float eps,
+                            Tensor y, Tensor z) {
+        ops::ple_conv_add_norm(residual.tensor, gated.tensor, kernel, ragged.view, before,
+                               records.tensor, f.norm.tensor, eps, y, z, ex);
+    };
+    const auto before = f.state_view();
+    int failures      = rejects("ragged invalid epsilon", [&] {
+        launch(f.kernel.tensor, before, 0.f, updated.tensor, normalized.tensor);
+    });
+    auto bad_history  = before;
+    bad_history.history.field.tensor.region.offset += 1;
+    failures += rejects("ragged history base alignment", [&] {
+        launch(f.kernel.tensor, bad_history, epsilon, updated.tensor, normalized.tensor);
+    });
+    auto bad_kernel  = f.kernel.tensor;
+    bad_kernel.ne[1] = 3;
+    failures += rejects("ragged kernel shape", [&] {
+        launch(bad_kernel, before, epsilon, updated.tensor, normalized.tensor);
+    });
+    auto overlapping_norm = normalized.tensor;
+    overlapping_norm.data = records.tensor.data;
+    failures += rejects("ragged output/record overlap", [&] {
+        launch(f.kernel.tensor, before, epsilon, updated.tensor, overlapping_norm);
+    });
+    cuda_environment().context.synchronize();
+    return failures + updated.preserved("rejected ragged convolution writes no output");
+}
+
+enum class RaggedConvLayout { Dense, ScalarPadded, WidePadded, PairedPadded };
+
+int ragged_conv(std::vector<int> lengths, bool norm, RaggedConvLayout layout, bool inplace,
+                bool graph) {
+    RaggedFixture ragged(std::move(lengths));
+    const int n = ragged.tokens(), rows = ragged.segments();
+    const int width           = *std::max_element(ragged.lengths.begin(), ragged.lengths.end());
+    const bool scalar         = layout == RaggedConvLayout::ScalarPadded;
+    const bool wide           = layout == RaggedConvLayout::WidePadded;
+    const bool paired_padding = layout == RaggedConvLayout::PairedPadded;
+    auto strides              = column_strides(n, 1, scalar ? 1 : wide ? 2 : 0);
+    if (paired_padding) {
+        constexpr std::int64_t stride = D + 2;
+        strides                       = {1, stride, stride * n, stride * n};
+    }
+    ConvFixture f(width, rows, scalar ? 1 : 0);
+    Words residual({H, C, n}), gated({H, C, n}), current({D, n}, scalar, strides),
+        updated({H, C, n}), normalized({H, C, n});
+    // The packed column stride is wide-aligned, while the unused batch stride is not.
+    if (wide) current.tensor.nb[2] = n * current.tensor.nb[1] + 2;
+    auto y      = inplace ? residual.tensor : updated.tensor;
+    auto before = f.state_view();
+    if (wide || paired_padding) before.history.field.tensor.region.alignment = 8;
+    if (scalar) before.history.field.tensor.region.alignment = 1;
+    auto& device      = cuda_environment().context;
+    const auto ex     = device.execution_view();
+    const auto launch = [&] {
+        if (norm)
+            ops::ple_conv_add_norm(residual.tensor, gated.tensor, f.kernel.tensor, ragged.view,
+                                   before, current.tensor, f.norm.tensor, epsilon, y,
+                                   normalized.tensor, ex);
+        else
+            ops::ple_conv_add(residual.tensor, gated.tensor, f.kernel.tensor, ragged.view, before,
+                              current.tensor, y, ex);
+    };
     const auto unpack = [&](const Tensor& tensor) {
         return ragged.unpack(from_device<std::uint16_t>(tensor.data, D * n), width, D);
     };
-    const auto out = unpack(y), z = norm ? unpack(normalized.tensor) : std::vector<std::uint16_t>{};
-    int failures = f.verify(norm, "ragged PLE convolution", &out, norm ? &z : nullptr);
-    for (const auto* data : {&residual, &updated, &normalized})
-        failures += data->device->verify_guards("ragged PLE convolution");
-    return failures + gated.preserved("ragged gated values") +
-           current.preserved("ragged current values");
+    DecodeGraphDefinition definition;
+    DecodeGraphExecutable executable;
+    int failures = 0;
+    for (int phase = 0; phase < (graph ? 2 : 1); ++phase) {
+        if (phase) rotate_replay_partition(ragged);
+        f.prepare(phase, false);
+        f.valid         = ragged.lengths;
+        f.source.back() = f.source.front();
+        upload_i32(f.d_valid, f.valid);
+        upload_offsets(f.d_source, f.history.tensor, f.source);
+        residual.host = ragged.pack(f.residual.host, width, D);
+        gated.host    = ragged.pack(f.gated.host, width, D);
+        for (int s = 0; s < rows; ++s)
+            for (int t = 0; t < ragged.lengths[s]; ++t)
+                std::copy_n(f.records.host.begin() + f.records.index(0, t + f.offset[s], s), D,
+                            current.host.begin() + current.index(0, ragged.prefix[s] + t));
+        for (const auto* data : {&residual, &gated, &current, &updated, &normalized})
+            data->upload();
+        cuda_synchronize();
+        if (graph && phase == 0) {
+            definition.capture(device.stream(), launch);
+            executable.instantiate(definition);
+        }
+        if (graph)
+            executable.launch(device.stream());
+        else
+            launch();
+        device.synchronize();
+        const auto out = unpack(y);
+        const auto z   = norm ? unpack(normalized.tensor) : std::vector<std::uint16_t>{};
+        failures += f.verify(norm, "ragged PLE convolution", &out, norm ? &z : nullptr);
+        for (const auto* data : {&residual, &updated, &normalized})
+            failures += data->device->verify_guards("ragged PLE convolution");
+        failures += gated.preserved("ragged gated values") + current.preserved("ragged records");
+        if (!inplace) failures += residual.preserved("ragged residual");
+    }
+    return failures;
 }
 } // namespace
 
 void add_ple_conv_cases(ninfer::test::OpSuite& suite) {
-    suite.add("ple_conv/ragged/plain", [] { return ragged_conv(false); });
-    suite.add("ple_conv/ragged/norm", [] { return ragged_conv(true); });
-    suite.add("ple_conv/ragged/padded_records", [] { return ragged_conv(true, true); });
+    using Layout = RaggedConvLayout;
+    suite.add("ple_conv/ragged/single",
+              [] { return ragged_conv({17}, true, Layout::WidePadded, true, false); });
+    suite.add("ple_conv/ragged/small",
+              [] { return ragged_conv({1, 2, 5}, false, Layout::Dense, false, false); });
+    suite.add("ple_conv/ragged/large_norm",
+              [] { return ragged_conv({511, 513}, true, Layout::WidePadded, true, true); },
+              {{"execution", "graph"}});
+    suite.add("ple_conv/ragged/large_norm_paired_stride",
+              [] { return ragged_conv({511, 513}, true, Layout::PairedPadded, true, false); });
+    for (bool norm : {false, true}) {
+        const auto name = std::string("ple_conv/ragged/") + (norm ? "norm" : "plain");
+        suite.add(name + "/paired",
+                  [=] {
+                      return ragged_conv({1, 2, 5, 8, 9, 10, 17, 129}, norm, Layout::WidePadded,
+                                         false, true);
+                  },
+                  {{"execution", "graph"}});
+        suite.add(name + "/scalar", [=] {
+            return ragged_conv({1, 2, 5, 8, 9, 10, 17, 129}, norm, Layout::ScalarPadded, true,
+                               false);
+        });
+    }
     suite.add("ple_conv/contract", [] { return validation(cuda_environment().context); });
+    suite.add("ple_conv/ragged/contract", ragged_validation);
     suite.add("ple_conv/history_gap",
               [] { return output_in_history_gap(cuda_environment().context); });
     const auto add = [&](int t, int b, int layout, bool inplace, bool norm, bool graph = false,

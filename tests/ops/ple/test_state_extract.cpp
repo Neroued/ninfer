@@ -1,10 +1,12 @@
 #include "ops/suite.h"
-#include "ops/ragged_fixture.h"
 #include "fixture.h"
 #include "cuda_fixture.h"
 #include "core/buffer.h"
 #include "ninfer/ops/ple.h"
 #include "core/decode_graph.h"
+
+#include <cstring>
+#include <numeric>
 
 using namespace ninfer;
 using namespace ninfer::test;
@@ -106,43 +108,209 @@ int run(DeviceContext& device, int batch, int layout, bool inplace, bool sliced,
     return failures;
 }
 
-int ragged_extract(bool padded) {
-    RaggedFixture ragged({1, 3, 17, 65});
-    constexpr int slots = 8;
-    const std::vector<int> source{3, 1, 6, 0}, destination{3, 4, 6, 2};
-    Words history({D, 9, slots}, 1, history_strides(slots, 1)),
-        values({D, ragged.tokens()}, padded, column_strides(ragged.tokens(), 1, padded));
-    history.fill(1001, 1.0f, true);
-    values.fill(1013, 1.0f, true);
+int ragged_validation() {
+    const RaggedFixture ragged({1, 1});
+    Words history({D, 9, 2}), values({D, 2});
+    auto offsets = to_device(history_offsets(history.tensor, {0, 1}));
     history.upload();
     values.upload();
-    auto src          = to_device(history_offsets(history.tensor, source));
-    auto dst          = to_device(history_offsets(history.tensor, destination));
-    const auto input  = history_field(history.tensor, history.device->span(),
-                                      Tensor(src.span(), DType::I64, {ragged.segments()}));
-    const auto output = history_field(history.tensor, history.device->span(),
-                                      Tensor(dst.span(), DType::I64, {ragged.segments()}));
-    auto expected     = history.host;
-    for (int s = 0; s < ragged.segments(); ++s)
-        for (int h = 0; h < 9; ++h) {
-            const int local  = ragged.lengths[s] - 9 + h;
-            const auto* from = local < 0
-                                   ? history.host.data() + history.index(0, local + 9, source[s])
-                                   : values.host.data() + values.index(0, ragged.prefix[s] + local);
-            std::copy_n(from, D, expected.begin() + history.index(0, h, destination[s]));
-        }
-    ops::ple_state_extract(ops::PleConvStateView{input}, values.tensor, ragged.view, {output},
-                           cuda_environment().default_execution);
     cuda_synchronize();
-    return verify_exact("ragged updated histories and neighbours", history.download(), expected) +
-           history.device->verify_guards("ragged PLE state") +
-           values.preserved("ragged state records");
+    const auto state  = history_field(history.tensor, history.device->span(),
+                                      Tensor(offsets.span(), DType::I64, {2}));
+    auto& device      = cuda_environment().context;
+    const auto launch = [&](const StateFieldView& after) {
+        ops::ple_state_extract(ops::PleConvStateView{state}, values.tensor, ragged.view, {after},
+                               device.execution_view());
+    };
+    auto invalid         = state;
+    invalid.field.layers = 2;
+    const int failures   = rejects("ragged extract history layer", [&] { launch(invalid); });
+    invalid              = state;
+    invalid.field.tensor.region.offset += 1;
+    return failures + rejects("ragged extract history base alignment", [&] { launch(invalid); });
+}
+
+int ragged_extract(int layout, std::vector<int> source, std::vector<int> destination, bool graph,
+                   std::vector<int> lengths = {1, 2, 8, 9, 10, 65}) {
+    RaggedFixture ragged(std::move(lengths));
+    constexpr int slots = 13;
+    const int rows = ragged.segments(), n = ragged.tokens();
+    const bool inplace = source == destination;
+    Words history({D, 9, slots}, layout == 1, history_strides(slots, layout == 1)),
+        values({D, n}, layout == 1, column_strides(n, 1, layout));
+    auto& device = cuda_environment().context;
+    DeviceBuffer src(device.device(), rows * sizeof(std::int64_t));
+    DeviceBuffer dst(device.device(), rows * sizeof(std::int64_t));
+    const auto input = history_field(history.tensor, history.device->span(),
+                                     Tensor(src.span(), DType::I64, {rows}));
+    const auto output =
+        history_field(history.tensor, history.device->span(),
+                      Tensor(inplace ? src.span() : dst.span(), DType::I64, {rows}));
+    const auto launch = [&] {
+        ops::ple_state_extract(ops::PleConvStateView{input}, values.tensor, ragged.view, {output},
+                               device.execution_view());
+    };
+    DecodeGraphDefinition definition;
+    DecodeGraphExecutable executable;
+    int failures = 0;
+    for (int phase = 0; phase < (graph ? 2 : 1); ++phase) {
+        if (phase) rotate_replay_partition(ragged);
+        history.fill(1001 + phase, 1.0f, true);
+        values.fill(1013 + phase, 1.0f, true);
+        for (int s = 0; s < slots; ++s)
+            for (int h = 0; h < 9; ++h) history.host[history.index(0, h, s)] = 0x8000;
+        for (int t = 0; t < n; ++t) values.host[values.index(1, t)] = 0x8000;
+        if (phase) {
+            for (int& slot : source) slot = (slot + 1) % slots;
+            for (int& slot : destination) slot = (slot + 1) % slots;
+        }
+        history.upload();
+        values.upload();
+        upload_offsets(src, history.tensor, source);
+        if (!inplace) upload_offsets(dst, history.tensor, destination);
+        auto expected = history.host;
+        for (int s = 0; s < rows; ++s)
+            for (int h = 0; h < 9; ++h) {
+                const int local = ragged.lengths[s] - 9 + h;
+                const auto* from =
+                    local < 0 ? history.host.data() + history.index(0, local + 9, source[s])
+                              : values.host.data() + values.index(0, ragged.prefix[s] + local);
+                std::copy_n(from, D, expected.begin() + history.index(0, h, destination[s]));
+            }
+        cuda_synchronize();
+        if (graph && phase == 0) {
+            definition.capture(device.stream(), launch);
+            executable.instantiate(definition);
+        }
+        if (graph)
+            executable.launch(device.stream());
+        else
+            launch();
+        device.synchronize();
+        failures +=
+            verify_exact("ragged updated histories and neighbours", history.download(), expected);
+        failures += history.device->verify_guards("ragged PLE state") +
+                    values.preserved("ragged state records");
+        failures += verify_exact("ragged source offsets", from_device<std::int64_t>(src, rows),
+                                 history_offsets(history.tensor, source));
+        if (!inplace)
+            failures +=
+                verify_exact("ragged destination offsets", from_device<std::int64_t>(dst, rows),
+                             history_offsets(history.tensor, destination));
+    }
+    return failures;
+}
+
+int ragged_shared_storage() {
+    constexpr int history_columns = 9;
+    const RaggedFixture ragged({1, 3});
+    const int rows = ragged.segments(), n = ragged.tokens();
+    const int first_record = 1, first_history = first_record + n;
+    Words pool({D, first_history + rows * history_columns});
+    const auto storage = pool.device->span();
+    const auto records = pool.tensor.slice(1, first_record, n);
+    const auto history = pool.tensor.slice(1, first_history, rows * history_columns)
+                             .view({D, history_columns, rows});
+    const auto offsets                  = history_offsets(history, {0, 1});
+    const auto offsets_bytes            = offsets.size() * sizeof(std::int64_t);
+    auto state                          = history_field(history, storage,
+                                                        Tensor(storage.subspan(0, offsets_bytes), DType::I64, {rows}));
+    state.field.tensor.region.alignment = 1;
+    auto layout                         = ragged.view;
+    const auto mapping_bytes            = ragged.mapping.size() * sizeof(int);
+    layout.token_to_seq = Tensor(storage.subspan(offsets_bytes, mapping_bytes), DType::I32, {n});
+    pool.fill(1237, 1.f, true);
+    auto* metadata = reinterpret_cast<std::byte*>(pool.host.data());
+    std::memcpy(metadata, offsets.data(), offsets_bytes);
+    std::memcpy(metadata + offsets_bytes, ragged.mapping.data(), mapping_bytes);
+    pool.upload();
+    cuda_synchronize();
+
+    auto expected = pool.host;
+    for (int s = 0; s < rows; ++s) {
+        const int dst       = first_history + s * history_columns;
+        const int length    = ragged.lengths[s];
+        const auto kept     = pool.host.begin() + pool.index(0, dst + length);
+        const auto appended = pool.host.begin() + pool.index(0, first_record + ragged.prefix[s]);
+        auto output         = expected.begin() + pool.index(0, dst);
+        output              = std::copy_n(kept, D * (history_columns - length), output);
+        std::copy_n(appended, D * length, output);
+    }
+    auto& device = cuda_environment().context;
+    const ops::PleConvStateView in_place{state};
+    ops::ple_state_extract(in_place, records, layout, in_place, device.execution_view());
+    device.synchronize();
+    return verify_exact("extract preserves shared records and metadata", pool.download(),
+                        expected) +
+           pool.device->verify_guards("ragged shared storage");
+}
+
+int ragged_extract_grid_slice() {
+    constexpr int rows = 65'536, history_columns = 9;
+    constexpr std::size_t record_bytes  = D * sizeof(std::uint16_t);
+    constexpr std::size_t history_bytes = history_columns * record_bytes;
+    auto& device                        = cuda_environment().context;
+    std::size_t free_bytes = 0, total_bytes = 0;
+    CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+    if (free_bytes < (16ULL << 30)) throw OpTestSkip("requires 16 GiB of free CUDA memory");
+
+    const RaggedFixture ragged(std::vector<int>(rows, 1));
+    DeviceBuffer history(device.device(), rows * history_bytes);
+    DeviceBuffer records(device.device(), rows * record_bytes);
+    std::vector<std::int64_t> offsets(rows);
+    for (int row = 0; row < rows; ++row) offsets[row] = row * history_bytes;
+    auto d_offsets = to_device(offsets);
+    const auto state =
+        history_field(Tensor(history.span(), DType::BF16, {D, history_columns, rows}),
+                      history.span(), Tensor(d_offsets.span(), DType::I64, {rows}));
+    history.fill(0x31);
+    records.fill(0x11);
+    cuda_synchronize();
+
+    constexpr std::array boundary_rows{0, 1, rows - 2, rows - 1};
+    std::array<std::vector<std::uint16_t>, boundary_rows.size()> expected;
+    std::vector<std::uint16_t> before(D * history_columns), appended(D);
+    for (int i = 0; i < int(boundary_rows.size()); ++i) {
+        const int row = boundary_rows[i];
+        std::iota(before.begin(), before.end(), std::uint16_t(0x8000 + i * D));
+        std::iota(appended.begin(), appended.end(), std::uint16_t(i * D));
+        history.copy_from_host(before.data(), history_bytes, offsets[row]);
+        records.copy_from_host(appended.data(), record_bytes, row * record_bytes);
+        expected[i].assign(before.begin() + D, before.end());
+        expected[i].insert(expected[i].end(), appended.begin(), appended.end());
+    }
+    const ops::PleConvStateView in_place{state};
+    ops::ple_state_extract(in_place, Tensor(records.span(), DType::BF16, {D, rows}), ragged.view,
+                           in_place, device.execution_view());
+    device.synchronize();
+
+    int failures = 0;
+    std::vector<std::uint16_t> actual(D * history_columns);
+    for (int i = 0; i < int(boundary_rows.size()); ++i) {
+        const int row = boundary_rows[i];
+        history.copy_to_host(actual.data(), history_bytes, offsets[row]);
+        const auto label = "extract grid slice row " + std::to_string(row);
+        failures += verify_exact(label.c_str(), actual, expected[i]);
+    }
+    return failures;
 }
 } // namespace
 
 void add_ple_state_extract_cases(ninfer::test::OpSuite& suite) {
-    suite.add("ple_state_extract/ragged", [] { return ragged_extract(false); });
-    suite.add("ple_state_extract/ragged/padded_records", [] { return ragged_extract(true); });
+    suite.add("ple_state_extract/ragged/contract", ragged_validation);
+    suite.add("ple_state_extract/ragged/shared_storage", ragged_shared_storage);
+    suite.add("ple_state_extract/ragged/grid_slice", ragged_extract_grid_slice,
+              {{"suite", "concurrency"}});
+    suite.add("ple_state_extract/ragged/single",
+              [] { return ragged_extract(0, {3}, {3}, false, {2}); });
+    suite.add("ple_state_extract/ragged/paired_alias",
+              [] { return ragged_extract(0, {3, 1, 6, 0, 7, 9}, {3, 1, 6, 0, 7, 9}, true); },
+              {{"execution", "graph"}});
+    suite.add("ple_state_extract/ragged/scalar_mixed",
+              [] { return ragged_extract(1, {3, 1, 6, 0, 7, 9}, {3, 4, 6, 2, 8, 9}, true); },
+              {{"execution", "graph"}});
+    suite.add("ple_state_extract/ragged/padded_shared_source",
+              [] { return ragged_extract(2, {3, 1, 1, 0, 7, 3}, {12, 4, 11, 2, 8, 9}, false); });
     const auto add = [&](int batch, int layout, bool inplace, bool sliced) {
         suite.add("ple_state_extract/b" + std::to_string(batch) + "/layout" +
                       std::to_string(layout) + (inplace ? "/alias" : "/disjoint") +

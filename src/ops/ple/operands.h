@@ -25,8 +25,6 @@ inline bool field_aligned(const ConstStateFieldView& view, std::size_t alignment
                0;
 }
 
-common::operand::Range ragged_record_range(const Tensor& records, int tokens, Device device);
-
 void validate_gate(const PleProjectionView& projected, const Tensor& residual,
                    const PleGateParameters& parameters, const PleBatchView& batch,
                    const PleConvRecordWindowView& records, const Tensor& gated,
@@ -35,9 +33,12 @@ void validate_conv(const Tensor& residual, const Tensor& gated, const Tensor& ke
                    const PleBatchView& batch, const ConstPleConvStateView& before,
                    const PleConvRecordWindowView& current, const Tensor& updated,
                    const Tensor* norm_weight, float epsilon, const Tensor* normalized,
-                   CudaExecutionView execution);
+                   CudaExecutionView execution, const RaggedSequenceView* ragged = nullptr);
 void validate_extract(const ConstPleConvStateView& before, const PleConvRecordReadView& records,
                       const Tensor& accepted, const PleConvStateView& after,
                       const Tensor& live_rows, CudaExecutionView execution);
+void validate_extract(const ConstPleConvStateView& before, const Tensor& records,
+                      const RaggedSequenceView& ragged, const PleConvStateView& after,
+                      CudaExecutionView execution);
 
 } // namespace ninfer::ops::detail::ple

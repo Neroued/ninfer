@@ -33,6 +33,7 @@ struct Arguments {
     std::uint64_t multipliers[3];
     HashHead heads[kHeads];
     Shard shards[128];
+    const std::int32_t *cu_seqlens = nullptr, *token_to_seq = nullptr;
 };
 
 static_assert(sizeof(Arguments) <= 4096);
@@ -44,16 +45,17 @@ void require(bool condition, const char* message) {
 Arguments arguments(const Tensor& ids, const Tensor& valid, const NgramTokenTailView& before,
                     const NgramHashParameters& hash, int eos,
                     std::span<const Nf4EmbeddingShard> shards, Tensor& out,
-                    CudaExecutionView execution) {
+                    CudaExecutionView execution, const RaggedSequenceView* ragged = nullptr) {
     const int tokens = ids.ne[0], batch = ids.ne[1];
+    const int rows    = ragged ? ragged->num_seqs() : batch;
     const auto device = execution.device();
     require(tokens > 0 && batch >= 1, "invalid T/B");
     require(eos >= 0 && shards.size() <= 128, "invalid EOS or shard count");
     operand::slotted_tensor(ids, DType::I32, {tokens, batch}, 1, 4, kOp, "token IDs", device);
     require(before.token_ids.field.layers == 1, "tail layer");
     operand::state_field(before.token_ids, DType::I32, {2}, 4, kOp, "tail IDs", device);
-    operand::tensor(valid, DType::I32, {batch}, 4, kOp, "valid columns", device);
-    operand::shape(before.token_ids.records.byte_offsets, {batch, 1, 1, 1}, kOp,
+    if (!ragged) operand::tensor(valid, DType::I32, {batch}, 4, kOp, "valid columns", device);
+    operand::shape(before.token_ids.records.byte_offsets, {rows, 1, 1, 1}, kOp,
                    "tail byte offsets");
     operand::tensor(out, DType::BF16, {kHeads * kWidth, tokens, batch}, 16, kOp, "embedding",
                     device);
@@ -71,6 +73,10 @@ Arguments arguments(const Tensor& ids, const Tensor& valid, const NgramTokenTail
     a.tokens        = tokens;
     a.batch         = batch;
     a.eos           = eos;
+    if (ragged) {
+        a.cu_seqlens   = static_cast<const std::int32_t*>(ragged->cu_seqlens.data);
+        a.token_to_seq = static_cast<const std::int32_t*>(ragged->token_to_seq.data);
+    }
     std::copy(hash.multipliers.begin(), hash.multipliers.end(), a.multipliers);
     std::uint64_t previous_end = 0;
     for (std::size_t i = 0; i < shards.size(); ++i) {
@@ -126,7 +132,7 @@ __device__ std::uint32_t hash_row(std::uint64_t word, const HashHead& head) {
     return head.offset + static_cast<std::uint32_t>(remainder);
 }
 
-template <int Warps>
+template <int Warps, bool Ragged>
 __global__ __launch_bounds__(Warps * 32) void lookup_kernel(const __grid_constant__ Arguments a) {
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
     const auto tasks = std::int64_t(a.tokens) * a.batch * kHeads;
@@ -134,12 +140,23 @@ __global__ __launch_bounds__(Warps * 32) void lookup_kernel(const __grid_constan
          task += std::int64_t(gridDim.x) * Warps) {
         const int head_index = task % kHeads;
         const auto column    = task / kHeads;
-        const int b = column / a.tokens, t = column % a.tokens;
+        int b = 0, t = 0;
+        if constexpr (!Ragged) {
+            b = column / a.tokens;
+            t = column % a.tokens;
+        }
         const auto& head  = a.heads[head_index];
         int owner         = -1;
         std::uint32_t row = 0;
-        if (lane == 0 && head.first < head.last && t < a.valid[b]) {
-            const auto* ids     = a.ids + b * a.id_stride;
+        if (lane == 0 && head.first < head.last && (Ragged || t < a.valid[b])) {
+            const int* ids;
+            if constexpr (Ragged) {
+                b   = a.token_to_seq[column];
+                t   = column - a.cu_seqlens[b];
+                ids = a.ids + column - t;
+            } else {
+                ids = a.ids + b * a.id_stride;
+            }
             const auto offset   = t < 2 ? a.state_offsets[b] : 0;
             const auto* tail    = a.tail + offset / 4;
             const auto current  = std::uint64_t(ids[t]);
@@ -186,48 +203,52 @@ __global__ __launch_bounds__(Warps * 32) void lookup_kernel(const __grid_constan
         }
     }
 }
+
+template <bool Ragged>
+void launch_lookup(const Arguments& a, CudaExecutionView execution) {
+    const auto columns = std::int64_t(a.tokens) * a.batch;
+    const auto tasks   = columns * kHeads;
+    if (columns <= 8) {
+        lookup_kernel<1, Ragged><<<int(tasks), 32, 0, execution.stream()>>>(a);
+    } else {
+        const int blocks =
+            int(std::min((tasks + 7) / 8, std::int64_t(execution.multiprocessor_count()) * 16));
+        lookup_kernel<8, Ragged><<<blocks, 256, 0, execution.stream()>>>(a);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
 } // namespace
 
 void ngram_embedding_lookup(const Tensor& token_ids, const Tensor& valid_columns,
                             const NgramTokenTailView& before, const NgramHashParameters& hash,
                             std::int32_t eos, std::span<const Nf4EmbeddingShard> shards,
                             Tensor& embedding, CudaExecutionView execution) {
-    const auto a =
-        arguments(token_ids, valid_columns, before, hash, eos, shards, embedding, execution);
-    const auto tasks = std::int64_t(a.tokens) * a.batch * kHeads;
-    if (a.tokens * std::int64_t(a.batch) <= 8) {
-        lookup_kernel<1><<<int(tasks), 32, 0, execution.stream()>>>(a);
-    } else {
-        const int blocks =
-            int(std::min((tasks + 7) / 8, std::int64_t(execution.multiprocessor_count()) * 16));
-        lookup_kernel<8><<<blocks, 256, 0, execution.stream()>>>(a);
-    }
-    CUDA_CHECK(cudaGetLastError());
+    launch_lookup<false>(
+        arguments(token_ids, valid_columns, before, hash, eos, shards, embedding, execution),
+        execution);
 }
 
 void ngram_embedding_lookup(const Tensor& token_ids, const RaggedSequenceView& ragged,
                             const NgramTokenTailView& before, const NgramHashParameters& hash,
                             std::int32_t eos, std::span<const Nf4EmbeddingShard> shards,
                             Tensor& embedding, CudaExecutionView execution) {
-    namespace operand        = common::operand;
-    constexpr const char* op = "ngram_embedding_lookup";
-    const auto device        = execution.device();
-    operand::ragged_sequence(ragged, op, device);
+    const auto device = execution.device();
+    operand::ragged_sequence(ragged, kOp, device);
     const int n = ragged.total_tokens(), rows = ragged.num_seqs();
-    operand::tensor(token_ids, DType::I32, {n}, 4, op, "token IDs", device);
-    operand::tensor(embedding, DType::BF16, {2560, n}, 16, op, "embedding", device);
-    operand::state_field(before.token_ids, DType::I32, {2}, 4, op, "token history", device);
-    operand::shape(before.token_ids.records.byte_offsets, {rows, 1, 1, 1}, op, "state offsets");
-    for (const auto* input : {&token_ids, &ragged.cu_seqlens, &ragged.seq_lengths,
-                              &ragged.token_to_seq, &before.token_ids.records.byte_offsets})
-        operand::disjoint(operand::range(embedding, op), operand::range(*input, op), op);
-    for (int s = 0; s < rows; ++s) {
-        const int begin = ragged.segment_begin(s), len = ragged.segment_length(s);
-        auto out = embedding.slice(1, begin, len);
-        ngram_embedding_lookup(token_ids.slice(0, begin, len), ragged.seq_lengths.slice(0, s, 1),
-                               {operand::state_row(before.token_ids, s)}, hash, eos, shards, out,
-                               execution);
+    operand::tensor(token_ids, DType::I32, {n}, 4, kOp, "token IDs", device);
+    operand::tensor(embedding, DType::BF16, {kHeads * kWidth, n}, 16, kOp, "embedding", device);
+    const auto destination = operand::range(embedding, kOp);
+    for (const auto* input : {&ragged.cu_seqlens, &ragged.seq_lengths, &ragged.token_to_seq})
+        operand::disjoint(destination, operand::range(*input, kOp), kOp);
+    const auto ids = token_ids.view({n, 1});
+    if (rows == 1) {
+        auto out = embedding.view({kHeads * kWidth, n, 1});
+        ngram_embedding_lookup(ids, ragged.seq_lengths, before, hash, eos, shards, out, execution);
+        return;
     }
+    launch_lookup<true>(arguments(ids, ragged.seq_lengths, before, hash, eos, shards, embedding,
+                                  execution, &ragged),
+                        execution);
 }
 
 } // namespace ninfer::ops

@@ -23,11 +23,15 @@ Engine 记录请求生命周期、调度工作和协调侧执行边界；模型/
 | Resolution | 结果可用之后的解释、决定及提交交接区间 |
 | Retirement | 后续设备提交与最终资源退役区间 |
 | GPU stream 时间 | 对应设备事件区间，可以与 Host 或另一 stream 重叠 |
-| Host 工作时间 | 实际 CPU 工作区间，不等于整个请求或设备等待墙钟 |
+| Host 工作时间 | 协调线程各互斥调用阶段的墙钟，包含 executor flush，另计 scheduler yield/relock |
 
 分布式执行的组耗时来自完整完成边界；各 rank 的设备时间分别展示，不相加当作组延迟。
 Prefill chunk 和 decode step 使用执行样本。Decode 按实际 batch 分组，不能用平均 batch
 解释目标并发的延迟。Spec 的实际接受量与执行时间分开，token/s 不能代替每步计算成本。
+
+启用 speculation 的 Decode 行步按[验证长度与授予](speculative-decoding.md#逐轮验证长度与容量授予)
+互斥计入 `rounds`、`bypass_steps` 或 `fallback_steps`。`proposed_tokens` 计收窄前候选，
+`drafted_tokens` 计实际送入验证的候选。
 
 首 token、结果返回、提交被接受和最后消费者退出不是同一个时刻。
 批量请求结束先发布结算后的快照，再通知请求完成；每个请求按自己的完成时点结算 Host exposure。
@@ -78,6 +82,8 @@ profiler 并保留原始错误。窗口可以复用自然预热的缓存，不�
 
 启动进度携带 rank/node、attempt 与 phase 身份，耗时由生产者提供；嵌套阶段解释父阶段，
 不能再次相加。转发有界，失败保留最终原因，日志回调异常不改变引擎准备结果。
+自适应长度校准以 `SpeculativeCalibration` 阶段报告进度。启用 speculative backend 时，
+`StartupReport::speculative` 提供长度策略、校准结果和准备的 target 宽度。
 
 日志包含必要的标识、计数和原因，不输出凭据、prompt、生成内容或媒体载荷。
 预期请求拒绝、可恢复问题与实例失败按实际影响分类；不能用更高日志级别代替正确的错误归属。

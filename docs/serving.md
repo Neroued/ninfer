@@ -33,7 +33,9 @@ ID in requests; `GET /v1/models` returns it.
 Enable `--vision` at startup for image/video requests. Without it, media generation and media
 counting requests return HTTP 400 `vision_disabled`. Select a speculative backend with
 `--spec mtp|dflash|dflash2` and `--draft-tokens`; `--proposal-head optimized` loads the additional
-head when available. Components omitted at startup cannot be enabled by a later HTTP request.
+head when available. Serve defaults to adaptive verification length. Use `--spec-length-policy fixed`
+to skip speculative cost calibration and use the fixed window subject to request and capacity limits.
+Components omitted at startup cannot be enabled by a later HTTP request.
 The [CLI guide](cli.md#speculative-decoding) describes backend and head differences across models.
 
 Qwen and GLM use the same protocol surfaces with their own templates and output decoders.
@@ -934,9 +936,13 @@ listener and follow the server's API-key authentication. The first two return JS
 They expose observations without submitting model work or resetting counters.
 
 - Info describes the instance, selected model/backend, effective configuration, rank/placement
-  topology and startup resources. Credentials are redacted.
+  topology and startup resources. Credentials are redacted. With a speculative backend,
+  `resources.speculative` contains `backend`, `length_policy`, `draft_window`, `calibrated`,
+  `calibration_anchors`, `calibration_contexts`, `calibration_seconds`, and `target_widths`.
 - Snapshot contains `engine` and `service` observations, including execution samples, per-rank
-  resources and current requests. Missing timing samples remain unmeasured.
+  resources and current requests. Each `engine.in_flight` entry has a `speculative` field with
+  `verify_width`, `valid_target_tokens`, `mtp_steps`, and `head_columns` when verification geometry
+  is available. Otherwise the field is `null`. Missing timing samples remain unmeasured.
 - Events describe live request/service transitions. Subscribers are bounded; capacity exhaustion
   returns HTTP 503. The stream has no historical replay.
 
@@ -963,12 +969,14 @@ curl http://127.0.0.1:8080/metrics
 
 | Metrics | Meaning |
 |---|---|
-| `ninfer_model_info`, `ninfer_max_concurrency`, `ninfer_max_context_tokens` | Model/backend identity and startup limits |
-| `ninfer_requests_running`, `waiting`, `paused`, `prefilling`, `decode_ready`, `replaying`, `materializing` | Current Engine gauges; prefill/decode/replay are subsets of resident requests |
+| `ninfer_model_info{model_name,speculative_backend,speculative_length_policy}` | Resident model, backend, and effective length policy |
+| `ninfer_max_concurrency`, `ninfer_max_context_tokens`, `ninfer_spec_decode_draft_window` | Startup limits for active requests, per-request context, and draft window |
+| `ninfer_requests_{running,waiting,paused,prefilling,decode_ready,replaying,materializing}` | Current Engine gauges. Prefill, decode, and replay are subsets of resident requests |
 | `ninfer_prompt_tokens_total`, `ninfer_prompt_tokens_cached_total` | Full input and reused tokens counted once on initial binding |
 | `ninfer_prefill_tokens_total`, `ninfer_replayed_tokens_total` | Actual initial prefill and separate recovery recomputation |
 | `ninfer_generation_tokens_total`, `ninfer_decode_tokens_total` | All committed outputs, or decode/control outputs excluding the first token; include thinking and injected control tokens |
-| `ninfer_spec_decode_{rounds,draft_tokens,accepted_tokens,fallback_steps}_total` | Live native speculative work, including MTP and DFlash/DFlash2 |
+| `ninfer_spec_decode_{rounds,proposed_tokens,draft_tokens,accepted_tokens,bypass_steps,fallback_steps}_total` | Row-level verification rounds, drafts generated before narrowing, drafts evaluated by verification, accepted drafts, steps with a grant and zero verified drafts (bypass), and steps without a grant (fallback) |
+| `ninfer_spec_decode_committed_draft_tokens_total` | Accepted drafts retained after output limits, stops, and cancellation |
 | `ninfer_spec_decode_position_tokens_total{kind,position}` | Attempted and accepted draft tokens at each zero-based position |
 | `ninfer_{preemptions,snapshot_restores,replay_restores}_total` | Pressure pauses and recovery routes |
 | `ninfer_context_pool_bytes{rank,domain,kind}` | Per-rank Device/Host capacity, live, reserved, pending retirement, padding, assigned/unassigned free and tail bytes |
@@ -977,10 +985,9 @@ curl http://127.0.0.1:8080/metrics
 | `ninfer_context_{state,history}_objects`, `ninfer_context_kv_page_groups{pool_id}` | Logical object counts, without independent capacity quotas |
 | `ninfer_context_metadata_{budget,allocated,reserved}_bytes` | Coordinator Context metadata budget and usage |
 | `ninfer_context_transfer_bytes_total{resource,pool_id,direction}` | Completed State or KV payload transfers; `pool_id` is present for KV |
-| `ninfer_host_work_seconds_total{phase}`, `ninfer_device_wait_seconds_total` | Instrumented worker wall time; device wait is not CUDA kernel time |
+| `ninfer_host_work_seconds_total{phase}`, `ninfer_scheduler_yield_seconds_total`, `ninfer_executor_flush_seconds_total` | Worker call wall time by phase, scheduler yield/relock wall time, and executor flush wall time. The flush counter reports the `executor_flush` Host phase separately |
 | `ninfer_constraint_requests_total{outcome}`, `ninfer_constraint_cache_total{result}` | Settled constrained requests by completion state and compilation-cache access |
 | `ninfer_constraint_{prepare,mask,matcher}_seconds_total`, `ninfer_constraint_mask_{positions,upload_bytes}_total` | Constraint work aggregated at request settlement, including truncated/cancelled results |
-| `ninfer_constraint_draft_wait_seconds_total` | Live draft-ready wait counted once per batch; a subset of device wait |
 | `ninfer_requests_total{outcome}`, `ninfer_response_failures_total` | Generation attempts entering preparation and subsequent response failures; protocol/model validation failures and token-count requests are excluded |
 | `ninfer_rank_gpu_interval_seconds_total`, `ninfer_rank_gpu_interval_samples_total` | Per-rank CUDA stream totals and sample counts; require GPU timing |
 | `ninfer_execution_units_total`, `ninfer_execution_rows_total`, `ninfer_execution_positions_total`, `ninfer_execution_elapsed_seconds_total` | Completed work and all-rank retirement time by execution kind |
@@ -1006,12 +1013,12 @@ the JSONL log. Monitoring tools with engine-specific metric names need an NInfer
 ## Structured request log
 
 `--request-log-jsonl FILE` enables the machine-readable measurement log. The server opens `FILE`
-in append mode and flushes every event, so successive model or MTP blocks may share one campaign
+in append mode and flushes every event, so successive model or speculation blocks may share one campaign
 file. The parent directory must already exist. Failure to open the file aborts startup; the log path
 is also rejected if it resolves to the model artifact.
 
 Every line is one `ninfer_serve_request_log` JSON object with a `schema_version` identifying its
-field contract. The current version is defined in [request_log.h](../src/serve/request_log.h).
+field contract. The current version is 33. See [request_log.h](../src/serve/request_log.h).
 All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
 that server instance. Successful request-start records include request-scoped acquisition,
@@ -1021,7 +1028,7 @@ they do not infer request behavior from process-global counter deltas.
 | Event | Contents |
 |---|---|
 | `startup_config` | before model loading: active entry, configuration path, merged values, per-field default/file/argv sources, environment controls and redacted argv |
-| `server_start` | artifact identity, model/configuration, effective sampling defaults, per-rank resource budgets and observations under `resources.ranks`, aggregate explicit allocations under `resources.total_allocations`, environment and redacted argv |
+| `server_start` | artifact identity, model/configuration including `engine.speculative_length_policy`, effective sampling defaults, resource budgets and observations, optional `resources.speculative`, environment and redacted argv |
 | `request_start` | protocol, resolved sampler and seed, requested reasoning effort, actual initial thinking mode and optional budget, Responses semantic-change flag, output budget, stream/message/tool shape |
 | `request_rejected` | parsed request shape, requested reasoning effort, media-item count, `phase: "prepare"`, and the exact HTTP status/type/code/parameter/message for a synchronous preparation rejection |
 | `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, tool-call parse diagnostics, preemption/recovery counters, thinking-budget application counters, unrounded request-stage seconds, per-request Engine Host exposure, and complete speculative-decoding counters |
@@ -1046,9 +1053,10 @@ or `null` for unconstrained requests. Preparation failures and execution errors 
 rejection/error records rather than successful constraint outcomes.
 
 `request_done.timings_seconds` contains `prepare`, `ttft`, `vision_stream`, `prefill`, `decode`, and `total`
-as full-precision JSON numbers. Its `speculative` object contains `backend`, `draft_window`, `rounds`,
-`drafted_tokens`, `accepted_tokens`, `fallback_steps`, and `accepted_per_position`. Rates can be
-derived downstream from raw token counts and seconds instead of rounded stderr strings.
+as full-precision JSON numbers, with `ttft` set to `null` if no first token was committed.
+`request_done.speculative` contains `backend`, `draft_window`, `rounds`, `proposed_tokens`,
+`drafted_tokens`, `accepted_tokens`, `committed_draft_tokens`, `bypass_steps`, `fallback_steps`,
+`attempted_per_position`, and `accepted_per_position`. Derive rates from raw token counts and seconds.
 `generation.scheduling` records preemptions, snapshot/replay restores, replayed tokens, paused time
 and request-owned transfer bytes. Replay rebuilds committed state without adding new output usage.
 
@@ -1079,6 +1087,8 @@ then provides `budget` and sampled `resources`. Each resource observation separa
 `physical_memory`. `resources.total_allocations` sums explicit rank allocations. CUDA free memory,
 planning allowances and workspace usage are different observations and must not be added to that sum.
 On Spark, CUDA and Host memory use the same physical memory; those physical totals are not additive.
+`server_start.resources.speculative`, when present, uses the same fields as
+[`/monitor/info`](#monitoring-api).
 
 Vision's `budget_bytes`, `max_window_features`, encoder workspace, output and staging capacities
 are reported in each rank's `resources.vision`, or `null` when disabled. Encoder workspace is shared
@@ -1087,41 +1097,36 @@ already represented in allocation totals.
 
 `request_done.execution` reports prefill/decode/replay/control/score/context execution exposure,
 separating `result`, `resolution`, `retirement` and `total`. Each has `count`, `total_ns` and
-`maximum_ns`. `request_done.execution.max_rank_gpu_intervals` contains optional CUDA measurements for
-`result_stream`, `commit_stream`, `prefill_stream` and `vision_stream`.
+`maximum_ns`. `request_done.execution.max_rank_gpu_intervals` contains counters for
+`draft_stream`, `target_stream`, `result_stream`, `commit_stream`, `prefill_stream`, and `vision_stream`.
 Enable `--gpu-timing` to collect these samples. A zero sample count means unmeasured, not a measured
 zero duration. Stream intervals may overlap Host work and each other; do not sum them into TTFT.
 `timings_seconds.ttft` is the server's first-token boundary, including service preparation. Client
 network TTFT and `first_output_timing` have their own boundaries.
 
-`request_done.engine_timing` separates FIFO `queue_wait_seconds`, blocking
-`device_wait_exposed_seconds`, and five mutually exclusive Host-active exposure phases under
-`host_exposed_seconds`: `engine_boundary`, `program_submit`, `program_post`,
-`engine_commit_output`, and `engine_maintenance`. `total` is exactly their sum and excludes Device
-wait. The nested `decode` object reports the request's decode-class Host exposure, Device wait, and
-round count; `units` reports its prefill/control unit counts. In a compact batch every participating
-request is delayed by the full round, so these values explain request latency but **must not be
-summed across concurrent requests**.
-`constraint_draft_wait_exposed_seconds` is the request's exposure to the batch's draft-ready wait,
-already included in `device_wait_exposed_seconds`. The `throughput.host_work.constraint_draft_wait_seconds`
-interval and Prometheus counter count each batch once.
+`request_done.engine_timing` reports `queue_wait_seconds`, `scheduler_yield_exposed_seconds`, and
+`host_exposed_seconds`. Host exposure has six mutually exclusive phases (`engine_boundary`,
+`session_call`, `executor_poll`, `executor_flush`, `engine_commit_output`, and `engine_maintenance`),
+with `total` equal to their sum. The nested `decode` object contains `host_exposed_seconds`,
+`scheduler_yield_exposed_seconds`, and `rounds`. The `units` object counts `prefill` and `control`
+units. Each participating request sees the batch's exposure, so use interval Host-work deltas
+for aggregation across concurrent requests.
 
 `request_done.first_output_timing` freezes observations immediately before Engine publishes its
 first nonempty text or tool-argument delta; call metadata does not count. It is `null` when no such
-output exists. This boundary differs from the first accepted model token and the client's first
-HTTP output. Engine elapsed time begins at submit:
-initial queue ends when the successful binding attempt starts, initial binding ends when the
-binding is installed, and paused time includes pause preparation, waiting and restoration. The remaining
-interval is resident time. Its `engine` observations describe resident Host/Device-wait exposure;
-`prefill` and `replay` describe this request's submitted work. Terminal `engine_timing` still covers
-the whole request.
+output exists. This boundary differs from the first committed model token and the client's first
+HTTP output. Engine elapsed time begins at submission. Initial queue time ends when the successful
+binding attempt starts, initial binding ends when the binding is installed, and paused time
+includes pause preparation, waiting, and restoration. The `engine` object uses the
+`engine_timing` fields with observations up to first output, including Host and scheduler-yield
+exposure. The `prefill` and `replay` objects report execution exposure, and `pending_execution`
+describes work still in flight when available. Terminal `engine_timing` covers the whole request.
 
-The work `gpu_seconds` measures Text prefill stream intervals, including their MTP/DFlash work;
-Vision encode, standalone bridges and exact-hit sampling fall outside that interval.
 `context_transfers` contains `state` and a `kv_pools` array indexed by startup `pool_id`. Each
-resource reports `d2h`, `h2d`, `d2d` entries with `images`, `page_groups`, `bytes`, `copy_operations`
-and transfer-event `seconds`. Only completed request-owned copies are included, also when the
-request is later cancelled. Engine interval records expose `context_cache.state_transfers` and
+resource reports `d2h`, `h2d`, `d2d`, `h2h`, and `peer_d2d` entries with `images`, `page_groups`,
+`bytes`, `copy_operations`, and transfer-event `seconds`. Completed request-owned copies are
+included even if the request is later cancelled. Engine interval records expose
+`context_cache.state_transfers` and
 `context_cache.kv_pools`; each KV entry carries its diagnostic `label`, `occupied_page_groups`
 and transfers. `context_cache.occupancy` reports shared pool bytes and logical object counts.
 GPU intervals overlap Host submission and waits, so they are separate evidence, not additional
@@ -1140,10 +1145,11 @@ events only and do not add a second JSONL terminal. Schema/model validation reje
 preparation and token-count-only calls are not measurement requests and do not receive request IDs.
 
 `throughput.execution` reports interval counts and elapsed/mean times for prefill, decode, replay
-and control work. `throughput.speculative` reports that interval's drafts, accepted tokens, rounds
-and acceptance, with `null` acceptance when no drafts were measured. For decode cost at a particular
-actual batch size, use [ninfer_bench](../bench/README.md#engine-微测); aggregate token/s also depends
-on speculative acceptance.
+and control work. `throughput.speculative` reports interval deltas for `proposed_tokens`,
+`drafted_tokens`, `accepted_tokens`, `rounds`, `bypass_steps`, and `fallback_steps`. Its `acceptance`
+is accepted tokens divided by verified drafts, or `null` when no drafts were verified. Aggregate
+token/s also depends on speculative acceptance. For decode cost at a particular actual batch size,
+use [ninfer_bench](../bench/README.md#engine-微测).
 
 By default the server persistently reports aggregate activity every five seconds. `prefill` counts
 prompt suffix tokens actually computed during the interval, excluding prefix-cache hits; `decode`
@@ -1158,10 +1164,12 @@ transfers, tail-page COW and pressure spills as interval deltas; `occupancy` and
 end-of-interval gauges. The separate `scheduling` object reports preemptions, restores and replayed
 tokens. Occupancy includes Host reservations while transfers are in flight.
 
-The JSONL `throughput.host_work` object is the aggregation authority: the Engine worker counts each
-wall-time segment once, independent of batch size. `elapsed_seconds` contains the same five
-mutually exclusive Host phases and their `total`; `device_wait_seconds` is separate.
-`work_class_seconds` splits Host and Device-wait time into decode, prefill, and control classes.
+Use the JSONL `throughput.host_work` object for aggregation. The Engine worker counts each
+wall-time segment once, independent of batch size. `elapsed_seconds` contains the same six
+mutually exclusive Host phases as `engine_timing.host_exposed_seconds` and their `total`.
+`scheduler_yield_seconds` counts yield/relock time separately. `executor_flush_seconds` repeats
+the `executor_flush` phase already included in `total`. `work_class_seconds` reports Host and
+scheduler-yield times for decode, prefill, and control.
 `detail_subset_seconds` and `detail_invocations` expose stats-publication work; these detail values
 are already contained in a top-level Host phase and must not be added to `total`.
 Per-round, per-row-round, and per-invocation normalized values are

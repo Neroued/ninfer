@@ -16,6 +16,10 @@ Family 按计算与维护关系组织。相同模型层的多个计算不自动�
 Text/MTP token 轴的合法范围由语义合同决定。私有 tile、网格和 route 阈值不能收紧公开范围；
 实现可以拆分合法调用。Host envelope 只承诺 Device 值的范围，精确数学仍由设备输入决定。
 
+Attention/Indexer 的公开 [`ContextBucket` / `OpGraphProfile`](../../include/ninfer/ops/context_bucket.h)
+合同让调用方随上下文增长在扁平 CUDA Graph 内更新 kernel 参数切片。调用方据 Op 返回的
+profile 判断哪些桶可共享 patch，内部 selector 由 Op 维护。
+
 ## 代码组织
 
 | 职责 | 内容 |

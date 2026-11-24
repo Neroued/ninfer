@@ -26,7 +26,7 @@ RAM for expert weights; see the [CLI guide](docs/cli.md#cpu-expert-offload).
 Dual-Spark Flash Next uses TP2, optionally with EP2. GLM uses TP2 plus attention DP2, optionally
 with EP2. The [deployment guide](docs/startup-configuration.md#distributed-deployment) explains
 these settings and worker startup. [Example configurations](examples/configs/) cover the common
-deployments, including Vision, FP8 KV, MTP3 and the optimized draft head.
+deployments, including Vision, FP8 KV, speculative decoding, and the optimized draft head.
 
 ## Build
 

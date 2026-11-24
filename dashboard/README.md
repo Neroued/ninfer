@@ -104,6 +104,12 @@ tokens committed by decode rounds; the first token produced by prefill is exclud
 Prefill throughput in the main chart is work per wall second; execution efficiency is
 shown separately in Details. Work is recorded at its engine publication boundary.
 
+Speculative telemetry shows accepted / drafted tokens and mean draft depth (verified drafts
+per decode step, including bypass and fallback). A policy bypass step has a grant and zero
+verified drafts. A fallback step has no grant. Details shows verified / proposed drafts, the
+startup backend, length policy, draft window, target widths, and calibration counts and duration
+when available.
+
 Latency percentiles are estimates from the engine's histogram buckets. A percentile
 falling in the unbounded overflow bucket is shown as `—`; bucket counts remain visible.
 Charts use wall-clock-aligned averages, from 1s at a 1m range to 5s at 15m and 5m at 24h.
@@ -136,7 +142,7 @@ npm run dev
 ```
 
 `npm run check` checks TypeScript and Vue types. `npm run format` formats source files.
-There is no test framework in this application.
+`npm test` runs the unit test suite.
 
 `server/` owns collection, statistics and SQLite. `web/` owns presentation and
 interaction. `shared/types.ts` is the dashboard's browser/server contract. The engine's

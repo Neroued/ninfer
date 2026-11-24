@@ -128,8 +128,9 @@ MTP 与 DFlash2 是互斥的启动选择，只加载所选 backend、head 和执
 ## Graph
 
 Decode 主体按全局物理桶 P 和各 rank 共同的本地 Attention 桶 L 组织，owner 分布通过设备行映射
-进入，不枚举 owner 向量。采样参数、实际 draft/accepted 长度是输入数据；Indexer/MLA 局部 child
-随上下文更新，外层通信保持固定。Decision 与最终 commit 依赖独立，Prefill/Replay 使用 eager。
+进入，不枚举 owner 向量。采样参数、实际 draft/accepted 长度是输入数据。Indexer/MLA 按
+`ContextBucket` 在扁平图内更新局部 kernel 参数切片，外层通信保持固定。
+Decision 与最终 commit 依赖独立，Prefill/Replay 使用 eager。
 批次与 padding 合同见[并发执行](concurrent-execution.md)，其他共享原则见
 [Speculative 执行](speculative-decoding.md)与[分布式执行](distributed-execution.md)。
 

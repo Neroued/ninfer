@@ -61,9 +61,10 @@ KV 页组内打包相关层与 planes；Device/Host 使用相同记录表示。S
 
 ## 预留与持续推进
 
-Session 给出一次可完成工作的需求，包括读源/写目的、增长、共享尾页 COW、speculative 峰值和
-提交所需对象。Directory 联合评估所有 rank/domain，并取得物理位置与必要元数据；
-Executor 另保留 frame 和收尾额度。失败不留下半份许可。
+Session 给出一次可完成工作的需求，包括读源/写目的、必要增长、共享尾页 COW 和提交所需对象。
+Directory 联合评估所有 rank/domain，并取得物理位置与必要元数据；Executor 另保留 frame 和
+收尾额度。失败不留下半份许可。Decode 的可选 draft 增长见
+[逐轮容量授予](speculative-decoding.md#逐轮验证长度与容量授予)。
 
 预留可以包含已存在记录的复用、尚未物化的增长，以及明确消费者退役后的接管。
 同一位置在这些状态之间转移，不先释放到公共池再竞争，也不重复计费。

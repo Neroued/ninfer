@@ -31,8 +31,9 @@ cost_presets = "" # Optional context-cost JSON path; empty uses existing default
 
 [speculative]
 backend = "none" # none / mtp / dflash / dflash2
-draft_tokens = 0 # none: 0; MTP: 1..5; DFlash/DFlash2: 1..15.
+draft_tokens = 0 # Draft window ceiling. None: 0, MTP: 1..5, DFlash/DFlash2: 1..15.
 proposal_head = "full" # full / optimized; support depends on the model and artifact.
+length_policy = "default" # default / adaptive / fixed; CLI: fixed, serve: adaptive.
 
 [vision]
 memory_budget = "1GiB" # Per-rank encoder activations and output window; excludes weights and Host staging.

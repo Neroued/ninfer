@@ -228,9 +228,19 @@ Qwen3.5-family optimized heads use a selected vocabulary. Flash Next and GLM use
 full-vocabulary Q4 A16 head, keeping the main head unchanged. The artifact must contain the selected
 head. Only one backend is active per Engine; `--spec none` disables speculation.
 
+`--spec-length-policy default|adaptive|fixed` selects how the draft window is used. The CLI
+defaults to `fixed` to skip startup calibration for a single request. Pass
+`--spec-length-policy adaptive` for long or mixed-entropy generations to let the Engine
+shorten or bypass verification within the configured window. `ninfer-serve` defaults to `adaptive`.
+
 All supported backends can follow multimodal prefill with `--vision`. They accelerate generated-text
 decode; Vision encoding and prefill remain eager. `--no-cuda-graph` selects eager decode.
 Draft count is a workload choice: more proposals add compute and help only when enough are accepted.
+
+The speculative summary includes the length policy, bypass steps (a draft grant was available),
+and fallback steps (no draft grant). It prints `proposed tokens` when narrowing leaves fewer
+`drafted tokens` for verification. `tokens / step` is one plus accepted drafts per decode step,
+including bypass and fallback. `acceptance length` is one plus accepted drafts per verification round.
 
 ## Common options
 

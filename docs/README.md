@@ -9,7 +9,7 @@ run the CLI or HTTP server.
 |---|---|
 | [Startup configuration](startup-configuration.md) | shared CLI/serve TOML schema, defaults, overrides, resource controls and startup display |
 | [Deployment configurations](../examples/configs/) | RTX 5090, single Spark and dual-Spark TOML examples |
-| [CLI](cli.md) | text, chat-history, image/video input, output streams, sampling, MTP, and common runtime options |
+| [CLI](cli.md) | text, chat-history, image/video input, output streams, sampling, speculative decoding, and common runtime options |
 | [HTTP serving](serving.md) | OpenAI Responses/Chat Completions, Anthropic Messages, state, streaming, token counting, authentication, and tool calls |
 | [Dashboard](../dashboard/README.md) | independent monitoring service, shared history, deployment and display semantics |
 | [Performance](performance.md) | RTX 5090 measurement coverage, per-model serving results, methodology, and publication rules |
@@ -38,7 +38,7 @@ Published artifact downloads are listed in the [project README](../README.md).
 | [Qwen3.5](maintainer/qwen3_5-model.md) | Dense/MoE、Main/MTP/DFlash、Vision 与状态组合 |
 | [Qwen4Exp](maintainer/qwen4_exp-model.md) | Flash Next、HC/QSA/PLE、量化、TP/EP 与执行组合 |
 | [GLM5Next](maintainer/glm5next-model.md) | KDA/MLA/mHC、权重表示、ADP、MTP/DFlash2、Vision 与 Graph |
-| [Speculative execution](maintainer/speculative-decoding.md) | MTP 对齐、ReplaySSM、DFlash 分布与接受前缀 |
+| [Speculative execution](maintainer/speculative-decoding.md) | 自适应验证长度与启动校准、MTP 对齐、ReplaySSM、DFlash/DFlash2 分布与接受前缀 |
 | [Expert cache](maintainer/expert-weight-cache.md) | 固定与流式缓存、CPU/GPU 分工、上传和消费寿命 |
 | [Observability](maintainer/observability.md) | 时间和资源口径、测量窗口、rank 统计与日志边界 |
 | [Op development](maintainer/op-development.md) | 语义、实现组织、数值验证与调优方法 |
@@ -57,5 +57,3 @@ Published artifact downloads are listed in the [project README](../README.md).
 Qwen4-27B 的[架构与量化](designs/qwen4-27b-rtx5090.md)保留独立预研的几何假设与表示选择。
 
 Qwen3.8-Flash-Next 使用 Qwen4Exp；Qwen3.8-27B 使用 Qwen3.5。
-
-动态投机解码的[设计](designs/dynamic-speculative-verification.md)定义逐请求验证长度、执行布局与状态提交，[实施计划](designs/dynamic-speculative-verification-implementation.md)列出各组件的切换顺序和验收方法。

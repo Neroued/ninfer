@@ -1,0 +1,67 @@
+# spark2-glm5_3-flash-dflash2: two-Spark CLI/Serve deployment with TP2 + ADP2.
+# Edit paths, addresses and worker environments. Include Text, Vision and DFlash2
+# in the artifact on both nodes, including for FP4 Local. Include the optimized
+# proposal head or set proposal_head = "full".
+
+[model]
+path = "/srv/models/glm5_3_flash_dflash2.ninfer"
+vision = true
+
+[engine]
+max_context = 1048576 # Per-request limit; shared physical capacity is planned separately.
+max_concurrency = 8
+kv_dtype = "fp8"
+context_capacity = "auto"
+prefill_chunk = 4096
+cuda_graph = true
+
+[speculative]
+backend = "dflash2"
+draft_tokens = 7
+proposal_head = "optimized"
+
+[vision]
+memory_budget = "1GiB"
+
+[server]
+host = "127.0.0.1" # Use 0.0.0.0 for LAN access.
+port = 8080
+model_id = "glm5.3-flash"
+# api_key = "replace-with-your-key"
+
+# Launch the CLI/Serve process on node 0. It starts both workers.
+[distributed]
+coordinator_node = 0
+control_host = "192.0.2.10" # Reachable address on node 0; replace on your network.
+control_port = 0
+connect_timeout = "60s"
+shutdown_timeout = "30s"
+
+[distributed.parallel]
+tp = 2
+adp = 2
+# ep = 2 # Optional whole-expert EP; omitted ep defaults to 1 (expert TP).
+
+[[distributed.nodes]]
+id = 0
+worker = "/opt/ninfer/build/dgx-spark-release/apps/ninfer-worker"
+artifact = "/srv/models/glm5_3_flash_dflash2.ninfer"
+# Native RDMA selection; use comma-separated local HCA names when needed.
+# environment = { NINFER_COMM_HCA = "your-rdma-device" }
+
+[[distributed.nodes]]
+id = 1
+ssh = "user@192.0.2.11"
+worker = "/opt/ninfer/build/dgx-spark-release/apps/ninfer-worker"
+artifact = "/srv/models/glm5_3_flash_dflash2.ninfer"
+# environment = { NINFER_COMM_HCA = "your-rdma-device" }
+
+[[distributed.ranks]]
+rank = 0
+node = 0
+device = 0
+
+[[distributed.ranks]]
+rank = 1
+node = 1
+device = 0

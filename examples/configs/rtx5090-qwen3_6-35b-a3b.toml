@@ -1,0 +1,31 @@
+# rtx5090-qwen3_6-35b-a3b: CLI/Serve MoE deployment example.
+# Set model.path to an artifact with Text, Vision, MTP and the optimized proposal head.
+# With companion DFlash weights, use backend = "dflash" and draft_tokens = 7.
+# NINFER_VRAM_BUDGET_MIB caps device memory for CPU expert offload.
+
+[model]
+path = "/srv/models/qwen3_6_35b_a3b.ninfer"
+vision = true
+
+[engine]
+max_context = 262144 # Per-request limit; shared physical capacity is planned separately.
+max_concurrency = 8
+kv_dtype = "fp8"
+context_capacity = "auto"
+memory_headroom = "256MiB"
+prefill_chunk = 1024
+cuda_graph = true
+
+[speculative]
+backend = "mtp"
+draft_tokens = 3
+proposal_head = "optimized"
+
+[vision]
+memory_budget = "1GiB"
+
+[server]
+host = "127.0.0.1" # Use 0.0.0.0 for LAN access.
+port = 8080
+model_id = "qwen3.6-35b-a3b"
+# api_key = "replace-with-your-key"

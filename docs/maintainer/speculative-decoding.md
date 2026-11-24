@@ -18,6 +18,47 @@ Greedy 路线按 target argmax 接受。Grammar、penalty 和词表截断在各�
 不能裁剪 q 来伪造另一种 proposal。精确概率合同由
 [sampling](../../include/ninfer/ops/sampling.h)与相应候选/acceptance Ops 维护。
 
+## 逐轮验证长度与容量授予
+
+`draft_tokens` 在启动时确定窗口上限 K，最大 target 宽度为 `W_max = K + 1`。
+若 Main 前沿为 F，Decode 准入只预留推进到 `F + 1` 的 anchor 及所需的 backend state 和 COW。
+额外 draft 增长由 Session 在上下文和输出预算内向 `ContextDirectory` 请求即时可用容量。
+可选授予不驱逐缓存前缀、不触发抢占。每行验证深度 `v_i` 受 `granted_limit` 约束。
+
+`SpeculativeLengthPolicy` 的 Fixed 与 Adaptive 共用 `DecodeRoundPlan`、frame 视图和提交路径。
+启用 speculative backend 后，每个结算的真实 Decode 行步恰归入一类：
+验证轮 `v_i > 0`，策略旁路 `v_i = 0` 且 `granted_limit > 0`，或边界/容量回退
+`v_i = 0` 且 `granted_limit = 0`。物理图宽可以大于当前有效列数。
+
+## 置信度读取、同轮收窄与无偏性
+
+跨轮控制（Tier C）按序列维护指数衰减的逐位置到达与接受计数，用分层收缩估计条件存活率。
+`W = 1` 普通 Decode 的 target 全支持集 top-1 概率 `p_top1` 为旁路后的下一轮提供唤醒信号，
+低熵转变可直接进入估计，省去周期性强制探测。TP 词表分片通过 AllGather 汇合各 shard 的
+FP32 最大分数与相对该最大值的 log-sum-exp，得到全词表域的 `p_top1` 和 MTP draft head 的
+top-1 置信度，精度遵循[词表 Op](../../include/ninfer/ops/vocabulary.h)合同。MTP 实际 proposal 为
+argmax 的 one-hot 分布，DFlash2 的 `q(d)` 由候选路径条件分布给出。
+
+Qwen3.5 MoE 的 Adaptive `SplitProposal` 路径（如 CPU expert offload）可在同轮 target forward
+前按抽样前的置信度收窄（Tier S）。DFlash 读取 head top-1 概率，DFlash2 按已采样前缀逐位置
+使用停止条件概率，MTP 读取抽样前 top-1 概率。收窄满足 `W_exec <= W_init` 和
+`proposed_tokens >= drafted_tokens`。DFlash2 按前缀顺序决定每列是否进入验证，再选择覆盖该深度
+的物理路由。随机 proposal 的 `q != p` 时，不以已抽中 token 的 `q(d)` 决定是否验证该列；
+验证仍使用实际条件 proposal 分布。
+
+## 物理成本模型、启动校准与窄图门控
+
+`SpeculativeCostModel` 以 `sum_i L_i(v_i) / cost_ns` 评价候选，`L_i` 为该行期望产出 token 数。
+成本特征覆盖 target token、按上下文加权的 attention、MoE 唯一 expert 数的非线性饱和、
+MTP 步数与行数以及 DFlash block/head 工作。Adaptive 启动时以
+`StartupPhase::SpeculativeCalibration` 在临时 Context 上测量代表性的边界几何，使用 COW 分支
+保全共享前缀，并拟合非负权重。在线按 `DeviceRetired` 的总延迟，以实测/预测比的 EWMA 修正成本。
+
+Adaptive masked-block 路线的窄 target 图（`1 < W < K + 1`）按扣除 Graph 资源后可保留的
+Device Context 容量门控。自动容量下，窄图方案须保留至少 95% 的全宽基线容量，该比较同样
+适用于 NVFP4、K8V4 等块量化 KV。SplitProposal 的 `ProposalGraph` 在同一物理 batch 桶内按
+proposal 几何复用，多个 target 宽度可共享同一 masked-block proposal 图。
+
 ## MTP 的稳定前沿
 
 令 Main 已计算 `[0,F)`，已知下一输入为 `x[F]`。稳定状态为：

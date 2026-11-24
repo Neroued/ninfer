@@ -31,7 +31,8 @@ Qwen Decode 使用 P；GLM 的 ADP Decode 使用 `(P,L)`。P 对 B 向上取整�
 捕获与预热使用能选中该桶的真实代表分布，再补 padding，不能把 P 个物理位置都当作真实请求。
 
 Graph 变体表达物理几何与必要计算主体。采样参数、请求身份、draft extent 和接受长度作为数据输入，
-不增加变体轴。上下文变化沿用 Attention Op 的 profile/child-node 更新，外层通信次序保持不变。
+不增加变体轴。上下文变化按 `ContextBucket` 在扁平图内更新 Attention/Indexer 的 kernel 参数切片，
+外层通信次序保持不变。自适应验证可选择不同的物理 target 宽度。
 需要 Host grammar、CPU expert 或接受结果的边界保留显式交接。
 
 ## 逻辑成员与物理行

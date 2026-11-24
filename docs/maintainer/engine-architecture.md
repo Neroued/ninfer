@@ -64,6 +64,10 @@ Vision 窗口和通信资源分别由其 owner 计费。互斥 scratch 取峰值
 快照中，不重复扣费。正式资源与控制侧目录建立后再核验总预算，自动容量允许有界纠偏，
 显式容量保持原要求。模型、Op 和实际分配错误保留自身原因。
 
+自适应 speculative 启动在 Graph 规划中用全宽基线门控窄 target 图，以保留 Context 容量。
+正式 Program 与 Context 准备后、接纳请求前，`StartupPhase::SpeculativeCalibration` 在临时
+COW Context 分支校准执行成本。门控和测量口径见[Speculative 执行](speculative-decoding.md#物理成本模型启动校准与窄图门控)。
+
 实现入口：[启动预算](../../src/runtime/engine/startup_memory.h)、
 [容量求解](../../src/runtime/engine/context_capacity.h)、
 [Graph 准备](../../src/models/common/graph_preparation.h)。
@@ -115,7 +119,9 @@ CPU 任务池处理独立任务，CPU collective 团队服务算术；模型调�
 
 Eager 与 Graph 使用同源数学组合。图绑定稳定 backing、frame 和执行表，实际请求通过 offsets、
 positions、有效长度和行映射进入。图变体只表达必要的物理几何与计算主体；采样配置、实际采用长度
-和请求身份作为数据输入。Attention 的局部节点更新遵循 Op 合同，不改变外层通信次序。
+和请求身份作为数据输入。Attention/Indexer 随 `ops::ContextBucket` 变化，由
+`ContextBucketSite` 在扁平 `DecodeGraphSuite` 图内更新 `DecodeGraphKernelSlice` 的 kernel 参数，
+保持外层拓扑和 collective 次序。双槽 Host producer/hook 交接使用 `SlotPatchSite` 更新 child graph。
 
 需要 Host grammar、CPU expert 或最终接受结果的边界显式交接。可捕获的连续设备段保持完整，
 PLE 的数据来源本身不决定 Main 切图。图、事件和注册视图先于其借用的 backing 销毁。

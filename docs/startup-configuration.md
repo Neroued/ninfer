@@ -30,6 +30,7 @@ the file even though its own default profile is smaller.
 | Output limit | 128 | 8192; requests can override |
 | Prefix reuse | false | true |
 | Host context capacity | 0 B | RTX 5090: 8 GiB + eight native StateImages; Spark: 0 B |
+| Speculative length policy | fixed | adaptive |
 | Seed | 0 | Random per request |
 
 [PPL](perplexity.md) consumes model path, device, max context, KV type, Context capacity, memory
@@ -64,8 +65,9 @@ are not opened.
   append. `--clear-stops` clears all three CLI stop lists.
 - `--prompt` and `--messages` are alternatives. A command-line choice replaces the file's input
   choice. Likewise a command-line output constraint replaces the complete file constraint.
-- `--spec none` clears inherited draft/head settings. Explicitly pairing `none` with nonzero drafts
-  or an optimized head is an error.
+- `--spec none` clears inherited draft/head settings and resets `length_policy` to `default`.
+  Pairing `none` with nonzero drafts, an optimized head, or an explicit `fixed` or `adaptive`
+  policy in the same source is an error.
 - Thinking and CLI reasoning effort are merged together; contradictory explicit values at the same
   level are rejected. Supported efforts and thinking modes depend on the model.
 
@@ -145,9 +147,13 @@ are separate from the GPU Vision budget. Processor-specific media limits still a
 | TOML field | CLI flag | Values / default | Meaning |
 |---|---|---|---|
 | `speculative.backend` | `--spec` | `none/mtp/dflash/dflash2` / `none` | One backend per Engine |
-| `speculative.draft_tokens` | `--draft-tokens` | 0 when none; MTP 1..5; DFlash/DFlash2 1..15 | Number of proposed tokens |
+| `speculative.draft_tokens` | `--draft-tokens` | 0 when none; MTP 1..5; DFlash/DFlash2 1..15 | Startup draft window. Under `adaptive`, this is the maximum, and verification depth can vary by request and step |
 | `speculative.proposal_head` | `--proposal-head` | `full/optimized` / `full` | Draft head; requires a backend and the selected weights |
+| `speculative.length_policy` | `--spec-length-policy` | `default/adaptive/fixed` / `default` | `default` resolves to `fixed` for `ninfer` and `adaptive` for `ninfer-serve` and `ninfer_bench` |
 
+With a speculative backend enabled, `adaptive` calibrates execution cost at startup
+(`calibrating speculative execution`) and can shorten or bypass verification. `fixed` skips
+that calibration and uses the configured window subject to request and capacity limits.
 The [CLI guide](cli.md#speculative-decoding) describes model-specific backends and optimized heads.
 
 ## Generation defaults

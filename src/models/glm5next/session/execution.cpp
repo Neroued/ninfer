@@ -165,6 +165,10 @@ Session::start_decode_round(std::span<const SequenceHandle> members,
             selection.select(p.shape.length_policy, batch.shape, path, p.plan.decode_routes.get(),
                              p.cost_model, limits, adaptive, p.shape.max_context);
         if (!tx.round) return {};
+        if (p.shape.draft_tokens) {
+            tx.could_speculate.reserve(limits.size());
+            for (const auto& row : limits) tx.could_speculate.push_back(row.granted_limit > 0);
+        }
         if (measure_cost)
             tx.cost_query = speculative::CostQuery::from_plan(p.shape.speculative, *tx.round,
                                                               frontiers, p.shape.max_context);

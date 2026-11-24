@@ -489,6 +489,7 @@ public:
         std::unique_ptr<context::ContextTransaction> preparation;
         std::unique_ptr<context::ContextTransaction> settlement;
         std::shared_ptr<const speculative::DecodeRoundPlan> round;
+        std::vector<std::uint8_t> could_speculate;
         std::optional<speculative::CostQuery> cost_query;
         bool record_online_cost = true;
         std::optional<GeneratedResult> generated;

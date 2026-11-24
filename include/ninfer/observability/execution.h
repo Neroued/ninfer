@@ -27,10 +27,10 @@ struct SpeculativeExecutionGeometry {
 };
 
 struct ExecutionWork {
-    ExecutionKind kind                = ExecutionKind::Context;
-    std::uint32_t rows                = 0;
-    std::uint64_t input_tokens        = 0;
-    std::uint64_t scheduled_positions = 0;
+    ExecutionKind kind                                              = ExecutionKind::Context;
+    std::uint32_t rows                                              = 0;
+    std::uint64_t input_tokens                                      = 0;
+    std::uint64_t scheduled_positions                               = 0;
     std::shared_ptr<const SpeculativeExecutionGeometry> speculative = {};
 };
 
@@ -336,14 +336,20 @@ struct GenerationFirstOutputTiming {
 };
 
 struct SpeculativeStats {
-    SpeculativeBackend backend           = SpeculativeBackend::None;
-    bool enabled                         = false;
-    std::uint32_t draft_window           = 0;
-    std::uint64_t rounds                 = 0;
+    SpeculativeBackend backend = SpeculativeBackend::None;
+    bool enabled               = false;
+    std::uint32_t draft_window = 0;
+    // Each decode row-step counts as a round, bypass, or fallback.
+    std::uint64_t rounds = 0;
+    // Candidates generated before target verification narrowing.
+    std::uint64_t proposed_tokens        = 0;
     std::uint64_t drafted_tokens         = 0;
     std::uint64_t accepted_tokens        = 0;
     std::uint64_t committed_draft_tokens = 0;
-    std::uint64_t fallback_steps         = 0;
+    // Zero verified drafts despite a positive draft grant.
+    std::uint64_t bypass_steps = 0;
+    // Zero verified drafts because no drafts were granted.
+    std::uint64_t fallback_steps = 0;
     std::vector<std::uint64_t> attempted_per_position;
     std::vector<std::uint64_t> accepted_per_position;
 };

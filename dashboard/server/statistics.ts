@@ -91,6 +91,10 @@ function quantile(bounds: number[], bins: number[], fraction: number): number | 
 
 export function summarize(bucket: Bucket, bounds: Record<string, number[]>): Summary {
   const c = bucket.counters;
+  const specRounds = c.speculative_rounds ?? 0;
+  const bypassSteps = c.speculative_bypass_steps ?? 0;
+  const fallbackSteps = c.speculative_fallback_steps ?? 0;
+  const totalSpecSteps = specRounds + bypassSteps + fallbackSteps;
   const distribution = (key: string, sum: number): Distribution => {
     const edges = bounds[key] ?? [];
     const bins = bucket.bins[key] ?? edges.map(() => 0).concat(0);
@@ -132,11 +136,14 @@ export function summarize(bucket: Bucket, bounds: Record<string, number[]>): Sum
     stepMs: divide(c['execution.decode.total_ns'], c['execution.decode.total_count'], 1e-6),
     specPercent: divide(c.speculative_accepted_tokens, c.speculative_draft_tokens, 100),
     prefixPercent: divide(c.reused_prompt_tokens, c.prompt_tokens, 100),
-    fallbackPercent: divide(
-      c.speculative_fallback_steps,
-      (c.speculative_rounds ?? 0) + (c.speculative_fallback_steps ?? 0),
-      100,
-    ),
+    bypassPercent: divide(bypassSteps, totalSpecSteps, 100),
+    fallbackPercent: divide(fallbackSteps, totalSpecSteps, 100),
+    avgDraftDepth: divide(c.speculative_draft_tokens, totalSpecSteps),
+    proposedDrafts: c.speculative_proposed_tokens ?? 0,
+    verifiedDrafts: c.speculative_draft_tokens ?? 0,
+    specRounds,
+    bypassSteps,
+    fallbackSteps,
     committedDrafts: c.speculative_committed_draft_tokens ?? 0,
     reusedTokens: c.reused_prompt_tokens ?? 0,
     specPositions: positions.map((position) => ({

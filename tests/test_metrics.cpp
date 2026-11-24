@@ -18,7 +18,9 @@ int main() {
         }
     };
     EngineOptions options;
-    options.max_concurrency = 2;
+    options.max_concurrency           = 2;
+    options.speculative.backend       = SpeculativeBackend::DFlash;
+    options.speculative.length_policy = SpeculativeLengthPolicy::Fixed;
     EngineDescription description;
     description.context_pools = {{0, ContextMemoryDomain::Host, 1048576, 4096}};
     StartupReport startup;
@@ -28,6 +30,8 @@ int main() {
     EngineSnapshot baseline;
     baseline.runtime.generated_tokens                         = 4;
     baseline.runtime.speculative_draft_tokens                 = 3;
+    baseline.runtime.speculative_proposed_tokens              = 5;
+    baseline.runtime.speculative_bypass_steps                 = 1;
     baseline.runtime.prefix_cache.shared_prefix.adopted       = 2;
     baseline.runtime.prefix_cache.shared_prefix.reused_tokens = 256;
     baseline.ranks.resize(1);
@@ -60,6 +64,9 @@ int main() {
     running.ranks[0].gpu_intervals[0] = {4, 9000, 3000};
     running.runtime.generated_tokens += 5;
     running.runtime.speculative_draft_tokens += 6;
+    running.runtime.speculative_proposed_tokens += 10;
+    running.runtime.speculative_bypass_steps += 4;
+    running.runtime.speculative_fallback_steps  = 2;
     running.runtime.speculative_accepted_tokens = 3;
     running.runtime.prefix_cache.shared_prefix.adopted += 3;
     running.runtime.prefix_cache.shared_prefix.reused_tokens += 512;
@@ -116,8 +123,14 @@ int main() {
               live.find("ninfer_execution_unit_seconds_count{kind=\"prefill\"} 0\n") !=
                   std::string::npos,
           "execution histograms must retain zero-sample kinds and subtract warmup by actual batch");
-    check(live.find("ninfer_spec_decode_draft_tokens_total 6\n") != std::string::npos,
-          "speculative work must be observable before request completion");
+    check(live.find("ninfer_model_info{model_name=\"custom\\\"model\\\\name\\nline\","
+                    "speculative_backend=\"dflash\",speculative_length_policy=\"fixed\"} 1\n") !=
+                  std::string::npos &&
+              live.find("ninfer_spec_decode_proposed_tokens_total 10\n") != std::string::npos &&
+              live.find("ninfer_spec_decode_draft_tokens_total 6\n") != std::string::npos &&
+              live.find("ninfer_spec_decode_bypass_steps_total 4\n") != std::string::npos &&
+              live.find("ninfer_spec_decode_fallback_steps_total 2\n") != std::string::npos,
+          "metrics must expose the length policy and distinguish speculative counter deltas");
     check(live.find("ninfer_time_to_first_token_seconds_count 1\n") != std::string::npos &&
               live.find("ninfer_requests_total{outcome=\"completed\"} 0\n") != std::string::npos,
           "TTFT must be visible before completion");
@@ -209,11 +222,30 @@ int main() {
                         .recovery         = RecoveryProgress{GenerationRecoveryRoute::Replay, 128, 256, 512},
                         .last_progress_ns = 900,
                         .recovery_pending = true}};
+    running.in_flight = {
+        {.id   = 1,
+         .work = {.kind        = ExecutionKind::Decode,
+                  .speculative = std::make_shared<const SpeculativeExecutionGeometry>(
+                      SpeculativeExecutionGeometry{.verify_width        = 4,
+                                                   .mtp_steps           = 0,
+                                                   .head_columns        = 3,
+                                                   .valid_target_tokens = 6})}},
+        {.id = 2, .work = {.kind = ExecutionKind::Prefill}}};
     const auto normalized = observations.normalize(running);
     const auto json       = product::observation_json(normalized, 1000);
     check(json["runtime"]["generated_tokens"] == 5 &&
               json["context"]["pools"][0]["live_bytes"] == 3072,
           "JSON and metrics must use the same counter baseline while preserving current gauges");
+    check(json["runtime"]["speculative_proposed_tokens"] == 10 &&
+              json["runtime"]["speculative_draft_tokens"] == 6 &&
+              json["runtime"]["speculative_bypass_steps"] == 4 &&
+              json["runtime"]["speculative_fallback_steps"] == 2 &&
+              json["in_flight"][0]["speculative"] == nlohmann::json{{"verify_width", 4},
+                                                                    {"valid_target_tokens", 6},
+                                                                    {"mtp_steps", 0},
+                                                                    {"head_columns", 3}} &&
+              json["in_flight"][1]["speculative"].is_null(),
+          "monitor omitted counter deltas or in-flight geometry");
     check(json["runtime"]["prefix_cache"]["shared_prefix"]["adopted"] == 3 &&
               json["runtime"]["prefix_cache"]["shared_prefix"]["reused_tokens"] == 512,
           "prefix JSON lost normalized adoption counters");

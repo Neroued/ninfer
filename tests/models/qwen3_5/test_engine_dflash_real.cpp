@@ -204,9 +204,9 @@ int exercise_partial_terminal(ninfer::Engine& engine, const std::vector<ninfer::
             return 1;
         }
 
-        const std::uint64_t fully_licensed = 1 + stopped.stats.speculative.rounds +
-                                             stopped.stats.speculative.accepted_tokens +
-                                             stopped.stats.speculative.fallback_steps;
+        const std::uint64_t fully_licensed =
+            1 + stopped.stats.speculative.rounds + stopped.stats.speculative.accepted_tokens +
+            stopped.stats.speculative.bypass_steps + stopped.stats.speculative.fallback_steps;
         if (stopped.generated_token_ids.size() >= fully_licensed) { continue; }
 
         std::vector<ninfer::TokenId> continuation = prompt;

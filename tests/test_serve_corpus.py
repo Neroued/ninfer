@@ -370,6 +370,16 @@ def test_startup_resources_reach_concurrency_and_ttft_reports(
                 rank["budget"]["context_capacity_bytes"] for rank in ranks
             ),
         },
+        "speculative": {
+            "backend": "mtp",
+            "length_policy": "adaptive",
+            "draft_window": 3,
+            "calibrated": True,
+            "calibration_anchors": 16,
+            "calibration_contexts": 4,
+            "calibration_seconds": 0.75,
+            "target_widths": [1, 2, 4],
+        },
     }
     start = {
         "artifact_type": "ninfer_serve_request_log",
@@ -442,7 +452,11 @@ def test_startup_resources_reach_concurrency_and_ttft_reports(
     observed = run["global_diagnostics"]
     assert observed["reason"] == "runtime_intervals_missing"
     if resource_case in ("single", "pair"):
-        expected = {"status": "available", **resources}
+        expected = {
+            "status": "available",
+            "ranks": ranks,
+            "total_allocations": resources["total_allocations"],
+        }
     else:
         reason = (
             "startup_resources_missing"

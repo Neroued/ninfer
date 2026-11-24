@@ -339,6 +339,7 @@ CommitResult SessionImpl::commit(PendingBatch&& pending,
             speculative_backend != SpeculativeBackend::None) {
             const auto& generated = *current.generated;
             const auto drafted    = generated.executed->verify_drafts[b];
+            const auto proposed   = current.round->verify_drafts()[b];
             const auto confidences =
                 drafted ? std::span<const float>(generated.draft_confidences)
                               .subspan(b * generated.draft_stride, generated.draft_stride)
@@ -347,7 +348,8 @@ CommitResult SessionImpl::commit(PendingBatch&& pending,
                                  ? &request.speculative_state
                                  : nullptr;
             speculative::record_speculative_commit(
-                stats, feedback, d, drafted, generated.counts[b] - 1, confidences,
+                stats, feedback, d, current.could_speculate[b], proposed, drafted,
+                generated.counts[b] - 1, confidences,
                 generated.target_top1_probabilities.empty()
                     ? std::nullopt
                     : std::optional{generated.target_top1_probabilities[b]});

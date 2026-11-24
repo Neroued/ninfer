@@ -259,13 +259,18 @@ OperationalRecord render_request_done(const RequestLogContext& context,
     if (metrics.timings.decode_seconds > 0.0) {
         out << " | decode " << product::format_pretty_rate(rates.output_tokens_per_second, "tok");
     }
-    if (metrics.speculative.drafted_tokens != 0) {
-        const double acceptance = static_cast<double>(metrics.speculative.accepted_tokens) /
-                                  static_cast<double>(metrics.speculative.drafted_tokens);
-        out << " | " << product::speculative_backend_name(metrics.speculative.backend)
-            << " accepted " << product::format_pretty_count(metrics.speculative.accepted_tokens)
-            << '/' << product::format_pretty_count(metrics.speculative.drafted_tokens) << " ("
-            << product::format_pretty_percent(acceptance) << ')';
+    const auto& spec = metrics.speculative;
+    if (spec.enabled && (spec.drafted_tokens || spec.bypass_steps)) {
+        out << " | " << product::speculative_backend_name(spec.backend);
+        if (spec.drafted_tokens)
+            out << " accepted " << product::format_pretty_count(spec.accepted_tokens) << '/'
+                << product::format_pretty_count(spec.drafted_tokens) << " ("
+                << product::format_pretty_percent(double(spec.accepted_tokens) /
+                                                  spec.drafted_tokens)
+                << ')';
+        if (spec.bypass_steps)
+            out << (spec.drafted_tokens ? ", bypass " : " bypass ")
+                << product::format_pretty_count(spec.bypass_steps);
     }
     if (outcome.stats.thinking.configured_budget) {
         out << " | thinking "
@@ -385,9 +390,12 @@ OperationalRecord render_throughput(const ThroughputReport& report) {
         report.current.speculative_draft_tokens - report.previous.speculative_draft_tokens;
     const auto accepted =
         report.current.speculative_accepted_tokens - report.previous.speculative_accepted_tokens;
+    const auto bypass =
+        report.current.speculative_bypass_steps - report.previous.speculative_bypass_steps;
     if (drafts)
         out << " | draft accepted " << accepted << '/' << drafts << " ("
             << product::format_pretty_percent(double(accepted) / drafts) << ')';
+    if (bypass) out << (drafts ? ", bypass " : " | bypass ") << bypass;
     const double host_seconds = static_cast<double>(host_active_ns(report)) * 1.0e-9;
     const double host_ratio =
         report.interval_seconds > 0.0 ? host_seconds / report.interval_seconds : 0.0;
@@ -462,6 +470,25 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
     logger_->info("capacity | {} | {} ranks | {} active lanes", kv_cache_name(description.kv_cache),
                   description.ranks.size(), engine.max_concurrency);
     product::log_context_capacity(*logger_, description);
+    if (startup.speculative) {
+        const auto& spec = *startup.speculative;
+        std::ostringstream summary;
+        summary << "speculative | " << product::speculative_backend_name(spec.backend) << " | "
+                << product::speculative_length_policy_name(spec.length_policy) << " | draft window "
+                << spec.draft_window;
+        if (!spec.target_widths.empty()) {
+            summary << " | target widths ";
+            for (std::size_t i = 0; i < spec.target_widths.size(); ++i) {
+                if (i) summary << ", ";
+                summary << spec.target_widths[i];
+            }
+        }
+        if (spec.calibrated)
+            summary << " | calibrated " << spec.calibration_anchors << " anchors across "
+                    << spec.calibration_contexts << " contexts in "
+                    << product::format_pretty_duration(spec.calibration_seconds);
+        logger_->info("{}", summary.str());
+    }
     for (std::size_t i = 0; i < description.ranks.size(); ++i) {
         const auto& rank   = description.ranks[i];
         const auto& budget = startup.ranks.at(i);

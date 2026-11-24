@@ -156,7 +156,14 @@ const eventScope = computed(() =>
         ><span class="instrument-value">{{ number(summary?.specPercent) }}<small>%</small></span>
       </div>
       <p class="instrument-note mono">
-        accepted / drafted · fallback {{ number(summary?.fallbackPercent) }}%
+        accepted / drafted<template v-if="summary && summary.avgDraftDepth !== null">
+          · avg depth {{ number(summary.avgDraftDepth) }}</template
+        >
+        · bypass {{ number(summary?.bypassPercent, 0) }}%<template
+          v-if="(summary?.fallbackSteps ?? 0) > 0 || (summary?.bypassSteps ?? 0) === 0"
+        >
+          · fallback {{ number(summary?.fallbackPercent, 0) }}%</template
+        >
       </p>
       <div class="thin-meter"><span :style="{ width: `${summary?.specPercent ?? 0}%` }" /></div>
     </section>

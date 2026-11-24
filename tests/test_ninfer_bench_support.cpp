@@ -118,8 +118,11 @@ bench::Repetition sample(std::initializer_list<std::pair<std::uint32_t, std::uin
         request.generated_token_ids.resize(4);
         request.finish_reason = FinishReason::StopToken;
         request.stats.decode_by_batch.resize(4);
+        request.stats.speculative.proposed_tokens = 12;
         request.stats.speculative.drafted_tokens  = 10;
         request.stats.speculative.accepted_tokens = 6;
+        request.stats.speculative.bypass_steps    = 2;
+        request.stats.speculative.fallback_steps  = 1;
     }
     for (const auto& [batch, ns] : steps) {
         const ExecutionLatency latency{.result_ns     = ns * 3 / 4,
@@ -160,6 +163,11 @@ void report_test() {
                batches[2]["total"]["mean_ms"].is_null(),
            "missing target batch has no latency sample");
     near(summary["speculative"]["acceptance"], 0.6, "token-weighted acceptance");
+    expect(summary["speculative"]["proposed_tokens"] == 96 &&
+               summary["speculative"]["drafted_tokens"] == 80 &&
+               summary["speculative"]["bypass_steps"] == 16 &&
+               summary["speculative"]["fallback_steps"] == 8,
+           "proposal, verification, bypass and fallback counts across repetitions");
     expect(summary["executions"]["prefill"]["total"]["mean_ms"].is_null(),
            "missing timing is null");
     std::vector<bench::Repetition> prefill_only(1);
@@ -176,12 +184,12 @@ void report_test() {
            "missing first-token timing is null");
     expect(Json::parse(bench::format_report(report, bench::OutputFormat::Json)) == report,
            "JSON round trip");
-    expect(bench::format_report(report, bench::OutputFormat::Table).find("13.333") !=
-               std::string::npos,
-           "table main metric");
-    expect(bench::format_report(report, bench::OutputFormat::Table).find("no samples") !=
-               std::string::npos,
-           "missing target is shown in table");
+    const auto table = bench::format_report(report, bench::OutputFormat::Table);
+    expect(table.find("13.333") != std::string::npos, "table main metric");
+    expect(table.find("no samples") != std::string::npos, "missing target is shown in table");
+    expect(table.find("Speculative tokens: proposed=96  drafted=80") != std::string::npos &&
+               table.find("bypass steps=16  fallback steps=8") != std::string::npos,
+           "table separates speculative counters");
     expect(bench::format_report(report, bench::OutputFormat::Csv).find("all,decode,2,false,3,") !=
                std::string::npos,
            "CSV main metric");

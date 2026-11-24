@@ -251,9 +251,10 @@ CommitResult Session::commit(PendingBatch&& batch,
             auto* feedback     = p.shape.length_policy == SpeculativeLengthPolicy::Adaptive
                                      ? &s.speculative_state
                                      : nullptr;
-            speculative::record_speculative_commit(s.speculative, feedback, decision, output.drafts,
-                                                   output.accepted_drafts, output.draft_confidences,
-                                                   output.target_top1_probability);
+            speculative::record_speculative_commit(
+                s.speculative, feedback, decision, tx.could_speculate[b], output.drafts,
+                output.drafts, output.accepted_drafts, output.draft_confidences,
+                output.target_top1_probability);
         }
         row.speculative = s.speculative;
 

@@ -16,7 +16,7 @@ SessionImpl::start_decode_round(std::span<const SequenceHandle> members,
         throw std::invalid_argument("decode membership is invalid");
     auto reservation = executor().try_reserve(runtime::FrameKind::Compute);
     if (!reservation) return {};
-    bool prepared = false;
+    bool prepared              = false;
     const bool adaptive_length = draft_window && selection.uses_adaptive_length(plan.length_policy);
     const bool measure_cost    = draft_window && (adaptive_length || selection.budgets.empty());
     try {
@@ -89,6 +89,10 @@ SessionImpl::start_decode_round(std::span<const SequenceHandle> members,
         pending.record_online_cost = selection.record_online_cost;
         DecodeWork decode(std::move(*round), plan.decode_path);
         pending.round = decode.plan;
+        if (draft_window) {
+            pending.could_speculate.reserve(size);
+            for (const auto& row : rows) pending.could_speculate.push_back(row.granted_limit > 0);
+        }
         if (narrow) {
             auto& narrowing = decode.narrowing.emplace(
                 SplitProposalNarrowingInput{.cost = cost_model, .max_context = capacity});

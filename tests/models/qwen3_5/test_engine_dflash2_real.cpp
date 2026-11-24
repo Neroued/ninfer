@@ -30,8 +30,10 @@ void valid(const ninfer::GenerationResult& result, std::size_t outputs) {
                 result.finish_reason == ninfer::FinishReason::OutputLimit,
             "DFlash2 did not honor the requested output budget");
     require(result.stats.speculative.backend == ninfer::SpeculativeBackend::DFlash2 &&
-                (outputs == 1 ||
-                 result.stats.speculative.rounds + result.stats.speculative.fallback_steps != 0),
+                (outputs == 1 || result.stats.speculative.rounds +
+                                         result.stats.speculative.bypass_steps +
+                                         result.stats.speculative.fallback_steps !=
+                                     0),
             "generation bypassed DFlash2");
 }
 
@@ -168,6 +170,7 @@ int main(int argc, char** argv) {
                     engine.generate(engine.prepare_tokens(prompt), stopped_options);
                 const auto licensed = 1 + stopped.stats.speculative.rounds +
                                       stopped.stats.speculative.accepted_tokens +
+                                      stopped.stats.speculative.bypass_steps +
                                       stopped.stats.speculative.fallback_steps;
                 if (stopped.generated_token_ids.size() >= licensed) { continue; }
                 require(stopped.finish_reason == ninfer::FinishReason::StopToken &&

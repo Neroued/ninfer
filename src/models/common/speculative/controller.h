@@ -32,7 +32,8 @@ static_assert(sizeof(SequenceSpeculativeState) <= 160);
 // result can update adaptive feedback. The Session supplies validated counts and statistics
 // storage.
 void record_speculative_commit(SpeculativeStats&, SequenceSpeculativeState* adaptive_state,
-                               const runtime::CommitDecision&, std::uint32_t drafted,
+                               const runtime::CommitDecision&, bool could_speculate,
+                               std::uint32_t proposed, std::uint32_t drafted,
                                std::uint32_t accepted, std::span<const float> draft_confidences,
                                std::optional<float> target_top1_probability);
 

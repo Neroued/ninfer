@@ -547,7 +547,8 @@ void SequenceSpeculativeState::predict_conditional_survival(
 }
 
 void record_speculative_commit(SpeculativeStats& stats, SequenceSpeculativeState* adaptive_state,
-                               const runtime::CommitDecision& decision, std::uint32_t drafted,
+                               const runtime::CommitDecision& decision, bool could_speculate,
+                               std::uint32_t proposed, std::uint32_t drafted,
                                std::uint32_t accepted, std::span<const float> draft_confidences,
                                std::optional<float> target_top1_probability) {
     if (adaptive_state && !decision.cancelled && !decision.failed) {
@@ -560,8 +561,11 @@ void record_speculative_commit(SpeculativeStats& stats, SequenceSpeculativeState
     stats.committed_draft_tokens += std::min(decision.accepted_tokens, accepted);
     if (drafted)
         ++stats.rounds;
+    else if (could_speculate)
+        ++stats.bypass_steps;
     else
         ++stats.fallback_steps;
+    stats.proposed_tokens += proposed;
     stats.drafted_tokens += drafted;
     stats.accepted_tokens += accepted;
     for (std::uint32_t i = 0; i < drafted; ++i) ++stats.attempted_per_position[i];

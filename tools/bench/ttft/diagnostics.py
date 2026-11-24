@@ -11,7 +11,7 @@ from typing import Any, Sequence
 from tools.bench.serve_log import startup_resource_observation
 
 
-REQUEST_LOG_SCHEMA_VERSION = 32
+REQUEST_LOG_SCHEMA_VERSION = 33
 
 SCHEDULING_FIELDS = (
     "preemptions", "snapshot_restores", "direct_restores", "replay_restores", "replayed_tokens",

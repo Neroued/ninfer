@@ -199,6 +199,7 @@ struct ComputeTransaction {
     std::vector<SequenceHandle> members;
     std::vector<WorkRow> rows;
     std::optional<speculative::DecodeRoundPlan> round;
+    std::vector<std::uint8_t> could_speculate;
     std::optional<speculative::CostQuery> cost_query;
     bool record_online_cost = true;
     std::optional<ComputeResult> result;

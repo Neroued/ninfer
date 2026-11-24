@@ -229,7 +229,9 @@ public:
             result.stats.speculative.backend == selected &&
                 (selected == ninfer::SpeculativeBackend::None ||
                  (result.stats.speculative.enabled && result.stats.speculative.draft_window == 3 &&
-                  result.stats.speculative.rounds + result.stats.speculative.fallback_steps != 0)),
+                  result.stats.speculative.rounds + result.stats.speculative.bypass_steps +
+                          result.stats.speculative.fallback_steps !=
+                      0)),
             "request did not execute the selected backend");
         require(result.stats.timings.first_token_seconds > 0.0 &&
                     result.stats.timings.prefill_seconds > 0.0 &&
@@ -439,6 +441,12 @@ void exercise(const std::filesystem::path& artifact, ninfer::SpeculativeBackend 
     require(after.speculative_rounds - before.speculative_rounds ==
                     first_result->stats.speculative.rounds +
                         second_result.stats.speculative.rounds &&
+                after.speculative_proposed_tokens - before.speculative_proposed_tokens ==
+                    first_result->stats.speculative.proposed_tokens +
+                        second_result.stats.speculative.proposed_tokens &&
+                after.speculative_bypass_steps - before.speculative_bypass_steps ==
+                    first_result->stats.speculative.bypass_steps +
+                        second_result.stats.speculative.bypass_steps &&
                 after.speculative_draft_tokens - before.speculative_draft_tokens ==
                     first_result->stats.speculative.drafted_tokens +
                         second_result.stats.speculative.drafted_tokens &&

@@ -494,22 +494,27 @@ void speculative_commit() {
                            .accepted_per_position  = std::vector<std::uint64_t>(3)};
     std::array<float, 3> prior, accepted, discarded, ordinary;
     state.predict_conditional_survival(Backend::Mtp, 3, prior);
-    record_speculative_commit(stats, &state, {.accepted_tokens = 1, .terminal = true}, 3, 2,
-                              std::array{.8f, .9f, .1f}, {});
+    record_speculative_commit(stats, &state, {.accepted_tokens = 1, .terminal = true}, true, 3, 3,
+                              2, std::array{.8f, .9f, .1f}, {});
     state.predict_conditional_survival(Backend::Mtp, 3, accepted);
     require(accepted[0] > prior[0] && stats.committed_draft_tokens == 1,
             "terminal prefix did not separate verification and adopted drafts");
-    record_speculative_commit(stats, &state, {.terminal = true, .cancelled = true}, 2, 2, {}, {});
-    record_speculative_commit(stats, &state, {.terminal = true, .failed = true}, 1, 0, {}, {});
+    record_speculative_commit(stats, &state, {.terminal = true, .cancelled = true}, true, 3, 2, 2,
+                              {}, {});
+    record_speculative_commit(stats, &state, {.terminal = true, .failed = true}, true, 1, 1, 0, {},
+                              {});
     state.predict_conditional_survival(Backend::Mtp, 3, discarded);
     require(discarded == accepted && stats.committed_draft_tokens == 1,
             "failed or cancelled output changed feedback or adopted drafts");
-    record_speculative_commit(stats, &state, {.accepted_tokens = 1}, 0, 0, {}, .05f);
+    record_speculative_commit(stats, &state, {.accepted_tokens = 1}, true, 0, 0, 0, {}, .05f);
     state.predict_conditional_survival(Backend::Mtp, 3, ordinary);
-    require(ordinary[0] < discarded[0], "ordinary fallback did not update target feedback");
-    record_speculative_commit(stats, nullptr, {.accepted_tokens = 2}, 2, 1, {}, {});
+    require(ordinary[0] < discarded[0], "ordinary bypass did not update target feedback");
+    record_speculative_commit(stats, nullptr, {.accepted_tokens = 1}, true, 3, 0, 0, {}, {});
+    record_speculative_commit(stats, nullptr, {.accepted_tokens = 1}, false, 0, 0, 0, {}, {});
+    record_speculative_commit(stats, nullptr, {.accepted_tokens = 2}, true, 2, 2, 1, {}, {});
     require(stats.backend == Backend::Mtp && stats.enabled && stats.draft_window == 3 &&
-                stats.rounds == 4 && stats.fallback_steps == 1 && stats.drafted_tokens == 8 &&
+                stats.rounds == 4 && stats.bypass_steps == 2 && stats.fallback_steps == 1 &&
+                stats.proposed_tokens == 12 && stats.drafted_tokens == 8 &&
                 stats.accepted_tokens == 5 && stats.committed_draft_tokens == 2 &&
                 stats.attempted_per_position == std::vector<std::uint64_t>{4, 3, 1} &&
                 stats.accepted_per_position == std::vector<std::uint64_t>{3, 2, 0},

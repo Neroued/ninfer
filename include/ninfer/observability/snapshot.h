@@ -45,10 +45,12 @@ struct RuntimeStats {
     // All committed output tokens, including the first token and Engine-injected control tokens.
     std::uint64_t generated_tokens        = 0;
     std::uint64_t injected_control_tokens = 0;
-    // Native verification work, using the same acceptance semantics as SpeculativeStats.
+    // Speculative decode work, using the same semantics as SpeculativeStats.
     std::uint64_t speculative_rounds                 = 0;
+    std::uint64_t speculative_proposed_tokens        = 0;
     std::uint64_t speculative_draft_tokens           = 0;
     std::uint64_t speculative_accepted_tokens        = 0;
+    std::uint64_t speculative_bypass_steps           = 0;
     std::uint64_t speculative_fallback_steps         = 0;
     std::uint64_t speculative_committed_draft_tokens = 0;
     std::vector<std::uint64_t> speculative_attempted_per_position;

@@ -35,6 +35,16 @@ export interface EngineInfo {
   resources: {
     ranks: { rank: number; budget: Record<string, number | Record<string, number> | null> }[];
     total_allocations: Numbers;
+    speculative?: {
+      backend: string;
+      length_policy: string;
+      draft_window: number;
+      calibrated: boolean;
+      calibration_anchors: number;
+      calibration_contexts: number;
+      calibration_seconds: number;
+      target_widths: number[];
+    } | null;
   };
 }
 
@@ -96,7 +106,14 @@ export interface Summary {
   stepMs: number | null;
   specPercent: number | null;
   prefixPercent: number | null;
+  bypassPercent: number | null;
   fallbackPercent: number | null;
+  avgDraftDepth: number | null;
+  proposedDrafts: number;
+  verifiedDrafts: number;
+  specRounds: number;
+  bypassSteps: number;
+  fallbackSteps: number;
   committedDrafts: number;
   reusedTokens: number;
   specPositions: {

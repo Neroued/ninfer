@@ -17,10 +17,12 @@ constexpr std::array kRuntimeCounters{
     std::pair{"decode_rounds", &RuntimeStats::decode_rounds},
     std::pair{"decode_row_rounds", &RuntimeStats::decode_row_rounds},
     std::pair{"speculative_rounds", &RuntimeStats::speculative_rounds},
+    std::pair{"speculative_proposed_tokens", &RuntimeStats::speculative_proposed_tokens},
     std::pair{"speculative_draft_tokens", &RuntimeStats::speculative_draft_tokens},
     std::pair{"speculative_accepted_tokens", &RuntimeStats::speculative_accepted_tokens},
     std::pair{"speculative_committed_draft_tokens",
               &RuntimeStats::speculative_committed_draft_tokens},
+    std::pair{"speculative_bypass_steps", &RuntimeStats::speculative_bypass_steps},
     std::pair{"speculative_fallback_steps", &RuntimeStats::speculative_fallback_steps},
     std::pair{"active_captures_completed", &RuntimeStats::active_captures_completed},
     std::pair{"active_captures_aborted", &RuntimeStats::active_captures_aborted},
@@ -319,14 +321,22 @@ Json observation_json(const EngineSnapshot& snapshot, std::uint64_t now) {
         out["decode_by_batch"].push_back(std::move(row));
     }
     out["in_flight"] = Json::array();
-    for (const auto& unit : snapshot.in_flight)
+    for (const auto& unit : snapshot.in_flight) {
+        Json speculative = nullptr;
+        if (const auto& geometry = unit.work.speculative)
+            speculative = {{"verify_width", geometry->verify_width},
+                           {"valid_target_tokens", geometry->valid_target_tokens},
+                           {"mtp_steps", geometry->mtp_steps},
+                           {"head_columns", geometry->head_columns}};
         out["in_flight"].push_back({{"id", unit.id},
                                     {"started_ns", unit.started_ns},
                                     {"kind", kKinds[static_cast<std::size_t>(unit.work.kind)]},
                                     {"stage", kStages[static_cast<std::size_t>(unit.stage)]},
                                     {"rows", unit.work.rows},
                                     {"input_tokens", unit.work.input_tokens},
-                                    {"scheduled_positions", unit.work.scheduled_positions}});
+                                    {"scheduled_positions", unit.work.scheduled_positions},
+                                    {"speculative", std::move(speculative)}});
+    }
     out["ranks"] = Json::array();
     for (const auto& rank : snapshot.ranks) {
         auto value                      = resource_json(rank);

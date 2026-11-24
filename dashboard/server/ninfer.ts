@@ -112,6 +112,21 @@ export interface NinferSnapshot {
     execution_latency_bounds_ns: number[];
     executions: Record<string, Execution>;
     decode_by_batch: (Execution & { batch: number })[];
+    in_flight?: {
+      id: number;
+      started_ns: number;
+      kind: string;
+      stage: string;
+      rows: number;
+      input_tokens: number;
+      scheduled_positions: number;
+      speculative?: {
+        verify_width: number;
+        valid_target_tokens: number;
+        mtp_steps: number;
+        head_columns: number;
+      } | null;
+    }[];
     context: {
       pools: ContextPool[];
       resources: ContextResource[];

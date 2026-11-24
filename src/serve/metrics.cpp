@@ -88,13 +88,15 @@ std::string Metrics::render(const EngineSnapshot& snapshot, const ServiceSnapsho
     counter("constraint_mask_upload_bytes_total", requests.constraint_upload_bytes,
             "Submitted mask payload bytes.");
     counter("executor_flush_seconds_total", stats.host_work.executor_flush_ns * 1e-9,
-            "Draft-ready wait, counted once per batch.");
+            "Executor flush wall time, counted once per worker flush.");
     gauge("engine_ready", ready ? 1 : 0, "Whether Engine can accept work.");
     gauge("server_start_time_seconds", start_seconds_,
           "Unix time at service attachment after warmup.");
-    header("model_info", "gauge", "Resident model and speculative backend.");
+    header("model_info", "gauge", "Resident model, speculative backend and length policy.");
     out << "ninfer_model_info{model_name=\"" << escape_label(model_) << "\",speculative_backend=\""
-        << product::speculative_backend_name(options_.speculative.backend) << "\"} 1\n";
+        << product::speculative_backend_name(options_.speculative.backend)
+        << "\",speculative_length_policy=\""
+        << product::speculative_length_policy_name(options_.speculative.length_policy) << "\"} 1\n";
     gauge("max_concurrency", options_.max_concurrency, "Maximum resident execution lanes.");
     gauge("max_context_tokens", options_.max_context, "Per-request logical context limit.");
     gauge("spec_decode_draft_window", options_.speculative.draft_tokens,
@@ -135,12 +137,16 @@ std::string Metrics::render(const EngineSnapshot& snapshot, const ServiceSnapsho
             "Initial bindings with checkpoint reuse.");
     COUNTER(speculative_rounds, "spec_decode_rounds_total",
             "Native speculative verification rounds.");
+    COUNTER(speculative_proposed_tokens, "spec_decode_proposed_tokens_total",
+            "Draft candidates generated before target verification narrowing.");
     COUNTER(speculative_draft_tokens, "spec_decode_draft_tokens_total",
             "Draft tokens evaluated by native verification.");
     COUNTER(speculative_accepted_tokens, "spec_decode_accepted_tokens_total",
             "Draft tokens accepted by native verification.");
+    COUNTER(speculative_bypass_steps, "spec_decode_bypass_steps_total",
+            "Speculative decode row-steps with a draft grant and no verified drafts.");
     COUNTER(speculative_fallback_steps, "spec_decode_fallback_steps_total",
-            "Speculative fallback steps without drafts.");
+            "Speculative decode row-steps without a draft grant.");
     GAUGE(state_objects, "context_state_objects", "Live logical State objects.");
     GAUGE(history_objects, "context_history_objects", "Live logical histories.");
     header("context_pool_bytes", "gauge",

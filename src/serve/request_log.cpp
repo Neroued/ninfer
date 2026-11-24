@@ -279,9 +279,11 @@ Json speculative_json(const RequestStats& metrics) {
     return Json{{"backend", product::speculative_backend_name(metrics.speculative.backend)},
                 {"draft_window", metrics.speculative.draft_window},
                 {"rounds", metrics.speculative.rounds},
+                {"proposed_tokens", metrics.speculative.proposed_tokens},
                 {"drafted_tokens", metrics.speculative.drafted_tokens},
                 {"accepted_tokens", metrics.speculative.accepted_tokens},
                 {"committed_draft_tokens", metrics.speculative.committed_draft_tokens},
+                {"bypass_steps", metrics.speculative.bypass_steps},
                 {"fallback_steps", metrics.speculative.fallback_steps},
                 {"attempted_per_position", metrics.speculative.attempted_per_position},
                 {"accepted_per_position", metrics.speculative.accepted_per_position}};
@@ -544,6 +546,8 @@ std::string format_server_start_json(const std::string& server_instance_id, std:
                                       {"prefix_reuse", options.launch.engine.context_cache.enabled},
                                       {"speculative_backend",
                                        product::speculative_backend_name(engine_options.speculative.backend)},
+                                      {"speculative_length_policy",
+                                       product::speculative_length_policy_name(engine_options.speculative.length_policy)},
                                       {"speculative_draft_window", engine_options.speculative.draft_tokens},
                                       {"proposal_head", proposal_head_name(engine_options.speculative.proposal_head)},
                                       {"context_cost", Json{{"transfer_source", ninfer::context_cost_preset_source_name(
@@ -716,9 +720,12 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
     const auto accepted =
         current.speculative_accepted_tokens - previous.speculative_accepted_tokens;
     record["speculative"] = {
+        {"proposed_tokens",
+         current.speculative_proposed_tokens - previous.speculative_proposed_tokens},
         {"drafted_tokens", drafts},
         {"accepted_tokens", accepted},
         {"rounds", current.speculative_rounds - previous.speculative_rounds},
+        {"bypass_steps", current.speculative_bypass_steps - previous.speculative_bypass_steps},
         {"fallback_steps",
          current.speculative_fallback_steps - previous.speculative_fallback_steps},
         {"acceptance", drafts ? Json(double(accepted) / drafts) : Json(nullptr)}};
@@ -730,15 +737,15 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
     record["throughput_tokens_per_second"] = Json{{"prefill", prefill_rate},
                                                   {"decode", decode_rate},
                                                   {"replay", report.replay_tokens_per_second()}};
-    record["scheduler"]  = Json{{"running", current.running_requests},
-                                {"prefilling", current.prefilling_requests},
-                                {"decode_ready", current.decode_ready_requests},
-                                {"waiting", current.waiting_requests},
-                                {"paused", current.paused_requests},
-                                {"replaying", current.replaying_requests},
-                                {"materializing", current.materializing_requests},
-                                {"capture_pending", current.capture_pending_requests},
-                                {"terminal_pending", current.terminal_pending_requests}};
+    record["scheduler"]                    = Json{{"running", current.running_requests},
+                                                  {"prefilling", current.prefilling_requests},
+                                                  {"decode_ready", current.decode_ready_requests},
+                                                  {"waiting", current.waiting_requests},
+                                                  {"paused", current.paused_requests},
+                                                  {"replaying", current.replaying_requests},
+                                                  {"materializing", current.materializing_requests},
+                                                  {"capture_pending", current.capture_pending_requests},
+                                                  {"terminal_pending", current.terminal_pending_requests}};
     record["scheduling"]                   = Json{
                           {"preemptions", monotonic_delta(previous.preemptions, current.preemptions)},
                           {"snapshot_restores",

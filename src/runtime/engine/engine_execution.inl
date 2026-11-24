@@ -149,10 +149,13 @@ void EngineCore<Instance>::commit_pending(PendingBatch&& pending, ComputeFlight 
         auto& observed       = request->speculative_stats;
         const auto& counters = committed.rows[row].speculative;
         cumulative_stats_.speculative_rounds += counters.rounds - observed.rounds;
+        cumulative_stats_.speculative_proposed_tokens +=
+            counters.proposed_tokens - observed.proposed_tokens;
         cumulative_stats_.speculative_draft_tokens +=
             counters.drafted_tokens - observed.drafted_tokens;
         cumulative_stats_.speculative_accepted_tokens +=
             counters.accepted_tokens - observed.accepted_tokens;
+        cumulative_stats_.speculative_bypass_steps += counters.bypass_steps - observed.bypass_steps;
         cumulative_stats_.speculative_fallback_steps +=
             counters.fallback_steps - observed.fallback_steps;
         cumulative_stats_.speculative_committed_draft_tokens +=
@@ -166,8 +169,10 @@ void EngineCore<Instance>::commit_pending(PendingBatch&& pending, ComputeFlight 
             observed.accepted_per_position[i]  = counters.accepted_per_position[i];
         }
         observed.rounds                 = counters.rounds;
+        observed.proposed_tokens        = counters.proposed_tokens;
         observed.drafted_tokens         = counters.drafted_tokens;
         observed.accepted_tokens        = counters.accepted_tokens;
+        observed.bypass_steps           = counters.bypass_steps;
         observed.fallback_steps         = counters.fallback_steps;
         observed.committed_draft_tokens = counters.committed_draft_tokens;
         if (preview[row].cancelled || preview[row].failed) {

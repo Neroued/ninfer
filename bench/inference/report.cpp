@@ -187,9 +187,11 @@ Json summarize(std::span<const Repetition> repetitions, std::uint32_t target_bat
             }
             const auto& s = request.stats.speculative;
             spec.rounds += s.rounds;
+            spec.proposed_tokens += s.proposed_tokens;
             spec.drafted_tokens += s.drafted_tokens;
             spec.accepted_tokens += s.accepted_tokens;
             spec.committed_draft_tokens += s.committed_draft_tokens;
+            spec.bypass_steps += s.bypass_steps;
             spec.fallback_steps += s.fallback_steps;
             spec.accepted_per_position.resize(
                 std::max(spec.accepted_per_position.size(), s.accepted_per_position.size()));
@@ -229,9 +231,11 @@ Json summarize(std::span<const Repetition> repetitions, std::uint32_t target_bat
     out["decode_by_batch"] = decode_batches(std::move(decode), target_batch);
     for (const auto& field : kHostFields) out["host_ns"][field.name] = host.*field.member;
     out["speculative"] = {{"request_rounds", spec.rounds},
+                          {"proposed_tokens", spec.proposed_tokens},
                           {"drafted_tokens", spec.drafted_tokens},
                           {"accepted_tokens", spec.accepted_tokens},
                           {"committed_draft_tokens", spec.committed_draft_tokens},
+                          {"bypass_steps", spec.bypass_steps},
                           {"fallback_steps", spec.fallback_steps},
                           {"acceptance", ratio(spec.accepted_tokens, spec.drafted_tokens)},
                           {"accepted_per_position", spec.accepted_per_position}};
@@ -365,10 +369,12 @@ std::string format_report(const Json& report, OutputFormat format) {
         }
     });
     const auto& summary = report["summary"];
-    out << "\nSpeculative tokens: drafted=" << summary["speculative"]["drafted_tokens"]
+    out << "\nSpeculative tokens: proposed=" << summary["speculative"]["proposed_tokens"]
+        << "  drafted=" << summary["speculative"]["drafted_tokens"]
         << "  accepted=" << summary["speculative"]["accepted_tokens"]
         << "  committed=" << summary["speculative"]["committed_draft_tokens"]
         << "  acceptance=" << number(summary["speculative"]["acceptance"])
+        << "  bypass steps=" << summary["speculative"]["bypass_steps"]
         << "  fallback steps=" << summary["speculative"]["fallback_steps"] << '\n'
         << "Prompt tokens: " << summary["prompt_tokens"]
         << "  output tokens: " << summary["output_tokens"]

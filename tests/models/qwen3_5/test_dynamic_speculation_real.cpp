@@ -129,7 +129,7 @@ void adaptive_rounds(const char* artifact, bool graph, bool startup_fit) {
     const auto k     = options.speculative.draft_tokens;
     const auto round = [&](std::span<const q::SequenceHandle> rows,
                            std::span<const std::uint8_t> accept_drafts, bool explicit_extents,
-                           TokenId replacement = 198) {
+                           TokenId replacement = 198, std::optional<unsigned> budget = {}) {
         std::vector<q::ExecutionUnit> units;
         for (auto row : rows) units.push_back({row, q::ExecutionUnitKind::Decode, 1});
         check(bool(session.reserve_units(units)), "adaptive decode permissions");
@@ -157,8 +157,9 @@ void adaptive_rounds(const char* artifact, bool graph, bool startup_fit) {
         };
         auto pending = [&] {
             if (!explicit_extents)
-                return driver.decode(rows, std::vector<runtime::RoundBudget>(rows.size(), {k + 1}),
-                                     constrained, masks);
+                return driver.decode(
+                    rows, std::vector<runtime::RoundBudget>(rows.size(), {budget.value_or(k + 1)}),
+                    constrained, masks);
             if (!startup_fit)
                 return driver.decode_extents(rows, std::vector<std::uint32_t>(rows.size(), k),
                                              constrained, masks);
@@ -189,10 +190,12 @@ void adaptive_rounds(const char* artifact, bool graph, bool startup_fit) {
         (void)round(members, std::array<std::uint8_t, 2>{0, 1}, true);
     const auto low = std::span(members).first(1);
     if (!startup_fit) session.fit_speculative_cost_model(feedback_fixture_costs(session), 0.0);
-    const auto previous_cells            = session.speculative_cost_summary().online_cell_count;
-    const auto [fallback, fallback_rows] = round(low, std::array<std::uint8_t, 1>{0}, false);
-    check(!fallback[0] && fallback_rows[0].speculative.fallback_steps,
-          "persistent rejection did not select ordinary decode");
+    const auto previous_cells          = session.speculative_cost_summary().online_cell_count;
+    const auto [bypassed, bypass_rows] = round(low, std::array<std::uint8_t, 1>{0}, false);
+    const auto& bypass                 = bypass_rows[0].speculative;
+    check(!bypassed[0] && bypass.bypass_steps == 1 && bypass.fallback_steps == 0 &&
+              bypass.proposed_tokens == bypass.drafted_tokens,
+          "persistent rejection did not record an ordinary policy bypass");
     check(session.speculative_cost_summary().online_cell_count == previous_cells + 1,
           "ordinary decode did not update the retired cost cell");
     bool woke = false;
@@ -206,6 +209,13 @@ void adaptive_rounds(const char* artifact, bool graph, bool startup_fit) {
     if (ragged[0] || !ragged[1])
         throw std::runtime_error("mixed acceptance histories selected extents " +
                                  std::to_string(ragged[0]) + ", " + std::to_string(ragged[1]));
+    const auto [forced, forced_rows] = round(low, std::array<std::uint8_t, 1>{0}, false, 198, 1);
+    const auto& fallback             = forced_rows[0].speculative;
+    const auto& prior                = mixed[0].speculative;
+    check(!forced[0] && fallback.fallback_steps == prior.fallback_steps + 1 &&
+              fallback.bypass_steps == prior.bypass_steps && fallback.rounds == prior.rounds &&
+              fallback.proposed_tokens == prior.proposed_tokens,
+          "a single output token remaining did not record a fallback");
     check(!startup_fit || session.speculative_cost_summary().calibration_elapsed_ms > 0,
           "the measured fit was replaced during adaptive verification");
     for (const auto member : members) (void)driver.abort(member);
@@ -370,9 +380,10 @@ void masked_decode(EngineOptions options, bool expect_offload) {
             const auto committed =
                 driver.commit(std::move(pending), std::array{runtime::CommitDecision{count}});
             const auto& stats = committed.rows.front().speculative;
-            check(draft_intervals() == before + 1 && stats.drafted_tokens == verified &&
-                      stats.fallback_steps == unsigned(!verified),
-                  "split-narrow statistics used the original proposal extent");
+            check(draft_intervals() == before + 1 && stats.proposed_tokens == k &&
+                      stats.drafted_tokens == verified && stats.rounds == unsigned(verified > 0) &&
+                      stats.bypass_steps == unsigned(!verified) && stats.fallback_steps == 0,
+                  "split-narrow statistics did not distinguish proposal and verification");
             (void)driver.abort(member.front());
             if (executed->verify_width < allowed->width) {
                 std::cout << "OK live offload proposal expanded W" << initial.route().width

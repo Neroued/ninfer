@@ -28,6 +28,7 @@ watch(
 );
 const eventRows = computed(() => (props.kind === 'request' ? props.requestEvents : props.events));
 const counters = computed(() => props.summary?.counters ?? {});
+const speculative = computed(() => props.instance?.info.resources.speculative);
 const gpuStages = [
   'draft_stream',
   'target_stream',
@@ -215,6 +216,18 @@ function closeOnBackdrop(event: MouseEvent) {
         </section>
         <section class="drawer-section">
           <h3 class="label">Draft positions</h3>
+          <dl class="detail-list" v-if="summary">
+            <dt>Speculative rounds</dt>
+            <dd>{{ number(summary.specRounds, 0) }}</dd>
+            <dt>Policy bypass</dt>
+            <dd>{{ number(summary.bypassSteps, 0) }}</dd>
+            <dt>Fallback</dt>
+            <dd>{{ number(summary.fallbackSteps, 0) }}</dd>
+            <dt>Verified / proposed drafts</dt>
+            <dd>{{ number(summary.verifiedDrafts, 0) }} / {{ number(summary.proposedDrafts, 0) }}</dd>
+            <dt>Mean draft depth</dt>
+            <dd>{{ number(summary.avgDraftDepth, 2) }}</dd>
+          </dl>
           <table>
             <thead>
               <tr>
@@ -312,6 +325,27 @@ function closeOnBackdrop(event: MouseEvent) {
         </section>
       </template>
       <template v-else-if="tab === 'resources'">
+        <section v-if="speculative" class="drawer-section">
+          <h3 class="label">Speculative execution</h3>
+          <dl class="detail-list">
+            <dt>Backend</dt>
+            <dd>{{ speculative.backend }}</dd>
+            <dt>Length policy</dt>
+            <dd>{{ speculative.length_policy }}</dd>
+            <dt>Draft window</dt>
+            <dd>{{ speculative.draft_window }}</dd>
+            <dt>Target widths</dt>
+            <dd>{{ speculative.target_widths.join(', ') || '—' }}</dd>
+            <template v-if="speculative.calibrated">
+              <dt>Calibration anchors</dt>
+              <dd>{{ number(speculative.calibration_anchors, 0) }}</dd>
+              <dt>Calibration contexts</dt>
+              <dd>{{ number(speculative.calibration_contexts, 0) }}</dd>
+              <dt>Calibration duration</dt>
+              <dd>{{ ms(speculative.calibration_seconds * 1000) }}</dd>
+            </template>
+          </dl>
+        </section>
         <section v-for="resource in rankResources" :key="resource.rank.rank" class="drawer-section">
           <h3 class="label">R{{ resource.rank.rank }} · {{ resource.rank.hardware }}</h3>
           <p class="mono muted">

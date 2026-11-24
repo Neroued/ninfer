@@ -216,21 +216,31 @@ void print_generation_summary(const ninfer::GenerationResult& result,
     const ninfer::SpeculativeStats& speculative = result.stats.speculative;
     if (speculative.enabled) {
         const std::string backend = ninfer::product::speculative_backend_name(speculative.backend);
+        print_metric(backend + " length policy", ninfer::product::speculative_length_policy_name(
+                                                     engine.options().speculative.length_policy));
         print_metric(backend + " draft window", std::to_string(speculative.draft_window));
         print_metric(backend + " rounds", std::to_string(speculative.rounds));
+        print_metric(backend + " bypass steps", std::to_string(speculative.bypass_steps));
         print_metric(backend + " fallback steps", std::to_string(speculative.fallback_steps));
+        if (speculative.proposed_tokens != speculative.drafted_tokens)
+            print_metric(backend + " proposed tokens", std::to_string(speculative.proposed_tokens));
         print_metric(backend + " drafted tokens", std::to_string(speculative.drafted_tokens));
         print_metric(backend + " accepted tokens", std::to_string(speculative.accepted_tokens));
         print_metric(backend + " acceptance rate",
                      format_percent(speculative.accepted_tokens, speculative.drafted_tokens));
-        if (speculative.rounds != 0) {
+        const auto format_length = [&](std::uint64_t steps, const char* unit) {
             std::ostringstream length;
             length << std::fixed << std::setprecision(2)
-                   << 1.0 + static_cast<double>(speculative.accepted_tokens) /
-                                static_cast<double>(speculative.rounds)
-                   << " tok/round";
-            print_metric(backend + " acceptance length", length.str());
-        }
+                   << 1.0 + static_cast<double>(speculative.accepted_tokens) / steps << ' ' << unit;
+            return length.str();
+        };
+        const auto total_steps =
+            speculative.rounds + speculative.bypass_steps + speculative.fallback_steps;
+        if (total_steps)
+            print_metric(backend + " tokens / step", format_length(total_steps, "tok/step"));
+        if (speculative.rounds)
+            print_metric(backend + " acceptance length",
+                         format_length(speculative.rounds, "tok/round"));
         if (!speculative.accepted_per_position.empty()) {
             std::ostringstream positions;
             for (std::size_t i = 0; i < speculative.accepted_per_position.size(); ++i) {

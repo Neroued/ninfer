@@ -1,4 +1,5 @@
 #include "product/statistics.h"
+#include "product/speculative_options.h"
 
 #include <nlohmann/json.hpp>
 #include <cmath>
@@ -293,8 +294,20 @@ Json startup_resources_json(const EngineDescription& description, const StartupR
             if (sample.rank == rank.rank) out["resources"] = resource_json(sample);
         ranks.push_back(std::move(out));
     }
-    return {{"ranks", std::move(ranks)},
-            {"total_allocations", allocations_json(sum_allocations(snapshot.ranks))}};
+    Json result{{"ranks", std::move(ranks)},
+                {"total_allocations", allocations_json(sum_allocations(snapshot.ranks))}};
+    if (startup.speculative) {
+        const auto& s         = *startup.speculative;
+        result["speculative"] = {{"backend", speculative_backend_name(s.backend)},
+                                 {"length_policy", speculative_length_policy_name(s.length_policy)},
+                                 {"draft_window", s.draft_window},
+                                 {"calibrated", s.calibrated},
+                                 {"calibration_anchors", s.calibration_anchors},
+                                 {"calibration_contexts", s.calibration_contexts},
+                                 {"calibration_seconds", s.calibration_seconds},
+                                 {"target_widths", s.target_widths}};
+    }
+    return result;
 }
 
 } // namespace ninfer::product

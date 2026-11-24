@@ -373,6 +373,7 @@ template <class Instance>
     for (const auto lane : flight.lanes) reserved_units_[lane].reset();
     scheduler_.prefill_executed(flight.lanes.front(), max_concurrency_);
     prefill_coalesce_waits_ = 0;
+    last_coalesced_request_ = 0;
     compute_.emplace(std::move(flight));
     return true;
 }

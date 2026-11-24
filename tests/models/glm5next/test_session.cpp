@@ -1757,7 +1757,7 @@ void engine_packed_prefill(std::shared_ptr<const glm::ModelDefinition> definitio
     options.context_cache.enabled  = true;
     executor.hold_poll             = true;
     executor.defer_binding         = 2;
-    executor.deferred_bind_flushes = 1;
+    executor.deferred_bind_flushes = 8;
     executor.hold_mixed_prefill    = cancel_in_flight;
     rt::EngineCore<Instance> engine(instance, options, {});
     const auto submit = [&](std::uint32_t length, TokenId token, bool cache, bool stream = false) {

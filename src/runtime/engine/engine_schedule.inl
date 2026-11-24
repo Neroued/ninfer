@@ -1106,18 +1106,23 @@ template <class Instance>
     build_prefill_membership(policy);
     if (selected.empty()) {
         prefill_coalesce_waits_ = 0;
+        last_coalesced_request_ = 0;
         release_unused_prefill_units();
         return false;
     }
     if (policy.max_sequences_per_step > 1 && !scheduler_.progress_owner() && materializing_ &&
         !materializing_->resumed && materializing_->source.source.transfers.empty() &&
-        !selected.is_replay && selected.size() < policy.max_sequences_per_step &&
-        prefill_coalesce_waits_ < max_concurrency_) {
+        !selected.is_replay && selected.size() < policy.max_sequences_per_step) {
         std::uint64_t tokens = 0;
         for (const auto& grant : selected.grants) tokens += grant.max_tokens;
         if (tokens < policy.max_tokens_global) {
-            ++prefill_coalesce_waits_;
-            return false;
+            const auto id = materializing_->request->id;
+            if (id == last_coalesced_request_) return false;
+            if (prefill_coalesce_waits_ < max_concurrency_) {
+                last_coalesced_request_ = id;
+                ++prefill_coalesce_waits_;
+                return false;
+            }
         }
     }
 
@@ -1378,7 +1383,7 @@ void EngineCore<Instance>::worker_loop() noexcept {
             if (revision != published_revision_) publish_runtime_stats();
             const bool schedule = progressed || revision != scheduled_revision ||
                                   !execution_outstanding() || Clock::now() >= pending_deadline_ ||
-                                  (prefill_coalesce_waits_ && materializing_);
+                                  (prefill_coalesce_waits_ && !materializing_);
             if (cycle_step_ == CycleStep::Boundary && !compute_pending() && schedule) {
                 scheduled_revision = revision;
                 set_host_work_class(HostWorkClass::Control);

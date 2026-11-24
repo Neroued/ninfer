@@ -801,6 +801,7 @@ private:
     std::optional<ComputeFlight> retiring_;
     CycleStep cycle_step_                 = CycleStep::Boundary;
     std::uint32_t prefill_coalesce_waits_ = 0;
+    std::uint64_t last_coalesced_request_ = 0;
     std::vector<std::uint8_t> control_executed_;
     std::vector<std::optional<UnitPermit>> reserved_units_;
     std::atomic<bool> admission_check_pending_{false};

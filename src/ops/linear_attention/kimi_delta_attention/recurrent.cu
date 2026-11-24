@@ -17,6 +17,27 @@ void launch_recurrent(const Arguments& args, cudaStream_t stream) {
     CUDA_CHECK(cudaGetLastError());
 }
 
+void launch_ragged_recurrent(const Arguments& args, RaggedSegments segments, int recurrent_before,
+                             cudaStream_t stream) {
+    for (std::int64_t begin = 0; begin < segments.count; begin += kGridRows) {
+        const int rows = std::min<std::int64_t>(kGridRows, segments.count - begin);
+#if NINFER_TARGET_SPARK
+        if (segments.count >= 16) {
+            recurrent_kernel<true, false, kDvPerWarp, true>
+                <<<dim3(args.value_heads * (kStateDim / kBlockDv), rows),
+                   dim3(common::kWarpSize, kNumWarps), 0, stream>>>(
+                    args, args.source_offset, args.destination_offset, nullptr, {},
+                    static_cast<int>(begin), RaggedRecurrent{segments, recurrent_before});
+        } else
+#endif
+            recurrent_kernel<true, false><<<dim3(args.value_heads, rows, kStateDim / kBlockDv),
+                                            dim3(common::kWarpSize, kNumWarps), 0, stream>>>(
+                args, args.source_offset, args.destination_offset, nullptr, {},
+                static_cast<int>(begin), RaggedRecurrent{segments, recurrent_before});
+        CUDA_CHECK(cudaGetLastError());
+    }
+}
+
 void launch_batch_update(const Arguments& args, const std::int64_t* sources,
                          const std::int64_t* destinations, const std::int32_t* valid, int batch,
                          cudaStream_t stream) {

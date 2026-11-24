@@ -6,6 +6,8 @@
 #include "ops/common/cuda/mma.cuh"
 #include "ops/common/cuda/memory.cuh"
 
+#include <atomic>
+
 namespace ninfer::ops::detail::kimi_delta_attention {
 namespace {
 
@@ -64,12 +66,26 @@ struct RecurrenceShared {
     float delta[kChunkSize * DV];
 };
 
-template <int DV>
+struct PacketRange {
+    int width, packet, seg_chunk;
+};
+
+template <int DV, class... Range>
 __device__ __forceinline__ void load_stage(typename RecurrenceShared<DV>::Stage& stage,
                                            const Arguments& args, const Chunk* workspace, int head,
-                                           int value_start, int chunk, int tid) {
-    const auto* src = reinterpret_cast<const uint4*>(
-        workspace + static_cast<std::int64_t>(head) * chunk_count(args.tokens) + chunk);
+                                           int value_start, int chunk, int tid,
+                                           const Range&... range) {
+    constexpr bool Packed = sizeof...(Range) != 0;
+    const uint4* src;
+    if constexpr (Packed) {
+        const auto& r = (..., range);
+        src = reinterpret_cast<const uint4*>(workspace + static_cast<std::int64_t>(head) * r.width +
+                                             r.packet + chunk);
+        chunk += r.seg_chunk;
+    } else {
+        src = reinterpret_cast<const uint4*>(
+            workspace + static_cast<std::int64_t>(head) * chunk_count(args.tokens) + chunk);
+    }
     auto* dst = reinterpret_cast<uint4*>(&stage.packet);
 #pragma unroll
     for (int i = tid; i < static_cast<int>(sizeof(Chunk) / 16); i += kThreads<DV>) {
@@ -136,14 +152,16 @@ __device__ __forceinline__ void store_output(const Arguments& args, float (&acc)
     }
 }
 
-template <int DV>
+template <int DV, class... Metadata>
 __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurrence_kernel(
-    Arguments args, const Chunk* __restrict__ workspace) {
-    constexpr int kWarps = kThreads<DV> / 32;
-    constexpr int NT     = DV / 8;
-    constexpr int MW     = NT < kWarps ? kWarps / NT : 1;
-    constexpr int MPW    = (kStateDim / 16) / MW;
-    constexpr int NPW    = NT > kWarps ? NT / kWarps : 1;
+    Arguments args, const Chunk* __restrict__ workspace,
+    const __grid_constant__ Metadata... metadata) {
+    constexpr bool Packed = sizeof...(Metadata) != 0;
+    constexpr int kWarps  = kThreads<DV> / 32;
+    constexpr int NT      = DV / 8;
+    constexpr int MW      = NT < kWarps ? kWarps / NT : 1;
+    constexpr int MPW     = (kStateDim / 16) / MW;
+    constexpr int NPW     = NT > kWarps ? NT / kWarps : 1;
     extern __shared__ __align__(256) unsigned char backing[];
     auto& sm      = *reinterpret_cast<RecurrenceShared<DV>*>(backing);
     const int tid = threadIdx.x, lane = tid & 31, warp = tid / 32;
@@ -152,7 +170,38 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
     const int value_start = blockIdx.x % (kStateDim / DV) * DV;
     const int n_start     = warp % NT;
     const int m_start     = NT < kWarps ? warp / NT : 0;
-    const int chunks      = chunk_count(args.tokens);
+    int chunks            = chunk_count(args.tokens);
+    PacketRange range{};
+    if constexpr (Packed) {
+        const auto& packed = (..., metadata);
+        const auto window  = packed.window;
+        const unsigned row = blockIdx.y + blockIdx.z * gridDim.y;
+        if (row >= static_cast<unsigned>(window.segments)) return;
+        int index = window.first_segment + row;
+        // Give the longest-running CTAs the first wave on skewed windows.
+        if (index == window.first_segment)
+            index = window.longest_segment;
+        else if (index == window.longest_segment)
+            index = window.first_segment;
+        const auto [s, first] = packed.index()[index];
+        args.tokens           = packed.segments.lengths[s];
+        const int begin       = max(first, window.begin);
+        const int end         = min(first + chunk_count(args.tokens), window.end);
+        range                 = {window.end - window.begin, begin - window.begin, begin - first};
+        chunks                = end - begin;
+
+        const auto offset =
+            static_cast<std::int64_t>(packed.segments.cu_seqlens[s]) * args.value_heads * kStateDim;
+        args.v += offset;
+        args.out += offset;
+        args.destination_offset += s;
+        if (begin != first) {
+            args.state_in      = args.state_out;
+            args.source_offset = args.destination_offset;
+        } else {
+            args.source_offset += s;
+        }
+    }
     const auto state_base = static_cast<std::int64_t>(head) * kStateDim * kStateDim;
     const auto src_base =
         state_base +
@@ -177,8 +226,14 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
             state[ni][mi][3] = args.state_in[src_base + (value + 1) * kStateDim + key + 8];
         }
     }
-    load_stage<DV>(sm.stage[0], args, workspace, head, value_start, 0, tid);
-    if (chunks > 1) load_stage<DV>(sm.stage[1], args, workspace, head, value_start, 1, tid);
+    if constexpr (Packed) {
+        load_stage<DV>(sm.stage[0], args, workspace, head, value_start, 0, tid, range);
+        if (chunks > 1)
+            load_stage<DV>(sm.stage[1], args, workspace, head, value_start, 1, tid, range);
+    } else {
+        load_stage<DV>(sm.stage[0], args, workspace, head, value_start, 0, tid);
+        if (chunks > 1) load_stage<DV>(sm.stage[1], args, workspace, head, value_start, 1, tid);
+    }
 
     for (int chunk = 0; chunk < chunks; ++chunk) {
         if (chunk + 1 < chunks)
@@ -281,12 +336,14 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
             for (int ni = 0; ni < NPW; ++ni) {
                 const int n = warp + ni * kWarps;
                 matrix_delta<DV>(history[ni], p.mqk, sm.delta, n, lane);
-                store_output(args, history[ni], chunk, head, value_start, n, lane);
+                store_output(args, history[ni], Packed ? chunk + range.seg_chunk : chunk, head,
+                             value_start, n, lane);
             }
         } else if (warp >= NT && warp < 2 * NT) {
             const int n = warp - NT;
             matrix_delta<DV>(history[0], p.mqk, sm.delta, n, lane);
-            store_output(args, history[0], chunk, head, value_start, n, lane);
+            store_output(args, history[0], Packed ? chunk + range.seg_chunk : chunk, head,
+                         value_start, n, lane);
         }
 
         // S^T = diag(gamma) S^T + Kr^T Delta. State remains an FP32 accumulator.
@@ -320,7 +377,12 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
         }
         __syncthreads();
         if (chunk + 2 < chunks) {
-            load_stage<DV>(sm.stage[chunk & 1], args, workspace, head, value_start, chunk + 2, tid);
+            if constexpr (Packed)
+                load_stage<DV>(sm.stage[chunk & 1], args, workspace, head, value_start, chunk + 2,
+                               tid, range);
+            else
+                load_stage<DV>(sm.stage[chunk & 1], args, workspace, head, value_start, chunk + 2,
+                               tid);
         }
     }
 #pragma unroll
@@ -338,31 +400,58 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
     }
 }
 
-template <int DV>
-void launch(const Arguments& args, const Chunk* workspace, cudaStream_t stream) {
+template <int DV, class... Metadata>
+void launch(const Arguments& args, const Chunk* workspace, CudaExecutionView execution,
+            const Metadata&... metadata) {
     constexpr int shared_bytes = sizeof(RecurrenceShared<DV>);
-    (void)common::prepare_shared<shared_bytes, chunk_recurrence_kernel<DV>, true>();
-    chunk_recurrence_kernel<DV>
-        <<<args.value_heads*(kStateDim / DV), kThreads<DV>, shared_bytes, stream>>>(args,
-                                                                                    workspace);
+    if constexpr (shared_bytes > 48 * 1024) {
+        static std::atomic<std::uint64_t> configured{0};
+        const int device = execution.device().index();
+        const auto bit   = device < 64 ? std::uint64_t{1} << device : 0;
+        if ((configured.load(std::memory_order_acquire) & bit) == 0) {
+            CUDA_CHECK(cudaFuncSetAttribute(
+                reinterpret_cast<const void*>(chunk_recurrence_kernel<DV, Metadata...>),
+                cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes));
+            if (bit) configured.fetch_or(bit, std::memory_order_release);
+        }
+    }
+    dim3 grid(args.value_heads * (kStateDim / DV));
+    if constexpr (sizeof...(Metadata) != 0) {
+        const auto window = (..., metadata).window;
+        grid.y            = std::min(window.segments, common::kCudaGridYLimit);
+        grid.z            = common::div_up(static_cast<unsigned>(window.segments), grid.y);
+    }
+    chunk_recurrence_kernel<DV, Metadata...>
+        <<<grid, kThreads<DV>, shared_bytes, execution.stream()>>>(args, workspace, metadata...);
     CUDA_CHECK(cudaGetLastError());
+}
+
+template <class... Metadata>
+void dispatch(const Arguments& args, const Chunk* workspace, int value_tile,
+              CudaExecutionView execution, const Metadata&... metadata) {
+    switch (value_tile) {
+    case 64:
+        return launch<64>(args, workspace, execution, metadata...);
+    case 32:
+        return launch<32>(args, workspace, execution, metadata...);
+    case 16:
+        return launch<16>(args, workspace, execution, metadata...);
+    case 8:
+        return launch<8>(args, workspace, execution, metadata...);
+    }
+    throw std::logic_error("linear attention: invalid recurrence value tile");
 }
 
 } // namespace
 
 void launch_chunk_recurrence(const Arguments& args, const Chunk* workspace, int value_tile,
-                             cudaStream_t stream) {
-    switch (value_tile) {
-    case 64:
-        return launch<64>(args, workspace, stream);
-    case 32:
-        return launch<32>(args, workspace, stream);
-    case 16:
-        return launch<16>(args, workspace, stream);
-    case 8:
-        return launch<8>(args, workspace, stream);
-    }
-    throw std::logic_error("linear attention: invalid recurrence value tile");
+                             CudaExecutionView execution) {
+    dispatch(args, workspace, value_tile, execution);
+}
+
+void launch_chunk_recurrence(const Arguments& args, const Chunk* workspace, int value_tile,
+                             const PackedChunks& packed, CudaExecutionView execution) {
+    dispatch(args, workspace, value_tile, execution, packed);
 }
 
 } // namespace ninfer::ops::detail::kimi_delta_attention

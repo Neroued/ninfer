@@ -16,6 +16,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
+#include <limits>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -738,47 +739,63 @@ int contract_rejection_cases() {
     return failures;
 }
 
-int ragged_recurrence(bool multi_window) {
-    RaggedFixture ragged({1, 3, 17, multi_window ? 257 : 65});
-    const int heads = multi_window ? 32 : 2, qk_heads = heads / 2;
-    constexpr int slots = 8;
+enum class RaggedState { Distinct, InPlace, Mixed, SharedSource };
+enum class RaggedInputs { Random, Adversarial, Cancellation, PoisonedNeighbor };
+
+int ragged_recurrence(const std::string& label, std::vector<int> lengths, int qk_heads, int heads,
+                      RaggedState form, bool graph = false, bool tight = false, int min_tokens = 0,
+                      int max_tokens = 0, RaggedInputs inputs = RaggedInputs::Random) {
+    RaggedFixture ragged(std::move(lengths));
     const int n = ragged.tokens(), rows = ragged.segments();
-    const std::vector<int> source{3, 1, 6, 0}, destination{3, 4, 6, 2};
+    const int source_slots           = form == RaggedState::SharedSource ? 2 : rows;
+    const int slots                  = source_slots + rows + 1;
     const std::size_t state_elements = 128 * 128 * heads;
     const std::size_t out_column     = 128 * heads;
-    const float scale                = 1.0f / std::sqrt(128.0f);
-    Case c{"ragged", heads, 1};
-    kda_ref::Inputs packed;
-    c.qk_heads = qk_heads;
-    std::vector<kda_ref::Result> reference;
-    std::vector<float> initial(state_elements * slots, -.0625f);
-    const auto append = [](auto& dest, const auto& src) {
-        dest.insert(dest.end(), src.begin(), src.end());
-    };
-    for (int row = 0; row < rows; ++row) {
-        c.tokens   = ragged.lengths[row];
-        auto input = make_inputs(c, 937 + row * 41);
-        if (row == 0) {
-            packed.a_log   = input.a_log;
-            packed.dt_bias = input.dt_bias;
+    const std::size_t qk_column      = 128 * qk_heads;
+    const bool cancellation          = inputs == RaggedInputs::Cancellation;
+    const bool poisoned_neighbor     = inputs == RaggedInputs::PoisonedNeighbor;
+    const Case c{"ragged", heads, n, false, false, false, qk_heads, cancellation ? 0.0F : -0.5F};
+    auto make_packed = [&](unsigned seed) {
+        auto input = make_inputs(c, seed);
+        if (cancellation) {
+            std::fill(input.q.begin(), input.q.end(), 0.0F);
+            std::fill(input.k.begin(), input.k.end(), 0.0F);
+            std::fill(input.v.begin(), input.v.end(), 0.0F);
+            std::fill(input.state.begin(), input.state.end(), 0.0F);
+            input.q[0]     = 1.0F;
+            input.q[1]     = -1.0F;
+            input.state[0] = 1.0F + 0x1p-9F;
+            input.state[1] = 1.0F;
         }
-        input.a_log   = packed.a_log;
-        input.dt_bias = packed.dt_bias;
-        append(packed.q, input.q);
-        append(packed.k, input.k);
-        append(packed.v, input.v);
-        append(packed.g, input.g);
-        append(packed.beta, input.beta);
-        std::copy(input.state.begin(), input.state.end(),
-                  initial.begin() + source[row] * state_elements);
-        reference.push_back(kda_ref::evaluate(input, c.lower_bound, scale));
-    }
+        if (poisoned_neighbor) {
+            const auto first = input.v.begin() + ragged.prefix[1] * out_column;
+            for (std::size_t i = 0; i < out_column; ++i)
+                first[i] = i % 2 ? std::numeric_limits<float>::infinity()
+                                 : std::numeric_limits<float>::quiet_NaN();
+        }
+        if (inputs != RaggedInputs::Adversarial) return input;
+        for (int s = 1; s < rows; ++s) {
+            const int col = ragged.prefix[s];
+            // A conspicuous first row adjacent to the preceding segment's padded tail.
+            for (std::size_t i = 0; i < qk_column; ++i) {
+                input.q[col * qk_column + i] *= 64;
+                input.k[col * qk_column + i] *= -64;
+            }
+            for (std::size_t i = 0; i < out_column; ++i) {
+                input.v[col * out_column + i] *= -8;
+                input.g[col * out_column + i] = i % 2 ? -12 : 12;
+            }
+            for (int h = 0; h < heads; ++h) input.beta[col * heads + h] = h % 2 ? -8 : 8;
+        }
+        return input;
+    };
+    auto packed = make_packed(937);
     DeviceInputs device(packed);
-    GuardedDeviceBuffer states(initial.size() * 4), output(packed.v.size() * 2);
-    states.copy_from_host(initial.data(), initial.size() * 4);
+    GuardedDeviceBuffer states(slots * state_elements * sizeof(float)), output(packed.v.size() * 2);
+    states.fill(0);
     RecordStateFixture history(Tensor(states.span(), DType::FP32, {128, 128, heads, slots}), 3);
-    auto so  = to_device(history.record_offsets(source)),
-         do_ = to_device(history.record_offsets(destination));
+    auto so  = to_device(std::vector<std::int64_t>(rows));
+    auto do_ = to_device(std::vector<std::int64_t>(rows));
     auto src = history.view(Tensor(so.span(), DType::I64, {rows}));
     auto dst = history.view(Tensor(do_.span(), DType::I64, {rows}));
     Tensor q(device.q.span(), DType::BF16, {128, qk_heads, n});
@@ -786,54 +803,224 @@ int ragged_recurrence(bool multi_window) {
     Tensor v(device.v.span(), DType::BF16, {128, heads, n});
     Tensor g(device.g.span(), DType::BF16, {128, heads, n});
     Tensor beta(device.beta.span(), DType::BF16, {heads, n});
-    Tensor a(device.a_log.span(), DType::FP32, {heads}),
-        dt(device.dt_bias.span(), DType::FP32, {128, heads});
+    Tensor a(device.a_log.span(), DType::FP32, {heads});
+    Tensor dt(device.dt_bias.span(), DType::FP32, {128, heads});
     Tensor out(output.span(), DType::BF16, {128, heads, n});
-    const auto bytes = ops::kimi_delta_attention_ragged_workspace_capacity_bytes(qk_heads, heads, n,
-                                                                                 n, rows, rows);
+    const int chunked   = std::count_if(ragged.lengths.begin(), ragged.lengths.end(),
+                                        [](int length) { return length >= 12; });
+    const auto capacity = ops::kimi_delta_attention_ragged_workspace_capacity_bytes(
+        qk_heads, heads, min_tokens ? min_tokens : n, max_tokens ? max_tokens : n, rows, rows);
+    const int longest = *std::max_element(ragged.lengths.begin(), ragged.lengths.end());
+    // A direct segment must fit in the dense allocation for its exact length.
+    const auto bytes =
+        chunked <= 1
+            ? ops::kimi_delta_attention_workspace_capacity_bytes(qk_heads, heads, longest, longest)
+            : capacity;
+    if (capacity < bytes) {
+        std::cerr << label << ": insufficient ragged workspace query\n";
+        return 1;
+    }
     GuardedDeviceBuffer scratch(bytes);
     MemoryArena ws(scratch.span());
-    const auto ex = cuda_environment().default_execution;
-    ops::kimi_delta_attention(q, k, v, g, beta, a, dt, c.lower_bound, scale, ragged.view, ws, src,
-                              dst, out, ex);
-    cuda_synchronize();
-    history.copy_back();
-    const auto actual = from_device_bf16(output.data(), packed.v.size());
-    const auto after  = from_device<float>(states.data(), initial.size());
-    int failures =
-        output.verify_guards("ragged output") + scratch.verify_guards("ragged workspace") +
-        states.verify_guards("ragged state") + history.verify_guards("ragged selected fields");
-    for (int row = 0; row < rows; ++row) {
-        const std::size_t begin = destination[row] * state_elements;
-        const auto first        = actual.begin() + ragged.prefix[row] * out_column;
-        const auto last         = first + ragged.lengths[row] * out_column;
-        failures += verify_reduction("ragged KDA output", std::vector<double>(first, last),
-                                     reference[row].out, output_criterion());
-        const auto state = doubles(
-            std::vector<float>(after.begin() + begin, after.begin() + begin + state_elements));
-        failures += verify_reduction("ragged KDA state", state, reference[row].final_state,
-                                     state_criterion());
+    auto launch = [&](CudaExecutionView ex) {
+        ops::kimi_delta_attention(q, k, v, g, beta, a, dt, c.lower_bound, kScale, ragged.view, ws,
+                                  src, dst, out, ex);
+    };
+
+    cudaStream_t stream        = nullptr;
+    cudaGraph_t captured       = nullptr;
+    cudaGraphExec_t executable = nullptr;
+    if (graph) {
+        CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+        launch(cuda_environment().context.execution_view(stream));
+        CUDA_CHECK(cudaStreamEndCapture(stream, &captured));
+        CUDA_CHECK(cudaGraphInstantiate(&executable, captured, 0));
     }
-    for (int slot = 0; slot < slots; ++slot) {
-        if (std::find(destination.begin(), destination.end(), slot) != destination.end()) continue;
-        const auto begin = slot * state_elements;
-        failures += verify_exact(
-            "ragged unselected state",
-            std::vector<float>(after.begin() + begin, after.begin() + begin + state_elements),
-            std::vector<float>(initial.begin() + begin, initial.begin() + begin + state_elements));
+
+    int failures = 0;
+    for (int replay = 0; replay < (graph ? 2 : 1); ++replay) {
+        if (replay) {
+            auto next         = make_packed(1153);
+            const auto upload = [](DeviceBuffer& target, const std::vector<float>& values) {
+                const auto bits = bf16_bits(values);
+                target.copy_from_host(bits.data(), target.size());
+            };
+            upload(device.q, next.q);
+            upload(device.k, next.k);
+            upload(device.v, next.v);
+            upload(device.g, next.g);
+            upload(device.beta, next.beta);
+            next.a_log   = packed.a_log;
+            next.dt_bias = packed.dt_bias;
+            packed       = std::move(next);
+        }
+        std::vector<int> source(rows), destination(rows);
+        for (int s = 0; s < rows; ++s) {
+            source[s] = form == RaggedState::SharedSource ? (s + replay) % 2 : rows - 1 - s;
+            destination[s] =
+                form == RaggedState::InPlace || (form == RaggedState::Mixed && s % 2 == 0)
+                    ? source[s]
+                    : source_slots + (s + replay) % rows;
+        }
+        // A replay must read the current selectors. Reverse the order of the distinct
+        // sources, and move the lone source/destination pair for a one-segment graph.
+        if (replay && form == RaggedState::Distinct) {
+            for (auto& slot : source) slot = rows - 1 - slot;
+            if (rows == 1) std::swap(source[0], destination[0]);
+        }
+        const auto sources      = history.record_offsets(source);
+        const auto destinations = history.record_offsets(destination);
+        so.copy_from_host(sources.data(), so.size());
+        do_.copy_from_host(destinations.data(), do_.size());
+
+        auto input_state = [&](int slot) {
+            if (cancellation) return packed.state;
+            std::vector<float> state(state_elements);
+            for (std::size_t i = 0; i < state_elements; ++i)
+                state[i] = packed.state[i] + 0.005F * ((slot % 11) - 5);
+            return state;
+        };
+        const std::vector<float> sentinel(state_elements, -0.0625F);
+        const std::vector<float> poison(state_elements, std::numeric_limits<float>::quiet_NaN());
+        std::vector<bool> is_source(slots), is_destination(slots);
+        for (int s : source) is_source[s] = true;
+        for (int s : destination) is_destination[s] = true;
+        for (int slot = 0; slot < slots; ++slot) {
+            const auto field    = history.tensor(slot);
+            const auto& initial = is_source[slot]        ? input_state(slot)
+                                  : is_destination[slot] ? poison
+                                                         : sentinel;
+            CUDA_CHECK(
+                cudaMemcpy(field.data, initial.data(), field.bytes(), cudaMemcpyHostToDevice));
+        }
+        scratch.fill(0xff);
+        output.fill(0xff);
+        if (graph) {
+            CUDA_CHECK(cudaGraphLaunch(executable, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+        } else {
+            launch(cuda_environment().default_execution);
+            cuda_synchronize();
+        }
+
+        failures += output.verify_guards(label) + scratch.verify_guards(label) +
+                    states.verify_guards(label) + history.verify_guards(label);
+        if (ws.used() != 0 || ws.peak_used() > bytes || (tight && ws.peak_used() != bytes)) {
+            std::cerr << label << ": workspace capacity " << bytes << ", peak " << ws.peak_used()
+                      << ", used after call " << ws.used() << '\n';
+            ++failures;
+        }
+        const auto actual = from_device_bf16(output.data(), packed.v.size());
+        for (int s = 0; s < rows; ++s) {
+            if (poisoned_neighbor && s == 1) continue;
+            const auto slice = [&](const std::vector<float>& tensor, std::size_t stride) {
+                return std::vector<float>(tensor.begin() + ragged.prefix[s] * stride,
+                                          tensor.begin() + ragged.prefix[s + 1] * stride);
+            };
+            const kda_ref::Inputs step{qk_heads,
+                                       heads,
+                                       ragged.lengths[s],
+                                       slice(packed.q, qk_column),
+                                       slice(packed.k, qk_column),
+                                       slice(packed.v, out_column),
+                                       slice(packed.g, out_column),
+                                       slice(packed.beta, heads),
+                                       packed.a_log,
+                                       packed.dt_bias,
+                                       input_state(source[s])};
+            const auto expected = kda_ref::evaluate(step, c.lower_bound, kScale);
+            const auto name =
+                label + " replay " + std::to_string(replay) + " segment " + std::to_string(s);
+            const auto first = actual.begin() + ragged.prefix[s] * out_column;
+            const auto last  = actual.begin() + ragged.prefix[s + 1] * out_column;
+            failures += verify_reduction(name + " output", std::vector<double>(first, last),
+                                         expected.out, output_criterion());
+            const auto state =
+                from_device<float>(history.tensor(destination[s]).data, state_elements);
+            failures += verify_reduction(name + " state", doubles(state), expected.final_state,
+                                         state_criterion());
+        }
+        for (int slot = 0; slot < slots; ++slot) {
+            if (is_destination[slot]) continue;
+            failures += verify_exact("ragged unselected state",
+                                     from_device<float>(history.tensor(slot).data, state_elements),
+                                     is_source[slot] ? input_state(slot) : sentinel);
+        }
     }
-    return failures + (ws.used() != 0 || ws.peak_used() > bytes);
+    if (graph) {
+        CUDA_CHECK(cudaGraphExecDestroy(executable));
+        CUDA_CHECK(cudaGraphDestroy(captured));
+        CUDA_CHECK(cudaStreamDestroy(stream));
+    }
+    return failures;
+}
+
+int ragged_workspace_envelopes() {
+    constexpr std::size_t packet_column = 14848 * 32;
+    const auto bytes                    = [](int min_t, int max_t, int min_s, int max_s) {
+        return ops::kimi_delta_attention_ragged_workspace_capacity_bytes(32, 32, min_t, max_t,
+                                                                                            min_s, max_s);
+    };
+#if NINFER_TARGET_SPARK
+    const std::vector<std::size_t> expected{0, 0, 16, 16, 16, 8, 16, 16, 16, 16, 8, 1};
+#else
+    const std::vector<std::size_t> expected{0, 0, 17, 17, 16, 256, 257, 257, 17, 18, 218, 1};
+#endif
+    constexpr int largest = std::numeric_limits<int>::max();
+    const std::vector<std::size_t> actual{
+        bytes(1, 11, 1, 1),          bytes(160, 170, 160, 160),
+        bytes(255, 257, 1, 1),       bytes(256, 257, 1, 1),
+        bytes(255, 256, 1, 1),       bytes(257, 4096, 1, 1),
+        bytes(240, 4096, 2, 2),      bytes(257, 4096, 2, 2),
+        bytes(244, 257, 2, 2),       bytes(257, 257, 2, 3),
+        bytes(2000, 2000, 100, 100), bytes(largest, largest, largest - 11, largest - 11)};
+    std::vector<std::size_t> expected_bytes;
+    for (const auto packets : expected) expected_bytes.push_back(packets * packet_column);
+    expected_bytes[10] += 100 * 2 * sizeof(int);
+    return verify_exact("ragged workspace envelope high watermarks", actual, expected_bytes);
 }
 
 } // namespace
 
 int main(int argc, char** argv) {
     OpSuite suite;
-    suite.add("kimi_delta_attention/ragged", [] { return ragged_recurrence(false); });
+    const auto ragged = [&suite](std::string label, std::vector<int> lengths, int qk, int value,
+                                 RaggedState form, bool graph = false, bool tight = false,
+                                 int min_tokens = 0, int max_tokens = 0,
+                                 RaggedInputs inputs = RaggedInputs::Random) {
+        suite.add("kimi_delta_attention/ragged/" + label,
+                  [=] {
+                      return ragged_recurrence(label, lengths, qk, value, form, graph, tight,
+                                               min_tokens, max_tokens, inputs);
+                  },
+                  {{"execution", graph ? "graph" : "eager"}});
+    };
+    using enum RaggedState;
+    for (const int t : {11, 12, 255, 256, 257})
+        ragged("single_" + std::to_string(t), {t}, 32, 32, Distinct, false, true);
 #if NINFER_TARGET_SPARK
-    suite.add("kimi_delta_attention/ragged/window_transition",
-              [] { return ragged_recurrence(true); });
+    ragged("single_interior_peak", {256}, 8, 32, InPlace, false, true, 255, 257);
+    ragged("direct_interior_peak", {256, 1}, 8, 32, Distinct, false, true, 255, 257);
 #endif
+    ragged("partial_chunks", {1, 2, 11, 12, 15, 16, 17, 65}, 4, 16, Mixed, true, false, 0, 0,
+           RaggedInputs::Adversarial);
+    ragged("fp32_short_readout", {1, 12}, 4, 16, Distinct, false, true, 0, 0,
+           RaggedInputs::Cancellation);
+    ragged("poisoned_neighbor", {17, 17}, 4, 16, Distinct, false, true, 0, 0,
+           RaggedInputs::PoisonedNeighbor);
+    ragged("window_handoff_two", {140, 140}, 32, 32, Distinct);
+    ragged("window_handoff_three", {200, 80, 80}, 8, 32, Distinct, true);
+    ragged("window_handoff_larger_cap", {300, 140, 140}, 8, 32, Distinct, true);
+    ragged("long_then_short", {4095, 1}, 4, 16, InPlace, false, true);
+    ragged("short_then_long", {1, 4095}, 8, 32, SharedSource, false, true);
+    ragged("eight_by_three", std::vector<int>(8, 3), 32, 32, Mixed, true, true);
+    ragged("thirty_two_by_one", std::vector<int>(32, 1), 8, 32, SharedSource, false, true);
+    auto spill = std::vector<int>(160, 1);
+    for (int s = 0; s < 130; s += 2) spill[s] = 12;
+    ragged("device_chunk_offsets", std::move(spill), 8, 32, SharedSource, true, false, 0, 0,
+           RaggedInputs::Adversarial);
+    suite.add("kimi_delta_attention/ragged/workspace_envelopes", ragged_workspace_envelopes);
     suite.add("kda/contract", contract_rejection_cases);
     suite.add("kda/batch_contract", batch_contract_rejection_cases);
     suite.add("kda/graph_updates", graph_replay_case, {{"execution", "graph"}});

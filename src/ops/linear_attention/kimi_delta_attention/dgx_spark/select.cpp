@@ -1,24 +1,34 @@
 #include "ops/linear_attention/kimi_delta_attention/plan.h"
 #include "ops/linear_attention/kimi_delta_attention/input_conv/launch.h"
-#include <climits>
+#include <limits>
 
 namespace ninfer::ops::detail::kimi_delta_attention {
-int select_value_tile(int value_heads, int multiprocessor_count) {
+int select_value_tile(int value_heads, int multiprocessor_count, int active_segments,
+                      int total_chunks, int longest_chunks) {
+    const auto head_groups = static_cast<std::int64_t>(value_heads) * active_segments;
     // Small grids need the narrowest stripe. Otherwise minimize SM waves weighted
     // by the per-wave cost of the mixed BF16/TF32 contraction.
-    // The GLM local geometry selects 32 values per CTA.
-    if (static_cast<std::int64_t>(value_heads) * 16 <= multiprocessor_count) return 8;
-    int best               = 64;
-    std::int64_t best_work = INT64_MAX;
+    if (head_groups <= multiprocessor_count / 16) return 8;
+    int best                    = 64;
+    double best_work            = std::numeric_limits<double>::infinity();
+    const double average_chunks = static_cast<double>(total_chunks) / active_segments;
 
     struct Choice {
         int tile, cost;
     };
 
-    for (const auto [tile, cost] : {Choice{64, 34}, Choice{32, 20}, Choice{16, 13}}) {
-        const auto blocks = static_cast<std::int64_t>(value_heads) * (kStateDim / tile);
-        const auto waves  = (blocks + multiprocessor_count - 1) / multiprocessor_count;
-        const auto work   = waves * cost;
+    // Account for the longest CTA separately so a few short segments do not
+    // widen stripes on the critical path of a much longer segment.
+    // On GB10, the 64-value tile's longer wave costs more on short, concurrent runs.
+    const int wide_cost = value_heads == 32 && active_segments > 1 && longest_chunks <= 4 ? 42 : 34;
+    for (const auto [tile, cost] : {Choice{64, wide_cost}, Choice{32, 20}, Choice{16, 13}}) {
+        const int stripes = kStateDim / tile;
+        const auto waves =
+            common::div_up(head_groups * stripes, std::int64_t(multiprocessor_count));
+        const auto tail_waves =
+            common::div_up(std::int64_t(value_heads) * stripes, std::int64_t(multiprocessor_count));
+        const double work =
+            std::max(waves * average_chunks, tail_waves * double(longest_chunks)) * cost;
         if (work < best_work) {
             best      = tile;
             best_work = work;
@@ -39,6 +49,17 @@ int recurrence_window_tokens(int heads, int tokens) {
 int recurrence_window_peak(int heads, int first, int last) {
     if (heads != 32 || last <= kPacketWindowThreshold) return last;
     return first <= kPacketWindowThreshold ? kPacketWindowThreshold : kPacketWindow;
+}
+
+int ragged_window_chunks(int heads, int chunks) {
+    return heads == 32 && chunks > kPacketWindowThreshold / kChunkSize ? kPacketWindow / kChunkSize
+                                                                       : chunks;
+}
+
+int ragged_window_peak(int heads, int first, int last) {
+    constexpr int threshold = kPacketWindowThreshold / kChunkSize;
+    if (heads != 32 || last <= threshold) return last;
+    return first <= threshold ? threshold : ragged_window_chunks(heads, last);
 }
 
 RecordSchedule select_record_schedule(int heads, int tokens, int batch) {

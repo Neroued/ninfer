@@ -5,6 +5,10 @@
 #include "ops/common/cuda/reduce.cuh"
 #include "ops/common/cuda/mma.cuh"
 #include "ops/common/cuda/memory.cuh"
+#include "ops/common/host/launch.h"
+#include "ops/linear_attention/kimi_delta_attention/plan.h"
+
+#include <cub/block/block_scan.cuh>
 
 namespace ninfer::ops::detail::kimi_delta_attention {
 namespace {
@@ -18,19 +22,75 @@ struct PrepareShared {
     float lower[kChunkSize * kChunkSize];
 };
 
-__global__ __launch_bounds__(256, 2) void prepare_kernel(Arguments args,
-                                                         Chunk* __restrict__ workspace) {
+constexpr int kScanThreads = 256;
+
+struct ChunkCounts {
+    int segments, chunks;
+};
+
+struct AddChunkCounts {
+    __device__ ChunkCounts operator()(ChunkCounts a, ChunkCounts b) const {
+        return {a.segments + b.segments, a.chunks + b.chunks};
+    }
+};
+
+__global__ void build_chunk_index(RaggedSegments segments, ChunkIndexEntry* index) {
+    using Scan = cub::BlockScan<ChunkCounts, kScanThreads, cub::BLOCK_SCAN_WARP_SCANS>;
+    __shared__ Scan::TempStorage storage;
+    ChunkCounts carry{};
+    for (std::int64_t base = 0; base < segments.count; base += kScanThreads) {
+        const auto s = base + threadIdx.x;
+        const int length = s < segments.count ? segments.lengths[s] : 0;
+        const bool chunked = length >= kFirstChunkedTokens;
+        const ChunkCounts count{int(chunked), chunked ? chunk_count(length) : 0};
+        ChunkCounts prefix, total;
+        Scan(storage).ExclusiveScan(count, prefix, ChunkCounts{}, AddChunkCounts{}, total);
+        if (chunked)
+            index[carry.segments + prefix.segments] = {int(s), carry.chunks + prefix.chunks};
+        carry = AddChunkCounts{}(carry, total);
+        __syncthreads();
+    }
+}
+
+template <class... Metadata>
+__global__ __launch_bounds__(256, 2) void prepare_kernel(
+    Arguments args, Chunk* __restrict__ workspace, const __grid_constant__ Metadata... metadata) {
+    constexpr bool Packed = sizeof...(Metadata) != 0;
     __shared__ PrepareShared sm;
     const int tid    = threadIdx.x;
     const int lane   = tid & 31;
-    const int head   = blockIdx.x % args.value_heads;
-    const int chunk  = blockIdx.x / args.value_heads;
-    const int start  = chunk * kChunkSize;
-    const int length = min(kChunkSize, args.tokens - start);
+    int head   = blockIdx.x % args.value_heads;
+    int chunk  = blockIdx.x / args.value_heads;
+    int start  = chunk * kChunkSize;
+    int length = min(kChunkSize, args.tokens - start);
+    int window_width = 0;
+    if constexpr (Packed) {
+        const auto& packed = (..., metadata);
+        const auto window = packed.window;
+        window_width = window.end - window.begin;
+        const unsigned local = blockIdx.y + blockIdx.z * gridDim.y;
+        if (local >= static_cast<unsigned>(window_width)) return;
+        chunk = local;
+        head = blockIdx.x;
+        const int global = window.begin + chunk;
+        const auto* index = packed.index();
+        int first = window.first_segment, last = first + window.segments;
+        while (first + 1 < last) {
+            const int mid = first + (last - first) / 2;
+            if (index[mid].first_chunk <= global)
+                first = mid;
+            else
+                last = mid;
+        }
+        const auto [s, first_chunk] = index[first];
+        const int local_start = (global - first_chunk) * kChunkSize;
+        start = packed.segments.cu_seqlens[s] + local_start;
+        length = min(kChunkSize, packed.segments.lengths[s] - local_start);
+    }
     const int qh     = head / (args.value_heads / args.qk_heads);
     const int row    = tid / 16;
     const int col    = (tid & 15) * 8;
-    const auto qo    = (static_cast<std::int64_t>(start + row) * args.qk_heads + qh) * kStateDim;
+    const auto qo    = (static_cast<std::int64_t>(start + (Packed && row >= length ? 0 : row)) * args.qk_heads + qh) * kStateDim;
 
     float q[8]{}, k[8]{};
     if (row < length) {
@@ -173,7 +233,7 @@ __global__ __launch_bounds__(256, 2) void prepare_kernel(Arguments args,
     __syncthreads();
 
     auto* dst = reinterpret_cast<uint4*>(
-        workspace + static_cast<std::int64_t>(head) * chunk_count(args.tokens) + chunk);
+        workspace + static_cast<std::int64_t>(head) * (Packed ? window_width : chunk_count(args.tokens)) + chunk);
     const auto* src = reinterpret_cast<const uint4*>(&sm.packet);
 #pragma unroll
     for (int i = tid; i < static_cast<int>(sizeof(Chunk) / 16); i += 256) dst[i] = src[i];
@@ -185,6 +245,20 @@ void launch_prepare(const Arguments& args, Chunk* workspace, cudaStream_t stream
     prepare_kernel<<<static_cast<unsigned>(static_cast<std::int64_t>(args.value_heads) *
                                            chunk_count(args.tokens)),
                      256, 0, stream>>>(args, workspace);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void launch_chunk_index(RaggedSegments segments, ChunkIndexEntry* index, cudaStream_t stream) {
+    build_chunk_index<<<1, kScanThreads, 0, stream>>>(segments, index);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void launch_prepare(const Arguments& args, Chunk* workspace, const PackedChunks& packed,
+                    cudaStream_t stream) {
+    const int width = packed.window.end - packed.window.begin;
+    const int rows  = std::min(width, common::kCudaGridYLimit);
+    const dim3 grid(args.value_heads, rows, common::div_up(width, rows));
+    prepare_kernel<<<grid, 256, 0, stream>>>(args, workspace, packed);
     CUDA_CHECK(cudaGetLastError());
 }
 

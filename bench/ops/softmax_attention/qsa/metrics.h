@@ -31,6 +31,7 @@ struct Metrics {
     std::uint64_t read_bytes = 0, write_bytes = 0;
     std::uint64_t kv_read = 0, kv_write = 0, index_read = 0, index_write = 0, record_write = 0;
     std::uint64_t per_query_cache_bytes = 0;
+    std::uint64_t completed_blocks = 0, tail_write = 0;
 
     static constexpr const char* columns =
         "live_queries,scoring_queries,candidate_blocks,selected_tokens,qk_flops,pv_flops,"
@@ -57,10 +58,11 @@ struct Metrics {
 };
 
 inline Metrics indexer_metrics(int tokens, std::span<const int> contexts,
-                               std::span<const int> lengths, int shared_prefix_tokens) {
+                               std::span<const int> lengths, int shared_prefix_tokens,
+                               bool packed) {
     Metrics m;
-    m.read_bytes      = lengths.size() * sizeof(std::int32_t);
-    m.write_bytes     = std::uint64_t(tokens) * lengths.size() * sizeof(std::int32_t);
+    m.read_bytes  = lengths.size() * sizeof(std::int32_t);
+    m.write_bytes = std::uint64_t(tokens) * (packed ? 1 : lengths.size()) * sizeof(std::int32_t);
     int shared_blocks = 0;
     for (std::size_t b = 0; b < lengths.size(); ++b) {
         int maximum_scored = 0;
@@ -75,7 +77,8 @@ inline Metrics indexer_metrics(int tokens, std::span<const int> contexts,
             maximum_scored = blocks;
         }
         if (maximum_scored) m.read_bytes += 4ULL + 8ULL * ((maximum_scored + 15) / 16);
-        const int shared = std::min(maximum_scored, shared_prefix_tokens / 4);
+        const bool shares_prefix = !packed || contexts[b] - lengths[b] >= shared_prefix_tokens;
+        const int shared = shares_prefix ? std::min(maximum_scored, shared_prefix_tokens / 4) : 0;
         m.index_read += 256ULL * (maximum_scored - shared);
         shared_blocks = std::max(shared_blocks, shared);
     }
@@ -88,29 +91,34 @@ inline Metrics indexer_metrics(int tokens, std::span<const int> contexts,
 
 inline Metrics prepare_metrics(int tokens, int axes, int query_heads, int kv_heads,
                                std::span<const int> bases, std::span<const int> lengths,
-                               std::uint64_t kv_token_bytes, bool queries = true) {
+                               std::uint64_t kv_token_bytes, bool queries, bool packed) {
     Metrics m;
     m.read_bytes              = lengths.size() * sizeof(std::int32_t);
     const auto query_elements = queries ? 256 * query_heads + 512 : 0;
-    m.write_bytes             = std::uint64_t(tokens) * lengths.size() * query_elements * 2;
-    std::uint64_t complete    = 0;
+    m.write_bytes = std::uint64_t(tokens) * (packed ? 1 : lengths.size()) * query_elements * 2;
     for (std::size_t b = 0; b < lengths.size(); ++b) {
         const int n = lengths[b], first = bases[b];
         if (!n) continue;
         m.live_queries += n;
         const int blocks = (first + n) / 4 - first / 4;
-        complete += blocks;
+        m.completed_blocks += blocks;
         m.read_bytes +=
             std::uint64_t(n) * ((query_elements + 512 * kv_heads + 128) * 2 + 4 * (axes + 1));
         m.read_bytes += 8 + 8ULL * ((first + n - 1) / 64 - first / 64 + 1);
-        if (blocks && first % 4) m.read_bytes += 256ULL * (first % 4) + 12 + 16;
+        if (first % 4 && (blocks || packed)) m.read_bytes += 256ULL * (first % 4) + 12 + 16;
     }
     if (m.live_queries) m.read_bytes += (256 + (queries ? 256 + 128 : 0)) * 2;
-    if (complete) m.read_bytes += 128 * 2;
-    m.kv_write     = m.live_queries * kv_token_bytes;
-    m.index_write  = complete * 128 * 2;
-    m.record_write = m.live_queries * (128 * 2 + 3 * 4);
-    m.write_bytes += m.kv_write + m.index_write + m.record_write;
+    if (m.completed_blocks) m.read_bytes += 128 * 2;
+    m.kv_write    = m.live_queries * kv_token_bytes;
+    m.index_write = m.completed_blocks * 128 * 2;
+    if (packed) {
+        // Raw records are scratch. The persisted result is one canonical tail per segment.
+        m.tail_write = lengths.size() * (3 * 128 * 2 + 3 * 4);
+        m.read_bytes += lengths.size() * 2 * sizeof(std::int64_t); // destination field offsets
+    } else {
+        m.record_write = m.live_queries * (128 * 2 + 3 * 4);
+    }
+    m.write_bytes += m.kv_write + m.index_write + m.record_write + m.tail_write;
     return m;
 }
 

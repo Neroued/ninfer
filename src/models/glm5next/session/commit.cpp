@@ -247,27 +247,13 @@ CommitResult Session::commit(PendingBatch&& batch,
         const auto& decision = decisions[b];
         auto& row            = result.rows[b];
         if (batch.decode_ && p.shape.draft_tokens) {
-            auto& stats         = s.speculative;
-            const auto& output  = tx.result->rows[b];
-            const auto drafted  = output.drafts;
-            const auto accepted = output.accepted_drafts;
-            if (!decision.cancelled && !decision.failed) {
-                if (drafted)
-                    s.speculative_state.observe_speculative_round(
-                        drafted, accepted,
-                        std::span<const float>(output.draft_confidences).first(drafted));
-                else
-                    s.speculative_state.observe_ordinary_round(output.target_top1_probability);
-            }
-            stats.committed_draft_tokens += std::min(decision.accepted_tokens, accepted);
-            if (drafted)
-                ++stats.rounds;
-            else
-                ++stats.fallback_steps;
-            stats.drafted_tokens += drafted;
-            for (std::uint32_t i = 0; i < drafted; ++i) ++stats.attempted_per_position[i];
-            stats.accepted_tokens += accepted;
-            for (std::uint32_t i = 0; i < accepted; ++i) ++stats.accepted_per_position[i];
+            const auto& output = tx.result->rows[b];
+            auto* feedback     = p.shape.length_policy == SpeculativeLengthPolicy::Adaptive
+                                     ? &s.speculative_state
+                                     : nullptr;
+            speculative::record_speculative_commit(s.speculative, feedback, decision, output.drafts,
+                                                   output.accepted_drafts, output.draft_confidences,
+                                                   output.target_top1_probability);
         }
         row.speculative = s.speculative;
 

@@ -171,9 +171,23 @@ struct EngineDescription {
     std::vector<ContextKvPoolUsage> kv_pools;
 };
 
+enum class SpeculativeLengthPolicy : std::uint8_t;
+
+struct SpeculativeStartupSummary {
+    SpeculativeBackend backend = SpeculativeBackend::None;
+    SpeculativeLengthPolicy length_policy{}; // Adaptive, defined in ninfer/types.h.
+    std::uint32_t draft_window         = 0;
+    bool calibrated                    = false;
+    std::uint32_t calibration_anchors  = 0;
+    std::uint32_t calibration_contexts = 0;
+    double calibration_seconds         = 0.0;
+    std::vector<std::uint32_t> target_widths;
+};
+
 struct StartupReport {
     LoadSummary load;
     std::vector<RankMemoryBudget> ranks;
+    std::optional<SpeculativeStartupSummary> speculative;
 };
 
 struct SnapshotStamp {

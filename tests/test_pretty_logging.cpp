@@ -129,6 +129,15 @@ int main() {
                                .current       = 16ULL << 30,
                                .total         = 16ULL << 30,
                                .elapsed_ns    = 2'000'000'000});
+            observer.callback({.phase  = ninfer::StartupPhase::SpeculativeCalibration,
+                               .status = ninfer::StartupStatus::Begin});
+            observer.callback({.phase      = ninfer::StartupPhase::SpeculativeCalibration,
+                               .status     = ninfer::StartupStatus::Complete,
+                               .elapsed_ns = 1'000'000'000});
+            observer.callback({.phase  = ninfer::StartupPhase::EngineFinalize,
+                               .status = ninfer::StartupStatus::Begin});
+            observer.callback({.phase  = ninfer::StartupPhase::EngineFinalize,
+                               .status = ninfer::StartupStatus::Complete});
             observer.callback({.phase      = ninfer::StartupPhase::EngineStartup,
                                .status     = ninfer::StartupStatus::Complete,
                                .elapsed_ns = 3'000'000'000});
@@ -141,7 +150,7 @@ int main() {
         startup_output = capture.finish();
     }
     failures += check(
-        line_count(startup_output) == 4 &&
+        line_count(startup_output) == 6 &&
             startup_output.find("starting engine") != std::string::npos &&
             startup_output.find("loading weights | 16.0 GiB") != std::string::npos &&
             startup_output.find("weights ready | 16.0 GiB | 2.0s | 8.00 GiB/s") !=
@@ -151,6 +160,12 @@ int main() {
             startup_output.find("CUDA sync blocking") != std::string::npos &&
             startup_output.find("CUDA initialized") == std::string::npos,
         "normal startup pretty output is noisy or incomplete");
+    const auto calibration_begin = startup_output.find("calibrating speculative execution");
+    const auto calibration_end   = startup_output.find("speculative execution calibrated | 1.0s");
+    failures += check(startup_output.find("weights ready") < calibration_begin &&
+                          calibration_begin < calibration_end &&
+                          calibration_end < startup_output.find("engine ready"),
+                      "speculative calibration startup output is missing or out of order");
 
     std::string ranks_output;
     {

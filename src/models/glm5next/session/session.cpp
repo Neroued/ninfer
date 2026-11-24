@@ -229,6 +229,11 @@ speculative::CostModelSummary Session::speculative_cost_summary() const noexcept
     return impl_->cost_model.summary();
 }
 
+std::vector<std::uint32_t> Session::decode_target_widths() const {
+    const auto& routes = impl_->plan.decode_routes;
+    return routes ? routes->target_widths() : std::vector<std::uint32_t>{};
+}
+
 speculative::CalibrationConstraints Session::calibration_constraints() const {
     const auto& p = *impl_;
     return {.model           = p.cost_model.config(),

@@ -104,26 +104,34 @@ public:
         const auto frames = instance_.executor->capacity();
         execution_observations_.reserve(frames.compute_frames + frames.context_frames);
         published_snapshot_.in_flight.reserve(frames.compute_frames + frames.context_frames);
-        std::promise<void> startup;
-        std::future<void> started = startup.get_future();
-        worker_                   = std::thread([this, startup = std::move(startup)]() mutable {
-            try {
-                instance_.executor->bind_to_current_thread();
-                if (speculative_positions_) calibrate_speculative(instance_);
-                publish_runtime_stats();
-                startup.set_value();
-            } catch (...) {
-                startup.set_exception(std::current_exception());
-                return;
-            }
-            worker_loop();
-        });
+        std::promise<std::optional<SpeculativeStartupSummary>> startup;
+        auto started = startup.get_future();
+        worker_ =
+            std::thread([this, spec = options.speculative, &observer = options.startup_observer,
+                         startup = std::move(startup)]() mutable {
+                try {
+                    instance_.executor->bind_to_current_thread();
+                    auto summary = prepare_speculative_startup(spec, observer);
+                    StartupPhaseScope phase(observer, StartupPhase::EngineFinalize);
+                    publish_runtime_stats();
+                    phase.complete();
+                    startup.set_value(std::move(summary));
+                } catch (...) {
+                    startup.set_exception(std::current_exception());
+                    return;
+                }
+                worker_loop();
+            });
         try {
-            started.get();
+            speculative_startup_ = started.get();
         } catch (...) {
             if (worker_.joinable()) { worker_.join(); }
             throw;
         }
+    }
+
+    [[nodiscard]] std::optional<SpeculativeStartupSummary> take_speculative_startup() noexcept {
+        return std::exchange(speculative_startup_, std::nullopt);
     }
 
     ~EngineCore() noexcept {
@@ -734,11 +742,32 @@ private:
 
     void worker_loop() noexcept;
 
+    std::optional<SpeculativeStartupSummary>
+    prepare_speculative_startup(const SpeculativeOptions& options,
+                                const StartupObserver& observer) {
+        if (options.backend == SpeculativeBackend::None) return {};
+        SpeculativeStartupSummary summary{.backend       = options.backend,
+                                          .length_policy = options.length_policy,
+                                          .draft_window  = options.draft_tokens,
+                                          .target_widths =
+                                              instance_.session->decode_target_widths()};
+        if (options.length_policy == SpeculativeLengthPolicy::Adaptive) {
+            if (const auto calibration = calibrate_speculative(instance_, observer)) {
+                summary.calibrated           = true;
+                summary.calibration_anchors  = calibration->anchors;
+                summary.calibration_contexts = calibration->contexts;
+                summary.calibration_seconds  = calibration->seconds;
+            }
+        }
+        return summary;
+    }
+
     Instance& instance_;
     const std::uint32_t max_context_;
     const std::uint32_t max_concurrency_;
     const std::size_t max_outstanding_;
     const std::uint32_t speculative_positions_;
+    std::optional<SpeculativeStartupSummary> speculative_startup_;
     const std::chrono::milliseconds pending_timeout_;
     ResourceManagement resources_;
     PlacementId next_placement_tie_;

@@ -606,6 +606,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->prefill_chunk       = inputs.prefill_chunk;
     impl->draft_window        = inputs.draft_window;
     impl->speculative_backend = inputs.speculative_backend;
+    impl->length_policy       = inputs.length_policy;
     impl->decode_routes       = std::make_shared<const speculative::DecodeGraphRoutes>(
         *impl->batch_execution, impl->speculative_backend, impl->draft_window,
         inputs.target_widths);
@@ -664,6 +665,7 @@ make_sequence_planner_impl(std::shared_ptr<const execution::ModelProfile> profil
             std::min(options.prefill_chunk ? options.prefill_chunk : 1024U, options.max_context),
         .draft_window               = options.speculative.draft_tokens,
         .speculative_backend        = options.speculative.backend,
+        .length_policy              = options.speculative.length_policy,
         .kv_storage                 = options.kv_cache,
         .proposal_head              = options.speculative.proposal_head,
         .features                   = models::load_options(options),

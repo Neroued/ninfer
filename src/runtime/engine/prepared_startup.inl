@@ -91,7 +91,7 @@ build_prepared_local_model(const artifact::Reader& reader, EngineOptions& option
     const auto gated_capacity = [&](const DeviceMemorySnapshot& before) {
         auto value = resolve(before);
         if (!narrow || options.context_capacity.mode == ContextCapacityMode::Explicit ||
-            keeps_context_capacity(value.device_bytes, resolve(before, true).device_bytes))
+            preserves_context_capacity(value, resolve(before, true)))
             return value;
 
         const auto narrow_graphs = preparation->graph_memory();
@@ -107,7 +107,7 @@ build_prepared_local_model(const artifact::Reader& reader, EngineOptions& option
         narrow = true;
         try {
             value = resolve(snapshot);
-            if (keeps_context_capacity(value.device_bytes, baseline.device_bytes)) return value;
+            if (preserves_context_capacity(value, baseline)) return value;
         } catch (const ContextBudgetError&) {}
         select_baseline();
         return baseline;

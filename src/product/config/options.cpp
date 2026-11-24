@@ -216,6 +216,10 @@ void check_layer(const StartupPatch& patch, EntryPoint entry, const std::filesys
         if (const auto& head = assignment(patch, Field::ProposalHead);
             head && std::get<std::string>(head->value) != "full")
             fail(Field::ProposalHead, "disabled speculative backend requires the full head");
+        if (const auto& policy = assignment(patch, Field::SpecLengthPolicy);
+            policy && !std::holds_alternative<DefaultValue>(policy->value))
+            fail(Field::SpecLengthPolicy,
+                 "disabled speculative backend requires default length policy");
     }
     if (entry != EntryPoint::Cli) return;
     if (assignment(patch, Field::Prompt) && assignment(patch, Field::Messages))
@@ -248,6 +252,7 @@ void merge_layer(StartupPatch& merged, StartupPatch layer, EntryPoint entry) {
         std::get<std::string>(backend->value) == "none") {
         assignment(merged, Field::DraftTokens)  = Assignment{std::uint64_t{0}, backend->source};
         assignment(merged, Field::ProposalHead) = Assignment{std::string("full"), backend->source};
+        assignment(merged, Field::SpecLengthPolicy) = Assignment{DefaultValue{}, backend->source};
     }
     if (entry == EntryPoint::Cli) {
         if (assignment(layer, Field::Prompt) || assignment(layer, Field::Messages)) {
@@ -426,6 +431,9 @@ ParsedOptions parse(int argc, char** argv, EntryPoint entry,
             engine.speculative.proposal_head =
                 string() == "optimized" ? ProposalHead::Optimized : ProposalHead::Full;
             break;
+        case Field::SpecLengthPolicy:
+            engine.speculative.length_policy = parse_speculative_length_policy(string());
+            break;
         case Field::MediaCache:
             engine.media_cache_bytes = u64();
             break;
@@ -585,7 +593,10 @@ LaunchOptions default_launch_options(EntryPoint entry) {
         options.engine.kv_cache = KvCacheStorage::Fp8E4m3fnGroup128Ue8m0;
     }
     if (entry != EntryPoint::Serve) {
-        if (entry == EntryPoint::Cli) { options.engine.context_cache.enabled = false; }
+        if (entry == EntryPoint::Cli) {
+            options.engine.context_cache.enabled     = false;
+            options.engine.speculative.length_policy = SpeculativeLengthPolicy::Fixed;
+        }
         options.engine.context_cache.host_capacity_bytes = 0;
         options.generation.sampling.seed                 = 0;
     } else
@@ -641,7 +652,7 @@ std::string startup_usage_text(std::string_view executable, EntryPoint entry) {
                "diagnostics use stderr.\n";
     out << "\nCapacities: bytes or B/KiB/MiB/GiB; durations: milliseconds or ms/s.\n"
         << "Boolean options also accept --flag=true|false.\n"
-        << "Default prefill chunk: Qwen4Exp/CPU expert offload 4096, otherwise 1024.\n"
+        << "Default prefill chunk: Qwen4Exp/GLM5Next/CPU expert offload 4096, otherwise 1024.\n"
         << "Context capacity defaults to auto; KV and State share each rank's Device budget.\n";
     if (applies_to(field_spec(Field::HostCapacity), entry))
         out << "Host context: CLI 0B; serve RTX 5090 8GiB + 8 StateImages, Spark 0B.\n";

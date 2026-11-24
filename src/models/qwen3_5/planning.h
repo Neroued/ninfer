@@ -78,6 +78,7 @@ struct SessionPlan {
     std::uint32_t prefill_chunk            = 0;
     std::uint32_t draft_window             = 0;
     SpeculativeBackend speculative_backend = SpeculativeBackend::None;
+    SpeculativeLengthPolicy length_policy  = SpeculativeLengthPolicy::Adaptive;
     std::uint32_t hybrid_max_tokens        = 0;
     ContextCacheOptions context_cache;
     KvCacheStorage kv_storage  = KvCacheStorage::BFloat16;

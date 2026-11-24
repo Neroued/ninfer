@@ -34,6 +34,15 @@ std::span<const RoundRoute> DecodeGraphRoutes::at(PhysicalBatchShape shape) cons
     return buckets_.at(shape);
 }
 
+std::vector<std::uint32_t> DecodeGraphRoutes::target_widths() const {
+    std::vector<std::uint32_t> widths;
+    if (buckets_.empty()) return widths;
+    // Every physical batch shape prepares the same ordered set of target widths.
+    for (const auto& route : buckets_.begin()->second)
+        if (widths.empty() || widths.back() != route.width) widths.push_back(route.width);
+    return widths;
+}
+
 RoundRoute DecodeGraphRoutes::select_route(PhysicalBatchShape shape, SpeculativeBackend backend,
                                            std::uint32_t depth) const {
     if (backend != backend_)

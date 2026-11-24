@@ -5,7 +5,7 @@
 #include "models/qwen4_exp/program/program.h"
 #include "models/qwen4_exp/program/resources.h"
 #include "models/qwen4_exp/program/ple_pipeline.h"
-#include "models/qwen4_exp/program/graphs.h"
+#include "models/qwen4_exp/program/graph_inputs.h"
 #include "models/qwen4_exp/execution/text.h"
 #include "models/qwen4_exp/execution/mtp.h"
 #include "models/common/graph/suite.h"

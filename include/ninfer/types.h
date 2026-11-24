@@ -54,11 +54,18 @@ enum class ProposalHead : std::uint8_t {
     Optimized,
 };
 
+enum class SpeculativeLengthPolicy : std::uint8_t {
+    Adaptive,
+    Fixed,
+};
+static_assert(SpeculativeLengthPolicy{} == SpeculativeLengthPolicy::Adaptive);
+
 struct SpeculativeOptions {
     SpeculativeBackend backend = SpeculativeBackend::None;
     // Startup-fixed K: MTP 1..5; DFlash and DFlash2 1..15 (query width K+1).
     std::uint32_t draft_tokens = 0;
     ProposalHead proposal_head = ProposalHead::Full;
+    SpeculativeLengthPolicy length_policy = SpeculativeLengthPolicy::Adaptive;
 };
 
 enum class StartupPhase : std::uint8_t {
@@ -78,6 +85,7 @@ enum class StartupPhase : std::uint8_t {
     CommunicationWarmup,
     RuntimeMemoryCheck,
     RuntimeRelease,
+    SpeculativeCalibration,
     EngineFinalize,
 };
 
@@ -164,7 +172,7 @@ struct EngineOptions {
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
-    // Zero uses 4096 for Qwen4Exp or CPU expert offload, otherwise 1024.
+    // Zero uses 4096 for Qwen4Exp, GLM5Next, or CPU expert offload, otherwise 1024.
     std::uint32_t prefill_chunk = 0;
     MoeOptions moe;
     KvCacheStorage kv_cache = KvCacheStorage::BFloat16;

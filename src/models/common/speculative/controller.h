@@ -28,6 +28,14 @@ private:
 
 static_assert(sizeof(SequenceSpeculativeState) <= 160);
 
+// Record verification work even when the result is discarded at commit. Only an adopted
+// result can update adaptive feedback. The Session supplies validated counts and statistics
+// storage.
+void record_speculative_commit(SpeculativeStats&, SequenceSpeculativeState* adaptive_state,
+                               const runtime::CommitDecision&, std::uint32_t drafted,
+                               std::uint32_t accepted, std::span<const float> draft_confidences,
+                               std::optional<float> target_top1_probability);
+
 struct AdaptiveRowInput {
     RoundMember member;
     std::uint32_t frontier                = 0;
@@ -46,12 +54,13 @@ struct DecodeRoundRequest {
     const RoundRoute* route = nullptr;
     bool record_online_cost = true;
 
+    [[nodiscard]] bool uses_adaptive_length(SpeculativeLengthPolicy policy) const noexcept;
     [[nodiscard]] bool valid_membership(std::size_t rows) const noexcept;
     [[nodiscard]] std::uint32_t draft_budget(std::size_t row) const noexcept;
     [[nodiscard]] std::optional<DecodeRoundPlan>
-    select(PhysicalBatchShape, ExecutionPath, const DecodeGraphRoutes*, const SpeculativeCostModel&,
-           std::span<const RoundMember>, std::span<const AdaptiveRowInput>,
-           std::uint32_t max_context) const;
+    select(SpeculativeLengthPolicy, PhysicalBatchShape, ExecutionPath, const DecodeGraphRoutes*,
+           const SpeculativeCostModel&, std::span<const RoundMember>,
+           std::span<const AdaptiveRowInput>, std::uint32_t max_context) const;
 };
 
 struct NarrowedTargetPlan {

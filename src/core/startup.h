@@ -55,6 +55,8 @@ inline const char* startup_phase_name(StartupPhase phase) noexcept {
         return "runtime memory check";
     case StartupPhase::RuntimeRelease:
         return "runtime release";
+    case StartupPhase::SpeculativeCalibration:
+        return "speculative calibration";
     case StartupPhase::EngineFinalize:
         return "engine finalization";
     }

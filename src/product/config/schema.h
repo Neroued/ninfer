@@ -30,6 +30,7 @@ enum class Field {
     SpecBackend,
     DraftTokens,
     ProposalHead,
+    SpecLengthPolicy,
     MediaCache,
     MediaLive,
     MediaThreads,

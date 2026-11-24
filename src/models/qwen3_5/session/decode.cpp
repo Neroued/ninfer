@@ -17,6 +17,8 @@ SessionImpl::start_decode_round(std::span<const SequenceHandle> members,
     auto reservation = executor().try_reserve(runtime::FrameKind::Compute);
     if (!reservation) return {};
     bool prepared = false;
+    const bool adaptive_length = draft_window && selection.uses_adaptive_length(plan.length_policy);
+    const bool measure_cost    = draft_window && (adaptive_length || selection.budgets.empty());
     try {
         Execution pending{.kind = OperationKind::Decode};
         pending.members.assign(members.begin(), members.end());
@@ -26,8 +28,8 @@ SessionImpl::start_decode_round(std::span<const SequenceHandle> members,
         std::vector<std::uint32_t> frontiers;
         std::vector<speculative::RowGrowth> growth;
         rows.reserve(members.size());
-        adaptive.reserve(members.size());
-        frontiers.reserve(members.size());
+        if (adaptive_length) adaptive.reserve(members.size());
+        if (measure_cost) frontiers.reserve(members.size());
         growth.reserve(members.size());
         const auto mark = next_lane_mark();
         for (std::size_t b = 0; b < members.size(); ++b) {
@@ -47,8 +49,8 @@ SessionImpl::start_decode_round(std::span<const SequenceHandle> members,
                 (is_masked_draft_backend(speculative_backend) && capacity - f <= draft_window))
                 hard = 0;
             rows.push_back({0, hard, hard});
-            frontiers.push_back(f);
-            adaptive.push_back({rows.back(), f, &request.speculative_state});
+            if (measure_cost) frontiers.push_back(f);
+            if (adaptive_length) adaptive.push_back({rows.back(), f, &request.speculative_state});
             auto& row = growth.emplace_back();
             if (hard) {
                 row.text.emplace(*text_kv_histories, state.kv->text.handle(), base.text_kv_valid,
@@ -59,14 +61,15 @@ SessionImpl::start_decode_round(std::span<const SequenceHandle> members,
             }
         }
         grant_windows(directory, growth, rows);
-        for (std::size_t b = 0; b < rows.size(); ++b) adaptive[b].member = rows[b];
+        for (std::size_t b = 0; b < adaptive.size(); ++b) adaptive[b].member = rows[b];
         const auto size  = static_cast<std::uint32_t>(members.size());
         const auto shape = plan.batch_execution->decode(size, size);
-        auto round = selection.select(shape, plan.decode_path, plan.decode_routes.get(), cost_model,
-                                      rows, adaptive, capacity);
+        auto round =
+            selection.select(plan.length_policy, shape, plan.decode_path, plan.decode_routes.get(),
+                             cost_model, rows, adaptive, capacity);
         if (!round) return {};
         const bool narrow =
-            plan.split_proposal_narrowing && !selection.budgets.empty() && round->route().width > 1;
+            plan.split_proposal_narrowing && adaptive_length && round->route().width > 1;
         if (narrow && is_masked_draft_backend(speculative_backend) &&
             !std::ranges::equal(round->verify_drafts(), rows, [](auto depth, const auto& row) {
                 return !depth || depth == row.granted_limit;
@@ -80,7 +83,7 @@ SessionImpl::start_decode_round(std::span<const SequenceHandle> members,
                                                          shape, plan.decode_path,
                                                          plan.decode_routes.get(), rows, extents);
         }
-        if (draft_window)
+        if (measure_cost)
             pending.cost_query =
                 speculative::CostQuery::from_plan(speculative_backend, *round, frontiers, capacity);
         pending.record_online_cost = selection.record_online_cost;

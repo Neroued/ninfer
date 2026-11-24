@@ -337,30 +337,20 @@ CommitResult SessionImpl::commit(PendingBatch&& pending,
         auto& stats = request.speculative_stats;
         if (current.kind == OperationKind::Decode && draft_window &&
             speculative_backend != SpeculativeBackend::None) {
-            const auto drafted  = current.generated->executed->verify_drafts[b];
-            const auto accepted = current.generated->counts[b] - 1;
-            if (!d.cancelled && !d.failed) {
-                const auto& generated = *current.generated;
-                if (drafted)
-                    request.speculative_state.observe_speculative_round(
-                        drafted, accepted,
-                        std::span<const float>(generated.draft_confidences)
-                            .subspan(b * generated.draft_stride, drafted));
-                else
-                    request.speculative_state.observe_ordinary_round(
-                        generated.target_top1_probabilities.empty()
-                            ? std::nullopt
-                            : std::optional{generated.target_top1_probabilities[b]});
-            }
-            stats.committed_draft_tokens += std::min(d.accepted_tokens, accepted);
-            if (drafted)
-                ++stats.rounds;
-            else
-                ++stats.fallback_steps;
-            stats.drafted_tokens += drafted;
-            for (std::uint32_t i = 0; i < drafted; ++i) ++stats.attempted_per_position[i];
-            stats.accepted_tokens += accepted;
-            for (std::uint32_t j = 0; j < accepted; ++j) ++stats.accepted_per_position[j];
+            const auto& generated = *current.generated;
+            const auto drafted    = generated.executed->verify_drafts[b];
+            const auto confidences =
+                drafted ? std::span<const float>(generated.draft_confidences)
+                              .subspan(b * generated.draft_stride, generated.draft_stride)
+                        : std::span<const float>{};
+            auto* feedback = plan.length_policy == SpeculativeLengthPolicy::Adaptive
+                                 ? &request.speculative_state
+                                 : nullptr;
+            speculative::record_speculative_commit(
+                stats, feedback, d, drafted, generated.counts[b] - 1, confidences,
+                generated.target_top1_probabilities.empty()
+                    ? std::nullopt
+                    : std::optional{generated.target_top1_probabilities[b]});
         }
         auto& row         = result.rows[b];
         row.disposition   = d.cancelled  ? runtime::CommitDisposition::CancelledReleased

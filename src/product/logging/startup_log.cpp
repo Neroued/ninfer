@@ -80,6 +80,9 @@ PhasePresentation phase_presentation(StartupPhase phase) noexcept {
                 false};
     case StartupPhase::RuntimeRelease:
         return {"releasing runtime", "runtime released", PhaseVisibility::Debug, false, false};
+    case StartupPhase::SpeculativeCalibration:
+        return {"calibrating speculative execution", "speculative execution calibrated",
+                PhaseVisibility::Info, true, false};
     case StartupPhase::EngineFinalize:
         return {"finalizing engine", "engine finalized", PhaseVisibility::Debug, false, false};
     }

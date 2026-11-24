@@ -457,6 +457,65 @@ void sequence_and_rounds() {
     }
 }
 
+void length_policy() {
+    const Rounds block({Backend::DFlash, 7, 1, 256, 8}, 32, std::array{4u, 8u});
+    const SpeculativeCostModel model(block.config);
+    const auto rejected = train(0, .01f);
+    const std::array budgets{runtime::RoundBudget{4}, runtime::RoundBudget{1}};
+    const DecodeRoundRequest request{.budgets = budgets};
+    // The first row wanted three drafts and received two. The second can only
+    // emit its next token. Both policies have the same grants and available routes.
+    const std::array limits{RoundMember{0, 3, 2}, RoundMember{0, 0, 0}};
+    const std::array rows{AdaptiveRowInput{limits[0], 64, &rejected},
+                          AdaptiveRowInput{limits[1], 64, &rejected}};
+    for (const auto path : {ExecutionPath::Eager, ExecutionPath::Graph}) {
+        const auto shape    = block.shape(2, path);
+        const auto fixed    = request.select(SpeculativeLengthPolicy::Fixed, shape, path,
+                                             &block.routes, model, limits, {}, 8192);
+        const auto adaptive = request.select(SpeculativeLengthPolicy::Adaptive, shape, path,
+                                             &block.routes, model, limits, rows, 8192);
+        require(fixed && std::ranges::equal(fixed->verify_drafts(), std::array{2u, 0u}) &&
+                    fixed->route().width == (path == ExecutionPath::Eager ? 3u : 4u),
+                "fixed policy did not use the full grant for each row");
+        require(adaptive && std::ranges::equal(adaptive->verify_drafts(), std::array{0u, 0u}) &&
+                    adaptive->route().width == 1,
+                "adaptive policy ignored evidence against speculation");
+    }
+    require(block.routes.target_widths() == Extents{1, 4, 8},
+            "prepared graph widths were not reported uniquely and in ascending order");
+}
+
+void speculative_commit() {
+    SequenceSpeculativeState state;
+    SpeculativeStats stats{.backend                = Backend::Mtp,
+                           .enabled                = true,
+                           .draft_window           = 3,
+                           .attempted_per_position = std::vector<std::uint64_t>(3),
+                           .accepted_per_position  = std::vector<std::uint64_t>(3)};
+    std::array<float, 3> prior, accepted, discarded, ordinary;
+    state.predict_conditional_survival(Backend::Mtp, 3, prior);
+    record_speculative_commit(stats, &state, {.accepted_tokens = 1, .terminal = true}, 3, 2,
+                              std::array{.8f, .9f, .1f}, {});
+    state.predict_conditional_survival(Backend::Mtp, 3, accepted);
+    require(accepted[0] > prior[0] && stats.committed_draft_tokens == 1,
+            "terminal prefix did not separate verification and adopted drafts");
+    record_speculative_commit(stats, &state, {.terminal = true, .cancelled = true}, 2, 2, {}, {});
+    record_speculative_commit(stats, &state, {.terminal = true, .failed = true}, 1, 0, {}, {});
+    state.predict_conditional_survival(Backend::Mtp, 3, discarded);
+    require(discarded == accepted && stats.committed_draft_tokens == 1,
+            "failed or cancelled output changed feedback or adopted drafts");
+    record_speculative_commit(stats, &state, {.accepted_tokens = 1}, 0, 0, {}, .05f);
+    state.predict_conditional_survival(Backend::Mtp, 3, ordinary);
+    require(ordinary[0] < discarded[0], "ordinary fallback did not update target feedback");
+    record_speculative_commit(stats, nullptr, {.accepted_tokens = 2}, 2, 1, {}, {});
+    require(stats.backend == Backend::Mtp && stats.enabled && stats.draft_window == 3 &&
+                stats.rounds == 4 && stats.fallback_steps == 1 && stats.drafted_tokens == 8 &&
+                stats.accepted_tokens == 5 && stats.committed_draft_tokens == 2 &&
+                stats.attempted_per_position == std::vector<std::uint64_t>{4, 3, 1} &&
+                stats.accepted_per_position == std::vector<std::uint64_t>{3, 2, 0},
+            "shared bookkeeping lost verification or commit statistics");
+}
+
 void narrow_split_proposal() {
     const Rounds block({Backend::DFlash2, 7, 2, 256, 8});
     const SpeculativeCostModel model(block.config);
@@ -649,6 +708,8 @@ int main() {
         hybrid_fit();
         calibration_schedule();
         sequence_and_rounds();
+        length_policy();
+        speculative_commit();
         narrow_split_proposal();
         overconfident_rejection();
         parallel_draft_confidence();

@@ -1,6 +1,7 @@
 #include "product/config/options.h"
 #include "product/logging/configuration.h"
 
+#include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -121,6 +122,76 @@ void test_arguments() {
     }
 }
 
+void test_speculative_length_policy(const Files& files) {
+    using ninfer::SpeculativeLengthPolicy;
+    using namespace ninfer::product;
+    require(ninfer::EngineOptions{}.speculative.length_policy == SpeculativeLengthPolicy::Adaptive,
+            "C++ length policy default differs");
+    const auto path = files.write(R"(
+model.path = 'model.ninfer'
+cli.prompt = 'hello'
+speculative.backend = 'mtp'
+speculative.draft_tokens = 3
+)");
+    for (const auto entry : {EntryPoint::Cli, EntryPoint::Serve, EntryPoint::Bench}) {
+        const auto parse_shared = [&](std::vector<std::string> arguments) {
+            std::vector<char*> argv;
+            for (auto& argument : arguments) argv.push_back(argument.data());
+            return parse_launch_options(static_cast<int>(argv.size()), argv.data(), entry).launch;
+        };
+        const auto expected = entry == EntryPoint::Cli ? SpeculativeLengthPolicy::Fixed
+                                                       : SpeculativeLengthPolicy::Adaptive;
+        const auto other    = entry == EntryPoint::Cli ? "adaptive" : "fixed";
+        const auto defaults = parse_shared({"ninfer", "--config", path.string()});
+        require(defaults.engine.speculative.length_policy == expected,
+                "entry-point length policy default differs");
+        const auto override =
+            parse_shared({"ninfer", "--config", path.string(), "--spec-length-policy", other});
+        require(override.engine.speculative.length_policy != expected,
+                "entry-point parser ignored the policy override");
+        const auto view = configuration_view(override, entry);
+        const auto head =
+            std::ranges::find(view.items, "speculative.proposal_head", &ConfigurationItem::key);
+        const auto policy =
+            std::ranges::find(view.items, "speculative.length_policy", &ConfigurationItem::key);
+        require(head != view.items.end() && policy != view.items.end() && policy == head + 1 &&
+                    std::get<std::string>(policy->value) == other &&
+                    policy->source.kind == ConfigSourceKind::CommandLine,
+                "configuration view lost the effective policy, order, or source");
+    }
+
+    for (const auto* value : {"adaptive", "fixed"}) {
+        const auto message = rejection([&] {
+            parse({"ninfer", "--config", path.string(), "--spec", "none", "--spec-length-policy",
+                   value});
+        });
+        require(message.find("--spec-length-policy") != std::string::npos &&
+                    message.find("disabled speculative backend requires default length policy") !=
+                        std::string::npos,
+                "same-layer conflict lost the length policy diagnostic");
+    }
+    const auto invalid = rejection(
+        [&] { parse({"ninfer", "--config", path.string(), "--spec-length-policy", "auto"}); });
+    require(invalid.find("--spec-length-policy") != std::string::npos,
+            "invalid length policy lost the field diagnostic");
+    const auto disabled = parse(
+        {"ninfer", "--config", path.string(), "--spec", "none", "--spec-length-policy", "default"});
+    require(disabled.launch.engine.speculative.length_policy == SpeculativeLengthPolicy::Fixed,
+            "default policy was rejected or failed to resolve with disabled speculation");
+
+    files.write(R"(
+model.path = 'model.ninfer'
+cli.prompt = 'hello'
+speculative.backend = 'none'
+speculative.length_policy = 'fixed'
+)");
+    const auto conflict = rejection([&] { parse({"ninfer", "--config", path.string()}); });
+    require(conflict.find("speculative.length_policy") != std::string::npos &&
+                conflict.find("disabled speculative backend requires default length policy") !=
+                    std::string::npos,
+            "file policy conflict lost the length policy diagnostic");
+}
+
 void test_memory_headroom(const Files& files) {
     using namespace ninfer::product;
     const auto path = files.write(R"(
@@ -183,6 +254,7 @@ host_capacity = "0.0625MiB"
 backend = "mtp"
 draft_tokens = 3
 proposal_head = "optimized"
+length_policy = "adaptive"
 [generation]
 thinking = true
 [generation.sampling]
@@ -204,6 +276,13 @@ regex = "file"
                 base.launch.engine.context_cache.host_capacity_bytes == 65536 &&
                 base.launch.engine.vision_memory_budget_bytes == (512ULL << 20),
             "file values or exact capacity conversion failed");
+    require(base.launch.engine.speculative.length_policy ==
+                ninfer::SpeculativeLengthPolicy::Adaptive,
+            "file length policy was ignored");
+    const auto reset =
+        parse({"ninfer", "--config", path.string(), "--spec-length-policy", "default"});
+    require(reset.launch.engine.speculative.length_policy == ninfer::SpeculativeLengthPolicy::Fixed,
+            "explicit policy reset retained the file value");
     require(base.launch.generation.sampling.seed == UINT64_MAX,
             "uint64 seed string lost precision");
     const auto replaced = parse({"ninfer",
@@ -241,7 +320,9 @@ regex = "file"
             "input choice or argv path base failed");
     require(replaced.launch.engine.speculative.backend == ninfer::SpeculativeBackend::None &&
                 replaced.launch.engine.speculative.draft_tokens == 0 &&
-                replaced.launch.engine.speculative.proposal_head == ninfer::ProposalHead::Full,
+                replaced.launch.engine.speculative.proposal_head == ninfer::ProposalHead::Full &&
+                replaced.launch.engine.speculative.length_policy ==
+                    ninfer::SpeculativeLengthPolicy::Fixed,
             "disabled backend retained dependent settings");
     require(!replaced.launch.generation.sampling.temperature &&
                 replaced.launch.generation.sampling.seed == 0 &&
@@ -401,6 +482,7 @@ int main() {
     try {
         Files files;
         test_arguments();
+        test_speculative_length_policy(files);
         test_memory_headroom(files);
         test_file_merge(files);
         test_file_errors_and_example(files);

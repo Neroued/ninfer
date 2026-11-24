@@ -474,6 +474,7 @@ public:
                          std::span<const std::uint32_t> verify_drafts,
                          std::span<const std::uint8_t> constrained = {});
     [[nodiscard]] speculative::CostModelSummary speculative_cost_summary() const noexcept;
+    [[nodiscard]] std::vector<std::uint32_t> decode_target_widths() const;
     [[nodiscard]] speculative::CalibrationConstraints calibration_constraints() const;
     [[nodiscard]] std::optional<speculative::CostQuery>
         decode_cost_query(runtime::ExecutionTicket) const noexcept;

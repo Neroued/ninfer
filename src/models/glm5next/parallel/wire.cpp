@@ -73,6 +73,7 @@ void encode(Encoder& out, const RankResourceDescription& r) {
     out.boolean(s.gpu_timing);
     out.u8(static_cast<std::uint8_t>(s.speculative));
     out.boolean(s.narrow_dflash_targets);
+    out.u8(static_cast<std::uint8_t>(s.length_policy));
     encode_batch_execution_spec(out, r.batches);
     for (auto record : {r.state.common, r.state.owner}) {
         out.u64(record.bytes);
@@ -117,7 +118,8 @@ RankResourceDescription decode_rank_resources(Decoder& in) {
                             in.boolean(),
                             in.boolean(),
                             static_cast<SpeculativeBackend>(in.u8()),
-                            in.boolean()};
+                            in.boolean(),
+                            static_cast<SpeculativeLengthPolicy>(in.u8())};
     r.batches            = decode_batch_execution_spec(in);
     r.state.common       = {in.u64(), in.u64()};
     r.state.owner        = {in.u64(), in.u64()};

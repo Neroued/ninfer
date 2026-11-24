@@ -546,6 +546,28 @@ void SequenceSpeculativeState::predict_conditional_survival(
     for (auto j = blended_count; j < max_drafts; ++j) out_probs[j] = clamp_survival(empirical(j));
 }
 
+void record_speculative_commit(SpeculativeStats& stats, SequenceSpeculativeState* adaptive_state,
+                               const runtime::CommitDecision& decision, std::uint32_t drafted,
+                               std::uint32_t accepted, std::span<const float> draft_confidences,
+                               std::optional<float> target_top1_probability) {
+    if (adaptive_state && !decision.cancelled && !decision.failed) {
+        if (drafted)
+            adaptive_state->observe_speculative_round(drafted, accepted,
+                                                      draft_confidences.first(drafted));
+        else
+            adaptive_state->observe_ordinary_round(target_top1_probability);
+    }
+    stats.committed_draft_tokens += std::min(decision.accepted_tokens, accepted);
+    if (drafted)
+        ++stats.rounds;
+    else
+        ++stats.fallback_steps;
+    stats.drafted_tokens += drafted;
+    stats.accepted_tokens += accepted;
+    for (std::uint32_t i = 0; i < drafted; ++i) ++stats.attempted_per_position[i];
+    for (std::uint32_t i = 0; i < accepted; ++i) ++stats.accepted_per_position[i];
+}
+
 DecodeRoundPlan select_adaptive_round(SpeculativeBackend backend, std::uint32_t max_drafts,
                                       std::uint32_t owner_count, PhysicalBatchShape shape,
                                       ExecutionPath path, const DecodeGraphRoutes* routes,
@@ -554,6 +576,10 @@ DecodeRoundPlan select_adaptive_round(SpeculativeBackend backend, std::uint32_t 
                                       std::uint32_t max_context) {
     return optimize(backend, max_drafts, owner_count, shape, path, routes, cost_model, rows,
                     max_context);
+}
+
+bool DecodeRoundRequest::uses_adaptive_length(SpeculativeLengthPolicy policy) const noexcept {
+    return !budgets.empty() && policy == SpeculativeLengthPolicy::Adaptive;
 }
 
 bool DecodeRoundRequest::valid_membership(std::size_t rows) const noexcept {
@@ -567,17 +593,22 @@ std::uint32_t DecodeRoundRequest::draft_budget(std::size_t row) const noexcept {
     return budgets.empty() ? extents[row] : budgets[row].generated_tokens_remaining - 1;
 }
 
-std::optional<DecodeRoundPlan> DecodeRoundRequest::select(
-    PhysicalBatchShape shape, ExecutionPath path, const DecodeGraphRoutes* routes,
-    const SpeculativeCostModel& cost, std::span<const RoundMember> limits,
-    std::span<const AdaptiveRowInput> rows, std::uint32_t max_context) const {
+std::optional<DecodeRoundPlan>
+DecodeRoundRequest::select(SpeculativeLengthPolicy policy, PhysicalBatchShape shape,
+                           ExecutionPath path, const DecodeGraphRoutes* routes,
+                           const SpeculativeCostModel& cost, std::span<const RoundMember> limits,
+                           std::span<const AdaptiveRowInput> rows,
+                           std::uint32_t max_context) const {
     const auto& config = cost.config();
     const auto backend = config.backend;
     const auto k       = config.max_drafts;
     const auto owners  = config.owner_count;
-    if (!budgets.empty())
-        return select_adaptive_round(backend, k, owners, shape, path, routes, cost, rows,
-                                     max_context);
+    if (!budgets.empty()) {
+        if (backend != SpeculativeBackend::None && uses_adaptive_length(policy))
+            return select_adaptive_round(backend, k, owners, shape, path, routes, cost, rows,
+                                         max_context);
+        return DecodeRoundPlan::select(backend, k, owners, shape, path, routes, limits);
+    }
     for (std::size_t i = 0; i < extents.size(); ++i)
         if (extents[i] > limits[i].granted_limit) return {};
     if (!route)

@@ -113,12 +113,16 @@ Session::start_decode_round(std::span<const SequenceHandle> members,
     try {
         tx.members.assign(members.begin(), members.end());
         const auto& options = p.definition->options();
+        const bool adaptive_length =
+            p.shape.draft_tokens && selection.uses_adaptive_length(p.shape.length_policy);
+        const bool measure_cost =
+            p.shape.draft_tokens && (adaptive_length || selection.budgets.empty());
         std::vector<speculative::RoundMember> limits;
         std::vector<speculative::AdaptiveRowInput> adaptive;
         std::vector<std::uint32_t> frontiers;
         limits.reserve(members.size());
-        adaptive.reserve(members.size());
-        frontiers.reserve(members.size());
+        if (adaptive_length) adaptive.reserve(members.size());
+        if (measure_cost) frontiers.reserve(members.size());
         std::vector<speculative::RowGrowth> growth(members.size());
         const auto mark = p.next_membership_mark();
         for (std::size_t b = 0; b < members.size(); ++b) {
@@ -136,8 +140,8 @@ Session::start_decode_round(std::span<const SequenceHandle> members,
                 can_propose ? std::min({p.shape.draft_tokens, room, selection.draft_budget(b)})
                             : 0U;
             limits.push_back({s.continuation.metadata.placement.value, hard, hard});
-            frontiers.push_back(f);
-            adaptive.push_back({limits.back(), f, &s.speculative_state});
+            if (measure_cost) frontiers.push_back(f);
+            if (adaptive_length) adaptive.push_back({limits.back(), f, &s.speculative_state});
             if (hard) {
                 growth[b].text.emplace(p.directory.pool(0).histories(), s.histories[0].handle(), f,
                                        f + 1);
@@ -148,7 +152,7 @@ Session::start_decode_round(std::span<const SequenceHandle> members,
             }
         }
         speculative::grant_windows(p.directory, growth, limits);
-        for (std::size_t b = 0; b < limits.size(); ++b) adaptive[b].member = limits[b];
+        for (std::size_t b = 0; b < adaptive.size(); ++b) adaptive[b].member = limits[b];
         for (std::size_t b = 0; b < members.size(); ++b) {
             auto& s         = p.sequence(members[b]);
             auto row        = p.work_row(s, 1);
@@ -157,10 +161,11 @@ Session::start_decode_round(std::span<const SequenceHandle> members,
         }
         auto batch      = plan_batch(tx.rows, *p.plan.batches, true);
         const auto path = p.plan.decode_routes ? ExecutionPath::Graph : ExecutionPath::Eager;
-        tx.round = selection.select(batch.shape, path, p.plan.decode_routes.get(), p.cost_model,
-                                    limits, adaptive, p.shape.max_context);
+        tx.round =
+            selection.select(p.shape.length_policy, batch.shape, path, p.plan.decode_routes.get(),
+                             p.cost_model, limits, adaptive, p.shape.max_context);
         if (!tx.round) return {};
-        if (p.shape.draft_tokens)
+        if (measure_cost)
             tx.cost_query = speculative::CostQuery::from_plan(p.shape.speculative, *tx.round,
                                                               frontiers, p.shape.max_context);
         tx.record_online_cost = selection.record_online_cost;

@@ -139,6 +139,7 @@ void encode_rank_options(Encoder& out, const EngineOptions& o) {
     out.u8(static_cast<std::uint8_t>(o.speculative.backend));
     out.u32(o.speculative.draft_tokens);
     out.u8(static_cast<std::uint8_t>(o.speculative.proposal_head));
+    out.u8(static_cast<std::uint8_t>(o.speculative.length_policy));
     out.boolean(o.enable_vision);
     out.u64(o.vision_memory_budget_bytes);
     out.boolean(o.use_cuda_graph);
@@ -158,6 +159,7 @@ EngineOptions decode_rank_options(Decoder& in) {
     o.speculative.backend               = static_cast<SpeculativeBackend>(in.u8());
     o.speculative.draft_tokens          = in.u32();
     o.speculative.proposal_head         = static_cast<ProposalHead>(in.u8());
+    o.speculative.length_policy         = static_cast<SpeculativeLengthPolicy>(in.u8());
     o.enable_vision                     = in.boolean();
     o.vision_memory_budget_bytes        = in.u64();
     o.use_cuda_graph                    = in.boolean();

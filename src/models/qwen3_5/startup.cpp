@@ -97,7 +97,9 @@ Startup::plan(DeviceContext& device, const EngineOptions& options, WeightPlaceme
 
 std::vector<std::uint32_t> Startup::narrow_target_widths(const EngineOptions& options,
                                                          WeightPlacement placement) const {
-    if (!options.use_cuda_graph || !is_masked_draft_backend(options.speculative.backend) ||
+    if (!options.use_cuda_graph ||
+        options.speculative.length_policy != SpeculativeLengthPolicy::Adaptive ||
+        !is_masked_draft_backend(options.speculative.backend) ||
         options.speculative.draft_tokens < 5)
         return {};
     const auto full_width = options.speculative.draft_tokens + 1;

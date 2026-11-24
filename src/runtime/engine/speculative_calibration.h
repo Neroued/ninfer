@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/startup.h"
 #include "models/common/speculative/calibration.h"
 #include "runtime/contract/execution.h"
 #include "runtime/contract/request.h"
@@ -15,6 +16,13 @@
 #include <variant>
 
 namespace ninfer::runtime {
+
+struct SpeculativeCalibrationResult {
+    std::uint32_t anchors;
+    std::uint32_t contexts;
+    double seconds;
+};
+
 namespace detail {
 
 template <class Instance>
@@ -32,9 +40,12 @@ public:
         : instance_(instance), session_(*instance.session), executor_(*instance.executor),
           constraints_(session_.calibration_constraints()) {}
 
-    void run(std::string_view prompt_text) {
+    std::optional<SpeculativeCalibrationResult> run(const StartupObserver& observer,
+                                                    std::string_view prompt_text) {
         const auto schedule = models::speculative::build_corner_calibration_schedule(constraints_);
-        if (schedule.empty()) return;
+        if (schedule.empty()) return {};
+        started_ = Clock::now();
+        StartupPhaseScope phase(observer, StartupPhase::SpeculativeCalibration);
         const auto pattern = instance_.frontend.tokenize_text(prompt_text);
         if (pattern.empty()) throw std::logic_error("speculative calibration prompt is empty");
         try {
@@ -50,6 +61,10 @@ public:
             session_.fail_all_cleanup();
             throw;
         }
+        const SpeculativeCalibrationResult result{static_cast<std::uint32_t>(anchors_.size()),
+                                                  contexts_, elapsed_ms() * 1e-3};
+        phase.complete();
+        return result;
     }
 
 private:
@@ -221,6 +236,7 @@ private:
         }
         if (!members.empty() && launch(members, ordinary_route(members.size()),
                                        std::vector<std::uint32_t>(members.size()), false)) {
+            ++contexts_;
             for (const auto& probe : schedule) {
                 if (!in_budget()) break;
                 if (probe.context_tokens != length || probe.logical_rows > members.size()) continue;
@@ -242,23 +258,24 @@ private:
         drain();
     }
 
-    const Clock::time_point started_ = Clock::now();
+    Clock::time_point started_;
     Instance& instance_;
     typename Model::Session& session_;
     Executor<typename Model::ExecutionTypes>& executor_;
     models::speculative::CalibrationConstraints constraints_;
     std::vector<models::speculative::TimedCostAnchor> anchors_;
+    std::uint32_t contexts_ = 0;
 };
 
 } // namespace detail
 
 // Called on the executor's bound thread before the Session admits user requests.
 template <class Instance>
-void calibrate_speculative(
-    Instance& instance,
+std::optional<SpeculativeCalibrationResult> calibrate_speculative(
+    Instance& instance, const StartupObserver& observer,
     std::string_view prompt_text =
         "A field notebook records the date, weather, and observations from each walk. ") {
-    detail::SpeculativeCalibration<Instance>(instance).run(prompt_text);
+    return detail::SpeculativeCalibration<Instance>(instance).run(observer, prompt_text);
 }
 
 } // namespace ninfer::runtime

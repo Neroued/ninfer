@@ -30,6 +30,24 @@ namespace ninfer::product {
     return "unknown";
 }
 
+[[nodiscard]] inline SpeculativeLengthPolicy
+parse_speculative_length_policy(std::string_view value) {
+    if (value == "adaptive") return SpeculativeLengthPolicy::Adaptive;
+    if (value == "fixed") return SpeculativeLengthPolicy::Fixed;
+    throw std::invalid_argument("invalid speculative length policy: " + std::string(value));
+}
+
+[[nodiscard]] inline const char*
+speculative_length_policy_name(SpeculativeLengthPolicy policy) noexcept {
+    switch (policy) {
+    case SpeculativeLengthPolicy::Adaptive:
+        return "adaptive";
+    case SpeculativeLengthPolicy::Fixed:
+        return "fixed";
+    }
+    return "unknown";
+}
+
 inline void validate_speculative_cli_options(const SpeculativeOptions& options) {
     switch (options.backend) {
     case SpeculativeBackend::None:

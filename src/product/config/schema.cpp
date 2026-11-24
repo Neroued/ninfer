@@ -52,11 +52,14 @@ constexpr FieldSpec kFields[] = {
     {Field::CostPresets, "context_cache.cost_presets", "--context-cost-presets", "", "FILE",
      "Context-cost JSON overrides; empty uses built-in defaults."},
     {Field::SpecBackend, "speculative.backend", "--spec", "", "none|mtp|dflash|dflash2",
-     "Speculative backend; none clears drafts and proposal head."},
+     "Speculative backend; none resets drafts, proposal head, and length policy."},
     {Field::DraftTokens, "speculative.draft_tokens", "--draft-tokens", "", "N",
      "MTP: 1..5; DFlash/DFlash2: 1..15; none: 0."},
     {Field::ProposalHead, "speculative.proposal_head", "--proposal-head", "", "full|optimized",
      "Proposal head representation."},
+    {Field::SpecLengthPolicy, "speculative.length_policy", "--spec-length-policy", "",
+     "default|adaptive|fixed", "Draft verification length policy; CLI fixed, serve adaptive.",
+     Scope::Generation},
     {Field::MediaCache, "media.cache_capacity", "--media-cache-capacity", "", "SIZE",
      "Retained media cache (1GiB); 0B disables reuse.", Scope::Generation,
      ConfigurationUnit::Bytes},
@@ -289,6 +292,7 @@ FieldValue parse_field_value(Field field, const RawValue& value, bool command_li
     case Field::PrefillChunk:
     case Field::MaxTokens:
     case Field::Seed:
+    case Field::SpecLengthPolicy:
         if (is("default")) return DefaultValue{};
         break;
     case Field::Thinking:
@@ -380,6 +384,8 @@ FieldValue parse_field_value(Field field, const RawValue& value, bool command_li
         return enumeration(value, {"none", "mtp", "dflash", "dflash2"});
     case Field::ProposalHead:
         return enumeration(value, {"full", "optimized"});
+    case Field::SpecLengthPolicy:
+        return enumeration(value, {"adaptive", "fixed"});
     case Field::ReasoningEffort:
         return enumeration(value, {"none", "minimal", "low", "medium", "high", "xhigh", "max"});
     case Field::ConstraintKind:

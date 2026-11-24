@@ -37,7 +37,9 @@ ExecutionShape shape(const execution::ModelProfile& p, const EngineOptions& o,
             o.purpose,
             o.context_cache.enabled,
             o.observability.gpu_timing,
-            o.speculative.backend};
+            o.speculative.backend,
+            false,
+            o.speculative.length_policy};
 }
 
 context::ContextDirectorySpec schema(const ExecutionPlan& p, std::size_t capacity, bool global) {

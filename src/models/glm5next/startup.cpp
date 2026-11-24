@@ -19,6 +19,7 @@ KvCacheVectorFormat index_format_from_environment() {
 
 bool can_narrow_dflash_targets(const EngineOptions& options) noexcept {
     return options.use_cuda_graph && options.purpose == EnginePurpose::Generation &&
+           options.speculative.length_policy == SpeculativeLengthPolicy::Adaptive &&
            options.speculative.backend == SpeculativeBackend::DFlash2 &&
            options.speculative.draft_tokens >= 5;
 }

@@ -169,6 +169,9 @@ StartupConfigurationView view(const LaunchOptions& launch, EntryPoint entry, con
             value = std::string(e.speculative.proposal_head == ProposalHead::Full ? "full"
                                                                                   : "optimized");
             break;
+        case Field::SpecLengthPolicy:
+            value = std::string(speculative_length_policy_name(e.speculative.length_policy));
+            break;
         case Field::MediaCache:
             value = std::uint64_t{e.media_cache_bytes};
             break;

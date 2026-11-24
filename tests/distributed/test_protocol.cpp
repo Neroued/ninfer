@@ -218,6 +218,7 @@ void cache_profiles_roundtrip() {
                          KvCacheStorage::Fp8KeyNvfp4Value}) {
         q::RankLoadRequest request{};
         request.options.kv_cache = storage;
+        request.options.speculative.length_policy = SpeculativeLengthPolicy::Fixed;
         request.batches = models::make_batch_execution_spec(request.options.max_concurrency, 1,
                                                             request.options.use_cuda_graph);
         wire::Encoder load_out;
@@ -226,12 +227,15 @@ void cache_profiles_roundtrip() {
         wire::Decoder load_in(load_bytes);
         const auto loaded = q::decode_rank_load(load_in);
         load_in.finish();
-        require(loaded.options.kv_cache == storage, "rank load changed the KV profile");
+        require(loaded.options.kv_cache == storage &&
+                    loaded.options.speculative.length_policy == SpeculativeLengthPolicy::Fixed,
+                "rank load changed the KV profile or length policy");
 
         q::RankExecutionDescription execution{};
         execution.session.shape.kv_storage      = storage;
         execution.session.shape.max_concurrency = request.options.max_concurrency;
         execution.session.shape.cuda_graph      = request.options.use_cuda_graph;
+        execution.session.shape.length_policy   = request.options.speculative.length_policy;
         execution.session.batches =
             std::make_shared<const models::BatchExecutionPlan>(request.batches);
         wire::Encoder execution_out;
@@ -240,9 +244,9 @@ void cache_profiles_roundtrip() {
         wire::Decoder execution_in(execution_bytes);
         const auto decoded = q::decode_rank_execution(execution_in);
         execution_in.finish();
-        require(decoded.session.shape.kv_storage == storage &&
+        require(decoded.session.shape == execution.session.shape &&
                     decoded.session.batches->spec() == request.batches,
-                "rank execution changed the KV profile or batch plan");
+                "rank execution changed the shape or batch plan");
     }
 }
 
@@ -320,7 +324,8 @@ void model_preparation() {
     o.use_cuda_graph                    = false;
     o.enable_vision                     = true;
     o.vision_memory_budget_bytes        = 256ULL << 20;
-    o.speculative                       = {SpeculativeBackend::Mtp, 3, ProposalHead::Optimized};
+    o.speculative                       = {SpeculativeBackend::Mtp, 3, ProposalHead::Optimized,
+                                           SpeculativeLengthPolicy::Fixed};
     o.context_cache.host_capacity_bytes = 0;
     request.host_reservation_bytes      = 2ULL << 30;
     request.control_owner               = false;
@@ -348,6 +353,7 @@ void model_preparation() {
     glm::encode_rank_load(roundtrip, decoded);
     require(std::move(roundtrip).take() == bytes && decoded.rank.kda_heads.begin == 32 &&
                 decoded.options.speculative.proposal_head == ProposalHead::Optimized &&
+                decoded.options.speculative.length_policy == SpeculativeLengthPolicy::Fixed &&
                 decoded.index_format == request.index_format &&
                 decoded.batches == request.batches &&
                 decoded.host_reservation_bytes == request.host_reservation_bytes,
@@ -396,6 +402,7 @@ void model_preparation() {
                                        EnginePurpose::Generation,
                                        true,
                                        false};
+    r.shape.length_policy           = SpeculativeLengthPolicy::Fixed;
     r.state                         = {{1024, 256}, {1536, 256}, {1024, 512, 256}};
     r.batches                       = request.batches;
     r.context.ranks                 = {{1, 2ULL << 30, 0}};

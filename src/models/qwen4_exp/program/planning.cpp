@@ -139,7 +139,8 @@ ExecutionShape describe_execution_shape(const execution::ModelProfile& profile,
             o.purpose,
             o.context_cache.enabled,
             o.use_cuda_graph,
-            o.observability.gpu_timing};
+            o.observability.gpu_timing,
+            o.speculative.length_policy};
 }
 
 std::size_t ExecutionPlan::device_bytes() const {

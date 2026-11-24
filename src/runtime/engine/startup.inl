@@ -2,6 +2,7 @@
 
 #include "runtime/engine/instance.h"
 #include "runtime/executor/local_executor.h"
+#include "runtime/executor/preparation.h"
 #include "runtime/engine/context_cache/context_cost.h"
 #include "runtime/engine/startup_memory.h"
 #include "artifact/reader.h"
@@ -21,6 +22,47 @@
 
 namespace ninfer::runtime::detail {
 
+inline bool preserves_context_capacity(const ContextCapacityResolution& narrow,
+                                       const ContextCapacityResolution& baseline) {
+    return keeps_context_capacity(narrow.device_bytes, baseline.device_bytes);
+}
+
+inline bool preserves_group_context_capacity(std::span<const ContextCapacityResolution> narrow,
+                                             std::span<const ContextCapacityResolution> baseline) {
+    return std::ranges::equal(narrow, baseline, preserves_context_capacity);
+}
+
+inline std::vector<ContextCapacityResolution>
+group_baseline_capacity_upper_bound(std::span<const RankPreparationReport> reports,
+                                    std::span<const RankMemoryBudget> budgets) {
+    std::vector<RankCapacityOffer> offers;
+    offers.reserve(reports.size());
+    std::optional<std::size_t> owner;
+    for (std::size_t rank = 0; rank < reports.size(); ++rank) {
+        const auto& report = reports[rank];
+        auto& offer       = offers.emplace_back(report.capacity);
+        offer.available_bytes += budgets[rank].graphs->rebuild_estimate_bytes;
+        if (report.control_owner) owner = rank;
+    }
+    const auto policy = ContextCapacityPolicy::automatic();
+    auto upper = resolve_group_context_capacity(policy, offers, owner);
+    if (!owner) return upper;
+
+    // Bound each rank independently. With the other non-owner ranks at their minimum,
+    // the metadata owner's rank order cannot understate a baseline rank's capacity.
+    auto minimum = offers;
+    for (std::size_t rank = 0; rank < offers.size(); ++rank) {
+        if (rank == *owner) continue;
+        auto& offer = minimum[rank];
+        offer.available_bytes = offer.plan.reservation_bytes(offer.plan.minimum_capacity());
+    }
+    for (std::size_t rank = 0; rank < offers.size(); ++rank) {
+        auto maximal = minimum;
+        maximal[rank] = offers[rank];
+        upper[rank] = resolve_group_context_capacity(policy, maximal, owner)[rank];
+    }
+    return upper;
+}
 
 template <class Plan>
 struct CalibratedPlan {

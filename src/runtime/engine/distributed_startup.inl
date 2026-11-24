@@ -43,80 +43,47 @@ build_distributed_model(const artifact::Reader& reader, EngineOptions& options,
                                         },
                                         [&] { session.reset(); }});
     };
-    auto prepared = [&] {
+    auto prepared = [&]() -> GroupPreparation {
         if constexpr (requires { setup.narrow_targets(options); }) {
-            if (setup.narrow_targets(options)) {
-                const auto requested = options;
-                const auto release = [&] {
-                    session.reset();
-                    if (group) group->shutdown();
-                    group.reset();
-                    options = requested;
-                };
-                const auto try_narrow = [&]() -> std::optional<GroupPreparation> {
-                    try {
-                        return prepare(true);
-                    } catch (const DeviceAllocationError&) {
-                    } catch (const distributed::RankDeviceAllocationError&) {
-                    } catch (const ContextBudgetError&) {
-                    }
-                    release();
-                    return {};
-                };
-                const auto preserves = [](const auto& proposed, const auto& reference) {
-                    for (std::size_t rank = 0; rank < proposed.size(); ++rank)
-                        if (!keeps_context_capacity(proposed[rank].device_bytes,
-                                                    reference[rank].device_bytes))
-                            return false;
-                    return true;
-                };
-                if (auto narrow = try_narrow()) {
-                    if (requested.context_capacity.mode == ContextCapacityMode::Explicit)
-                        return std::move(*narrow);
-                    // A corrected startup offer is already capped by a measured runtime limit.
-                    // Compare actual catalogs on this uncommon path.
-                    if (!narrow->attempt) {
-                        const auto budgets = setup.memory_budgets();
-                        std::vector<RankCapacityOffer> offers;
-                        std::optional<std::size_t> owner;
-                        for (std::size_t rank = 0; rank < narrow->reports.size(); ++rank) {
-                            const auto& report = narrow->reports[rank];
-                            auto& offer = offers.emplace_back(report.capacity);
-                            offer.available_bytes += budgets[rank].graphs->rebuild_estimate_bytes;
-                            if (report.control_owner) owner = rank;
-                        }
-                        auto upper = resolve_group_context_capacity(requested.context_capacity,
-                                                                    offers, owner);
-                        // The shared metadata owner allocates in rank order. Maximize each
-                        // rank's bound with the other non-owner ranks at their minimum, so a
-                        // change in allocation order cannot understate a baseline rank's capacity.
-                        if (owner) {
-                            auto minimum = offers;
-                            for (std::size_t rank = 0; rank < offers.size(); ++rank) {
-                                if (rank == *owner) continue;
-                                auto& offer = minimum[rank];
-                                offer.available_bytes = offer.plan.reservation_bytes(
-                                    offer.plan.minimum_capacity());
-                            }
-                            for (std::size_t rank = 0; rank < offers.size(); ++rank) {
-                                auto maximal = minimum;
-                                maximal[rank] = offers[rank];
-                                upper[rank] = resolve_group_context_capacity(
-                                    requested.context_capacity, maximal, owner)[rank];
-                            }
-                        }
-                        if (preserves(narrow->capacities, upper)) return std::move(*narrow);
-                    }
-                    release();
-                    auto baseline = prepare(false);
-                    if (!preserves(narrow->capacities, baseline.capacities)) return baseline;
-                    release();
-                    if (auto rebuilt = try_narrow()) {
-                        if (preserves(rebuilt->capacities, baseline.capacities))
-                            return std::move(*rebuilt);
-                        release();
-                    }
+            if (!setup.narrow_targets(options)) return prepare(false);
+            const auto requested = options;
+            const auto release = [&] {
+                session.reset();
+                if (group) group->shutdown();
+                group.reset();
+                options = requested;
+            };
+            const auto try_narrow = [&]() -> std::optional<GroupPreparation> {
+                try {
+                    return prepare(true);
+                } catch (const DeviceAllocationError&) {
+                } catch (const distributed::RankDeviceAllocationError&) {
+                } catch (const ContextBudgetError&) {
                 }
+                release();
+                return {};
+            };
+            auto narrow = try_narrow();
+            if (!narrow) return prepare(false);
+            if (requested.context_capacity.mode == ContextCapacityMode::Explicit)
+                return std::move(*narrow);
+            // A corrected offer is capped by a measured runtime limit. Use a measured
+            // baseline on that path.
+            if (!narrow->attempt &&
+                preserves_group_context_capacity(
+                    narrow->capacities,
+                    group_baseline_capacity_upper_bound(narrow->reports, setup.memory_budgets())))
+                return std::move(*narrow);
+
+            release();
+            auto baseline = prepare(false);
+            if (!preserves_group_context_capacity(narrow->capacities, baseline.capacities))
+                return baseline;
+            release();
+            if (auto rebuilt = try_narrow()) {
+                if (preserves_group_context_capacity(rebuilt->capacities, baseline.capacities))
+                    return std::move(*rebuilt);
+                release();
             }
         }
         return prepare(false);

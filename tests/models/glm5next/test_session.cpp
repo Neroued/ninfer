@@ -500,10 +500,18 @@ void calibrate_attention_owners(std::shared_ptr<const glm::ModelDefinition> defi
         glm::Session* session;
     } instance{frontend, &f.executor, &f.session};
 
-    rt::calibrate_speculative(instance, "aabbab");
+    std::vector<StartupStatus> phases;
+    const StartupObserver observer{[&](const StartupEvent& event) {
+        if (event.phase == StartupPhase::SpeculativeCalibration) phases.push_back(event.status);
+    }};
+    const auto calibration = rt::calibrate_speculative(instance, observer, "aabbab");
     const auto cost = f.session.speculative_cost_summary();
     require(cost.fitted && cost.anchor_count && !cost.online_cell_count,
             "two-owner calibration did not fit from isolated probes");
+    require(calibration && calibration->anchors == cost.anchor_count &&
+                calibration->contexts == 1 && calibration->seconds > 0 &&
+                phases == std::vector{StartupStatus::Begin, StartupStatus::Complete},
+            "calibration reported the wrong measured scope or startup events");
     const auto usage = f.session.physical_usage();
     require(f.executor.bindings == 2 + f.layout.shape.max_concurrency &&
                 !f.executor.has_pending_work() && !f.session.has_context_operation() &&

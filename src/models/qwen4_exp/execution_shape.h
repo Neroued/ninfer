@@ -11,6 +11,7 @@ struct ExecutionShape {
     bool context_cache = false;
     bool cuda_graph    = false;
     bool gpu_timing    = false;
+    SpeculativeLengthPolicy length_policy = SpeculativeLengthPolicy::Adaptive;
 
     bool operator==(const ExecutionShape&) const = default;
 };

@@ -105,7 +105,7 @@ void adaptive_rounds(const char* artifact, bool graph, bool startup_fit) {
     instance.executor->bind_to_current_thread();
     auto& session = *instance.session;
     if (startup_fit) {
-        runtime::calibrate_speculative(instance);
+        runtime::calibrate_speculative(instance, {});
         check(session.speculative_cost_summary().fitted, "adaptive startup cost fit is empty");
     }
     test::qwen3_5::EventDriver driver(session, *instance.executor);

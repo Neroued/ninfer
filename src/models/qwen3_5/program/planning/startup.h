@@ -33,6 +33,7 @@ struct SequencePlanningInputs {
     std::uint32_t prefill_chunk            = 0;
     std::uint32_t draft_window             = 0;
     SpeculativeBackend speculative_backend = SpeculativeBackend::None;
+    SpeculativeLengthPolicy length_policy  = SpeculativeLengthPolicy::Adaptive;
     KvCacheStorage kv_storage              = KvCacheStorage::BFloat16;
     ProposalHead proposal_head             = ProposalHead::Full;
     models::LoadOptions features;
@@ -56,6 +57,7 @@ struct SequencePlanImpl {
     std::uint32_t prefill_chunk            = 0;
     std::uint32_t draft_window             = 0;
     SpeculativeBackend speculative_backend = SpeculativeBackend::None;
+    SpeculativeLengthPolicy length_policy  = SpeculativeLengthPolicy::Adaptive;
     KvCacheStorage kv_storage              = KvCacheStorage::BFloat16;
     ProposalHead proposal_head             = ProposalHead::Full;
     models::LoadOptions features;

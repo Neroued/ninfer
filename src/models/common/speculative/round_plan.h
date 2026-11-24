@@ -36,6 +36,7 @@ public:
     DecodeGraphRoutes(const BatchExecutionPlan&, SpeculativeBackend, std::uint32_t draft_window,
                       std::span<const std::uint32_t> target_widths = {});
     [[nodiscard]] std::span<const RoundRoute> at(PhysicalBatchShape shape) const;
+    [[nodiscard]] std::vector<std::uint32_t> target_widths() const;
     [[nodiscard]] RoundRoute select_route(PhysicalBatchShape, SpeculativeBackend,
                                           std::uint32_t depth) const;
 

@@ -3,6 +3,7 @@
 #include "core/dtype.h"
 #include "ninfer/types.h"
 #include "ops/fp8_cache_reference.h"
+#include "ops/float_codec.h"
 
 #include <algorithm>
 #include <array>
@@ -11,6 +12,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <span>
 #include <stdexcept>
 #include <vector>
 
@@ -72,10 +74,17 @@ inline std::uint16_t fp16_encode(float x) {
 inline float fp16_decode(std::uint16_t x) { return float(std::bit_cast<_Float16>(x)); }
 
 inline double positive_fp8(int code) {
-    const int exponent = code >> 3, fraction = code & 7;
-    if (code == 127) return std::numeric_limits<double>::quiet_NaN();
-    return exponent == 0 ? std::ldexp(double(fraction), -9)
-                         : std::ldexp(1.0 + fraction / 8.0, exponent - 7);
+    static const auto values = [] {
+        std::array<double, 128> result;
+        for (int i = 0; i < 127; ++i) {
+            const int exponent = i >> 3, fraction = i & 7;
+            result[i] = exponent == 0 ? std::ldexp(double(fraction), -9)
+                                      : std::ldexp(1.0 + fraction / 8.0, exponent - 7);
+        }
+        result[127] = std::numeric_limits<double>::quiet_NaN();
+        return result;
+    }();
+    return values[code];
 }
 
 inline double positive_fp4(int code) {
@@ -85,20 +94,30 @@ inline double positive_fp4(int code) {
 
 inline std::uint8_t encode_minifloat(float x, bool fp4) {
     const double magnitude = std::abs(double(x));
-    const auto value = [=](int code) { return fp4 ? positive_fp4(code) : positive_fp8(code); };
-    int low = 0, high = fp4 ? 7 : 126;
-    while (low < high) {
-        const int mid = (low + high) / 2;
-        if (value(mid) < magnitude)
-            low = mid + 1;
-        else
-            high = mid;
-    }
-    int selected = low;
-    if (low > 0) {
-        const double upper_error = std::abs(value(low) - magnitude);
-        const double lower_error = std::abs(value(low - 1) - magnitude);
-        if (lower_error < upper_error || (lower_error == upper_error && (low & 1))) --selected;
+    int selected           = 0;
+    if (!fp4 && magnitude < 448.0) {
+        const int lower          = float_codec::e4m3fn_floor_code(float(magnitude));
+        const double lower_error = magnitude - positive_fp8(lower);
+        const double upper_error = positive_fp8(lower + 1) - magnitude;
+        selected =
+            lower + (upper_error < lower_error || (upper_error == lower_error && (lower & 1)));
+    } else if (!fp4) {
+        selected = std::isnan(magnitude) ? 0 : 126;
+    } else {
+        int low = 0, high = 7;
+        while (low < high) {
+            const int mid = (low + high) / 2;
+            if (positive_fp4(mid) < magnitude)
+                low = mid + 1;
+            else
+                high = mid;
+        }
+        selected = low;
+        if (low > 0) {
+            const double upper_error = std::abs(positive_fp4(low) - magnitude);
+            const double lower_error = std::abs(positive_fp4(low - 1) - magnitude);
+            if (lower_error < upper_error || (lower_error == upper_error && (low & 1))) --selected;
+        }
     }
     return std::uint8_t(selected | (std::signbit(x) ? (fp4 ? 8 : 128) : 0));
 }
@@ -160,10 +179,10 @@ struct EncodedRow {
     std::vector<std::uint8_t> data, scales;
 };
 
-inline EncodedRow encode_row(std::array<float, 256> values, VectorEncoding format) {
+inline void encode_row_into(std::array<float, 256> values, VectorEncoding format,
+                            std::span<std::uint8_t> data, std::span<std::uint8_t> scales) {
     if (format.rotate) hadamard(values);
-    EncodedRow out{std::vector<std::uint8_t>(format.data_extent * dtype_size(format.data_dtype)),
-                   std::vector<std::uint8_t>(format.scale_extent * dtype_size(format.scale_dtype))};
+    if (format.encoding == Encoding::Nvfp4) std::fill(data.begin(), data.end(), 0);
     for (int begin = 0; begin < 256; begin += format.group) {
         float absmax = 0;
         for (int d = begin; d < begin + format.group; ++d)
@@ -171,17 +190,23 @@ inline EncodedRow encode_row(std::array<float, 256> values, VectorEncoding forma
         const auto scale = encode_scale(absmax, format.encoding);
         const int group  = begin / format.group;
         if (format.scale_dtype == DType::U8)
-            out.scales[group] = std::uint8_t(scale.bits);
+            scales[group] = std::uint8_t(scale.bits);
         else
-            write_u16(out.scales, 2 * group, scale.bits);
+            std::memcpy(scales.data() + 2 * group, &scale.bits, sizeof(scale.bits));
         for (int d = begin; d < begin + format.group; ++d) {
             const auto code = encode_code(values[d], scale.value, format.encoding);
             if (format.encoding == Encoding::Nvfp4)
-                out.data[d / 2] |= code << (4 * (d % 2));
+                data[d / 2] |= code << (4 * (d % 2));
             else
-                out.data[d] = code;
+                data[d] = code;
         }
     }
+}
+
+inline EncodedRow encode_row(std::array<float, 256> values, VectorEncoding format) {
+    EncodedRow out{std::vector<std::uint8_t>(format.data_extent * dtype_size(format.data_dtype)),
+                   std::vector<std::uint8_t>(format.scale_extent * dtype_size(format.scale_dtype))};
+    encode_row_into(values, format, out.data, out.scales);
     return out;
 }
 

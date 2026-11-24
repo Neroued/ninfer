@@ -87,9 +87,11 @@ Fixture::Fixture(Weights& w, int n, bool f, ops::LinearPolicy p, ops::LinearPoli
       j(final ? Tensor{} : Tensor(dj.span(), DType::FP32, {4, m})), words(std::size_t(K) * m) {}
 
 void Fixture::upload(std::span<const float> catalog, cudaStream_t stream) {
-    for (int m0 = 0; m0 < m; ++m0)
-        for (int k = 0; k < K; ++k)
-            words[std::size_t(m0) * K + k] = f32_to_bf16(catalog[(m0 % Catalog) * K + k]);
+    parallel_rows(m, words.size(), [&](int first, int last) {
+        for (int m0 = first; m0 < last; ++m0)
+            for (int k = 0; k < K; ++k)
+                words[std::size_t(m0) * K + k] = f32_to_bf16(catalog[(m0 % Catalog) * K + k]);
+    });
     cuda_check(
         cudaMemcpyAsync(dz.data(), words.data(), words.size() * 2, cudaMemcpyHostToDevice, stream),
         "HC input upload");

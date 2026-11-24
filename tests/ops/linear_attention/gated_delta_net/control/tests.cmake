@@ -1,4 +1,5 @@
 ninfer_add_op_test(ninfer_gdn_control_test
+  PROCESSORS 2 COST 70
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/main.cpp"
           "${CMAKE_CURRENT_LIST_DIR}/test_control.cpp"
           "${CMAKE_CURRENT_LIST_DIR}/fixtures.cpp"

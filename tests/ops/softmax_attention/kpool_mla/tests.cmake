@@ -6,9 +6,11 @@ if(NINFER_TARGET STREQUAL "dgx_spark")
     SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_sparse_mla.cpp"
     LIBRARIES ninfer_ops)
   ninfer_add_op_test(ninfer_kpool_indexer_test
+    PROCESSORS 2 COST 80
     SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_indexer.cpp"
     LIBRARIES ninfer_ops CUDA::cuda_driver)
   ninfer_add_op_test(ninfer_kpool_prepare_test
+    PROCESSORS 2 COST 80
     SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_prepare.cpp"
     LIBRARIES ninfer_ops)
 endif()

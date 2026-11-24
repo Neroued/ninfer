@@ -26,8 +26,19 @@ struct Ideal {
     std::vector<double> values, scales;
 };
 
+using RopeRotation = std::array<std::pair<double, double>, 32>;
+
+RopeRotation rope_rotation(std::array<int, 3> rho, float theta) {
+    RopeRotation rotation;
+    for (int i = 0; i < 32; ++i) {
+        const double phase = double(rho[i % 3]) * std::pow(double(theta), -double(i) / 32);
+        rotation[i]        = {std::cos(phase), std::sin(phase)};
+    }
+    return rotation;
+}
+
 Ideal oracle(const std::vector<double>& raw, const Buffer<std::uint16_t>& weight,
-             std::array<int, 3> rho, const ops::QsaKvPrepareParameters& params) {
+             const RopeRotation& rotation, const ops::QsaKvPrepareParameters& params) {
     const int d = raw.size();
     double sum  = 0;
     for (double x : raw) sum += x * x;
@@ -38,9 +49,7 @@ Ideal oracle(const std::vector<double>& raw, const Buffer<std::uint16_t>& weight
         out.scales[c] = std::abs(out.values[c]);
     }
     for (int i = 0; i < 32; ++i) {
-        const double phase =
-            double(rho[i % 3]) * std::pow(double(params.rope_theta), -double(i) / 32);
-        const double cosine = std::cos(phase), sine = std::sin(phase);
+        const auto [cosine, sine] = rotation[i];
         const double x = out.values[i], y = out.values[i + 32];
         out.values[i]      = x * cosine - y * sine;
         out.values[i + 32] = y * cosine + x * sine;
@@ -59,6 +68,13 @@ struct Error {
         sum += error * error;
         reference += expected * expected;
         max_pair = std::max(max_pair, error_limit_ratio(std::abs(error), scale));
+    }
+
+    void merge(const Error& other) {
+        sum += other.sum;
+        reference += other.reference;
+        max_pair = std::max(max_pair, other.max_pair);
+        finite &= other.finite;
     }
 
     int check(const std::string& label) const {
@@ -90,88 +106,118 @@ int verify(Fixture& f, const std::string& label, bool updates_tail = false) {
         return std::array{f.rope.at(t, 0, b), f.rope.at(t, f.A == 1 ? 0 : 1, b),
                           f.rope.at(t, f.A == 1 ? 0 : 2, b)};
     };
-    const auto ideal_head = [&](const auto& input, int h, int t, int b, const auto& weight) {
+    const auto ideal_head = [&](const auto& input, int h, int t, int b, const auto& weight,
+                                const RopeRotation& rotation) {
         std::vector<double> raw(input.view.ne[0]);
         for (int c = 0; c < input.view.ne[0]; ++c) raw[c] = bf16_to_f32(input.at(c, h, t, b));
-        return oracle(raw, weight, coordinates(t, b), f.parameters.kv);
+        return oracle(raw, weight, rotation, f.parameters.kv);
     };
     const auto head = [&](const auto& input, int h, int t, int b, const auto& weight,
-                          const auto& actual, std::size_t offset, Error& error) {
-        const auto ideal = ideal_head(input, h, t, b, weight);
+                          const auto& actual, std::size_t offset, Error& error,
+                          const RopeRotation& rotation) {
+        const auto ideal = ideal_head(input, h, t, b, weight, rotation);
         for (int c = 0; c < input.view.ne[0]; ++c)
             error.add(actual[offset + c], ideal.values[c], ideal.scales[c]);
     };
+
+    struct TokenErrors {
+        Error q, k, iq;
+        int failures = 0;
+    };
+
+    std::vector<TokenErrors> token_errors(f.B * f.T);
+    // Table rows use disjoint physical page ranges and each token owns its cache/record row.
+    parallel_rows(
+        f.B * f.T, std::uint64_t(f.B) * f.T * f.query_heads * 256, [&](int first, int last) {
+            for (int row = first; row < last; ++row) {
+                const int b = row / f.T, t = row % f.T, n = f.valid.at(b);
+                auto& [q_error, k_error, iq_error, failures] = token_errors[row];
+                if (t >= n) {
+                    if (f.kv_only) continue;
+                    for (int h = 0; h < f.query_heads; ++h)
+                        for (int c = 0; c < 256; ++c)
+                            failures += actual_q[f.q.index(c, h, t, b)] != 0;
+                    for (int h = 0; h < 4; ++h)
+                        for (int c = 0; c < 128; ++c)
+                            failures += actual_iq[f.iq.index(c, h, t, b)] != 0;
+                    continue;
+                }
+                const auto rho      = coordinates(t, b);
+                const auto rotation = rope_rotation(rho, f.parameters.kv.rope_theta);
+                if (!f.kv_only) {
+                    for (int h = 0; h < f.query_heads; ++h)
+                        head(f.q, h, t, b, f.wq, actual_q, f.q.index(0, h, t, b), q_error,
+                             rotation);
+                    for (int h = 0; h < 4; ++h)
+                        head(f.iq, h, t, b, f.wiq, actual_iq, f.iq.index(0, h, t, b), iq_error,
+                             rotation);
+                }
+                const int p = f.positions.at(t, b), page = f.tables.at(p / 64, f.table_rows.at(b));
+                for (int h = 0; h < f.kv_heads; ++h) {
+                    const auto ideal = ideal_head(f.k, h, t, b, f.wk, rotation);
+                    if (f.storage == KvCacheStorage::BFloat16) {
+                        for (int c = 0; c < 256; ++c) {
+                            const auto index = f.keys.index(c, p % 64, h, page);
+                            const auto word  = read_u16(actual_k, index);
+                            k_error.add(word, ideal.values[c], ideal.scales[c]);
+                            // Live approximate values were checked above; every other byte is
+                            // exact.
+                            write_u16(expected_k, index, word);
+                            write_u16(expected_v, f.values.index(c, p % 64, h, page),
+                                      fp16_encode(bf16_to_f32(f.v.at(c, h, t, b))));
+                        }
+                    } else {
+                        const auto row = [&](const auto& data, const CachePlane& plane) {
+                            const auto first = data.begin() + plane.index(0, p % 64, h, page);
+                            return std::vector<std::uint8_t>(
+                                first, first + plane.view.ne[0] * dtype_size(plane.view.dtype));
+                        };
+                        const auto put = [&](auto& data, const CachePlane& plane,
+                                             const auto& words) {
+                            std::copy(words.begin(), words.end(),
+                                      data.begin() + plane.index(0, p % 64, h, page));
+                        };
+                        std::array<double, 256> key;
+                        std::copy(ideal.values.begin(), ideal.values.end(), key.begin());
+                        EncodedRow got{row(actual_k, f.keys), row(actual_ks, f.key_scales)};
+                        if (!compatible_key_encoding(key, f.encoding.key, got)) {
+                            std::cerr << label
+                                      << " K encoding incompatible with mathematical key at " << b
+                                      << '/' << t << '/' << h << '\n';
+                            ++failures;
+                        }
+                        if (f.exact_key) {
+                            std::array<float, 256> represented;
+                            std::copy(key.begin(), key.end(), represented.begin());
+                            const auto encoded = encode_row(represented, f.encoding.key);
+                            failures += verify_exact("exact K codes", got.data, encoded.data);
+                            failures += verify_exact("exact K scales", got.scales, encoded.scales);
+                        }
+                        put(expected_k, f.keys, got.data);
+                        put(expected_ks, f.key_scales, got.scales);
+                        std::array<float, 256> raw_value;
+                        for (int c = 0; c < 256; ++c)
+                            raw_value[c] = bf16_to_f32(f.v.at(c, h, t, b));
+                        const auto value = encode_row(raw_value, f.encoding.value);
+                        put(expected_v, f.values, value.data);
+                        put(expected_vs, f.value_scales, value.scales);
+                    }
+                }
+                const int record = f.offsets.at(b) + t;
+                for (int c = 0; c < 128; ++c)
+                    expected_raw[f.records.index(c, record, b)] = f.ik.at(c, t, b);
+                for (int a = 0; a < 3; ++a)
+                    expected_rope[f.record_rope.index(a, record, b)] = rho[a];
+            }
+        });
+    for (const auto& error : token_errors) {
+        q_error.merge(error.q);
+        k_error.merge(error.k);
+        iq_error.merge(error.iq);
+        failures += error.failures;
+    }
     for (int b = 0; b < f.B; ++b) {
         const int n = f.valid.at(b), base = f.bases[b];
-        for (int t = 0; t < f.T; ++t) {
-            if (t >= n) {
-                if (f.kv_only) continue;
-                for (int h = 0; h < f.query_heads; ++h)
-                    for (int c = 0; c < 256; ++c) failures += actual_q[f.q.index(c, h, t, b)] != 0;
-                for (int h = 0; h < 4; ++h)
-                    for (int c = 0; c < 128; ++c)
-                        failures += actual_iq[f.iq.index(c, h, t, b)] != 0;
-                continue;
-            }
-            if (!f.kv_only) {
-                for (int h = 0; h < f.query_heads; ++h)
-                    head(f.q, h, t, b, f.wq, actual_q, f.q.index(0, h, t, b), q_error);
-                for (int h = 0; h < 4; ++h)
-                    head(f.iq, h, t, b, f.wiq, actual_iq, f.iq.index(0, h, t, b), iq_error);
-            }
-            const int p = f.positions.at(t, b), page = f.tables.at(p / 64, f.table_rows.at(b));
-            for (int h = 0; h < f.kv_heads; ++h) {
-                const auto ideal = ideal_head(f.k, h, t, b, f.wk);
-                if (f.storage == KvCacheStorage::BFloat16) {
-                    for (int c = 0; c < 256; ++c) {
-                        const auto index = f.keys.index(c, p % 64, h, page);
-                        const auto word  = read_u16(actual_k, index);
-                        k_error.add(word, ideal.values[c], ideal.scales[c]);
-                        // Live approximate values were checked above; every other byte is exact.
-                        write_u16(expected_k, index, word);
-                        write_u16(expected_v, f.values.index(c, p % 64, h, page),
-                                  fp16_encode(bf16_to_f32(f.v.at(c, h, t, b))));
-                    }
-                } else {
-                    const auto row = [&](const auto& data, const CachePlane& plane) {
-                        const auto first = data.begin() + plane.index(0, p % 64, h, page);
-                        return std::vector<std::uint8_t>(
-                            first, first + plane.view.ne[0] * dtype_size(plane.view.dtype));
-                    };
-                    const auto put = [&](auto& data, const CachePlane& plane, const auto& words) {
-                        std::copy(words.begin(), words.end(),
-                                  data.begin() + plane.index(0, p % 64, h, page));
-                    };
-                    std::array<double, 256> key;
-                    std::copy(ideal.values.begin(), ideal.values.end(), key.begin());
-                    EncodedRow got{row(actual_k, f.keys), row(actual_ks, f.key_scales)};
-                    if (!compatible_key_encoding(key, f.encoding.key, got)) {
-                        std::cerr << label << " K encoding incompatible with mathematical key at "
-                                  << b << '/' << t << '/' << h << '\n';
-                        ++failures;
-                    }
-                    if (f.exact_key) {
-                        std::array<float, 256> represented;
-                        std::copy(key.begin(), key.end(), represented.begin());
-                        const auto encoded = encode_row(represented, f.encoding.key);
-                        failures += verify_exact("exact K codes", got.data, encoded.data);
-                        failures += verify_exact("exact K scales", got.scales, encoded.scales);
-                    }
-                    put(expected_k, f.keys, got.data);
-                    put(expected_ks, f.key_scales, got.scales);
-                    std::array<float, 256> raw_value;
-                    for (int c = 0; c < 256; ++c) raw_value[c] = bf16_to_f32(f.v.at(c, h, t, b));
-                    const auto value = encode_row(raw_value, f.encoding.value);
-                    put(expected_v, f.values, value.data);
-                    put(expected_vs, f.value_scales, value.scales);
-                }
-            }
-            const int record = f.offsets.at(b) + t;
-            for (int c = 0; c < 128; ++c)
-                expected_raw[f.records.index(c, record, b)] = f.ik.at(c, t, b);
-            const auto rho = coordinates(t, b);
-            for (int a = 0; a < 3; ++a) expected_rope[f.record_rope.index(a, record, b)] = rho[a];
-        }
         if (n == 0) continue;
         // Independent chronological grouping, starting with the canonical pending prefix.
         std::vector<std::vector<double>> pending;
@@ -196,7 +242,8 @@ int verify(Fixture& f, const std::string& label, bool updates_tail = false) {
                 for (const auto& token : pending) sum += token[c];
                 pooled[c] = bf16_to_f32(f32_to_bf16(float(sum / 4)));
             }
-            const auto ideal = oracle(pooled, f.wik, first, f.parameters.kv);
+            const auto ideal = oracle(
+                pooled, f.wik, rope_rotation(first, f.parameters.kv.rope_theta), f.parameters.kv);
             const int g = (base + t) / 4, page = f.tables.at(g / 16, f.table_rows.at(b));
             for (int c = 0; c < 128; ++c) {
                 const auto idx = f.compressed.index(c, g % 16, 0, page);

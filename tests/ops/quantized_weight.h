@@ -1,5 +1,7 @@
 #pragma once
 
+#include "suite.h"
+
 // Test-owned packed-weight fixtures for every registered quantized Weight format. Physical
 // row-split and block-scale codecs remain format-specific beneath one logical fixture interface.
 
@@ -140,12 +142,14 @@ inline double decode_e4m3fn(std::uint8_t word) {
     const std::uint32_t m = word & 0x07U;
     double magnitude      = 0.0;
     if (e == 0) {
-        magnitude = m == 0 ? 0.0 : static_cast<double>(m) * std::ldexp(1.0, -9);
+        magnitude = m == 0 ? 0.0 : static_cast<double>(m) * 0x1p-9;
     } else {
         if (e == 0x0fU && m == 0x07U) {
             throw std::invalid_argument("quantized-weight fixture: E4M3FN NaN scale");
         }
-        magnitude = (1.0 + static_cast<double>(m) / 8.0) * std::ldexp(1.0, static_cast<int>(e) - 7);
+        constexpr double powers[]{0, 0x1p-6, 0x1p-5, 0x1p-4, 0x1p-3, 0x1p-2, 0x1p-1, 1,
+                                  2, 4,      8,      16,     32,     64,     128,    256};
+        magnitude = (1.0 + static_cast<double>(m) / 8.0) * powers[e];
     }
     return negative ? -magnitude : magnitude;
 }
@@ -1176,14 +1180,16 @@ inline std::vector<float> materialize_rows_fp32(const PackedWeight& packed,
         throw std::invalid_argument("quantized-weight fixture: row selection is empty");
     }
     std::vector<float> result(static_cast<std::size_t>(packed.weight.k) * rows.size());
-    for (std::size_t selected = 0; selected < rows.size(); ++selected) {
-        const std::int32_t row = rows[selected];
-        for (std::int32_t column = 0; column < packed.weight.k; ++column) {
-            result[selected * static_cast<std::size_t>(packed.weight.k) +
-                   static_cast<std::size_t>(column)] =
-                static_cast<float>(logical_weight_fp64(packed, row, column));
+    parallel_rows(rows.size(), result.size(), [&](int first, int last) {
+        for (int selected = first; selected < last; ++selected) {
+            const std::int32_t row = rows[selected];
+            for (std::int32_t column = 0; column < packed.weight.k; ++column) {
+                result[selected * static_cast<std::size_t>(packed.weight.k) +
+                       static_cast<std::size_t>(column)] =
+                    static_cast<float>(logical_weight_fp64(packed, row, column));
+            }
         }
-    }
+    });
     return result;
 }
 

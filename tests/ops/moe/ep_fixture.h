@@ -1,6 +1,7 @@
 #pragma once
 #include "ninfer/ops/moe.h"
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <span>
 #include <vector>
@@ -13,7 +14,9 @@ enum class Placement { Contiguous, Interleaved };
 // The producer and independent host oracle compile as C++, outside the CUDA benchmark TU.
 class Weights {
 public:
-    Weights(Device device, Placement placement, int side, bool fp8 = false);
+    using RunRows = void (*)(int, std::uint64_t, const std::function<void(int, int)>&);
+    Weights(Device device, Placement placement, int side, bool fp8 = false,
+            RunRows run_rows = nullptr);
     ~Weights();
     Weights(const Weights&)            = delete;
     Weights& operator=(const Weights&) = delete;

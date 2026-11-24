@@ -5,6 +5,7 @@
 #include "core/platform.h"
 #include "core/decode_graph.h"
 #include <array>
+#include <cstring>
 
 namespace ninfer::test::clamped_ep {
 namespace {
@@ -26,10 +27,13 @@ int run(Weights& w, CudaExecutionView execution, const Case& c,
     const auto subset = c.all ? ops::ExpertSubset{ops::ExpertSubsetKind::All, {}} : w.subset();
     auto routes       = make_routes(w, m, c.distribution.c_str(), c.hits);
     std::vector<float> input(std::size_t(m) * H);
-    for (int t = 0; t < m; ++t)
-        std::copy(patterns[t % 3].begin(), patterns[t % 3].end(),
-                  input.begin() + std::size_t(t) * H);
-    auto dx = to_device_bf16(input), di = to_device(routes.ids),
+    parallel_rows(m, input.size(), [&](int first, int last) {
+        for (int t = first; t < last; ++t)
+            std::copy(patterns[t % 3].begin(), patterns[t % 3].end(),
+                      input.begin() + std::size_t(t) * H);
+    });
+    const auto input_words = bf16_words(input);
+    auto dx = to_device(input_words), di = to_device(routes.ids),
          da = to_device(routes.coefficients);
     Tensor x(dx.span(), DType::BF16, {H, m});
     ops::ExpertRoutes selected{Tensor(di.span(), DType::I32, {K, m}),
@@ -122,32 +126,64 @@ int run(Weights& w, CudaExecutionView execution, const Case& c,
         const auto actual_bits =
             from_device<std::uint8_t>(result.data(), input.size() * cell_bytes);
         std::vector<double> reference(input.size());
-        for (int t = 0; t < m; ++t) {
-            int hits = 0;
+        std::array<std::array<bool, 3>, E> needed{};
+        std::array<std::array<const std::vector<double>*, 3>, E> contributions{};
+        for (int t = 0; t < m; ++t)
             for (int j = 0; j < K; ++j) {
                 const auto a = std::size_t(t) * K + j;
                 const int e  = routes.ids[a];
-                if (!c.all && !w.active(e)) continue;
-                ++hits;
-                const auto& v = w.oracle(t % 3, e, patterns[t % 3]);
-                for (int h = 0; h < H; ++h)
-                    reference[std::size_t(t) * H + h] += double(routes.coefficients[a]) * v[h];
+                if (c.all || w.active(e)) needed[e][t % 3] = true;
             }
-            if (!hits) {
-                const auto begin = actual_bits.begin() + std::size_t(t) * H * cell_bytes;
-                if (std::any_of(begin, begin + H * cell_bytes, [](auto v) { return v != 0; }))
-                    ++failures;
+        std::vector<int> experts;
+        for (int e = 0; e < E; ++e)
+            if (std::any_of(needed[e].begin(), needed[e].end(), [](bool value) { return value; }))
+                experts.push_back(e);
+        // Each worker owns one expert's cache and its uniquely mapped physical slot.
+        parallel_rows(experts.size(), std::uint64_t(experts.size()) * H * I,
+                      [&](int first, int last) {
+                          for (int i = first; i < last; ++i) {
+                              const int e = experts[i];
+                              for (int p = 0; p < 3; ++p)
+                                  if (needed[e][p])
+                                      contributions[e][p] = &w.oracle(p, e, patterns[p]);
+                          }
+                      });
+        std::vector<unsigned char> bad_zero(m);
+        parallel_rows(m, input.size() * K, [&](int first, int last) {
+            for (int t = first; t < last; ++t) {
+                int hits = 0;
+                for (int j = 0; j < K; ++j) {
+                    const auto a = std::size_t(t) * K + j;
+                    const int e  = routes.ids[a];
+                    if (!c.all && !w.active(e)) continue;
+                    ++hits;
+                    const auto& v = *contributions[e][t % 3];
+                    for (int h = 0; h < H; ++h)
+                        reference[std::size_t(t) * H + h] += double(routes.coefficients[a]) * v[h];
+                }
+                if (!hits) {
+                    const auto begin = actual_bits.begin() + std::size_t(t) * H * cell_bytes;
+                    bad_zero[t] =
+                        std::any_of(begin, begin + H * cell_bytes, [](auto v) { return v != 0; });
+                }
             }
-        }
+        });
+        failures += std::count(bad_zero.begin(), bad_zero.end(), 1);
         const std::string label = "EP144 m=" + std::to_string(m) + " " + c.distribution +
                                   " hits=" + std::to_string(c.hits) +
                                   " replay=" + std::to_string(replay);
-        std::vector<double> got;
-        if (c.fp32) {
-            const auto values = from_device<float>(result.data(), input.size());
-            got.assign(values.begin(), values.end());
-        } else
-            got = from_device_bf16(result.data(), input.size());
+        std::vector<double> got(input.size());
+        parallel_elements(got.size(), [&](std::size_t i) {
+            if (c.fp32) {
+                float value;
+                std::memcpy(&value, actual_bits.data() + i * cell_bytes, sizeof(value));
+                got[i] = value;
+            } else {
+                std::uint16_t value;
+                std::memcpy(&value, actual_bits.data() + i * cell_bytes, sizeof(value));
+                got[i] = bf16_to_f32(value);
+            }
+        });
         failures += verify_reduction(label, got, reference, fp8 ? kA8 : kA4);
         failures +=
             scratch.verify_guards(label) + result.verify_guards(label) + w.verify_controls();
@@ -157,7 +193,7 @@ int run(Weights& w, CudaExecutionView execution, const Case& c,
         }
         if (from_device<int>(di, routes.ids.size()) != routes.ids ||
             from_device<float>(da, routes.coefficients.size()) != routes.coefficients ||
-            from_device_bf16(dx, input.size()) != std::vector<double>(input.begin(), input.end()))
+            from_device<std::uint16_t>(dx, input_words.size()) != input_words)
             ++failures;
     }
     std::array<std::byte, 256> prefix;

@@ -4,6 +4,7 @@
 #include "ops/suite.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -26,62 +27,83 @@ void naive_dense_softmax_attention(ops::AttentionHeadGeometry geometry, int quer
     if (!ops::valid_attention_head_geometry(geometry) || query_tokens < 0 || key_tokens < 0) {
         throw std::invalid_argument("invalid naive Softmax Attention geometry");
     }
-    const int group         = geometry.query_heads / geometry.kv_heads;
-    const std::int64_t rows = static_cast<std::int64_t>(query_tokens) * geometry.query_heads;
-    if (rows == 0) return;
-    const auto run_rows = [&](std::int64_t first, std::int64_t last) {
-        std::vector<double> scores(static_cast<std::size_t>(key_tokens));
-        std::vector<double> numerators(static_cast<std::size_t>(geometry.head_dim));
-        for (auto row = first; row < last; ++row) {
-            const int query      = row / geometry.query_heads;
-            const int query_head = row % geometry.query_heads;
-            const int kv_head    = query_head / group;
-            double maximum       = -std::numeric_limits<double>::infinity();
-            for (int key = 0; key < key_tokens; ++key) {
-                if (!visible(query, key)) {
-                    scores[static_cast<std::size_t>(key)] =
-                        -std::numeric_limits<double>::infinity();
-                    continue;
-                }
-                double dot = 0.0;
-                for (int d = 0; d < geometry.head_dim; ++d) {
-                    dot += query_value(d, query_head, query) * key_value(d, kv_head, key);
-                }
-                const double score                    = dot * scale;
-                scores[static_cast<std::size_t>(key)] = score;
-                maximum                               = std::max(maximum, score);
-            }
+    const int group = geometry.query_heads / geometry.kv_heads;
+    if (query_tokens == 0) return;
 
-            double denominator = 0.0;
-            if (maximum != -std::numeric_limits<double>::infinity()) {
+    // Batch heads that share the same represented K/V row. Each score still adds
+    // features in ascending order, and each numerator/denominator adds keys in ascending order.
+    const auto evaluate = [&]<int Heads>() {
+        using HeadValues          = std::array<double, Heads>;
+        const int tiles_per_kv    = group / Heads;
+        const int tiles_per_query = geometry.kv_heads * tiles_per_kv;
+        const int rows            = query_tokens * tiles_per_query;
+        const auto run_rows       = [&](int first, int last) {
+            std::vector<HeadValues> scores(key_tokens);
+            std::vector<HeadValues> query_values(geometry.head_dim), numerators(geometry.head_dim);
+            for (int row = first; row < last; ++row) {
+                const int query      = row / tiles_per_query;
+                const int kv_head    = (row % tiles_per_query) / tiles_per_kv;
+                const int query_head = (row % tiles_per_query) * Heads;
+                for (int d = 0; d < geometry.head_dim; ++d)
+                    for (int h = 0; h < Heads; ++h)
+                        query_values[d][h] = query_value(d, query_head + h, query);
+
+                constexpr double masked = -std::numeric_limits<double>::infinity();
+                HeadValues maximum;
+                maximum.fill(masked);
                 for (int key = 0; key < key_tokens; ++key) {
-                    double& score = scores[static_cast<std::size_t>(key)];
-                    if (score == -std::numeric_limits<double>::infinity()) continue;
-                    score = std::exp(score - maximum);
-                    denominator += score;
+                    if (!visible(query, key)) {
+                        scores[key].fill(masked);
+                        continue;
+                    }
+                    HeadValues dot{};
+                    for (int d = 0; d < geometry.head_dim; ++d) {
+                        const double value = key_value(d, kv_head, key);
+                        for (int h = 0; h < Heads; ++h) dot[h] += query_values[d][h] * value;
+                    }
+                    for (int h = 0; h < Heads; ++h) {
+                        const double score = dot[h] * scale;
+                        scores[key][h]     = score;
+                        maximum[h]         = std::max(maximum[h], score);
+                    }
                 }
-            }
-            // Visit each contiguous value row once. Each output still sums keys in ascending
-            // order in FP64; only the interleaving of independent feature sums changes.
-            std::fill(numerators.begin(), numerators.end(), 0.0);
-            for (int key = 0; key < key_tokens; ++key) {
-                const double weight = scores[static_cast<std::size_t>(key)];
-                if (weight == -std::numeric_limits<double>::infinity()) continue;
-                for (int d = 0; d < geometry.head_dim; ++d) {
-                    numerators[static_cast<std::size_t>(d)] +=
-                        weight * value_value(d, kv_head, key);
+
+                HeadValues denominator{};
+                for (auto& row_scores : scores)
+                    for (int h = 0; h < Heads; ++h) {
+                        double& score = row_scores[h];
+                        if (maximum[h] == masked || score == masked) continue;
+                        score = std::exp(score - maximum[h]);
+                        denominator[h] += score;
+                    }
+                std::fill(numerators.begin(), numerators.end(), HeadValues{});
+                for (int key = 0; key < key_tokens; ++key) {
+                    const auto& weights = scores[key];
+                    if (std::all_of(weights.begin(), weights.end(),
+                                          [&](double weight) { return weight == masked; }))
+                        continue;
+                    for (int d = 0; d < geometry.head_dim; ++d) {
+                        const double value = value_value(d, kv_head, key);
+                        for (int h = 0; h < Heads; ++h)
+                            if (weights[h] != masked) numerators[d][h] += weights[h] * value;
+                    }
                 }
+                for (int d = 0; d < geometry.head_dim; ++d)
+                    for (int h = 0; h < Heads; ++h)
+                        store(d, query_head + h, query,
+                              denominator[h] > 0.0 ? numerators[d][h] / denominator[h] : 0.0);
             }
-            for (int d = 0; d < geometry.head_dim; ++d) {
-                store(d, query_head, query,
-                      denominator > 0.0 ? numerators[static_cast<std::size_t>(d)] / denominator
-                                        : 0.0);
-            }
-        }
+        };
+        if (parallel)
+            parallel_rows(rows, std::uint64_t(rows) * Heads * key_tokens * geometry.head_dim,
+                          run_rows);
+        else
+            run_rows(0, rows);
     };
-    if (!parallel) return run_rows(0, rows);
-    parallel_rows(static_cast<int>(rows), std::uint64_t(rows) * key_tokens * geometry.head_dim,
-                  run_rows);
+    if (group % 4 == 0 && key_tokens >= 64)
+        evaluate.template operator()<4>();
+    else
+        evaluate.template operator()<1>();
 }
 
 } // namespace ninfer::test

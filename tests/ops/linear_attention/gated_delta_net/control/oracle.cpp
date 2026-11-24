@@ -21,32 +21,35 @@ Reference projection_reference(const Fixture& f) {
     result.g.resize(std::size_t(h) * m);
     result.beta.resize(result.g.size());
     if (f.normalize_input) result.normalized.resize(std::size_t(k) * m);
-    std::vector<double> column(k);
-    for (int token = 0; token < m; ++token) {
-        double ss = 0;
-        for (int row = 0; row < k; ++row) {
-            const double x = f.x[std::size_t(token) * k + row];
-            ss += x * x;
-            column[row] = x;
-        }
-        if (f.normalize_input) {
-            const double inv = 1.0 / std::sqrt(ss / k + double(kEps));
+    parallel_rows(m, std::uint64_t(m) * k * h, [&](int first, int last) {
+        std::vector<double> column(k);
+        for (int token = first; token < last; ++token) {
+            double ss = 0;
             for (int row = 0; row < k; ++row) {
-                column[row] *= inv * (1.0 + double(f.norm_gain[row]));
-                result.normalized[std::size_t(token) * k + row] = column[row];
+                const double x = f.x[std::size_t(token) * k + row];
+                ss += x * x;
+                column[row] = x;
+            }
+            if (f.normalize_input) {
+                const double inv = 1.0 / std::sqrt(ss / k + double(kEps));
+                for (int row = 0; row < k; ++row) {
+                    column[row] *= inv * (1.0 + double(f.norm_gain[row]));
+                    result.normalized[std::size_t(token) * k + row] = column[row];
+                }
+            }
+            for (int head = 0; head < h; ++head) {
+                double a = 0, b = 0;
+                for (int row = 0; row < k; ++row) {
+                    a += double(f.weights.a[std::size_t(head) * k + row]) * column[row];
+                    b += double(f.weights.b[std::size_t(head) * k + row]) * column[row];
+                }
+                const auto i = std::size_t(token) * h + head;
+                result.g[i] =
+                    -std::exp(double(f.a_log[head])) * softplus(a + double(f.dt_bias[head]));
+                result.beta[i] = sigmoid(b);
             }
         }
-        for (int head = 0; head < h; ++head) {
-            double a = 0, b = 0;
-            for (int row = 0; row < k; ++row) {
-                a += double(f.weights.a[std::size_t(head) * k + row]) * column[row];
-                b += double(f.weights.b[std::size_t(head) * k + row]) * column[row];
-            }
-            const auto i = std::size_t(token) * h + head;
-            result.g[i]  = -std::exp(double(f.a_log[head])) * softplus(a + double(f.dt_bias[head]));
-            result.beta[i] = sigmoid(b);
-        }
-    }
+    });
     return result;
 }
 

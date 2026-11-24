@@ -62,12 +62,12 @@ struct Matrix {
                 scale_bytes  = std::size_t(n / 128) * (k / 128) * 2;
                 scale_offset = code_bytes;
                 bytes.resize(code_bytes + scale_bytes);
-                for (std::size_t b = 0; b < code_bytes; ++b) {
+                parallel_elements(code_bytes, [&](std::size_t b) {
                     unsigned code =
                         quantized_weight::detail::mix64(b + seed + slot * 998123ULL) & 255;
                     if ((code & 127) == 127) { --code; }
                     bytes[b] = code;
-                }
+                });
                 for (int nr = 0; nr < n / 128; ++nr) {
                     for (int kc = 0; kc < k / 128; ++kc) {
                         const int index = nr * (k / 128) + kc;
@@ -79,31 +79,35 @@ struct Matrix {
                                                                f32_to_bf16(scale));
                     }
                 }
-                for (int r = 0; r < n; ++r) {
-                    for (int c = 0; c < k; ++c) {
-                        const auto index = std::size_t(r) * k + c;
-                        const auto scale = quantized_weight::detail::load_u16_le(
-                            bytes, scale_offset + ((r / 128) * (k / 128) + c / 128) * 2);
-                        values[index] = quantized_weight::detail::decode_e4m3fn(bytes[index]) *
-                                        quantized_weight::detail::bf16_to_f32(scale);
+                parallel_rows(n, values.size(), [&](int first, int last) {
+                    for (int r = first; r < last; ++r) {
+                        for (int c = 0; c < k; ++c) {
+                            const auto index = std::size_t(r) * k + c;
+                            const auto scale = quantized_weight::detail::load_u16_le(
+                                bytes, scale_offset + ((r / 128) * (k / 128) + c / 128) * 2);
+                            values[index] = quantized_weight::detail::decode_e4m3fn(bytes[index]) *
+                                            quantized_weight::detail::bf16_to_f32(scale);
+                        }
                     }
-                }
+                });
             } else {
                 auto p = quantized_weight::make_patterned_weight(
                     QType::NVFP4, n, k, seed + slot, {.weight_scale = 1, .input_scale = 1});
-                for (std::size_t b = 0; b < p.code_plane_bytes; ++b) {
+                parallel_elements(p.code_plane_bytes, [&](std::size_t b) {
                     p.payload[b] =
                         quantized_weight::detail::mix64(b + seed + slot * 998123ULL) & 255;
-                }
+                });
                 code_bytes   = p.code_plane_bytes;
                 scale_bytes  = p.scale_plane_bytes;
                 scale_offset = p.scale_plane_offset;
-                for (int r = 0; r < n; ++r) {
-                    for (int c = 0; c < k; ++c) {
-                        values[std::size_t(r) * k + c] =
-                            quantized_weight::logical_weight_fp64(p, r, c);
+                parallel_rows(n, values.size(), [&](int first, int last) {
+                    for (int r = first; r < last; ++r) {
+                        for (int c = 0; c < k; ++c) {
+                            values[std::size_t(r) * k + c] =
+                                quantized_weight::logical_weight_fp64(p, r, c);
+                        }
                     }
-                }
+                });
                 bytes = std::move(p.payload);
             }
             payload.push_back(std::move(bytes));
@@ -157,19 +161,23 @@ std::vector<double> ffn(std::span<const float> x, const std::vector<float>& gu,
                         const std::vector<float>& down, float gu_divisor, float down_divisor,
                         int intermediate = I) {
     std::vector<double> h(intermediate), out(H);
-    for (int row = 0; row < intermediate; ++row) {
-        double gate = 0, up = 0;
-        for (int k = 0; k < H; ++k) {
-            gate += double(x[k]) * gu[std::size_t(row) * H + k] / gu_divisor;
-            up += double(x[k]) * gu[std::size_t(row + intermediate) * H + k] / gu_divisor;
+    parallel_rows(intermediate, std::uint64_t(intermediate) * H, [&](int first, int last) {
+        for (int row = first; row < last; ++row) {
+            double gate = 0, up = 0;
+            for (int k = 0; k < H; ++k) {
+                gate += double(x[k]) * gu[std::size_t(row) * H + k] / gu_divisor;
+                up += double(x[k]) * gu[std::size_t(row + intermediate) * H + k] / gu_divisor;
+            }
+            h[row] = gate / (1 + std::exp(-gate)) * up;
         }
-        h[row] = gate / (1 + std::exp(-gate)) * up;
-    }
-    for (int row = 0; row < H; ++row) {
-        for (int k = 0; k < intermediate; ++k) {
-            out[row] += h[k] * down[std::size_t(row) * intermediate + k] / down_divisor;
+    });
+    parallel_rows(H, std::uint64_t(intermediate) * H, [&](int first, int last) {
+        for (int row = first; row < last; ++row) {
+            for (int k = 0; k < intermediate; ++k) {
+                out[row] += h[k] * down[std::size_t(row) * intermediate + k] / down_divisor;
+            }
         }
-    }
+    });
     return out;
 }
 
@@ -327,28 +335,38 @@ int run(Fixture& f, CudaExecutionView execution, int tokens, ops::ExpertSubsetKi
         }
         f.publish(mask, kind, flip);
         std::vector<double> ref(x.size());
+        std::array<std::vector<int>, 3> orders;
+        if (complete) {
+            for (int p = 0; p < 3; ++p) {
+                auto& order = orders[p];
+                order.resize(E);
+                std::iota(order.begin(), order.end(), 0);
+                std::stable_sort(order.begin(), order.end(),
+                                 [&](int a, int b) { return f.logits[p][a] > f.logits[p][b]; });
+            }
+        }
+
+        struct TokenReference {
+            std::array<double, TopK> coefficients{};
+            std::array<const std::vector<double>*, TopK> experts{};
+            double shared_coefficient = 0;
+        };
+
+        std::vector<TokenReference> tokens_ref(tokens);
         for (int t = 0; t < tokens; ++t) {
             const int p = (t + replay) % 3;
-            std::copy(f.x[p].begin(), f.x[p].end(), x.begin() + std::size_t(t) * H);
             if (padded && t % 2 >= columns[t / 2]) {
                 for (int j = 0; j < TopK; ++j) {
                     ids[t * TopK + j]   = -1;
                     alpha[t * TopK + j] = 0;
                 }
                 beta[t] = 0;
-                if (mode == ops::MoeEpilogue::AddResidual)
-                    for (int h = 0; h < H; ++h)
-                        ref[std::size_t(t) * H + h] = residual[std::size_t(t) * H + h];
                 continue;
             }
-            std::vector<int> order(E);
-            std::iota(order.begin(), order.end(), 0);
+            const auto& order  = orders[p];
             const auto& logits = f.logits[p];
-            if (complete) {
-                std::stable_sort(order.begin(), order.end(),
-                                 [&](int a, int b) { return logits[a] > logits[b]; });
-            }
-            std::array<double, TopK> coefficients;
+            auto& record       = tokens_ref[t];
+            auto& coefficients = record.coefficients;
             double total = 0;
             for (int j = 0; j < TopK; ++j) {
                 int e = complete ? order[j] : (replay == 1 ? j : (t * 13 + j * 31) % E);
@@ -368,28 +386,41 @@ int run(Fixture& f, CudaExecutionView execution, int tokens, ops::ExpertSubsetKi
                 total += coefficients[j];
             }
             beta[t]                         = .25F + p * .125F;
-            const double shared_coefficient = complete ? 1 / (1 + std::exp(-logits[E])) : beta[t];
+            record.shared_coefficient       = complete ? 1 / (1 + std::exp(-logits[E])) : beta[t];
             for (int j = 0; j < TopK; ++j) {
                 if (complete) { coefficients[j] /= total; }
                 const int e        = ids[t * TopK + j];
                 const bool include = kind == ops::ExpertSubsetKind::All ||
                                      (kind == ops::ExpertSubsetKind::MaskOnes && mask[e]) ||
                                      (kind == ops::ExpertSubsetKind::MaskZeros && !mask[e]);
-                if (include) {
-                    const auto& value = f.expert(p, e, flip);
-                    for (int h = 0; h < H; ++h) {
-                        ref[std::size_t(t) * H + h] += coefficients[j] * value[h];
-                    }
-                }
-            }
-            for (int h = 0; h < H; ++h) {
-                const auto i = std::size_t(t) * H + h;
-                if (shared) { ref[i] += shared_coefficient * f.shared_values[p][h]; }
-                if (mode == ops::MoeEpilogue::AddResidual) { ref[i] += residual[i]; }
+                if (include) record.experts[j] = &f.expert(p, e, flip);
             }
         }
-        std::vector<std::uint16_t> bits(x.size());
-        std::transform(x.begin(), x.end(), bits.begin(), f32_to_bf16);
+        parallel_rows(tokens, std::uint64_t(tokens) * H * TopK, [&](int first, int last) {
+            for (int t = first; t < last; ++t) {
+                const int p       = (t + replay) % 3;
+                const auto offset = std::size_t(t) * H;
+                std::copy(f.x[p].begin(), f.x[p].end(), x.begin() + offset);
+                const bool live = !padded || t % 2 < columns[t / 2];
+                if (!live) {
+                    if (mode == ops::MoeEpilogue::AddResidual)
+                        std::copy_n(residual.begin() + offset, H, ref.begin() + offset);
+                    continue;
+                }
+                const auto& record = tokens_ref[t];
+                for (int j = 0; j < TopK; ++j)
+                    if (const auto* value = record.experts[j])
+                        for (int h = 0; h < H; ++h)
+                            ref[offset + h] += record.coefficients[j] * (*value)[h];
+                for (int h = 0; h < H; ++h) {
+                    if (shared)
+                        ref[offset + h] += record.shared_coefficient * f.shared_values[p][h];
+                    if (mode == ops::MoeEpilogue::AddResidual)
+                        ref[offset + h] += residual[offset + h];
+                }
+            }
+        });
+        auto bits = bf16_words(x);
         dx.copy_from_host(bits.data(), dx.size());
         di.copy_from_host(ids.data(), di.size());
         da.copy_from_host(alpha.data(), da.size());

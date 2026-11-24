@@ -21,12 +21,16 @@ function(ninfer_linear_format_tests family)
   foreach(format IN LISTS ARGN)
     set(name "ninfer_linear_${family}_${format}_test")
     add_test(NAME ${name} COMMAND ninfer_linear_${family}_test --format ${format})
-    set_tests_properties(${name} PROPERTIES SKIP_RETURN_CODE 77 LABELS "ops")
+    if(family STREQUAL "projection")
+      ninfer_set_op_test_properties(${name} 2 85)
+    else()
+      ninfer_set_op_test_properties(${name} 1 "")
+    endif()
   endforeach()
 endfunction()
 
 ninfer_linear_suite(projection
-  test.cpp runner.cpp cases_bf16.cpp cases_q4.cpp cases_q5.cpp cases_q6.cpp cases_q8.cpp
+  test.cpp runner.cpp output_scan.cu cases_bf16.cpp cases_q4.cpp cases_q5.cpp cases_q6.cpp cases_q8.cpp
   cases_fp8.cpp cases_nvfp4.cpp cases_bank.cpp cases_native.cpp)
 ninfer_linear_format_tests(projection bf16 q4 q5 q6 q8 fp8 nvfp4)
 if(NINFER_TARGET STREQUAL "dgx_spark")

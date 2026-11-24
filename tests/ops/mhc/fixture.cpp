@@ -72,14 +72,17 @@ void Fixture::set(Pattern pattern, int phase) {
     fill_uniform(gamma, 4117 + phase, -1.25F, 1.25F);
     scale = scale_type == DType::BF16 ? std::vector<float>{0.75F, 1.25F, 0.5F}
                                       : std::vector<float>{0.75137F, 1.25319F, 0.50073F};
-    for (int t = 0; t < m; ++t) {
-        for (int i = 0; i < S; ++i) {
-            q[t * S + i] = 0.2F + 0.4F * ((i + phase) % S);
-            for (int j = 0; j < S; ++j)
-                c[t * S * S + i * S + j] = float(1 + ((7 * i + 3 * j + phase) % 11)) / 16;
-            for (int d = 0; d < D; ++d) x[std::size_t(t) * K + i * D + d] *= std::ldexp(1.F, i - 1);
+    parallel_rows(m, x.size(), [&](int first, int last) {
+        for (int t = first; t < last; ++t) {
+            for (int i = 0; i < S; ++i) {
+                q[t * S + i] = 0.2F + 0.4F * ((i + phase) % S);
+                for (int j = 0; j < S; ++j)
+                    c[t * S * S + i * S + j] = float(1 + ((7 * i + 3 * j + phase) % 11)) / 16;
+                for (int d = 0; d < D; ++d)
+                    x[std::size_t(t) * K + i * D + d] *= std::ldexp(1.F, i - 1);
+            }
         }
-    }
+    });
     if (pattern == Pattern::Zero) {
         std::fill(x.begin(), x.end(), 0.F);
         std::fill(y.begin(), y.end(), 0.F);
@@ -120,16 +123,14 @@ void Fixture::set(Pattern pattern, int phase) {
 
 namespace {
 void upload_bf16(GuardedDeviceBuffer& b, const std::vector<float>& values) {
-    std::vector<std::uint16_t> words(values.size());
-    std::transform(values.begin(), values.end(), words.begin(), f32_to_bf16);
+    const auto words = bf16_words(values);
     b.copy_from_host(words.data(), words.size() * 2);
 }
 
 int unchanged(const std::string& label, const GuardedDeviceBuffer& b, const std::vector<float>& v,
               bool bf16) {
     if (bf16) {
-        std::vector<std::uint16_t> expected(v.size());
-        std::transform(v.begin(), v.end(), expected.begin(), f32_to_bf16);
+        const auto expected = bf16_words(v);
         return verify_exact(label.c_str(), from_device<std::uint16_t>(b.data(), v.size()),
                             expected);
     }

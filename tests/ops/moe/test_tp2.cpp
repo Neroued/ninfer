@@ -45,7 +45,7 @@ std::size_t capacity(const Fixture& fixture, bool complete, int first, int last,
         fixture.routed_profile(), subset, output_type, ops::MoeEpilogue::Write, first, last);
 }
 
-int run_case(Fixture& fixture, Case c, CudaExecutionView cuda) {
+int run_case(Fixture& fixture, Oracle& oracle, Case c, CudaExecutionView cuda) {
     const auto label =
         std::string(c.complete ? "complete" : "routed") + "/T" + std::to_string(c.tokens);
     GuardedDeviceBuffer destination(std::size_t(fixture.shape.hidden) * c.tokens *
@@ -152,7 +152,7 @@ int run_case(Fixture& fixture, Case c, CudaExecutionView cuda) {
         CUDA_CHECK(
             cudaMemcpy(preserved.data(), x.data, preserved.size() * 2, cudaMemcpyDeviceToHost));
         if (preserved != fixture.input_words()) throw std::runtime_error("TP2 input was modified");
-        Oracle oracle(fixture);
+        oracle.reset_input();
         std::vector<double> got, reference;
         std::set<int> tokens{0, c.tokens - 1};
         if (c.distribution == "partial") tokens.insert(1);
@@ -294,8 +294,9 @@ void add_profile(OpSuite& suite, Shape shape, const std::string& name) {
                       Fixture fixture(cuda, shape, 0, tokens);
                       fixture.zero_routed();
                       fixture.preserve_weights();
+                      Oracle oracle(fixture);
                       return run_case(
-                                 fixture,
+                                 fixture, oracle,
                                  {tokens, 0, true, true, true, "reuse", false, DType::BF16, true},
                                  cuda) +
                              fixture.verify_preserved();
@@ -455,7 +456,9 @@ void add_profile(OpSuite& suite, Shape shape, const std::string& name) {
                                 "TP2 short interval workspace underestimates an interior extent");
                 }
             }
-            for (auto index : selected) failures += run_case(fixture, cases[index], cuda);
+            // The fixture's published weights are immutable for the whole case group.
+            Oracle oracle(fixture);
+            for (auto index : selected) failures += run_case(fixture, oracle, cases[index], cuda);
             return failures + fixture.verify_preserved();
         });
     }

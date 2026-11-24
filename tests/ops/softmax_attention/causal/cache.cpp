@@ -158,21 +158,28 @@ std::size_t physical_plane_elements(std::int32_t leading_extent, const Geometry&
 std::vector<float> make_bf16_values(std::size_t count, std::uint32_t seed, float lo, float hi) {
     std::vector<float> values(count);
     fill_uniform(values, seed, lo, hi);
-    round_to_bf16(values);
+    parallel_elements(count,
+                      [&](std::size_t i) { values[i] = bf16_to_f32(f32_to_bf16(values[i])); });
     return values;
 }
 
 std::vector<std::uint16_t> to_bf16_bits(const std::vector<float>& values) {
     std::vector<std::uint16_t> bits(values.size());
-    for (std::size_t i = 0; i < values.size(); ++i) { bits[i] = f32_to_bf16(values[i]); }
+    parallel_rows((values.size() + 255) / 256, values.size(), [&](int first, int last) {
+        const auto end = std::min(values.size(), std::size_t(last) * 256);
+        for (std::size_t i = std::size_t(first) * 256; i < end; ++i)
+            bits[i] = f32_to_bf16(values[i]);
+    });
     return bits;
 }
 
 std::vector<double> bf16_bits_to_double(const std::vector<std::uint16_t>& bits) {
     std::vector<double> values(bits.size());
-    for (std::size_t i = 0; i < bits.size(); ++i) {
-        values[i] = static_cast<double>(bf16_to_f32(bits[i]));
-    }
+    parallel_rows((bits.size() + 255) / 256, bits.size(), [&](int first, int last) {
+        const auto end = std::min(bits.size(), std::size_t(last) * 256);
+        for (std::size_t i = std::size_t(first) * 256; i < end; ++i)
+            values[i] = static_cast<double>(bf16_to_f32(bits[i]));
+    });
     return values;
 }
 
@@ -180,7 +187,11 @@ float round_to_f16(float value) { return f16_bits_to_f32(f32_to_f16_bits(value))
 
 std::vector<std::uint16_t> to_f16_bits(const std::vector<float>& values) {
     std::vector<std::uint16_t> bits(values.size());
-    for (std::size_t i = 0; i < values.size(); ++i) { bits[i] = f32_to_f16_bits(values[i]); }
+    parallel_rows((values.size() + 255) / 256, values.size(), [&](int first, int last) {
+        const auto end = std::min(values.size(), std::size_t(last) * 256);
+        for (std::size_t i = std::size_t(first) * 256; i < end; ++i)
+            bits[i] = f32_to_f16_bits(values[i]);
+    });
     return bits;
 }
 
@@ -207,35 +218,29 @@ void encode_group(std::span<const float> source, std::size_t source_base,
     }
 }
 
-void normalized_hadamard_d256(std::array<float, kHeadDim>& values) {
+namespace {
+template <class T>
+void normalized_hadamard(std::array<T, kHeadDim>& values) {
     for (std::int32_t stride = 1; stride < kHeadDim; stride *= 2) {
         for (std::int32_t base = 0; base < kHeadDim; base += 2 * stride) {
             for (std::int32_t offset = 0; offset < stride; ++offset) {
-                const float low  = values[static_cast<std::size_t>(base + offset)];
-                const float high = values[static_cast<std::size_t>(base + offset + stride)];
+                const T low  = values[static_cast<std::size_t>(base + offset)];
+                const T high = values[static_cast<std::size_t>(base + offset + stride)];
                 values[static_cast<std::size_t>(base + offset)]          = low + high;
                 values[static_cast<std::size_t>(base + offset + stride)] = low - high;
             }
         }
     }
-    for (float& value : values) { value *= 0x1p-4f; }
+    for (T& value : values) { value *= T(0x1p-4); }
 }
 
+} // namespace
+
+void normalized_hadamard_d256(std::array<float, kHeadDim>& values) { normalized_hadamard(values); }
+
 void normalized_hadamard_d256(std::array<double, kHeadDim>& values) {
-    static const auto matrix = [] {
-        std::array<std::array<double, kHeadDim>, kHeadDim> result{};
-        for (unsigned row = 0; row < kHeadDim; ++row)
-            for (unsigned column = 0; column < kHeadDim; ++column)
-                result[row][column] = (std::popcount(row & column) & 1) ? -0.0625 : 0.0625;
-        return result;
-    }();
-    const auto input = values;
-    for (int row = 0; row < kHeadDim; ++row) {
-        double sum = 0.0;
-        for (int column = 0; column < kHeadDim; ++column)
-            sum += matrix[row][column] * input[column];
-        values[row] = sum;
-    }
+    // The Sylvester butterfly evaluates H[row, column] = (-1)^popcount(row & column).
+    normalized_hadamard(values);
 }
 
 void encode_nvfp4_rotated_row(std::span<const float> source, std::size_t source_base,
@@ -331,12 +336,14 @@ HostCache make_cache(const Geometry& geometry, KvCacheStorage storage, std::int3
         storage == KvCacheStorage::Fp8KeyNvfp4Value) {
         // Correlated halves produce unequal G128 scales after H256. Alternate the
         // dominant group across rows so both MMA groups and column scales matter.
-        for (std::size_t row = 0; row < elements / 256; ++row)
-            for (int d = 0; d < 128; ++d) {
-                logical_k[row * 256 + 128 + d] = bf16_to_f32(
-                    f32_to_bf16((row % 2 ? -0.875f : 0.875f) * logical_k[row * 256 + d]));
-                logical_v[row * 256 + 128 + d] *= 0.125f;
-            }
+        parallel_rows(elements / 256, elements, [&](int first, int last) {
+            for (std::size_t row = first; row < std::size_t(last); ++row)
+                for (int d = 0; d < 128; ++d) {
+                    logical_k[row * 256 + 128 + d] = bf16_to_f32(
+                        f32_to_bf16((row % 2 ? -0.875f : 0.875f) * logical_k[row * 256 + d]));
+                    logical_v[row * 256 + 128 + d] *= 0.125f;
+                }
+        });
     }
 
     HostCache cache{geometry, storage, max_context, logical_capacity};
@@ -545,31 +552,44 @@ void append_cache(HostCache& cache, const std::vector<float>& k, const std::vect
     }
 }
 
-double cache_value(const HostCache& cache, bool key, int head, int position, int d) {
-    const std::size_t row   = std::size_t(head) * cache.logical_capacity + position;
-    const std::size_t index = row * kHeadDim + d;
-    if (cache.storage == KvCacheStorage::BFloat16)
-        return key ? double(bf16_to_f32(cache.k_bf16[index]))
-                   : double(f16_bits_to_f32(cache.v_fp16[index]));
-    if (cache.storage == KvCacheStorage::Int8Group64) {
+void decode_cache_row(const HostCache& cache, bool key, int head, int position,
+                      std::span<double, kHeadDim> output) {
+    const auto row  = std::size_t(head) * cache.logical_capacity + position;
+    const auto base = row * kHeadDim;
+    if (cache.storage == KvCacheStorage::BFloat16) {
+        if (key)
+            for (int d = 0; d < kHeadDim; ++d) output[d] = bf16_to_f32(cache.k_bf16[base + d]);
+        else
+            for (int d = 0; d < kHeadDim; ++d) output[d] = f16_bits_to_f32(cache.v_fp16[base + d]);
+    } else if (cache.storage == KvCacheStorage::Int8Group64) {
         const auto& codes  = key ? cache.k_i8 : cache.v_i8;
         const auto& scales = key ? cache.k_scale : cache.v_scale;
-        return double(codes[index]) *
-               double(f16_bits_to_f32(scales[row * kQuantGroups + d / kQuantGroup]));
-    }
-    if (cache.storage == KvCacheStorage::Fp8E4m3fnGroup128Ue8m0 ||
-        (key && cache.storage == KvCacheStorage::Fp8KeyNvfp4Value)) {
+        for (int group = 0; group < kQuantGroups; ++group) {
+            const double scale = f16_bits_to_f32(scales[row * kQuantGroups + group]);
+            for (int d = group * kQuantGroup; d < (group + 1) * kQuantGroup; ++d)
+                output[d] = codes[base + d] * scale;
+        }
+    } else if (cache.storage == KvCacheStorage::Fp8E4m3fnGroup128Ue8m0 ||
+               (key && cache.storage == KvCacheStorage::Fp8KeyNvfp4Value)) {
         const auto& codes  = key ? cache.k_fp8 : cache.v_fp8;
         const auto& scales = key ? cache.k_fp8_scale : cache.v_fp8_scale;
-        return double(decode_e4m3fn(codes[index])) *
-               fp8_cache_multiplier(scales[row * 2 + d / 128]);
+        for (int group = 0; group < 2; ++group) {
+            const double scale = fp8_cache_multiplier(scales[row * 2 + group]);
+            for (int d = group * 128; d < (group + 1) * 128; ++d)
+                output[d] = decode_e4m3fn(codes[base + d]) * scale;
+        }
+    } else {
+        const auto& codes  = key ? cache.k_nvfp4 : cache.v_nvfp4;
+        const auto& scales = key ? cache.k_nvfp4_scale : cache.v_nvfp4_scale;
+        for (int group = 0; group < kNvfp4QuantGroups; ++group) {
+            const double scale = decode_e4m3fn(scales[row * kNvfp4QuantGroups + group]);
+            for (int d = group * kNvfp4QuantGroup; d < (group + 1) * kNvfp4QuantGroup; d += 2) {
+                const auto code = codes[row * kNvfp4CodeBytes + d / 2];
+                output[d]       = decode_e2m1(code & 15) * scale;
+                output[d + 1]   = decode_e2m1(code >> 4) * scale;
+            }
+        }
     }
-    const auto& codes  = key ? cache.k_nvfp4 : cache.v_nvfp4;
-    const auto& scales = key ? cache.k_nvfp4_scale : cache.v_nvfp4_scale;
-    const auto byte    = codes[row * kNvfp4CodeBytes + d / 2];
-    const auto code    = (d & 1) ? byte >> 4 : byte & 15;
-    return double(decode_e2m1(code)) *
-           double(decode_e4m3fn(scales[row * kNvfp4QuantGroups + d / kNvfp4QuantGroup]));
 }
 
 int verify_cache(const std::string& label, const HostCache& got, const HostCache& expected) {

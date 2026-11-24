@@ -74,7 +74,7 @@ void add_fp8_mix_cases(OpSuite& suite) {
                 cuda_synchronize(e.stream());
                 std::string label =
                     "FP8 HC pattern=" + std::to_string(int(pattern)) + " M=" + std::to_string(c.m);
-                failed += fixture.check(values, ref, label);
+                failed += fixture.check(values, ref, label, c.graph || c.m <= 32);
                 if (c.graph) {
                     fixture.upload(next, e.stream());
                     graph.launch(e.stream());

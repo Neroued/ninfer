@@ -1,4 +1,6 @@
 #pragma once
+
+#include "ops/suite.h"
 //
 // op_tester.h — small reusable building blocks for Op tests: checked CUDA
 // calls, device buffers and transfers, deterministic inputs, output guards,
@@ -85,6 +87,28 @@ inline std::uint16_t f32_to_bf16(float f) {
 
 // Round an fp32 buffer to the bf16 grid in place, so a CPU reference computes
 // from EXACTLY the values the kernel will read.
+// Use contiguous chunks for elementwise host work without changing the PRNG draw order.
+template <class F>
+inline void parallel_elements(std::size_t count, F&& run) {
+    constexpr std::size_t chunk = 1024;
+    parallel_rows((count + chunk - 1) / chunk, count, [&](int first, int last) {
+        const auto end = std::min(count, std::size_t(last) * chunk);
+        for (std::size_t i = std::size_t(first) * chunk; i < end; ++i) run(i);
+    });
+}
+
+inline std::vector<std::uint16_t> bf16_words(std::span<const float> values) {
+    std::vector<std::uint16_t> words(values.size());
+    parallel_elements(values.size(), [&](std::size_t i) { words[i] = f32_to_bf16(values[i]); });
+    return words;
+}
+
+inline std::vector<double> decode_bf16_words(std::span<const std::uint16_t> words) {
+    std::vector<double> values(words.size());
+    parallel_elements(words.size(), [&](std::size_t i) { values[i] = bf16_to_f32(words[i]); });
+    return values;
+}
+
 inline void round_to_bf16(std::vector<float>& v) {
     for (auto& x : v) x = bf16_to_f32(f32_to_bf16(x));
 }
@@ -239,6 +263,10 @@ inline int verify_exact(const char* label, const std::vector<T>& got,
         std::cerr << label << ": size mismatch got=" << got.size()
                   << " expected=" << expected.size() << '\n';
         return 1;
+    }
+    if constexpr (std::is_integral_v<T> && !std::is_same_v<T, bool>) {
+        if (got.empty() || std::memcmp(got.data(), expected.data(), got.size() * sizeof(T)) == 0)
+            return 0;
     }
     for (std::size_t i = 0; i < got.size(); ++i) {
         if (!(got[i] == expected[i])) {

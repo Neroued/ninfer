@@ -87,10 +87,12 @@ Fixture::Fixture(Weights& w, int m)
 void Fixture::upload(std::span<const float> catalog, cudaStream_t stream) {
     cuda_synchronize(stream);
     const int count = int(catalog.size() / kTotal);
-    for (int m = 0; m < columns; ++m)
-        for (int d = 0; d < kTotal; ++d)
-            input_words[std::size_t(m) * kTotal + d] =
-                f32_to_bf16(catalog[(m % count) * kTotal + d]);
+    parallel_rows(columns, input_words.size(), [&](int first, int last) {
+        for (int m = first; m < last; ++m)
+            for (int d = 0; d < kTotal; ++d)
+                input_words[std::size_t(m) * kTotal + d] =
+                    f32_to_bf16(catalog[(m % count) * kTotal + d]);
+    });
     input.copy_from_host(input_words.data(), input.bytes());
     cuda_check(cudaStreamSynchronize(nullptr), "Mix upload completion");
     cuda_check(cudaMemsetAsync(output.data(), 0xff, output.bytes(), stream), "poison Mix output");
@@ -106,12 +108,13 @@ void Fixture::invoke(CudaExecutionView e) {
         ops::hc_mix(z, ops::HcBf16FinalMixWeights{weights.down, weights.up}, workspace, x, e);
 }
 
-int Fixture::check(const std::string& label) const {
+int Fixture::check(const std::string& label, bool preserve_input) const {
     int failed = input.verify_guards(label) + output.verify_guards(label) +
                  injection.verify_guards(label) + scratch.verify_guards(label);
-    failed +=
-        verify_exact((label + " input preserved").c_str(),
-                     from_device<std::uint16_t>(input.data(), input_words.size()), input_words);
+    if (preserve_input)
+        failed +=
+            verify_exact((label + " input preserved").c_str(),
+                         from_device<std::uint16_t>(input.data(), input_words.size()), input_words);
     if (workspace.used() != 0 || workspace.peak_used() != capacity) {
         std::cerr << label << ": workspace scope/capacity mismatch\n";
         ++failed;

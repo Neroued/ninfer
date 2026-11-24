@@ -1,5 +1,6 @@
 #include "ops/moe/clamped_ep_fixture.h"
 #include "ops/quantized_weight.h"
+#include "expert_oracle.h"
 #include "core/buffer.h"
 #include "ops/suite.h"
 #include <algorithm>
@@ -63,32 +64,38 @@ struct Matrix {
         encoded      = base.code_plane_bytes + base.scale_plane_bytes;
         storage      = DeviceBuffer(dev, Local * stride + 2 * Guard);
         storage.fill(0xa5);
-        for (int ordinal = 0; ordinal < Local; ++ordinal) {
-            const int e = ids[ordinal], slot = (73 * ordinal + 19) % Local;
-            packed[slot] = base;
-            auto& p      = packed[slot];
-            for (std::size_t b = 0; b < p.code_plane_bytes; ++b) {
-                unsigned code = q::detail::mix64(b + seed + std::uint64_t(e) * 998123ULL) & 255;
-                if (fp8 && (code & 127) == 127) --code;
-                p.payload[b] = code;
+        reference_rows(Local, std::uint64_t(Local) * stride, [&](int first, int last) {
+            for (int ordinal = first; ordinal < last; ++ordinal) {
+                const int e = ids[ordinal], slot = (73 * ordinal + 19) % Local;
+                packed[slot] = base;
+                auto& p      = packed[slot];
+                for (std::size_t b = 0; b < p.code_plane_bytes; ++b) {
+                    unsigned code = q::detail::mix64(b + seed + std::uint64_t(e) * 998123ULL) & 255;
+                    if (fp8 && (code & 127) == 127) --code;
+                    p.payload[b] = code;
+                }
+                // Fingerprints are finite, represented values and unique for every global ID.
+                const std::size_t fingerprint = fp8 && n == 2 * I ? std::size_t(128) * k : 0;
+                p.payload[fingerprint]        = fp8 ? std::uint8_t(e & 63) : std::uint8_t(e);
+                p.payload[fingerprint + 1] =
+                    fp8 ? std::uint8_t(0x18 + (e >> 6)) : (e < 256 ? 0x5a : 0xa5);
+                if (fp8)
+                    for (int nr = 0; nr < n / 128; ++nr)
+                        for (int kc = 0; kc < k / 128; ++kc) {
+                            const float scale =
+                                n == 2 * I && nr == 0
+                                    ? 0
+                                    : (1 + (nr * 3 + kc * 7 + seed + e) % 13) * .0000083F;
+                            const auto bits = q::detail::float_bits(scale);
+                            const auto bf16 =
+                                std::uint16_t((bits + 0x7fff + ((bits >> 16) & 1)) >> 16);
+                            q::detail::store_u16_le(
+                                p.payload, scale_offset + ((nr * (k / 128) + kc) * 2), bf16);
+                        }
             }
-            // Fingerprints are finite, represented values and unique for every global ID.
-            const std::size_t fingerprint = fp8 && n == 2 * I ? std::size_t(128) * k : 0;
-            p.payload[fingerprint]        = fp8 ? std::uint8_t(e & 63) : std::uint8_t(e);
-            p.payload[fingerprint + 1] =
-                fp8 ? std::uint8_t(0x18 + (e >> 6)) : (e < 256 ? 0x5a : 0xa5);
-            if (fp8)
-                for (int nr = 0; nr < n / 128; ++nr)
-                    for (int kc = 0; kc < k / 128; ++kc) {
-                        const float scale =
-                            n == 2 * I && nr == 0
-                                ? 0
-                                : (1 + (nr * 3 + kc * 7 + seed + e) % 13) * .0000083F;
-                        const auto bits = q::detail::float_bits(scale);
-                        const auto bf16 = std::uint16_t((bits + 0x7fff + ((bits >> 16) & 1)) >> 16);
-                        q::detail::store_u16_le(p.payload,
-                                                scale_offset + ((nr * (k / 128) + kc) * 2), bf16);
-                    }
+        });
+        for (int slot = 0; slot < Local; ++slot) {
+            const auto& p = packed[slot];
             CUDA_CHECK(cudaMemcpy(static_cast<std::byte*>(storage.data()) + Guard + slot * stride,
                                   p.payload.data(), p.payload.size(), cudaMemcpyHostToDevice));
         }
@@ -119,11 +126,11 @@ struct Matrix {
                             const auto& p   = packed[slot];
                             const auto bits = q::detail::load_u16_le(
                                 p.payload, scale_offset + ((r / 128) * (k / 128) + c / 128) * 2);
-                            values[std::size_t(r) * k + c] =
+                            values[moe_oracle::weight_index(r, c, k)] =
                                 q::detail::decode_e4m3fn(p.payload[std::size_t(r) * k + c]) *
                                 q::detail::bf16_to_f32(bits);
                         } else
-                            values[std::size_t(r) * k + c] =
+                            values[moe_oracle::weight_index(r, c, k)] =
                                 q::logical_weight_fp64(packed[slot], r, c);
             });
         }
@@ -177,14 +184,14 @@ struct Weights::Impl {
     Device device;
     Placement place;
     bool fp8;
-    int rank, phase = 0;
+    int rank;
     float limit = 10;
     bool probe  = false;
     std::vector<int> ids;
     DeviceBuffer mask;
     std::array<int, E> mask_host{};
     Matrix gu, down;
-    std::map<std::tuple<int, int, int>, std::vector<double>> cache;
+    std::array<std::map<std::pair<int, int>, std::vector<double>>, Local> cache;
 
     static std::vector<int> assigned(Placement p, int side) {
         if (side < 0 || side > 1) throw std::invalid_argument("EP side");
@@ -237,14 +244,14 @@ ops::ExpertSubset Weights::subset() const {
 void Weights::set_limit(float limit) {
     if (!std::isfinite(limit) || limit <= 0) throw std::invalid_argument("fixture limit");
     impl_->limit = limit;
-    impl_->cache.clear();
+    for (auto& cache : impl_->cache) cache.clear();
 }
 
 void Weights::clamp_probe(int recipe) {
     auto& f = *impl_;
     f.probe = true;
     f.limit = recipe == 3 ? 3 : 10;
-    f.cache.clear();
+    for (auto& cache : f.cache) cache.clear();
     for (Matrix* m : {&f.gu, &f.down}) {
         const bool gate = m == &f.gu;
         for (auto& values : m->decoded) values.clear();
@@ -300,7 +307,6 @@ void Weights::clamp_probe(int recipe) {
 
 void Weights::publish(int phase, bool drop_half) {
     auto& f = *impl_;
-    f.phase = phase;
     f.gu.offsets.fill(UINT64_MAX);
     f.down.offsets.fill(UINT64_MAX);
     for (int e = 0; e < E; ++e)
@@ -349,37 +355,42 @@ std::size_t Weights::backing_bytes() const {
 }
 
 const std::vector<double>& Weights::oracle(int pattern, int e, std::span<const float> x) {
-    auto& f  = *impl_;
-    auto key = std::tuple{pattern, e, f.phase};
-    if (auto it = f.cache.find(key); it != f.cache.end()) return it->second;
+    using namespace moe_oracle;
+    static_assert(H % kRows == 0 && I % kRows == 0);
+    auto& f = *impl_;
     if (f.gu.offsets[e] == UINT64_MAX) throw std::logic_error("oracle requested remote payload");
-    const auto& gu   = f.gu.values(f.gu.offsets[e] / f.gu.stride);
+    const auto slot = f.gu.offsets[e] / f.gu.stride;
+    // Replay can remap a logical expert to another slot. Reuse a result only when
+    // both the represented payload and the logical expert's divisor are the same.
+    const auto key = std::pair{pattern, f.fp8 ? 0 : e % 8};
+    auto& cache    = f.cache[slot];
+    if (auto it = cache.find(key); it != cache.end()) return it->second;
+    const auto& gu   = f.gu.values(slot);
     const auto& down = f.down.values(f.down.offsets[e] / f.down.stride);
-    std::vector<double> h(I), out(H);
-    std::vector<std::pair<int, double>> active;
-    for (int c = 0; c < H; ++c)
-        if (x[c] != 0) active.emplace_back(c, x[c]);
+    std::vector<double> input(x.begin(), x.end()), h(I), out(H);
     const double gd = f.gu.dw[e], dd = f.down.dw[e];
-    reference_rows(I, std::uint64_t(I) * active.size(), [&](int begin, int end) {
-        for (int row = begin; row < end; ++row) {
-            double g = 0, u = 0;
-            for (auto [c, v] : active) {
-                g += v * gu[std::size_t(row) * H + c] / gd;
-                u += v * gu[std::size_t(row + I) * H + c] / gd;
+    reference_rows(I / kRows, std::uint64_t(I) * H, [&](int first, int last) {
+        for (int tile = first; tile < last; ++tile) {
+            const int row   = tile * kRows;
+            const auto gate = project(gu.data() + std::size_t(row) * H, input, gd);
+            const auto up   = project(gu.data() + std::size_t(row + I) * H, input, gd);
+            for (int lane = 0; lane < kRows; ++lane) {
+                double g = gate[lane], u = up[lane];
+                g = std::min(g, double(f.limit));
+                u = std::clamp(u, -double(f.limit), double(f.limit));
+                h[row + lane] =
+                    (g >= 0 ? g / (1 + std::exp(-g)) : g * std::exp(g) / (1 + std::exp(g))) * u;
             }
-            g      = std::min(g, double(f.limit));
-            u      = std::clamp(u, -double(f.limit), double(f.limit));
-            h[row] = (g >= 0 ? g / (1 + std::exp(-g)) : g * std::exp(g) / (1 + std::exp(g))) * u;
         }
     });
-    active.clear();
-    for (int c = 0; c < I; ++c)
-        if (h[c] != 0) active.emplace_back(c, h[c]);
-    reference_rows(H, std::uint64_t(H) * active.size(), [&](int begin, int end) {
-        for (int row = begin; row < end; ++row)
-            for (auto [c, v] : active) out[row] += v * down[std::size_t(row) * I + c] / dd;
+    reference_rows(H / kRows, std::uint64_t(H) * I, [&](int first, int last) {
+        for (int tile = first; tile < last; ++tile) {
+            const int row     = tile * kRows;
+            const auto values = project(down.data() + std::size_t(row) * I, h, dd);
+            std::copy(values.begin(), values.end(), out.begin() + row);
+        }
     });
-    return f.cache.emplace(key, std::move(out)).first->second;
+    return cache.emplace(key, std::move(out)).first->second;
 }
 
 int Weights::verify_controls() const {
@@ -395,7 +406,7 @@ int Weights::verify_payloads() const {
 void Weights::release_host_oracle() {
     impl_->gu.release();
     impl_->down.release();
-    impl_->cache.clear();
+    for (auto& cache : impl_->cache) cache.clear();
 }
 
 Routes make_routes(const Weights& w, int tokens, const char* distribution, int fixed_hits) {

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -77,8 +78,10 @@ inline float decode_e4m3fn_positive(std::uint8_t code) {
     if (code == 0x7fU) return std::numeric_limits<float>::quiet_NaN();
     const int exponent = (code >> 3) & 0x0f;
     const int mantissa = code & 0x07;
-    if (exponent == 0) return std::ldexp(static_cast<float>(mantissa), -9);
-    return std::ldexp(1.0f + static_cast<float>(mantissa) / 8.0f, exponent - 7);
+    constexpr float scales[]{0, 0x1p-6f, 0x1p-5f, 0x1p-4f, 0x1p-3f, 0x1p-2f, 0x1p-1f, 1,
+                             2, 4,       8,       16,      32,      64,      128,     256};
+    if (exponent == 0) return static_cast<float>(mantissa) * 0x1p-9f;
+    return (1.0f + static_cast<float>(mantissa) / 8.0f) * scales[exponent];
 }
 
 inline double decode_ue8m0(std::uint8_t code) {
@@ -91,28 +94,24 @@ inline float decode_e4m3fn(std::uint8_t code) {
     return (code & 0x80U) == 0 ? magnitude : -magnitude;
 }
 
+// Index the lower codebook entry from the power-of-two interval and the first three
+// fraction bits. The caller still compares decoded distances and decides midpoint ties.
+inline int e4m3fn_floor_code(float magnitude) {
+    if (magnitude < 0x1p-6f) return static_cast<int>(magnitude * 512.0f);
+    const auto bits    = std::bit_cast<std::uint32_t>(magnitude);
+    const int exponent = int(bits >> 23) - 127;
+    return (exponent + 7) * 8 + int((bits >> 20) & 7);
+}
+
 inline std::uint8_t encode_e4m3fn_rne_satfinite(float value) {
-    static const auto codebook = [] {
-        std::array<float, 127> values{};
-        for (int code = 0; code < 127; ++code) values[code] = decode_e4m3fn_positive(code);
-        return values;
-    }();
     const bool negative   = std::signbit(value);
     const float magnitude = std::abs(value);
     int selected          = 126;
     if (magnitude < 448.0f) {
-        const int upper =
-            std::lower_bound(codebook.begin(), codebook.end(), magnitude) - codebook.begin();
-        if (upper == 0)
-            selected = 0;
-        else {
-            const int lower        = upper - 1;
-            const float low_error  = magnitude - codebook[lower],
-                        high_error = codebook[upper] - magnitude;
-            selected               = low_error < high_error   ? lower
-                                     : high_error < low_error ? upper
-                                                              : (lower % 2 == 0 ? lower : upper);
-        }
+        const int lower        = e4m3fn_floor_code(magnitude);
+        const float low_error  = magnitude - decode_e4m3fn_positive(lower);
+        const float high_error = decode_e4m3fn_positive(lower + 1) - magnitude;
+        selected = lower + (high_error < low_error || (high_error == low_error && (lower & 1)));
     }
     return static_cast<std::uint8_t>(selected | (negative ? 128 : 0));
 }

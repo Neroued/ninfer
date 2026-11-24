@@ -1,4 +1,5 @@
 ninfer_add_op_test(ninfer_gated_residual_test
+  PROCESSORS 2 COST 85
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/main.cpp"
           "${CMAKE_CURRENT_LIST_DIR}/norm.cpp"
           "${CMAKE_CURRENT_LIST_DIR}/fixtures.cpp"

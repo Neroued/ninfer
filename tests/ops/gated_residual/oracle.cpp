@@ -1,14 +1,17 @@
 #include "support.h"
 #include "ops/suite.h"
 
+#include <bit>
+
 namespace ninfer::test::hc {
 namespace {
 // Quantize FP64 directly to the BF16 grid. Do not pass through FP32 near midpoints.
 std::uint16_t rounded_word(double value) {
     if (value == 0.0) return std::signbit(value) ? 0x8000 : 0;
-    int exponent;
-    std::frexp(std::abs(value), &exponent);
-    const double quantum = std::ldexp(1.0, std::max(exponent - 8, -133));
+    const auto bits               = std::bit_cast<std::uint64_t>(value);
+    const int exponent            = int((bits >> 52) & 0x7ff) - 1023;
+    const auto quantized_exponent = std::uint64_t(std::max(exponent - 7, -133) + 1023);
+    const double quantum          = std::bit_cast<double>(quantized_exponent << 52);
     const double rounded = std::nearbyint(value / quantum) * quantum;
     return f32_to_bf16(static_cast<float>(rounded));
 }
@@ -51,9 +54,10 @@ Reference reference(const Fixture& f) {
                         else if (f.form == Form::Combine || f.form == Form::CombineNorm)
                             value += double(f.injection[m * kStreams + s]) * double(f.block[b]);
                         result.residual[i]       = value;
-                        result.residual_words[i] = f.form == Form::ExpandNorm
-                                                       ? f32_to_bf16(f.block[b])
-                                                       : rounded_word(value);
+                        result.residual_words[i] =
+                            f.form == Form::ExpandNorm || f.form == Form::GroupedNorm
+                                ? f32_to_bf16(static_cast<float>(value))
+                                : rounded_word(value);
                         represented[i]           = bf16_to_f32(result.residual_words[i]);
                     }
         });

@@ -51,15 +51,18 @@ if(NINFER_TARGET STREQUAL "rtx5090")
 endif()
 
 ninfer_add_op_test(ninfer_moe_block_scaled_test
+  PROCESSORS 2 COST 75
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_block_scaled.cpp"
   LIBRARIES ninfer_ops)
 
 ninfer_add_op_test(ninfer_moe_ep_test
+  PROCESSORS 2 COST 100
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ep.cpp"
-          "${CMAKE_CURRENT_LIST_DIR}/ep_fixture.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/ep_fixture.cpp"
   LIBRARIES ninfer_ops)
 if(NINFER_TARGET STREQUAL "dgx_spark")
   ninfer_add_op_test(ninfer_moe_tp2_test
+    PROCESSORS 2 COST 100
     SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_tp2.cpp"
             "${CMAKE_CURRENT_LIST_DIR}/tp2_fixture.cu"
             "${CMAKE_CURRENT_LIST_DIR}/tp2_oracle.cpp"
@@ -77,10 +80,12 @@ if(NINFER_TARGET STREQUAL "dgx_spark")
     SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_sigmoid_route.cpp"
     LIBRARIES ninfer_ops ninfer_linear_test_support)
   ninfer_add_op_test(ninfer_moe_clamped_ep_test
+    PROCESSORS 2 COST 90
     SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_clamped_ep.cpp"
             "${CMAKE_CURRENT_LIST_DIR}/clamped_ep_fixture.cpp"
     LIBRARIES ninfer_ops)
   ninfer_add_op_test(ninfer_sigmoid_moe_test
+    PROCESSORS 2 COST 90
     SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_sigmoid_moe.cpp"
             "${CMAKE_CURRENT_LIST_DIR}/clamped_ep_fixture.cpp"
     LIBRARIES ninfer_ops ninfer_linear_test_support)

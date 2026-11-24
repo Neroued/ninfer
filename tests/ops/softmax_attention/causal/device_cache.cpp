@@ -1,5 +1,7 @@
 #include "fixture.h"
 
+#include <atomic>
+
 namespace ninfer::test::causal_attention {
 namespace {
 
@@ -340,18 +342,27 @@ int BatchDeviceCache::verify_untouched(const std::string& label, const Bytes& be
                 verify_exact((label + " unused scale").c_str(), after[plane], before[plane]);
             continue;
         }
-        for (int row = 0; row < physical_rows; ++row)
-            if (!writable[row]) {
-                const auto first = std::size_t(row) * row_bytes[plane];
-                if (!std::equal(before[plane].begin() + first,
-                                before[plane].begin() + first + row_bytes[plane],
-                                after[plane].begin() + first)) {
-                    std::cerr << label << ": unrelated cache bytes changed in plane " << plane
-                              << " row " << row << '\n';
-                    ++failures;
-                    break;
-                }
-            }
+        std::atomic<int> changed{physical_rows};
+        parallel_rows(physical_rows, std::uint64_t(physical_rows) * row_bytes[plane],
+                      [&](int first, int last) {
+                          for (int row = first; row < last; ++row) {
+                              if (writable[row]) continue;
+                              const auto offset = std::size_t(row) * row_bytes[plane];
+                              if (std::equal(before[plane].begin() + offset,
+                                             before[plane].begin() + offset + row_bytes[plane],
+                                             after[plane].begin() + offset))
+                                  continue;
+                              int previous = changed.load();
+                              while (previous > row &&
+                                     !changed.compare_exchange_weak(previous, row)) {}
+                              break;
+                          }
+                      });
+        if (changed != physical_rows) {
+            std::cerr << label << ": unrelated cache bytes changed in plane " << plane << " row "
+                      << changed << '\n';
+            ++failures;
+        }
     }
     return failures;
 }

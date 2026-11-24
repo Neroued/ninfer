@@ -79,12 +79,20 @@ quantized_weight::PackedWeight make_fp8_weight(std::int32_t n, std::int32_t k, s
 
 quantized_weight::PackedWeight make_bf16_weight(std::int32_t n, std::int32_t k,
                                                 std::uint32_t seed) {
-    const auto host = direct_bf16_weight::make_patterned(n, k, seed);
+    if (n <= 0 || k <= 0)
+        throw std::invalid_argument("direct BF16 test weight requires positive shape");
     quantized_weight::PackedWeight result;
-    result.payload.resize(host.bits.size() * sizeof(std::uint16_t));
-    std::memcpy(result.payload.data(), host.bits.data(), result.payload.size());
-    result.weight =
-        host.device_weight({result.payload.data(), result.payload.size(), Device::cpu()});
+    result.payload.resize(std::size_t(n) * k * sizeof(std::uint16_t));
+    parallel_rows(n, std::uint64_t(n) * k, [&](int first, int last) {
+        for (int row = first; row < last; ++row)
+            for (int column = 0; column < k; ++column) {
+                const auto word = direct_bf16_weight::patterned_word(row, column, seed);
+                std::memcpy(result.payload.data() + (std::size_t(row) * k + column) * sizeof(word),
+                            &word, sizeof(word));
+            }
+    });
+    result.weight = direct_bf16_weight::device_weight(
+        n, k, {result.payload.data(), result.payload.size(), Device::cpu()});
     result.code_plane_bytes = result.payload.size();
     return result;
 }

@@ -1,4 +1,6 @@
 #include "support.h"
+
+#include <atomic>
 #include "../../support.h"
 
 #include "ops/suite.h"
@@ -63,20 +65,28 @@ int verify(const Fixture& f, std::span<const Column> ref, const std::string& lab
         f.j.data, f.weights.kind == Kind::Block ? std::size_t(kStreams) * f.columns : 0);
     const std::vector<double> injection(injection_words.begin(), injection_words.end());
     int failed = 0;
-    for (int m = 0; m < f.columns; ++m) {
-        const auto& expected = ref[m % ref.size()];
-        const auto tag       = label + " column=" + std::to_string(m);
-        failed += verify_reduction(tag, std::span{output}.subspan(std::size_t(m) * kWidth, kWidth),
-                                   expected.output, kMixOutput);
-        if (f.weights.kind == Kind::Block) {
-            failed +=
-                verify_pointwise(tag + " injection",
-                                 std::span{injection}.subspan(std::size_t(m) * kStreams, kStreams),
-                                 expected.injection, kMixInjection);
-            for (int s = 0; s < kStreams; ++s)
-                if (injection[m * kStreams + s] < 0 || injection[m * kStreams + s] > 2) ++failed;
+    std::atomic<int> column_failures = 0;
+    parallel_rows(f.columns, std::uint64_t(f.columns) * kWidth, [&](int first, int last) {
+        int errors = 0;
+        for (int m = first; m < last; ++m) {
+            const auto& expected = ref[m % ref.size()];
+            const auto tag       = label + " column=" + std::to_string(m);
+            errors +=
+                verify_reduction(tag, std::span{output}.subspan(std::size_t(m) * kWidth, kWidth),
+                                 expected.output, kMixOutput);
+            if (f.weights.kind == Kind::Block) {
+                errors += verify_pointwise(
+                    tag + " injection",
+                    std::span{injection}.subspan(std::size_t(m) * kStreams, kStreams),
+                    expected.injection, kMixInjection);
+                for (int s = 0; s < kStreams; ++s)
+                    if (injection[m * kStreams + s] < 0 || injection[m * kStreams + s] > 2)
+                        ++errors;
+            }
         }
-    }
+        column_failures.fetch_add(errors, std::memory_order_relaxed);
+    });
+    failed += column_failures.load(std::memory_order_relaxed);
     return failed;
 }
 } // namespace ninfer::test::hc::mix::bf16

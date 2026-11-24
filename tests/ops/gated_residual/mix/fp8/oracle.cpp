@@ -1,5 +1,7 @@
 #include "support.h"
 
+#include <atomic>
+
 namespace ninfer::test::hc::mix::fp8 {
 Ref reference(const Weights& w, std::span<const float> z) {
     Ref ref{std::vector<double>(Catalog * H), std::vector<double>(Catalog * 4)};
@@ -34,7 +36,8 @@ Ref reference(const Weights& w, std::span<const float> z) {
     return ref;
 }
 
-int Fixture::check(std::span<const float>, const Ref& ref, const std::string& label) const {
+int Fixture::check(std::span<const float>, const Ref& ref, const std::string& label,
+                   bool preserve_input) const {
     const auto actual = from_device_bf16(x.data, std::size_t(H) * m);
     // Two permitted A8 activation encodings each have E4M3 unit roundoff 1/16.
     // A16 staging uses only BF16; the criteria are selected by public policy.
@@ -43,10 +46,16 @@ int Fixture::check(std::span<const float>, const Ref& ref, const std::string& la
             ? ReductionCriterion{.008, 1.e-5, .016}
             : ReductionCriterion{.025, 1.e-5, .08};
     int failed = 0;
-    for (int c = 0; c < m; ++c)
-        failed += verify_reduction(label + " column=" + std::to_string(c),
-                                   std::span(actual).subspan(c * H, H),
-                                   std::span(ref.output).subspan((c % Catalog) * H, H), criterion);
+    std::atomic<int> column_failures = 0;
+    parallel_rows(m, std::uint64_t(m) * H, [&](int first, int last) {
+        int errors = 0;
+        for (int c = first; c < last; ++c)
+            errors += verify_reduction(
+                label + " column=" + std::to_string(c), std::span(actual).subspan(c * H, H),
+                std::span(ref.output).subspan((c % Catalog) * H, H), criterion);
+        column_failures.fetch_add(errors, std::memory_order_relaxed);
+    });
+    failed += column_failures.load(std::memory_order_relaxed);
     if (!final) {
         auto actual_j = from_device<float>(j.data, std::size_t(4) * m);
         std::vector<double> jr(actual_j.begin(), actual_j.end()), expected(jr.size());
@@ -54,8 +63,9 @@ int Fixture::check(std::span<const float>, const Ref& ref, const std::string& la
             for (int s = 0; s < 4; ++s) expected[c * 4 + s] = ref.injection[(c % Catalog) * 4 + s];
         failed += verify_pointwise(label + " injection", jr, expected, kMixInjection);
     }
-    failed += verify_exact((label + " z preserved").c_str(),
-                           from_device<std::uint16_t>(dz.data(), words.size()), words);
+    if (preserve_input)
+        failed += verify_exact((label + " z preserved").c_str(),
+                               from_device<std::uint16_t>(dz.data(), words.size()), words);
     failed += dz.verify_guards(label) + dx.verify_guards(label) + dj.verify_guards(label) +
               scratch.verify_guards(label);
     if (arena.used() != 0) {

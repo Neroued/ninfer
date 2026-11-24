@@ -3,6 +3,7 @@ ninfer_add_op_test(ninfer_sliding_window_attention_test
   LIBRARIES ninfer_ops)
 
 ninfer_add_op_test(ninfer_softmax_attention_test
+  PROCESSORS 2 COST 80
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/main.cpp"
           "${CMAKE_CURRENT_LIST_DIR}/causal/cache.cpp"
           "${CMAKE_CURRENT_LIST_DIR}/causal/device_cache.cpp"

@@ -56,10 +56,13 @@ int run(Weights& w, CudaExecutionView execution, const Case& c,
     const bool fp8 = w.profile().ffn.gate_up_type == QType::FP8_E4M3FN_BLOCK128X128_BF16;
     auto routes    = make_routes(w, m, c.distribution.c_str(), c.hits);
     std::vector<float> input(std::size_t(m) * H);
-    for (int t = 0; t < m; ++t)
-        std::copy(patterns[t % 3].begin(), patterns[t % 3].end(),
-                  input.begin() + std::size_t(t) * H);
-    auto dx = to_device_bf16(input), di = to_device(routes.ids),
+    parallel_rows(m, input.size(), [&](int first, int last) {
+        for (int t = first; t < last; ++t)
+            std::copy(patterns[t % 3].begin(), patterns[t % 3].end(),
+                      input.begin() + std::size_t(t) * H);
+    });
+    const auto input_words = bf16_words(input);
+    auto dx = to_device(input_words), di = to_device(routes.ids),
          da = to_device(routes.coefficients);
     Tensor x(dx.span(), DType::BF16, {H, m});
     ops::ExpertRoutes selected{Tensor(di.span(), DType::I32, {K, m}),
@@ -152,27 +155,52 @@ int run(Weights& w, CudaExecutionView execution, const Case& c,
             invoke();
         cuda_synchronize(execution.stream());
         std::vector<double> reference(input.size());
-        for (int t = 0; t < m; ++t) {
-            int hits = 0;
+        std::array<std::array<bool, 3>, E> needed{};
+        std::array<std::array<const std::vector<double>*, 3>, E> contributions{};
+        for (int t = 0; t < m; ++t)
             for (int j = 0; j < K; ++j) {
                 const auto a = std::size_t(t) * K + j;
                 const int e  = c.complete ? global_ids[t % 3][j] : routes.ids[a];
-                if (!w.active(e)) continue;
-                ++hits;
-                const auto& v = w.oracle(t % 3, e, patterns[t % 3]);
-                for (int h = 0; h < H; ++h)
-                    reference[std::size_t(t) * H + h] +=
-                        (c.complete ? global_coefficients[t % 3][j]
-                                    : double(routes.coefficients[a])) *
-                        v[h];
+                if (w.active(e)) needed[e][t % 3] = true;
             }
-            if (!hits && !c.complete) {
-                const auto words = from_device<std::uint16_t>(
-                    static_cast<const std::uint16_t*>(result.data()) + std::size_t(t) * H, H);
-                if (std::any_of(words.begin(), words.end(), [](auto v) { return v != 0; }))
-                    ++failures;
+        std::vector<int> experts;
+        for (int e = 0; e < E; ++e)
+            if (std::any_of(needed[e].begin(), needed[e].end(), [](bool value) { return value; }))
+                experts.push_back(e);
+        // Each worker owns one expert's cache and its uniquely mapped physical slot.
+        parallel_rows(experts.size(), std::uint64_t(experts.size()) * H * I,
+                      [&](int first, int last) {
+                          for (int i = first; i < last; ++i) {
+                              const int e = experts[i];
+                              for (int p = 0; p < 3; ++p)
+                                  if (needed[e][p])
+                                      contributions[e][p] = &w.oracle(p, e, patterns[p]);
+                          }
+                      });
+        const auto actual_bits = from_device<std::uint16_t>(result.data(), input.size());
+        std::vector<unsigned char> bad_zero(m);
+        parallel_rows(m, input.size() * K, [&](int first, int last) {
+            for (int t = first; t < last; ++t) {
+                int hits = 0;
+                for (int j = 0; j < K; ++j) {
+                    const auto a = std::size_t(t) * K + j;
+                    const int e  = c.complete ? global_ids[t % 3][j] : routes.ids[a];
+                    if (!w.active(e)) continue;
+                    ++hits;
+                    const auto& v = *contributions[e][t % 3];
+                    for (int h = 0; h < H; ++h)
+                        reference[std::size_t(t) * H + h] +=
+                            (c.complete ? global_coefficients[t % 3][j]
+                                        : double(routes.coefficients[a])) *
+                            v[h];
+                }
+                if (!hits && !c.complete) {
+                    const auto* begin = actual_bits.data() + std::size_t(t) * H;
+                    bad_zero[t] = std::any_of(begin, begin + H, [](auto v) { return v != 0; });
+                }
             }
-        }
+        });
+        failures += std::count(bad_zero.begin(), bad_zero.end(), 1);
         if (c.complete) {
             for (int t = 0; t < m; ++t) {
                 const auto& pattern = patterns[t % 3];
@@ -186,8 +214,12 @@ int run(Weights& w, CudaExecutionView execution, const Case& c,
         const std::string label = "EP256 m=" + std::to_string(m) + " " + c.distribution +
                                   " hits=" + std::to_string(c.hits) +
                                   " replay=" + std::to_string(replay);
-        failures += verify_reduction(label, from_device_bf16(result.data(), input.size()),
-                                     reference, fp8 ? kA8 : kA4);
+        std::vector<double> got(input.size());
+        parallel_rows(m, got.size(), [&](int first, int last) {
+            for (std::size_t i = std::size_t(first) * H; i < std::size_t(last) * H; ++i)
+                got[i] = bf16_to_f32(actual_bits[i]);
+        });
+        failures += verify_reduction(label, got, reference, fp8 ? kA8 : kA4);
         failures +=
             scratch.verify_guards(label) + result.verify_guards(label) + w.verify_controls();
         if (arena.used() != 0 || arena.peak_used() != bytes) {
@@ -196,7 +228,7 @@ int run(Weights& w, CudaExecutionView execution, const Case& c,
         }
         if (from_device<int>(di, routes.ids.size()) != routes.ids ||
             from_device<float>(da, routes.coefficients.size()) != routes.coefficients ||
-            from_device_bf16(dx, input.size()) != std::vector<double>(input.begin(), input.end()))
+            from_device<std::uint16_t>(dx, input_words.size()) != input_words)
             ++failures;
     }
     if (exec) cuda_check(cudaGraphExecDestroy(exec), "destroy exec");
@@ -259,7 +291,7 @@ int main(int argc, char** argv) {
                 for (int m : {1, 8, 128, 1024}) add(m, "mixed", -1, true, true);
                 suite.add(std::move(catalogue), [=](auto chosen) {
                     auto& env = cuda_environment();
-                    Weights w(env.context.device(), p, side, fp8);
+                    Weights w(env.context.device(), p, side, fp8, parallel_rows);
                     if (w.encoded_expert_bytes() != (fp8 ? 4915800 : 2764800) ||
                         w.backing_bytes() != (fp8 ? 1258487808 : 707788800))
                         throw std::runtime_error("EP payload accounting mismatch");

@@ -54,7 +54,6 @@ struct ShapeCase {
     ActivationGenerator activation_generator = nullptr;
     IndexSampler row_sampler                 = nullptr;
     IndexSampler column_sampler              = nullptr;
-    bool verify_each_invocation              = false;
     // Bind a native BF16 prefix view into a larger parent with a poisoned unused suffix.
     std::int32_t parent_rows = 0;
     // Exercise borrowing scratch from a caller arena that already owns live bytes.

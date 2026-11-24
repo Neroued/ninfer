@@ -3,6 +3,7 @@ ninfer_add_op_test(ninfer_qsa_tail_extract_test
   LIBRARIES ninfer_ops)
 
 ninfer_add_op_test(ninfer_qsa_prepare_test
+  PROCESSORS 2 COST 90
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_prepare.cpp"
   LIBRARIES ninfer_ops)
 
@@ -11,6 +12,7 @@ ninfer_add_op_test(ninfer_qsa_indexer_test
   LIBRARIES ninfer_ops CUDA::cuda_driver)
 
 ninfer_add_op_test(ninfer_qsa_sparse_gqa_test
+  PROCESSORS 2 COST 95
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_sparse_gqa.cpp"
-  LIBRARIES ninfer_ops
+  LIBRARIES ninfer_ops CUDA::cuda_driver
   FORMATS bf16 int8 fp8 nvfp4 k8v4)

@@ -33,7 +33,8 @@ struct Plane {
     Tensor view;
 
     Plane(int pages, DType dtype, int heads = 2)
-        : row(256), head(64 * row), page(heads * head), host(page * pages),
+        : row(256), head(64 * row), page(heads * head),
+          host(page * pages, dtype == DType::BF16 ? 0x7fc1 : 0x7e01),
           view(Tensor::metadata(dtype, {256, 64, heads, pages})) {
         view.nb[1] = row * 2;
         view.nb[2] = head * 2;
@@ -47,14 +48,12 @@ struct Plane {
     void bind(tool::PackedKVFixture& arena, std::size_t index) {
         packed      = &arena;
         plane_index = index;
+        initialize_plane(arena, index, host.front(), view.ne[3]);
     }
 
-    void upload() {
-        if (!packed) return;
-        auto source   = view;
-        source.data   = host.data();
-        source.device = Device::cpu();
-        packed->upload_plane(plane_index, source);
+    void upload(std::span<const int> dirty_pages) {
+        if (packed)
+            upload_pages(*packed, plane_index, std::span<const std::uint16_t>(host), dirty_pages);
     }
 
     std::vector<std::uint16_t> download() const {
@@ -77,6 +76,7 @@ struct Fixture {
     std::unique_ptr<tool::PackedKVFixture> packed;
     std::vector<std::vector<int>> visible;
     Plane keys, values;
+    std::vector<int> populated_pages, dirty_pages;
     KvCacheStorage storage;
     std::unique_ptr<EncodedVector> encoded_key, encoded_value;
     GuardedDeviceBuffer q, gate, out, pos, lengths, rows, table, selections, sizes;
@@ -137,15 +137,11 @@ struct Fixture {
     }
 
     void reset(int phase = 0, int cap = 512, float magnitude = 1.0F) {
-        std::fill(qhost.begin(), qhost.end(), 0x7fc1);
-        std::fill(ghost.begin(), ghost.end(), 0x7fc1);
-        std::fill(keys.host.begin(), keys.host.end(), 0x7fc1);
-        std::fill(values.host.begin(), values.host.end(), 0x7e01);
         std::fill(positions.begin(), positions.end(), -1);
         std::fill(ids.begin(), ids.end(), -1);
         std::fill(counts.begin(), counts.end(), -1);
         for (auto& row : visible) row.clear();
-        std::vector<bool> populated(std::size_t(pages) * 64);
+        std::vector<int> ends(B);
         for (int b = 0; b < B; ++b) {
             int end = history, live = std::min(T, end);
             if (phase == 1 || B > 1) {
@@ -165,56 +161,99 @@ struct Fixture {
             }
             live = std::min(live, live_limit);
             if (phase == 2) live = 0;
+            ends[b]      = end;
             valid[b]     = live;
             selectors[b] = live ? (b + phase) % B + 1 : -1;
             if (!live) continue;
             for (int p = 0; p < table_width; ++p)
                 tables[selectors[b] * table_stride + p] =
                     (pages - 1 - (b * table_width + p) % pages + phase * 7) % pages;
-            for (int t = 0; t < live; ++t) {
-                const int m = t + T * b, p = end - live + t, C = (p + 1) / 4;
-                positions[m] = p;
-                counts[m]    = std::min(C, cap);
-                int step     = C > 0 ? (hash(m + phase * 71) % C) | 1 : 1;
-                while (C > 0 && std::gcd(step, C) != 1) step += 2;
-                for (int i = 0; i < counts[m]; ++i) {
-                    const int g = (std::int64_t(i) * step + hash(m + 31 + phase)) % C;
-                    ids[std::size_t(m) * 512 + i] = g;
-                    for (int j = 0; j < 4; ++j) visible[m].push_back(g * 4 + j);
+        }
+        // Sort the selected groups, then expand each four-token group in place. Keep
+        // the unsorted IDs in the original routing order for the device input.
+        std::vector<std::vector<std::uint64_t>> worker_pages(T * B);
+        parallel_rows(T * B, qhost.size(), [&](int first, int last) {
+            auto& populated = worker_pages[first];
+            populated.resize(pages);
+            for (int m = first; m < last; ++m) {
+                const int b = m / T, t = m % T;
+                if (t < valid[b]) {
+                    const int p = ends[b] - valid[b] + t, C = (p + 1) / 4;
+                    positions[m] = p;
+                    counts[m]    = std::min(C, cap);
+                    int step     = C > 0 ? (hash(m + phase * 71) % C) | 1 : 1;
+                    while (C > 0 && std::gcd(step, C) != 1) step += 2;
+                    std::array<int, 512> groups;
+                    for (int i = 0; i < counts[m]; ++i) {
+                        const int g = (std::int64_t(i) * step + hash(m + 31 + phase)) % C;
+                        ids[std::size_t(m) * 512 + i] = g;
+                        groups[i]                     = g;
+                    }
+                    std::sort(groups.begin(), groups.begin() + counts[m]);
+                    auto& tokens = visible[m];
+                    tokens.reserve(4 * counts[m] + (p + 1) % 4);
+                    const auto physical_page = [&](int j) {
+                        return tables[selectors[b] * table_stride + j / 64];
+                    };
+                    for (int i = 0; i < counts[m]; ++i) {
+                        const int j = groups[i] * 4;
+                        populated[physical_page(j)] |= std::uint64_t{15} << (j % 64);
+                        for (int k = 0; k < 4; ++k) tokens.push_back(j + k);
+                    }
+                    for (int j = C * 4; j <= p; ++j) {
+                        tokens.push_back(j);
+                        populated[physical_page(j)] |= std::uint64_t{1} << (j % 64);
+                    }
                 }
-                for (int j = C * 4; j <= p; ++j) visible[m].push_back(j);
-                std::sort(visible[m].begin(), visible[m].end());
-                if (visible[m].empty()) continue;
-                for (int i = 0; i < (256 * q_heads); ++i) {
+                const bool live = !visible[m].empty();
+                for (int i = 0; i < 256 * q_heads; ++i) {
                     const auto index = std::size_t(m) * (256 * q_heads) + i;
-                    qhost[index]     = f32_to_bf16(sample(index + 711 + phase) * magnitude);
-                    ghost[index]     = f32_to_bf16(sample(index + 129 + phase) * 4);
-                }
-                for (int j : visible[m]) {
-                    const int page                = tables[selectors[b] * table_stride + j / 64];
-                    populated[page * 64 + j % 64] = true;
+                    qhost[index] =
+                        live ? f32_to_bf16(sample(index + 711 + phase) * magnitude) : 0x7fc1;
+                    ghost[index] = live ? f32_to_bf16(sample(index + 129 + phase) * 4) : 0x7fc1;
                 }
             }
-        }
-        for (int row = 0; row < pages * 64; ++row) {
-            if (!populated[row]) continue;
-            const int page = row / 64, token = row % 64;
-            for (int h = 0; h < kv_heads; ++h)
-                for (int d = 0; d < 256; ++d) {
-                    const auto seed = std::uint32_t((page * 128 + h * 64 + token) * 256 + d);
-                    keys.host[keys.offset(d, h, token, page)] =
-                        f32_to_bf16(sample(seed + 701) * magnitude);
-                    values.host[values.offset(d, h, token, page)] = half(sample(seed + 1311));
-                }
-        }
+        });
+        std::vector<std::uint64_t> populated(pages);
+        for (const auto& part : worker_pages)
+            for (std::size_t p = 0; p < part.size(); ++p) populated[p] |= part[p];
+        dirty_pages = populated_pages;
+        populated_pages.clear();
+        for (int p = 0; p < pages; ++p)
+            if (populated[p]) populated_pages.push_back(p);
+        dirty_pages.insert(dirty_pages.end(), populated_pages.begin(), populated_pages.end());
+        std::sort(dirty_pages.begin(), dirty_pages.end());
+        dirty_pages.erase(std::unique(dirty_pages.begin(), dirty_pages.end()), dirty_pages.end());
+        parallel_rows(dirty_pages.size(), std::uint64_t(dirty_pages.size()) * keys.page,
+                      [&](int first, int last) {
+                          for (int i = first; i < last; ++i) {
+                              const int page = dirty_pages[i];
+                              for (int h = 0; h < kv_heads; ++h)
+                                  for (int token = 0; token < 64; ++token) {
+                                      const auto offset = keys.offset(0, h, token, page);
+                                      if ((populated[page] & (std::uint64_t{1} << token)) == 0) {
+                                          std::fill_n(keys.host.data() + offset, 256, 0x7fc1);
+                                          std::fill_n(values.host.data() + offset, 256, 0x7e01);
+                                          continue;
+                                      }
+                                      for (int d = 0; d < 256; ++d) {
+                                          const auto seed = std::uint32_t(
+                                              (page * 128 + h * 64 + token) * 256 + d);
+                                          keys.host[offset + d] =
+                                              f32_to_bf16(sample(seed + 701) * magnitude);
+                                          values.host[offset + d] = half(sample(seed + 1311));
+                                      }
+                                  }
+                          }
+                      });
         upload();
     }
 
     void upload() {
         q.copy_from_host(qhost.data(), qhost.size() * 2);
         gate.copy_from_host(ghost.data(), ghost.size() * 2);
-        keys.upload();
-        values.upload();
+        keys.upload(dirty_pages);
+        values.upload(dirty_pages);
         pos.copy_from_host(positions.data(), positions.size() * 4);
         lengths.copy_from_host(valid.data(), valid.size() * 4);
         rows.copy_from_host(selectors.data(), selectors.size() * 4);
@@ -223,8 +262,8 @@ struct Fixture {
         selections.copy_from_host(ids.data(), ids.size() * 4);
         sizes.copy_from_host(counts.data(), counts.size() * 4);
         if (encoded_key) {
-            encoded_key->encode(keys);
-            encoded_value->encode(values);
+            encoded_key->encode(keys, dirty_pages);
+            encoded_value->encode(values, dirty_pages);
         }
         out.fill(0xff);
         // Fixture transfers/memset use the default stream; the Op's stream is nonblocking.
@@ -274,20 +313,23 @@ struct Fixture {
         parallel_rows(
             int(rows.size()), std::uint64_t(rows.size()) * (256 * kv_heads),
             [&](int first, int last) {
-                for (int i = first; i < last; ++i)
-                    for (int h = 0; h < kv_heads; ++h)
-                        for (int d = 0; d < 256; ++d) {
-                            const int page = rows[i] / 64, token = rows[i] % 64;
-                            const auto index = std::size_t(i) * (256 * kv_heads) + h * 256 + d;
-                            decoded_keys[index] =
-                                encoded_key ? encoded_key->decode(d, h, token, page)
-                                            : double(bf16_to_f32(
-                                                  keys.host[keys.offset(d, h, token, page)]));
-                            decoded_values[index] =
-                                encoded_value
-                                    ? encoded_value->decode(d, h, token, page)
-                                    : double(unhalf(values.host[values.offset(d, h, token, page)]));
+                for (int i = first; i < last; ++i) {
+                    const int page = rows[i] / 64, token = rows[i] % 64;
+                    for (int h = 0; h < kv_heads; ++h) {
+                        const auto index = std::size_t(i) * (256 * kv_heads) + h * 256;
+                        if (encoded_key) {
+                            encoded_key->decode_row(h, token, page, decoded_keys.data() + index);
+                            encoded_value->decode_row(h, token, page,
+                                                      decoded_values.data() + index);
+                        } else {
+                            const auto source = keys.offset(0, h, token, page);
+                            for (int d = 0; d < 256; ++d) {
+                                decoded_keys[index + d]   = bf16_to_f32(keys.host[source + d]);
+                                decoded_values[index + d] = unhalf(values.host[source + d]);
+                            }
                         }
+                    }
+                }
             });
         parallel_rows(
             int(result.queries.size()),

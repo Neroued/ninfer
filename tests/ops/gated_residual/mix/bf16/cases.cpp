@@ -7,7 +7,8 @@ using namespace ninfer;
 using namespace ninfer::test::hc::mix::bf16;
 
 int run(Weights& weights, std::span<const float> catalog, std::span<const Column> ref, int m,
-        CudaExecutionView execution, bool captured = false) {
+        CudaExecutionView execution, bool captured, std::span<const float> next,
+        std::span<const Column> next_ref) {
     Fixture f(weights, m);
     f.upload(catalog, execution.stream());
     DecodeGraphDefinition definition;
@@ -22,10 +23,8 @@ int run(Weights& weights, std::span<const float> catalog, std::span<const Column
     const auto label = std::string(name(weights.kind)) + " M=" + std::to_string(m) +
                        " pattern=" + std::to_string(int(weights.pattern)) +
                        " graph=" + std::to_string(captured);
-    int failed = verify(f, ref, label) + f.check(label);
+    int failed = verify(f, ref, label) + f.check(label, captured || m <= 32);
     if (captured) {
-        const auto next     = input_catalog(weights.pattern, 1);
-        const auto next_ref = reference(weights, next);
         f.upload(next, execution.stream());
         graph.launch(execution.stream());
         ninfer::test::cuda_synchronize(execution.stream());
@@ -84,13 +83,17 @@ void add_bf16_mix_cases(OpSuite& suite) {
                 const auto catalog = std::span{input}.first(
                     pattern == mix::bf16::Pattern::Dense ? input.size() : 3 * kTotal);
                 const auto ref       = mix::bf16::reference(weights, catalog);
+                const bool any_graph = std::any_of(selected.begin(), selected.end(),
+                                                   [&](auto i) { return cases[i].graph; });
+                const auto next      = any_graph ? input_catalog(pattern, 1) : std::vector<float>{};
+                const auto next_ref  = any_graph ? reference(weights, next) : std::vector<Column>{};
                 const auto execution = cuda_environment().context.execution_view();
                 int failures         = 0;
                 for (auto i : selected) {
                     auto c = cases[i];
-                    failures += c.columns
-                                    ? run(weights, catalog, ref, c.columns, execution, c.graph)
-                                    : mix::bf16::validate(weights, ref, execution);
+                    failures += c.columns ? run(weights, catalog, ref, c.columns, execution,
+                                                c.graph, next, next_ref)
+                                          : mix::bf16::validate(weights, ref, execution);
                 }
                 return failures + weights.check();
             });

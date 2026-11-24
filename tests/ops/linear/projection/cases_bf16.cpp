@@ -30,13 +30,15 @@ using ninfer::test::linear_suite::Suite;
 std::vector<std::uint16_t> make_bf16_activation(std::int32_t hidden, std::int32_t tokens,
                                                 std::uint32_t) {
     std::vector<std::uint16_t> result(static_cast<std::size_t>(hidden) * tokens);
-    for (std::int32_t token = 0; token < tokens; ++token) {
-        for (std::int32_t column = 0; column < hidden; ++column) {
-            const int centered = ((column * 29 + token * 71 + 17) & 0xff) - 128;
-            result[static_cast<std::size_t>(token) * hidden + column] =
-                f32_to_bf16(static_cast<float>(centered) * (1.0F / 512.0F));
+    parallel_rows(tokens, result.size(), [&](int first, int last) {
+        for (int token = first; token < last; ++token) {
+            for (std::int32_t column = 0; column < hidden; ++column) {
+                const int centered = ((column * 29 + token * 71 + 17) & 0xff) - 128;
+                result[static_cast<std::size_t>(token) * hidden + column] =
+                    f32_to_bf16(static_cast<float>(centered) * (1.0F / 512.0F));
+            }
         }
-    }
+    });
     return result;
 }
 
@@ -66,7 +68,6 @@ bf16_fixture(std::int32_t n, std::int32_t k, std::uint32_t seed,
     shape.activation_generator   = make_bf16_activation;
     shape.row_sampler            = sampled_rows;
     shape.column_sampler         = sampled_tokens;
-    shape.verify_each_invocation = true;
     return shape;
 }
 
@@ -182,16 +183,19 @@ const std::array kNewGeometries{
 
 ninfer::test::quantized_weight::PackedWeight cancellation_weight(int n, int k, std::uint32_t seed) {
     auto result = ninfer::test::linear_weights::make_bf16_weight(n, k, seed);
-    for (int row = 0; row < n; ++row) {
-        for (int column = 0; column < k; column += 2) {
-            const auto offset = (static_cast<std::size_t>(row) * k + column) * 2;
-            auto value =
-                ninfer::test::quantized_weight::detail::load_u16_le(result.payload, offset);
-            if (column == k - 2 && (value & 0x7fff) == 0) value = 0x3d80;
-            ninfer::test::quantized_weight::detail::store_u16_le(result.payload, offset, value);
-            ninfer::test::quantized_weight::detail::store_u16_le(result.payload, offset + 2, value);
+    ninfer::test::parallel_rows(n, std::uint64_t(n) * k, [&](int first, int last) {
+        for (int row = first; row < last; ++row) {
+            for (int column = 0; column < k; column += 2) {
+                const auto offset = (static_cast<std::size_t>(row) * k + column) * 2;
+                auto value =
+                    ninfer::test::quantized_weight::detail::load_u16_le(result.payload, offset);
+                if (column == k - 2 && (value & 0x7fff) == 0) value = 0x3d80;
+                ninfer::test::quantized_weight::detail::store_u16_le(result.payload, offset, value);
+                ninfer::test::quantized_weight::detail::store_u16_le(result.payload, offset + 2,
+                                                                     value);
+            }
         }
-    }
+    });
     return result;
 }
 

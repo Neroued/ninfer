@@ -22,11 +22,7 @@ std::string label(Profile p, Case c, bool normalize_input) {
            (c.prefix ? " arena-prefix" : "");
 }
 
-std::vector<std::uint16_t> bits(const std::vector<float>& values) {
-    std::vector<std::uint16_t> outputs(values.size());
-    for (std::size_t i = 0; i < values.size(); ++i) outputs[i] = f32_to_bf16(values[i]);
-    return outputs;
-}
+std::vector<std::uint16_t> bits(const std::vector<float>& values) { return bf16_words(values); }
 
 Weights::Weights(Profile p, Pattern pattern)
     : profile(p), a(std::size_t(p.heads) * p.input_rows), b(a.size()),
@@ -172,7 +168,7 @@ void Fixture::upload() {
 }
 
 void Fixture::advance() {
-    for (auto& v : x) v *= -0.5F;
+    parallel_elements(x.size(), [&](std::size_t i) { x[i] *= -0.5F; });
     if (normalize_input)
         for (auto& v : norm_gain) v = -v;
     for (auto& v : weights.a) v = -v;

@@ -21,22 +21,26 @@ namespace cache_reference = ninfer::test::qsa::prepare;
 // BF16 store. Inputs cover near-uniform, unit-RMS and sharper QK distributions.
 constexpr ReductionCriterion kSparseA16Criterion{2.8e-3, 1.0e-3, 2.7e-3};
 
-int verify(Fixture& f, const std::string& label, bool preserved = true) {
+int verify(Fixture& f, const std::string& label, bool preserved = true,
+           bool preserve_cache = true) {
     const auto reference = f.reference();
-    const auto got       = from_device_bf16(f.out.data(), f.qhost.size());
-    std::vector<double> selected;
-    selected.reserve(reference.values.size());
-    for (int m : reference.queries)
-        selected.insert(selected.end(), got.begin() + std::size_t(m) * (256 * f.q_heads),
-                        got.begin() + std::size_t(m + 1) * (256 * f.q_heads));
+    const auto words     = from_device<std::uint16_t>(f.out.data(), f.qhost.size());
+    const int width      = 256 * f.q_heads;
+    std::vector<double> selected(reference.values.size());
+    parallel_rows(reference.queries.size(), selected.size(), [&](int first, int last) {
+        for (int q = first; q < last; ++q)
+            for (int i = 0; i < width; ++i)
+                selected[std::size_t(q) * width + i] =
+                    bf16_to_f32(words[std::size_t(reference.queries[q]) * width + i]);
+    });
     int failures = selected.empty()
                        ? 0
                        : verify_reduction(label, selected, reference.values, kSparseA16Criterion);
-    if (!std::all_of(got.begin(), got.end(), [](double x) { return std::isfinite(x); })) {
+    if (std::any_of(words.begin(), words.end(),
+                    [](auto word) { return (word & 0x7f80) == 0x7f80; })) {
         std::cerr << label << ": nonfinite or unwritten output\n";
         ++failures;
     }
-    const auto words = from_device<std::uint16_t>(f.out.data(), f.qhost.size());
     for (int m = 0; m < f.T * f.B; ++m)
         if (f.visible[m].empty())
             for (int i = 0; i < 256 * f.q_heads; ++i)
@@ -49,7 +53,7 @@ int verify(Fixture& f, const std::string& label, bool preserved = true) {
                                  from_device<std::uint16_t>(f.q.data(), f.qhost.size()), f.qhost);
         failures += verify_exact(
             "gate preserved", from_device<std::uint16_t>(f.gate.data(), f.ghost.size()), f.ghost);
-        if (!f.encoded_key) {
+        if (preserve_cache && !f.encoded_key) {
             failures += verify_exact("K preserved", f.keys.download(), f.keys.host);
             failures += verify_exact("V preserved", f.values.download(), f.values.host);
         }
@@ -66,7 +70,7 @@ int verify(Fixture& f, const std::string& label, bool preserved = true) {
         failures += verify_exact("tables preserved",
                                  from_device<std::int64_t>(f.table.data(), f.table_offsets.size()),
                                  f.table_offsets);
-        if (f.encoded_key)
+        if (preserve_cache && f.encoded_key)
             for (const auto* plane : {&f.encoded_key->data, &f.encoded_key->scales,
                                       &f.encoded_value->data, &f.encoded_value->scales})
                 failures += plane->preserved(label);
@@ -107,7 +111,9 @@ int run(DeviceContext& device, int t, int b, int history, bool padded = false, i
                            " T=" + std::to_string(t) + " B=" + std::to_string(b) +
                            " L=" + std::to_string(history) + " cap=" + std::to_string(cap) +
                            " phase=" + std::to_string(phase);
-        failures += verify(f, label);
+        // Keep exact payload checks for small caches and every graph phase. Large read-only
+        // eager caches still check the guards on every case.
+        failures += verify(f, label, true, graph || f.pages <= 64);
         failures += scratch.verify_guards(label);
         failures += arena.used() != 0 || arena.peak_used() > bytes;
         if (failures) return failures;

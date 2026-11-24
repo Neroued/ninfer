@@ -1,4 +1,6 @@
 #include "support.h"
+
+#include <atomic>
 #include "core/platform.h"
 #include "ops/suite.h"
 #include "core/decode_graph.h"
@@ -10,8 +12,7 @@ int verify(const Fixture& f, const std::string& label, bool exact_residual) {
     const auto residual_words = f.form == Form::GroupedNorm
                                     ? std::vector<std::uint16_t>{}
                                     : from_device<std::uint16_t>(f.tr.data, f.h.size());
-    std::vector<double> residual(residual_words.size());
-    std::transform(residual_words.begin(), residual_words.end(), residual.begin(), bf16_to_f32);
+    const auto residual       = decode_bf16_words(residual_words);
     if (f.form == Form::ExpandNorm)
         failed += verify_exact((label + " expansion").c_str(), residual_words, ref.residual_words);
     else if (f.form != Form::GroupedNorm)
@@ -20,24 +21,32 @@ int verify(const Fixture& f, const std::string& label, bool exact_residual) {
         failed += verify_exact((label + " midpoint residual").c_str(), residual_words,
                                ref.residual_words);
     if (f.form != Form::Combine) {
-        const auto actual   = from_device_bf16(f.tz.data, f.h.size());
+        const auto actual   = decode_bf16_words(from_device<std::uint16_t>(f.tz.data, f.h.size()));
         const bool combined = f.form == Form::CombineNorm || f.form == Form::AddNorm;
         const auto seam_reference =
             combined ? grouped_norm(residual, f.weight, f.columns, f.epsilon, f.width)
                      : std::vector<double>{};
-        for (int m = 0; m < f.columns; ++m)
-            for (int s = 0; s < kStreams; ++s) {
-                const auto base = (std::size_t(m) * kStreams + s) * f.width;
-                const auto part = [&](const std::vector<double>& values) {
-                    return std::span<const double>(values.data() + base, f.width);
-                };
-                const auto tag =
-                    label + " column=" + std::to_string(m) + " stream=" + std::to_string(s);
-                failed += verify_reduction(tag, part(actual), part(ref.normalized), kNormalized);
-                if (combined)
-                    failed += verify_reduction(tag + " actual seam", part(actual),
-                                               part(seam_reference), kNormalized);
-            }
+        std::atomic<int> column_failures = 0;
+        parallel_rows(
+            f.columns, std::uint64_t(f.columns) * kStreams * f.width, [&](int first, int last) {
+                int errors = 0;
+                for (int m = first; m < last; ++m)
+                    for (int s = 0; s < kStreams; ++s) {
+                        const auto base = (std::size_t(m) * kStreams + s) * f.width;
+                        const auto part = [&](const std::vector<double>& values) {
+                            return std::span<const double>(values.data() + base, f.width);
+                        };
+                        const auto tag =
+                            label + " column=" + std::to_string(m) + " stream=" + std::to_string(s);
+                        errors +=
+                            verify_reduction(tag, part(actual), part(ref.normalized), kNormalized);
+                        if (combined)
+                            errors += verify_reduction(tag + " actual seam", part(actual),
+                                                       part(seam_reference), kNormalized);
+                    }
+                column_failures.fetch_add(errors, std::memory_order_relaxed);
+            });
+        failed += column_failures.load(std::memory_order_relaxed);
     }
     return failed;
 }

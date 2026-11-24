@@ -138,7 +138,13 @@ struct Fixture {
         auto key = std::pair{pattern, sign};
         if (auto it = shared_cache.find(key); it != shared_cache.end()) return it->second;
         std::vector<double> r(H);
-        for (int h = 0; h < H; ++h) r[h] = shared_ref.output(h, pattern, sign);
+        const auto& product = shared_ref.product(pattern, sign);
+        parallel_rows(H, std::uint64_t(H) * I, [&](int first, int last) {
+            for (int h = first; h < last; ++h) {
+                for (int k = 0; k < I; ++k)
+                    r[h] += shared_ref.down[std::size_t(h) * I + k] * product[k];
+            }
+        });
         return shared_cache.emplace(key, std::move(r)).first->second;
     }
 
@@ -193,9 +199,11 @@ int run(Fixture& f, const Case& c) {
         f.bank.publish(phase == 1 ? 1 : 0, phase == 2);
         const int sign = phase == 1;
         std::vector<std::uint16_t> values(std::size_t(H) * c.m);
-        for (int t = 0; t < c.m; ++t)
-            for (int k = 0; k < H; ++k)
-                values[std::size_t(t) * H + k] = f.bits[(t % 3) * H + k] ^ (sign ? 0x8000 : 0);
+        parallel_rows(c.m, values.size(), [&](int first, int last) {
+            for (int t = first; t < last; ++t)
+                for (int k = 0; k < H; ++k)
+                    values[std::size_t(t) * H + k] = f.bits[(t % 3) * H + k] ^ (sign ? 0x8000 : 0);
+        });
         const int phase_hits = c.zero_then_restore && phase == 1 ? 0 : c.hits;
         std::vector<float> corrections(E);
         for (int j = 0; j < K; ++j) {
@@ -213,7 +221,8 @@ int run(Fixture& f, const Case& c) {
         else
             invoke();
         cuda_synchronize(execution.stream());
-        auto actual = from_device_bf16(output.data(), std::size_t(H) * c.m);
+        const auto actual =
+            decode_bf16_words(from_device<std::uint16_t>(output.data(), std::size_t(H) * c.m));
         std::array<std::vector<double>, 3> refs;
         for (int pattern = 0; pattern < std::min(c.m, 3); ++pattern) {
             refs[pattern] = f.reference_shared(pattern, sign);
@@ -232,15 +241,21 @@ int run(Fixture& f, const Case& c) {
             }
         }
         std::vector<double> reference(actual.size());
-        for (int t = 0; t < c.m; ++t) {
-            if (c.padded && t % 2 >= columns[t / 2]) {
-                for (int h = 0; h < H; ++h)
-                    if (actual[std::size_t(t) * H + h] != 0) ++failures;
-            } else {
-                std::copy(refs[t % 3].begin(), refs[t % 3].end(),
-                          reference.begin() + std::size_t(t) * H);
+        std::atomic<int> invalid_failures = 0;
+        parallel_rows(c.m, actual.size(), [&](int first, int last) {
+            int local = 0;
+            for (int t = first; t < last; ++t) {
+                if (c.padded && t % 2 >= columns[t / 2]) {
+                    for (int h = 0; h < H; ++h)
+                        if (actual[std::size_t(t) * H + h] != 0) ++local;
+                } else {
+                    std::copy(refs[t % 3].begin(), refs[t % 3].end(),
+                              reference.begin() + std::size_t(t) * H);
+                }
             }
-        }
+            invalid_failures.fetch_add(local, std::memory_order_relaxed);
+        });
+        failures += invalid_failures.load(std::memory_order_relaxed);
         const auto label = "whole/" + std::string(f.fp8 ? "fp8" : "nvfp4") + "/M" +
                            std::to_string(c.m) + "/hits" + std::to_string(c.hits) + "/recipe" +
                            std::to_string(f.recipe) + "/phase" + std::to_string(phase);

@@ -4,7 +4,10 @@
 #include "ops/op_tester.h"
 
 #include <algorithm>
+#include <charconv>
 #include <chrono>
+#include <cstdlib>
+#include <string_view>
 #include <future>
 #include <iostream>
 #include <map>
@@ -138,13 +141,31 @@ int OpSuite::main(int argc, char** argv) const {
 
 void parallel_rows(int rows, std::uint64_t work, const std::function<void(int, int)>& run) {
     static thread_local bool in_worker = false;
-    if (rows < 2 || work < 262144 || in_worker) {
+    if (rows < 2 || work < 65536 || in_worker) {
         run(0, rows);
         return;
     }
-    const unsigned threads = std::min(8U, std::max(1U, std::thread::hardware_concurrency()));
-    static TaskPool pool({.threads = threads, .queue_capacity = threads});
-    const int parts = std::min(rows, static_cast<int>(threads));
+    static const int threads = [] {
+        // An explicit override also works when CTest supplies its reserved processor count.
+        const int fallback = std::min(8U, std::max(1U, std::thread::hardware_concurrency()));
+        for (const char* name : {"NINFER_TEST_THREADS", "NINFER_TEST_PROCESSORS"}) {
+            if (const char* value = std::getenv(name)) {
+                const std::string_view text(value);
+                int count         = 0;
+                const auto end    = text.data() + text.size();
+                const auto parsed = std::from_chars(text.data(), end, count);
+                if (parsed.ec == std::errc{} && parsed.ptr == end && count > 0) return count;
+            }
+        }
+        return fallback;
+    }();
+    if (threads == 1) {
+        run(0, rows);
+        return;
+    }
+    static TaskPool pool({.threads        = static_cast<unsigned>(threads),
+                          .queue_capacity = static_cast<std::size_t>(threads)});
+    const int parts = std::min(rows, threads);
     std::vector<std::future<void>> results;
     results.reserve(parts);
     try {
@@ -157,8 +178,9 @@ void parallel_rows(int rows, std::uint64_t work, const std::function<void(int, i
                 run(static_cast<std::int64_t>(rows) * part / parts,
                     static_cast<std::int64_t>(rows) * (part + 1) / parts);
             });
-            results.push_back(task->get_future());
+            auto result = task->get_future();
             pool.enqueue([task] { (*task)(); });
+            results.push_back(std::move(result));
         }
     } catch (...) {
         for (auto& result : results) result.wait();

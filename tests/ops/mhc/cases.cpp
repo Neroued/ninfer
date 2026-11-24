@@ -1,4 +1,6 @@
 #include "support.h"
+
+#include <atomic>
 #include "core/decode_graph.h"
 
 namespace ninfer::test::mhc {
@@ -17,13 +19,20 @@ int verify(const Fixture& f, const std::string& label) {
                             std::cerr << label << ": expansion changed BF16 words\n";
                             return 1;
                         }
-        } else
-            for (int m = 0; m < f.m; ++m) {
-                const auto expected = post_reference(f, m);
-                failed += verify_reduction(label + " residual",
-                                           std::span(residual.data() + std::size_t(m) * K, K),
-                                           expected, kBf16);
-            }
+        } else {
+            std::atomic<int> errors = 0;
+            parallel_rows(f.m, f.x.size(), [&](int first, int last) {
+                int local = 0;
+                for (int m = first; m < last; ++m) {
+                    const auto expected = post_reference(f, m);
+                    local += verify_reduction(label + " residual",
+                                              std::span(residual.data() + std::size_t(m) * K, K),
+                                              expected, kBf16);
+                }
+                errors.fetch_add(local, std::memory_order_relaxed);
+            });
+            failed += errors.load(std::memory_order_relaxed);
+        }
     }
     if (f.form == Form::Post) return failed;
     const auto actual = from_device_bf16(f.outputs.block_input.data, f.y.size());
@@ -39,53 +48,62 @@ int verify(const Fixture& f, const std::string& label) {
             for (auto v : *values)
                 if (!std::isfinite(v)) return failed + 1;
     }
-    for (int m = 0; m < f.m; ++m) {
-        if (f.m > 128 && m >= 8 && m != f.m / 2 && m != f.m - 1) continue;
-        std::vector<double> x(K);
-        if (f.form == Form::Pre)
-            std::copy_n(f.x.data() + std::size_t(m) * K, K, x.data());
-        else if (f.form == Form::ExpandPre)
-            for (int i = 0; i < S; ++i)
-                std::copy_n(f.y.data() + std::size_t(m) * D, D, x.data() + i * D);
-        else {
-            x = post_reference(f, m);
-            for (auto& v : x) v = round_bf16(v);
-        }
-        if (f.form == Form::PostMeanNorm) {
-            std::vector<double> expected(D);
-            double ss = 0;
-            for (int d = 0; d < D; ++d) {
-                for (int j = 0; j < S; ++j) expected[d] += x[j * D + d] / S;
-                ss += expected[d] * expected[d];
+    std::vector<int> sampled;
+    for (int m = 0; m < f.m; ++m)
+        if (f.m <= 128 || m < 8 || m == f.m / 2 || m == f.m - 1) sampled.push_back(m);
+    std::atomic<int> errors = 0;
+    parallel_rows(sampled.size(), std::uint64_t(sampled.size()) * K * N, [&](int first, int last) {
+        int local = 0;
+        for (int row = first; row < last; ++row) {
+            const int m = sampled[row];
+            std::vector<double> x(K);
+            if (f.form == Form::Pre)
+                std::copy_n(f.x.data() + std::size_t(m) * K, K, x.data());
+            else if (f.form == Form::ExpandPre)
+                for (int i = 0; i < S; ++i)
+                    std::copy_n(f.y.data() + std::size_t(m) * D, D, x.data() + i * D);
+            else {
+                x = post_reference(f, m);
+                for (auto& v : x) v = round_bf16(v);
             }
-            const double inverse = 1 / std::sqrt(ss / D + f.final_epsilon);
-            for (int d = 0; d < D; ++d) expected[d] *= inverse * double(f.gamma[d]);
-            failed += verify_reduction(label + " hidden",
-                                       std::span(actual.data() + std::size_t(m) * D, D), expected,
-                                       kFinalHidden);
-            continue;
-        }
-        const auto check_pre = [&](const PreReference& expected, const char* suffix,
-                                   const ReductionCriterion& coefficient_criterion,
-                                   const ReductionCriterion& block_criterion) {
-            int errors = verify_reduction(label + suffix + " block",
+            if (f.form == Form::PostMeanNorm) {
+                std::vector<double> expected(D);
+                double ss = 0;
+                for (int d = 0; d < D; ++d) {
+                    for (int j = 0; j < S; ++j) expected[d] += x[j * D + d] / S;
+                    ss += expected[d] * expected[d];
+                }
+                const double inverse = 1 / std::sqrt(ss / D + f.final_epsilon);
+                for (int d = 0; d < D; ++d) expected[d] *= inverse * double(f.gamma[d]);
+                local += verify_reduction(label + " hidden",
                                           std::span(actual.data() + std::size_t(m) * D, D),
-                                          expected.u, block_criterion);
-            errors += verify_reduction(label + suffix + " q", std::span(q.data() + m * S, S),
-                                       expected.q, coefficient_criterion);
-            errors +=
-                verify_reduction(label + suffix + " C", std::span(c.data() + m * S * S, S * S),
-                                 expected.c, coefficient_criterion);
-            return errors;
-        };
-        failed += check_pre(pre_reference(f, x), " formula",
-                            f.form == Form::PostPre ? kFusedCoefficients : kCoefficients,
-                            f.form == Form::PostPre ? kFusedBlock : kBf16);
-        if (f.form == Form::PostPre)
-            failed +=
-                check_pre(pre_reference(f, std::span(residual.data() + std::size_t(m) * K, K)),
-                          " published BF16 seam", kCoefficients, kBf16);
-    }
+                                          expected, kFinalHidden);
+                continue;
+            }
+            const auto check_pre = [&](const PreReference& expected, const char* suffix,
+                                       const ReductionCriterion& coefficient_criterion,
+                                       const ReductionCriterion& block_criterion) {
+                int errors = verify_reduction(label + suffix + " block",
+                                              std::span(actual.data() + std::size_t(m) * D, D),
+                                              expected.u, block_criterion);
+                errors += verify_reduction(label + suffix + " q", std::span(q.data() + m * S, S),
+                                           expected.q, coefficient_criterion);
+                errors +=
+                    verify_reduction(label + suffix + " C", std::span(c.data() + m * S * S, S * S),
+                                     expected.c, coefficient_criterion);
+                return errors;
+            };
+            local += check_pre(pre_reference(f, x), " formula",
+                               f.form == Form::PostPre ? kFusedCoefficients : kCoefficients,
+                               f.form == Form::PostPre ? kFusedBlock : kBf16);
+            if (f.form == Form::PostPre)
+                local +=
+                    check_pre(pre_reference(f, std::span(residual.data() + std::size_t(m) * K, K)),
+                              " published BF16 seam", kCoefficients, kBf16);
+        }
+        errors.fetch_add(local, std::memory_order_relaxed);
+    });
+    failed += errors.load(std::memory_order_relaxed);
     return failed;
 }
 

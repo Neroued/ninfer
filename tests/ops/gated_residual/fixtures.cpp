@@ -28,18 +28,54 @@ Fixture::Fixture(Form f, int m, bool alias, int w)
       tr(alias ? dh.span() : dr.span(), DType::BF16, {width, kStreams, m}),
       tz(dz.span(), DType::BF16, {width, kStreams, m}) {}
 
+namespace {
+
+struct UniformPrefix {
+    UniformPrefix(unsigned seed, float lo, float hi) : generator(seed), distribution(lo, hi) {}
+
+    void copy_to(std::span<float> destination) {
+        if (prefix.size() < destination.size()) {
+            const auto previous = prefix.size();
+            prefix.resize(destination.size());
+            for (std::size_t i = previous; i < prefix.size(); ++i)
+                prefix[i] = distribution(generator);
+        }
+        std::copy_n(prefix.begin(), destination.size(), destination.begin());
+    }
+
+    std::mt19937 generator;
+    std::uniform_real_distribution<float> distribution;
+    std::vector<float> prefix;
+};
+
+} // namespace
+
 void Fixture::set(Pattern pattern, int phase) {
     epsilon = kEpsilon;
-    fill_uniform(h, 3101U + phase, -1.0F, 1.0F);
-    fill_uniform(block, 3201U + phase, -0.75F, 0.75F);
+    const bool random_input =
+        pattern == Pattern::Random || pattern == Pattern::Affine || pattern == Pattern::Small;
+    if (random_input) {
+        // Every case starts from the same seeded prefixes. Grow them in draw order.
+        if (phase == 0) {
+            static thread_local UniformPrefix residual(3101U, -1.0F, 1.0F);
+            static thread_local UniformPrefix branch(3201U, -0.75F, 0.75F);
+            residual.copy_to(h);
+            branch.copy_to(block);
+        } else {
+            fill_uniform(h, 3101U + phase, -1.0F, 1.0F);
+            fill_uniform(block, 3201U + phase, -0.75F, 0.75F);
+        }
+        parallel_rows(columns, h.size(), [&](int first, int last) {
+            for (int m = first; m < last; ++m)
+                for (int s = 0; s < kStreams; ++s) {
+                    const float scale = std::ldexp(1.0F, s - 1);
+                    const auto base   = (std::size_t(m) * kStreams + s) * width;
+                    for (int d = 0; d < width; ++d) h[base + d] *= scale;
+                }
+        });
+    }
     fill_uniform(weight, 3301U + phase, -0.25F, 0.25F);
     fill_uniform(injection, 3401U + phase, 0.0F, 2.0F);
-    for (int m = 0; m < columns; ++m)
-        for (int s = 0; s < kStreams; ++s) {
-            const float scale = std::ldexp(1.0F, s - 1);
-            const auto base   = (std::size_t(m) * kStreams + s) * width;
-            for (int d = 0; d < width; ++d) h[base + d] *= scale;
-        }
     if (pattern == Pattern::Affine) {
         for (int s = 0; s < kStreams; ++s)
             for (int d = 0; d < width; ++d)
@@ -82,23 +118,22 @@ void Fixture::set(Pattern pattern, int phase) {
         for (auto& value : h) value *= 1.0e-4F;
         for (auto& value : block) value *= 1.0e-4F;
     }
-    round_to_bf16(h);
-    round_to_bf16(block);
+    parallel_elements(h.size(), [&](std::size_t i) { h[i] = bf16_to_f32(f32_to_bf16(h[i])); });
+    parallel_elements(block.size(),
+                      [&](std::size_t i) { block[i] = bf16_to_f32(f32_to_bf16(block[i])); });
     round_to_bf16(weight);
 }
 
 namespace {
 void upload_bf16(GuardedDeviceBuffer& buffer, const std::vector<float>& values) {
-    std::vector<std::uint16_t> bits(values.size());
-    std::transform(values.begin(), values.end(), bits.begin(), f32_to_bf16);
+    const auto bits = bf16_words(values);
     buffer.copy_from_host(bits.data(), bits.size() * 2);
 }
 
 int unchanged(const std::string& label, const GuardedDeviceBuffer& buffer,
               const std::vector<float>& values, bool bf16) {
     if (bf16) {
-        std::vector<std::uint16_t> expected(values.size());
-        std::transform(values.begin(), values.end(), expected.begin(), f32_to_bf16);
+        const auto expected = bf16_words(values);
         return verify_exact(label.c_str(), from_device<std::uint16_t>(buffer.data(), values.size()),
                             expected);
     }

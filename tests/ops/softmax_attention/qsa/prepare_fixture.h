@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ops/suite.h"
+
 #include "cache_reference.h"
 #include "ninfer/ops/qsa.h"
 #include "ops/op_tester.h"
@@ -272,34 +274,41 @@ struct Fixture {
                 for (int c = 0; c < 128; ++c)
                     tail.at(c, j, s) = j < f % 4 ? sample(f - f % 4 + j, b, c, 17 + phase) : 0;
             for (int a = 0; a < 3; ++a) first.at(a, s) = f % 4 ? rho(f - f % 4, b, a, phase) : 0;
-            for (int t = 0; t < valid.at(b); ++t) {
-                const int p        = f + t;
-                positions.at(t, b) = p;
-                for (int a = 0; a < A; ++a) rope.at(t, a, b) = rho(p, b, a, phase);
-                const int logical = p / 64;
-                tables.at(logical, table_rows.at(b)) =
-                    1 + (B - 1 - b) * pages_per_row + pages_per_row - 1 - (logical - f / 64);
-                for (int h = 0; h < query_heads; ++h)
-                    for (int c = 0; c < 256; ++c)
-                        q.at(c, h, t, b) = sample(p, b, c + 256 * h, 3 + phase);
-                for (int h = 0; h < kv_heads; ++h)
-                    for (int c = 0; c < 256; ++c) {
-                        k.at(c, h, t, b) = sample(p, b, c + 256 * h, 7 + phase);
-                        v.at(c, h, t, b) = sample(p, b, c + 256 * h, 11 + phase);
-                    }
-                for (int h = 0; h < 4; ++h)
-                    for (int c = 0; c < 128; ++c)
-                        iq.at(c, h, t, b) = sample(p, b, c + 128 * h, 13 + phase);
-                for (int c = 0; c < 128; ++c) ik.at(c, t, b) = sample(p, b, c, 17 + phase);
-                constexpr std::uint16_t casts[]{0,      0x8000, 0x3300, 0x3380,
-                                                0x3880, 0x477f, 0x4780, 0xc780};
-                for (int c = 0; c < 8; ++c) v.at(c, 0, t, b) = casts[c];
-            }
-            if (valid.at(b) == 0) {
+            if (valid.at(b) > 0) {
+                for (int logical = f / 64; logical <= (f + valid.at(b) - 1) / 64; ++logical)
+                    tables.at(logical, table_rows.at(b)) =
+                        1 + (B - 1 - b) * pages_per_row + pages_per_row - 1 - (logical - f / 64);
+            } else {
                 slots.at(b)      = -1;
                 table_rows.at(b) = -1;
             }
         }
+        parallel_rows(B * T, std::uint64_t(B) * T * 256 * query_heads,
+                      [&](int first_row, int last_row) {
+                          for (int row = first_row; row < last_row; ++row) {
+                              const int b = row / T, t = row % T;
+                              if (t >= valid.at(b)) continue;
+                              const int p        = bases[b] + t;
+                              positions.at(t, b) = p;
+                              for (int a = 0; a < A; ++a) rope.at(t, a, b) = rho(p, b, a, phase);
+                              for (int h = 0; h < query_heads; ++h)
+                                  for (int c = 0; c < 256; ++c)
+                                      q.at(c, h, t, b) = sample(p, b, c + 256 * h, 3 + phase);
+                              for (int h = 0; h < kv_heads; ++h)
+                                  for (int c = 0; c < 256; ++c) {
+                                      k.at(c, h, t, b) = sample(p, b, c + 256 * h, 7 + phase);
+                                      v.at(c, h, t, b) = sample(p, b, c + 256 * h, 11 + phase);
+                                  }
+                              for (int h = 0; h < 4; ++h)
+                                  for (int c = 0; c < 128; ++c)
+                                      iq.at(c, h, t, b) = sample(p, b, c + 128 * h, 13 + phase);
+                              for (int c = 0; c < 128; ++c)
+                                  ik.at(c, t, b) = sample(p, b, c, 17 + phase);
+                              constexpr std::uint16_t casts[]{0,      0x8000, 0x3300, 0x3380,
+                                                              0x3880, 0x477f, 0x4780, 0xc780};
+                              for (int c = 0; c < 8; ++c) v.at(c, 0, t, b) = casts[c];
+                          }
+                      });
         upload();
     }
 

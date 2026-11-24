@@ -107,16 +107,17 @@ struct Oracle::Impl {
         const auto s      = fixture.shape;
         const auto& gu    = matrix(expert, true);
         const auto& input = fixture.input_words();
+        std::vector<double> x(s.hidden);
+        for (int k = 0; k < s.hidden; ++k)
+            x[k] = codec::bf16_to_f32(input[std::size_t(token) * s.hidden + k]);
         std::vector<double> result(s.intermediate);
         parallel_rows(s.intermediate, std::uint64_t(s.intermediate) * s.hidden * 2,
                       [&](int begin, int end) {
                           for (int row = begin; row < end; ++row) {
                               double gate = 0, up = 0;
                               for (int k = 0; k < s.hidden; ++k) {
-                                  const double x =
-                                      codec::bf16_to_f32(input[std::size_t(token) * s.hidden + k]);
-                                  gate += gu[std::size_t(row) * s.hidden + k] * x;
-                                  up += gu[std::size_t(row + s.intermediate) * s.hidden + k] * x;
+                                  gate += gu[std::size_t(row) * s.hidden + k] * x[k];
+                                  up += gu[std::size_t(row + s.intermediate) * s.hidden + k] * x[k];
                               }
                               if (s.clamped) {
                                   gate = std::min(gate, 10.0);
@@ -141,6 +142,12 @@ struct Oracle::Impl {
 Oracle::Oracle(const Fixture& fixture) : impl_(std::make_unique<Impl>(fixture)) {}
 
 Oracle::~Oracle() = default;
+
+void Oracle::reset_input() {
+    impl_->products.clear();
+    impl_->selected.clear();
+    impl_->shared_coefficient.clear();
+}
 
 std::pair<std::vector<int>, std::vector<double>> Oracle::routing(int token) {
     return impl_->routing(token);

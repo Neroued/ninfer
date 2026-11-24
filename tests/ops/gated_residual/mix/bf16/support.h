@@ -26,7 +26,7 @@ struct Fixture {
     Fixture(Weights& weights, int columns);
     void upload(std::span<const float> catalog, cudaStream_t stream);
     void invoke(CudaExecutionView execution);
-    int check(const std::string& label) const;
+    int check(const std::string& label, bool preserve_input = true) const;
     std::size_t query(int first, int last) const;
 
     Weights& weights;

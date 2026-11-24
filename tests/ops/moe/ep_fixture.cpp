@@ -1,5 +1,6 @@
 #include "ops/moe/ep_fixture.h"
 #include "ops/quantized_weight.h"
+#include "expert_oracle.h"
 #include "core/buffer.h"
 #include <algorithm>
 #include <array>
@@ -17,10 +18,15 @@ namespace {
 namespace q                 = quantized_weight;
 constexpr std::size_t Guard = 256;
 
+void serial_rows(int rows, std::uint64_t, const std::function<void(int, int)>& run) {
+    run(0, rows);
+}
+
 struct Matrix {
     int n, k;
     Device device;
     bool fp8;
+    Weights::RunRows run_rows;
     DeviceBuffer storage, indices, divisors;
     std::vector<q::PackedWeight> packed;
     std::vector<std::vector<float>> decoded;
@@ -29,9 +35,9 @@ struct Matrix {
     std::size_t stride = 0, scale_offset = 0, encoded = 0;
 
     Matrix(Device dev, int rows, int columns, unsigned seed, const std::vector<int>& ids,
-           bool is_fp8)
-        : n(rows), k(columns), device(dev), fp8(is_fp8), indices(dev, E * 8),
-          divisors(dev, is_fp8 ? 0 : E * 4), packed(Local), decoded(Local) {
+           bool is_fp8, Weights::RunRows rows_executor)
+        : n(rows), k(columns), device(dev), fp8(is_fp8), run_rows(rows_executor),
+          indices(dev, E * 8), divisors(dev, is_fp8 ? 0 : E * 4), packed(Local), decoded(Local) {
         q::PackedWeight base;
         if (fp8) {
             base.code_plane_bytes   = std::size_t(n) * k;
@@ -52,32 +58,38 @@ struct Matrix {
         encoded      = base.code_plane_bytes + base.scale_plane_bytes;
         storage      = DeviceBuffer(dev, Local * stride + 2 * Guard);
         storage.fill(0xa5);
-        for (int ordinal = 0; ordinal < Local; ++ordinal) {
-            const int e = ids[ordinal], slot = (73 * ordinal + 19) & 255;
-            packed[slot] = base;
-            auto& p      = packed[slot];
-            for (std::size_t b = 0; b < p.code_plane_bytes; ++b) {
-                unsigned code = q::detail::mix64(b + seed + std::uint64_t(e) * 998123ULL) & 255;
-                if (fp8 && (code & 127) == 127) --code;
-                p.payload[b] = code;
+        run_rows(Local, std::uint64_t(Local) * stride, [&](int first, int last) {
+            for (int ordinal = first; ordinal < last; ++ordinal) {
+                const int e = ids[ordinal], slot = (73 * ordinal + 19) & 255;
+                packed[slot] = base;
+                auto& p      = packed[slot];
+                for (std::size_t b = 0; b < p.code_plane_bytes; ++b) {
+                    unsigned code = q::detail::mix64(b + seed + std::uint64_t(e) * 998123ULL) & 255;
+                    if (fp8 && (code & 127) == 127) --code;
+                    p.payload[b] = code;
+                }
+                // Fingerprints are finite, represented values and unique for every global ID.
+                const std::size_t fingerprint = fp8 && n == 2 * I ? std::size_t(128) * k : 0;
+                p.payload[fingerprint]        = fp8 ? std::uint8_t(e & 63) : std::uint8_t(e);
+                p.payload[fingerprint + 1] =
+                    fp8 ? std::uint8_t(0x18 + (e >> 6)) : (e < 256 ? 0x5a : 0xa5);
+                if (fp8)
+                    for (int nr = 0; nr < n / 128; ++nr)
+                        for (int kc = 0; kc < k / 128; ++kc) {
+                            const float scale =
+                                n == 2 * I && nr == 0
+                                    ? 0
+                                    : (1 + (nr * 3 + kc * 7 + seed + e) % 13) * .0000083F;
+                            const auto bits = q::detail::float_bits(scale);
+                            const auto bf16 =
+                                std::uint16_t((bits + 0x7fff + ((bits >> 16) & 1)) >> 16);
+                            q::detail::store_u16_le(
+                                p.payload, scale_offset + ((nr * (k / 128) + kc) * 2), bf16);
+                        }
             }
-            // Fingerprints are finite, represented values and unique for every global ID.
-            const std::size_t fingerprint = fp8 && n == 2 * I ? std::size_t(128) * k : 0;
-            p.payload[fingerprint]        = fp8 ? std::uint8_t(e & 63) : std::uint8_t(e);
-            p.payload[fingerprint + 1] =
-                fp8 ? std::uint8_t(0x18 + (e >> 6)) : (e < 256 ? 0x5a : 0xa5);
-            if (fp8)
-                for (int nr = 0; nr < n / 128; ++nr)
-                    for (int kc = 0; kc < k / 128; ++kc) {
-                        const float scale =
-                            n == 2 * I && nr == 0
-                                ? 0
-                                : (1 + (nr * 3 + kc * 7 + seed + e) % 13) * .0000083F;
-                        const auto bits = q::detail::float_bits(scale);
-                        const auto bf16 = std::uint16_t((bits + 0x7fff + ((bits >> 16) & 1)) >> 16);
-                        q::detail::store_u16_le(p.payload,
-                                                scale_offset + ((nr * (k / 128) + kc) * 2), bf16);
-                    }
+        });
+        for (int slot = 0; slot < Local; ++slot) {
+            const auto& p = packed[slot];
             CUDA_CHECK(cudaMemcpy(static_cast<std::byte*>(storage.data()) + Guard + slot * stride,
                                   p.payload.data(), p.payload.size(), cudaMemcpyHostToDevice));
         }
@@ -101,17 +113,20 @@ struct Matrix {
         auto& values = decoded[slot];
         if (values.empty()) {
             values.resize(std::size_t(n) * k);
-            for (int r = 0; r < n; ++r)
-                for (int c = 0; c < k; ++c)
-                    if (fp8) {
-                        const auto& p   = packed[slot];
-                        const auto bits = q::detail::load_u16_le(
-                            p.payload, scale_offset + ((r / 128) * (k / 128) + c / 128) * 2);
-                        values[std::size_t(r) * k + c] =
-                            q::detail::decode_e4m3fn(p.payload[std::size_t(r) * k + c]) *
-                            q::detail::bf16_to_f32(bits);
-                    } else
-                        values[std::size_t(r) * k + c] = q::logical_weight_fp64(packed[slot], r, c);
+            run_rows(n, std::uint64_t(n) * k, [&](int first, int last) {
+                for (int r = first; r < last; ++r)
+                    for (int c = 0; c < k; ++c)
+                        if (fp8) {
+                            const auto& p   = packed[slot];
+                            const auto bits = q::detail::load_u16_le(
+                                p.payload, scale_offset + ((r / 128) * (k / 128) + c / 128) * 2);
+                            values[moe_oracle::weight_index(r, c, k)] =
+                                q::detail::decode_e4m3fn(p.payload[std::size_t(r) * k + c]) *
+                                q::detail::bf16_to_f32(bits);
+                        } else
+                            values[moe_oracle::weight_index(r, c, k)] =
+                                q::logical_weight_fp64(packed[slot], r, c);
+            });
         }
         return values;
     }
@@ -163,12 +178,12 @@ struct Weights::Impl {
     Device device;
     Placement place;
     bool fp8;
-    int rank, phase = 0;
+    int rank;
     std::vector<int> ids;
     DeviceBuffer mask;
     std::array<int, E> mask_host{};
     Matrix gu, down;
-    std::map<std::tuple<int, int, int>, std::vector<double>> cache;
+    std::array<std::map<std::pair<int, int>, std::vector<double>>, Local> cache;
 
     static std::vector<int> assigned(Placement p, int side) {
         if (side < 0 || side > 1) throw std::invalid_argument("EP side");
@@ -178,13 +193,14 @@ struct Weights::Impl {
         return result;
     }
 
-    Impl(Device dev, Placement p, int side, bool is_fp8)
+    Impl(Device dev, Placement p, int side, bool is_fp8, RunRows run_rows)
         : device(dev), place(p), fp8(is_fp8), rank(side), ids(assigned(p, side)), mask(dev, E * 4),
-          gu(dev, 2 * I, H, 101, ids, is_fp8), down(dev, H, I, 211, ids, is_fp8) {}
+          gu(dev, 2 * I, H, 101, ids, is_fp8, run_rows),
+          down(dev, H, I, 211, ids, is_fp8, run_rows) {}
 };
 
-Weights::Weights(Device d, Placement p, int side, bool fp8)
-    : impl_(std::make_unique<Impl>(d, p, side, fp8)) {
+Weights::Weights(Device d, Placement p, int side, bool fp8, RunRows run_rows)
+    : impl_(std::make_unique<Impl>(d, p, side, fp8, run_rows ? run_rows : serial_rows)) {
     if (side < 0 || side > 1) throw std::invalid_argument("EP side");
     publish();
 }
@@ -216,7 +232,6 @@ ops::ExpertSubset Weights::subset() const {
 
 void Weights::publish(int phase, bool drop_half) {
     auto& f = *impl_;
-    f.phase = phase;
     f.gu.offsets.fill(UINT64_MAX);
     f.down.offsets.fill(UINT64_MAX);
     for (int e = 0; e < E; ++e)
@@ -254,25 +269,39 @@ std::size_t Weights::backing_bytes() const {
 }
 
 const std::vector<double>& Weights::oracle(int pattern, int e, std::span<const float> x) {
-    auto& f  = *impl_;
-    auto key = std::tuple{pattern, e, f.phase};
-    if (auto it = f.cache.find(key); it != f.cache.end()) return it->second;
+    using namespace moe_oracle;
+    static_assert(H % kRows == 0 && I % kRows == 0);
+    auto& f = *impl_;
     if (f.gu.offsets[e] == UINT64_MAX) throw std::logic_error("oracle requested remote payload");
-    const auto& gu   = f.gu.values(f.gu.offsets[e] / f.gu.stride);
+    const auto slot = f.gu.offsets[e] / f.gu.stride;
+    // Replay can remap a logical expert to another slot. Reuse a result only when
+    // both the represented payload and the logical expert's divisor are the same.
+    const auto key = std::pair{pattern, f.fp8 ? 0 : e % 8};
+    auto& cache    = f.cache[slot];
+    if (auto it = cache.find(key); it != cache.end()) return it->second;
+    const auto& gu   = f.gu.values(slot);
     const auto& down = f.down.values(f.down.offsets[e] / f.down.stride);
-    std::vector<double> h(I), out(H);
+    std::vector<double> input(x.begin(), x.end()), h(I), out(H);
     const double gd = f.gu.dw[e], dd = f.down.dw[e];
-    for (int row = 0; row < I; ++row) {
-        double g = 0, u = 0;
-        for (int c = 0; c < H; ++c) {
-            g += double(x[c]) * gu[std::size_t(row) * H + c] / gd;
-            u += double(x[c]) * gu[std::size_t(row + I) * H + c] / gd;
+    f.gu.run_rows(I / kRows, std::uint64_t(I) * H, [&](int first, int last) {
+        for (int tile = first; tile < last; ++tile) {
+            const int row   = tile * kRows;
+            const auto gate = project(gu.data() + std::size_t(row) * H, input, gd);
+            const auto up   = project(gu.data() + std::size_t(row + I) * H, input, gd);
+            for (int lane = 0; lane < kRows; ++lane) {
+                double g = gate[lane], u = up[lane];
+                h[row + lane] = g / (1 + std::exp(-g)) * u;
+            }
         }
-        h[row] = g / (1 + std::exp(-g)) * u;
-    }
-    for (int row = 0; row < H; ++row)
-        for (int c = 0; c < I; ++c) out[row] += h[c] * down[std::size_t(row) * I + c] / dd;
-    return f.cache.emplace(key, std::move(out)).first->second;
+    });
+    f.gu.run_rows(H / kRows, std::uint64_t(H) * I, [&](int first, int last) {
+        for (int tile = first; tile < last; ++tile) {
+            const int row     = tile * kRows;
+            const auto values = project(down.data() + std::size_t(row) * I, h, dd);
+            std::copy(values.begin(), values.end(), out.begin() + row);
+        }
+    });
+    return cache.emplace(key, std::move(out)).first->second;
 }
 
 int Weights::verify_controls() const {
@@ -288,7 +317,7 @@ int Weights::verify_payloads() const {
 void Weights::release_host_oracle() {
     impl_->gu.release();
     impl_->down.release();
-    impl_->cache.clear();
+    for (auto& cache : impl_->cache) cache.clear();
 }
 
 Routes make_routes(const Weights& w, int tokens, const char* distribution, int fixed_hits) {

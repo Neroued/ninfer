@@ -30,7 +30,8 @@ struct Fixture {
     Fixture(Weights&, int, bool, ops::LinearPolicy, ops::LinearPolicy);
     void upload(std::span<const float>, cudaStream_t);
     void invoke(CudaExecutionView);
-    int check(std::span<const float>, const Ref&, const std::string&) const;
+    int check(std::span<const float>, const Ref&, const std::string&,
+              bool preserve_input = true) const;
     Weights& weights;
     int m;
     bool final;

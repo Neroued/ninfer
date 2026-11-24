@@ -1,5 +1,6 @@
 if(NINFER_TARGET STREQUAL "dgx_spark")
   ninfer_add_op_test(ninfer_mhc_test
+    PROCESSORS 2 COST 65
     SOURCES "${CMAKE_CURRENT_LIST_DIR}/main.cpp"
             "${CMAKE_CURRENT_LIST_DIR}/fixture.cpp"
             "${CMAKE_CURRENT_LIST_DIR}/oracle.cpp"

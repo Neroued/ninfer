@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ops/suite.h"
+
 #include "cuda_fixture.h"
 #include "core/buffer.h"
 #include "core/weight.h"
@@ -16,33 +18,47 @@
 
 namespace ninfer::test::direct_bf16_weight {
 
+inline Weight device_weight(int n, int k, ConstMemorySpan storage) {
+    const void* data = storage.data;
+    const auto bytes = std::size_t(n) * k * sizeof(std::uint16_t);
+    if (storage.bytes < bytes) { throw std::out_of_range("BF16 weight backing is too small"); }
+    Weight weight{};
+    weight.device          = storage.device;
+    weight.payload         = data;
+    weight.payload_bytes   = bytes;
+    weight.qtype           = QType::BF16;
+    weight.shape[0]        = n;
+    weight.shape[1]        = k;
+    weight.padded_shape[0] = n;
+    weight.padded_shape[1] = k;
+    weight.ndim            = 2;
+    weight.qdata           = data;
+    weight.n               = n;
+    weight.k               = k;
+    weight.layout          = QuantLayout::Contiguous;
+    return weight;
+}
+
 struct HostWeight {
     std::int32_t n = 0;
     std::int32_t k = 0;
     std::vector<std::uint16_t> bits;
 
     [[nodiscard]] Weight device_weight(ConstMemorySpan storage) const {
-        const void* data = storage.data;
-        if (storage.bytes < bits.size() * sizeof(std::uint16_t)) {
-            throw std::out_of_range("BF16 weight backing is too small");
-        }
-        Weight weight{};
-        weight.device          = storage.device;
-        weight.payload         = data;
-        weight.payload_bytes   = bits.size() * sizeof(std::uint16_t);
-        weight.qtype           = QType::BF16;
-        weight.shape[0]        = n;
-        weight.shape[1]        = k;
-        weight.padded_shape[0] = n;
-        weight.padded_shape[1] = k;
-        weight.ndim            = 2;
-        weight.qdata           = data;
-        weight.n               = n;
-        weight.k               = k;
-        weight.layout          = QuantLayout::Contiguous;
-        return weight;
+        return direct_bf16_weight::device_weight(n, k, storage);
     }
 };
+
+inline std::uint16_t patterned_word(int row, int column, std::uint32_t seed) {
+    std::uint32_t hash = static_cast<std::uint32_t>(row) * 0x9e3779b9U ^
+                         static_cast<std::uint32_t>(column) * 0x85ebca6bU ^ seed * 0xc2b2ae35U;
+    hash ^= hash >> 16;
+    hash *= 0x7feb352dU;
+    hash ^= hash >> 15;
+    const int centered = static_cast<int>((hash >> 8) & 0xffU) - 128;
+    const float value  = static_cast<float>(centered) * (1.0F / 1024.0F);
+    return f32_to_bf16(value);
+}
 
 inline HostWeight make_patterned(std::int32_t n, std::int32_t k, std::uint32_t seed) {
     if (n <= 0 || k <= 0) {
@@ -52,19 +68,14 @@ inline HostWeight make_patterned(std::int32_t n, std::int32_t k, std::uint32_t s
     result.n = n;
     result.k = k;
     result.bits.resize(static_cast<std::size_t>(n) * k);
-    for (std::int32_t row = 0; row < n; ++row) {
-        for (std::int32_t column = 0; column < k; ++column) {
-            std::uint32_t hash = static_cast<std::uint32_t>(row) * 0x9e3779b9U ^
-                                 static_cast<std::uint32_t>(column) * 0x85ebca6bU ^
-                                 seed * 0xc2b2ae35U;
-            hash ^= hash >> 16;
-            hash *= 0x7feb352dU;
-            hash ^= hash >> 15;
-            const int centered = static_cast<int>((hash >> 8) & 0xffU) - 128;
-            const float value  = static_cast<float>(centered) * (1.0F / 1024.0F);
-            result.bits[static_cast<std::size_t>(row) * k + column] = f32_to_bf16(value);
+    parallel_rows(n, std::uint64_t(n) * k, [&](int first, int last) {
+        for (int row = first; row < last; ++row) {
+            for (std::int32_t column = 0; column < k; ++column) {
+                result.bits[static_cast<std::size_t>(row) * k + column] =
+                    patterned_word(row, column, seed);
+            }
         }
-    }
+    });
     return result;
 }
 

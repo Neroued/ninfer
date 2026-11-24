@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
@@ -23,11 +24,17 @@
 #include <limits>
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
 
 namespace ninfer::test::linear {
+
+cudaError_t scan_sampled_output(const std::uint16_t* output, std::size_t words, int width,
+                                const int* rows, int nr, const int* columns, int nc,
+                                std::uint16_t* selected, unsigned* status, cudaStream_t stream);
+
 namespace {
 
 using linear_common::all_indices;
@@ -37,7 +44,6 @@ using linear_common::evenly_spaced_indices;
 constexpr std::size_t kOutputGuardBytes   = 256;
 constexpr std::uint8_t kOutputGuardByte   = 0xa5;
 constexpr std::uint8_t kOutputPoisonByte  = 0xff;
-constexpr std::size_t kOutputScanWords    = 1U << 20;
 constexpr int kOracleTBlock               = 8;
 constexpr double kBf16UnitRoundoff        = 1.0 / 256.0;
 constexpr double kA8QuantizationAllowance = 0.04;
@@ -59,53 +65,78 @@ constexpr ReductionCriterion tolerance_for(ops::LinearPolicy policy) {
 class GuardedOutput {
 public:
     explicit GuardedOutput(std::size_t words)
-        : storage_(words * sizeof(std::uint16_t), kOutputGuardBytes, kOutputGuardByte) {
-        poison();
+        : storage_(cuda_environment().context.device(),
+                   words * sizeof(std::uint16_t) + 2 * kOutputGuardBytes) {}
+
+    void* data() { return storage_.span().subspan(kOutputGuardBytes, payload_bytes_).data; }
+
+    MemorySpan span() { return storage_.span().subspan(kOutputGuardBytes, payload_bytes_); }
+
+    void set_extent(std::size_t words) { payload_bytes_ = words * sizeof(std::uint16_t); }
+
+    void poison(cudaStream_t stream) {
+        auto* payload = static_cast<std::uint8_t*>(data());
+        cuda_check(cudaMemsetAsync(payload - kOutputGuardBytes, kOutputGuardByte, kOutputGuardBytes,
+                                   stream),
+                   "initialize output prefix");
+        cuda_check(cudaMemsetAsync(payload, kOutputPoisonByte, payload_bytes_, stream),
+                   "poison linear output");
+        cuda_check(
+            cudaMemsetAsync(payload + payload_bytes_, kOutputGuardByte, kOutputGuardBytes, stream),
+            "initialize output suffix");
     }
 
-    void* data() { return storage_.data(); }
-
-    const void* data() const { return storage_.data(); }
-
-    MemorySpan span() { return storage_.span(); }
-
-    ConstMemorySpan span() const { return storage_.span(); }
-
-    void poison() { storage_.fill(kOutputPoisonByte); }
-
-    int verify_guards(std::string_view label) const { return storage_.verify_guards(label); }
+    int verify_guards(std::string_view label) {
+        const auto* payload = static_cast<const std::uint8_t*>(data());
+        std::array<std::uint8_t, 2 * kOutputGuardBytes> guards;
+        cuda_check(cudaMemcpy(guards.data(), payload - kOutputGuardBytes, kOutputGuardBytes,
+                              cudaMemcpyDeviceToHost),
+                   "read output prefix");
+        cuda_check(cudaMemcpy(guards.data() + kOutputGuardBytes, payload + payload_bytes_,
+                              kOutputGuardBytes, cudaMemcpyDeviceToHost),
+                   "read output suffix");
+        if (std::all_of(guards.begin(), guards.end(),
+                        [](auto byte) { return byte == kOutputGuardByte; }))
+            return 0;
+        std::cerr << label << ": device buffer guard was overwritten\n";
+        return 1;
+    }
 
 private:
-    GuardedDeviceBuffer storage_;
+    DeviceBuffer storage_;
+    std::size_t payload_bytes_ = 0;
 };
 
 std::vector<std::uint16_t> make_activation(std::int32_t k, std::int32_t t, std::uint32_t seed,
                                            ActivationRecipe recipe) {
     const std::size_t elements = checked_elements(k, t, "activation");
     std::vector<std::uint16_t> result(elements);
-    for (std::int32_t token = 0; token < t; ++token) {
-        for (std::int32_t column = 0; column < k; ++column) {
-            std::uint32_t coordinate = seed ^ (static_cast<std::uint32_t>(column) * 0x9e3779b9U) ^
-                                       (static_cast<std::uint32_t>(token) * 0x85ebca6bU);
-            if (recipe == ActivationRecipe::TokenBlocks) {
-                const std::uint64_t token_block = static_cast<std::uint64_t>(token / 256);
-                coordinate                      = static_cast<std::uint32_t>(
-                    static_cast<std::uint64_t>(column) * 17U +
-                    static_cast<std::uint64_t>(token) * 31U +
-                    static_cast<std::uint64_t>(seed) * 13U +
-                    token_block * (static_cast<std::uint64_t>(column / 256) * 13U + 47U));
-            } else {
-                coordinate ^= coordinate >> 16;
-                coordinate *= 0x7feb352dU;
-                coordinate ^= coordinate >> 15;
-                coordinate *= 0x846ca68bU;
-                coordinate ^= coordinate >> 16;
+    parallel_rows(t, elements, [&](int first, int last) {
+        for (int token = first; token < last; ++token) {
+            for (std::int32_t column = 0; column < k; ++column) {
+                std::uint32_t coordinate = seed ^
+                                           (static_cast<std::uint32_t>(column) * 0x9e3779b9U) ^
+                                           (static_cast<std::uint32_t>(token) * 0x85ebca6bU);
+                if (recipe == ActivationRecipe::TokenBlocks) {
+                    const std::uint64_t token_block = static_cast<std::uint64_t>(token / 256);
+                    coordinate                      = static_cast<std::uint32_t>(
+                        static_cast<std::uint64_t>(column) * 17U +
+                        static_cast<std::uint64_t>(token) * 31U +
+                        static_cast<std::uint64_t>(seed) * 13U +
+                        token_block * (static_cast<std::uint64_t>(column / 256) * 13U + 47U));
+                } else {
+                    coordinate ^= coordinate >> 16;
+                    coordinate *= 0x7feb352dU;
+                    coordinate ^= coordinate >> 15;
+                    coordinate *= 0x846ca68bU;
+                    coordinate ^= coordinate >> 16;
+                }
+                const int raw     = static_cast<int>(coordinate & 0xffU);
+                const float value = static_cast<float>(raw - 128) * (1.0F / 256.0F);
+                result[static_cast<std::size_t>(token) * k + column] = test::f32_to_bf16(value);
             }
-            const int raw     = static_cast<int>(coordinate & 0xffU);
-            const float value = static_cast<float>(raw - 128) * (1.0F / 256.0F);
-            result[static_cast<std::size_t>(token) * k + column] = test::f32_to_bf16(value);
         }
-    }
+    });
     return result;
 }
 
@@ -131,40 +162,34 @@ struct OutputRead {
 
 OutputRead read_output(const void* device, std::int32_t n, std::int32_t t,
                        std::span<const std::int32_t> rows, std::span<const std::int32_t> columns,
-                       std::string_view label) {
+                       std::span<std::uint16_t> host, std::string_view label) {
     const std::size_t total_words = checked_elements(n, t, "output");
-    std::vector<std::size_t> wanted;
-    wanted.reserve(rows.size() * columns.size());
-    for (const std::int32_t column : columns) {
-        for (const std::int32_t row : rows) {
-            wanted.push_back(static_cast<std::size_t>(column) * n + static_cast<std::size_t>(row));
-        }
-    }
-
     OutputRead result;
-    result.selected.resize(wanted.size());
-    std::vector<std::uint16_t> chunk(std::min(kOutputScanWords, total_words));
-    std::size_t wanted_index    = 0;
-    std::size_t poison_count    = 0;
-    std::size_t nonfinite_count = 0;
-    for (std::size_t begin = 0; begin < total_words; begin += chunk.size()) {
-        const std::size_t count = std::min(chunk.size(), total_words - begin);
-        cuda_check(
-            cudaMemcpy(chunk.data(),
-                       static_cast<const std::uint8_t*>(device) + begin * sizeof(std::uint16_t),
-                       count * sizeof(std::uint16_t), cudaMemcpyDeviceToHost),
-            "copy linear output");
-        for (std::size_t index = 0; index < count; ++index) {
-            const std::uint16_t bits = chunk[index];
-            if (bits == 0xffffU) { ++poison_count; }
-            if ((bits & 0x7f80U) == 0x7f80U) { ++nonfinite_count; }
+    result.selected.resize(rows.size() * columns.size());
+    cuda_check(cudaMemcpy(host.data(), device, total_words * sizeof(std::uint16_t),
+                          cudaMemcpyDeviceToHost),
+               "copy linear output");
+    std::atomic<std::size_t> poison_count    = 0;
+    std::atomic<std::size_t> nonfinite_count = 0;
+    parallel_rows(t, total_words, [&](int first, int last) {
+        std::size_t poison    = 0;
+        std::size_t nonfinite = 0;
+        for (std::size_t index = std::size_t(first) * n; index < std::size_t(last) * n; ++index) {
+            const auto bits = host[index];
+            poison += bits == 0xffffU;
+            nonfinite += (bits & 0x7f80U) == 0x7f80U;
         }
-        while (wanted_index < wanted.size() && wanted[wanted_index] < begin + count) {
-            result.selected[wanted_index] =
-                static_cast<double>(test::bf16_to_f32(chunk[wanted[wanted_index] - begin]));
-            ++wanted_index;
+        poison_count.fetch_add(poison, std::memory_order_relaxed);
+        nonfinite_count.fetch_add(nonfinite, std::memory_order_relaxed);
+    });
+    parallel_rows(columns.size(), result.selected.size(), [&](int first, int last) {
+        for (int c = first; c < last; ++c) {
+            const auto* source = host.data() + std::size_t(columns[c]) * n;
+            auto* target       = result.selected.data() + std::size_t(c) * rows.size();
+            for (std::size_t r = 0; r < rows.size(); ++r)
+                target[r] = test::bf16_to_f32(source[rows[r]]);
         }
-    }
+    });
     if (poison_count != 0) {
         std::cerr << label << ": output retains " << poison_count << " poison values\n";
         ++result.failures;
@@ -175,6 +200,53 @@ OutputRead read_output(const void* device, std::int32_t n, std::int32_t t,
     }
     return result;
 }
+
+// Sampled oracles still check every output for poison and non-finite values. For large
+// outputs only transfer the flags and the words the FP64 oracle actually compares.
+struct SampledRead {
+    DeviceBuffer row_indices, column_indices, selected, status;
+    std::vector<std::uint16_t> host;
+
+    SampledRead(ninfer::Device device, std::span<const int> rows, int max_columns)
+        : row_indices(device, rows.size_bytes()), column_indices(device, max_columns * sizeof(int)),
+          selected(device, rows.size() * max_columns * sizeof(std::uint16_t)),
+          status(device, sizeof(unsigned)), host(rows.size() * max_columns) {
+        row_indices.copy_from_host(rows.data(), rows.size_bytes());
+    }
+
+    OutputRead read(const void* output, int n, int t, int nr, std::span<const int> columns,
+                    cudaStream_t stream, std::string_view label) {
+        cuda_check(cudaMemcpyAsync(column_indices.data(), columns.data(), columns.size_bytes(),
+                                   cudaMemcpyHostToDevice, stream),
+                   "upload sampled columns");
+        cuda_check(cudaMemsetAsync(status.data(), 0, sizeof(unsigned), stream),
+                   "initialize output scan flags");
+        cuda_check(scan_sampled_output(static_cast<const std::uint16_t*>(output),
+                                       std::size_t(n) * t, n,
+                                       static_cast<const int*>(row_indices.data()), nr,
+                                       static_cast<const int*>(column_indices.data()),
+                                       columns.size(), static_cast<std::uint16_t*>(selected.data()),
+                                       static_cast<unsigned*>(status.data()), stream),
+                   "scan and gather sampled linear output");
+        cuda_check(cudaStreamSynchronize(stream), "complete sampled output scan");
+        unsigned flags;
+        status.copy_to_host(&flags, sizeof(flags));
+        const auto count = nr * columns.size();
+        selected.copy_to_host(host.data(), count * sizeof(std::uint16_t));
+        OutputRead result;
+        result.selected.resize(count);
+        std::transform(host.begin(), host.begin() + count, result.selected.begin(), bf16_to_f32);
+        if (flags & 1) {
+            std::cerr << label << ": output retains poison values\n";
+            ++result.failures;
+        }
+        if (flags & 2) {
+            std::cerr << label << ": output contains non-finite values\n";
+            ++result.failures;
+        }
+        return result;
+    }
+};
 
 int compare_output(std::string_view label, std::span<const double> actual,
                    std::span<const double> reference, ops::LinearPolicy policy) {
@@ -190,30 +262,39 @@ void cpu_linear_gemm_fp64(const float* weight, const float* activation, double* 
         throw std::invalid_argument("linear test: invalid FP64 GEMM argument");
     }
 
-    ninfer::test::parallel_rows(
-        n, static_cast<std::uint64_t>(n) * k * t, [&](int row_begin, int row_end) {
-            for (std::int32_t row = row_begin; row < row_end; ++row) {
-                const float* weight_row = weight + static_cast<std::size_t>(row) * k;
-                for (std::int32_t token_begin = 0; token_begin < t; token_begin += kOracleTBlock) {
-                    const std::int32_t active = std::min(kOracleTBlock, t - token_begin);
-                    std::array<double, kOracleTBlock> accumulators{};
-                    for (std::int32_t column = 0; column < k; ++column) {
-                        const double weight_value = static_cast<double>(weight_row[column]);
-                        for (std::int32_t token = 0; token < active; ++token) {
-                            accumulators[static_cast<std::size_t>(token)] +=
-                                weight_value *
-                                static_cast<double>(
-                                    activation[static_cast<std::size_t>(token_begin + token) * k +
-                                               column]);
-                        }
-                    }
-                    for (std::int32_t token = 0; token < active; ++token) {
-                        output[static_cast<std::size_t>(token_begin + token) * n + row] =
-                            accumulators[static_cast<std::size_t>(token)];
-                    }
+    // Transpose a block of independent tokens so SIMD lanes do not change the
+    // accumulation order along K for any output.
+    const int blocks = (t + kOracleTBlock - 1) / kOracleTBlock;
+    using TokenBlock = std::array<double, kOracleTBlock>;
+    std::vector<TokenBlock> x(std::size_t(blocks) * k);
+    parallel_rows(blocks, std::uint64_t(t) * k, [&](int first, int last) {
+        for (int block = first; block < last; ++block) {
+            const int token_begin = block * kOracleTBlock;
+            const int active      = std::min(kOracleTBlock, t - token_begin);
+            for (int column = 0; column < k; ++column)
+                for (int token = 0; token < active; ++token)
+                    x[std::size_t(block) * k + column][token] =
+                        activation[std::size_t(token_begin + token) * k + column];
+        }
+    });
+    parallel_rows(n, std::uint64_t(n) * k * t, [&](int first, int last) {
+        for (int row = first; row < last; ++row) {
+            const float* weight_row = weight + std::size_t(row) * k;
+            for (int block = 0; block < blocks; ++block) {
+                const int token_begin = block * kOracleTBlock;
+                const int active      = std::min(kOracleTBlock, t - token_begin);
+                TokenBlock sums{};
+                const auto* inputs = x.data() + std::size_t(block) * k;
+                for (int column = 0; column < k; ++column) {
+                    const double value = weight_row[column];
+                    for (int token = 0; token < kOracleTBlock; ++token)
+                        sums[token] += value * inputs[column][token];
                 }
+                for (int token = 0; token < active; ++token)
+                    output[std::size_t(token_begin + token) * n + row] = sums[token];
             }
-        });
+        }
+    });
 }
 
 static int run_shape(std::string_view label, ActivationRecipe recipe, WeightGenerator generator,
@@ -247,19 +328,21 @@ static int run_shape(std::string_view label, ActivationRecipe recipe, WeightGene
             ? shape.activation_generator(shape.k, maximum->t, shape.seed + 1U)
             : make_activation(shape.k, maximum->t, shape.seed + 1U, recipe);
     if (shape.activation_pattern != ActivationPattern::Dense) {
-        for (int token = 0; token < maximum->t; ++token) {
-            for (int column = 0; column < shape.k; ++column) {
-                float value = 0.0F;
-                if (shape.activation_pattern == ActivationPattern::Cancellation) {
-                    value = (column & 1) ? -0.25F : 0.25F;
-                    if (column == shape.k - 1) value = 0.125F;
-                } else if (column >= shape.k - 16) {
-                    value = static_cast<float>((column + token) % 3 - 1) * 0.25F;
+        parallel_rows(maximum->t, activation_bits.size(), [&](int first, int last) {
+            for (int token = first; token < last; ++token) {
+                for (int column = 0; column < shape.k; ++column) {
+                    float value = 0.0F;
+                    if (shape.activation_pattern == ActivationPattern::Cancellation) {
+                        value = (column & 1) ? -0.25F : 0.25F;
+                        if (column == shape.k - 1) value = 0.125F;
+                    } else if (column >= shape.k - 16) {
+                        value = static_cast<float>((column + token) % 3 - 1) * 0.25F;
+                    }
+                    activation_bits[static_cast<std::size_t>(token) * shape.k + column] =
+                        test::f32_to_bf16(value);
                 }
-                activation_bits[static_cast<std::size_t>(token) * shape.k + column] =
-                    test::f32_to_bf16(value);
             }
-        }
+        });
     }
 
     DeviceBuffer device_activation(ninfer::test::cuda_environment().context.device(),
@@ -288,10 +371,17 @@ static int run_shape(std::string_view label, ActivationRecipe recipe, WeightGene
                              shape.n, shape.k, maximum->t);
     }
 
+    const auto max_words = checked_elements(shape.n, maximum->t, "guarded output");
+    GuardedOutput output(max_words);
+    constexpr auto kDeviceScanWords = std::size_t(1) << 20;
+    std::optional<SampledRead> sampled_read;
+    if (shape.comparison == Comparison::Sampled && max_words >= kDeviceScanWords)
+        sampled_read.emplace(device_activation.device(), oracle_rows, maximum->t);
+    std::vector<std::uint16_t> host_output(sampled_read ? kDeviceScanWords : max_words);
     int failures = 0;
     for (const Invocation& invocation : shape.invocations) {
         const auto& case_label = invocation.id;
-        GuardedOutput output(checked_elements(shape.n, invocation.t, "guarded output"));
+        output.set_extent(checked_elements(shape.n, invocation.t, "guarded output"));
         Tensor input(device_activation.span(), DType::BF16, {shape.k, invocation.t});
         Tensor destination(output.span(), DType::BF16, {shape.n, invocation.t});
         const std::size_t capacity = ops::linear_workspace_capacity_bytes(
@@ -316,21 +406,24 @@ static int run_shape(std::string_view label, ActivationRecipe recipe, WeightGene
                 ops::linear(input, weight, destination, invocation.policy, workspace, cuda);
             }
         };
+        const auto active = std::span(activation_bits).first(std::size_t(invocation.t) * shape.k);
+        std::vector<std::uint16_t> negative;
         try {
             if (invocation.graph_replay) {
-                cuda_check(cudaDeviceSynchronize(), "finish input initialization before capture");
                 graph_definition.capture(stream, launch);
                 graph.instantiate(graph_definition);
             }
             for (int replay = 0; replay < (invocation.graph_replay ? 2 : 1); ++replay) {
                 if (replay == 1) {
                     // BF16 negation is exact. Evaluate the same FP64 oracle using -X below.
-                    auto negative = activation_bits;
+                    if (shape.verify_input_preservation)
+                        failures += linear_common::verify_preserved(
+                            device_activation.data(), std::as_bytes(active), case_label);
+                    negative.assign(active.begin(), active.end());
                     for (auto& bits : negative) bits ^= 0x8000;
-                    device_activation.copy_from_host(negative.data(), device_activation.size());
+                    device_activation.copy_from_host(negative.data(), active.size_bytes());
                 }
-                output.poison();
-                cuda_check(cudaDeviceSynchronize(), "finish poisoning before replay");
+                output.poison(stream);
                 if (invocation.graph_replay)
                     graph.launch(stream);
                 else
@@ -359,8 +452,13 @@ static int run_shape(std::string_view label, ActivationRecipe recipe, WeightGene
                     shape.comparison == Comparison::Full ? all_indices(invocation.t)
                     : shape.column_sampler               ? shape.column_sampler(invocation.t)
                                                          : evenly_spaced_indices(invocation.t);
-                OutputRead actual = read_output(output.data(), shape.n, invocation.t, oracle_rows,
-                                                columns, case_label);
+                const auto output_words = std::size_t(shape.n) * invocation.t;
+                OutputRead actual =
+                    sampled_read && output_words >= kDeviceScanWords
+                        ? sampled_read->read(output.data(), shape.n, invocation.t,
+                                             oracle_rows.size(), columns, stream, case_label)
+                        : read_output(output.data(), shape.n, invocation.t, oracle_rows, columns,
+                                      host_output, case_label);
                 failures += actual.failures;
 
                 if (shape.comparison == Comparison::Full) {
@@ -390,32 +488,19 @@ static int run_shape(std::string_view label, ActivationRecipe recipe, WeightGene
                         compare_output(case_label, actual.selected, reference, invocation.policy);
                 }
                 if (replay == 1) {
-                    std::vector<std::uint16_t> after(activation_bits.size());
-                    device_activation.copy_to_host(after.data(), device_activation.size());
-                    for (std::size_t i = 0; i < after.size(); ++i) {
-                        if (after[i] != (activation_bits[i] ^ 0x8000)) {
-                            std::cerr << case_label << ": modified graph activation input\n";
-                            ++failures;
-                            break;
-                        }
-                    }
-                    device_activation.copy_from_host(activation_bits.data(),
-                                                     device_activation.size());
+                    failures += linear_common::verify_preserved(device_activation.data(),
+                                                                std::as_bytes(std::span(negative)),
+                                                                case_label + " graph activation");
                 }
             }
         } catch (const std::exception& error) {
             std::cerr << case_label << ": unexpected exception: " << error.what() << '\n';
             ++failures;
         }
-        if (shape.verify_each_invocation) {
-            failures += linear_common::verify_preserved(
-                device_activation.data(), std::as_bytes(std::span(activation_bits)), case_label);
-            failures += linear_common::verify_preserved(
-                device_weight.data(), std::as_bytes(std::span(host_weight.payload)), case_label);
-        }
+        if (!negative.empty()) device_activation.copy_from_host(active.data(), active.size_bytes());
     }
 
-    if (shape.verify_input_preservation && !shape.verify_each_invocation) {
+    if (shape.verify_input_preservation) {
         failures += linear_common::verify_preserved(
             device_activation.data(), std::as_bytes(std::span(activation_bits)), label);
         failures += linear_common::verify_preserved(

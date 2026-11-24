@@ -74,6 +74,7 @@ class Oracle {
 public:
     explicit Oracle(const Fixture&);
     ~Oracle();
+    void reset_input();
     std::pair<std::vector<int>, std::vector<double>> routing(int token);
     double output(int row, int token, bool complete, bool signed_coefficients = false,
                   std::span<const int> expert_mask = {});

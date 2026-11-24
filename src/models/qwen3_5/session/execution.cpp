@@ -37,11 +37,15 @@ runtime::PrefillCandidateInfo SessionImpl::prefill_candidate(SequenceHandle hand
     const auto end    = window_end(state, request, begin, prompt, vision_window);
     const bool capture =
         request.capture_reservation && request.capture_reservation->frontier == begin;
+    const auto* active_window = vision_window.current();
+    const bool carries_visual = active_window && active_window->owner.sequence == state.id &&
+                                active_window->owner.residency == state.residency;
     const bool exclusive =
         request.base->vision && begin < end &&
-        std::ranges::any_of(request.base->vision->units, [&](const models::vision::Unit& unit) {
-            return unit.token_begin < end && begin < unit.end();
-        });
+        (carries_visual ||
+         std::ranges::any_of(request.base->vision->units, [&](const models::vision::Unit& unit) {
+             return unit.token_begin < end && begin < unit.end();
+         }));
     return {.remaining_tokens  = prompt - begin,
             .unit_max_tokens   = end - begin,
             .exclusive         = exclusive,

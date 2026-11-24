@@ -54,8 +54,8 @@ PreparedSession::~PreparedSession()                                     = defaul
 
 PreparedSession prepare_session(std::shared_ptr<const ModelDefinition> definition,
                                 SessionPlan plan) {
-    return PreparedSession(
-        std::make_unique<detail::SessionImpl>(std::move(definition), std::move(plan)));
+    if (!definition) throw std::invalid_argument("Session preparation is incomplete");
+    return PreparedSession(std::make_unique<detail::SessionImpl>(std::move(plan)));
 }
 
 Session::Session(PreparedSession&& prepared, runtime::Executor<ExecutionTypes>& executor)
@@ -342,6 +342,7 @@ bool Session::has_context_operation() const noexcept { return impl_->has_context
 runtime::PrefillBudgetPolicy Session::prefill_budget_policy() const noexcept {
     return {.max_tokens_global           = impl_->prefill_chunk,
             .max_tokens_per_placement    = impl_->prefill_chunk,
+            .max_sequences_per_step      = impl_->max_concurrency,
             .max_sequences_per_placement = impl_->max_concurrency};
 }
 
@@ -515,9 +516,9 @@ speculative::CostModelConfig cost_config(const SessionPlan& plan) {
 }
 } // namespace
 
-SessionImpl::SessionImpl(std::shared_ptr<const ModelDefinition> definition_in, SessionPlan plan_in)
-    : definition(std::move(definition_in)), plan(std::move(plan_in)), directory(plan.context),
-      state_store(&directory.states()), text_kv_histories(&directory.pool(0).histories()),
+SessionImpl::SessionImpl(SessionPlan plan_in)
+    : plan(std::move(plan_in)), directory(plan.context), state_store(&directory.states()),
+      text_kv_histories(&directory.pool(0).histories()),
       backend_kv_histories(directory.pool_count() > 1 ? &directory.pool(1).histories() : nullptr),
       text_kv_pages(&directory.pool(0).pages()),
       backend_kv_pages(directory.pool_count() > 1 ? &directory.pool(1).pages() : nullptr),
@@ -530,7 +531,7 @@ SessionImpl::SessionImpl(std::shared_ptr<const ModelDefinition> definition_in, S
       lane_marks(max_concurrency),
       recovery_metadata(directory.metadata_budget(), plan.causal_scoring ? 0 : plan.max_concurrency,
                         1, 1) {
-    if (!definition || !plan.profile || !plan.batch_execution || plan.context.pools.empty())
+    if (!plan.profile || !plan.batch_execution || plan.context.pools.empty())
         throw std::invalid_argument("Session preparation is incomplete");
     checkpoints.configure(Checkpoints::capacity_for_metadata(directory.metadata_budget().limit()),
                           directory.metadata_budget(), &recovery_index);

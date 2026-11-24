@@ -136,7 +136,7 @@ struct PendingFeatures {
 
 void exercise_rounds(NativeRankFixture& fixture, models::qwen::Frontend& frontend,
                      const EngineOptions& options) {
-    q::detail::SessionImpl session(fixture.definition, fixture.session_plan);
+    q::detail::SessionImpl session(fixture.session_plan);
     session.executor_ = &fixture.executor();
     EventDriver driver(session, fixture);
     runtime::ResolvedExecutionOptions execution;

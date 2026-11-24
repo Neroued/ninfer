@@ -49,6 +49,9 @@ void bind_mtp_attention_readout(MtpExecutionView, const MtpInputs&, const Causal
 // Materialize K/V from true target conditioning without running query attention or the MLP.
 void mtp_history(MtpExecutionView state, const MtpInputs& inputs,
                  ops::KVCacheAppendPrefixExecutionEnvelope envelope);
+// Flat [N,1] token axes and segment-indexed counts and KV table rows.
+void mtp_history(MtpExecutionView state, const MtpInputs& inputs,
+                 const ops::RaggedSequenceView& ragged);
 
 // hidden is BF16 [H,C], ids is I32 [C] and confidences is FP32 [C].
 // Full uses caller-owned BF16 [V,C] logits;

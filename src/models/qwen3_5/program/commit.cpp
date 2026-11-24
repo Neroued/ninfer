@@ -17,7 +17,19 @@ void RankProgramImpl::launch_commit(ComputeOperation& operation) {
     bool count_tokens    = false;
     bool repair_mtp = false, append_terminal = false;
     frame.clear_commit();
-    for (std::uint32_t i = 0; generated && i < operation.batch; ++i) {
+    const auto* packed = operation.packed_prefill ? &*frame.packed_prefill : nullptr;
+    const auto samples =
+        packed ? operation.packed_prefill->sampled_count : static_cast<int>(operation.shape.rows);
+    if (packed) {
+        for (int slot = 0; slot < samples; ++slot) {
+            const auto& row = value.rows[packed->sampled_rows[slot]];
+            if (packed->host_sampling[slot].token_counts && !row.discarded) {
+                frame.host_commit.count_columns[slot] = row.accepted_tokens;
+                count_tokens |= row.accepted_tokens != 0;
+            }
+        }
+    }
+    for (std::uint32_t i = 0; !packed && generated && i < operation.batch; ++i) {
         const auto& row     = operation.rows[i];
         const auto accepted = value.rows[i].discarded ? 0 : value.rows[i].accepted_tokens;
         frame.host_commit.state_destination_offsets[i] = row.state_offsets.destination;
@@ -47,11 +59,11 @@ void RankProgramImpl::launch_commit(ComputeOperation& operation) {
     }
     if (count_tokens && !decode) {
         Tensor tokens({frame.output_tokens.data, frame.output_tokens.bytes(), device.device()},
-                      DType::I32, {1, static_cast<int>(operation.shape.rows)});
-        ops::increment_token_counts_batch(tokens,
-                                          frame.count_columns.slice(0, 0, operation.shape.rows),
-                                          frame.residency_slots.slice(0, 0, operation.shape.rows),
-                                          resources.token_counts, device.execution_view());
+                      DType::I32, {1, samples});
+        const auto& residencies = packed ? packed->device.residency_slots : frame.residency_slots;
+        ops::increment_token_counts_batch(tokens, frame.count_columns.slice(0, 0, samples),
+                                          residencies.slice(0, 0, samples), resources.token_counts,
+                                          device.execution_view());
     }
     if (const auto* forward = std::get_if<ForwardWork>(&operation.request.work.operation);
         forward && forward->purpose == ForwardPurpose::Control) {

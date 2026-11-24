@@ -169,6 +169,42 @@ void RankProgramImpl::align_mtp_history(ComputeOperation& operation) {
     execution::mtp_history(mtp_execution, inputs, {0, static_cast<std::uint32_t>(history_width)});
 }
 
+void RankProgramImpl::align_packed_mtp_history(const ComputeOperation& operation) {
+    const auto& packed_prefill = *operation.packed_prefill;
+    const auto& ragged         = packed_prefill.mtp_ragged;
+    const auto segments        = ragged.num_seqs();
+    if (!segments) return;
+    auto& frame      = resources.frame;
+    auto& mtp        = *frame.mtp;
+    const auto& meta = *frame.packed_prefill->device.mtp;
+    const auto cuda  = device.execution_view();
+    const auto h     = frame.spec.hidden;
+    const auto n     = ragged.total_tokens();
+    const auto n_in  = packed_prefill.ragged.total_tokens();
+    const auto main  = frame.input_view(n_in, 1);
+    auto base        = mtp.base_conditioning.slice(1, 0, segments);
+    ops::gather(
+        resources.state_images.continuation_hidden(meta.source_offsets.slice(0, 0, segments)),
+        ragged.seq_lengths, base, cuda);
+
+    const auto conditioning = packed(mtp.history_conditioning, {h, n});
+    const auto ids          = packed(mtp.history_ids, {n});
+    const auto positions    = packed(mtp.history_positions, {n});
+    const auto rope         = packed(mtp.history_rope_positions, {n, 3});
+    ops::prepare_causal_pairs(
+        ops::RaggedCausalPairInputs{
+            packed_prefill.ragged, main.hidden.view({h, n_in}), base, main.ids.view({n_in}),
+            main.cache_positions.view({n_in}), main.rope_positions,
+            meta.previous_rope.slice(1, 0, segments), meta.input_segments.slice(0, 0, segments),
+            meta.previous_rows.slice(0, 0, segments), meta.skip_first.slice(0, 0, segments)},
+        {ragged, conditioning, ids, positions, rope}, cuda);
+
+    execution::mtp_history(mtp_view(parameters, resources, cuda, proposal_head),
+                           {ids.view({n, 1}), conditioning.view({h, n, 1}), positions.view({n, 1}),
+                            rope, ragged.seq_lengths, meta.backend_tables.slice(0, 0, segments)},
+                           ragged);
+}
+
 void RankProgramImpl::rebuild_mtp_history(std::uint32_t batch_size, std::uint32_t verify_width) {
     auto& frame      = resources.frame;
     auto& mtp        = *frame.mtp;

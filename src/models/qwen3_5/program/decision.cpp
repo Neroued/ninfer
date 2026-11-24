@@ -18,11 +18,14 @@ Tensor prefix(const Tensor& value, std::initializer_list<std::int32_t> shape) {
 
 void RankProgramImpl::request_decision(ComputeOperation& operation) {
     if (operation.decision_requested) return;
-    if (const auto* forward = std::get_if<ForwardWork>(&operation.request.work.operation);
-        forward && forward->sample == SamplePurpose::None)
-        return;
-    const bool constrained = std::any_of(operation.sampling.begin(), operation.sampling.end(),
-                                         [](const auto& row) { return row.constrained; });
+    const auto* forward = std::get_if<ForwardWork>(&operation.request.work.operation);
+    if (forward && forward->sample == SamplePurpose::None) return;
+    const bool prefill    = forward && forward->purpose == ForwardPurpose::Prefill;
+    const auto needs_mask = [prefill](const SamplingInput& row) {
+        return row.constrained && (!prefill || row.sample);
+    };
+    const bool constrained =
+        std::any_of(operation.sampling.begin(), operation.sampling.end(), needs_mask);
     if (!constrained) {
         operation.decision_supplied = true;
         return;
@@ -33,7 +36,7 @@ void RankProgramImpl::request_decision(ComputeOperation& operation) {
     request.vocabulary = parameters.profile->public_tokens;
     const auto* drafts = static_cast<const TokenId*>(resources.frame.host_drafts.data);
     for (std::uint32_t row = 0; row < operation.batch; ++row) {
-        if (!operation.sampling[row].constrained) continue;
+        if (!needs_mask(operation.sampling[row])) continue;
         runtime::DecisionRequest::Row member;
         member.member = row;
         if (operation.verifies_drafts()) {
@@ -131,12 +134,14 @@ void RankProgramImpl::launch_decision(ComputeOperation& operation) {
     const int batch      = static_cast<int>(operation.batch);
     const int vocabulary = execution::dimension(parameters.profile->public_tokens);
     const int rows       = frame.spec.output_rows;
+    const auto* packed   = operation.packed_prefill ? &*frame.packed_prefill : nullptr;
     if (operation.decision) {
         runtime::DecisionConsumed consumed{operation.request.ticket, operation.decision_stage, {}};
         for (const auto& input : operation.decision->rows) {
-            const auto row = static_cast<int>(input.member);
-            auto host      = frame.host_masks.slice(2, row, 1);
-            auto target    = frame.masks.slice(2, row, 1);
+            const auto row  = static_cast<int>(input.member);
+            const auto slot = packed ? packed->sample_slots[row] : row;
+            auto host       = frame.host_masks.slice(2, slot, 1);
+            auto target     = frame.masks.slice(2, slot, 1);
             std::copy(input.words.begin(), input.words.end(),
                       static_cast<std::uint32_t*>(host.data));
             const auto bytes = input.words.size() * sizeof(std::uint32_t);
@@ -160,6 +165,34 @@ void RankProgramImpl::launch_decision(ComputeOperation& operation) {
             decide_decode(route, operation.proposal_route());
             readback_result(operation.shape.rows, &route);
         }
+        gpu_timer.record_result();
+        result_ready.record(device.stream());
+        operation.stage = ComputeStage::Readback;
+        return;
+    }
+    if (packed) {
+        const auto samples  = operation.packed_prefill->sampled_count;
+        const auto cuda     = device.execution_view();
+        auto sampled_hidden = packed->sampled_hidden.slice(1, 0, samples);
+        for (int slot = 0; slot < samples; ++slot) {
+            const auto row    = packed->sampled_rows[slot];
+            const auto column = packed->last_columns[row];
+            const auto source = column >= 0 ? frame.hidden.slice(1, column, 1)
+                                            : resources.state_images.continuation_hidden(
+                                                  operation.rows[row].state_offsets.source);
+            auto target       = sampled_hidden.slice(1, slot, 1);
+            CUDA_CHECK(cudaMemcpyAsync(target.data, source.data, target.bytes(),
+                                       cudaMemcpyDeviceToDevice, device.stream()));
+        }
+        auto logits = prefix(frame.logits, {rows, samples});
+        execution::project(sampled_hidden, parameters.text.output_head, logits, resources.work,
+                           cuda);
+        auto tokens = prefix(frame.output_tokens, {samples});
+        ops::sample(logits, tokens, vocabulary, packed->sampling,
+                    packed->device.sampling_positions.slice(0, 0, samples),
+                    ops::kSamplePurposePrefill, packed->device.live_rows.slice(0, 0, samples),
+                    resources.work, cuda);
+        readback_result(samples);
         gpu_timer.record_result();
         result_ready.record(device.stream());
         operation.stage = ComputeStage::Readback;
@@ -207,7 +240,25 @@ void RankProgramImpl::publish_result(ComputeOperation& operation) {
     const auto* forward  = std::get_if<ForwardWork>(&operation.request.work.operation);
     const bool generated = std::holds_alternative<DecodeWork>(operation.request.work.operation) ||
                            (forward && forward->sample != SamplePurpose::None);
-    if (generated) {
+    if (generated && operation.packed_prefill) {
+        const auto& frame  = resources.frame;
+        const auto& packed = *frame.packed_prefill;
+        auto info          = std::get<ForwardResult>(std::move(operation.result->output));
+        auto& value        = info.generated.emplace();
+        value.tokens.resize(operation.batch);
+        value.counts.resize(operation.batch);
+        value.dead_positions = std::move(operation.dead_positions);
+        for (int slot = 0; slot < operation.packed_prefill->sampled_count; ++slot) {
+            const auto row   = packed.sampled_rows[slot];
+            const auto token = frame.host_egress.tokens[slot];
+            if (token < 0 || static_cast<std::uint32_t>(token) >= parameters.profile->public_tokens)
+                throw std::runtime_error(
+                    "Qwen3.5 sampling returned a token outside the vocabulary");
+            value.tokens[row] = token;
+            value.counts[row] = 1;
+        }
+        result.output = std::move(info);
+    } else if (generated) {
         auto& output = resources.frame.host_egress;
         GeneratedResult value;
         value.row_stride = forward ? 1 : operation.width;

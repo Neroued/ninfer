@@ -6,6 +6,76 @@
 
 namespace ninfer::models::qwen3_5::detail {
 
+void RankProgramImpl::begin_packed_target(ComputeOperation& operation) {
+    const auto& ragged = operation.packed_prefill->ragged;
+    const int segments = ragged.num_seqs(), tokens = ragged.total_tokens();
+    auto& frame      = resources.frame;
+    const auto input = frame.input_view(tokens, 1);
+    const auto& meta = frame.packed_prefill->device;
+    ++operation.attention.forwards;
+    operation.attention.rows += segments;
+    operation.attention.scheduled_positions += tokens;
+    operation.attention.valid_positions += tokens;
+
+    std::optional<execution::DFlashFeatureSink> features;
+    if (resources.dflash) {
+        const auto& draft = *resources.dflash;
+        features.emplace(draft.prefill_features.slice(1, 0, tokens),
+                         draft.prefill_positions.slice(0, 0, tokens), Tensor{},
+                         parameters.profile->config.draft->target_layer_ids);
+    }
+    const execution::TextInputs inputs{
+        .ids                       = input.ids,
+        .cache_positions           = input.cache_positions,
+        .rope_positions            = input.rope_positions,
+        .valid_columns             = {},
+        .kv_table_rows             = meta.main_tables.slice(0, 0, segments),
+        .state_source_offsets      = meta.source_offsets.slice(0, 0, segments),
+        .state_destination_offsets = meta.destination_offsets.slice(0, 0, segments),
+        .input_embeddings          = {},
+        .active_tokens             = operation.width,
+    };
+    resources.work.reset();
+    prefill_timer.start();
+    operation.text = std::make_unique<execution::TextRun>(
+        execution::TextExecutionView{parameters, resources.work, device.execution_view(),
+                                     resources.decoder.text_kv, resources.state_images.linear(),
+                                     resources.moe.get()},
+        inputs, execution::PackedPrefillUpdate{ragged}, target_bucket(), input.hidden,
+        features ? &*features : nullptr);
+    operation.row_finished = operation.text->start();
+}
+
+void RankProgramImpl::finish_packed_prefill(ComputeOperation& operation) {
+    const auto& ragged  = operation.packed_prefill->ragged;
+    const auto& frame   = resources.frame;
+    const auto& storage = *frame.packed_prefill;
+    const auto hidden   = frame.input_view(ragged.total_tokens(), 1).hidden;
+    const auto* destinations =
+        static_cast<const std::int64_t*>(storage.host.destination_offsets.data);
+    if (backend == SpeculativeBackend::Mtp) align_packed_mtp_history(operation);
+    for (int s = 0; s < ragged.num_seqs(); ++s) {
+        const int begin = ragged.segment_begin(s), len = ragged.segment_length(s);
+        if (resources.dflash) {
+            auto& draft      = *resources.dflash;
+            const auto count = static_cast<std::uint32_t>(len);
+            execution::draft_append_context(
+                {parameters, resources.work, device.execution_view(), draft.local,
+                 draft.full ? &*draft.full : nullptr, proposal_head},
+                draft.prefill_features.slice(1, begin, len)
+                    .view({draft.prefill_features.ne[0], len, 1}),
+                draft.prefill_positions.slice(0, begin, len).view({len, 1}),
+                ragged.seq_lengths.slice(0, s, 1),
+                storage.device.destination_offsets.slice(0, s, 1),
+                storage.device.backend_tables.slice(0, s, 1), {count, count});
+        }
+        const auto source = hidden.slice(1, begin + len - 1, 1);
+        const auto target = resources.state_images.continuation_hidden(destinations[s]);
+        CUDA_CHECK(cudaMemcpyAsync(target.data, source.data, target.bytes(),
+                                   cudaMemcpyDeviceToDevice, device.stream()));
+    }
+}
+
 void RankProgramImpl::progress() {
     if (context_operation && context_ready.ready()) {
         const auto ticket    = context_operation->request.ticket;
@@ -83,7 +153,9 @@ void RankProgramImpl::progress() {
                 operation.stage = ComputeStage::AwaitDecision;
                 break;
             }
-            if (operation.width) {
+            if (operation.width && operation.packed_prefill) {
+                finish_packed_prefill(operation);
+            } else if (operation.width) {
                 if (backend == SpeculativeBackend::Mtp) align_mtp_history(operation);
                 if (resources.dflash) {
                     const int width = static_cast<int>(operation.width);
@@ -118,6 +190,12 @@ void RankProgramImpl::progress() {
                 operation.gpu.add_prefill(
                     static_cast<std::uint64_t>(prefill_timer.elapsed_ms() * 1.0e6));
             if (const auto* forward = std::get_if<ForwardWork>(&operation.request.work.operation)) {
+                if (operation.packed_prefill) {
+                    operation.stage = operation.packed_prefill->sampled_count
+                                          ? ComputeStage::AwaitDecision
+                                          : ComputeStage::Readback;
+                    break;
+                }
                 auto& result       = std::get<ForwardResult>(operation.result->output);
                 const auto& window = forward->inputs[operation.forward_row];
                 operation.forward_offset += operation.width;

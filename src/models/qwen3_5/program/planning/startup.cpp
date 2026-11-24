@@ -137,6 +137,7 @@ WorkspaceSpec build_workspace_plan(const SequencePlanImpl& plan) {
         throw std::invalid_argument("sequence workspace dimensions are invalid");
     }
     const auto chunk        = static_cast<std::int32_t>(chunk_u32);
+    const auto batch_max    = dimension(plan.max_concurrency);
     const auto drafts       = static_cast<std::int32_t>(plan.draft_window);
     const auto verify       = drafts + 1;
     const auto text_buckets = ops::ContextBucketRange::through(plan.capacity);
@@ -177,12 +178,19 @@ WorkspaceSpec build_workspace_plan(const SequencePlanImpl& plan) {
                     scratch(layout, execution::attention_projection_workspace_bytes(*attention,
                                                                                     first, last));
                     (void)workspace::text_attention_results(layout, config, last);
-                    scratch(layout, ops::causal_softmax_attention_workspace_capacity_bytes(
-                                        {dimension(config.attention->head_dim),
-                                         dimension(config.attention->num_attention_heads),
-                                         dimension(config.attention->num_key_value_heads)},
-                                        plan.kv_storage, buckets, batch_size, min_width, max_width,
-                                        plan.multiprocessor_count));
+                    const ops::AttentionHeadGeometry geometry{
+                        dimension(config.attention->head_dim),
+                        dimension(config.attention->num_attention_heads),
+                        dimension(config.attention->num_key_value_heads)};
+                    auto bytes = ops::causal_softmax_attention_workspace_capacity_bytes(
+                        geometry, plan.kv_storage, buckets, batch_size, min_width, max_width,
+                        plan.multiprocessor_count);
+                    if (path == GdnWorkspacePath::Prefill && !plan.causal_scoring)
+                        bytes = std::max(
+                            bytes, ops::causal_softmax_attention_ragged_workspace_capacity_bytes(
+                                       geometry, plan.kv_storage, buckets, first, last, 1,
+                                       batch_max, plan.multiprocessor_count));
+                    scratch(layout, bytes);
                     add_scratch(layout, attention->output, first, last);
                 } else {
                     const auto& gdn = std::get<execution::GdnProfile>(block.mixer);
@@ -203,10 +211,15 @@ WorkspaceSpec build_workspace_plan(const SequencePlanImpl& plan) {
                     }
                     (void)workspace::gdn_recurrent_output(layout, config, last);
                     if (path == GdnWorkspacePath::Prefill) {
-                        scratch(layout,
-                                ops::gated_delta_net_workspace_capacity_bytes(
-                                    dimension(config.gdn->linear_num_key_heads),
-                                    dimension(config.gdn->linear_num_value_heads), first, last));
+                        const auto qk = dimension(config.gdn->linear_num_key_heads);
+                        const auto v  = dimension(config.gdn->linear_num_value_heads);
+                        auto bytes =
+                            ops::gated_delta_net_workspace_capacity_bytes(qk, v, first, last);
+                        if (!plan.causal_scoring)
+                            bytes = std::max(bytes,
+                                             ops::gated_delta_net_ragged_workspace_capacity_bytes(
+                                                 qk, v, first, last, 1, batch_max));
+                        scratch(layout, bytes);
                     }
                     (void)workspace::gdn_normalized_output(layout, config, last);
                     add_scratch(layout, gdn.output, first, last);
@@ -273,8 +286,9 @@ WorkspaceSpec build_workspace_plan(const SequencePlanImpl& plan) {
     target_body(text_prefill, 1, chunk, qwen3_5::TextPhase::Prefill, GdnWorkspacePath::Prefill, 1,
                 1, chunk, text_buckets);
     if (!plan.causal_scoring) {
-        scratch(text_prefill,
-                ops::sampling_workspace_capacity_bytes(dimension(profile.public_tokens), 1, 1));
+        scratch(text_prefill, ops::sampling_workspace_capacity_bytes(
+                                  dimension(profile.public_tokens), 1, batch_max));
+        linear_scratch(text_prefill, profile.text.output_head, 1, batch_max);
     }
     out.text_prefill = finish(text_prefill);
 

@@ -2,6 +2,7 @@
 
 #include "core/buffer.h"
 #include "core/layout.h"
+#include "ninfer/ops/ragged.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/types.h"
 
@@ -136,6 +137,32 @@ struct DFlashFrameLayout {
     std::optional<TensorRegion> proposal_q;
 };
 
+template <class T>
+struct RaggedPrefillMetadata {
+    T cu_seqlens, seq_lengths, token_to_seq;
+};
+
+template <class T>
+struct PackedMtpMetadata {
+    RaggedPrefillMetadata<T> ragged;
+    T input_segments, previous_rows, skip_first, previous_rope;
+    T source_offsets, backend_tables;
+};
+
+template <class T>
+struct PackedPrefillMetadata {
+    RaggedPrefillMetadata<T> ragged;
+    T main_tables, backend_tables, source_offsets, destination_offsets;
+    T sampling_positions, live_rows, residency_slots;
+    std::optional<PackedMtpMetadata<T>> mtp;
+};
+
+struct PackedPrefillLayout {
+    PackedPrefillMetadata<TensorRegion> metadata;
+    LayoutRegion device, host, sampling;
+    TensorRegion sampled_hidden, sampled_rows, sample_slots, last_columns;
+};
+
 struct FrameHostLayout {
     LayoutRegion ingress;
     LayoutRegion commit;
@@ -172,6 +199,7 @@ struct FrameLayout {
     std::optional<TensorRegion> control_ids;
     std::optional<MtpFrameLayout> mtp;
     std::optional<DFlashFrameLayout> dflash;
+    std::optional<PackedPrefillLayout> packed_prefill;
     FrameHostLayout host;
 };
 
@@ -206,6 +234,17 @@ struct DFlashFrame {
 
 struct FrameInputView {
     Tensor ids, cache_positions, rope_positions, hidden;
+};
+
+struct PackedPrefillFrame {
+    MemorySpan device_storage, host_storage;
+    PackedPrefillMetadata<Tensor> device, host;
+    const ops::SamplingConfig* sampling;
+    std::span<ops::SamplingConfig> host_sampling;
+    Tensor sampled_hidden;
+    std::span<std::int32_t> sampled_rows, sample_slots, last_columns;
+
+    PackedPrefillFrame(MemorySpan device, MemorySpan host, const PackedPrefillLayout&);
 };
 
 // One stable device frame and its pinned transfer storage. The execution ticket retains both
@@ -257,6 +296,7 @@ public:
     Tensor logits, target_argmax, masks, score_targets, score_logprobs;
     std::optional<MtpFrame> mtp;
     std::optional<DFlashFrame> dflash;
+    std::optional<PackedPrefillFrame> packed_prefill;
 
 private:
     MemorySpan ingress_storage_, commit_storage_, egress_storage_;

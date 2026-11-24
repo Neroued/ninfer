@@ -77,7 +77,7 @@ struct SessionFixture {
                    std::shared_ptr<const q35::execution::ModelProfile> profile,
                    const EngineOptions& options, native::ContextBudget budget = {})
         : rank(std::move(definition), std::move(model), std::move(profile), options, budget),
-          session(rank.definition, std::move(rank.session_plan)) {
+          session(std::move(rank.session_plan)) {
         session.executor_ = &rank.executor();
     }
 };
@@ -1743,7 +1743,7 @@ void shared_capture_alignment(std::shared_ptr<const q35::ModelDefinition> defini
     options.context_cache.enabled             = true;
     options.context_cache.host_capacity_bytes = 0;
     native::NativeRankFixture rank(definition, model, profile, options, {.retained_states = 2});
-    q35::detail::SessionImpl program(definition, std::move(rank.session_plan));
+    q35::detail::SessionImpl program(std::move(rank.session_plan));
     program.executor_ = &rank.executor();
     native::EventDriver driver(program, rank);
     const auto empty   = program.physical_usage();
@@ -1874,7 +1874,7 @@ void replay_sampling_counts(std::shared_ptr<const q35::ModelDefinition> definiti
     options.context_cache.enabled             = false;
     options.context_cache.host_capacity_bytes = 0;
     native::NativeRankFixture rank(definition, model, profile, options);
-    q35::detail::SessionImpl program(definition, std::move(rank.session_plan));
+    q35::detail::SessionImpl program(std::move(rank.session_plan));
     program.executor_ = &rank.executor();
     native::EventDriver driver(program, rank);
 

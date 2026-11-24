@@ -47,13 +47,20 @@ struct SequenceUpdate {
     std::int64_t destination_offset;
 };
 
+// One flat token axis, with KV rows and State offsets indexed by positive-length segment.
+// Packed prefill has no per-row valid_columns mask.
+struct PackedPrefillUpdate {
+    ops::RaggedSequenceView ragged;
+};
+
 struct StepUpdate {};
 
 struct ReplayRecords {
     const GdnReplayRecords& records;
 };
 
-using TextStateUpdate = std::variant<SequenceUpdate, StepUpdate, ReplayRecords>;
+using TextStateUpdate =
+    std::variant<SequenceUpdate, StepUpdate, ReplayRecords, PackedPrefillUpdate>;
 
 // Selected post-layer residuals concatenate along the feature axis. With residency_slots,
 // features is BF16 [H*layers,W,Slots], and valid row prefixes scatter to absolute residency

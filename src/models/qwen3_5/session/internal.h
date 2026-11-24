@@ -294,7 +294,7 @@ struct PendingContext {
 
 class SessionImpl {
 public:
-    SessionImpl(std::shared_ptr<const ModelDefinition>, SessionPlan);
+    explicit SessionImpl(SessionPlan);
     std::uint64_t next_lane_mark();
     ~SessionImpl();
     [[nodiscard]] RequestBasePlan plan_request(qwen::PreparedPromptData&& prompt,
@@ -414,7 +414,6 @@ public:
     void fail_all_cleanup() noexcept;
     [[nodiscard]] PhysicalUsageSnapshot physical_usage() const noexcept;
 
-    std::shared_ptr<const ModelDefinition> definition;
     SessionPlan plan;
     vision::Window vision_window;
     [[nodiscard]] std::optional<qwen::VisionWork>

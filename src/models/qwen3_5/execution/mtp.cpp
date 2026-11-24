@@ -18,6 +18,7 @@
 #include <initializer_list>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace ninfer::models::qwen3_5::execution {
 namespace {
@@ -46,7 +47,8 @@ const MtpParameters& require_mtp(const Parameters& parameters) {
     return *parameters.mtp;
 }
 
-std::int32_t validate_inputs(MtpExecutionView state, const MtpInputs& inputs) {
+std::int32_t validate_inputs(MtpExecutionView state, const MtpInputs& inputs,
+                             const ops::RaggedSequenceView* ragged = nullptr) {
     const auto& config = state.parameters.profile->config.text;
     const auto width   = inputs.ids.ne[0];
     const auto batch   = inputs.ids.ne[1];
@@ -60,8 +62,11 @@ std::int32_t validate_inputs(MtpExecutionView state, const MtpInputs& inputs) {
     require_tensor(inputs.conditioning, DType::BF16, {hidden, width, batch}, device,
                    "conditioning");
     require_tensor(inputs.cache_positions, DType::I32, {width, batch}, device, "cache positions");
-    require_tensor(inputs.valid_columns, DType::I32, {batch}, device, "valid columns");
-    require_tensor(inputs.kv_table_rows, DType::I32, {batch}, device, "KV table rows");
+    if (ragged && (batch != 1 || width != ragged->total_tokens() || !ragged->num_seqs()))
+        throw std::invalid_argument("MTP: invalid packed history geometry");
+    const auto rows = ragged ? ragged->num_seqs() : batch;
+    require_tensor(inputs.valid_columns, DType::I32, {rows}, device, "valid columns");
+    require_tensor(inputs.kv_table_rows, DType::I32, {rows}, device, "KV table rows");
     const auto axes = inputs.rope_positions.ne[1];
     if (axes != 1 && axes != 3) {
         throw std::invalid_argument("MTP: RoPE positions require one or three axes");
@@ -268,20 +273,16 @@ void bind_mtp_attention_readout(MtpExecutionView state, const MtpInputs& inputs,
     readout.submit(state.workspace, state.execution, submit);
 }
 
-void mtp_history(MtpExecutionView state, const MtpInputs& inputs,
-                 ops::KVCacheAppendPrefixExecutionEnvelope envelope) {
+namespace {
+
+std::pair<Tensor, Tensor> project_history(MtpExecutionView state, const MtpInputs& inputs,
+                                          int columns) {
     const auto& parameters = require_mtp(state.parameters);
     const auto& config     = state.parameters.profile->config.text;
-    const auto columns     = validate_inputs(state, inputs);
     const auto& attention  = *config.attention;
     const auto head_dim    = dimension(attention.head_dim);
     const auto kv_heads    = dimension(attention.num_key_value_heads);
-    const auto width       = inputs.ids.ne[0];
-    const auto batch       = inputs.ids.ne[1];
-    nvtx::ScopedRange range(nvtx::Name::PrefillMtpChunk, nvtx::Category::Mtp,
-                            static_cast<std::uint64_t>(columns));
-    auto scope   = state.workspace.scope();
-    auto stem    = mtp_stem(state, inputs, columns);
+    auto stem              = mtp_stem(state, inputs, columns);
     Tensor key   = state.workspace.alloc(DType::BF16, {dimension(attention.key_width()), columns});
     Tensor value = state.workspace.alloc(DType::BF16, {dimension(attention.key_width()), columns});
     mtp_kv_projection(stem.attention_hidden, parameters.projection, attention, key, value,
@@ -290,10 +291,40 @@ void mtp_history(MtpExecutionView state, const MtpInputs& inputs,
     ops::rmsnorm(key.view({head_dim, kv_heads, columns}), parameters.key_norm, config.rms_norm_eps,
                  true, normalized_key, state.execution);
     text_rope(inputs.rope_positions, *config.rope_parameters, normalized_key, state.execution);
-    ops::kv_cache_append_prefix(normalized_key.view({head_dim, kv_heads, width, batch}),
-                                value.view({head_dim, kv_heads, width, batch}),
+    return {normalized_key, value.view({head_dim, kv_heads, columns})};
+}
+
+} // namespace
+
+void mtp_history(MtpExecutionView state, const MtpInputs& inputs,
+                 ops::KVCacheAppendPrefixExecutionEnvelope envelope) {
+    const auto columns = validate_inputs(state, inputs);
+    const auto width = inputs.ids.ne[0], batch = inputs.ids.ne[1];
+    nvtx::ScopedRange range(nvtx::Name::PrefillMtpChunk, nvtx::Category::Mtp,
+                            static_cast<std::uint64_t>(columns));
+    auto scope              = state.workspace.scope();
+    const auto [key, value] = project_history(state, inputs, columns);
+    ops::kv_cache_append_prefix(key.view({key.ne[0], key.ne[1], width, batch}),
+                                value.view({value.ne[0], value.ne[1], width, batch}),
                                 inputs.cache_positions, inputs.valid_columns, inputs.kv_table_rows,
                                 envelope, state.cache, state.execution);
+}
+
+void mtp_history(MtpExecutionView state, const MtpInputs& inputs,
+                 const ops::RaggedSequenceView& ragged) {
+    const auto columns = validate_inputs(state, inputs, &ragged);
+    nvtx::ScopedRange range(nvtx::Name::PrefillMtpChunk, nvtx::Category::Mtp,
+                            static_cast<std::uint64_t>(columns));
+    auto scope              = state.workspace.scope();
+    const auto [key, value] = project_history(state, inputs, columns);
+    for (int s = 0; s < ragged.num_seqs(); ++s) {
+        const auto begin = ragged.segment_begin(s), len = ragged.segment_length(s);
+        const auto count = static_cast<std::uint32_t>(len);
+        ops::kv_cache_append_prefix(
+            key.slice(2, begin, len), value.slice(2, begin, len),
+            inputs.cache_positions.slice(0, begin, len), inputs.valid_columns.slice(0, s, 1),
+            inputs.kv_table_rows.slice(0, s, 1), {count, count}, state.cache, state.execution);
+    }
 }
 
 void mtp_propose(MtpExecutionView state, const Tensor& hidden, Tensor& full_logits, Tensor& ids,

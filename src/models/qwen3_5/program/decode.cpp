@@ -38,11 +38,13 @@ execution::DraftInputs draft_inputs(const ExecutionFrame& frame, int batch) {
 
 void RankProgramImpl::append_draft_history(ComputeOperation& operation) {
     if (!resources.dflash) return;
-    const bool forward    = std::holds_alternative<ForwardWork>(operation.request.work.operation);
-    const auto batch      = forward ? 1 : static_cast<int>(operation.shape.rows);
+    const bool forward = std::holds_alternative<ForwardWork>(operation.request.work.operation);
+    const bool sequential_forward = forward && !operation.packed_prefill;
+    const auto batch              = sequential_forward ? 1 : static_cast<int>(operation.shape.rows);
     std::uint32_t minimum = std::numeric_limits<std::uint32_t>::max(), maximum = 0;
-    const auto rows = forward ? std::span(operation.rows).subspan(operation.forward_row, 1)
-                              : std::span(operation.rows);
+    const auto rows = sequential_forward
+                          ? std::span(operation.rows).subspan(operation.forward_row, 1)
+                          : std::span(operation.rows);
     for (const auto& row : rows) {
         const auto count = row.main_frontier - row.backend_frontier;
         minimum          = std::min(minimum, count);
@@ -225,6 +227,10 @@ void RankProgramImpl::narrow_target(ComputeOperation& operation) {
 
 void RankProgramImpl::begin_target(ComputeOperation& operation) {
     if (!operation.width) return;
+    if (operation.packed_prefill) {
+        begin_packed_target(operation);
+        return;
+    }
     auto& frame        = resources.frame;
     const bool forward = std::holds_alternative<ForwardWork>(operation.request.work.operation) ||
                          std::holds_alternative<ScoreWork>(operation.request.work.operation);

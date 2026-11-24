@@ -10,6 +10,10 @@ ninfer_add_test(ninfer_qwen3_5_runtime_mechanisms_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_runtime_mechanisms.cpp"
   LIBRARIES ninfer_engine ninfer_core)
 
+ninfer_add_test(ninfer_qwen3_5_packed_prefill_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_packed_prefill.cpp"
+  LIBRARIES ninfer_model_control ninfer_model_execution ninfer_model_loading)
+
 ninfer_add_test(ninfer_qwen3_5_state_image_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_state_image.cpp"
   LIBRARIES ninfer_engine ninfer_core)

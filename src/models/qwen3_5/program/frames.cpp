@@ -50,6 +50,77 @@ Tensor prefix(const Tensor& tensor, std::initializer_list<std::int32_t> shape) {
     return Tensor(MemorySpan{tensor.data, tensor.bytes(), tensor.device}, tensor.dtype, shape);
 }
 
+PackedPrefillLayout plan_packed_prefill(LayoutBuilder& device, LayoutBuilder& host, int batch,
+                                        int chunk, const FrameSpec& spec) {
+    LayoutBuilder metadata;
+    const auto rows = [&](DType dtype, const char* label) {
+        return metadata.add_tensor(dtype, {batch}, dtype_size(dtype), label);
+    };
+    const auto ragged = [&] {
+        return RaggedPrefillMetadata<TensorRegion>{
+            metadata.add_tensor(DType::I32, {dimension(std::uint64_t(batch) + 1)}, 4,
+                                "ragged offsets"),
+            rows(DType::I32, "ragged lengths"),
+            metadata.add_tensor(DType::I32, {chunk}, 4, "ragged token segments")};
+    };
+    PackedPrefillLayout out;
+    auto& m               = out.metadata;
+    m.ragged              = ragged();
+    m.main_tables         = rows(DType::I32, "packed Main tables");
+    m.backend_tables      = rows(DType::I32, "packed backend tables");
+    m.source_offsets      = rows(DType::I64, "packed source State offsets");
+    m.destination_offsets = rows(DType::I64, "packed destination State offsets");
+    m.sampling_positions  = rows(DType::I32, "packed sampling positions");
+    m.live_rows           = rows(DType::I32, "packed sampling live rows");
+    m.residency_slots     = rows(DType::I32, "packed sampling residency slots");
+    out.sampling          = metadata.add(std::size_t(batch) * sizeof(ops::SamplingConfig),
+                                         alignof(ops::SamplingConfig), "packed sampling configs");
+    if (spec.backend == SpeculativeBackend::Mtp) {
+        m.mtp = PackedMtpMetadata<TensorRegion>{
+            ragged(),
+            rows(DType::I32, "MTP Main segments"),
+            rows(DType::I32, "MTP previous rows"),
+            rows(DType::I32, "MTP history skip"),
+            metadata.add_tensor(DType::I32, {3, batch}, 4, "MTP previous RoPE"),
+            rows(DType::I64, "MTP source State offsets"),
+            rows(DType::I32, "MTP backend tables")};
+    }
+    const auto bytes   = metadata.finish(kAlignment);
+    out.device         = device.add(bytes, kAlignment, "packed prefill metadata");
+    out.host           = host.add(bytes, kAlignment, "Host packed prefill metadata");
+    out.sampled_hidden = add(device, DType::BF16, {spec.hidden, batch}, "packed sampled hidden");
+    out.sampled_rows   = add(host, DType::I32, {batch}, "packed sampled members");
+    out.sample_slots   = add(host, DType::I32, {batch}, "packed member sampling slots");
+    out.last_columns   = add(host, DType::I32, {batch}, "packed member last columns");
+    return out;
+}
+
+PackedPrefillMetadata<Tensor> bind_packed_metadata(const PackedPrefillMetadata<TensorRegion>& m,
+                                                   MemorySpan storage) {
+    const auto bind   = [&](const TensorRegion& region) { return region.bind(storage); };
+    const auto ragged = [&](const RaggedPrefillMetadata<TensorRegion>& r) {
+        return RaggedPrefillMetadata<Tensor>{bind(r.cu_seqlens), bind(r.seq_lengths),
+                                             bind(r.token_to_seq)};
+    };
+    PackedPrefillMetadata<Tensor> out{
+        ragged(m.ragged),       bind(m.main_tables),         bind(m.backend_tables),
+        bind(m.source_offsets), bind(m.destination_offsets), bind(m.sampling_positions),
+        bind(m.live_rows),      bind(m.residency_slots),     {}};
+    if (m.mtp) {
+        const auto& p = *m.mtp;
+        out.mtp       = PackedMtpMetadata<Tensor>{ragged(p.ragged),      bind(p.input_segments),
+                                                  bind(p.previous_rows), bind(p.skip_first),
+                                                  bind(p.previous_rope), bind(p.source_offsets),
+                                                  bind(p.backend_tables)};
+    }
+    return out;
+}
+
+std::span<std::int32_t> host_i32(const TensorRegion& region, MemorySpan backing) {
+    const auto tensor = region.bind(backing);
+    return {static_cast<std::int32_t*>(tensor.data), static_cast<std::size_t>(tensor.ne[0])};
+}
+
 } // namespace
 
 FrameControlLayout plan_frame_controls(const FrameSpec& spec, std::uint32_t row_count) {
@@ -198,6 +269,7 @@ FrameLayout plan_frames(LayoutBuilder& builder, const FrameSpec& spec) {
         out.host.visual_indices = add(host, DType::I32, {chunk}, "Host visual indices");
     }
     if (!spec.causal_scoring) {
+        out.packed_prefill      = plan_packed_prefill(builder, host, batch, chunk, spec);
         const auto control      = dimension(std::max(spec.control_token_limit, 1U));
         out.host.control_tokens = add(host, DType::I32, {control, batch}, "Host control tokens");
         out.control_ids         = add(builder, DType::I32, {control}, "control token counts input");
@@ -215,6 +287,22 @@ FrameLayout plan_frames(LayoutBuilder& builder, const FrameSpec& spec) {
     }
     out.host.bytes = host.finish(kAlignment, "Host execution frame");
     return out;
+}
+
+PackedPrefillFrame::PackedPrefillFrame(MemorySpan device_backing, MemorySpan host_backing,
+                                       const PackedPrefillLayout& layout)
+    : device_storage(layout.device.bind(device_backing)),
+      host_storage(layout.host.bind(host_backing)),
+      device(bind_packed_metadata(layout.metadata, device_storage)),
+      host(bind_packed_metadata(layout.metadata, host_storage)),
+      sampling(static_cast<const ops::SamplingConfig*>(layout.sampling.bind(device_storage).data)),
+      host_sampling(static_cast<ops::SamplingConfig*>(layout.sampling.bind(host_storage).data),
+                    static_cast<std::size_t>(host.live_rows.ne[0])),
+      sampled_hidden(layout.sampled_hidden.bind(device_backing)),
+      sampled_rows(host_i32(layout.sampled_rows, host_backing)),
+      sample_slots(host_i32(layout.sample_slots, host_backing)),
+      last_columns(host_i32(layout.last_columns, host_backing)) {
+    std::memset(host_storage.data, 0, host_storage.bytes);
 }
 
 MtpFrame::MtpFrame(MemorySpan backing, const MtpFrameLayout& layout)
@@ -281,7 +369,8 @@ ExecutionFrame::ExecutionFrame(MemorySpan backing, const FrameLayout& layout)
     if (layout.control_ids) control_ids = layout.control_ids->bind(backing);
     if (layout.mtp) mtp.emplace(backing, *layout.mtp);
     if (layout.dflash) dflash.emplace(backing, *layout.dflash);
-    const auto host       = host_storage.span();
+    const auto host = host_storage.span();
+    if (layout.packed_prefill) packed_prefill.emplace(backing, host, *layout.packed_prefill);
     host_ingress_storage_ = layout.host.ingress.bind(host);
     host_commit_storage_  = layout.host.commit.bind(host);
     host_egress_storage_  = layout.host.egress.bind(host);

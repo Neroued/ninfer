@@ -45,6 +45,14 @@ enum class ComputeStage : std::uint8_t {
     Retiring,
 };
 
+struct PackedPrefill {
+    ops::RaggedSequenceView ragged, mtp_ragged;
+    std::int32_t sampled_count = 0;
+};
+
+void validate_prefill_work(const ForwardWork&, std::uint32_t prefill_chunk);
+void validate_prefill_commit(const ForwardWork&, std::span<const CommitRow>);
+
 struct ComputeOperation {
     runtime::ExecutionRequest<ExecutionTypes> request;
     runtime::CommandSequence last_command;
@@ -75,6 +83,7 @@ struct ComputeOperation {
     GpuExecutionObservation gpu;
     AttentionWorkCounters attention;
     std::optional<Tensor> input_embeddings;
+    std::optional<PackedPrefill> packed_prefill;
     std::unique_ptr<execution::TextRun> text;
     TargetGraphBody* graph_target = nullptr;
     std::optional<speculative::NarrowedTargetPlan> narrowed;
@@ -134,11 +143,14 @@ public:
     void initialize_inputs(ComputeOperation&);
     void initialize_decode(ComputeOperation&, const DecodeWork&);
     void initialize_forward(ComputeOperation&, const ForwardWork&);
+    void initialize_packed_prefill(ComputeOperation&, const ForwardWork&);
     void initialize_score(ComputeOperation&, const ScoreWork&);
     void upload_input(std::uint32_t width, std::uint32_t batch);
     void upload_positions(std::uint32_t width, std::uint32_t batch);
     void upload_ingress();
     void begin_target(ComputeOperation&);
+    void begin_packed_target(ComputeOperation&);
+    void finish_packed_prefill(ComputeOperation&);
     bool advance_target(ComputeOperation&);
     void begin_draft(ComputeOperation&);
     void narrow_target(ComputeOperation&);
@@ -168,6 +180,7 @@ public:
     void append_draft_history(std::uint32_t batch, ops::KVCacheAppendPrefixExecutionEnvelope);
     void commit_draft_history(ComputeOperation&);
     void align_mtp_history(ComputeOperation&);
+    void align_packed_mtp_history(const ComputeOperation&);
     void rebuild_mtp_history(std::uint32_t batch, std::uint32_t width);
     void execute_decode_commit(std::uint32_t batch, std::uint32_t width, bool repair, bool counts,
                                const SectionRecorder& repair_section = {},

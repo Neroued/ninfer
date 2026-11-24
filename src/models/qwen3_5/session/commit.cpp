@@ -8,7 +8,9 @@ namespace ninfer::models::qwen3_5::detail {
 PendingBatch SessionImpl::generated_pending(const GeneratedResult& generated) {
     auto& current    = *execution;
     const auto batch = current.members.size();
-    if (!generated.row_stride || generated.tokens.size() != batch * generated.row_stride ||
+    if (!generated.row_stride ||
+        (current.kind == OperationKind::Prefill && generated.row_stride != 1) ||
+        generated.tokens.size() != batch * generated.row_stride ||
         generated.counts.size() != batch || generated.dead_positions.size() != batch)
         throw std::logic_error("generated result has an invalid shape");
     const auto stride =
@@ -72,9 +74,7 @@ PendingBatch SessionImpl::generated_pending(const GeneratedResult& generated) {
         if (current.kind == OperationKind::Prefill) out.sampled_.push_back(sampled);
         out.counts_.push_back(static_cast<std::int32_t>(count));
         out.failed_.push_back((generated.dead_positions[b] & ((1U << count) - 1)) != 0);
-        auto& state       = sequences[lane(current.members[b])];
-        auto& request     = requests[state.lane];
-        request.lifecycle = Lifecycle::Pending;
+        if (sampled) requests[lane(current.members[b])].lifecycle = Lifecycle::Pending;
     }
     return out;
 }

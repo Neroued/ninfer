@@ -250,6 +250,15 @@ int request_groups(bool fp8) {
     return verify(f);
 }
 
+template <class F>
+int rejects(F&& call) {
+    try {
+        call();
+    } catch (const std::invalid_argument&) { return 0; }
+    std::cerr << "Kpool indexer accepted invalid view/profile\n";
+    return 1;
+}
+
 int ragged_indexer() {
     RaggedFixture ragged({1, 3, 17});
     constexpr int width = 17;
@@ -273,9 +282,14 @@ int ragged_indexer() {
     ops::KpoolBlockSelection selected{Tensor(ids.span(), DType::I32, {512, n}),
                                       Tensor(counts.span(), DType::I32, {n}),
                                       Tensor(ends.span(), DType::I32, {n})};
-    ops::kpool_indexer(Tensor(q.span(), DType::BF16, {128, 32, n}),
-                       Tensor(coeff.span(), DType::FP32, {32, n}), f.cache, batch, f.bucket, arena,
-                       selected, execution);
+    const Tensor query(q.span(), DType::BF16, {128, 32, n});
+    const Tensor coefficients(coeff.span(), DType::FP32, {32, n});
+    auto alias          = selected;
+    alias.selection_end = ragged.view.token_to_seq;
+    int failures        = rejects([&] {
+        ops::kpool_indexer(query, coefficients, f.cache, batch, f.bucket, arena, alias, execution);
+    });
+    ops::kpool_indexer(query, coefficients, f.cache, batch, f.bucket, arena, selected, execution);
     cuda_synchronize();
     const auto unpack = [&](auto& dst, const auto& buffer, int features) {
         const auto padded =
@@ -285,7 +299,9 @@ int ragged_indexer() {
     unpack(f.ids, ids, 512);
     unpack(f.counts, counts, 1);
     unpack(f.ends, ends, 1);
-    int failures = verify(f) + (arena.used() != 0 || arena.peak_used() > bytes);
+    failures += verify(f) + (arena.used() != 0 || arena.peak_used() > bytes) +
+                verify_exact("Kpool token mapping preserved",
+                             from_device<int>(ragged.view.token_to_seq.data, n), ragged.mapping);
     for (const auto* buffer : {&scratch, &ids, &counts, &ends})
         failures += buffer->verify_guards("ragged Kpool indexer");
     return failures;
@@ -447,13 +463,7 @@ int workspace_interval(bool fp8 = false) {
 }
 
 int admission() {
-    auto& d            = cuda_environment().context;
-    const auto rejects = [&](auto fn) {
-        try {
-            fn();
-        } catch (const std::invalid_argument&) { return 0; }
-        return 1;
-    };
+    auto& d      = cuda_environment().context;
     int failures = 0;
     for (auto profile :
          {ops::KpoolIndexerProfile{4, 128}, {32, 64}, {32, 128, 8, 512}, {32, 128, 4, 256}})

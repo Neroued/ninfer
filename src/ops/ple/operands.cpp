@@ -89,6 +89,12 @@ void validate_batch_extent(int batch) { require(batch >= 1, "batch extent"); }
 
 } // namespace
 
+common::operand::Range ragged_record_range(const Tensor& records, int tokens, Device device) {
+    require(records.nb[1] >= kChannels * 2 && records.nb[1] % 2 == 0, "record column stride");
+    if (!tokens) return {};
+    return columns(records, tokens, 1, "records", device).bounds;
+}
+
 void validate_gate(const PleProjectionView& projected, const Tensor& residual,
                    const PleGateParameters& parameters, const PleBatchView& batch,
                    const PleConvRecordWindowView& records, const Tensor& gated,

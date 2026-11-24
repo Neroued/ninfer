@@ -128,6 +128,16 @@ void qsa_indexer(const Tensor& query, const ConstQsaIndexCacheView& cache,
     operand::tensor(query, DType::BF16, {128, 4, n}, 16, op, "query", device);
     operand::tensor(out.block_ids, DType::I32, {512, n}, 4, op, "block ids", device);
     operand::tensor(out.block_counts, DType::I32, {n}, 4, op, "block counts", device);
+    const std::array outputs{operand::range(out.block_ids, op),
+                             operand::range(out.block_counts, op)};
+    operand::disjoint(outputs, op);
+    const auto table = operand::blocks(cache.keys.records.page_offsets, op);
+    for (const auto range : outputs) {
+        v.require(!operand::overlaps(table, range), "output overlaps page table");
+        for (const Tensor* input : {&query, &batch.positions, &batch.table_rows, &seq.cu_seqlens,
+                                    &seq.seq_lengths, &seq.token_to_seq})
+            operand::disjoint(range, operand::range(*input, op), op);
+    }
     for (int s = 0; s < seq.num_seqs(); ++s) {
         const int begin = seq.segment_begin(s), len = seq.segment_length(s);
         const QsaBatchView segment{batch.positions.slice(0, begin, len),

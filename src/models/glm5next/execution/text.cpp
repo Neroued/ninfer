@@ -124,8 +124,8 @@ void TextRun::exchange_packed_mla(const PackedPrefillUpdate& packed, Tensor& exc
     for (std::uint32_t root = 0; root < columns_.ranks; ++root) {
         const TokenPartition part(columns_.columns, columns_.ranks, input ? root : 1 - root);
         const auto own  = packed.owner_tokens[input ? 1 - root : root];
-        const int first = std::max(part.begin, dimension(own.begin));
-        const int last  = std::min(part.begin + part.count, dimension(own.begin + own.size));
+        const int first = std::max(part.begin, extent(own.begin));
+        const int last  = std::min(part.begin + part.count, extent(own.begin + own.size));
         broadcast_mla_columns(exchange, first, last, root);
     }
 }
@@ -182,8 +182,8 @@ void TextRun::finish_mixer(std::uint32_t layer) {
             else
                 for (std::uint32_t owner = 0; owner < profile.local.size; ++owner) {
                     const auto own = packed->owner_tokens[owner];
-                    broadcast_mla_columns(roots_.output, dimension(own.begin),
-                                          dimension(own.begin + own.size), owner);
+                    broadcast_mla_columns(roots_.output, extent(own.begin),
+                                          extent(own.begin + own.size), owner);
                 }
         } else if (batch_.sequence_owner) {
             auto output = columns_.split() ? TokenPartition(columns_.columns, columns_.ranks,

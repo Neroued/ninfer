@@ -22,15 +22,15 @@ void RankProgramImpl::commit(runtime::ExecutionTicket ticket, runtime::CommandSe
     else if (forward && forward->sample != SampleKind::None) {
         const auto& io     = frame;
         const auto members = f.sampling_members();
-        const int b        = dimension(members.size());
+        const int b        = extent(members.size());
         auto* values       = static_cast<std::int32_t*>(host(io.rows.count_columns).data);
         bool any           = false;
         for (int i = 0; i < b; ++i) {
             const auto logical   = members[i];
             const auto& sampling = forward->rows[logical].sampling;
-            values[i] = f.packed || sampling.presence_penalty || sampling.frequency_penalty
-                            ? commit.rows[logical].accepted
-                            : 0;
+            values[i]            = sampling.presence_penalty || sampling.frequency_penalty
+                                       ? commit.rows[logical].accepted
+                                       : 0;
             any |= values[i] != 0;
         }
         if (any) {

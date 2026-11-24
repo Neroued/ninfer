@@ -145,6 +145,8 @@ public:
     bool failure            = false;
     std::atomic<bool> hold_poll{false};
     std::atomic<bool> fail_poll{false};
+    std::atomic<bool> mixed_prefill_held{false};
+    bool hold_mixed_prefill             = false;
     std::uint32_t hold_prefill_frontier = UINT32_MAX;
     std::uint64_t unit_time_ns          = 0;
     unsigned defer_binding = 0, bindings = 0;
@@ -237,6 +239,12 @@ public:
             if (forward && forward->kind == glm::ForwardKind::Prefill &&
                 rows.front().main_frontier >= hold_prefill_frontier)
                 hold_poll = true;
+            if (hold_mixed_prefill && forward && forward->kind == glm::ForwardKind::Prefill &&
+                rows.size() > 1) {
+                hold_mixed_prefill = false;
+                hold_poll          = true;
+                mixed_prefill_held = true;
+            }
         }
         return ticket;
     }
@@ -1678,6 +1686,28 @@ struct WaitingCaptureRuntime : glm::RuntimeTypes {
 class PackedPrefillSession : public glm::Session {
 public:
     using glm::Session::Session;
+    using glm::Session::start_prefill;
+
+    std::optional<rt::ExecutionTicket> start_prefill(std::span<const glm::SequenceHandle> members,
+                                                     std::span<const rt::PrefillGrant> grants) {
+        auto ticket = glm::Session::start_prefill(members, grants);
+        if (ticket) prefill_members.assign(members.begin(), members.end());
+        return ticket;
+    }
+
+    glm::CommitResult commit(glm::PendingBatch&& batch,
+                             std::span<const rt::CommitDecision> decisions) {
+        std::vector<std::pair<glm::SequenceHandle, std::uint32_t>> cancelled;
+        for (std::size_t row = 0; row < decisions.size(); ++row) {
+            if (!decisions[row].cancelled) continue;
+            const auto member = prefill_members.at(row);
+            cancelled.emplace_back(member, decode_frontier(member));
+        }
+        auto result = glm::Session::commit(std::move(batch), decisions);
+        for (const auto& [member, before] : cancelled)
+            require(decode_frontier(member) == before, "cancelled row adopted its prompt suffix");
+        return result;
+    }
 
     glm::FinishResult finish(glm::SequenceHandle sequence) {
         auto result = glm::Session::finish(sequence);
@@ -1695,13 +1725,15 @@ public:
     }
 
     unsigned finished = 0, captures = 0, finished_before_capture = 0;
+    std::vector<glm::SequenceHandle> prefill_members;
 };
 
 struct PackedPrefillRuntime : glm::RuntimeTypes {
     using Session = PackedPrefillSession;
 };
 
-void engine_packed_prefill(std::shared_ptr<const glm::ModelDefinition> definition) {
+void engine_packed_prefill(std::shared_ptr<const glm::ModelDefinition> definition,
+                           bool cancel_in_flight = false) {
     auto layout                = plan(*definition);
     layout.shape.prefill_chunk = 128;
     auto frontend              = make_frontend();
@@ -1726,8 +1758,9 @@ void engine_packed_prefill(std::shared_ptr<const glm::ModelDefinition> definitio
     executor.hold_poll             = true;
     executor.defer_binding         = 2;
     executor.deferred_bind_flushes = 1;
+    executor.hold_mixed_prefill    = cancel_in_flight;
     rt::EngineCore<Instance> engine(instance, options, {});
-    const auto submit = [&](std::uint32_t length, TokenId token, bool cache) {
+    const auto submit = [&](std::uint32_t length, TokenId token, bool cache, bool stream = false) {
         auto prompt        = frontend.prepare_tokens(std::vector<TokenId>(length, token), cache);
         const auto summary = prompt.summary();
         rt::ResolvedRequestOptions request;
@@ -1735,14 +1768,52 @@ void engine_packed_prefill(std::shared_ptr<const glm::ModelDefinition> definitio
         request.execution.allow_prefix_reuse      = cache;
         request.output.raw                        = true;
         request.stop.include_model_defaults       = false;
-        return engine.submit(std::move(prompt), summary, 0, request, OutputConsumerMode::Aggregate,
-                             {});
+        return engine.submit(std::move(prompt), summary, 0, request,
+                             stream ? OutputConsumerMode::Streaming : OutputConsumerMode::Aggregate,
+                             {.prompt_progress = stream});
     };
-    auto short_prompt   = submit(8, 0, false);
+    auto short_prompt   = submit(8, 0, false, cancel_in_flight);
     auto capture_prompt = submit(96, 1, true);
     executor.hold_poll  = false;
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     const CancellationView timeout([&] { return std::chrono::steady_clock::now() >= deadline; });
+    if (cancel_in_flight) {
+        while (!executor.mixed_prefill_held && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::yield();
+        require(executor.mixed_prefill_held, "cancellation fixture did not pack both requests");
+
+        struct Sink : OutputSink {
+            void start(GenerationStart) override {}
+
+            void progress(PromptProgress) override { ++progress_events; }
+
+            void timing(GenerationTimingObservation) override {}
+
+            void publish(OutputEvent) override { ++output_events; }
+
+            unsigned progress_events = 0, output_events = 0;
+        } sink;
+
+        unsigned checks = 0;
+        const auto a    = short_prompt.wait(&sink, CancellationView([&] {
+            // The first check sets the request flag before the next check releases the result.
+            if (++checks == 2) executor.hold_poll = false;
+            return true;
+        }));
+        const auto b    = capture_prompt.wait(nullptr, timeout);
+        require(a.finish_reason == FinishReason::Cancelled && a.generated_token_ids.empty() &&
+                    !a.stats.timings.first_token_seconds && !sink.progress_events &&
+                    !sink.output_events,
+                "cancelled in-flight row published prompt progress or its first token");
+        require(b.finish_reason == FinishReason::OutputLimit && b.generated_token_ids.size() == 1,
+                "cancellation interrupted the other packed row");
+        require(executor.packed_commit.size() == 2 && executor.packed_commit[0].terminal &&
+                    executor.packed_commit[0].cancelled &&
+                    executor.packed_commit[0].accepted == 0 &&
+                    executor.packed_commit[1].accepted == 96,
+                "mixed prefill did not reject only the cancelled row");
+        return;
+    }
     const auto a = short_prompt.wait(nullptr, timeout);
     const auto b = capture_prompt.wait(nullptr, timeout);
     require(a.finish_reason == FinishReason::OutputLimit &&
@@ -1888,6 +1959,7 @@ int main(int argc, char** argv) {
         engine_pressure(glm::read_definition(reader, {}), true);
         engine_stop(glm::read_definition(reader, {}));
         engine_packed_prefill(glm::read_definition(reader, {}));
+        engine_packed_prefill(glm::read_definition(reader, {}), true);
         independent_prefill(glm::read_definition(reader, {}));
         cancelled_prefix_statistics(glm::read_definition(reader, {}));
         engine_pressure(glm::read_definition(reader, {}), false, true);

@@ -283,6 +283,15 @@ int verify(Fixture& f, const std::string& label, bool updates_tail = false) {
     return failures;
 }
 
+template <class F>
+int rejects(const char* label, F&& call) {
+    try {
+        call();
+    } catch (const std::invalid_argument&) { return 0; }
+    std::cerr << label << ": invalid view accepted\n";
+    return 1;
+}
+
 int ragged_prepare(bool kv_only) {
     RaggedFixture ragged({1, 3, 17});
     constexpr int width = 17;
@@ -341,33 +350,59 @@ int ragged_prepare(bool kv_only) {
     const auto bytes = kv_only
                            ? ops::qsa_prepare_kv_update_ragged_workspace_capacity_bytes(n, n, s, s)
                            : ops::qsa_prepare_update_ragged_workspace_capacity_bytes(n, n, s, s);
-    GuardedDeviceBuffer scratch(bytes), iq(128 * 4 * n * 2ULL);
+    GuardedDeviceBuffer scratch(bytes);
     MemoryArena arena(scratch.span());
-    auto query = projected.query; // Exact in-place Q, with a disjoint index-query.
-    Tensor index_query(iq.span(), DType::BF16, {128, 4, n});
+    auto query = projected.query, index_query = projected.index_query;
+    query.nb[3] += 16;
     const auto execution = cuda_environment().default_execution;
+    int failures         = 0;
     if (kv_only)
         ops::qsa_prepare_kv_update({projected.key, projected.value, projected.index_key},
                                    f.parameters.kv, batch, rope_positions, f.before, f.cache, after,
                                    arena, execution);
-    else
+    else {
+        // A one-column shift is disjoint within the first segment, but aliases later inputs.
+        for (const bool shift_index : {false, true}) {
+            auto inputs     = projected;
+            const int width = shift_index ? 128 : 256, heads = shift_index ? 4 : f.query_heads;
+            GuardedDeviceBuffer shifted(std::size_t(width) * heads * (n + 1) * 2);
+            shifted.fill();
+            const Tensor parent(shifted.span(), DType::BF16, {width, heads, n + 1});
+            (shift_index ? inputs.index_query : inputs.query) = parent.slice(2, 0, n);
+            auto q = query, iq = index_query;
+            (shift_index ? iq : q) = parent.slice(2, 1, n);
+            failures += rejects("shifted packed query", [&] {
+                ops::qsa_prepare_update(inputs, f.parameters, batch, rope_positions, f.before,
+                                        f.cache, after, q, iq, arena, execution);
+            });
+            cuda_synchronize();
+        }
+        auto alias = batch;
+        alias.ragged.token_to_seq =
+            Tensor({query.data, n * sizeof(int), query.device}, DType::I32, {n});
+        failures += rejects("packed query overlaps token-to-sequence metadata", [&] {
+            ops::qsa_prepare_update(projected, f.parameters, alias, rope_positions, f.before,
+                                    f.cache, after, query, index_query, arena, execution);
+        });
+        failures += arena.peak_used() != 0;
         ops::qsa_prepare_update(projected, f.parameters, batch, rope_positions, f.before, f.cache,
                                 after, query, index_query, arena, execution);
+    }
     cuda_synchronize();
     if (!kv_only) {
         const auto padded_q  = ragged.unpack(from_device<std::uint16_t>(query.data, query.numel()),
                                              width, 256 * f.query_heads);
         const auto padded_iq = ragged.unpack(
-            from_device<std::uint16_t>(iq.data(), index_query.numel()), width, 128 * 4);
+            from_device<std::uint16_t>(index_query.data, index_query.numel()), width, 128 * 4);
         f.out_q.device->copy_from_host(padded_q.data(), padded_q.size() * 2);
         f.out_iq.device->copy_from_host(padded_iq.data(), padded_iq.size() * 2);
     }
-    return verify(f, "ragged QSA prepare", true) +
+    return failures + verify(f, "ragged QSA prepare", true) +
            verify_exact("ragged raw tails and untouched slots", f.tail.download(), expected_tail) +
            verify_exact("ragged tail coordinates and untouched slots", f.first.download(),
                         expected_rope) +
            f.tail.guards("ragged raw tail") + f.first.guards("ragged coordinates") +
-           iq.verify_guards("ragged query") + scratch.verify_guards("ragged prepare workspace") +
+           scratch.verify_guards("ragged prepare workspace") +
            (arena.used() != 0 || arena.peak_used() > bytes);
 }
 
@@ -631,15 +666,6 @@ int read_footprint(DeviceContext& device, KvCacheStorage storage = KvCacheStorag
     device.synchronize();
     f.rope.view = saved;
     return verify(f, "masked read footprint");
-}
-
-template <class F>
-int rejects(const char* label, F&& call) {
-    try {
-        call();
-    } catch (const std::invalid_argument&) { return 0; }
-    std::cerr << label << ": invalid view accepted\n";
-    return 1;
 }
 
 int validation(DeviceContext& device) {

@@ -271,21 +271,22 @@ void WorkContract::validate(const Work& work, runtime::FrameKind kind) const {
                     std::unordered_map<std::uint32_t, std::unordered_set<std::int64_t>> reads,
                         writes;
                     for (const auto& row : rows) {
+                        const bool updates = !row.ids.empty();
                         total += row.ids.size();
                         any_sample |= row.sample;
-                        if ((row.ids.empty() && (!row.sample || !row.main_frontier)) ||
+                        if ((!updates && (!row.sample || !row.main_frontier)) ||
                             (row.constrained && !row.sample))
                             throw std::invalid_argument("invalid Qwen4Exp prefill row");
                         for (const auto& [rank, offsets] : row.states) {
                             auto& rank_reads  = reads[rank];
                             auto& rank_writes = writes[rank];
-                            if (rank_writes.contains(offsets.destination) ||
-                                rank_writes.contains(offsets.source) ||
-                                rank_reads.contains(offsets.destination))
+                            if (rank_writes.contains(offsets.source) ||
+                                (updates && (rank_writes.contains(offsets.destination) ||
+                                             rank_reads.contains(offsets.destination))))
                                 throw std::invalid_argument(
                                     "Qwen4Exp prefill rows have overlapping State writes");
                             rank_reads.insert(offsets.source);
-                            rank_writes.insert(offsets.destination);
+                            if (updates) rank_writes.insert(offsets.destination);
                         }
                     }
                     if (total > shape.prefill_chunk ||

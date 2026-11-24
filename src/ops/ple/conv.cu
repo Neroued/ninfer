@@ -136,16 +136,17 @@ void ragged_conv(const Tensor& residual, const Tensor& gated, const Tensor& kern
         operand::tensor(*t, DType::BF16, {detail::ple::kFeatures, detail::ple::kStreams, n}, 16, op,
                         "activation", device);
     }
-    operand::tensor(current, DType::BF16, {detail::ple::kChannels, n}, 2, op, "records", device);
+    const auto records = detail::ple::ragged_record_range(current, n, device);
     operand::shape(before.history.records.byte_offsets, {ragged.num_seqs(), 1, 1, 1}, op,
                    "state offsets");
     for (const auto* out : {&updated, normalized}) {
         if (!out) continue;
-        for (const auto* src :
-             {&residual, &gated, &current, &ragged.cu_seqlens, &ragged.seq_lengths,
-              &ragged.token_to_seq, &before.history.records.byte_offsets}) {
+        const auto range = operand::range(*out, op);
+        operand::disjoint(range, records, op);
+        for (const auto* src : {&residual, &gated, &ragged.cu_seqlens, &ragged.seq_lengths,
+                                &ragged.token_to_seq, &before.history.records.byte_offsets}) {
             if (out == &updated && src == &residual && out->data == src->data) continue;
-            operand::disjoint(operand::range(*out, op), operand::range(*src, op), op);
+            operand::disjoint(range, operand::range(*src, op), op);
         }
     }
     if (normalized)

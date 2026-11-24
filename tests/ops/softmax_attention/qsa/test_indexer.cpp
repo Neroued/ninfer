@@ -171,6 +171,15 @@ int run(DeviceContext& device, int t, int b, int history, int layout, Pattern pa
     return failures;
 }
 
+template <class F>
+int rejects(F&& call) {
+    try {
+        call();
+    } catch (const std::invalid_argument&) { return 0; }
+    std::cerr << "indexer accepted invalid view/profile\n";
+    return 1;
+}
+
 int ragged_indexer() {
     RaggedFixture ragged({1, 3, 17});
     constexpr int width = 17;
@@ -188,15 +197,22 @@ int ragged_indexer() {
     const auto bytes = ops::qsa_indexer_ragged_workspace_capacity_bytes(f.bucket, n, n, s, s);
     GuardedDeviceBuffer scratch(std::max<std::size_t>(256, bytes));
     MemoryArena arena(scratch.span());
-    ops::qsa_indexer(Tensor(q.span(), DType::BF16, {128, 4, n}), f.cache, batch, f.bucket, arena,
-                     selection, cuda_environment().default_execution);
+    const Tensor query(q.span(), DType::BF16, {128, 4, n});
+    const auto execution = cuda_environment().default_execution;
+    auto alias           = selection;
+    alias.block_counts   = ragged.view.token_to_seq;
+    const auto failures  = rejects(
+        [&] { ops::qsa_indexer(query, f.cache, batch, f.bucket, arena, alias, execution); });
+    ops::qsa_indexer(query, f.cache, batch, f.bucket, arena, selection, execution);
     cuda_synchronize();
     const auto padded_ids    = ragged.unpack(from_device<int>(ids.data(), 512 * n), width, 512);
     const auto padded_counts = ragged.unpack(from_device<int>(counts.data(), n), width, 1);
     f.ids.copy_from_host(padded_ids.data(), padded_ids.size() * 4);
     f.counts.copy_from_host(padded_counts.data(), padded_counts.size() * 4);
-    return verify(f, "ragged QSA indexer") + ids.verify_guards("ragged indices") +
+    return failures + verify(f, "ragged QSA indexer") + ids.verify_guards("ragged indices") +
            counts.verify_guards("ragged counts") +
+           verify_exact("QSA token mapping preserved",
+                        from_device<int>(ragged.view.token_to_seq.data, n), ragged.mapping) +
            scratch.verify_guards("ragged indexer workspace") +
            (arena.used() != 0 || arena.peak_used() > bytes);
 }
@@ -333,15 +349,6 @@ int read_footprint(DeviceContext& device) {
     f.launch(workspace, device.execution_view());
     device.synchronize();
     return verify(f, "masked reads", false);
-}
-
-template <class F>
-int rejects(F&& call) {
-    try {
-        call();
-    } catch (const std::invalid_argument&) { return 0; }
-    std::cerr << "indexer accepted invalid view/profile\n";
-    return 1;
 }
 
 int validation(DeviceContext& device) {

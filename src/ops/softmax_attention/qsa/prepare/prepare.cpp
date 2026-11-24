@@ -15,7 +15,7 @@ namespace {
 bool identical(const Tensor& a, const Tensor& b) {
     if (a.data != b.data || a.device != b.device || a.dtype != b.dtype) return false;
     for (int d = 0; d < 4; ++d)
-        if (a.ne[d] != b.ne[d] || a.nb[d] != b.nb[d]) return false;
+        if (a.ne[d] != b.ne[d] || (a.ne[d] > 1 && a.nb[d] != b.nb[d])) return false;
     return true;
 }
 
@@ -176,7 +176,8 @@ template <class Prepare>
 void prepare_update(const QsaKvProjectionView& kv, const QsaKvPrepareParameters& params,
                     const QsaRaggedBatchView& batch, const Tensor& rope,
                     const ConstQsaTailStateView& before, QsaTailStateView after,
-                    MemoryArena& workspace, std::span<const Tensor* const> queries, Prepare prepare,
+                    MemoryArena& workspace, std::span<const Tensor* const> queries,
+                    std::span<const Tensor* const> query_outputs, Prepare prepare,
                     CudaExecutionView execution) {
     const auto& seq         = batch.ragged;
     const auto device       = execution.device();
@@ -207,6 +208,11 @@ void prepare_update(const QsaKvProjectionView& kv, const QsaKvPrepareParameters&
                                &after.raw_keys.records.byte_offsets,
                                &after.first_rope.records.byte_offsets};
     const auto coordinates  = operand::blocks(rope, op);
+    for (const auto* output : query_outputs) {
+        const auto range = operand::range(*output, op);
+        v.require(!operand::overlaps(coordinates, range), "output/coordinate overlap");
+        for (const auto* input : tensors) operand::disjoint(range, operand::range(*input, op), op);
+    }
     for (int s = 0; s < seq.num_seqs(); ++s) {
         const int begin = seq.segment_begin(s), len = seq.segment_length(s);
         auto scope = workspace.scope();
@@ -264,11 +270,23 @@ void qsa_prepare_update(const QsaProjectionView& p, const QsaPrepareParameters& 
         operand::tensor(*t, DType::BF16, {256, h, n}, 16, op, "query", device);
     for (const auto* t : std::array<const Tensor*, 2>{&p.index_query, &index_query})
         operand::tensor(*t, DType::BF16, {128, 4, n}, 16, op, "index query", device);
+    const Tensor* outputs[] = {&query, &index_query};
+    operand::disjoint(operand::range(query, op), operand::range(index_query, op), op);
+    for (const auto* out : outputs) {
+        const auto range = operand::range(*out, op);
+        for (const auto* in :
+             {&p.query, &p.index_query, &parameters.query_norm, &parameters.index_query_norm}) {
+            const bool paired =
+                (out == &query && in == &p.query) || (out == &index_query && in == &p.index_query);
+            if (paired && identical(*out, *in)) continue;
+            operand::disjoint(range, operand::range(*in, op), op);
+        }
+    }
     const Tensor* queries[] = {&p.query,     &p.index_query,         &query,
                                &index_query, &parameters.query_norm, &parameters.index_query_norm};
     prepare_update(
         {p.key, p.value, p.index_key}, parameters.kv, batch, rope, before, after, workspace,
-        queries,
+        queries, outputs,
         [&](const QsaKvProjectionView& kv, const QsaBatchView& segment, const Tensor& coords,
             const ConstQsaTailStateView& src, QsaRawRecordWriteView records, int begin, int len) {
             auto out = query.slice(2, begin, len);
@@ -286,7 +304,7 @@ void qsa_prepare_kv_update(const QsaKvProjectionView& p, const QsaKvPrepareParam
                            QsaTailStateView after, MemoryArena& workspace,
                            CudaExecutionView execution) {
     prepare_update(
-        p, parameters, batch, rope, before, after, workspace, {},
+        p, parameters, batch, rope, before, after, workspace, {}, {},
         [&](const QsaKvProjectionView& kv, const QsaBatchView& segment, const Tensor& coords,
             const ConstQsaTailStateView& src, QsaRawRecordWriteView records, int, int) {
             prepare_kv<true>(kv, parameters, segment, coords, src, cache, records, execution);

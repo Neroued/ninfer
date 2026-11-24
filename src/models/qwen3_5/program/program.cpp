@@ -144,13 +144,16 @@ void validate_prefill_work(const ForwardWork& op, std::uint32_t prefill_chunk) {
         any_sample |= sampled;
         if ((!n && (!sampled || !row.main_frontier)) || (constrained && !sampled))
             throw std::invalid_argument("Qwen3.5 prefill row has invalid sampling or extent");
-        for (const auto& prev : std::span(op.rows).first(i)) {
-            if (row.destination_state == prev.destination_state ||
-                row.source_state == prev.destination_state ||
-                row.destination_state == prev.source_state ||
-                row.state_offsets.destination == prev.state_offsets.destination ||
-                row.state_offsets.source == prev.state_offsets.destination ||
-                row.state_offsets.destination == prev.state_offsets.source ||
+        for (std::size_t j = 0; j < i; ++j) {
+            const auto& prev        = op.rows[j];
+            const bool prev_updates = !op.inputs[j].tokens.empty();
+            if ((n && prev_updates &&
+                 (row.destination_state == prev.destination_state ||
+                  row.state_offsets.destination == prev.state_offsets.destination)) ||
+                (prev_updates && (row.source_state == prev.destination_state ||
+                                  row.state_offsets.source == prev.state_offsets.destination)) ||
+                (n && (row.destination_state == prev.source_state ||
+                       row.state_offsets.destination == prev.state_offsets.source)) ||
                 row.main_table.index == prev.main_table.index ||
                 (row.backend_table && prev.backend_table &&
                  row.backend_table->index == prev.backend_table->index))

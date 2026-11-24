@@ -65,18 +65,31 @@ SessionImpl::start_prefill(std::span<const SequenceHandle> members,
     if (execution) return {};
     if (members.empty() || members.size() > max_concurrency || grants.size() != members.size())
         throw std::logic_error("invalid prefill membership");
-    const auto mark = next_lane_mark();
+    std::vector<std::uint32_t> ends;
+    ends.reserve(members.size());
+    const auto mark         = next_lane_mark();
+    std::uint32_t remaining = prefill_chunk;
     for (std::size_t b = 0; b < members.size(); ++b) {
         const auto l        = lane(members[b]);
         const auto& request = requests[l];
         const auto info     = prefill_candidate(members[b]);
         if (!request.permit || request.permit->kind != ExecutionUnitKind::Prefill ||
             request.capture_pending || lane_marks[l] == mark ||
-            (info.exclusive && members.size() > 1) ||
-            (!info.zero_token_sample && (!grants[b].max_tokens || !info.unit_max_tokens ||
-                                         request.permit->main_frontier == request.prefill->cursor)))
+            (info.exclusive && members.size() > 1))
             throw std::logic_error("prefill has no distinct executable window");
-        lane_marks[l] = mark;
+        lane_marks[l]     = mark;
+        const auto& state = sequences[l];
+        const auto begin  = state.continuation.metadata.execution_frontier;
+        const auto limit =
+            begin + std::min(grants[b].max_tokens, request.prefill->prompt_tokens - begin);
+        const auto end = window_end(state, request, begin,
+                                    std::min(limit, request.permit->main_frontier), vision_window);
+        if (end < begin || (end == begin && !info.zero_token_sample))
+            throw std::logic_error("prefill grant has no executable window");
+        if (end - begin > remaining)
+            throw std::logic_error("prefill grants exceed the token budget");
+        remaining -= end - begin;
+        ends.push_back(end);
     }
     auto reservation = executor().try_reserve(runtime::FrameKind::Compute);
     if (!reservation) return {};
@@ -98,11 +111,8 @@ SessionImpl::start_prefill(std::span<const SequenceHandle> members,
             auto& request = requests[l];
             prepare_capture_boundary(l);
             const auto begin = state.continuation.metadata.execution_frontier;
-            const auto limit =
-                begin + std::min(grants[b].max_tokens, request.prefill->prompt_tokens - begin);
-            const auto end =
-                window_end(state, request, begin, std::min(limit, request.permit->main_frontier),
-                           vision_window);
+            // A newly reserved capture can shorten the validated window.
+            const auto end = window_end(state, request, begin, ends[b], vision_window);
             const bool capture =
                 request.capture_reservation && request.capture_reservation->frontier == end;
             const bool sample = end == request.prefill->prompt_tokens && !capture;

@@ -25,6 +25,8 @@ inline bool field_aligned(const ConstStateFieldView& view, std::size_t alignment
                0;
 }
 
+common::operand::Range ragged_record_range(const Tensor& records, int tokens, Device device);
+
 void validate_gate(const PleProjectionView& projected, const Tensor& residual,
                    const PleGateParameters& parameters, const PleBatchView& batch,
                    const PleConvRecordWindowView& records, const Tensor& gated,

@@ -231,8 +231,7 @@ void RankProgramImpl::forward_packed_prefill(const ForwardWork& work) {
         for (int s = 0; s < ragged.num_seqs(); ++s) {
             const auto last   = ragged.host_cu_seqlens[s + 1] - 1;
             const auto source = f.hidden.slice(1, last, 1);
-            const bool local =
-                last >= dimension(own.begin) && last < dimension(own.begin + own.size);
+            const bool local  = last >= extent(own.begin) && last < extent(own.begin + own.size);
             const auto destination =
                 resources.states.image(local).tensor(resources.plan.state.hidden, offsets[s]);
             copy_bytes_async({destination.data, destination.bytes(), cuda.device()},
@@ -240,7 +239,7 @@ void RankProgramImpl::forward_packed_prefill(const ForwardWork& work) {
         }
         if (f.timed_prefill) prefill_timer->record_stop();
     }
-    const int sampled = dimension(packed.sampled_members.size());
+    const int sampled = extent(packed.sampled_members.size());
     if (sampled) {
         f.sampled_hidden = resources.packed(frame.pending_hidden, {h, sampled});
         ops::gather(resources.states.hidden(row(layout.sampled_offsets, sampled)),
@@ -347,7 +346,7 @@ void RankProgramImpl::decide() {
     if (verify && !f.decision) request_decision();
     if (!f.decision) return;
     upload_sampling();
-    const int b = f.packed ? dimension(f.sampling_members().size()) : f.batch.rows;
+    const int b = f.packed ? extent(f.sampling_members().size()) : f.batch.rows;
     if (f.graph_route) {
         graphs->decide(*f.graph_route);
     } else if (verify) {

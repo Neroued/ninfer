@@ -15,10 +15,15 @@ struct Directory;
 
 namespace ninfer::models::glm5next {
 
-[[nodiscard]] inline std::int32_t dimension(std::uint64_t value) {
-    if (!value || value > std::uint64_t(std::numeric_limits<std::int32_t>::max()))
+[[nodiscard]] inline std::int32_t extent(std::uint64_t value) {
+    if (value > std::uint64_t(std::numeric_limits<std::int32_t>::max()))
         throw std::overflow_error("GLM5Next tensor extent is outside int32");
     return static_cast<std::int32_t>(value);
+}
+
+[[nodiscard]] inline std::int32_t dimension(std::uint64_t value) {
+    if (!value) throw std::overflow_error("GLM5Next tensor extent is outside int32");
+    return extent(value);
 }
 
 enum class MixerKind { Kda, Mla };

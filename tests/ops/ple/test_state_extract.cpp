@@ -106,11 +106,12 @@ int run(DeviceContext& device, int batch, int layout, bool inplace, bool sliced,
     return failures;
 }
 
-int ragged_extract() {
+int ragged_extract(bool padded) {
     RaggedFixture ragged({1, 3, 17, 65});
     constexpr int slots = 8;
     const std::vector<int> source{3, 1, 6, 0}, destination{3, 4, 6, 2};
-    Words history({D, 9, slots}, 1, history_strides(slots, 1)), values({D, ragged.tokens()});
+    Words history({D, 9, slots}, 1, history_strides(slots, 1)),
+        values({D, ragged.tokens()}, padded, column_strides(ragged.tokens(), 1, padded));
     history.fill(1001, 1.0f, true);
     values.fill(1013, 1.0f, true);
     history.upload();
@@ -140,7 +141,8 @@ int ragged_extract() {
 } // namespace
 
 void add_ple_state_extract_cases(ninfer::test::OpSuite& suite) {
-    suite.add("ple_state_extract/ragged", ragged_extract);
+    suite.add("ple_state_extract/ragged", [] { return ragged_extract(false); });
+    suite.add("ple_state_extract/ragged/padded_records", [] { return ragged_extract(true); });
     const auto add = [&](int batch, int layout, bool inplace, bool sliced) {
         suite.add("ple_state_extract/b" + std::to_string(batch) + "/layout" +
                       std::to_string(layout) + (inplace ? "/alias" : "/disjoint") +

@@ -1235,7 +1235,8 @@ void EngineCore<Instance>::begin_cycle(HostPhaseMeasurement& boundary) {
             const bool changed = try_admit_one(false);
             if (instance_.session->has_context_operation()) (void)poll_execution(boundary);
             if (instance_.session->has_context_operation()) break;
-            if (changed) reserve_resident_units();
+            if (!changed) break;
+            reserve_resident_units();
         }
     }
     if (instance_.session->has_context_operation()) {

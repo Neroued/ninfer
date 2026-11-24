@@ -227,10 +227,10 @@ void RankProgramImpl::prepare_packed_inputs(const ForwardWork& work) {
             const auto member               = plan.members[b];
             const auto& input               = work.rows[member];
             const auto offsets              = input.states.at(rank);
-            const int len                   = dimension(input.ids.size());
+            const int len                   = extent(input.ids.size());
             f.result.rows[member].processed = len;
             if (input.sample) {
-                const int slot = dimension(packed.sampled_members.size());
+                const int slot = extent(packed.sampled_members.size());
                 packed.sampled_members.push_back(member);
                 i64(layout.sampled_offsets)[slot]    = len ? offsets.destination : offsets.source;
                 i32(global.live_rows)[slot]          = 1;
@@ -267,7 +267,7 @@ void RankProgramImpl::prepare_packed_inputs(const ForwardWork& work) {
         }
         packed.update.owner_tokens[owner] = {std::uint32_t(begin), std::uint32_t(tokens - begin)};
     }
-    const int sampled = dimension(packed.sampled_members.size());
+    const int sampled = extent(packed.sampled_members.size());
     if (sampled) {
         upload(layout.sampled_offsets, sampled);
         upload(global.live_rows, sampled);

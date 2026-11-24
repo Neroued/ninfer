@@ -147,6 +147,7 @@ void work_contract() {
     for (auto& row : operation.rows) {
         row.ids.clear();
         row.rope_positions.clear();
+        row.states        = {{0, {0, 0}}, {1, {0, 0}}};
         row.main_frontier = 9;
         row.sample        = true;
     }

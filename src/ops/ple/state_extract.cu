@@ -95,8 +95,7 @@ void ple_state_extract(const ConstPleConvStateView& before, const Tensor& record
     namespace operand        = common::operand;
     constexpr const char* op = "ple_state_extract";
     operand::ragged_sequence(ragged, op, execution.device());
-    operand::tensor(records, DType::BF16, {detail::ple::kChannels, ragged.total_tokens()}, 2, op,
-                    "records", execution.device());
+    (void)detail::ple::ragged_record_range(records, ragged.total_tokens(), execution.device());
     for (const auto& state : std::array<ConstStateFieldView, 2>{before.history, after.history})
         operand::shape(state.records.byte_offsets, {ragged.num_seqs(), 1, 1, 1}, op,
                        "state offsets");

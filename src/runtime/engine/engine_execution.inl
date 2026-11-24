@@ -46,8 +46,10 @@ void EngineCore<Instance>::commit_pending(PendingBatch&& pending, ComputeFlight 
                 throw std::logic_error("pending row has no active Engine request");
             }
             if (decode_round) { ++request->host_timing.decode_rounds; }
-            sampled[row]           = pending.row_sampled(row);
-            preview[row].cancelled = flight.cancelled[row];
+            sampled[row] = pending.row_sampled(row);
+            preview[row].cancelled =
+                flight.cancelled[row] ||
+                (!decode_round && request->cancelled.load(std::memory_order_acquire));
             preview[row].failed =
                 sampled[row] && !preview[row].cancelled && pending.constraint_failed(row);
             const std::int32_t raw_count =
@@ -194,6 +196,8 @@ void EngineCore<Instance>::commit_pending(PendingBatch&& pending, ComputeFlight 
         const std::uint32_t lane     = lane_indices[row];
         const auto& request          = flight.requests[row];
         const std::uint32_t accepted = decisions[row].accepted_tokens;
+        if (!decode_round && flight.progressed[row] && !preview[row].cancelled)
+            publish_prompt_progress(request);
         if (preview[row].failed) {
             request->terminal_error     = std::make_exception_ptr(RequestError(
                 RequestErrorKind::ConstraintDeadEnd, "grammar has no valid next token"));
@@ -304,7 +308,7 @@ void EngineCore<Instance>::resolve_prefill_progress(
         }
         if (flight.progressed[row]) {
             request->last_progress = Clock::now();
-            publish_prompt_progress(request);
+            if (!progress.pending) publish_prompt_progress(request);
         }
         if (step.complete != (progress.pending && progress.pending->row_sampled(row))) {
             throw std::logic_error("prefill completion differs from its sampled rows");

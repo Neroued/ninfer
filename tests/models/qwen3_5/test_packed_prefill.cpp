@@ -75,7 +75,10 @@ void validate_work_and_commit() {
 
     auto hits = work;
     for (std::size_t i = 0; i < hits.rows.size(); ++i) {
-        hits.rows[i].main_frontier = 13;
+        auto& row        = hits.rows[i];
+        row.source_state = row.destination_state = work.rows[2].source_state;
+        row.state_offsets = {work.rows[2].state_offsets.source, work.rows[2].state_offsets.source};
+        row.main_frontier = 13;
         hits.inputs[i].tokens.clear();
         hits.sampling[i].sample = true;
     }
@@ -115,6 +118,7 @@ public:
     rt::ExecutionCapacity capacity() const noexcept override { return {1, 1}; }
 
     std::optional<rt::ExecutionReservation> try_reserve(rt::FrameKind kind) override {
+        if (kind == rt::FrameKind::Compute) ++compute_reservations;
         return frames_.try_reserve(kind);
     }
 
@@ -189,6 +193,7 @@ public:
 
     q35::ForwardWork forward;
     std::vector<q35::CommitRow> committed;
+    unsigned compute_reservations = 0;
 
 private:
     void queue_retire(rt::ExecutionTicket ticket) {
@@ -252,6 +257,33 @@ q35::SequenceHandle bind(q35::detail::SessionImpl& session, std::uint32_t lane, 
     const auto result = next_event<q35::ContextProgress>(session);
     require(result.published && result.sequence.has_value(), "prefill binding was not published");
     return *result.sequence;
+}
+
+void oversized_grants() {
+    Executor executor;
+    q35::detail::SessionImpl session(session_plan());
+    session.executor_ = &executor;
+    const std::array rows{bind(session, 0, 8), bind(session, 1, 8)};
+    const std::array units{q35::ExecutionUnit{rows[0], q35::ExecutionUnitKind::Prefill, 8},
+                           q35::ExecutionUnit{rows[1], q35::ExecutionUnitKind::Prefill, 8}};
+    require(bool(session.reserve_units(units)), "could not reserve both prefill units");
+    const std::array oversized{rt::PrefillGrant{8}, rt::PrefillGrant{8}};
+    bool rejected = false;
+    try {
+        (void)session.start_prefill(rows, oversized);
+    } catch (const std::logic_error&) { rejected = true; }
+    require(rejected && executor.compute_reservations == 0 && !executor.failed() &&
+                !executor.has_pending_work(),
+            "oversized packed prefill reached transaction preparation");
+    const std::array fitting{rt::PrefillGrant{8}, rt::PrefillGrant{4}};
+    require(session.start_prefill(rows, fitting).has_value(),
+            "valid grants could not reuse the prefill reservations");
+    auto progress = next_event<q35::PrefillProgress>(session);
+    require(progress.pending && progress.rows[0].processed_prompt_tokens == 8 &&
+                progress.rows[1].processed_prompt_tokens == 4,
+            "packed prefill changed the valid token windows after rejection");
+    (void)session.discard(std::move(*progress.pending));
+    (void)next_event<rt::ExecutionComplete>(session);
 }
 
 void mixed_pending_commit() {
@@ -327,6 +359,7 @@ void mixed_pending_commit() {
 int main() {
     try {
         validate_work_and_commit();
+        oversized_grants();
         mixed_pending_commit();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

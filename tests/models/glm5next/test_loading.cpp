@@ -1,5 +1,6 @@
 #include "models/glm5next/load.h"
 #include "models/glm5next/execution/parameters.h"
+#include "models/glm5next/program/internal.h"
 
 #include <algorithm>
 #include <array>
@@ -313,6 +314,103 @@ void draft_loading(const std::filesystem::path& directory, DeviceContext* device
     }
 }
 
+void packed_prefill_inputs(const glm::execution::Parameters& parameters, DeviceContext& device) {
+    glm::ExecutionPlan plan;
+    plan.profile = parameters.profile;
+    plan.shape   = {.max_context = 64, .max_concurrency = 2, .prefill_chunk = 8};
+    plan.batches = std::make_shared<const BatchExecutionPlan>(
+        make_batch_execution_spec(plan.shape.max_concurrency, 1, false));
+    plan.state = glm::plan_state(*plan.profile);
+    LayoutBuilder layout;
+    const auto& text = plan.profile->config.text;
+    plan.main        = glm::plan_cache(layout, text.mla, text.mla_layers, plan.shape.max_context,
+                                       plan.shape.max_concurrency, ops::KpoolMlaStorage::BFloat16,
+                                       KvCacheVectorFormat::BFloat16);
+    plan.frame       = glm::plan_frame(layout, *plan.profile, plan.shape);
+    plan.fixed_bytes = layout.finish(256);
+    plan.mapping_elements      = plan.main.tables.page_offsets.region.bytes / sizeof(std::int64_t);
+    plan.pinned_output_bytes   = plan.frame.egress.bytes;
+    plan.capacity.device_bytes = 3 * plan.state.owner.image_bytes;
+    plan.capacity.runtime_reservation_bytes = plan.reservation_bytes();
+    const auto image_bytes = static_cast<std::int64_t>(plan.state.owner.image_bytes);
+    // The loading fixture has small matrices. Exercise the rank's actual ingress without
+    // dispatching the model mixers, which require production Op geometry.
+    glm::detail::RankProgramImpl rank(
+        parameters, std::make_unique<glm::Resources>(std::move(plan), device), device, {});
+    glm::ForwardWork forward{.kind = glm::ForwardKind::Prefill};
+    forward.rows.resize(2);
+    for (std::uint32_t row = 0; row < forward.rows.size(); ++row) {
+        forward.rows[row].member     = {{row + 1, 1}, {{row}, 1}};
+        forward.rows[row].main_table = {0, row, 1};
+    }
+    forward.rows[0].ids               = {1, 2};
+    forward.rows[0].states            = {{0, {0, image_bytes}}};
+    forward.rows[1].states            = {{0, {2 * image_bytes, 2 * image_bytes}}};
+    forward.rows[1].main_frontier     = 5;
+    forward.rows[1].sampling_position = 5;
+    forward.rows[1].sample            = true;
+    forward.sample                    = glm::SampleKind::FirstToken;
+
+    const auto prepare = [&](const glm::ForwardWork& prefill) {
+        glm::Work work{{}, prefill};
+        glm::prepare_batch(work, *rank.contract().batches);
+        rank.contract().validate(work, runtime::FrameKind::Compute);
+        rank.compute = std::make_unique<glm::detail::ComputeFrame>();
+        rank.compute->result.rows.resize(prefill.rows.size());
+        rank.prepare_packed_inputs(std::get<glm::ForwardWork>(work.operation));
+        device.synchronize();
+    };
+    prepare(forward);
+    const auto& frame  = *rank.compute;
+    const auto& packed = *frame.packed;
+    const auto own     = packed.update.owner_tokens[0];
+    require(frame.tokens == 2 && own.begin == 0 && own.size == 2 &&
+                frame.batch.attention.positions.data == frame.batch.positions.data &&
+                frame.result.rows[0].processed == 2 && frame.result.rows[1].processed == 0 &&
+                packed.sampled_members == std::vector<std::uint32_t>{1} &&
+                packed.update.ragged.num_seqs() == 1,
+            "packed rank ingress confused the first owner, sampled slot, or cache-hit row");
+    const auto& ingress         = *rank.frame.packed_prefill;
+    std::int64_t sampled_offset = -1;
+    CUDA_CHECK(cudaMemcpy(&sampled_offset, rank.resources.tensor(ingress.sampled_offsets).data,
+                          sizeof(sampled_offset), cudaMemcpyDeviceToHost));
+    require(sampled_offset == 2 * image_bytes, "slot zero did not select cached hidden state");
+
+    auto cached = forward.rows.back();
+    forward.rows.pop_back();
+    forward.sample = glm::SampleKind::None;
+    prepare(forward);
+    require(rank.compute->tokens == 2 && rank.compute->sampling_members().empty() &&
+                rank.compute->result.rows[0].processed == 2,
+            "packed rank ingress rejected an unsampled prefill");
+
+    // A constrained cache hit gathers hidden state and waits for its decision before the head.
+    cached.constrained = true;
+    const auto source =
+        rank.resources.states.image(true).tensor(rank.resources.plan.state.hidden, 2 * image_bytes);
+    CUDA_CHECK(cudaMemsetAsync(source.data, 0x3f, source.bytes(), device.stream()));
+    glm::Work hit{{},
+                  glm::ForwardWork{.kind   = glm::ForwardKind::Prefill,
+                                   .sample = glm::SampleKind::FirstToken,
+                                   .rows   = {cached}}};
+    glm::prepare_batch(hit, *rank.contract().batches);
+    rank.bindings[cached.member.residency.lane.value] = cached.member;
+    rank.validate_work(hit, runtime::FrameKind::Compute);
+    rank.compute.reset();
+    const runtime::ExecutionTicket ticket{{1}, 1, {runtime::FrameKind::Compute, 0, 1}};
+    rank.start({ticket, {1}, std::move(hit)});
+    const auto event = rank.poll();
+    require(event && std::holds_alternative<runtime::DecisionNeeded>(*event) &&
+                rank.compute->tokens == 0 && rank.compute->result.rows[0].processed == 0,
+            "non-visual cache hit did not enter packed sampling");
+    device.synchronize();
+    std::vector<std::uint16_t> hidden(text.hidden);
+    CUDA_CHECK(cudaMemcpy(hidden.data(), rank.compute->sampled_hidden.data, source.bytes(),
+                          cudaMemcpyDeviceToHost));
+    require(std::ranges::all_of(hidden, [](auto word) { return word == 0x3f3f; }),
+            "cache hit read hidden state from the wrong slot");
+}
+
 void materialization(const std::filesystem::path& directory, DeviceContext& device,
                      std::uint32_t size, std::uint32_t rank, bool optimized, std::uint32_t ep = 2) {
     std::unique_ptr<glm::ModelShard> model;
@@ -361,6 +459,17 @@ void materialization(const std::filesystem::path& directory, DeviceContext& devi
     const auto profile = glm::execution::describe_model(model->definition(), model->weight_data(),
                                                         model->expert_data(), model->rank_plan());
     const glm::execution::Parameters parameters(*model, profile);
+    if (size == 1) {
+        artifact::Reader reader(directory / "model.ninfer");
+        auto definition = glm::read_definition(reader, {});
+        auto text       = glm::materialize_model(
+            glm::resolve_rank_load(reader, definition, glm::plan_single_rank(*definition),
+                                         device.device()),
+            device);
+        auto text_profile = glm::execution::describe_model(text->definition(), text->weight_data(),
+                                                           text->expert_data(), text->rank_plan());
+        packed_prefill_inputs(glm::execution::Parameters(*text, std::move(text_profile)), device);
+    }
     const auto& prepared_kda =
         std::get<glm::execution::KdaParameters>(parameters.text.layers[0].mixer);
     require(prepared_kda.dt_bias.dtype == DType::FP32 &&

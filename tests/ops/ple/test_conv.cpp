@@ -156,21 +156,22 @@ int short_record_view(DeviceContext& device, bool norm) {
     return f.verify(norm, "PLE padded T with R=3");
 }
 
-int ragged_conv(bool norm) {
+int ragged_conv(bool norm, bool padded = false) {
     RaggedFixture ragged({2, 15, 34});
     const int n = ragged.tokens(), width = 34, rows = ragged.segments();
     ConvFixture f(width, rows);
     f.prepare(0, false);
     f.valid = ragged.lengths;
     upload_i32(f.d_valid, f.valid);
-    Words residual({H, C, n}), gated({H, C, n}), current({D, n}), updated({H, C, n}),
+    Words residual({H, C, n}), gated({H, C, n}),
+        current({D, n}, padded, column_strides(n, 1, padded)), updated({H, C, n}),
         normalized({H, C, n});
     residual.host = ragged.pack(f.residual.host, width, D);
     gated.host    = ragged.pack(f.gated.host, width, D);
     for (int s = 0; s < rows; ++s)
         for (int t = 0; t < ragged.lengths[s]; ++t)
             std::copy_n(f.records.host.begin() + f.records.index(0, t + f.offset[s], s), D,
-                        current.host.begin() + (ragged.prefix[s] + t) * D);
+                        current.host.begin() + current.index(0, ragged.prefix[s] + t));
     for (const auto* data : {&residual, &gated, &current}) data->upload();
     const auto ex = cuda_environment().default_execution;
     auto y        = norm ? residual.tensor : updated.tensor;
@@ -197,6 +198,7 @@ int ragged_conv(bool norm) {
 void add_ple_conv_cases(ninfer::test::OpSuite& suite) {
     suite.add("ple_conv/ragged/plain", [] { return ragged_conv(false); });
     suite.add("ple_conv/ragged/norm", [] { return ragged_conv(true); });
+    suite.add("ple_conv/ragged/padded_records", [] { return ragged_conv(true, true); });
     suite.add("ple_conv/contract", [] { return validation(cuda_environment().context); });
     suite.add("ple_conv/history_gap",
               [] { return output_in_history_gap(cuda_environment().context); });

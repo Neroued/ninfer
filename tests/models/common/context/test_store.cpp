@@ -749,6 +749,7 @@ void test_migration_state_fields(ninfer::DeviceContext& device) {
         const auto image = storage.image(states.physical_offset(destination));
         CUDA_CHECK(
             cudaMemcpy(image.data, expected.data(), expected.size(), cudaMemcpyHostToDevice));
+        device.synchronize();
         store::ContextTransaction migration(directory);
         migration.own_state(destination);
         if (clear) {

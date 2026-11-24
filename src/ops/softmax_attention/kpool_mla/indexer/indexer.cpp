@@ -167,6 +167,16 @@ void kpool_indexer(const Tensor& query, const Tensor& coeff, const ConstKpoolInd
     operand::tensor(out.pool_ids, DType::I32, {512, n}, 4, op, "pool IDs", device);
     operand::tensor(out.pool_counts, DType::I32, {n}, 4, op, "pool counts", device);
     operand::tensor(out.selection_end, DType::I32, {n}, 4, op, "selection end", device);
+    const std::array outputs{operand::range(out.pool_ids, op), operand::range(out.pool_counts, op),
+                             operand::range(out.selection_end, op)};
+    operand::disjoint(outputs, op);
+    const auto table = operand::blocks(cache.keys.records.page_offsets, op);
+    for (const auto range : outputs) {
+        require(!operand::overlaps(table, range), "output overlaps page table");
+        for (const Tensor* input : {&query, &coeff, &batch.positions, &batch.table_rows,
+                                    &seq.cu_seqlens, &seq.seq_lengths, &seq.token_to_seq})
+            operand::disjoint(range, operand::range(*input, op), op);
+    }
     for (int s = 0; s < seq.num_seqs(); ++s) {
         const int begin = seq.segment_begin(s), len = seq.segment_length(s);
         const KpoolMlaBatchView segment{batch.positions.slice(0, begin, len),

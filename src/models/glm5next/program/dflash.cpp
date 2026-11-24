@@ -106,19 +106,20 @@ void RankProgramImpl::append_packed_dflash_context(const execution::BatchView& c
     const auto capacity = p.draft->context.capacity;
     // Draft context is TP-sharded, so both ranks materialize every segment in the same order.
     for (int s = 0; s < ragged.num_seqs(); ++s) {
-        auto scope          = resources.workspace.scope();
         const auto len      = std::uint32_t(ragged.segment_length(s));
         const auto retained = std::min(len, capacity);
-        const int end       = ragged.host_cu_seqlens[s + 1];
-        const int begin     = end - dimension(retained);
-        const auto tail     = columns.split()
-                                  ? gather_feature_range(features, columns, begin, end,
-                                                         resources.workspace, *parallel, cuda)
-                                  : features.slice(1, begin, retained);
-        const auto positions =
-            call.positions.slice(0, begin, retained).view({dimension(retained), 1});
-        const auto counts = len > capacity ? resources.tensor(frame.dflash->window_count)
-                                           : ragged.seq_lengths.slice(0, s, 1);
+        const int count     = extent(retained);
+        if (!count) continue;
+        auto scope           = resources.workspace.scope();
+        const int end        = ragged.host_cu_seqlens[s + 1];
+        const int begin      = end - count;
+        const auto tail      = columns.split()
+                                   ? gather_feature_range(features, columns, begin, end,
+                                                          resources.workspace, *parallel, cuda)
+                                   : features.slice(1, begin, count);
+        const auto positions = call.positions.slice(0, begin, count).view({count, 1});
+        const auto counts    = len > capacity ? resources.tensor(frame.dflash->window_count)
+                                              : ragged.seq_lengths.slice(0, s, 1);
         execution::draft_append_context(
             parameters, {resources.workspace, resources.states, *parallel}, tail, positions, counts,
             call.destination_offsets.slice(0, s, 1), {retained, retained}, cuda);

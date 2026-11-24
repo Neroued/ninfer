@@ -1,7 +1,10 @@
+#include "ops/linear_attention/kimi_delta_attention/chunked/workspace.h"
 #include "ops/linear_attention/kimi_delta_attention/launch.h"
-#include "ops/common/math.cuh"
-#include "ops/common/mma.cuh"
-#include "ops/common/warp.cuh"
+#include "ops/common/numeric/math.h"
+#include "ops/common/numeric/math.cuh"
+#include "ops/common/cuda/reduce.cuh"
+#include "ops/common/cuda/mma.cuh"
+#include "ops/common/cuda/memory.cuh"
 
 namespace ninfer::ops::detail::kimi_delta_attention {
 namespace {
@@ -31,8 +34,8 @@ __global__ __launch_bounds__(256, 2) void prepare_kernel(Arguments args,
 
     float q[8]{}, k[8]{};
     if (row < length) {
-        const uint4 qp = load_vec<uint4>(args.q + qo + col);
-        const uint4 kp = load_vec<uint4>(args.k + qo + col);
+        const uint4 qp = common::load_vec<uint4>(args.q + qo + col);
+        const uint4 kp = common::load_vec<uint4>(args.k + qo + col);
         const auto* qb = reinterpret_cast<const __nv_bfloat16*>(&qp);
         const auto* kb = reinterpret_cast<const __nv_bfloat16*>(&kp);
 #pragma unroll
@@ -47,8 +50,8 @@ __global__ __launch_bounds__(256, 2) void prepare_kernel(Arguments args,
         qs = fmaf(q[i], q[i], qs);
         ks = fmaf(k[i], k[i], ks);
     }
-    qs             = warp_sum<16>(qs);
-    ks             = warp_sum<16>(ks);
+    qs             = common::warp_sum<16>(qs);
+    ks             = common::warp_sum<16>(ks);
     const float qi = rsqrtf(qs + kQkL2NormEps);
     const float ki = rsqrtf(ks + kQkL2NormEps);
 #pragma unroll
@@ -60,7 +63,7 @@ __global__ __launch_bounds__(256, 2) void prepare_kernel(Arguments args,
     if (tid < kChunkSize) {
         sm.beta[tid] =
             tid < length
-                ? sigmoid_approx(__bfloat162float(
+                ? common::sigmoid_approx(__bfloat162float(
                       args.beta[static_cast<std::int64_t>(start + tid) * args.value_heads + head]))
                 : 0.0F;
     }
@@ -74,25 +77,26 @@ __global__ __launch_bounds__(256, 2) void prepare_kernel(Arguments args,
                 const auto off =
                     (static_cast<std::int64_t>(start + t) * args.value_heads + head) * kStateDim;
                 const float raw = __bfloat162float(args.g[off + tid]);
-                sum += (args.lower_bound * kLog2E) * sigmoid_approx(a * (raw + bias));
+                sum +=
+                    (args.lower_bound * common::kLog2E) * common::sigmoid_approx(a * (raw + bias));
             }
             sm.prefix[t * kStateDim + tid] = sum;
         }
         sm.last[tid]         = sum;
-        sm.packet.gamma[tid] = exp2_approx_ftz(sum);
+        sm.packet.gamma[tid] = common::exp2_approx_ftz(sum);
     }
     __syncthreads();
 
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
         const float g       = sm.prefix[row * kStateDim + col + i];
-        const float decay   = exp2_approx_ftz(g);
+        const float decay   = common::exp2_approx_ftz(g);
         const int index     = vector_index(row, col + i);
         sm.packet.kd[index] = __float2bfloat16_rn(k[i] * decay);
         sm.packet.qd[index] = __float2bfloat16_rn(q[i] * decay);
-        sm.ki[index]        = __float2bfloat16_rn(k[i] * exp2_approx_ftz(-g));
+        sm.ki[index]        = __float2bfloat16_rn(k[i] * common::exp2_approx_ftz(-g));
         sm.packet.kr[restored_index(row, col + i)] =
-            __float2bfloat16_rn(k[i] * exp2_approx_ftz(sm.last[col + i] - g));
+            __float2bfloat16_rn(k[i] * common::exp2_approx_ftz(sm.last[col + i] - g));
     }
     __syncthreads();
 
@@ -105,15 +109,17 @@ __global__ __launch_bounds__(256, 2) void prepare_kernel(Arguments args,
             unsigned af[4];
             const int ar = (lane & 7) + ((lane >> 3) & 1) * 8;
             const int ac = offset + (lane >> 4) * 8;
-            ldmatrix_x4(af[0], af[1], af[2], af[3], smem_addr(a + vector_index(ar, ac)));
+            common::ldmatrix_x4(af[0], af[1], af[2], af[3],
+                                common::smem_addr(a + vector_index(ar, ac)));
 #pragma unroll
             for (int n = 0; n < 2; ++n) {
                 unsigned bf[2];
-                ldmatrix_x2(bf[0], bf[1],
-                            smem_addr(sm.ki + vector_index(n * 8 + (lane & 7),
-                                                           offset + ((lane >> 3) & 1) * 8)));
-                mma_bf16(acc[n][0], acc[n][1], acc[n][2], acc[n][3], af[0], af[1], af[2], af[3],
-                         bf[0], bf[1]);
+                common::ldmatrix_x2(
+                    bf[0], bf[1],
+                    common::smem_addr(
+                        sm.ki + vector_index(n * 8 + (lane & 7), offset + ((lane >> 3) & 1) * 8)));
+                common::mma_bf16(acc[n][0], acc[n][1], acc[n][2], acc[n][3], af[0], af[1], af[2],
+                                 af[3], bf[0], bf[1]);
             }
         }
 #pragma unroll
@@ -159,10 +165,10 @@ __global__ __launch_bounds__(256, 2) void prepare_kernel(Arguments args,
 #pragma unroll
     for (int which = 0; which < 2; ++which) {
         auto* plane        = which == 0 ? sm.packet.kd : sm.packet.qd;
-        const uint4 p      = load_vec<uint4>(plane + at);
+        const uint4 p      = common::load_vec<uint4>(plane + at);
         const uint4 native = {(p.x & 0xffffU) | (p.z << 16), (p.x >> 16) | (p.z & 0xffff0000U),
                               (p.y & 0xffffU) | (p.w << 16), (p.y >> 16) | (p.w & 0xffff0000U)};
-        store_vec(plane + at, native);
+        common::store_vec(plane + at, native);
     }
     __syncthreads();
 

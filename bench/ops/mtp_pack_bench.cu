@@ -1,6 +1,7 @@
 // Public benchmark for exact MTP tensor transforms.
 
-#include "ninfer/ops/mtp_pack.h"
+#include "ninfer/ops/indexing.h"
+#include "core/buffer.h"
 
 #include "ninfer_bench_common.h"
 
@@ -40,18 +41,18 @@ void run_pack(int hidden, int tokens) {
     DeviceBuffer embedding           = make_bf16(input_elements, 101U);
     DeviceBuffer hidden_norm         = make_bf16(input_elements, 103U);
     DeviceBuffer output              = make_zeros(2 * input_elements * sizeof(std::uint16_t));
-    Tensor embedding_tensor(embedding.p, DType::BF16, {hidden, tokens});
-    Tensor hidden_tensor(hidden_norm.p, DType::BF16, {hidden, tokens});
-    Tensor output_tensor(output.p, DType::BF16, {2 * hidden, tokens});
+    Tensor embedding_tensor(embedding.span(), DType::BF16, {hidden, tokens});
+    Tensor hidden_tensor(hidden_norm.span(), DType::BF16, {hidden, tokens});
+    Tensor output_tensor(output.span(), DType::BF16, {2 * hidden, tokens});
 
     const double bytes  = 4.0 * input_elements * sizeof(std::uint16_t);
     const Result result = bench_loop(
-        [&](cudaStream_t stream) {
-            ops::mtp_pack_fc_input(embedding_tensor, hidden_tensor, output_tensor, stream);
+        [&](CudaExecutionView cuda) {
+            ops::concat_bf16_features(embedding_tensor, hidden_tensor, output_tensor, cuda);
         },
         bytes);
     char label[96];
-    std::snprintf(label, sizeof(label), "mtp_pack_fc_input D=%d T=%d", hidden, tokens);
+    std::snprintf(label, sizeof(label), "concat_bf16_features D=%d T=%d", hidden, tokens);
     print_result(label, result);
 }
 
@@ -65,21 +66,21 @@ void run_split(int tokens) {
     DeviceBuffer key   = make_zeros(static_cast<std::size_t>(kKvRows) * tokens * 2);
     DeviceBuffer gate  = make_zeros(static_cast<std::size_t>(kQueryRows) * tokens * 2);
     DeviceBuffer value = make_zeros(static_cast<std::size_t>(kKvRows) * tokens * 2);
-    Tensor input_tensor(input.p, DType::BF16, {kInputRows, tokens});
-    Tensor query_tensor(query.p, DType::BF16, {256, 24, tokens});
-    Tensor key_tensor(key.p, DType::BF16, {256, 4, tokens});
-    Tensor gate_tensor(gate.p, DType::BF16, {256, 24, tokens});
-    Tensor value_tensor(value.p, DType::BF16, {256, 4, tokens});
+    Tensor input_tensor(input.span(), DType::BF16, {kInputRows, tokens});
+    Tensor query_tensor(query.span(), DType::BF16, {256, 24, tokens});
+    Tensor key_tensor(key.span(), DType::BF16, {256, 4, tokens});
+    Tensor gate_tensor(gate.span(), DType::BF16, {256, 24, tokens});
+    Tensor value_tensor(value.span(), DType::BF16, {256, 4, tokens});
 
     const double bytes  = 2.0 * input_elements * sizeof(std::uint16_t);
     const Result result = bench_loop(
-        [&](cudaStream_t stream) {
-            ops::mtp_split_attn_in(input_tensor, query_tensor, key_tensor, gate_tensor,
-                                   value_tensor, stream);
+        [&](CudaExecutionView cuda) {
+            ops::split_bf16_features(input_tensor, query_tensor, key_tensor, gate_tensor,
+                                     value_tensor, cuda);
         },
         bytes);
     char label[96];
-    std::snprintf(label, sizeof(label), "mtp_split_attn_in T=%d", tokens);
+    std::snprintf(label, sizeof(label), "split_bf16_features T=%d", tokens);
     print_result(label, result);
 }
 

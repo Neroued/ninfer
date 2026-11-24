@@ -1,5 +1,6 @@
-#include "ninfer/ops/scatter.h"
-#include "ninfer_bench_common.h"
+#include "ninfer/ops/indexing.h"
+#include "core/buffer.h"
+#include "op_measurement.cuh"
 
 #include <cuda_runtime.h>
 
@@ -8,6 +9,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <numeric>
+#include <algorithm>
+#include <random>
+#include <string>
 #include <vector>
 
 using namespace ninfer;
@@ -15,61 +19,49 @@ using namespace ninfer::bench;
 
 namespace {
 
-constexpr int kBlock = 128;
-
-__global__ void scatter_payload_control_x8(const uint4* source, uint4* destination,
-                                           std::int32_t vectors_per_column) {
-    const std::int32_t source_column = static_cast<std::int32_t>(blockIdx.x);
-    const std::int64_t source_base = static_cast<std::int64_t>(source_column) * vectors_per_column;
-    const std::int64_t destination_base =
-        static_cast<std::int64_t>(source_column + 1) * vectors_per_column;
-    for (std::int32_t vector = static_cast<std::int32_t>(threadIdx.x); vector < vectors_per_column;
-         vector += static_cast<std::int32_t>(blockDim.x)) {
-        destination[destination_base + vector] = source[source_base + vector];
-    }
-}
-
-void run(std::int32_t d, std::int32_t vision_tokens, bool control, bool profile_once) {
-    const std::int32_t prompt_tokens = vision_tokens + 2;
-    const std::size_t n              = static_cast<std::size_t>(d) * vision_tokens;
-    DeviceBuffer source              = make_bf16(n, 101U);
-    DeviceBuffer destination         = make_bf16(static_cast<std::size_t>(d) * prompt_tokens, 103U);
-    std::vector<std::int32_t> indices(static_cast<std::size_t>(vision_tokens));
+void run(std::int32_t d, std::int32_t columns, bool profile_once, bool permuted,
+         measurement::LogicalBenchmark& benchmark) {
+    const std::int32_t destination_columns = permuted ? columns * 2 + 1 : columns + 2;
+    const std::size_t n                    = static_cast<std::size_t>(d) * columns;
+    DeviceBuffer source                    = make_bf16(n, 101U);
+    DeviceBuffer destination = make_bf16(static_cast<std::size_t>(d) * destination_columns, 103U);
+    std::vector<std::int32_t> indices(static_cast<std::size_t>(columns));
     std::iota(indices.begin(), indices.end(), 1);
-    DeviceBuffer device_indices(indices.size() * sizeof(std::int32_t));
-    cudaMemcpy(device_indices.p, indices.data(), device_indices.bytes, cudaMemcpyHostToDevice);
-    Tensor source_tensor(source.p, DType::BF16, {d, vision_tokens});
-    Tensor destination_tensor(destination.p, DType::BF16, {d, prompt_tokens});
-    Tensor indices_tensor(device_indices.p, DType::I32, {vision_tokens});
+    if (permuted) {
+        for (int i = 0; i < columns; ++i) indices[i] = i * 2;
+        std::mt19937 generator(101);
+        std::shuffle(indices.begin(), indices.end(), generator);
+    }
+    DeviceBuffer device_indices(ninfer::bench::device_context().device(),
+                                indices.size() * sizeof(std::int32_t));
+    cudaMemcpy(device_indices.data(), indices.data(), device_indices.size(),
+               cudaMemcpyHostToDevice);
+    Tensor source_tensor(source.span(), DType::BF16, {d, columns});
+    Tensor destination_tensor(destination.span(), DType::BF16, {d, destination_columns});
+    Tensor indices_tensor(device_indices.span(), DType::I32, {columns});
 
-    const auto launch = [&](cudaStream_t stream) {
-        if (control) {
-            scatter_payload_control_x8<<<static_cast<unsigned>(vision_tokens), kBlock, 0, stream>>>(
-                static_cast<const uint4*>(source.p), static_cast<uint4*>(destination.p), d / 8);
-        } else {
-            ops::scatter(source_tensor, indices_tensor, destination_tensor, stream);
-        }
+    const auto launch = [&](CudaExecutionView cuda) {
+        ops::scatter(source_tensor, indices_tensor, destination_tensor, cuda);
     };
 
     if (profile_once) {
-        launch(nullptr);
+        launch(default_execution());
         cudaDeviceSynchronize();
-        std::printf("scatter %s profile D=%d V=%d grid=%d block=%d\n",
-                    control ? "control" : "production", d, vision_tokens, vision_tokens, kBlock);
+        std::printf("scatter profile D=%d columns=%d\n", d, columns);
         return;
     }
 
-    const double bytes  = static_cast<double>(vision_tokens) * (d * 4.0 + sizeof(std::int32_t));
-    const Result result = bench_loop(launch, bytes);
-    char tag[96];
-    std::snprintf(tag, sizeof(tag), "scatter%s [%d,%d]", control ? " control" : "", d,
-                  vision_tokens);
-    print_result(tag, result);
+    const auto bytes = std::size_t(columns) * (d * 4 + sizeof(std::int32_t));
+    benchmark.run({.op     = permuted ? "scatter-slots" : "scatter-contiguous",
+                   .format = "bf16",
+                   .n      = d,
+                   .tokens = columns},
+                  bytes, launch, [](CudaExecutionView) {});
 }
 
 } // namespace
 
-int main(int argc, char** argv) {
+int main(int argc, char** argv) try {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) {
         std::printf("SKIP: no usable CUDA device\n");
@@ -77,25 +69,41 @@ int main(int argc, char** argv) {
     }
 
     std::int32_t d    = 2048;
-    bool control      = false;
-    bool profile_once = false;
-    std::vector<std::int32_t> vision_tokens;
+    bool profile_once = false, permuted = false;
+    measurement::Options timing;
+    std::vector<std::int32_t> columns;
     for (int i = 1; i < argc; ++i) {
+        const char* flag = argv[i];
         if (!std::strcmp(argv[i], "--d") && i + 1 < argc) {
-            d = static_cast<std::int32_t>(std::strtol(argv[++i], nullptr, 10));
-        } else if (!std::strcmp(argv[i], "--vision") && i + 1 < argc) {
-            vision_tokens.push_back(static_cast<std::int32_t>(std::strtol(argv[++i], nullptr, 10)));
-        } else if (!std::strcmp(argv[i], "--control")) {
-            control = true;
+            d = measurement::integer(argv[++i]);
+        } else if (!std::strcmp(argv[i], "--columns") && i + 1 < argc) {
+            columns.push_back(measurement::integer(argv[++i]));
         } else if (!std::strcmp(argv[i], "--profile-once")) {
             profile_once = true;
-        } else {
-            std::fprintf(stderr, "usage: %s [--d D] [--vision V] [--control] [--profile-once]\n",
-                         argv[0]);
+        } else if (!std::strcmp(flag, "--mapping") && i + 1 < argc) {
+            const std::string mapping = argv[++i];
+            if (mapping != "contiguous" && mapping != "slots")
+                throw std::invalid_argument("mapping: contiguous|slots");
+            permuted = mapping == "slots";
+        } else if (!std::strcmp(flag, "--help")) {
+            std::puts("Scatter: --d D --columns T (repeatable) --mapping contiguous|slots "
+                      "--profile-once");
+            measurement::help();
+            return 0;
+        } else if (!measurement::parse(timing, flag, measurement::take(argc, argv, i))) {
+            std::fprintf(stderr, "usage: %s [--d D] [--columns T] [--profile-once]\n", argv[0]);
             return 2;
         }
     }
-    if (vision_tokens.empty()) { vision_tokens = {1, 2, 64, 1024, 12288, 16384}; }
-    for (const std::int32_t v : vision_tokens) { run(d, v, control, profile_once); }
+    measurement::hardware();
+    measurement::LogicalBenchmark benchmark(timing);
+    if (columns.empty()) {
+        columns = {1, 2, 64, 1024, 12288, 16384};
+    }
+    for (const std::int32_t v : columns) { run(d, v, profile_once, permuted, benchmark); }
     return 0;
+} catch (const std::exception& error) {
+
+    std::fprintf(stderr, "ninfer_scatter_bench: %s\n", error.what());
+    return 2;
 }

@@ -1,13 +1,13 @@
 // Public-Op benchmark for symmetric sliding-window Softmax Attention.
-// Every measured eager launch and captured graph is produced by one public
-// sliding_window_attention() call.
+// Each measured eager launch or graph-bundle entry calls public sliding_window_attention().
 
+#include "common/roofline.h"
 #include "ninfer/ops/sliding_window_attention.h"
+#include "core/buffer.h"
 
 #include "core/device.h"
 #include "core/cyclic_kv_cache.h"
-#include "ninfer_bench_common.h"
-#include "ops/softmax_attention/sliding_window/launch.h"
+#include "op_measurement.cuh"
 
 #include <cuda_profiler_api.h>
 #include <cuda_bf16.h>
@@ -15,7 +15,6 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
-#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -36,9 +35,7 @@ constexpr std::int32_t kQueryHeads = 32;
 constexpr std::int32_t kKvHeads    = 8;
 constexpr float kScale             = 0.08838834764831844055F;
 constexpr ops::AttentionHeadGeometry kGeometry{kHeadDim, kQueryHeads, kKvHeads};
-constexpr std::size_t kFlushBytes   = std::size_t{256} << 20;
-constexpr double kDenseBf16TcTflops = 209.5;
-constexpr double kRtx5090DramGBs    = 1792.0;
+constexpr std::size_t kFlushBytes = std::size_t{256} << 20;
 
 enum class Execution : std::uint8_t { Eager, Graph, Both };
 enum class CacheMode : std::uint8_t { Cold, Warm, Both };
@@ -65,10 +62,6 @@ struct Result {
     std::int32_t batch;
     std::int32_t context;
     std::int32_t envelope_max;
-    std::int32_t key_block;
-    std::int32_t reduce_warps;
-    ops::detail::SlidingWindowAttentionRoute route;
-    std::int32_t split_capacity;
     std::size_t graph_nodes;
     int graph_calls;
     Execution execution;
@@ -91,35 +84,6 @@ struct Result {
     std::exit(2);
 }
 
-std::int32_t parse_i32(std::string_view text, std::int32_t minimum, std::int32_t maximum,
-                       const char* flag) {
-    const std::string value(text);
-    errno       = 0;
-    char* end   = nullptr;
-    long parsed = std::strtol(value.c_str(), &end, 10);
-    if (errno != 0 || end == value.c_str() || *end != '\0' || parsed < minimum ||
-        parsed > maximum) {
-        usage(flag);
-    }
-    return static_cast<std::int32_t>(parsed);
-}
-
-std::vector<std::int32_t> parse_list(const char* text, std::int32_t minimum, std::int32_t maximum,
-                                     const char* flag) {
-    std::vector<std::int32_t> result;
-    std::string_view remaining(text);
-    while (!remaining.empty()) {
-        const std::size_t comma     = remaining.find(',');
-        const std::string_view item = remaining.substr(0, comma);
-        if (item.empty()) { usage(flag); }
-        result.push_back(parse_i32(item, minimum, maximum, flag));
-        if (comma == std::string_view::npos) { break; }
-        remaining.remove_prefix(comma + 1);
-    }
-    if (result.empty()) { usage(flag); }
-    return result;
-}
-
 Options parse_options(int argc, char** argv) {
     Options options;
     for (int index = 1; index < argc; ++index) {
@@ -129,20 +93,22 @@ Options parse_options(int argc, char** argv) {
             return argv[index];
         };
         if (argument == "--tokens") {
-            options.tokens = parse_list(next("--tokens requires a value"), 1, 16, "--tokens");
+            options.tokens = bench::measurement::integers(next("--tokens requires a value"), 1, 16);
         } else if (argument == "--batches") {
-            options.batches = parse_list(next("--batches requires a value"), 1, 8, "--batches");
+            options.batches =
+                bench::measurement::integers(next("--batches requires a value"), 1, 8);
         } else if (argument == "--window") {
-            options.window = parse_i32(next("--window requires a value"), 2048, 4096, "--window");
+            options.window =
+                bench::measurement::integer(next("--window requires a value"), 2048, 4096);
             if (options.window != 2048 && options.window != 4096) {
                 usage("--window expects 2048 or 4096");
             }
         } else if (argument == "--context") {
             options.contexts =
-                parse_list(next("--context requires a value"), 0, 262144, "--context");
+                bench::measurement::integers(next("--context requires a value"), 0, 262144);
         } else if (argument == "--envelope-max") {
             options.envelope_max =
-                parse_i32(next("--envelope-max requires a value"), 0, 262144, "--envelope-max");
+                bench::measurement::integer(next("--envelope-max requires a value"), 0, 262144);
         } else if (argument == "--execution") {
             const std::string_view value(next("--execution requires a value"));
             if (value == "eager")
@@ -164,12 +130,14 @@ Options parse_options(int argc, char** argv) {
             else
                 usage("--cache expects cold, warm, or both");
         } else if (argument == "--warmup") {
-            options.warmup = parse_i32(next("--warmup requires a value"), 0, 10000, "--warmup");
+            options.warmup =
+                bench::measurement::integer(next("--warmup requires a value"), 0, 10000);
         } else if (argument == "--repeat") {
-            options.repeat = parse_i32(next("--repeat requires a value"), 1, 10000, "--repeat");
+            options.repeat =
+                bench::measurement::integer(next("--repeat requires a value"), 1, 10000);
         } else if (argument == "--graph-calls") {
             options.graph_calls =
-                parse_i32(next("--graph-calls requires a value"), 1, 64, "--graph-calls");
+                bench::measurement::integer(next("--graph-calls requires a value"), 1, 64);
         } else if (argument == "--profile") {
             options.profile = true;
         } else if (argument == "--csv-out") {
@@ -195,15 +163,17 @@ Options parse_options(int argc, char** argv) {
 }
 
 CyclicKVCacheLayerView make_context_view(DeviceBuffer& k, DeviceBuffer& v, std::int32_t window,
-                                         std::int32_t batch) {
+                                         const Tensor& offsets) {
+    const std::size_t bytes = std::size_t(kHeadDim) * window * kKvHeads * 2;
     return {
-        .k               = Tensor(k.p, DType::BF16, {kHeadDim, window, kKvHeads, batch}),
-        .v               = Tensor(v.p, DType::FP16, {kHeadDim, window, kKvHeads, batch}),
+        .k               = {{k.span(), offsets},
+                            {{{0, bytes, 16}, DType::BF16, {kHeadDim, window, kKvHeads, 1}}, 1, bytes}},
+        .v               = {{v.span(), offsets},
+                            {{{0, bytes, 16}, DType::FP16, {kHeadDim, window, kKvHeads, 1}}, 1, bytes}},
         .capacity        = static_cast<std::uint32_t>(window),
         .padded_capacity = static_cast<std::uint32_t>(window),
         .num_kv_heads    = kKvHeads,
         .head_dim        = kHeadDim,
-        .lane_capacity   = batch,
     };
 }
 
@@ -216,9 +186,9 @@ std::size_t workspace_capacity(std::int32_t window, std::int32_t tokens, std::in
 }
 
 DeviceBuffer make_context_values(std::size_t elements) {
-    DeviceBuffer result(elements * sizeof(__half));
-    CUDA_CHECK(
-        bench::fixture::fill_values(static_cast<__half*>(result.p), elements, 311U, -1.F, 1.F));
+    DeviceBuffer result(ninfer::bench::device_context().device(), elements * sizeof(__half));
+    CUDA_CHECK(bench::fixture::fill_values(static_cast<__half*>(result.data()), elements, 311U,
+                                           -1.F, 1.F));
     CUDA_CHECK(cudaDeviceSynchronize());
     return result;
 }
@@ -234,9 +204,12 @@ public:
                                     103U)),
           query_v_(bench::make_bf16(static_cast<std::size_t>(kHeadDim) * kKvHeads * tokens * batch,
                                     105U)),
-          positions_(static_cast<std::size_t>(tokens) * batch * sizeof(std::int32_t)),
-          valid_(static_cast<std::size_t>(batch) * sizeof(std::int32_t)),
-          lane_(static_cast<std::size_t>(batch) * sizeof(std::int32_t)),
+          positions_(ninfer::bench::device_context().device(),
+                     static_cast<std::size_t>(tokens) * batch * sizeof(std::int32_t)),
+          valid_(ninfer::bench::device_context().device(),
+                 static_cast<std::size_t>(batch) * sizeof(std::int32_t)),
+          lane_(ninfer::bench::device_context().device(),
+                static_cast<std::size_t>(batch) * sizeof(std::int64_t)),
           context_k_(bench::make_bf16(
               static_cast<std::size_t>(kHeadDim) * window * kKvHeads * batch, 107U)),
           context_v_(
@@ -244,35 +217,40 @@ public:
           output_(bench::make_zeros(static_cast<std::size_t>(kHeadDim) * kQueryHeads * tokens *
                                     batch * 2)),
           workspace_bytes_(workspace_capacity(window, tokens, batch, maximum)),
-          workspace_(std::max<std::size_t>(workspace_bytes_, 1)),
-          q_tensor_(q_.p, DType::BF16, {kHeadDim, kQueryHeads, tokens, batch}),
-          query_k_tensor_(query_k_.p, DType::BF16, {kHeadDim, kKvHeads, tokens, batch}),
-          query_v_tensor_(query_v_.p, DType::BF16, {kHeadDim, kKvHeads, tokens, batch}),
-          positions_tensor_(positions_.p, DType::I32, {tokens, batch}),
-          valid_tensor_(valid_.p, DType::I32, {batch}), lane_tensor_(lane_.p, DType::I32, {batch}),
-          output_tensor_(output_.p, DType::BF16, {kHeadDim, kQueryHeads, tokens, batch}),
-          context_view_(make_context_view(context_k_, context_v_, window, batch)),
+          workspace_storage_(bench::make_buffer(std::max<std::size_t>(workspace_bytes_, 1))),
+          workspace_(workspace_storage_.span()),
+          q_tensor_(q_.span(), DType::BF16, {kHeadDim, kQueryHeads, tokens, batch}),
+          query_k_tensor_(query_k_.span(), DType::BF16, {kHeadDim, kKvHeads, tokens, batch}),
+          query_v_tensor_(query_v_.span(), DType::BF16, {kHeadDim, kKvHeads, tokens, batch}),
+          positions_tensor_(positions_.span(), DType::I32, {tokens, batch}),
+          valid_tensor_(valid_.span(), DType::I32, {batch}),
+          lane_tensor_(lane_.span(), DType::I64, {batch}),
+          output_tensor_(output_.span(), DType::BF16, {kHeadDim, kQueryHeads, tokens, batch}),
+          context_view_(make_context_view(context_k_, context_v_, window, lane_tensor_)),
           envelope_{0, static_cast<std::uint32_t>(maximum)} {
         std::vector<std::int32_t> host_positions(static_cast<std::size_t>(tokens) * batch);
         std::vector<std::int32_t> host_valid(static_cast<std::size_t>(batch), tokens);
-        std::vector<std::int32_t> host_lanes(static_cast<std::size_t>(batch));
+        std::vector<std::int64_t> host_lanes(static_cast<std::size_t>(batch));
         for (std::int32_t row = 0; row < batch; ++row) {
-            host_lanes[static_cast<std::size_t>(row)] = row;
+            host_lanes[static_cast<std::size_t>(row)] =
+                std::int64_t(row) * kHeadDim * window * kKvHeads * 2;
             for (std::int32_t token = 0; token < tokens; ++token) {
                 host_positions[static_cast<std::size_t>(row * tokens + token)] = context + token;
             }
         }
-        CUDA_CHECK(cudaMemcpy(positions_.p, host_positions.data(), positions_.bytes,
+        CUDA_CHECK(cudaMemcpy(positions_.data(), host_positions.data(), positions_.size(),
                               cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(valid_.p, host_valid.data(), valid_.bytes, cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(lane_.p, host_lanes.data(), lane_.bytes, cudaMemcpyHostToDevice));
+        CUDA_CHECK(
+            cudaMemcpy(valid_.data(), host_valid.data(), valid_.size(), cudaMemcpyHostToDevice));
+        CUDA_CHECK(
+            cudaMemcpy(lane_.data(), host_lanes.data(), lane_.size(), cudaMemcpyHostToDevice));
     }
 
-    void launch(cudaStream_t stream) {
+    void launch(CudaExecutionView cuda) {
         ops::sliding_window_attention(q_tensor_, query_k_tensor_, query_v_tensor_,
-                                      positions_tensor_, valid_tensor_, lane_tensor_, kGeometry,
+                                      positions_tensor_, valid_tensor_, kGeometry,
                                       static_cast<std::uint32_t>(window_), kScale, context_view_,
-                                      envelope_, workspace_, output_tensor_, stream);
+                                      envelope_, workspace_, output_tensor_, cuda);
     }
 
     [[nodiscard]] std::size_t workspace_bytes() const noexcept { return workspace_bytes_; }
@@ -292,7 +270,8 @@ private:
     DeviceBuffer context_v_;
     DeviceBuffer output_;
     std::size_t workspace_bytes_;
-    WorkspaceArena workspace_;
+    DeviceBuffer workspace_storage_;
+    MemoryArena workspace_;
     Tensor q_tensor_;
     Tensor query_k_tensor_;
     Tensor query_v_tensor_;
@@ -308,7 +287,10 @@ const char* execution_name(Execution execution) {
     return execution == Execution::Eager ? "eager" : "graph";
 }
 
-const char* cache_name(CacheState cache) { return cache == CacheState::Cold ? "cold" : "warm"; }
+const char* cache_name(CacheState cache, int graph_calls = 1) {
+    if (cache == CacheState::Warm) return "warm";
+    return graph_calls == 1 ? "cold" : "cold-before-graph-bundle";
+}
 
 double useful_bytes(std::int32_t window, std::int32_t tokens, std::int32_t batch,
                     std::int32_t context) {
@@ -329,16 +311,16 @@ double useful_flops(std::int32_t window, std::int32_t tokens, std::int32_t batch
 
 bench::ColdTiming measure(Case& data, Execution execution, CacheState cache,
                           bench::TimedGraph* graph, bench::L2FlushBuffer& flush,
-                          cudaStream_t stream, int warmup, int repeat) {
+                          CudaExecutionView cuda, int warmup, int repeat) {
     if (execution == Execution::Eager) {
-        const auto launch = [&](cudaStream_t launch_stream) { data.launch(launch_stream); };
+        const auto launch = [&](CudaExecutionView cuda) { data.launch(cuda); };
         return cache == CacheState::Cold
-                   ? bench::measure_cold_launch(launch, flush, stream, warmup, repeat)
-                   : bench::measure_launch(launch, stream, warmup, repeat);
+                   ? bench::measure_cold_launch(launch, flush, cuda, warmup, repeat)
+                   : bench::measure_launch(launch, cuda, warmup, repeat);
     }
     return cache == CacheState::Cold
-               ? bench::measure_cold_graph(*graph, flush, stream, warmup, repeat)
-               : bench::measure_graph(*graph, stream, warmup, repeat);
+               ? bench::measure_cold_graph(*graph, flush, cuda, warmup, repeat)
+               : bench::measure_graph(*graph, cuda, warmup, repeat);
 }
 
 void report(const Result& result) {
@@ -346,17 +328,23 @@ void report(const Result& result) {
     const double gbps    = result.useful_bytes / seconds / 1.0e9;
     const double tflops  = result.useful_flops / seconds / 1.0e12;
     std::printf("entry=sliding_window execution=%-5s cache=%-4s W=%d T=%2d B=%d L=%6d "
-                "max_L=%d key_block=%d reduce_warps=%d route=%s splits=%d graph_nodes=%zu "
+                "max_L=%d graph_nodes=%zu "
                 "graph_calls=%d workspace=%8zu "
                 "median=%9.3f us min=%9.3f us p95=%9.3f us "
-                "useful=%8.1f GB/s (%5.1f%% of %.0f) math=%7.2f TFLOP/s (%5.1f%% of %.1f)\n",
-                execution_name(result.execution), cache_name(result.cache), result.window,
-                result.tokens, result.batch, result.context, result.envelope_max, result.key_block,
-                result.reduce_warps, ops::detail::sliding_window_attention_route_name(result.route),
-                result.split_capacity, result.graph_nodes, result.graph_calls,
-                result.workspace_bytes, result.timing.median_us, result.timing.min_us,
-                result.timing.p95_us, gbps, gbps / kRtx5090DramGBs * 100.0, kRtx5090DramGBs, tflops,
-                tflops / kDenseBf16TcTflops * 100.0, kDenseBf16TcTflops);
+                "useful=%8.1f GB/s ",
+                execution_name(result.execution), cache_name(result.cache, result.graph_calls),
+                result.window, result.tokens, result.batch, result.context, result.envelope_max,
+                result.graph_nodes, result.graph_calls, result.workspace_bytes,
+                result.timing.median_us, result.timing.min_us, result.timing.p95_us, gbps);
+    if (result.cache == CacheState::Cold && result.graph_calls == 1) {
+        std::printf("DRAM=%5.1f%% of %.0f GB/s ", gbps / bench::kRoofline.memory_gbs * 100.0,
+                    bench::kRoofline.memory_gbs);
+    } else {
+        std::printf("DRAM=n/a ");
+    }
+    std::printf("math=%7.2f TFLOP/s (%5s%% of %s)\n", tflops,
+                bench::format_metric(tflops / bench::kRoofline.bf16_f32_tflops * 100.0, 1).c_str(),
+                bench::format_metric(bench::kRoofline.bf16_f32_tflops, 1).c_str());
 }
 
 void write_csv(const Options& options, const std::vector<Result>& results) {
@@ -365,37 +353,37 @@ void write_csv(const Options& options, const std::vector<Result>& results) {
     if (!path.parent_path().empty()) { std::filesystem::create_directories(path.parent_path()); }
     std::ofstream output(path);
     if (!output) { throw std::runtime_error("failed to open CSV output"); }
-    output << "entry,execution,cache,window,T,B,context,envelope_max,key_block,reduce_warps,route,"
-              "split_capacity,graph_nodes,graph_calls,"
+    output << "entry,execution,cache,window,T,B,context,envelope_max,"
+              "graph_nodes,graph_calls,"
               "workspace_bytes,useful_bytes,useful_flops,median_us,min_us,p95_us\n";
     for (const Result& result : results) {
         output << "sliding_window," << execution_name(result.execution) << ','
-               << cache_name(result.cache) << ',' << result.window << ',' << result.tokens << ','
-               << result.batch << ',' << result.context << ',' << result.envelope_max << ','
-               << result.key_block << ',' << result.reduce_warps << ','
-               << ops::detail::sliding_window_attention_route_name(result.route) << ','
-               << result.split_capacity << ',' << result.graph_nodes << ',' << result.graph_calls
+               << cache_name(result.cache, result.graph_calls) << ',' << result.window << ','
+               << result.tokens << ',' << result.batch << ',' << result.context << ','
+               << result.envelope_max << ',' << result.graph_nodes << ',' << result.graph_calls
                << ',' << result.workspace_bytes << ',' << result.useful_bytes << ','
                << result.useful_flops << ',' << result.timing.median_us << ','
                << result.timing.min_us << ',' << result.timing.p95_us << '\n';
     }
 }
 
-void profile(Case& data, const Options& options, bench::L2FlushBuffer& flush, cudaStream_t stream) {
+void profile(Case& data, const Options& options, bench::L2FlushBuffer& flush,
+             CudaExecutionView cuda) {
+    const auto stream         = cuda.stream();
     const Execution execution = options.execution;
     const CacheState cache = options.cache == CacheMode::Cold ? CacheState::Cold : CacheState::Warm;
     bench::TimedGraph graph;
     if (execution == Execution::Graph) {
-        data.launch(stream);
+        data.launch(cuda);
         CUDA_CHECK(cudaStreamSynchronize(stream));
-        graph.capture(stream, [&](cudaStream_t launch_stream) { data.launch(launch_stream); });
-        for (int index = 0; index < options.warmup; ++index) { graph.launch(stream); }
+        graph.capture(cuda, [&](CudaExecutionView cuda) { data.launch(cuda); });
+        for (int index = 0; index < options.warmup; ++index) { graph.launch(cuda); }
     } else {
-        for (int index = 0; index < options.warmup; ++index) { data.launch(stream); }
+        for (int index = 0; index < options.warmup; ++index) { data.launch(cuda); }
     }
     CUDA_CHECK(cudaStreamSynchronize(stream));
     if (cache == CacheState::Cold) {
-        bench::flush_l2(flush, stream);
+        bench::flush_l2(flush, cuda);
         CUDA_CHECK(cudaStreamSynchronize(stream));
     }
 
@@ -404,9 +392,9 @@ void profile(Case& data, const Options& options, bench::L2FlushBuffer& flush, cu
     std::fflush(stdout);
     CUDA_CHECK(cudaProfilerStart());
     if (execution == Execution::Graph)
-        graph.launch(stream);
+        graph.launch(cuda);
     else
-        data.launch(stream);
+        data.launch(cuda);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     CUDA_CHECK(cudaProfilerStop());
 }
@@ -423,13 +411,14 @@ int main(int argc, char** argv) {
         const Options options = parse_options(argc, argv);
         cudaStream_t stream   = nullptr;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        const auto cuda = ninfer::bench::device_context().execution_view(stream);
         bench::L2FlushBuffer flush(kFlushBytes);
 
         if (options.profile) {
             Case data(options.window, options.tokens.front(), options.batches.front(),
                       options.contexts.front(),
                       options.envelope_max < 0 ? options.contexts.front() : options.envelope_max);
-            profile(data, options, flush, stream);
+            profile(data, options, flush, cuda);
             CUDA_CHECK(cudaStreamDestroy(stream));
             return 0;
         }
@@ -440,17 +429,13 @@ int main(int argc, char** argv) {
                 for (const std::int32_t batch : options.batches) {
                     const int maximum = options.envelope_max < 0 ? context : options.envelope_max;
                     Case data(options.window, tokens, batch, context, maximum);
-                    const ops::SlidingWindowAttentionExecutionEnvelope envelope{
-                        0, static_cast<std::uint32_t>(maximum)};
-                    const auto plan = ops::detail::sliding_window_attention_resolve_plan(
-                        static_cast<std::uint32_t>(options.window), tokens, batch, envelope);
                     bench::TimedGraph graph;
                     if (options.execution != Execution::Eager) {
-                        data.launch(stream);
+                        data.launch(cuda);
                         CUDA_CHECK(cudaStreamSynchronize(stream));
-                        graph.capture(stream, [&](cudaStream_t launch_stream) {
+                        graph.capture(cuda, [&](CudaExecutionView cuda) {
                             for (int call = 0; call < options.graph_calls; ++call)
-                                data.launch(launch_stream);
+                                data.launch(cuda);
                         });
                     }
                     for (const Execution execution : {Execution::Eager, Execution::Graph}) {
@@ -471,10 +456,6 @@ int main(int argc, char** argv) {
                                 batch,
                                 context,
                                 maximum,
-                                plan.key_block,
-                                plan.reduce_warps,
-                                plan.route,
-                                plan.split_capacity,
                                 execution == Execution::Graph ? graph.nodes() : 0,
                                 options.graph_calls,
                                 execution,
@@ -482,8 +463,8 @@ int main(int argc, char** argv) {
                                 data.workspace_bytes(),
                                 useful_bytes(options.window, tokens, batch, context),
                                 useful_flops(options.window, tokens, batch, context),
-                                measure(data, execution, cache, &graph, flush, stream,
-                                        options.warmup, options.repeat),
+                                measure(data, execution, cache, &graph, flush, cuda, options.warmup,
+                                        options.repeat),
                             };
                             result.timing.median_us /= options.graph_calls;
                             result.timing.min_us /= options.graph_calls;

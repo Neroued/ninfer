@@ -11,6 +11,13 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from tools.bench.ttft.cases import CASES
+from tools.bench.ttft.diagnostics import (
+    MECHANISM_COUNTERS,
+    SCHEDULING_FIELDS,
+    attach_generation_diagnostics,
+    request_timing_analysis,
+    unavailable_diagnostics,
+)
 
 
 class ReportError(RuntimeError):
@@ -134,15 +141,6 @@ COMPARISONS = (
         "resume",
     ),
     _comparison(
-        "resume_catalog_vs_device",
-        "resource pressure",
-        "Catalog pressure resume vs Device",
-        "resume-after-interference-catalog",
-        "resume",
-        "resume-after-interference-device",
-        "resume",
-    ),
-    _comparison(
         "session_hot_vs_cache_off",
         "private and session reuse",
         "Named hot continuation vs cache-off control",
@@ -229,64 +227,64 @@ COMPARISONS = (
     _comparison(
         "shared_openai_implicit_reuse_vs_first",
         "shared prefix",
-        "OpenAI implicit full-prompt reuse vs first",
+        "OpenAI automatic-prefix reuse vs first",
         "shared-openai-implicit",
         "reuse",
         "shared-openai-implicit",
         "first",
     ),
     _comparison(
-        "shared_observed_promotion_vs_first",
-        "shared prefix",
-        "Observed private-base promotion vs first",
-        "shared-observed-promotion",
-        "promotion",
-        "shared-observed-promotion",
+        "unmarked_repeat_vs_first",
+        "private and session reuse",
+        "Repeated unmarked prompt vs first",
+        "unmarked-repeat-after-interference",
+        "second-observation",
+        "unmarked-repeat-after-interference",
         "first-observation",
     ),
     _comparison(
-        "shared_observed_reuse_vs_first",
-        "shared prefix",
-        "Observed shared reuse after private displacement vs first",
-        "shared-observed-promotion",
-        "shared-reuse",
-        "shared-observed-promotion",
+        "unmarked_reuse_vs_first",
+        "private and session reuse",
+        "Unmarked repeat after interference vs first",
+        "unmarked-repeat-after-interference",
+        "reuse",
+        "unmarked-repeat-after-interference",
         "first-observation",
     ),
     _comparison(
         "shared_tools_second_vs_first",
         "shared prefix",
         "Stable tool-prefix second vs first",
-        "shared-tools-sequential",
-        "second",
-        "shared-tools-sequential",
-        "first",
+        "shared-tools-revisit",
+        "stable",
+        "shared-tools-revisit",
+        "source",
     ),
     _comparison(
         "shared_tools_changed_vs_stable",
         "shared prefix",
         "Changed tool identity vs stable second use",
-        "shared-tools-changed",
-        "second",
-        "shared-tools-sequential",
-        "second",
+        "shared-tools-revisit",
+        "changed",
+        "shared-tools-revisit",
+        "stable",
     ),
     _comparison(
-        "shared_slot_retention_final_vs_first",
+        "shared_prefix_competition_final_vs_first",
         "shared prefix",
-        "Incumbent prefix after equal-value competition vs first",
-        "shared-slot-retention",
+        "Marked prefix after competition vs first",
+        "shared-prefix-competition",
         "a-final",
-        "shared-slot-retention",
+        "shared-prefix-competition",
         "a-first",
     ),
     _comparison(
-        "shared_value_replacement_reuse_vs_first",
+        "shared_tool_competition_reuse_vs_first",
         "shared prefix",
-        "Higher-value replacement reuse vs first",
-        "shared-value-replacement",
+        "Tool prefix after competition vs first",
+        "shared-tool-prefix-competition",
         "b-reuse",
-        "shared-value-replacement",
+        "shared-tool-prefix-competition",
         "b-first",
     ),
     _comparison(
@@ -320,7 +318,7 @@ COMPARISONS = (
         "decode_short_vs_cold",
         "scheduling",
         "Short arrival during decode vs cold",
-        "short-during-decode",
+        "decode-with-short-arrival",
         "short",
         "cold-short",
         "request",
@@ -383,19 +381,19 @@ COMPARISONS = (
         "media_warm_second_vs_first",
         "media",
         "Warm media preprocessing vs first use",
-        "media-preprocess-warm",
-        "second",
-        "media-preprocess-warm",
-        "first",
+        "media-preprocess-revisit",
+        "a-warm",
+        "media-preprocess-revisit",
+        "a-cold",
     ),
     _comparison(
         "media_thrash_final_vs_first",
         "media",
         "A after B/C pressure vs first A",
-        "media-cache-thrash",
-        "a-final",
-        "media-cache-thrash",
-        "a-first",
+        "media-preprocess-revisit",
+        "a-revisit",
+        "media-preprocess-revisit",
+        "a-cold",
     ),
     _comparison(
         "many_image_thread1_vs_default",
@@ -531,10 +529,11 @@ def _validate_run_artifact(value: dict[str, Any], plan: PlannedRun) -> None:
             raise ReportError(f"{context} has an invalid symmetric role group")
         for role in roles:
             request = by_role.get(role)
-            if request is None or request.get("outcome") != "success":
+            if request is None:
                 raise ReportError(
-                    f"{context} lacks successful symmetric role {role} in group {name}"
+                    f"{context} lacks symmetric role {role} in group {name}"
                 )
+
 
 
 def load_campaign(path: Path) -> CampaignData:
@@ -657,6 +656,12 @@ def load_campaign(path: Path) -> CampaignData:
             else None
         )
         value["_plan_index"] = plan.index
+        diagnostic_error = attach_generation_diagnostics(value, plan.request_log_jsonl)
+        if diagnostic_error is not None:
+            artifact_errors.append({
+                "kind": "request_log", "case": plan.case, "sample": plan.sample,
+                "request_log_jsonl": value["_request_log_jsonl"], "error": diagnostic_error,
+            })
         runs.append(value)
 
     failures: list[dict[str, Any]] = []
@@ -822,6 +827,8 @@ def _symmetric_rows(runs: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
             ):
                 raise ReportError(f"run {case} has an invalid symmetric role group")
             roles = tuple(raw_roles)
+            if any(requests.get(role, {}).get("outcome") != "success" for role in roles):
+                continue
             ranked: list[tuple[int, str]] = []
             for role in roles:
                 request = requests.get(role)
@@ -1065,10 +1072,280 @@ def _validate_baseline(current: CampaignData, baseline: CampaignData) -> None:
             )
 
 
+def _distribution(values: Sequence[int]) -> dict[str, int | float | None]:
+    ordered = sorted(values)
+    return {
+        "count": len(ordered),
+        "mean_ns": statistics.mean(ordered) if ordered else None,
+        "median_ns": statistics.median(ordered) if ordered else None,
+        "p95_ns": ordered[(95 * len(ordered) + 99) // 100 - 1] if ordered else None,
+        "max_ns": ordered[-1] if ordered else None,
+    }
+
+
+def _lifecycle_metrics(requests: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "requests": len(requests),
+        "request_outcomes": dict(Counter(str(r.get("outcome")) for r in requests)),
+        **{
+            metric: _distribution([r[field] for r in requests if type(r.get(field)) is int])
+            for metric, field in (("ttft", "ttft_ns"), ("terminal", "terminal_latency_ns"))
+        },
+        "output_gap": _distribution([gap for r in requests for gap in r.get("output_gap_ns", [])]),
+    }
+
+
+def _lifecycle_groups(runs: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    groups: dict[tuple[str, str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    samples: dict[tuple[str, str, str, str], set[int]] = defaultdict(set)
+    for run in runs:
+        if run.get("constructed") is not True:
+            continue
+        classes = run.get("notes", {}).get("request_classes", {})
+        for request in run.get("requests", []):
+            role = request["role"]
+            kind, label = ("class", classes[role]) if role in classes else ("role", role)
+            key = (run["case"], run["profile_label"], kind, label)
+            groups[key].append(request)
+            samples[key].add(run["_sample"])
+    return [
+        {"case": case, "profile_label": profile, "group_kind": kind, "group_label": label,
+         "samples": len(samples[key]), **_lifecycle_metrics(requests)}
+        for key, requests in sorted(groups.items()) for case, profile, kind, label in [key]
+    ]
+
+
+def _phase_metrics(runs: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows = []
+    for run in runs:
+        by_role = {request["role"]: request for request in run.get("requests", [])}
+        for phase, roles in run.get("notes", {}).get("workload_phases", {}).items():
+            requests = [by_role[role] for role in roles if role in by_role]
+            starts = [r["sent_ns"] for r in requests if type(r.get("sent_ns")) is int]
+            ends = [r["ended_ns"] for r in requests if type(r.get("ended_ns")) is int]
+            complete = bool(roles) and len(requests) == len(roles)
+            timed = complete and len(starts) == len(roles) and len(ends) == len(roles)
+            rows.append({
+                "case": run["case"], "sample": run["_sample"], "phase": phase,
+                "scope": "selected_client_requests", "constructed": run.get("constructed"),
+                "missing_roles": [role for role in roles if role not in by_role],
+                "duration_ns": max(ends) - min(starts) if timed else None,
+                **_lifecycle_metrics(requests),
+            })
+    return rows
+
+
+def _arrival_metrics(notes: dict[str, Any], requests: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """Use only scheduled roles and the client's monotonic clock, excluding setup requests."""
+    arrivals = notes.get("arrivals") or []
+    if not arrivals:
+        return {}
+    roles = {arrival["role"] for arrival in arrivals}
+    scheduled = [r for r in requests if r.get("role") in roles]
+    offsets = [a["offset_ns"] for a in arrivals if type(a.get("offset_ns")) is int]
+    starts = [r["sent_ns"] for r in scheduled if type(r.get("sent_ns")) is int]
+    ends = [r["ended_ns"] for r in scheduled if type(r.get("ended_ns")) is int]
+    terminals = [r["terminal_ns"] for r in scheduled if type(r.get("terminal_ns")) is int]
+    success = [r for r in scheduled if r.get("outcome") == "success"]
+    tokens = [r.get("usage", {}).get("output_tokens") for r in success]
+    complete_starts = len(starts) == len(roles)
+    complete_ends = len(ends) == len(roles)
+    late = [a["lateness_ns"] for a in arrivals if type(a.get("lateness_ns")) is int]
+    return {
+        "scheduled_requests": len(roles), "scheduled_successful_requests": len(success),
+        "scheduled_completed_output_tokens": sum(tokens) if all(type(n) is int for n in tokens) else None,
+        "planned_injection_span_ns": max(offsets) - min(offsets) if len(offsets) == len(roles) else None,
+        "actual_injection_span_ns": max(starts) - min(starts) if complete_starts else None,
+        "max_send_lateness_ns": max(late) if len(late) == len(roles) else None,
+        "drain_ns": max(ends) - max(starts) if complete_starts and complete_ends else None,
+        "terminal_drain_ns": max(terminals) - max(starts)
+                             if complete_starts and len(terminals) == len(roles) else None,
+    }
+
+
+def _contract_rejections(current: CampaignData, baseline: CampaignData) -> list[dict[str, Any]]:
+    def contracts(runs: Sequence[dict[str, Any]]) -> dict[tuple[str, str], set[str]]:
+        result: dict[tuple[str, str], set[str]] = defaultdict(set)
+        for run in runs:
+            result[(run["case"], run["profile_label"])].add(
+                str(run.get("notes", {}).get("measurement_contract", "1")))
+        return result
+    current_contracts, baseline_contracts = contracts(current.runs), contracts(baseline.runs)
+    return [
+        {"case": key[0], "profile_label": key[1], "reason": "measurement_contract_mismatch",
+         "current_contracts": sorted(current_contracts[key]),
+         "baseline_contracts": sorted(baseline_contracts[key])}
+        for key in sorted(current_contracts.keys() & baseline_contracts.keys())
+        if len(current_contracts[key]) != 1 or current_contracts[key] != baseline_contracts[key]
+    ]
+
+
+def _stream_observations(runs: Sequence[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Keep failed and unconstructed measurements visible beside successful comparisons."""
+    observations: list[dict[str, Any]] = []
+    workloads: list[dict[str, Any]] = []
+    for run in runs:
+        requests = run.get("requests", [])
+        notes = run.get("notes", {})
+        starts = [r["sent_ns"] for r in requests if isinstance(r.get("sent_ns"), int)]
+        ends = [r["ended_ns"] for r in requests if isinstance(r.get("ended_ns"), int)]
+        duration = max(ends) - min(starts) if starts and ends else None
+        completed_tokens = 0
+        successful = 0
+        missing_usage = 0
+        for request in requests:
+            usage = request.get("usage", {})
+            tokens = usage.get("output_tokens") if isinstance(usage, dict) else None
+            diagnostics = request.get("diagnostics", unavailable_diagnostics("request_log_not_loaded"))
+            counts = diagnostics.get("scheduling", {})
+            server_result = diagnostics.get("result", {})
+            server_tokens = server_result.get("completion_tokens")
+            usage_check = (
+                "matched" if tokens == server_tokens else "mismatch"
+            ) if type(tokens) is int and type(server_tokens) is int else "unavailable"
+            gaps = sorted(request.get("output_gap_ns", []))
+            if request.get("outcome") == "success":
+                successful += 1
+                if type(tokens) is int:
+                    completed_tokens += tokens
+                else:
+                    missing_usage += 1
+            observations.append({
+                "case": run.get("case"),
+                "profile_label": run.get("profile_label"),
+                "sample": run.get("_sample"),
+                "request_role": request.get("role"),
+                "request_class": notes.get("request_classes", {}).get(request.get("role")),
+                "constructed": run.get("constructed"),
+                "outcome": request.get("outcome"),
+                "ttft_ns": request.get("ttft_ns"),
+                "terminal_latency_ns": request.get("terminal_latency_ns"),
+                "transport_duration_ns": request.get("transport_duration_ns"),
+                "max_output_gap_ns": request.get("max_output_gap_ns"),
+                "median_output_gap_ns": statistics.median(gaps) if gaps else None,
+                "p95_output_gap_ns": gaps[(95 * len(gaps) + 99) // 100 - 1] if gaps else None,
+                "terminal_tail_ns": request.get("terminal_tail_ns"),
+                "unterminated_tail_ns": request.get("unterminated_tail_ns"),
+                "output_event_count": request.get("output_event_count"),
+                "output_bytes": request.get("output_bytes"),
+                "output_tokens": tokens,
+                "wire_request_id": request.get("wire_request_id"),
+                "response_id": request.get("response_id"),
+                "input_tokens": usage.get("input_tokens") if isinstance(usage, dict) else None,
+                "finish_reason": server_result.get("finish_reason"),
+                "diagnostic_status": diagnostics["status"],
+                "diagnostic_reason": diagnostics.get("reason"),
+                "server_instance_id": diagnostics.get("server_instance_id"),
+                "service_request_id": diagnostics.get("service_request_id"),
+                "engine_request_id": diagnostics.get("engine_request_id"),
+                "mechanisms": diagnostics["mechanisms"],
+                "usage_check": usage_check,
+                **{field: counts.get(field) for field in SCHEDULING_FIELDS},
+                "raw": run.get("_source"),
+            })
+        complete_timing = len(starts) == len(requests) and len(ends) == len(requests)
+        measurable = bool(requests) and complete_timing and duration is not None and duration > 0 and not missing_usage
+        comparable = notes.get("throughput_comparable", True) is True and run.get("constructed") is True
+        input_dependency = notes.get("input_dependency", "unknown")
+        matched_input_eligible = comparable and input_dependency == "fixed"
+        limitation = notes.get("throughput_limitation")
+        if run.get("constructed") is not True:
+            limitation = "; ".join(filter(None, (
+                limitation, "The requested arrival graph was not constructed.",
+            )))
+        mechanism_coverage = {}
+        for name in MECHANISM_COUNTERS:
+            states = [request.get("diagnostics", {}).get("mechanisms", {}).get(name, "unavailable")
+                      for request in requests]
+            mechanism_coverage[name] = (
+                "observed" if "observed" in states
+                else "not_observed" if states and all(state == "not_observed" for state in states)
+                else "unavailable"
+            )
+        for name, state in notes.get("mechanism_observations", {}).items():
+            if name not in mechanism_coverage:
+                mechanism_coverage[name] = state if state in (
+                    "observed", "not_observed", "unavailable",
+                ) else "unavailable"
+        mechanism_coverage.update(run.get("scheduling_observations", {}).get("mechanisms", {}))
+        by_role = {request.get("role"): request for request in requests}
+        order_groups = notes.get("expected_engine_order_groups")
+        if order_groups:
+            ids = [[by_role.get(role, {}).get("diagnostics", {}).get("engine_request_id")
+                    for role in roles] for roles in order_groups]
+            valid = all(group and all(type(value) is int for value in group) for group in ids)
+            mechanism_coverage["expected_engine_order"] = (
+                "observed" if all(max(left) < min(right) for left, right in zip(ids, ids[1:]))
+                else "not_observed") if valid else "unavailable"
+        for name, requirement in notes.get("mechanism_role_requirements", {}).items():
+            if name in mechanism_coverage:
+                continue
+            diagnostic = by_role.get(requirement.get("role"), {}).get("diagnostics", {})
+            counter = requirement.get("counter")
+            value = diagnostic.get("scheduling", {}).get(counter)
+            mechanism_coverage[name] = (
+                "observed" if value > 0 else "not_observed"
+            ) if (counter in SCHEDULING_FIELDS and diagnostic.get("status") == "available"
+                  and type(value) is int) else "unavailable"
+        required = notes.get("mechanism_requirements", [])
+        required_states = [mechanism_coverage.get(name, "unavailable") for name in required]
+        required_status = (
+            "not_required" if not required_states
+            else "observed" if all(state == "observed" for state in required_states)
+            else "unavailable" if "unavailable" in required_states else "not_observed"
+        )
+        workloads.append({
+            "case": run.get("case"),
+            "sample": run.get("_sample"),
+            "constructed": run.get("constructed"),
+            "arrival_mode": notes.get("arrival_mode", "causal"),
+            "measurement_contract": str(notes.get("measurement_contract", "1")),
+            **_arrival_metrics(notes, requests),
+            "throughput_comparable": comparable,
+            "input_dependency": input_dependency,
+            "matched_input_eligible": matched_input_eligible,
+            "throughput_limitation": limitation,
+            "mechanism_coverage": mechanism_coverage,
+            "mechanism_requirements": required,
+            "replay_progress_intervals": run.get("scheduling_observations", {}).get("replay_intervals", []),
+            "incomplete_scheduling_requests": run.get("scheduling_observations", {}).get("incomplete_requests", []),
+            "required_mechanism_status": required_status,
+            "observed_workload": notes.get("observed_workload"),
+            "arrivals": notes.get("arrivals"),
+            "requests": len(requests),
+            "successful_requests": successful,
+            "request_outcomes": dict(Counter(str(r.get("outcome")) for r in requests)),
+            "missing_success_usage": missing_usage,
+            "measured_completed_output_tokens": completed_tokens,
+            "duration_ns": duration if complete_timing else None,
+            "completed_output_tokens_per_second": (
+                completed_tokens * 1e9 / duration if measurable and comparable else None
+            ),
+            "observed_completed_output_tokens_per_second": (
+                completed_tokens * 1e9 / duration if measurable else None
+            ),
+            "raw": run.get("_source"),
+        })
+    return observations, workloads
+
+
+def _request_timing_rows(runs: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {"case": run.get("case"), "profile_label": run.get("profile_label"),
+         "sample": run.get("_sample"), "request_role": request.get("role"),
+         "outcome": request.get("outcome"), "constructed": run.get("constructed"),
+         "wire_request_id": request.get("wire_request_id"),
+         "engine_request_id": request.get("diagnostics", {}).get("engine_request_id"),
+         **request_timing_analysis(request), "raw": run.get("_source")}
+        for run in runs for request in run.get("requests", [])
+    ]
+
+
 def summarize_campaign(
     campaign: CampaignData, baseline: CampaignData | None = None
 ) -> dict[str, Any]:
     groups_map, run_roles, rejected = _request_maps(campaign.runs)
+    stream_observations, workload_metrics = _stream_observations(campaign.runs)
     expected_by_case = Counter(plan.case for plan in campaign.plans)
     groups: list[dict[str, Any]] = []
     for (model, case, profile, role), samples in sorted(groups_map.items()):
@@ -1215,6 +1492,19 @@ def summarize_campaign(
         "coverage": coverage,
         "run_status_counts": dict(sorted(status_counts.items())),
         "ttft_groups": groups,
+        "stream_observations": stream_observations,
+        "request_lifecycle_groups": _lifecycle_groups(campaign.runs),
+        "workload_phase_metrics": _phase_metrics(campaign.runs),
+        "request_timing_analysis": _request_timing_rows(campaign.runs),
+        "workload_metrics": workload_metrics,
+        "global_runtime_observations": [
+            {"case": run.get("case"), "sample": run.get("_sample"), "raw": run.get("_source"),
+             **run.get("global_diagnostics", {"status": "unavailable", "reason": "request_log_not_loaded"})}
+            for run in campaign.runs
+        ],
+        "mechanism_coverage_counts": dict(Counter(
+            row["required_mechanism_status"] for row in workload_metrics
+        )),
         "comparisons": _comparison_rows(groups, run_roles),
         "symmetric_order_statistics": symmetric_rows,
         "boundary_rejections": boundary_rows,
@@ -1235,13 +1525,23 @@ def summarize_campaign(
             "created_at": baseline.manifest.get("created_at"),
             "completed_at": baseline.manifest.get("completed_at"),
         }
-        result["cross_campaign_comparisons"] = _cross_campaign_rows(
+        result["comparison_qualification"] = {
+            "status": "conditions_unverified",
+            "checked": ["model_profile", "kv_dtype", "measurement_contract"],
+            "reason": "Resource geometry, backend, Graph, observation settings and offered inputs "
+                      "must be checked before treating these observed TTFT deltas as performance changes.",
+        }
+        rejected = _contract_rejections(campaign, baseline)
+        rejected_keys = {(row["case"], row["profile_label"]) for row in rejected}
+        result["cross_campaign_rejected"] = rejected
+        result["cross_campaign_comparisons"] = [row for row in _cross_campaign_rows(
             groups,
             baseline_summary["ttft_groups"],
             symmetric_rows,
             baseline_summary["symmetric_order_statistics"],
-        )
+        ) if (row["case"], row["profile_label"]) not in rejected_keys]
     else:
+        result["cross_campaign_rejected"] = []
         result["cross_campaign_comparisons"] = []
 
     return result

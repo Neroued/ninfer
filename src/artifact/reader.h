@@ -3,6 +3,7 @@
 #include "artifact/framing.h"
 #include "artifact/schema.h"
 #include "core/weight_view.h"
+#include "core/io/file.h"
 
 #include <filesystem>
 #include <memory>
@@ -11,7 +12,7 @@
 namespace ninfer::artifact {
 
 struct ReadSegment {
-    std::size_t file_index           = 0;
+    std::size_t file_index           = 0; // Index into the producing owner's file set.
     std::uint64_t file_offset        = 0;
     std::uint64_t destination_offset = 0;
     std::uint64_t bytes              = 0;
@@ -41,8 +42,8 @@ public:
     [[nodiscard]] std::vector<std::byte> read_range(std::uint64_t offset,
                                                     std::uint64_t bytes) const;
     [[nodiscard]] std::vector<std::byte> read_object(ObjectHandle handle) const;
-    [[nodiscard]] std::size_t read_direct(std::size_t file_index, std::uint64_t file_offset,
-                                          std::span<std::byte> destination) const;
+    // Opens an independently owned file and checks its framing/length against this directory.
+    [[nodiscard]] io::ReadOnlyFile open_file(std::size_t file_index, io::ReadMode mode) const;
 
 private:
     struct Impl;

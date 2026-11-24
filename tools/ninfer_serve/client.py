@@ -119,6 +119,7 @@ class PreparedServeExchange:
         *,
         on_sent: Callable[[int], None] | None = None,
         on_body_sent: Callable[[int], None] | None = None,
+        on_headers: Callable[[HttpResponseHead], None] | None = None,
         on_event: Callable[[ProtocolEvent], None] | None = None,
     ) -> ServeExchangeResult:
         adapter = _adapter(self.request.protocol)
@@ -135,6 +136,8 @@ class PreparedServeExchange:
         def headers(value: HttpResponseHead) -> None:
             nonlocal head, protocol_error
             head = value
+            if on_headers is not None:
+                on_headers(value)
             if self.request.stream and 200 <= value.status < 300:
                 media_type = value.headers.get("content-type", "").split(";", 1)[0].strip().lower()
                 if media_type != "text/event-stream":
@@ -175,7 +178,15 @@ class PreparedServeExchange:
             # A cancellation intent that races after a complete protocol terminal is not a
             # cancelled exchange.  Conversely, shutdown may surface as a clean socket EOF rather
             # than an exception, so absence of a terminal event is the protocol-level authority.
-            http.cancelled = not any(event.kind in {"terminal", "error"} for event in events)
+            http.cancelled = (
+                http.error is None
+                and protocol_error is None
+                and (http.status is None or 200 <= http.status < 300)
+                and http.cancel_ns is not None
+                and http.ended_ns is not None
+                and http.cancel_ns <= http.ended_ns
+                and not any(event.kind in {"terminal", "error"} for event in events)
+            )
         if (
             self.request.stream
             and http.status is not None

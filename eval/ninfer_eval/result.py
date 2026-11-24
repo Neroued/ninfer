@@ -29,6 +29,7 @@ class DatasetResult:
     duration_seconds: float
     artifacts: list[str] = field(default_factory=list)
     error: str | None = None
+    diagnostics: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -53,8 +54,8 @@ def write_summary(
     lines = [f"# Evaluation Summary: {run_id}", "", f"Status: `{status}`", ""]
     lines.extend(
         [
-            "| Job | Backend | Dataset | Status | Primary metric | Score | Completed | Failed | Duration |",
-            "|---|---|---|---|---|---:|---:|---:|---:|",
+            "| Job | Status | Primary metric | Score | Scored / Planned | Failed | Truncated | Unparsed | Duration |",
+            "|---|---|---|---:|---:|---:|---:|---:|---:|",
         ]
     )
     for result in results:
@@ -63,12 +64,17 @@ def write_summary(
         )
         score_text = f"{score:.6f}" if isinstance(score, (int, float)) else "-"
         lines.append(
-            f"| {result.job_id} | {result.backend} | {result.dataset} | {result.status} | "
-            f"{result.primary_metric or '-'} | {score_text} | {result.counts.completed} | "
-            f"{result.counts.failed} | {result.duration_seconds:.1f}s |"
+            f"| {result.job_id} | {result.status} | "
+            f"{result.primary_metric or '-'} | {score_text} | "
+            f"{result.counts.scored} / {result.counts.planned or '?'} | "
+            f"{result.counts.failed} | {result.diagnostics.get('truncated', '-')} | "
+            f"{result.diagnostics.get('unparsed_answers', '-')} | "
+            f"{result.duration_seconds:.1f}s |"
         )
     lines.append("")
-    (run_dir / "summary.md").write_text("\n".join(lines), encoding="utf-8")
+    tmp = run_dir / "summary.md.tmp"
+    tmp.write_text("\n".join(lines), encoding="utf-8")
+    tmp.replace(run_dir / "summary.md")
     return payload
 
 

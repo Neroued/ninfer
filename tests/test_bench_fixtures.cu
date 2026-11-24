@@ -1,4 +1,5 @@
 #include "direct_bf16_weight.cuh"
+#include "core/buffer.h"
 #include "quantized_weight.cuh"
 #include "ops/quantized_weight.h"
 
@@ -18,8 +19,8 @@ void require(bool condition, const char* message) {
 }
 
 std::vector<std::uint8_t> download(const DeviceBuffer& buffer) {
-    std::vector<std::uint8_t> bytes(buffer.bytes);
-    CUDA_CHECK(cudaMemcpy(bytes.data(), buffer.p, buffer.bytes, cudaMemcpyDeviceToHost));
+    std::vector<std::uint8_t> bytes(buffer.size());
+    CUDA_CHECK(cudaMemcpy(bytes.data(), buffer.data(), buffer.size(), cudaMemcpyDeviceToHost));
     return bytes;
 }
 
@@ -96,7 +97,7 @@ void float_and_timing_fixtures() {
     require(first == download(b), "floating fixture is not reproducible");
     require(first != download(c), "operand seeds do not separate inputs");
     std::vector<__nv_bfloat16> values(8192);
-    CUDA_CHECK(cudaMemcpy(values.data(), a.p, a.bytes, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(values.data(), a.data(), a.size(), cudaMemcpyDeviceToHost));
     int changes = 0;
     for (std::size_t i = 0; i < values.size(); ++i) {
         const float value = __bfloat162float(values[i]);
@@ -107,29 +108,31 @@ void float_and_timing_fixtures() {
 
     auto state = qb::make_f32(1, 307, -.5F, .5F);
     float initial;
-    CUDA_CHECK(cudaMemcpy(&initial, state.p, sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&initial, state.data(), sizeof(float), cudaMemcpyDeviceToHost));
     qb::SavedBuffer saved(state);
-    const auto reset  = [&](cudaStream_t stream) { saved.restore(stream); };
-    const auto launch = [&](cudaStream_t stream) {
-        add_one<<<1, 1, 0, stream>>>(static_cast<float*>(state.p));
+    const auto reset  = [&](CudaExecutionView cuda) { saved.restore(cuda); };
+    const auto launch = [&](CudaExecutionView cuda) {
+        const auto stream = cuda.stream();
+        add_one<<<1, 1, 0, stream>>>(static_cast<float*>(state.data()));
     };
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    const auto cuda = ninfer::bench::device_context().execution_view(stream);
     qb::TimedGraph graph;
-    graph.capture(stream, launch);
+    graph.capture(cuda, launch);
     qb::L2FlushBuffer flush(4099);
     const auto check = [&] {
         float output;
-        CUDA_CHECK(cudaMemcpy(&output, state.p, sizeof(float), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(&output, state.data(), sizeof(float), cudaMemcpyDeviceToHost));
         require(output == initial + 1.F, "warmup/sample reused mutated input");
     };
-    qb::measure_launch_prepared(reset, launch, stream, 5, 9);
+    qb::measure_launch_prepared(reset, launch, cuda, 5, 9);
     check();
-    qb::measure_graph_prepared(reset, graph, stream, 5, 9);
+    qb::measure_graph_prepared(reset, graph, cuda, 5, 9);
     check();
-    qb::measure_cold_launch_prepared(reset, launch, flush, stream, 5, 9);
+    qb::measure_cold_launch_prepared(reset, launch, flush, cuda, 5, 9);
     check();
-    qb::measure_cold_graph_prepared(reset, graph, flush, stream, 5, 9);
+    qb::measure_cold_graph_prepared(reset, graph, flush, cuda, 5, 9);
     check();
     qb::bench_loop_prepared(reset, launch, sizeof(float) * 2, 5, 9);
     check();

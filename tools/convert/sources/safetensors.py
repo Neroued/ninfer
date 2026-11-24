@@ -151,16 +151,13 @@ class SafetensorsSource:
         count = (end - begin) * word_bytes
         offset = info.offset + begin * word_bytes
         with self._read_lock:
-            # _file() may evict/close the LRU descriptor. Keep the lock held
-            # until pread() and cache-discard complete so another worker cannot
-            # invalidate this descriptor underneath us.
             fd = self._file(info.file)
-            raw = os.pread(fd, count, offset)
-            if len(raw) != count:
+            raw = bytearray(count)
+            if os.preadv(fd, [raw], offset) != count:
                 raise ValueError(f"{name}: short source read")
             self.bytes_read += count
             discard_cached_pages(fd, offset, count)
-        return torch.frombuffer(bytearray(raw), dtype=dtype)
+        return torch.frombuffer(raw, dtype=dtype)
 
     def close(self) -> None:
         with self._read_lock:

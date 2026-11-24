@@ -63,7 +63,7 @@ int main() {
     auto* base                             = storage;
     int failures                           = 0;
 
-    ninfer::Tensor t(base, ninfer::DType::BF16, {2, 3, 4});
+    ninfer::Tensor t(base, ninfer::Device::cpu(), ninfer::DType::BF16, {2, 3, 4});
     failures += check_shape(t, {2, 3, 4, 1}, "t");
     failures += check_strides(t, {2, 4, 12, 48}, "t");
     failures += expect_i64(t.numel(), 24, "t.numel");
@@ -121,8 +121,9 @@ int main() {
     failures += expect_i64(reshaped.numel(), 24, "reshaped.numel");
 
     failures += expect_invalid([&] { (void)sliced.reshape({4, 4}); }, "non-contiguous reshape");
-    failures += expect_invalid([&] { (void)ninfer::Tensor(base, ninfer::DType::BF16, {2, 0}); },
-                               "zero dimension");
+    failures += expect_invalid(
+        [&] { (void)ninfer::Tensor(base, ninfer::Device::cpu(), ninfer::DType::BF16, {2, 0}); },
+        "zero dimension");
     failures += expect_invalid([&] { (void)t.slice(4, 0, 1); }, "invalid slice dim");
     failures += expect_invalid([&] { (void)t.slice(1, 2, 2); }, "out-of-range slice");
     failures += expect_invalid([&] { (void)t.permute({0, 0, 1, 2}); }, "duplicate permutation");

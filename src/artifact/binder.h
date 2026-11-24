@@ -1,6 +1,6 @@
 #pragma once
 
-#include "artifact/materializer.h"
+#include "artifact/placement.h"
 #include "artifact/reader.h"
 
 #include <optional>
@@ -10,13 +10,10 @@
 
 namespace ninfer::artifact {
 
-enum class Residency { Device, Host, Values };
-
 struct ParameterReference {
     std::string name;
     Shape shape;
     Binding binding;
-    Residency residency = Residency::Device;
 };
 
 struct HostValues {
@@ -35,32 +32,22 @@ public:
     explicit Binder(const Reader& reader);
 
     [[nodiscard]] ParameterReference parameter(std::string_view name, Shape shape,
-                                               Residency residency = Residency::Device,
                                                std::optional<QType> exact_format = {});
     [[nodiscard]] ParameterReference binding(std::string name, const Binding& binding, Shape shape,
-                                             Residency residency,
                                              std::optional<QType> exact_format = {});
     [[nodiscard]] const Use& use(std::string_view parameter, std::string_view input) const;
     [[nodiscard]] bool contains(std::string_view parameter) const;
 
     [[nodiscard]] const Reader& reader() const noexcept { return reader_; }
 
-    void require_device(ObjectHandle object, std::uint64_t alignment = 256);
-    [[nodiscard]] std::span<const std::byte> host_object(ObjectHandle object);
+    [[nodiscard]] std::span<const std::byte> resource_bytes(ObjectHandle object);
     [[nodiscard]] ObjectHandle resource(std::string_view component, std::string_view role);
     [[nodiscard]] HostValues values(const Binding& binding, std::optional<QType> format = {});
-    [[nodiscard]] MaterializationPlan finish() &&;
+    [[nodiscard]] PreparedResources finish() &&;
 
 private:
-    struct Demand {
-        bool device             = false;
-        bool host               = false;
-        std::uint64_t alignment = 256;
-        std::vector<std::byte> host_data;
-    };
-
     const Reader& reader_;
-    std::vector<Demand> demands_;
+    std::vector<PreparedResource> resources_;
     std::uint64_t read_bytes_        = 0;
     std::uint64_t owned_value_bytes_ = 0;
 };

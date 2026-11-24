@@ -12,6 +12,8 @@ namespace ninfer::serve {
 
 struct RequestLogContext {
     std::uint64_t id = 0;
+    std::string http_request_id;
+    std::string response_id;
     std::string protocol;
     std::string model;
     bool stream                             = false;
@@ -33,6 +35,8 @@ struct RequestLogContext {
 };
 
 struct RequestLogMetadata {
+    std::string http_request_id;
+    std::string response_id;
     std::string model;
     bool stream                            = false;
     bool output_tokens_explicit            = false;
@@ -43,6 +47,8 @@ struct RequestLogMetadata {
 // separate shape because sampler and prompt semantics may not have resolved.
 struct RequestRejectionLogContext {
     std::uint64_t id = 0;
+    std::string http_request_id;
+    std::string response_id;
     std::string protocol;
     std::string model;
     bool stream                             = false;
@@ -89,6 +95,7 @@ struct RequestFailure {
 };
 
 struct ThroughputReport {
+    ExecutionStatistics previous_execution{}, current_execution{};
     double interval_seconds               = 0.0;
     std::uint64_t computed_prefill_tokens = 0;
     std::uint64_t committed_decode_tokens = 0;
@@ -96,6 +103,7 @@ struct ThroughputReport {
     std::uint64_t decode_row_rounds       = 0;
     ninfer::RuntimeStats previous;
     ninfer::RuntimeStats current;
+    bool final_interval = false;
 };
 
 RequestLogContext make_request_log_context(std::uint64_t id, std::string protocol,

@@ -19,6 +19,9 @@ struct string_part {
     std::string val;
     std::optional<std::size_t> source_offset = 0;
     bool literal                             = false;
+    // For strip() annotations, val is empty and [source_offset, collapsed_source_end]
+    // is an inclusive range of source boundaries folded to this output position.
+    std::optional<std::size_t> collapsed_source_end;
 };
 
 struct string {
@@ -53,6 +56,8 @@ struct string {
                  std::optional<const std::string_view> chars = std::nullopt) const;
 
 private:
+    void append_boundary(std::uint32_t origin, std::size_t begin, std::size_t end);
+    string cut_bytes(std::size_t begin, std::size_t end, bool collapse_removed) const;
     string map_case(unicode::Case mode) const;
 };
 

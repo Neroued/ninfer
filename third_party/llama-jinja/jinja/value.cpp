@@ -156,7 +156,16 @@ static value tojson(const func_args& args) {
         result->val_str.tag(args.get_pos(0)->origin, false);
     else if (is_val<value_string>(args.get_pos(0))) {
         const auto& parts = args.get_pos(0)->val_str.parts;
-        if (parts.size() == 1) result->val_str.tag(parts.front().origin, false);
+        const string_part* source = nullptr;
+        for (const auto& part : parts) {
+            if (part.collapsed_source_end) continue;
+            if (source) {
+                source = nullptr;
+                break;
+            }
+            source = &part;
+        }
+        if (source) result->val_str.tag(source->origin, false);
     }
     return result;
 }

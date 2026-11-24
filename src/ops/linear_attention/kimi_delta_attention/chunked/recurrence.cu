@@ -1,6 +1,10 @@
+#include "ops/common/host/launch.h"
+#include "ops/linear_attention/kimi_delta_attention/chunked/workspace.h"
 #include "ops/linear_attention/kimi_delta_attention/launch.h"
-#include "ops/common/math.cuh"
-#include "ops/common/mma.cuh"
+#include "ops/common/numeric/convert.cuh"
+#include "ops/common/cuda/pipeline.cuh"
+#include "ops/common/cuda/mma.cuh"
+#include "ops/common/cuda/memory.cuh"
 
 namespace ninfer::ops::detail::kimi_delta_attention {
 namespace {
@@ -18,33 +22,35 @@ __device__ __forceinline__ int value_index(int row, int col) {
 __device__ __forceinline__ void load_vector_tf32_a(const __nv_bfloat16* p, int k, int lane,
                                                    unsigned (&a)[4]) {
     unsigned low, high;
-    ldmatrix_x2(low, high, smem_addr(p + vector_index((lane & 7) + ((lane >> 3) & 1) * 8, k)));
-    unpack_bf16x2_to_fp32_bits(low, a[0], a[2]);
-    unpack_bf16x2_to_fp32_bits(high, a[1], a[3]);
+    common::ldmatrix_x2(low, high,
+                        common::smem_addr(p + vector_index((lane & 7) + ((lane >> 3) & 1) * 8, k)));
+    common::unpack_bf16x2_to_fp32_bits(low, a[0], a[2]);
+    common::unpack_bf16x2_to_fp32_bits(high, a[1], a[3]);
 }
 
 // The producer interleaves each eight inner coordinates as {0,4,1,5,2,6,3,7}.
 // BF16 A consumes those bits directly; B packing applies the matching permutation.
 __device__ __forceinline__ void load_vector_bf16_a(const __nv_bfloat16* p, int k, int lane,
                                                    unsigned (&a)[4]) {
-    ldmatrix_x4(
-        a[0], a[1], a[2], a[3],
-        smem_addr(p + vector_index((lane & 7) + ((lane >> 3) & 1) * 8, k + (lane >> 4) * 8)));
+    common::ldmatrix_x4(a[0], a[1], a[2], a[3],
+                        common::smem_addr(p + vector_index((lane & 7) + ((lane >> 3) & 1) * 8,
+                                                           k + (lane >> 4) * 8)));
 }
 
 __device__ __forceinline__ void load_restored_bf16_a(const __nv_bfloat16* p, int key, int lane,
                                                      unsigned (&a)[4]) {
-    ldmatrix_x4_t(
-        a[0], a[1], a[2], a[3],
-        smem_addr(p + vector_index((lane & 7) + (lane >> 4) * 8, key + ((lane >> 3) & 1) * 8)));
+    common::ldmatrix_x4_t(a[0], a[1], a[2], a[3],
+                          common::smem_addr(p + vector_index((lane & 7) + (lane >> 4) * 8,
+                                                             key + ((lane >> 3) & 1) * 8)));
 }
 
 template <int DV>
 __device__ __forceinline__ void load_bf16_b(const float* p, int k, int n, int lane, unsigned& b0,
                                             unsigned& b1) {
     const int t = lane & 3, col = n * 8 + lane / 4;
-    b0 = pack_bf16x2(p[value_index<DV>(k + t, col)], p[value_index<DV>(k + t + 4, col)]);
-    b1 = pack_bf16x2(p[value_index<DV>(k + t + 8, col)], p[value_index<DV>(k + t + 12, col)]);
+    b0 = common::pack_bf16x2(p[value_index<DV>(k + t, col)], p[value_index<DV>(k + t + 4, col)]);
+    b1 = common::pack_bf16x2(p[value_index<DV>(k + t + 8, col)],
+                             p[value_index<DV>(k + t + 12, col)]);
 }
 
 template <int DV>
@@ -67,7 +73,7 @@ __device__ __forceinline__ void load_stage(typename RecurrenceShared<DV>::Stage&
     auto* dst = reinterpret_cast<uint4*>(&stage.packet);
 #pragma unroll
     for (int i = tid; i < static_cast<int>(sizeof(Chunk) / 16); i += kThreads<DV>) {
-        cp_async<16, Cache::cg>(dst + i, src + i);
+        common::cp_async<16, Cache::cg>(dst + i, src + i);
     }
     constexpr int vectors = kChunkSize * DV / 8;
 #pragma unroll
@@ -78,22 +84,23 @@ __device__ __forceinline__ void load_stage(typename RecurrenceShared<DV>::Stage&
         const auto off =
             (static_cast<std::int64_t>(valid_token) * args.value_heads + head) * kStateDim +
             value_start + col;
-        cp_async_zfill<16, Cache::cg>(stage.value + row * DV + col, args.v + off,
-                                      token < args.tokens ? 16 : 0);
+        common::cp_async_zfill<16, Cache::cg>(stage.value + row * DV + col, args.v + off,
+                                              token < args.tokens ? 16 : 0);
     }
-    cp_commit();
+    common::cp_commit();
 }
 
 template <int DV>
 __device__ __forceinline__ void store_residual(float* delta, const __nv_bfloat16* value,
                                                const float (&prediction)[4], int n, int lane) {
     const int row = lane / 4, col = n * 8 + (lane & 3) * 2;
-    const float2 v0 = __bfloat1622float2(load_vec<__nv_bfloat162>(value + row * DV + col));
-    const float2 v1 = __bfloat1622float2(load_vec<__nv_bfloat162>(value + (row + 8) * DV + col));
-    store_vec(delta + value_index<DV>(row, col),
-              make_float2(v0.x - prediction[0], v0.y - prediction[1]));
-    store_vec(delta + value_index<DV>(row + 8, col),
-              make_float2(v1.x - prediction[2], v1.y - prediction[3]));
+    const float2 v0 = __bfloat1622float2(common::load_vec<__nv_bfloat162>(value + row * DV + col));
+    const float2 v1 =
+        __bfloat1622float2(common::load_vec<__nv_bfloat162>(value + (row + 8) * DV + col));
+    common::store_vec(delta + value_index<DV>(row, col),
+                      make_float2(v0.x - prediction[0], v0.y - prediction[1]));
+    common::store_vec(delta + value_index<DV>(row + 8, col),
+                      make_float2(v1.x - prediction[2], v1.y - prediction[3]));
 }
 
 template <int DV>
@@ -103,12 +110,13 @@ __device__ __forceinline__ void matrix_delta(float (&acc)[4], const float* matri
 #pragma unroll
     for (int k = 0; k < kChunkSize; k += 8) {
         unsigned af[4];
-        ldmatrix_x4(af[0], af[1], af[2], af[3],
-                    smem_addr(matrix + square_index((lane & 7) + ((lane >> 3) & 1) * 8,
-                                                    k + (lane >> 4) * 4)));
-        mma_tf32_bits(acc[0], acc[1], acc[2], acc[3], af[0], af[1], af[2], af[3],
-                      __float_as_uint(delta[value_index<DV>(k + t, n * 8 + g)]),
-                      __float_as_uint(delta[value_index<DV>(k + t + 4, n * 8 + g)]));
+        common::ldmatrix_x4(
+            af[0], af[1], af[2], af[3],
+            common::smem_addr(
+                matrix + square_index((lane & 7) + ((lane >> 3) & 1) * 8, k + (lane >> 4) * 4)));
+        common::mma_tf32_bits(acc[0], acc[1], acc[2], acc[3], af[0], af[1], af[2], af[3],
+                              __float_as_uint(delta[value_index<DV>(k + t, n * 8 + g)]),
+                              __float_as_uint(delta[value_index<DV>(k + t + 4, n * 8 + g)]));
     }
 }
 
@@ -118,11 +126,13 @@ __device__ __forceinline__ void store_output(const Arguments& args, float (&acc)
     const int t0  = chunk * kChunkSize + row;
     const auto o0 = (static_cast<std::int64_t>(t0) * args.value_heads + head) * kStateDim + col;
     if (t0 < args.tokens) {
-        store_vec(args.out + o0, __floats2bfloat162_rn(acc[0] * args.scale, acc[1] * args.scale));
+        common::store_vec(args.out + o0,
+                          __floats2bfloat162_rn(acc[0] * args.scale, acc[1] * args.scale));
     }
     if (t0 + 8 < args.tokens) {
-        store_vec(args.out + o0 + static_cast<std::int64_t>(8) * args.value_heads * kStateDim,
-                  __floats2bfloat162_rn(acc[2] * args.scale, acc[3] * args.scale));
+        common::store_vec(args.out + o0 +
+                              static_cast<std::int64_t>(8) * args.value_heads * kStateDim,
+                          __floats2bfloat162_rn(acc[2] * args.scale, acc[3] * args.scale));
     }
 }
 
@@ -165,9 +175,9 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
 
     for (int chunk = 0; chunk < chunks; ++chunk) {
         if (chunk + 1 < chunks)
-            cp_wait<1>();
+            common::cp_wait<1>();
         else
-            cp_wait<0>();
+            common::cp_wait<0>();
 #pragma unroll
         for (int ni = 0; ni < NPW; ++ni) {
             const int n = n_start + ni * kWarps;
@@ -175,10 +185,10 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
             for (int mi = 0; mi < MPW; ++mi) {
                 const int key = (m_start + mi * MW) * 16 + g;
                 const int col = n * 8 + t * 2;
-                store_vec(sm.snapshot + value_index<DV>(key, col),
-                          make_float2(state[ni][mi][0], state[ni][mi][1]));
-                store_vec(sm.snapshot + value_index<DV>(key + 8, col),
-                          make_float2(state[ni][mi][2], state[ni][mi][3]));
+                common::store_vec(sm.snapshot + value_index<DV>(key, col),
+                                  make_float2(state[ni][mi][0], state[ni][mi][1]));
+                common::store_vec(sm.snapshot + value_index<DV>(key + 8, col),
+                                  make_float2(state[ni][mi][2], state[ni][mi][3]));
             }
         }
         __syncthreads();
@@ -201,14 +211,15 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
                     const float b1 = sm.snapshot[value_index<DV>(k + t + 4, n * 8 + g)];
                     const float b2 = sm.snapshot[value_index<DV>(k + t + 8, n * 8 + g)];
                     const float b3 = sm.snapshot[value_index<DV>(k + t + 12, n * 8 + g)];
-                    mma_tf32_bits(prediction[ni][0], prediction[ni][1], prediction[ni][2],
-                                  prediction[ni][3], ka0[0], ka0[1], ka0[2], ka0[3],
-                                  __float_as_uint(b0), __float_as_uint(b1));
-                    mma_tf32_bits(prediction[ni][0], prediction[ni][1], prediction[ni][2],
-                                  prediction[ni][3], ka1[0], ka1[1], ka1[2], ka1[3],
-                                  __float_as_uint(b2), __float_as_uint(b3));
-                    mma_bf16(history[ni][0], history[ni][1], history[ni][2], history[ni][3], qa[0],
-                             qa[1], qa[2], qa[3], pack_bf16x2(b0, b1), pack_bf16x2(b2, b3));
+                    common::mma_tf32_bits(prediction[ni][0], prediction[ni][1], prediction[ni][2],
+                                          prediction[ni][3], ka0[0], ka0[1], ka0[2], ka0[3],
+                                          __float_as_uint(b0), __float_as_uint(b1));
+                    common::mma_tf32_bits(prediction[ni][0], prediction[ni][1], prediction[ni][2],
+                                          prediction[ni][3], ka1[0], ka1[1], ka1[2], ka1[3],
+                                          __float_as_uint(b2), __float_as_uint(b3));
+                    common::mma_bf16(history[ni][0], history[ni][1], history[ni][2], history[ni][3],
+                                     qa[0], qa[1], qa[2], qa[3], common::pack_bf16x2(b0, b1),
+                                     common::pack_bf16x2(b2, b3));
                 }
             }
 #pragma unroll
@@ -225,15 +236,15 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
                         unsigned af[4], b0, b1;
                         load_vector_bf16_a(p.qd, k, lane, af);
                         load_bf16_b<DV>(sm.snapshot, k, n, lane, b0, b1);
-                        mma_bf16(history[0][0], history[0][1], history[0][2], history[0][3], af[0],
-                                 af[1], af[2], af[3], b0, b1);
+                        common::mma_bf16(history[0][0], history[0][1], history[0][2], history[0][3],
+                                         af[0], af[1], af[2], af[3], b0, b1);
                     }
                 } else {
 #pragma unroll
                     for (int k = 0; k < kStateDim; k += 8) {
                         unsigned af[4];
                         load_vector_tf32_a(p.kd, k, lane, af);
-                        mma_tf32_bits(
+                        common::mma_tf32_bits(
                             history[0][0], history[0][1], history[0][2], history[0][3], af[0],
                             af[1], af[2], af[3],
                             __float_as_uint(sm.snapshot[value_index<DV>(k + t, n * 8 + g)]),
@@ -252,8 +263,9 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
             matrix_delta<DV>(delta, p.solve, sm.delta, n, lane);
             const int col = n * 8 + t * 2;
             __syncwarp();
-            store_vec(sm.delta + value_index<DV>(g, col), make_float2(delta[0], delta[1]));
-            store_vec(sm.delta + value_index<DV>(g + 8, col), make_float2(delta[2], delta[3]));
+            common::store_vec(sm.delta + value_index<DV>(g, col), make_float2(delta[0], delta[1]));
+            common::store_vec(sm.delta + value_index<DV>(g + 8, col),
+                              make_float2(delta[2], delta[3]));
         }
         __syncthreads();
 
@@ -294,8 +306,9 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
             load_restored_bf16_a(p.kr, key - g, lane, af);
 #pragma unroll
             for (int ni = 0; ni < NPW; ++ni) {
-                mma_bf16(state[ni][mi][0], state[ni][mi][1], state[ni][mi][2], state[ni][mi][3],
-                         af[0], af[1], af[2], af[3], delta_b[ni][0], delta_b[ni][1]);
+                common::mma_bf16(state[ni][mi][0], state[ni][mi][1], state[ni][mi][2],
+                                 state[ni][mi][3], af[0], af[1], af[2], af[3], delta_b[ni][0],
+                                 delta_b[ni][1]);
             }
         }
         __syncthreads();
@@ -321,8 +334,7 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
 template <int DV>
 void launch(const Arguments& args, const Chunk* workspace, cudaStream_t stream) {
     constexpr int shared_bytes = sizeof(RecurrenceShared<DV>);
-    CUDA_CHECK(cudaFuncSetAttribute(chunk_recurrence_kernel<DV>,
-                                    cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes));
+    (void)common::prepare_shared<shared_bytes, chunk_recurrence_kernel<DV>, true>();
     chunk_recurrence_kernel<DV>
         <<<args.value_heads*(kStateDim / DV), kThreads<DV>, shared_bytes, stream>>>(args,
                                                                                     workspace);
@@ -331,42 +343,19 @@ void launch(const Arguments& args, const Chunk* workspace, cudaStream_t stream) 
 
 } // namespace
 
-int chunk_value_tile(int value_heads, int multiprocessor_count) {
-    // Small grids need the narrowest stripe. Otherwise minimize SM waves weighted
-    // by the measured per-wave cost of this mixed BF16/TF32 kernel on SM120a.
-    // Wider stripes reduce replicated packet reads but retain more state per CTA.
-    if (static_cast<std::int64_t>(value_heads) * 16 <= multiprocessor_count) return 8;
-    int best               = 64;
-    std::int64_t best_work = INT64_MAX;
-
-    struct Choice {
-        int tile, cost;
-    };
-
-    for (const auto [tile, cost] : {Choice{64, 34}, Choice{32, 20}, Choice{16, 13}}) {
-        const auto blocks = static_cast<std::int64_t>(value_heads) * (kStateDim / tile);
-        const auto waves  = (blocks + multiprocessor_count - 1) / multiprocessor_count;
-        const auto work   = waves * cost;
-        if (work < best_work) {
-            best      = tile;
-            best_work = work;
-        }
-    }
-    return best;
-}
-
-void launch_chunk_recurrence(const Arguments& args, const Chunk* workspace,
-                             DeviceExecutionView execution) {
-    switch (chunk_value_tile(args.value_heads, execution.multiprocessor_count)) {
+void launch_chunk_recurrence(const Arguments& args, const Chunk* workspace, int value_tile,
+                             cudaStream_t stream) {
+    switch (value_tile) {
     case 64:
-        return launch<64>(args, workspace, execution.stream);
+        return launch<64>(args, workspace, stream);
     case 32:
-        return launch<32>(args, workspace, execution.stream);
+        return launch<32>(args, workspace, stream);
     case 16:
-        return launch<16>(args, workspace, execution.stream);
-    default:
-        return launch<8>(args, workspace, execution.stream);
+        return launch<16>(args, workspace, stream);
+    case 8:
+        return launch<8>(args, workspace, stream);
     }
+    throw std::logic_error("linear attention: invalid recurrence value tile");
 }
 
 } // namespace ninfer::ops::detail::kimi_delta_attention

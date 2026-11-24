@@ -16,6 +16,24 @@ class HttpClientError(RuntimeError):
     pass
 
 
+class _StreamingResponse(http.client.HTTPResponse):
+    def _read_next_chunk_size(self) -> int:
+        # HTTPResponse conflates EOF with a malformed chunk-size line as IncompleteRead.
+        # Keep EOF distinct so a local shutdown cannot hide a protocol error.
+        line = self.fp.readline(http.client._MAXLINE + 1)
+        if len(line) > http.client._MAXLINE:
+            raise http.client.LineTooLong("chunk size")
+        if not line:
+            self._close_conn()
+            raise http.client.IncompleteRead(b"")
+        size = line.split(b";", 1)[0]
+        try:
+            return int(size, 16)
+        except ValueError as error:
+            self._close_conn()
+            raise http.client.HTTPException(f"invalid chunk size: {size!r}") from error
+
+
 @dataclass(frozen=True)
 class HttpResponseHead:
     status: int
@@ -52,6 +70,7 @@ class PreparedExchange:
         headers: Mapping[str, str],
     ) -> None:
         self._connection = connection
+        self._connection.response_class = _StreamingResponse
         self._transport = connection.sock
         if self._transport is None:
             raise HttpClientError("prepared HTTP exchange has no connected transport")
@@ -59,6 +78,7 @@ class PreparedExchange:
         self._lock = threading.Lock()
         self._cancel_requested = False
         self._cancel_ns: int | None = None
+        self._shutdown = False
         self._started = False
         self._finished = False
 
@@ -85,15 +105,16 @@ class PreparedExchange:
                 self._cancel_ns = now
             self._cancel_requested = True
             transport = None if self._finished else self._transport
-        if transport is not None:
-            try:
+            if transport is not None:
                 # HTTPConnection drops its `sock` reference for a will-close response after
                 # getresponse(), while HTTPResponse keeps reading from the same transport.  Keep
                 # and shut down that exact preconnected socket so cancellation wakes either
                 # getresponse() or response.read1().
-                transport.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
+                try:
+                    transport.shutdown(socket.SHUT_RDWR)
+                    self._shutdown = True
+                except OSError:
+                    pass
         return self._cancel_ns
 
     def execute(
@@ -161,10 +182,23 @@ class PreparedExchange:
             with self._lock:
                 cancel_requested = self._cancel_requested
                 cancel_ns = self._cancel_ns
+                shutdown = self._shutdown
             result.cancel_requested = cancel_requested
-            result.cancelled = cancel_requested
+            # Local shutdown can interrupt sending with EPIPE or reading with EOF. Timeouts,
+            # resets, malformed responses and other socket failures remain failures even when
+            # a concurrent caller has also requested cancellation.
+            shutdown_error = (
+                shutdown and cancel_ns is not None and cancel_ns <= result.ended_ns
+                and (
+                    (result.body_sent_ns is None and isinstance(error, BrokenPipeError))
+                    or (response is None and isinstance(error, http.client.RemoteDisconnected))
+                    or (response is not None and isinstance(error, http.client.IncompleteRead))
+                    or isinstance(error, ssl.SSLEOFError)
+                )
+            )
+            result.cancelled = shutdown_error
             result.cancel_ns = cancel_ns
-            if not cancel_requested:
+            if not shutdown_error:
                 result.error = f"{type(error).__name__}: {error}"
         finally:
             if response is not None:

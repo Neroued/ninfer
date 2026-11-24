@@ -4,7 +4,10 @@
 // outside the measured body. Every measured eager launch and every captured graph contains one
 // call to the public context_softmax_attention contract. Production dispatch is opaque here.
 
+#include "common/roofline.h"
 #include "ninfer/ops/softmax_attention.h"
+#include "core/buffer.h"
+#include "../../tools/support/paged_kv_fixture.h"
 
 #include "core/device.h"
 #include "core/paged_kv_cache.h"
@@ -36,9 +39,7 @@ constexpr std::int32_t kQueryHeads = 32;
 constexpr std::int32_t kKvHeads    = 8;
 constexpr float kScale             = 0.08838834764831844055F;
 constexpr ops::AttentionHeadGeometry kGeometry{kHeadDim, kQueryHeads, kKvHeads};
-constexpr std::size_t kFlushBytes   = std::size_t{256} << 20;
-constexpr double kDenseBf16TcTflops = 209.5;
-constexpr double kRtx5090DramGBs    = 1792.0;
+constexpr std::size_t kFlushBytes = std::size_t{256} << 20;
 
 enum class Execution : std::uint8_t { Eager, Graph, Both };
 enum class CacheMode : std::uint8_t { Cold, Warm, Both };
@@ -165,17 +166,20 @@ std::int32_t paged_context(std::int32_t context) {
     return ((std::max(context, 1) + kPagedKVPageSize - 1) / kPagedKVPageSize) * kPagedKVPageSize;
 }
 
-PagedKVBatchLayerView make_context_view(DeviceBuffer& k, DeviceBuffer& v,
-                                        DeviceBuffer& block_tables, std::int32_t context) {
-    const std::int32_t pages = paged_context(context) / kPagedKVPageSize;
-    return {
-        .k_pages      = Tensor(k.p, DType::BF16, {kHeadDim, kPagedKVPageSize, pages, kKvHeads}),
-        .v_pages      = Tensor(v.p, DType::FP16, {kHeadDim, kPagedKVPageSize, pages, kKvHeads}),
-        .block_tables = Tensor(block_tables.p, DType::I32, {pages, 1}),
-        .head_dim     = kHeadDim,
-        .num_kv_heads = kKvHeads,
-        .storage      = KvCacheStorage::BFloat16,
-    };
+KVPageGeometry context_geometry() {
+    return {kPagedKVPageSize,
+            {{DType::BF16, kHeadDim, kKvHeads}, {DType::FP16, kHeadDim, kKvHeads}}};
+}
+
+PagedKVBatchLayerView make_context_view(tool::PackedKVFixture& packed, DeviceBuffer& offsets,
+                                        std::int32_t context) {
+    const auto pages = paged_context(context) / kPagedKVPageSize;
+    const Tensor table(offsets.span(), DType::I64, {pages, 1});
+    return {.k_pages      = packed.plane(0, table),
+            .v_pages      = packed.plane(1, table),
+            .head_dim     = kHeadDim,
+            .num_kv_heads = kKvHeads,
+            .storage      = KvCacheStorage::BFloat16};
 }
 
 std::size_t workspace_capacity(std::int32_t tokens, std::int32_t context) {
@@ -192,47 +196,59 @@ public:
           q_(bench::make_bf16(static_cast<std::size_t>(kHeadDim) * kQueryHeads * tokens, 101U)),
           query_k_(bench::make_bf16(static_cast<std::size_t>(kHeadDim) * kKvHeads * tokens, 103U)),
           query_v_(bench::make_bf16(static_cast<std::size_t>(kHeadDim) * kKvHeads * tokens, 105U)),
-          context_k_(bench::make_bf16(static_cast<std::size_t>(kHeadDim) * paged_context(context) *
-                                          kKvHeads,
-                                      211U, -.25F, .25F)),
-          context_v_(bench::make_bf16(static_cast<std::size_t>(kHeadDim) * paged_context(context) *
-                                          kKvHeads,
-                                      311U, -1.F, 1.F)),
-          block_table_(static_cast<std::size_t>(paged_context(context) / kPagedKVPageSize) *
-                       sizeof(std::int32_t)),
-          context_length_(sizeof(std::int32_t)), valid_(sizeof(std::int32_t)),
-          table_row_(sizeof(std::int32_t)),
+          packed_(bench::device_context().device(), context_geometry(),
+                  paged_context(context) / kPagedKVPageSize),
+          block_table_(ninfer::bench::device_context().device(),
+                       static_cast<std::size_t>(paged_context(context) / kPagedKVPageSize) *
+                           sizeof(std::int64_t)),
+          context_length_(ninfer::bench::device_context().device(), sizeof(std::int32_t)),
+          valid_(ninfer::bench::device_context().device(), sizeof(std::int32_t)),
+          table_row_(ninfer::bench::device_context().device(), sizeof(std::int32_t)),
           output_(bench::make_zeros(static_cast<std::size_t>(kHeadDim) * kQueryHeads * tokens * 2)),
           workspace_bytes_(workspace_capacity(tokens, context)),
-          workspace_(std::max<std::size_t>(workspace_bytes_, 1)),
-          q_tensor_(q_.p, DType::BF16, {kHeadDim, kQueryHeads, tokens, 1}),
-          query_k_tensor_(query_k_.p, DType::BF16, {kHeadDim, kKvHeads, tokens, 1}),
-          query_v_tensor_(query_v_.p, DType::BF16, {kHeadDim, kKvHeads, tokens, 1}),
-          length_tensor_(context_length_.p, DType::I32, {1}),
-          valid_tensor_(valid_.p, DType::I32, {1}),
-          table_row_tensor_(table_row_.p, DType::I32, {1}),
-          output_tensor_(output_.p, DType::BF16, {kHeadDim, kQueryHeads, tokens, 1}),
-          context_view_(make_context_view(context_k_, context_v_, block_table_, context)),
+          workspace_storage_(bench::make_buffer(std::max<std::size_t>(workspace_bytes_, 1))),
+          workspace_(workspace_storage_.span()),
+          q_tensor_(q_.span(), DType::BF16, {kHeadDim, kQueryHeads, tokens, 1}),
+          query_k_tensor_(query_k_.span(), DType::BF16, {kHeadDim, kKvHeads, tokens, 1}),
+          query_v_tensor_(query_v_.span(), DType::BF16, {kHeadDim, kKvHeads, tokens, 1}),
+          length_tensor_(context_length_.span(), DType::I32, {1}),
+          valid_tensor_(valid_.span(), DType::I32, {1}),
+          table_row_tensor_(table_row_.span(), DType::I32, {1}),
+          output_tensor_(output_.span(), DType::BF16, {kHeadDim, kQueryHeads, tokens, 1}),
+          context_view_(make_context_view(packed_, block_table_, context)),
           envelope_{static_cast<std::uint32_t>(context), static_cast<std::uint32_t>(context)} {
-        CUDA_CHECK(
-            cudaMemcpy(context_length_.p, &context_, sizeof(context_), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(valid_.p, &tokens_, sizeof(tokens_), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(context_length_.data(), &context_, sizeof(context_),
+                              cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(valid_.data(), &tokens_, sizeof(tokens_), cudaMemcpyHostToDevice));
         const std::int32_t table_row = 0;
-        CUDA_CHECK(cudaMemcpy(table_row_.p, &table_row, sizeof(table_row), cudaMemcpyHostToDevice));
-        std::vector<std::int32_t> table(
+        CUDA_CHECK(
+            cudaMemcpy(table_row_.data(), &table_row, sizeof(table_row), cudaMemcpyHostToDevice));
+        const auto pages = paged_context(context) / kPagedKVPageSize;
+        auto context_k =
+            bench::make_bf16(static_cast<std::size_t>(kHeadDim) * paged_context(context) * kKvHeads,
+                             211U, -.25F, .25F);
+        auto context_v =
+            bench::make_bf16(static_cast<std::size_t>(kHeadDim) * paged_context(context) * kKvHeads,
+                             311U, -1.F, 1.F);
+        packed_.upload_plane(
+            0, Tensor(context_k.span(), DType::BF16, {kHeadDim, kPagedKVPageSize, pages, kKvHeads}),
+            true);
+        packed_.upload_plane(
+            1, Tensor(context_v.span(), DType::FP16, {kHeadDim, kPagedKVPageSize, pages, kKvHeads}),
+            true);
+        std::vector<std::int64_t> table(
             static_cast<std::size_t>(paged_context(context) / kPagedKVPageSize));
         for (std::int32_t page = 0; page < static_cast<std::int32_t>(table.size()); ++page) {
-            table[static_cast<std::size_t>(page)] = page;
+            table[static_cast<std::size_t>(page)] = packed_.physical_offset(page);
         }
-        CUDA_CHECK(
-            cudaMemcpy(block_table_.p, table.data(), block_table_.bytes, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(block_table_.data(), table.data(), block_table_.size(),
+                              cudaMemcpyHostToDevice));
     }
 
-    void launch(cudaStream_t stream) {
+    void launch(CudaExecutionView cuda) {
         ops::context_softmax_attention(q_tensor_, query_k_tensor_, query_v_tensor_, length_tensor_,
                                        valid_tensor_, table_row_tensor_, kGeometry, kScale,
-                                       context_view_, envelope_, workspace_, output_tensor_,
-                                       stream);
+                                       context_view_, envelope_, workspace_, output_tensor_, cuda);
     }
 
     [[nodiscard]] std::size_t workspace_bytes() const noexcept { return workspace_bytes_; }
@@ -243,15 +259,15 @@ private:
     DeviceBuffer q_;
     DeviceBuffer query_k_;
     DeviceBuffer query_v_;
-    DeviceBuffer context_k_;
-    DeviceBuffer context_v_;
+    tool::PackedKVFixture packed_;
     DeviceBuffer block_table_;
     DeviceBuffer context_length_;
     DeviceBuffer valid_;
     DeviceBuffer table_row_;
     DeviceBuffer output_;
     std::size_t workspace_bytes_;
-    WorkspaceArena workspace_;
+    DeviceBuffer workspace_storage_;
+    MemoryArena workspace_;
     Tensor q_tensor_;
     Tensor query_k_tensor_;
     Tensor query_v_tensor_;
@@ -280,16 +296,16 @@ double useful_flops(std::int32_t tokens, std::int32_t context) {
 
 bench::ColdTiming measure(Case& data, Execution execution, CacheState cache,
                           bench::TimedGraph* graph, bench::L2FlushBuffer& flush,
-                          cudaStream_t stream, int warmup, int repeat) {
+                          CudaExecutionView cuda, int warmup, int repeat) {
     if (execution == Execution::Eager) {
-        const auto launch = [&](cudaStream_t launch_stream) { data.launch(launch_stream); };
+        const auto launch = [&](CudaExecutionView cuda) { data.launch(cuda); };
         return cache == CacheState::Cold
-                   ? bench::measure_cold_launch(launch, flush, stream, warmup, repeat)
-                   : bench::measure_launch(launch, stream, warmup, repeat);
+                   ? bench::measure_cold_launch(launch, flush, cuda, warmup, repeat)
+                   : bench::measure_launch(launch, cuda, warmup, repeat);
     }
     return cache == CacheState::Cold
-               ? bench::measure_cold_graph(*graph, flush, stream, warmup, repeat)
-               : bench::measure_graph(*graph, stream, warmup, repeat);
+               ? bench::measure_cold_graph(*graph, flush, cuda, warmup, repeat)
+               : bench::measure_graph(*graph, cuda, warmup, repeat);
 }
 
 void report(const Result& result) {
@@ -298,11 +314,13 @@ void report(const Result& result) {
     const double tflops  = result.useful_flops / seconds / 1.0e12;
     std::printf("entry=context execution=%-5s cache=%-4s T=%2d L=%6d workspace=%8zu "
                 "median=%9.3f us min=%9.3f us p95=%9.3f us useful=%8.1f GB/s "
-                "(%5.1f%% of %.0f) math=%7.2f TFLOP/s (%5.1f%% of %.1f)\n",
+                "(%5.1f%% of %.0f) math=%7.2f TFLOP/s (%5s%% of %s)\n",
                 execution_name(result.execution), cache_name(result.cache), result.tokens,
                 result.context, result.workspace_bytes, result.timing.median_us,
-                result.timing.min_us, result.timing.p95_us, gbps, gbps / kRtx5090DramGBs * 100.0,
-                kRtx5090DramGBs, tflops, tflops / kDenseBf16TcTflops * 100.0, kDenseBf16TcTflops);
+                result.timing.min_us, result.timing.p95_us, gbps,
+                gbps / bench::kRoofline.memory_gbs * 100.0, bench::kRoofline.memory_gbs, tflops,
+                bench::format_metric(tflops / bench::kRoofline.bf16_f32_tflops * 100.0, 1).c_str(),
+                bench::format_metric(bench::kRoofline.bf16_f32_tflops, 1).c_str());
 }
 
 void write_csv(const Options& options, const std::vector<Result>& results) {
@@ -322,21 +340,23 @@ void write_csv(const Options& options, const std::vector<Result>& results) {
     }
 }
 
-void profile(Case& data, const Options& options, bench::L2FlushBuffer& flush, cudaStream_t stream) {
+void profile(Case& data, const Options& options, bench::L2FlushBuffer& flush,
+             CudaExecutionView cuda) {
+    const auto stream         = cuda.stream();
     const Execution execution = options.execution;
     const CacheState cache = options.cache == CacheMode::Cold ? CacheState::Cold : CacheState::Warm;
     bench::TimedGraph graph;
     if (execution == Execution::Graph) {
-        data.launch(stream);
+        data.launch(cuda);
         CUDA_CHECK(cudaStreamSynchronize(stream));
-        graph.capture(stream, [&](cudaStream_t launch_stream) { data.launch(launch_stream); });
-        for (int index = 0; index < options.warmup; ++index) { graph.launch(stream); }
+        graph.capture(cuda, [&](CudaExecutionView cuda) { data.launch(cuda); });
+        for (int index = 0; index < options.warmup; ++index) { graph.launch(cuda); }
     } else {
-        for (int index = 0; index < options.warmup; ++index) { data.launch(stream); }
+        for (int index = 0; index < options.warmup; ++index) { data.launch(cuda); }
     }
     CUDA_CHECK(cudaStreamSynchronize(stream));
     if (cache == CacheState::Cold) {
-        bench::flush_l2(flush, stream);
+        bench::flush_l2(flush, cuda);
         CUDA_CHECK(cudaStreamSynchronize(stream));
     }
 
@@ -345,9 +365,9 @@ void profile(Case& data, const Options& options, bench::L2FlushBuffer& flush, cu
     std::fflush(stdout);
     CUDA_CHECK(cudaProfilerStart());
     if (execution == Execution::Graph)
-        graph.launch(stream);
+        graph.launch(cuda);
     else
-        data.launch(stream);
+        data.launch(cuda);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     CUDA_CHECK(cudaProfilerStop());
 }
@@ -364,11 +384,12 @@ int main(int argc, char** argv) {
         const Options options = parse_options(argc, argv);
         cudaStream_t stream   = nullptr;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        const auto cuda = ninfer::bench::device_context().execution_view(stream);
         bench::L2FlushBuffer flush(kFlushBytes);
 
         if (options.profile) {
             Case data(options.tokens.front(), options.contexts.front());
-            profile(data, options, flush, stream);
+            profile(data, options, flush, cuda);
             CUDA_CHECK(cudaStreamDestroy(stream));
             return 0;
         }
@@ -379,10 +400,9 @@ int main(int argc, char** argv) {
                 Case data(tokens, context);
                 bench::TimedGraph graph;
                 if (options.execution != Execution::Eager) {
-                    data.launch(stream);
+                    data.launch(cuda);
                     CUDA_CHECK(cudaStreamSynchronize(stream));
-                    graph.capture(stream,
-                                  [&](cudaStream_t launch_stream) { data.launch(launch_stream); });
+                    graph.capture(cuda, [&](CudaExecutionView cuda) { data.launch(cuda); });
                 }
                 for (const Execution execution : {Execution::Eager, Execution::Graph}) {
                     if ((options.execution == Execution::Eager && execution != Execution::Eager) ||
@@ -401,7 +421,7 @@ int main(int argc, char** argv) {
                                       data.workspace_bytes(),
                                       useful_bytes(tokens, context),
                                       useful_flops(tokens, context),
-                                      measure(data, execution, cache, &graph, flush, stream,
+                                      measure(data, execution, cache, &graph, flush, cuda,
                                               options.warmup, options.repeat)};
                         report(result);
                         results.push_back(result);

@@ -1,10 +1,4 @@
-#include "runtime/engine/model_instance.h"
-
-#include "core/device.h"
-#include "runtime/engine/context_cache/context_cost.h"
-#include "runtime/engine/kv_capacity.h"
-
-#include <cuda_runtime.h>
+#include "round_fixture.h"
 
 #include <algorithm>
 #include <array>
@@ -13,19 +7,16 @@
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
-#include <limits>
 #include <numeric>
-#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
-#include <variant>
 #include <vector>
 
 namespace {
 
-namespace qwen = ninfer::models::qwen3_5;
+namespace q35 = ninfer::models::qwen3_5;
 
 struct Options {
     std::filesystem::path artifact = "out/qwen3_6_27b.ninfer";
@@ -91,28 +82,7 @@ Options parse_options(int argc, char** argv) {
     return options;
 }
 
-struct RoundMeasurement {
-    float milliseconds            = 0.0F;
-    std::uint32_t licensed_tokens = 0;
-};
-
-RoundMeasurement measure_round(qwen::Program& program, ninfer::DeviceContext& device,
-                               qwen::SequenceHandle sequence, std::uint32_t draft_tokens) {
-    const std::array<qwen::SequenceHandle, 1> sequences{sequence};
-    const std::array<ninfer::runtime::RoundBudget, 1> budgets{
-        ninfer::runtime::RoundBudget{.generated_tokens_remaining = draft_tokens + 1}};
-    ninfer::CudaEventTimer timer(device);
-    timer.start();
-    auto pending                 = program.decode(sequences, budgets);
-    const std::uint32_t licensed = pending.row_counts().empty()
-                                       ? 1U
-                                       : static_cast<std::uint32_t>(pending.row_counts().front());
-    const std::array<ninfer::runtime::CommitDecision, 1> decisions{
-        ninfer::runtime::CommitDecision{.accepted_tokens = licensed}};
-    (void)program.commit(std::move(pending), decisions);
-    const float milliseconds = timer.stop_ms();
-    return RoundMeasurement{.milliseconds = milliseconds, .licensed_tokens = licensed};
-}
+using RoundMeasurement = ninfer::bench::qwen3_5::RoundMeasurement;
 
 int run(const Options& options) {
     if (!std::filesystem::exists(options.artifact)) {
@@ -124,94 +94,51 @@ int run(const Options& options) {
     const std::uint32_t measured_rounds =
         static_cast<std::uint32_t>(options.warmup + options.repetitions);
     ninfer::EngineOptions engine;
-    engine.artifact_path       = options.artifact;
-    engine.device              = options.device;
-    engine.max_context         = static_cast<std::uint32_t>(seed.size() + 64ULL +
-                                                            static_cast<std::uint64_t>(measured_rounds) *
-                                                                (options.draft_tokens + 1ULL) +
-                                                            2ULL * options.draft_tokens);
-    engine.kv_capacity         = ninfer::KvCapacityPolicy::explicit_capacity(engine.max_context);
-    engine.prefill_chunk       = 128;
-    engine.kv_cache            = ninfer::KvCacheStorage::BFloat16;
-    engine.speculative.backend = ninfer::SpeculativeBackend::Mtp;
+    engine.artifact_path             = options.artifact;
+    engine.device                    = options.device;
+    engine.max_context               = static_cast<std::uint32_t>(seed.size() + 64ULL +
+                                                                  static_cast<std::uint64_t>(measured_rounds) *
+                                                                      (options.draft_tokens + 1ULL) +
+                                                                  2ULL * options.draft_tokens);
+    engine.prefill_chunk             = 128;
+    engine.kv_cache                  = ninfer::KvCacheStorage::BFloat16;
+    engine.speculative.backend       = ninfer::SpeculativeBackend::Mtp;
     engine.speculative.draft_tokens  = options.draft_tokens;
     engine.speculative.proposal_head = options.proposal;
     engine.use_cuda_graph            = options.use_cuda_graph;
 
-    engine = ninfer::runtime::normalize_engine_options(std::move(engine));
-    ninfer::DeviceContext device(options.device);
-    auto constructed = ninfer::runtime::construct_model(engine, device);
-    auto& frontend   = constructed.instance->frontend;
-    auto& program    = constructed.instance->program;
-    auto prompt      = frontend.prepare_tokens(seed, false);
-    ninfer::runtime::ResolvedExecutionOptions execution;
-    execution.requested_output_tokens = 1 + measured_rounds * (options.draft_tokens + 1);
-    execution.allow_prefix_reuse      = false;
-    auto request_base                 = program->plan_request(prompt, execution);
-    auto request_plan = program->inspect_admission(prompt, request_base, ninfer::runtime::LaneId{0},
-                                                   nullptr, nullptr, std::nullopt, false);
-    if (!request_plan) { throw std::runtime_error("benchmark root admission was rejected"); }
-    auto resource_plan = program->seal_identity(*request_plan, prompt, {});
-    if (!resource_plan) { throw std::runtime_error("benchmark root resources were not sealed"); }
-    const auto reserved =
-        program->start_resource_transaction(std::move(*resource_plan), std::move(prompt), {});
-    if (reserved != ninfer::runtime::ContextTransactionReserveStatus::Reserved) {
-        throw std::runtime_error("benchmark root materialization was not reserved");
-    }
-    std::optional<qwen::MaterializationResult> published;
-    for (;;) {
-        auto transaction = program->progress_context_transaction({});
-        if (std::holds_alternative<ninfer::runtime::ContextTransactionInProgress>(transaction)) {
-            continue;
-        }
-        if (!std::holds_alternative<qwen::MaterializationResult>(transaction)) {
-            program->finalize_context_transaction();
-            throw std::runtime_error("benchmark root returned the wrong transaction result");
-        }
-        published.emplace(std::get<qwen::MaterializationResult>(std::move(transaction)));
-        break;
-    }
-    if (published->status != ninfer::runtime::ContextTransactionStatus::Published ||
-        !published->published) {
-        program->finalize_context_transaction();
-        throw std::runtime_error("benchmark root materialization was not published");
-    }
-    auto started = std::move(*published->published);
-    program->finalize_context_transaction();
-    auto progress = program->advance_prefill(started.sequence);
-    if (!progress.complete || !progress.pending || progress.pending->tokens().size() != 1) {
-        throw std::runtime_error("benchmark seed prefill did not complete in one scheduling unit");
-    }
-    const std::array<ninfer::runtime::CommitDecision, 1> begin_decision{
-        ninfer::runtime::CommitDecision{.accepted_tokens = 1}};
-    (void)program->commit(std::move(*progress.pending), begin_decision);
-    const auto active_sequence = started.sequence;
+    engine           = ninfer::runtime::normalize_engine_options(std::move(engine));
+    auto constructed = ninfer::runtime::construct_model(engine);
+    auto& instance =
+        *std::get<std::unique_ptr<ninfer::bench::qwen3_5::Instance>>(constructed.instance);
+    ninfer::bench::qwen3_5::RoundFixture fixture(instance);
+    const auto active_sequence = fixture.bind(seed, ninfer::runtime::LaneId{0},
+                                              1 + measured_rounds * (options.draft_tokens + 1));
+    const std::array<q35::SequenceHandle, 1> active_sequences{active_sequence};
 
     constexpr std::uint64_t rounds_before = 0;
     for (int iteration = 0; iteration < options.warmup; ++iteration) {
-        (void)measure_round(*program, device, active_sequence, options.draft_tokens);
+        (void)fixture.measure(active_sequences, options.draft_tokens);
     }
 
     std::vector<RoundMeasurement> measurements;
     measurements.reserve(static_cast<std::size_t>(options.repetitions));
     for (int iteration = 0; iteration < options.repetitions; ++iteration) {
-        measurements.push_back(
-            measure_round(*program, device, active_sequence, options.draft_tokens));
+        measurements.push_back(fixture.measure(active_sequences, options.draft_tokens));
     }
-    const auto aborted = program->abort(active_sequence);
-    if (aborted.status != ninfer::runtime::ConsumeStatus::Consumed) {
-        throw std::runtime_error("benchmark could not release its active sequence");
-    }
+    const auto aborted                   = fixture.release(active_sequence);
     const ninfer::SpeculativeStats stats = aborted.speculative;
     if (stats.rounds - rounds_before != measured_rounds || stats.fallback_steps != 0) {
         throw std::runtime_error("benchmark did not stay on the native MTP proposal/verify path");
     }
 
-    std::vector<float> milliseconds;
+    std::vector<double> milliseconds;
+    double host_call_ms = 0;
     milliseconds.reserve(measurements.size());
     std::uint64_t licensed_tokens = 0;
     for (const RoundMeasurement& measurement : measurements) {
-        milliseconds.push_back(measurement.milliseconds);
+        milliseconds.push_back(measurement.wall_ms);
+        host_call_ms += measurement.host_call_ms;
         licensed_tokens += measurement.licensed_tokens;
     }
     const double mean_ms =
@@ -220,9 +147,9 @@ int run(const Options& options) {
     const double mean_licensed =
         static_cast<double>(licensed_tokens) / static_cast<double>(measurements.size());
 
-    std::cout << "format,ninfer_qwen3_5_mtp_round_bench_v2\n";
+    std::cout << "format,ninfer_qwen3_5_mtp_round_bench_v3\n";
     std::cout << "artifact," << options.artifact.string() << '\n';
-    std::cout << "device," << device.props.name << '\n';
+    std::cout << "device," << ninfer::bench::qwen3_5::device_name(options.device) << '\n';
     std::cout << "draft_tokens," << options.draft_tokens << '\n';
     std::cout << "proposal_head,"
               << (options.proposal == ninfer::ProposalHead::Optimized ? "optimized" : "full")
@@ -230,9 +157,10 @@ int run(const Options& options) {
     std::cout << "cuda_graph," << (options.use_cuda_graph ? "true" : "false") << '\n';
     std::cout << "warmup," << options.warmup << '\n';
     std::cout << "repetitions," << options.repetitions << '\n';
-    std::cout << "mtp_round_mean_ms," << mean_ms << '\n';
-    std::cout << "mtp_round_min_ms," << *minimum << '\n';
-    std::cout << "mtp_round_max_ms," << *maximum << '\n';
+    std::cout << "mtp_round_wall_mean_ms," << mean_ms << '\n';
+    std::cout << "mtp_round_wall_min_ms," << *minimum << '\n';
+    std::cout << "mtp_round_wall_max_ms," << *maximum << '\n';
+    std::cout << "mtp_round_host_call_mean_ms," << host_call_ms / measurements.size() << '\n';
     std::cout << "mean_licensed_tokens," << mean_licensed << '\n';
     std::cout << "accepted_draft_tokens," << stats.accepted_tokens << '\n';
     return 0;

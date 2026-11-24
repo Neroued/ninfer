@@ -2,11 +2,9 @@
 
 #include "artifact/framing.h"
 
-#include <algorithm>
 #include <bit>
-#include <cmath>
-#include <cstring>
 #include <limits>
+#include <utility>
 
 namespace ninfer::artifact {
 
@@ -29,20 +27,19 @@ std::vector<std::int32_t> HostValues::integers() const {
     return out;
 }
 
-Binder::Binder(const Reader& reader)
-    : reader_(reader), demands_(reader.directory().objects.size()) {}
+Binder::Binder(const Reader& reader) : reader_(reader) {}
 
-ParameterReference Binder::parameter(std::string_view name, Shape shape, Residency residency,
+ParameterReference Binder::parameter(std::string_view name, Shape shape,
                                      std::optional<QType> exact_format) {
     const auto found = reader_.directory().bindings.find(name);
     if (found == reader_.directory().bindings.end()) {
         throw ArtifactError("missing logical parameter " + std::string(name));
     }
-    return binding(std::string(name), found->second, std::move(shape), residency, exact_format);
+    return binding(std::string(name), found->second, std::move(shape), exact_format);
 }
 
 ParameterReference Binder::binding(std::string name, const Binding& binding, Shape shape,
-                                   Residency residency, std::optional<QType> exact_format) {
+                                   std::optional<QType> exact_format) {
     if (weight_element_count(shape) != binding.elements ||
         (binding.whole_object &&
          reader_.directory().tensor(binding.parts.at(0).object).shape != shape)) {
@@ -54,13 +51,8 @@ ParameterReference Binder::binding(std::string name, const Binding& binding, Sha
             throw ArtifactError(name +
                                 ": representation does not match its mathematical value type");
         }
-        if (residency == Residency::Device) {
-            require_device(part.object);
-        } else if (residency == Residency::Host) {
-            (void)host_object(part.object);
-        }
     }
-    return {std::move(name), std::move(shape), binding, residency};
+    return {std::move(name), std::move(shape), binding};
 }
 
 const Use& Binder::use(std::string_view parameter, std::string_view input) const {
@@ -75,25 +67,18 @@ bool Binder::contains(std::string_view parameter) const {
     return reader_.directory().bindings.contains(parameter);
 }
 
-void Binder::require_device(ObjectHandle object, std::uint64_t alignment) {
-    const auto& geometry = reader_.geometry(object);
-    if (!alignment || (alignment & (alignment - 1))) {
-        throw ArtifactError("device alignment must be a power of two");
-    }
-    auto& demand     = demands_.at(object.index);
-    demand.device    = true;
-    demand.alignment = std::max({demand.alignment, alignment, geometry.alignment});
-}
-
-std::span<const std::byte> Binder::host_object(ObjectHandle object) {
+std::span<const std::byte> Binder::resource_bytes(ObjectHandle object) {
     reader_.validate_object(object);
-    auto& demand = demands_.at(object.index);
-    if (!demand.host) {
-        demand.host_data = reader_.read_object(object);
-        read_bytes_      = checked_add(read_bytes_, demand.host_data.size(), "Host read bytes");
-        demand.host      = true;
+    if (std::holds_alternative<TensorObject>(reader_.directory().object(object))) {
+        throw ArtifactError("tensor storage belongs to materialization, not prepared resources");
     }
-    return demand.host_data;
+    for (const auto& resource : resources_) {
+        if (resource.object == object) { return resource.data; }
+    }
+    auto bytes  = reader_.read_object(object);
+    read_bytes_ = checked_add(read_bytes_, bytes.size(), "resource read bytes");
+    resources_.push_back({object, std::move(bytes)});
+    return resources_.back().data;
 }
 
 ObjectHandle Binder::resource(std::string_view component, std::string_view role) {
@@ -102,7 +87,7 @@ ObjectHandle Binder::resource(std::string_view component, std::string_view role)
     if (found == resources.end()) {
         throw ArtifactError(std::string(component) + ": missing resource " + std::string(role));
     }
-    (void)host_object(found->second);
+    (void)resource_bytes(found->second);
     return found->second;
 }
 
@@ -137,14 +122,9 @@ HostValues Binder::values(const Binding& binding, std::optional<QType> format) {
         }
         const auto source = checked_mul(part.begin, word_bytes, "value offset");
         auto target = std::span(out.data).subspan(destination, static_cast<std::size_t>(bytes));
-        const auto& cached = demands_[part.object.index];
-        if (cached.host) {
-            std::memcpy(target.data(), cached.host_data.data() + source, target.size());
-        } else {
-            const auto& object = reader_.directory().tensor(part.object);
-            reader_.read_into(checked_add(object.offset, source, "value file offset"), target);
-            read_bytes_ = checked_add(read_bytes_, bytes, "Host read bytes");
-        }
+        const auto& object = reader_.directory().tensor(part.object);
+        reader_.read_into(checked_add(object.offset, source, "value file offset"), target);
+        read_bytes_ = checked_add(read_bytes_, bytes, "Host read bytes");
         destination += target.size();
     }
     if (destination != out.data.size()) {
@@ -154,27 +134,13 @@ HostValues Binder::values(const Binding& binding, std::optional<QType> format) {
     return out;
 }
 
-MaterializationPlan Binder::finish() && {
-    MaterializationPlan plan;
-    plan.source            = &reader_;
-    plan.object_count      = demands_.size();
-    plan.prior_read_bytes  = read_bytes_;
-    plan.owned_value_bytes = owned_value_bytes_;
-    for (std::size_t i = 0; i < demands_.size(); ++i) {
-        auto& demand = demands_[i];
-        if (demand.device) {
-            const ObjectHandle handle{i};
-            const auto& geometry = reader_.geometry(handle);
-            const auto offset =
-                align_up(plan.device_capacity_bytes, demand.alignment, "device offset");
-            plan.device_objects.push_back({handle, offset, geometry.bytes, demand.alignment});
-            plan.device_capacity_bytes = checked_add(offset, geometry.bytes, "device capacity");
-        }
-        if (demand.host) {
-            plan.host_objects.push_back({ObjectHandle{i}, std::move(demand.host_data)});
-        }
-    }
-    return plan;
+PreparedResources Binder::finish() && {
+    PreparedResources out;
+    out.source            = &reader_;
+    out.objects           = std::move(resources_);
+    out.read_bytes        = read_bytes_;
+    out.owned_value_bytes = owned_value_bytes_;
+    return out;
 }
 
 } // namespace ninfer::artifact

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "cuda_fixture.h"
+#include "core/buffer.h"
 #include "core/weight.h"
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
@@ -45,11 +47,12 @@ inline std::vector<float> make_bf16_activation(std::int32_t rows, std::int32_t t
 class DevicePackedWeight {
 public:
     explicit DevicePackedWeight(quantized_weight::PackedWeight packed)
-        : host(std::move(packed)), device(host.payload.size()) {
+        : host(std::move(packed)),
+          device(ninfer::test::cuda_environment().context.device(), host.payload.size()) {
         device.copy_from_host(host.payload.data(), host.payload.size());
     }
 
-    Weight view() const { return host.device_weight(device.p); }
+    Weight view() const { return host.device_weight(device.span()); }
 
     int verify_preserved(std::string_view label) const {
         std::vector<std::uint8_t> after(host.payload.size());
@@ -76,7 +79,11 @@ public:
 
     const void* data() const { return storage_.data(); }
 
-    Tensor tensor() { return Tensor(data(), DType::BF16, {rows_, tokens_}); }
+    MemorySpan span() { return storage_.span(); }
+
+    ConstMemorySpan span() const { return storage_.span(); }
+
+    Tensor tensor() { return Tensor(storage_.span(), DType::BF16, {rows_, tokens_}); }
 
     void copy_from_bits(std::span<const std::uint16_t> values) {
         if (values.size_bytes() != payload_bytes_) {
@@ -194,6 +201,14 @@ inline int verify_preserved(std::string_view label, const DeviceBuffer& device,
     const std::vector<std::int32_t> after = from_device<std::int32_t>(device, before.size());
     if (std::equal(after.begin(), after.end(), before.begin(), before.end())) { return 0; }
     std::cerr << label << ": I32 input was modified\n";
+    return 1;
+}
+
+inline int verify_preserved(std::string_view label, const DeviceBuffer& device,
+                            std::span<const std::int64_t> before) {
+    const auto after = from_device<std::int64_t>(device, before.size());
+    if (std::equal(after.begin(), after.end(), before.begin(), before.end())) { return 0; }
+    std::cerr << label << ": I64 input was modified\n";
     return 1;
 }
 

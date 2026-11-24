@@ -50,7 +50,7 @@ std::string data_media_type(std::string_view value) {
 }
 
 OwnedMedia acquire_media(const Json& part, MediaKind kind, std::size_t message_index,
-                         std::size_t part_index) {
+                         std::size_t part_index, const std::filesystem::path& media_root) {
     std::string value = media_value(part, kind);
     std::string media_type;
     if (part.contains("media_type") && part.at("media_type").is_string()) {
@@ -71,6 +71,8 @@ OwnedMedia acquire_media(const Json& part, MediaKind kind, std::size_t message_i
     } else {
         source.kind = media_acquire::SourceKind::Path;
         if (value.starts_with("file://")) { value.erase(0, 7); }
+        const std::filesystem::path path(value);
+        if (path.is_relative()) value = (media_root / path).lexically_normal().string();
     }
     source.value = value;
 
@@ -89,7 +91,8 @@ OwnedMedia acquire_media(const Json& part, MediaKind kind, std::size_t message_i
 }
 
 std::vector<MessagePart> parse_content(const Json& content, std::size_t message_index,
-                                       bool vision_enabled) {
+                                       bool vision_enabled,
+                                       const std::filesystem::path& media_root) {
     if (content.is_null()) { return {}; }
     if (content.is_string()) {
         MessagePart part;
@@ -122,14 +125,14 @@ std::vector<MessagePart> parse_content(const Json& content, std::size_t message_
                 throw std::invalid_argument("Vision is disabled for this Engine");
             }
             part.kind  = MessagePartKind::Media;
-            part.media = acquire_media(item, MediaKind::Image, message_index, i);
+            part.media = acquire_media(item, MediaKind::Image, message_index, i, media_root);
         } else if (type == "video" || type == "video_url" || item.contains("video") ||
                    item.contains("video_url")) {
             if (!vision_enabled) {
                 throw std::invalid_argument("Vision is disabled for this Engine");
             }
             part.kind  = MessagePartKind::Media;
-            part.media = acquire_media(item, MediaKind::Video, message_index, i);
+            part.media = acquire_media(item, MediaKind::Video, message_index, i, media_root);
         } else {
             throw std::invalid_argument("message " + std::to_string(message_index) +
                                         " has unsupported content part type: " + type);
@@ -175,7 +178,8 @@ std::vector<ToolCall> parse_tool_calls(const Json& value, std::size_t message_in
     return result;
 }
 
-ChatMessage parse_message(const Json& item, std::size_t index, bool vision_enabled) {
+ChatMessage parse_message(const Json& item, std::size_t index, bool vision_enabled,
+                          const std::filesystem::path& media_root) {
     if (!item.is_object() || !item.contains("role") || !item.contains("content")) {
         throw std::invalid_argument("message " + std::to_string(index) +
                                     " must be an object containing role and content");
@@ -183,7 +187,7 @@ ChatMessage parse_message(const Json& item, std::size_t index, bool vision_enabl
     for (auto field = item.begin(); field != item.end(); ++field) {
         if (field.key() != "role" && field.key() != "content" &&
             field.key() != "reasoning_content" && field.key() != "tool_calls" &&
-            field.key() != "tool_call_id") {
+            field.key() != "tool_call_id" && field.key() != "tool_result_is_error") {
             throw std::invalid_argument("message " + std::to_string(index) +
                                         " contains unsupported field: " + field.key());
         }
@@ -194,7 +198,7 @@ ChatMessage parse_message(const Json& item, std::size_t index, bool vision_enabl
 
     ChatMessage message;
     message.role  = parse_chat_role(item.at("role").get_ref<const std::string&>());
-    message.parts = parse_content(item.at("content"), index, vision_enabled);
+    message.parts = parse_content(item.at("content"), index, vision_enabled, media_root);
 
     if (item.contains("reasoning_content")) {
         if (!item.at("reasoning_content").is_string()) {
@@ -213,6 +217,12 @@ ChatMessage parse_message(const Json& item, std::size_t index, bool vision_enabl
             throw std::invalid_argument("tool_call_id must be a string on a tool message");
         }
         message.tool_call_id = item.at("tool_call_id").get<std::string>();
+    }
+    if (item.contains("tool_result_is_error")) {
+        if (message.role != ChatRole::Tool || !item.at("tool_result_is_error").is_boolean()) {
+            throw std::invalid_argument("tool_result_is_error must be a boolean on a tool message");
+        }
+        message.tool_result_is_error = item.at("tool_result_is_error").get<bool>();
     }
     if (message.parts.empty() && message.tool_calls.empty()) {
         throw std::invalid_argument("message " + std::to_string(index) + " has empty content");
@@ -267,8 +277,9 @@ PromptInput prompt_from_messages(const std::filesystem::path& path,
         throw std::invalid_argument("messages JSON must be a non-empty array");
     }
     input.messages.reserve(root.size());
+    const auto media_root = std::filesystem::absolute(path).parent_path();
     for (std::size_t i = 0; i < root.size(); ++i) {
-        input.messages.push_back(parse_message(root.at(i), i, vision_enabled));
+        input.messages.push_back(parse_message(root.at(i), i, vision_enabled, media_root));
     }
     return input;
 }

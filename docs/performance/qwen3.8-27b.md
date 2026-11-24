@@ -1,5 +1,9 @@
 # Qwen3.8-27B serving performance
 
+This page records a historical campaign. Numbers, cache representations and commands describe
+that campaign's engine revision. For current builds and startup flags, use the
+[deployment examples](../../examples/configs/) and [startup reference](../startup-configuration.md).
+
 [Performance index](../performance.md) · [Measurement and publication rules](methodology.md)
 
 On this page: [run records](#scope-and-run-records), [context profile](#no-speculation-context-profile),

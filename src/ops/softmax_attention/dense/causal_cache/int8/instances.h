@@ -1,6 +1,6 @@
 #pragma once
 
-#include "ops/softmax_attention/dense/causal_cache/int8/schedule.cuh"
+#include "ops/softmax_attention/kernels/causal/int8/schedule.cuh"
 
 namespace ninfer::ops::detail {
 

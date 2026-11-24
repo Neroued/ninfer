@@ -1,10 +1,12 @@
 // Cold-cache public Op benchmark for the registered row-scaled FP8 LinearSwiGLU profile.
 
+#include "common/roofline.h"
 #include "core/weight.h"
+#include "core/buffer.h"
 #include "ninfer/ops/linear_swiglu.h"
 
 #include "core/device.h"
-#include "ninfer_bench_common.h"
+#include "op_measurement.cuh"
 #include "quantized_weight.cuh"
 
 #include <cuda_profiler_api.h>
@@ -25,11 +27,10 @@ using namespace ninfer;
 
 namespace {
 
-constexpr std::int32_t kGateUpRows        = 34816;
-constexpr std::int32_t kOutputRows        = 17408;
-constexpr std::int32_t kHidden            = 5120;
-constexpr std::size_t kFlushBytes         = 256ULL << 20;
-constexpr double kMxFp8Fp32AccumulatePeak = 838.0;
+constexpr std::int32_t kGateUpRows = 34816;
+constexpr std::int32_t kOutputRows = 17408;
+constexpr std::int32_t kHidden     = 5120;
+constexpr std::size_t kFlushBytes  = 256ULL << 20;
 
 struct Options {
     ops::LinearPolicy policy = ops::LinearPolicy::AllowA8;
@@ -38,25 +39,6 @@ struct Options {
     int repeat   = 30;
     bool profile = false;
 };
-
-std::vector<std::int32_t> parse_tokens(std::string_view raw) {
-    std::vector<std::int32_t> result;
-    std::size_t begin = 0;
-    while (begin < raw.size()) {
-        const std::size_t end = raw.find(',', begin);
-        const std::string token(
-            raw.substr(begin, end == std::string_view::npos ? raw.size() - begin : end - begin));
-        const long value = std::stol(token);
-        if (value <= 0 || value > std::numeric_limits<std::int32_t>::max()) {
-            throw std::invalid_argument("--t-sweep values must be positive int32");
-        }
-        result.push_back(static_cast<std::int32_t>(value));
-        if (end == std::string_view::npos) { break; }
-        begin = end + 1;
-    }
-    if (result.empty()) { throw std::invalid_argument("--t-sweep must not be empty"); }
-    return result;
-}
 
 Options parse_options(int argc, char** argv) {
     Options options;
@@ -76,11 +58,11 @@ Options parse_options(int argc, char** argv) {
                 throw std::invalid_argument("--policy must be a16 or a8");
             }
         } else if (argument == "--t-sweep") {
-            options.tokens = parse_tokens(next("--t-sweep value"));
+            options.tokens = bench::measurement::integers(next("--t-sweep value"));
         } else if (argument == "--warmup") {
-            options.warmup = std::stoi(std::string(next("--warmup value")));
+            options.warmup = bench::measurement::integer(next("--warmup value"), 0);
         } else if (argument == "--repeat") {
-            options.repeat = std::stoi(std::string(next("--repeat value")));
+            options.repeat = bench::measurement::integer(next("--repeat value"));
         } else if (argument == "--profile") {
             options.profile = true;
         } else if (argument == "--help" || argument == "-h") {
@@ -117,56 +99,61 @@ int main(int argc, char** argv) {
 
         cudaStream_t stream = nullptr;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        const auto cuda = ninfer::bench::device_context().execution_view(stream);
         bench::L2FlushBuffer flush(kFlushBytes);
         DeviceBuffer input = bench::make_bf16(static_cast<std::size_t>(kHidden) * max_t, 101U);
-        DeviceBuffer output(static_cast<std::size_t>(kOutputRows) * max_t * sizeof(std::uint16_t));
+        DeviceBuffer output(ninfer::bench::device_context().device(),
+                            static_cast<std::size_t>(kOutputRows) * max_t * sizeof(std::uint16_t));
         bench::PackedQuantizedWeight packed  = bench::make_fp8_weight(kGateUpRows, kHidden);
         const std::size_t workspace_capacity = ops::linear_swiglu_workspace_capacity_bytes(
             QType::FP8_E4M3FN_ROW_BF16, kGateUpRows, kHidden, options.policy, min_t, max_t);
-        WorkspaceArena workspace(std::max<std::size_t>(workspace_capacity, 256));
+        ninfer::DeviceBuffer workspace_storage(ninfer::bench::device_context().device(),
+                                               std::max<std::size_t>(workspace_capacity, 256));
+        MemoryArena workspace(workspace_storage.span());
 
-        const auto launch = [&](std::int32_t tokens, cudaStream_t launch_stream) {
-            Tensor x(input.p, DType::BF16, {kHidden, tokens});
-            Tensor out(output.p, DType::BF16, {kOutputRows, tokens});
-            ops::linear_swiglu(x, packed.weight, out, options.policy, workspace, launch_stream);
+        const auto launch = [&](std::int32_t tokens, CudaExecutionView cuda) {
+            Tensor x(input.span(), DType::BF16, {kHidden, tokens});
+            Tensor out(output.span(), DType::BF16, {kOutputRows, tokens});
+            ops::linear_swiglu(x, packed.weight, out, options.policy, workspace, cuda);
         };
 
         if (options.profile) {
             const std::int32_t tokens = options.tokens.front();
             for (int iteration = 0; iteration < options.warmup; ++iteration) {
-                bench::flush_l2(flush, stream);
-                launch(tokens, stream);
+                bench::flush_l2(flush, cuda);
+                launch(tokens, cuda);
             }
             CUDA_CHECK(cudaStreamSynchronize(stream));
-            bench::flush_l2(flush, stream);
+            bench::flush_l2(flush, cuda);
             CUDA_CHECK(cudaStreamSynchronize(stream));
             std::printf("PROFILE linear_swiglu weight_type=FP8 policy=%s T=%d\n",
                         policy_name(options.policy), tokens);
             std::fflush(stdout);
             CUDA_CHECK(cudaProfilerStart());
-            launch(tokens, stream);
+            launch(tokens, cuda);
             CUDA_CHECK(cudaStreamSynchronize(stream));
             CUDA_CHECK(cudaProfilerStop());
             CUDA_CHECK(cudaStreamDestroy(stream));
             return 0;
         }
 
-        std::printf("# mxfp8_fp32_accumulate_peak_tflops=%.1f cache=cold\n",
-                    kMxFp8Fp32AccumulatePeak);
+        std::printf("# mxfp8_fp32_accumulate_peak_tflops=%s cache=cold\n",
+                    bench::format_metric(bench::kRoofline.mxfp8_f32_tflops, 1).c_str());
         std::printf("%-4s %6s %11s %11s %11s %10s %10s %8s\n", "pol", "T", "median_us", "min_us",
                     "p95_us", "eff_GB/s", "TFLOP/s", "TC_%");
         for (const std::int32_t tokens : options.tokens) {
-            const auto timing = bench::measure_cold_launch(
-                [&](cudaStream_t launch_stream) { launch(tokens, launch_stream); }, flush, stream,
-                options.warmup, options.repeat);
+            const auto timing =
+                bench::measure_cold_launch([&](CudaExecutionView cuda) { launch(tokens, cuda); },
+                                           flush, cuda, options.warmup, options.repeat);
             const double seconds = timing.median_us * 1.0e-6;
             const double flops   = 2.0 * static_cast<double>(kGateUpRows) * kHidden * tokens;
             const double bytes   = static_cast<double>(packed.model_weight_bytes()) +
                                  2.0 * static_cast<double>(kHidden + kOutputRows) * tokens;
             const double tflops     = flops / seconds / 1.0e12;
             const bool tensor_route = options.policy == ops::LinearPolicy::AllowA8 && tokens >= 5;
-            const double tensor_percent = tensor_route ? 100.0 * tflops / kMxFp8Fp32AccumulatePeak
-                                                       : std::numeric_limits<double>::quiet_NaN();
+            const double tensor_percent = tensor_route
+                                              ? 100.0 * tflops / bench::kRoofline.mxfp8_f32_tflops
+                                              : std::numeric_limits<double>::quiet_NaN();
             if (std::isfinite(tensor_percent)) {
                 std::printf("%-4s %6d %11.3f %11.3f %11.3f %10.1f %10.2f %8.2f\n",
                             policy_name(options.policy), tokens, timing.median_us, timing.min_us,

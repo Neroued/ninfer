@@ -1,93 +1,58 @@
 #pragma once
 
-#include "core/layout.h"
-#include "core/tensor.h"
-
-#include <cuda_runtime_api.h>
-
-#include <cstddef>
-#include <cstdint>
-#include <vector>
+#include "core/state_image.h"
 
 namespace ninfer {
 
-struct LinearAttentionStatePoolSpec {
+struct LinearAttentionStateSpec {
     std::uint32_t layers        = 0;
     std::int32_t conv_channels  = 0;
     std::int32_t conv_width     = 0;
     std::int32_t value_heads    = 0;
     std::int32_t value_head_dim = 0;
     std::int32_t key_head_dim   = 0;
-    std::int32_t slot_count     = 1;
     DType conv_dtype            = DType::BF16;
 };
 
-struct LinearAttentionStatePoolLayout {
-    LinearAttentionStatePoolSpec spec;
-    std::vector<LayoutRegion> conv;
-    std::vector<LayoutRegion> recurrent;
+struct LinearAttentionStateLayout {
+    LinearAttentionStateSpec spec;
+    StateField conv;
+    StateField recurrent;
 };
 
 struct LinearAttentionStateAllLayersView {
-    Tensor conv_layer0;
-    Tensor recurrent_layer0;
-    std::int64_t conv_layer_stride_bytes      = 0;
-    std::int64_t recurrent_layer_stride_bytes = 0;
-    LinearAttentionStatePoolSpec spec;
+    StateFieldView conv;
+    StateFieldView recurrent;
+    LinearAttentionStateSpec spec;
 };
 
 struct LinearAttentionStateLayerView {
-    Tensor conv;
-    Tensor recurrent;
+    StateFieldView conv;
+    StateFieldView recurrent;
 };
 
-struct LinearAttentionStateSlotView {
-    Tensor conv_layer0;
-    Tensor recurrent_layer0;
-    std::size_t conv_layer_bytes               = 0;
-    std::size_t recurrent_layer_bytes          = 0;
-    std::ptrdiff_t conv_layer_pitch_bytes      = 0;
-    std::ptrdiff_t recurrent_layer_pitch_bytes = 0;
-    std::uint32_t layers                       = 0;
-};
+[[nodiscard]] LinearAttentionStateLayout
+plan_linear_attention_state(StateImageBuilder& builder, const LinearAttentionStateSpec& spec);
 
-[[nodiscard]] LinearAttentionStatePoolLayout
-plan_linear_attention_state_pool(LayoutBuilder& builder, const LinearAttentionStatePoolSpec& spec);
-
-/**
- * Fixed-capacity physical storage for model-level Linear Attention state images.
- *
- * One logical slot selects the same frontier across every layer's convolution and recurrent
- * component. The pool owns no slot roles, validity, request metadata, allocation policy, or CUDA
- * stream. Construction binds caller-owned backing without mutating it.
- */
-class LinearAttentionStatePool {
+class LinearAttentionStateView {
 public:
-    LinearAttentionStatePool(DeviceSpan backing, const LinearAttentionStatePoolLayout& layout);
+    LinearAttentionStateView(const StateImageStorage& storage,
+                             const LinearAttentionStateLayout& layout);
 
-    LinearAttentionStatePool(const LinearAttentionStatePool&)            = delete;
-    LinearAttentionStatePool& operator=(const LinearAttentionStatePool&) = delete;
-    LinearAttentionStatePool(LinearAttentionStatePool&&)                 = delete;
-    LinearAttentionStatePool& operator=(LinearAttentionStatePool&&)      = delete;
+    [[nodiscard]] const LinearAttentionStateSpec& spec() const noexcept { return view_.spec; }
 
-    [[nodiscard]] const LinearAttentionStatePoolSpec& spec() const noexcept { return spec_; }
+    [[nodiscard]] std::uint32_t layer_count() const noexcept { return view_.spec.layers; }
 
-    [[nodiscard]] std::uint32_t layer_count() const noexcept;
-    [[nodiscard]] std::int32_t slot_count() const noexcept;
-    [[nodiscard]] LinearAttentionStateLayerView layer_view(std::uint32_t layer) const;
-    [[nodiscard]] LinearAttentionStateSlotView slot_view(std::int32_t slot) const;
-    [[nodiscard]] LinearAttentionStateAllLayersView all_layers_view() const;
-    [[nodiscard]] Tensor conv_slot(std::uint32_t layer, std::int32_t slot) const;
-    [[nodiscard]] Tensor recurrent_slot(std::uint32_t layer, std::int32_t slot) const;
+    [[nodiscard]] LinearAttentionStateLayerView layer_view(std::uint32_t layer,
+                                                           const Tensor& byte_offsets) const;
+    [[nodiscard]] LinearAttentionStateAllLayersView
+    all_layers_view(const Tensor& byte_offsets = {}) const;
 
-    void copy_slot(std::int32_t src, std::int32_t dst, cudaStream_t stream = nullptr);
-    void zero_slot(std::int32_t slot, cudaStream_t stream = nullptr);
-    void zero_all(cudaStream_t stream = nullptr);
+    [[nodiscard]] Tensor conv_tensor(std::uint32_t layer, std::int64_t byte_offset) const;
+    [[nodiscard]] Tensor recurrent_tensor(std::uint32_t layer, std::int64_t byte_offset) const;
 
 private:
-    std::vector<Tensor> conv_;
-    std::vector<Tensor> recurrent_;
-    LinearAttentionStatePoolSpec spec_;
+    LinearAttentionStateAllLayersView view_;
 };
 
 } // namespace ninfer

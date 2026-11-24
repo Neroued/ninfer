@@ -1,259 +1,76 @@
 # Tests
 
-The retained tests protect current `.ninfer`, numerical operator, model, runtime-transaction,
-benchmark-report, and external protocol behavior. Repository verification principles are defined in
-[`../AGENTS.md`](../AGENTS.md); Op contract and CUDA implementation guidance is in
-[`../docs/maintainer/op-development.md`](../docs/maintainer/op-development.md).
+测试保护公开行为、数学、状态和生命周期。具体 Op 的数值方法见
+[Op 开发](../docs/maintainer/op-development.md#数值验证)，跨模块所有权见
+[Engine 架构](../docs/maintainer/engine-architecture.md)。
 
-## Organization
+## 组织
 
-- `artifact/` — v3 framing, directory/binding records, codecs, sharding, selected-object
-  materialization and Python-writer/C++-reader interoperability;
-- `convert/` — source interpretation, Qwen logical mapping, recipe overrides/sharing, optional
-  components, resources, proposals and numerical conversion methods;
-- `models/qwen3_5/` — config/binding, frontend, state/context stores, workspace, MTP alignment and
-  opt-in real Engine integration;
-- `ops/` — semantic Op qualification with independent mathematical or state-transition oracles;
-  Linear and fused Linear suites are separated by their supported weight/activation paths;
-- root C++ tests — core storage, runtime admission/resource policy, public API, serving protocols,
-  logging, benchmark reports and causal-scoring evaluation;
-- `test_serve_corpus.py` — agreement between the serving request-log schema and its measurement
-  consumer.
+测试按可观察风险组织，不镜像每个源文件。Op suite 持有独立参考与有限 case；模型测试检查
+原生计算组合和状态事务；runtime 检查调度、缓存与资源；产品测试检查协议及统计消费者。
+Artifact/converter 检查表示、绑定和跨语言读写。实际注册由各目录 CMake 维护。
 
-Tests are grouped by observable risk, not by mirroring every source file or class.
-`CMakeLists.txt` includes explicit registrations from `cmake/`, `artifact/`, `models/qwen3_5/`
-and `ops/`. Registration helpers live in `cmake/NinferTests.cmake`; included manifests keep
-executables and CTest working directories under `build/tests/`.
-`ops/op_tester.h` and `ops/op_check.h` own only reusable device/guard and comparison mechanics.
-Concrete numerical criteria remain named by the semantic Op suite; there are no cross-Op tolerance
-presets.
+Op case 是一个可复现输入或完整 state/Graph 序列。Case 声明和筛选先于设备初始化及大 fixture；
+相关案例可共享不可变权重。独立 oracle 不按执行 target 拆成不同数学标准。
+真实仅属于某 target 的能力由对应 suite 组织，普通 case 不因调优差异复制。
 
-`ops/quantized_weight.h` is the common packed-weight fixture for Q4/Q5/Q6/Q8, FP8 and NVFP4 Op tests. It
-owns deterministic payload generation, device `Weight` views, row views, and independent logical
-weight decoding.
+共享 guards、上传与比较在 `ops/` 测试支持中；criterion 和参考留在语义 suite。
+Private selector、文件名、launcher 和代码结构不作为验收对象。
 
-## Build and run
+## 构建与筛选
 
-Select a Python environment with the dependencies for the tests first. The maintained environment
-uses Python 3.11; CMake finds Python 3 without restricting its minor version.
-`Python3_EXECUTABLE` selects the interpreter used by interop and frontend tests explicitly.
+在选定 Python 环境中准备所需测试依赖，使用开发 preset：
 
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON \
-  -DPython3_EXECUTABLE="$(command -v python3)"
-cmake --build build -j
-ctest --test-dir build --output-on-failure
+cmake --preset rtx5090-dev
+cmake --build build/rtx5090-dev -j
+ctest --test-dir build/rtx5090-dev -N
+ctest --test-dir build/rtx5090-dev -R 'ninfer_context_capacity' --output-on-failure
 ```
 
-Alternatively, `cmake --preset dev` enables products, tests and benchmarks together.
-After building, `ctest --preset dev` runs the same CTest suite. See
-[Build system](../docs/maintainer/build-system.md) for local interpreter presets.
+Spark 使用 `dgx-spark-dev`；`*-ops` 注册对应基础与 Op suites。
+Python interpreter 在本地 CMake preset 中显式选择。完整目标与链接规则见
+[构建系统](../docs/maintainer/build-system.md)。
 
-The chat-template reference test uses Python Jinja2.
-
-Run a focused target for a localized change:
+Op runner 支持元数据列举与交集筛选，例如：
 
 ```bash
-cmake --build build --parallel --target ninfer_sampling_test
-ctest --test-dir build -R ninfer_sampling_test --output-on-failure
+./build/rtx5090-dev/tests/ninfer_linear_projection_test --list --format q4
+./build/rtx5090-dev/tests/ninfer_linear_projection_test --format q4 --policy a16
 ```
 
-Enable uniform floating-point error records when establishing or reviewing an Op criterion:
+用 `--help` 查当前 filters，`--case` 选择稳定 case ID；一个 Graph/state 序列整体执行。
+测试默认集合覆盖实际生产风险，不把每次调优扫描变成长驻 case。增加检查应对应可能改变
+结果或破坏状态的边界；不为覆盖计数穷举所有配置组合。
+
+## 真实模型与分布式
+
+真实模型检查使用明确 artifact，按所属入口提供环境变量或参数；不自动下载权重。
+GPU integration tests 串行运行，以免互相争用资源。
+
+- [Qwen3.5](models/qwen3_5/tests.cmake)：加载、生成、MTP/DFlash、前缀与压力恢复。
+- [Qwen4Exp](models/qwen4_exp/tests.cmake)：加载、PLE、原生事务与模型组合。
+- [GLM5Next](models/glm5next/tests.cmake)：资源、Frontend、并行、Main/MTP/Vision 与图执行。
+- [分布式](distributed/)：执行组、消息、全 rank 完成和故障清理。
+
+启用 `NINFER_ENABLE_DISTRIBUTED` 后可运行独立的执行组测试。部署 TOML 使用
+`ninfer.example.toml` 的结构，将 node worker 指向各机对应测试 executable：
 
 ```bash
-NINFER_OP_REPORT_STATS=1 \
-  ctest --test-dir build -V -R '^ninfer_(rmsnorm|softmax_attention)_test$'
+./build/dgx-spark-dev/tests/ninfer_distributed_execution_test --config distributed.local.toml
 ```
 
-Every participating comparison emits one `OP_ERROR_STATS` record containing the stable case label,
-actual error, active limit, and error-to-limit ratio. The switch changes reporting only; the same
-statistics still drive the normal verdict. Passing tests remain quiet without it.
+这个入口使用生产 transport、Executor 与 NCCL，小型 Program 提供独立计算参考；
+它不证明某个真实模型已经正确集成。模型验证通过现有原生检查与公共 Engine/产品入口完成。
 
-`ninfer_softmax_attention_test --causal-only` runs both D256 geometries and all five KV types;
-`--kv-dtype bf16|int8|fp8|nvfp4|k8v4` selects the same complete causal suite for one type.
-The suite covers prefill, decode/spec widths, batched prefixes, cache effects, and Graph replay and
-updates with changing live lengths. Numerical cases include small, unit-RMS and RMS1.8 Q/K inputs.
-The FP64 oracle retains internal Q quantization error; the INT8/FP8 compute budgets account for
-that accepted approximation. The default invocation also runs packed and context attention.
+## 验证边界
 
-Linear tests are independently runnable by weight and activation-compute profile:
+浮点模型的不同合法路线可能产生不同 logits/token；数学正确性由 Op oracle 验证。
+模型检查关注组合、前沿、采用前缀、缓存内容、取消和资源寿命，不以输出看似正常替代这些事实。
 
-```bash
-cmake --build build --parallel --target \
-  ninfer_linear_q4_a16_test ninfer_linear_q5_a16_test \
-  ninfer_linear_q6_a16_test ninfer_linear_q8_a16_test
-ctest --test-dir build -R '^ninfer_linear_(q4|q5|q6|q8)_a16_test$' --output-on-failure
-```
+Prefix reuse 不保证任意负载序列后都命中。缓存测试需固定来源、保留资格与资源前提，
+然后检查仍可恢复的内容；不能通过改变 prompt 或增加预热追求断言通过。
 
-All Linear files use `ops/linear/linear_test_common.{h,cpp}` and the same
-`ops/quantized_weight.h` fixture as the fused projection tests. The fixture produces the complete
-packed GPU payload and exact-decodes the logical float rows used by the one
-`cpu_linear_gemm_fp64()` reference. The reference performs naive double accumulation and never
-reproduces a production route's activation quantization, staging, reduction tree, or BF16 output
-rounding. Each activation compute path selects one centrally defined comparison tolerance for its
-whole suite; private kernel, schedule, launcher, and T selection do not change it. Individual test
-files call public `linear()` and contain no private selector, launcher, schedule, or kernel
-assertions.
-
-The Linear, LinearAdd and LinearSwiGLU common `.cpp` implementations each compile once into a
-test support library. Both those libraries and the Op test executables receive the oracle's
-`-fno-fast-math` and `-ffp-contract=off` options on GNU/Clang C++ compilers.
-
-Run the native Python suites with the project Python environment:
-
-```bash
-python3 -m pytest \
-  tests/artifact tests/convert \
-  tests/test_serve_corpus.py
-```
-
-The Python suites exercise conversion and encoded output, without running model inference.
-The maintained environment uses Python 3.11 with the dependencies for those suites. C++ binding and Engine tests
-cover consumption of their resulting representation.
-
-The real loading test accepts an explicit artifact path and optional component selection:
-
-```bash
-./build/tests/ninfer_qwen3_5_loading_real_test \
-  --artifact out/qwen3_6_27b.ninfer --vision --speculative mtp --proposal optimized
-```
-
-Add `--host-only` to check semantic binding without uploading weights. This does not construct a
-Program or establish native Op support.
-
-The C++ prefix/MTP integration test is separately opt-in because it loads the full artifact and
-runs the real engine:
-
-```bash
-NINFER_TEST_ARTIFACT=$PWD/out/qwen3_6_27b.ninfer \
-  ctest --test-dir build -R ninfer_qwen3_5_prefix_real_test --output-on-failure
-```
-
-The causal-scoring integration test uses the same artifact variable and checks a full 1,024-column
-score tile, overlapping target suffixes, and repeated-window State/KV isolation:
-
-```bash
-NINFER_TEST_ARTIFACT=$PWD/out/qwen3_8_27b_nvfp4.ninfer \
-  ctest --test-dir build -R ninfer_qwen3_5_score_real_test --output-on-failure
-```
-
-Run the 35B-A3B MoE route independently:
-
-```bash
-NINFER_TEST_ARTIFACT=$PWD/out/qwen3_6_35b_a3b.ninfer \
-  ctest --test-dir build -R ninfer_qwen3_5_moe_real_test --output-on-failure
-```
-
-Without `NINFER_TEST_ARTIFACT`, CTest marks these real Engine tests as skipped. Run GPU integration
-tests serially. `NINFER_PREFIX_REAL_SCENARIO` selects a focused prefix scenario such as `vision`,
-`pressure-resume` or `concurrent`; the default is `all`. These integration checks
-use behavior and state accounting rather than another numerical path's generated tokens as a golden.
-
-The `attention` scenario checks the selected KV type, chunked prefill, concurrent Graph decode
-across a resource tier, prefix continuation, and workspace bounds:
-
-```bash
-NINFER_TEST_ARTIFACT=$PWD/out/qwen3_6_27b.ninfer \
-NINFER_PREFIX_REAL_SCENARIO=attention NINFER_TEST_KV_DTYPE=fp8 \
-NINFER_TEST_SPECULATIVE=mtp NINFER_TEST_BATCH=2 \
-  ./build/tests/ninfer_qwen3_5_prefix_real_test
-```
-
-KV choices are `bf16`, `int8`, `fp8`, `nvfp4`, and `k8v4`; backend choices are `none`, `mtp`,
-`dflash`, and `dflash2`, requiring an artifact with the selected component. Batch defaults to 2;
-`NINFER_TEST_DRAFT_TOKENS` overrides the default MTP3 or DFlash7 block. The DFlash2-specific
-integration executable also accepts all five KV names as its fifth positional argument and rejects
-unknown names.
-
-The capability-evaluation coordinator has its own environment and unittest entry point:
-
-```bash
-PYTHONPATH=eval eval/.venv/bin/python -m unittest discover \
-  -s eval/tests -p 'test_*.py'
-```
-
-Run the serving contract manually after starting a resident server in another terminal:
-
-```bash
-./build/apps/ninfer-serve out/qwen3_6_27b.ninfer \
-  --host 127.0.0.1 --port 18080
-```
-
-```bash
-python3 -m tools.smoke.serve_contract \
-  --base-url http://127.0.0.1:18080 --model qwen3.6-27b
-```
-
-This smoke check is intentionally not a CTest: it needs the real artifact, a supported GPU, and a
-server process that remains alive while the client exercises OpenAI Responses/Chat, Anthropic,
-state, streaming, and multimodal requests.
-
-The thinking-preservation fixture starts and stops its own server, submits a fixed two-step tool
-history, compares stripped and preserved closed-turn prompt lengths, and verifies compatible
-prefix reuse, speculative execution, frontier bounds and Responses inheritance:
-
-```bash
-python3 tools/smoke/serve_thinking_preservation.py \
-  --artifact out/qwen3_6_27b.ninfer --backend mtp
-
-python3 tools/smoke/serve_thinking_preservation.py \
-  --artifact out/qwen3_6_35b_a3b.ninfer --backend dflash
-```
-
-The shared messages are in
-[`fixtures/serve/qwen3_6_thinking_preservation.json`](fixtures/serve/qwen3_6_thinking_preservation.json).
-
-## What belongs here
-
-A permanent test should protect one current risk, such as:
-
-- exact artifact bytes, geometry, object binding, or conversion transform;
-- a numerical operator contract with an independent oracle;
-- model Frontend or Program frontier, prefix, MTP, or multimodal behavior;
-- generated-token commit/stop/cancel consistency;
-- public benchmark or OpenAI/Anthropic observable behavior;
-- a reproduced supported bug.
-
-Performance-only assertions belong in benchmarks and profiler review. Source scans,
-implementation-shape assertions, trivial getters/configuration, retired command surfaces, and
-broad additions without a concrete regression risk do not belong in the permanent suite.
-
-## DFlash2 Engine integration
-
-The DFlash prefill regression checks actual KV contents after a StateImage fork and a conflicting
-decode binding, including shortened chunks and oversized local/full KV appends. It uses native
-Program storage and the production prefill route; select the draft component stored in the artifact:
-
-```bash
-cmake --build build -j --target ninfer_qwen3_5_dflash_prefill_real_test
-NINFER_TEST_ARTIFACT=out/qwen3_8_27b_nvfp4.ninfer \
-  build/tests/ninfer_qwen3_5_dflash_prefill_real_test dflash2
-NINFER_TEST_ARTIFACT=out/qwen3_6_35b_a3b.ninfer \
-  build/tests/ninfer_qwen3_5_dflash_prefill_real_test dflash
-```
-
-The Engine test uses an artifact containing DFlash2 and checks output budgets, speculative activity,
-forced thinking-control append, penalty-enabled sampling, compact batches with unequal budgets,
-same-route same-seed replay, retained/fresh prefix behavior and absence of a full backend KV pool.
-A shared DFlash/DFlash2 fixture starts decode at token 63, verifies across the page boundary, stops
-after one target column at token 64, and checks the exact retained frontier and subsequent generation
-with and without reuse.
-The KV Store test checks exact mapping and reservation accounting for the same transition.
-K>=7 also exercises a stop inside a licensed block; K=15 additionally checks oversized prefill,
-local ring wrap, and the logical context-capacity tail. Optional Vision runs image/video capture
-and prefix restore. Zero extra Device StateImage slots exercise Host snapshot/restore.
-
-```bash
-cmake --build build -j --target ninfer_qwen3_5_dflash2_real_test
-NINFER_TEST_ARTIFACT=out/qwen3_8_27b.ninfer \
-  build/tests/ninfer_qwen3_5_dflash2_real_test 15 1 1 8
-NINFER_TEST_ARTIFACT=out/qwen3_8_27b.ninfer \
-  build/tests/ninfer_qwen3_5_dflash2_real_test 7 1 0 2 bf16 1 0
-NINFER_TEST_ARTIFACT=out/qwen3_8_27b_nvfp4.ninfer \
-  build/tests/ninfer_qwen3_5_dflash2_real_test 2 0 0 2 int8
-```
-
-Arguments are K, Graph enabled, optimized head enabled, maximum B, target KV (`bf16` or `int8`),
-Vision enabled, and extra Device StateImage slots. Defaults are `15 1 1 8 bf16 0 3`. Run GPU
-integration tests serially. The individual Op suites remain the numerical/state-transition oracle;
-the fixed Engine fixture does not define bit parity across arbitrary floating-point routes.
+失败注入仅在相关测试 executable 内使用现有 interpose 支持，生产代码不增加测试 hook。
+性能只由相应 benchmark/产品测量证明；确定性工作量检查可防算法复杂度回退，不能替代时延测量。
+临时实验和日志使用 `.agent-tmp/<task>/`。

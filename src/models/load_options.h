@@ -14,10 +14,6 @@ struct LoadOptions {
 
     bool operator==(const LoadOptions&) const = default;
 
-    [[nodiscard]] bool speculative_enabled() const noexcept {
-        return speculative != SpeculativeBackend::None;
-    }
-
     [[nodiscard]] bool mtp() const noexcept { return speculative == SpeculativeBackend::Mtp; }
 
     [[nodiscard]] bool dflash() const noexcept { return speculative == SpeculativeBackend::DFlash; }

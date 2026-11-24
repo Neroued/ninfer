@@ -4,7 +4,7 @@
 // by operational_log.* and never consumes these serialized records.
 
 #include "serve/request_events.h"
-#include "serve/serve_options.h"
+#include "product/config/options.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -20,7 +20,7 @@ class logger;
 
 namespace ninfer::serve {
 
-inline constexpr int kRequestLogSchemaVersion        = 21;
+inline constexpr int kRequestLogSchemaVersion        = 31;
 inline constexpr const char* kRequestLogArtifactType = "ninfer_serve_request_log";
 
 struct ServerLogEnvironment {
@@ -37,15 +37,24 @@ struct ServerLogEnvironment {
 
 // Pure JSON formatters are public to repository tests. Each return value is one complete JSON
 // object without a trailing newline.
+std::string format_startup_config_json(const std::string& server_instance_id,
+                                       std::uint64_t timestamp_unix_ms,
+                                       const product::ServeOptions& options);
 std::string format_server_start_json(
     const std::string& server_instance_id, std::uint64_t timestamp_unix_ms,
-    const ServeOptions& options, const ninfer::EngineOptions& engine_options,
+    const product::ServeOptions& options, const ninfer::EngineOptions& engine_options,
     const ninfer::ModelSamplingDefaults& sampling_defaults, const std::string& public_model_id,
-    const ninfer::LoadSummary& load, const ninfer::MemorySummary& memory,
-    const ServerLogEnvironment& environment, std::optional<std::uint64_t> artifact_size_bytes);
+    const EngineDescription& description, const StartupReport& startup,
+    const EngineSnapshot& snapshot, const ServerLogEnvironment& environment,
+    std::optional<std::uint64_t> artifact_size_bytes);
 std::string format_request_start_json(const std::string& server_instance_id,
                                       std::uint64_t timestamp_unix_ms,
                                       const RequestLogContext& context);
+std::string
+format_request_scheduling_json(const std::string& server_instance_id,
+                               std::uint64_t timestamp_unix_ms, std::uint64_t request_id,
+                               const std::string& http_request_id,
+                               const ninfer::GenerationSchedulingObservation& observation);
 std::string format_request_rejected_json(const std::string& server_instance_id,
                                          std::uint64_t timestamp_unix_ms,
                                          const RequestRejectionLogContext& context);
@@ -78,12 +87,16 @@ public:
         return server_instance_id_;
     }
 
-    void write_server_start(const ServeOptions& options,
+    void write_startup_config(const product::ServeOptions& options);
+    void write_server_start(const product::ServeOptions& options,
                             const ninfer::EngineOptions& engine_options,
                             const ninfer::ModelSamplingDefaults& sampling_defaults,
-                            const std::string& public_model_id, const ninfer::LoadSummary& load,
-                            const ninfer::MemorySummary& memory);
+                            const std::string& public_model_id,
+                            const EngineDescription& description, const StartupReport& startup,
+                            const EngineSnapshot& snapshot);
     void write_request_start(const RequestLogContext& context);
+    void write_request_scheduling(std::uint64_t request_id, const std::string& http_request_id,
+                                  const ninfer::GenerationSchedulingObservation& observation);
     void write_request_rejected(const RequestRejectionLogContext& context);
     void write_request_done(const RequestLogContext& context, const GenerationOutcome& outcome);
     void write_request_error(const RequestLogContext& context, const std::string& message);

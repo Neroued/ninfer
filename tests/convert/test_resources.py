@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from tools.convert.resources import load_resources, token_domain
+from tools.convert.resources import TEXT_RESOURCES, load_resources, token_domain
 
 
 def test_final_resources_override_defaults_without_hash_pinning(tmp_path):
@@ -26,6 +26,7 @@ def test_final_resources_override_defaults_without_hash_pinning(tmp_path):
     references, payloads, count, special = load_resources(
         tmp_path,
         vocab_size=4,
+        roles={"text": TEXT_RESOURCES},
         overrides={"tokenizer.json": selected, "chat_template.jinja": template},
     )
     assert count == 3 and special == (2,)

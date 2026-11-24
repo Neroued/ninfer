@@ -1,6 +1,7 @@
 #include "ninfer/ops/sliding_window_attention.h"
 
 #include "core/layout.h"
+#include "ops/common/host/operands.h"
 #include "ops/softmax_attention/sliding_window/launch.h"
 
 #include <algorithm>
@@ -30,26 +31,12 @@ void require_profile(AttentionHeadGeometry geometry, std::uint32_t window, const
     }
 }
 
-void require_shape(const Tensor& tensor, std::int32_t n0, std::int32_t n1, std::int32_t n2,
-                   std::int32_t n3, const char* op, const char* name) {
-    if (tensor.ne[0] != n0 || tensor.ne[1] != n1 || tensor.ne[2] != n2 || tensor.ne[3] != n3) {
-        throw std::invalid_argument(std::string(op) + ": invalid shape for " + name);
-    }
-}
-
-void require_contiguous_nonnull(const Tensor& tensor, const char* op, const char* name) {
-    if (!tensor.is_contiguous()) {
-        throw std::invalid_argument(std::string(op) + ": " + name + " must be contiguous");
-    }
-    if (tensor.data == nullptr) {
-        throw std::invalid_argument(std::string(op) + ": " + name + " data must be non-null");
-    }
-}
-
-void validate_context(const CyclicKVCacheLayerView& context, std::uint32_t window, const char* op) {
+void validate_context(const ConstCyclicKVCacheLayerView& context, std::uint32_t window,
+                      const char* op, Device device) {
+    common::operand::device(context.device(), device, op, "cache");
     if (context.num_kv_heads != kKVHeads || context.head_dim != kHeadDim ||
         context.capacity != window || context.padded_capacity < context.capacity ||
-        context.lane_capacity <= 0) {
+        context.k.field.layers != 1 || context.v.field.layers != 1) {
         throw std::invalid_argument(std::string(op) + ": invalid cyclic context");
     }
     if (context.padded_capacity >
@@ -57,13 +44,10 @@ void validate_context(const CyclicKVCacheLayerView& context, std::uint32_t windo
         throw std::overflow_error(std::string(op) + ": padded capacity exceeds int32");
     }
     const auto padded = static_cast<std::int32_t>(context.padded_capacity);
-    if (context.k.dtype != DType::BF16 || context.v.dtype != DType::FP16) {
-        throw std::invalid_argument(std::string(op) + ": context K/V must be BF16/FP16");
-    }
-    require_shape(context.k, kHeadDim, padded, kKVHeads, context.lane_capacity, op, "context k");
-    require_shape(context.v, kHeadDim, padded, kKVHeads, context.lane_capacity, op, "context v");
-    require_contiguous_nonnull(context.k, op, "context k");
-    require_contiguous_nonnull(context.v, op, "context v");
+    common::operand::state_field(context.k, DType::BF16, {kHeadDim, padded, kKVHeads}, 16, op,
+                                 "context K", device);
+    common::operand::state_field(context.v, DType::FP16, {kHeadDim, padded, kKVHeads}, 16, op,
+                                 "context V", device);
 }
 
 struct PartialWorkspace {
@@ -101,7 +85,7 @@ std::size_t sliding_window_attention_workspace_capacity_bytes(
     std::size_t capacity = 0;
     for (int tokens = min_tokens; tokens <= max_tokens; ++tokens) {
         const auto plan =
-            detail::sliding_window_attention_resolve_plan(window, tokens, batch_size, envelope);
+            detail::select_sliding_window_attention_plan(window, tokens, batch_size, envelope);
         if (plan.route == detail::SlidingWindowAttentionRoute::Direct) continue;
         WorkspaceLayoutBuilder layout;
         (void)allocate_workspace(layout, tokens, plan.split_capacity, batch_size);
@@ -112,21 +96,24 @@ std::size_t sliding_window_attention_workspace_capacity_bytes(
 
 void sliding_window_attention(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
                               const Tensor& positions, const Tensor& valid_columns,
-                              const Tensor& lanes, AttentionHeadGeometry geometry,
-                              std::uint32_t window, float scale,
-                              const CyclicKVCacheLayerView& context,
+                              AttentionHeadGeometry geometry, std::uint32_t window, float scale,
+                              const ConstCyclicKVCacheLayerView& context,
                               SlidingWindowAttentionExecutionEnvelope envelope,
-                              WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
+                              MemoryArena& workspace, Tensor& out, CudaExecutionView execution) {
+    if (workspace.device() != execution.device()) {
+        throw std::invalid_argument(
+            "sliding_window_attention: workspace belongs to another device");
+    }
+    const auto stream        = execution.stream();
     constexpr const char* op = "sliding_window_attention";
     require_profile(geometry, window, op);
     if (q.dtype != DType::BF16 || query_k.dtype != DType::BF16 || query_v.dtype != DType::BF16 ||
         out.dtype != DType::BF16) {
         throw std::invalid_argument("sliding_window_attention: q/k/v/out must be BF16");
     }
-    if (positions.dtype != DType::I32 || valid_columns.dtype != DType::I32 ||
-        lanes.dtype != DType::I32) {
+    if (positions.dtype != DType::I32 || valid_columns.dtype != DType::I32) {
         throw std::invalid_argument(
-            "sliding_window_attention: positions/valid_columns/lanes must be I32");
+            "sliding_window_attention: positions/valid_columns must be I32");
     }
     const std::int32_t tokens = q.ne[2];
     const std::int32_t batch  = q.ne[3];
@@ -136,21 +123,21 @@ void sliding_window_attention(const Tensor& q, const Tensor& query_k, const Tens
     if (batch < 1 || batch > 8) {
         throw std::invalid_argument("sliding_window_attention: B must be 1..8");
     }
-    require_shape(q, kHeadDim, kQHeads, tokens, batch, op, "q");
-    require_shape(query_k, kHeadDim, kKVHeads, tokens, batch, op, "query k");
-    require_shape(query_v, kHeadDim, kKVHeads, tokens, batch, op, "query v");
-    require_shape(positions, tokens, batch, 1, 1, op, "positions");
-    require_shape(valid_columns, batch, 1, 1, 1, op, "valid columns");
-    require_shape(lanes, batch, 1, 1, 1, op, "lanes");
-    require_shape(out, kHeadDim, kQHeads, tokens, batch, op, "out");
-    require_contiguous_nonnull(q, op, "q");
-    require_contiguous_nonnull(query_k, op, "query k");
-    require_contiguous_nonnull(query_v, op, "query v");
-    require_contiguous_nonnull(positions, op, "positions");
-    require_contiguous_nonnull(valid_columns, op, "valid columns");
-    require_contiguous_nonnull(lanes, op, "lanes");
-    require_contiguous_nonnull(out, op, "out");
-    validate_context(context, window, op);
+    common::operand::shape(q, {kHeadDim, kQHeads, tokens, batch}, op, "q");
+    common::operand::shape(query_k, {kHeadDim, kKVHeads, tokens, batch}, op, "query k");
+    common::operand::shape(query_v, {kHeadDim, kKVHeads, tokens, batch}, op, "query v");
+    common::operand::shape(positions, {tokens, batch, 1, 1}, op, "positions");
+    common::operand::shape(valid_columns, {batch, 1, 1, 1}, op, "valid columns");
+    common::operand::shape(out, {kHeadDim, kQHeads, tokens, batch}, op, "out");
+    common::operand::contiguous_nonnull(q, op, "q", execution.device());
+    common::operand::contiguous_nonnull(query_k, op, "query k", execution.device());
+    common::operand::contiguous_nonnull(query_v, op, "query v", execution.device());
+    common::operand::contiguous_nonnull(positions, op, "positions", execution.device());
+    common::operand::contiguous_nonnull(valid_columns, op, "valid columns", execution.device());
+    common::operand::contiguous_nonnull(out, op, "out", execution.device());
+    validate_context(context, window, op, execution.device());
+    common::operand::shape(context.k.records.byte_offsets, {batch, 1, 1, 1}, op, "K offsets");
+    common::operand::shape(context.v.records.byte_offsets, {batch, 1, 1, 1}, op, "V offsets");
     if (envelope.min_context > envelope.max_context ||
         envelope.max_context >
             static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
@@ -160,16 +147,15 @@ void sliding_window_attention(const Tensor& q, const Tensor& query_k, const Tens
         throw std::invalid_argument("sliding_window_attention: scale must be 1/sqrt(128)");
     }
 
-    auto scope = workspace.scope();
-    const auto plan =
-        detail::sliding_window_attention_resolve_plan(window, tokens, batch, envelope);
+    auto scope      = workspace.scope();
+    const auto plan = detail::select_sliding_window_attention_plan(window, tokens, batch, envelope);
     PartialWorkspace partial{};
     if (plan.route == detail::SlidingWindowAttentionRoute::SplitKv) {
         partial = allocate_workspace(workspace, tokens, plan.split_capacity, batch);
     }
-    detail::sliding_window_attention_launch(q, query_k, query_v, positions, valid_columns, lanes,
-                                            scale, context, plan, partial.acc, partial.m, partial.l,
-                                            out, stream);
+    detail::launch_sliding_window_attention(q, query_k, query_v, positions, valid_columns, scale,
+                                            context, plan, partial.acc, partial.m, partial.l, out,
+                                            stream);
 }
 
 } // namespace ninfer::ops

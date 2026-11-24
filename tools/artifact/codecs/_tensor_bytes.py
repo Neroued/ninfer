@@ -35,7 +35,7 @@ def _payload_tensor(payload: Payload, device: torch.device) -> torch.Tensor:
 
 
 def _exact_uint8_matrix(
-    tensor: torch.Tensor, shape: tuple[int, int], label: str
+    tensor: torch.Tensor, shape: tuple[int, ...], label: str
 ) -> torch.Tensor:
     if tensor.dtype != torch.uint8 or tuple(tensor.shape) != shape:
         raise TypeError(f"{label} must be uint8 with shape {shape}")

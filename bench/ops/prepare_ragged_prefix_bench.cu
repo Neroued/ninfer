@@ -1,5 +1,6 @@
 // Measures one public prepare_ragged_prefix call, including values, positions and counts.
-#include "ninfer/ops/prepare_ragged_prefix.h"
+#include "ninfer/ops/sequence.h"
+#include "core/buffer.h"
 #include "core/device.h"
 #include "ninfer_bench_common.h"
 
@@ -96,17 +97,28 @@ Options parse(int argc, char** argv) {
 }
 
 struct Case {
-    DeviceBuffer source, lanes, starts, ends, output, positions, counts;
+    DeviceBuffer source;
+    DeviceBuffer lanes;
+    DeviceBuffer starts;
+    DeviceBuffer ends;
+    DeviceBuffer output;
+    DeviceBuffer positions;
+    DeviceBuffer counts;
     Tensor x, l, s, e, y, p, n;
     std::size_t live = 0;
 
     Case(int d, int w, int b, const std::string& mode)
-        : source(bench::make_bf16(static_cast<std::size_t>(d) * w * 8, 101U)), lanes(b * 4),
-          starts(b * 4), ends(b * 4), output(static_cast<std::size_t>(d) * w * b * 2),
-          positions(w * b * 4), counts(b * 4), x(source.p, DType::BF16, {d, w, 8}),
-          l(lanes.p, DType::I32, {b}), s(starts.p, DType::I32, {b}), e(ends.p, DType::I32, {b}),
-          y(output.p, DType::BF16, {d, w, b}), p(positions.p, DType::I32, {w, b}),
-          n(counts.p, DType::I32, {b}) {
+        : source(bench::make_bf16(static_cast<std::size_t>(d) * w * 8, 101U)),
+          lanes(ninfer::bench::device_context().device(), b * 4),
+          starts(ninfer::bench::device_context().device(), b * 4),
+          ends(ninfer::bench::device_context().device(), b * 4),
+          output(ninfer::bench::device_context().device(), static_cast<std::size_t>(d) * w * b * 2),
+          positions(ninfer::bench::device_context().device(), w * b * 4),
+          counts(ninfer::bench::device_context().device(), b * 4),
+          x(source.span(), DType::BF16, {d, w, 8}), l(lanes.span(), DType::I32, {b}),
+          s(starts.span(), DType::I32, {b}), e(ends.span(), DType::I32, {b}),
+          y(output.span(), DType::BF16, {d, w, b}), p(positions.span(), DType::I32, {w, b}),
+          n(counts.span(), DType::I32, {b}) {
         constexpr int order[]{7, 0, 4, 2, 6, 1, 5, 3};
         std::vector<int> hl(b), hs(b), he(b);
         for (int i = 0; i < b; ++i) {
@@ -122,12 +134,12 @@ struct Case {
             he[i]           = hs[i] + count;
             live += count;
         }
-        CUDA_CHECK(cudaMemcpy(lanes.p, hl.data(), b * 4, cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(starts.p, hs.data(), b * 4, cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(ends.p, he.data(), b * 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(lanes.data(), hl.data(), b * 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(starts.data(), hs.data(), b * 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(ends.data(), he.data(), b * 4, cudaMemcpyHostToDevice));
     }
 
-    void launch(cudaStream_t stream) { ops::prepare_ragged_prefix(x, l, s, e, y, p, n, stream); }
+    void launch(CudaExecutionView cuda) { ops::prepare_ragged_prefix(x, l, s, e, y, p, n, cuda); }
 };
 } // namespace
 
@@ -137,7 +149,7 @@ int main(int argc, char** argv) {
         int devices     = 0;
         CUDA_CHECK(cudaGetDeviceCount(&devices));
         if (!devices) return 77;
-        DeviceContext device;
+        auto& device = ninfer::bench::device_context();
         bench::L2FlushBuffer flush(std::size_t{256} << 20);
         std::ofstream csv;
         if (!o.csv.empty()) {
@@ -154,42 +166,44 @@ int main(int argc, char** argv) {
                 Case data(o.rows, w, b, o.counts);
                 bench::TimedGraph graph;
                 if (o.execution == "graph") {
-                    data.launch(device.stream);
-                    CUDA_CHECK(cudaStreamSynchronize(device.stream));
-                    graph.capture(device.stream, [&](cudaStream_t stream) {
-                        for (int call = 0; call < o.graph_calls; ++call) data.launch(stream);
+                    data.launch(device.execution_view());
+                    CUDA_CHECK(cudaStreamSynchronize(device.stream()));
+                    graph.capture(device.execution_view(), [&](CudaExecutionView cuda) {
+                        for (int call = 0; call < o.graph_calls; ++call) data.launch(cuda);
                     });
                 }
-                const auto launch = [&](cudaStream_t stream) { data.launch(stream); };
+                const auto launch = [&](CudaExecutionView cuda) { data.launch(cuda); };
                 if (o.profile) {
                     for (int i = 0; i < o.warmup; ++i) {
                         if (o.execution == "graph")
-                            graph.launch(device.stream);
+                            graph.launch(device.execution_view());
                         else
-                            data.launch(device.stream);
+                            data.launch(device.execution_view());
                     }
-                    if (o.cache == "cold") bench::flush_l2(flush, device.stream);
-                    CUDA_CHECK(cudaStreamSynchronize(device.stream));
+                    if (o.cache == "cold") bench::flush_l2(flush, device.execution_view());
+                    CUDA_CHECK(cudaStreamSynchronize(device.stream()));
                     CUDA_CHECK(cudaProfilerStart());
                     if (o.execution == "graph")
-                        graph.launch(device.stream);
+                        graph.launch(device.execution_view());
                     else
-                        data.launch(device.stream);
-                    CUDA_CHECK(cudaStreamSynchronize(device.stream));
+                        data.launch(device.execution_view());
+                    CUDA_CHECK(cudaStreamSynchronize(device.stream()));
                     CUDA_CHECK(cudaProfilerStop());
                     return 0;
                 }
                 bench::ColdTiming time;
                 if (o.execution == "graph")
                     time = o.cache == "cold"
-                               ? bench::measure_cold_graph(graph, flush, device.stream, o.warmup,
-                                                           o.repeat)
-                               : bench::measure_graph(graph, device.stream, o.warmup, o.repeat);
+                               ? bench::measure_cold_graph(graph, flush, device.execution_view(),
+                                                           o.warmup, o.repeat)
+                               : bench::measure_graph(graph, device.execution_view(), o.warmup,
+                                                      o.repeat);
                 else
                     time = o.cache == "cold"
-                               ? bench::measure_cold_launch(launch, flush, device.stream, o.warmup,
-                                                            o.repeat)
-                               : bench::measure_launch(launch, device.stream, o.warmup, o.repeat);
+                               ? bench::measure_cold_launch(launch, flush, device.execution_view(),
+                                                            o.warmup, o.repeat)
+                               : bench::measure_launch(launch, device.execution_view(), o.warmup,
+                                                       o.repeat);
                 time.median_us /= o.graph_calls;
                 time.min_us /= o.graph_calls;
                 time.p95_us /= o.graph_calls;

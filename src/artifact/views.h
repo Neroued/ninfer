@@ -7,6 +7,6 @@
 namespace ninfer::artifact {
 
 [[nodiscard]] WeightView bind_view(const ParameterReference& reference,
-                                   const MaterializedArtifact& materialized);
+                                   const MaterializedArtifact& materialized, Device device);
 
 } // namespace ninfer::artifact

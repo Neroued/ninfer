@@ -27,27 +27,33 @@ std::size_t align_up(std::size_t value, std::size_t alignment, std::string_view 
 
 } // namespace
 
-DeviceSpan LayoutRegion::bind(DeviceSpan backing) const {
+ConstMemorySpan LayoutRegion::bind(ConstMemorySpan backing) const {
+    validate_memory(backing);
     if (backing.data == nullptr) { throw std::invalid_argument("layout backing is null"); }
     if (!is_power_of_two(alignment)) {
         throw std::logic_error("layout region has an invalid alignment");
     }
-    const auto base = reinterpret_cast<std::uintptr_t>(backing.data);
-    if ((base + offset) % alignment != 0) {
-        throw std::invalid_argument("layout backing does not satisfy region alignment");
-    }
     if (offset > backing.bytes || bytes > backing.bytes - offset) {
         throw std::out_of_range("layout region exceeds its backing allocation");
     }
-    return DeviceSpan{static_cast<unsigned char*>(backing.data) + offset, bytes};
+    const auto part = backing.subspan(offset, bytes);
+    if (reinterpret_cast<std::uintptr_t>(part.data) % alignment != 0) {
+        throw std::invalid_argument("layout backing does not satisfy region alignment");
+    }
+    return part;
 }
 
-Tensor TensorRegion::bind(DeviceSpan backing) const {
-    Tensor expected(nullptr, dtype, {shape[0], shape[1], shape[2], shape[3]});
+MemorySpan LayoutRegion::bind(MemorySpan backing) const {
+    const auto part = bind(static_cast<ConstMemorySpan>(backing));
+    return {const_cast<void*>(part.data), part.bytes, part.device, part.host_pinned};
+}
+
+Tensor TensorRegion::bind(MemorySpan backing) const {
+    const auto expected = Tensor::metadata(dtype, {shape[0], shape[1], shape[2], shape[3]});
     if (expected.bytes() != region.bytes) {
         throw std::logic_error("tensor layout has an inconsistent byte size");
     }
-    return Tensor(region.bind(backing).data, dtype, {shape[0], shape[1], shape[2], shape[3]});
+    return Tensor(region.bind(backing), dtype, {shape[0], shape[1], shape[2], shape[3]});
 }
 
 LayoutBuilder::Scope::Scope(LayoutBuilder& builder) noexcept
@@ -72,7 +78,7 @@ LayoutRegion LayoutBuilder::add(std::size_t bytes, std::size_t alignment, std::s
 
 TensorRegion LayoutBuilder::add_tensor(DType dtype, std::initializer_list<std::int32_t> shape,
                                        std::size_t alignment, std::string_view label) {
-    Tensor tensor(nullptr, dtype, shape);
+    const auto tensor = Tensor::metadata(dtype, shape);
     TensorRegion out;
     out.region = add(tensor.bytes(), alignment, label);
     out.dtype  = dtype;
@@ -100,19 +106,19 @@ WorkspaceLayoutBuilder::Scope::Scope(Scope&& other) noexcept
 
 Tensor WorkspaceLayoutBuilder::alloc(DType dtype, std::initializer_list<std::int32_t> shape,
                                      std::size_t alignment) {
-    Tensor tensor(nullptr, dtype, shape);
-    cursor_ = align_up(cursor_, alignment, "workspace layout");
-    cursor_ = checked_add(cursor_, tensor.bytes(), "workspace layout");
+    const auto tensor = Tensor::metadata(dtype, shape);
+    const auto offset = align_up(cursor_, alignment, "workspace layout");
+    cursor_           = checked_add(offset, tensor.bytes(), "workspace layout");
     if (cursor_ > peak_) { peak_ = cursor_; }
     return tensor;
 }
 
-DeviceSpan WorkspaceLayoutBuilder::alloc_bytes(std::size_t bytes, std::size_t alignment) {
+MemorySpan WorkspaceLayoutBuilder::alloc_bytes(std::size_t bytes, std::size_t alignment) {
     if (bytes == 0) { return {}; }
-    cursor_ = align_up(cursor_, alignment, "workspace layout");
-    cursor_ = checked_add(cursor_, bytes, "workspace layout");
+    const auto offset = align_up(cursor_, alignment, "workspace layout");
+    cursor_           = checked_add(offset, bytes, "workspace layout");
     if (cursor_ > peak_) { peak_ = cursor_; }
-    return DeviceSpan{nullptr, bytes};
+    return MemorySpan{nullptr, bytes, Device{}};
 }
 
 WorkspaceLayoutBuilder::Scope WorkspaceLayoutBuilder::scope() noexcept { return Scope(*this); }

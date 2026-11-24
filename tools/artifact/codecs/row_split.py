@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
-import operator
 from typing import Sequence, TypeAlias
 
 import torch
@@ -150,85 +149,6 @@ def split_row_planes(
         source[high_begin : high_begin + count * geometry.high_row_bytes],
         source[scale_begin : scale_begin + count * geometry.scale_row_bytes],
         count,
-    )
-
-
-def _sequence_rows(rows: Sequence[int], n: int) -> list[int]:
-    result = []
-    for row in rows:
-        if isinstance(row, bool):
-            raise TypeError("row indices must be integers")
-        try:
-            index = operator.index(row)
-        except TypeError:
-            raise TypeError("row indices must be integers") from None
-        if index < 0 or index >= n:
-            raise IndexError("row index is outside the row-split tensor")
-        result.append(index)
-    if not result:
-        raise ValueError("at least one row is required")
-    return result
-
-
-def gather_row_planes(
-    payload: Payload,
-    geometry: RowSplitGeometry,
-    rows: Sequence[int] | torch.Tensor,
-) -> RowPlanes:
-    """Materialize arbitrary rows independently in each physical plane."""
-
-    full = split_row_planes(payload, geometry)
-    if isinstance(payload, torch.Tensor):
-        if isinstance(rows, torch.Tensor):
-            if rows.dim() != 1 or rows.numel() == 0:
-                raise ValueError("rows must be a nonempty one-dimensional tensor")
-            if rows.dtype not in (torch.int32, torch.int64):
-                raise TypeError("row-index tensors must use int32 or int64")
-            indices = rows.to(device=payload.device, dtype=torch.long)
-        else:
-            indices = torch.tensor(
-                _sequence_rows(rows, geometry.n),
-                dtype=torch.long,
-                device=payload.device,
-            )
-        count = indices.numel()
-
-        def gather(plane: torch.Tensor, row_bytes: int) -> torch.Tensor:
-            if row_bytes == 0:
-                return plane[:0]
-            return (
-                plane.reshape(geometry.n, row_bytes)
-                .index_select(0, indices)
-                .reshape(-1)
-            )
-
-        assert isinstance(full.base, torch.Tensor)
-        assert isinstance(full.high, torch.Tensor)
-        assert isinstance(full.scale, torch.Tensor)
-        return RowPlanes(
-            gather(full.base, geometry.base_row_bytes),
-            gather(full.high, geometry.high_row_bytes),
-            gather(full.scale, geometry.scale_row_bytes),
-            count,
-        )
-
-    if isinstance(rows, torch.Tensor):
-        indices_list = _sequence_rows(rows.detach().cpu().tolist(), geometry.n)
-    else:
-        indices_list = _sequence_rows(rows, geometry.n)
-
-    def gather_bytes(plane: Plane, row_bytes: int) -> bytes:
-        if row_bytes == 0:
-            return b""
-        return b"".join(
-            plane[index * row_bytes : (index + 1) * row_bytes] for index in indices_list
-        )
-
-    return RowPlanes(
-        gather_bytes(full.base, geometry.base_row_bytes),
-        gather_bytes(full.high, geometry.high_row_bytes),
-        gather_bytes(full.scale, geometry.scale_row_bytes),
-        len(indices_list),
     )
 
 

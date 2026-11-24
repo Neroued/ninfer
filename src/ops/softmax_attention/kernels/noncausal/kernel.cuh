@@ -1,0 +1,468 @@
+#pragma once
+
+#include "core/tensor.h"
+#include "core/device.h"
+#include "ops/common/numeric/math.cuh"
+#include "ops/common/numeric/convert.cuh"
+#include "ops/common/cuda/pipeline.cuh"
+#include "ops/common/cuda/mma.cuh"
+#include "ops/common/cuda/reduce.cuh"
+
+#include <cuda_bf16.h>
+#include <math_constants.h>
+
+#include <cstdint>
+
+namespace ninfer::ops::detail {
+
+inline constexpr int kNoncausalAttentionHeads = 16;
+
+struct alignas(16) NoncausalAttentionTile {
+    std::int32_t q0;
+    std::int32_t begin;
+    std::int32_t end;
+    std::int32_t reserved;
+};
+
+static_assert(sizeof(NoncausalAttentionTile) == 16);
+
+__device__ __forceinline__ const __nv_bfloat16*
+noncausal_ptr(const __nv_bfloat16* data, std::int64_t stride_d, std::int64_t stride_h,
+              std::int64_t stride_t, int d, int h, int t) {
+    return data + static_cast<std::int64_t>(d) * stride_d +
+           static_cast<std::int64_t>(h) * stride_h + static_cast<std::int64_t>(t) * stride_t;
+}
+
+template <int QueryRows>
+__global__ void packed_attention_prepare_tiles_kernel(const std::int32_t* cu_seqlens,
+                                                      std::int32_t segments,
+                                                      NoncausalAttentionTile* tiles,
+                                                      std::int32_t max_tiles, std::int32_t tokens) {
+    for (int tile = static_cast<int>(threadIdx.x); tile < max_tiles;
+         tile += static_cast<int>(blockDim.x)) {
+        tiles[tile] = {-1, 0, 0, 0};
+    }
+    __syncthreads();
+    for (int segment = threadIdx.x; segment < segments; segment += blockDim.x) {
+        const int begin = cu_seqlens[segment];
+        const int end   = cu_seqlens[segment + 1];
+        if (begin < 0 || end <= begin || end > tokens) { continue; }
+        // Reserve [floor(begin/R)+s, floor(end/R)+s+1) for segment s.
+        // It holds ceil((end-begin)/R) descriptors, fits the existing capacity
+        // bound ceil(T/R)+S-1, and requires no device prefix sum. Gaps stay inert.
+        int next = begin / QueryRows + segment;
+        for (int q0 = begin; q0 < end && next < max_tiles; q0 += QueryRows) {
+            tiles[next++] = {q0, begin, end, 0};
+        }
+    }
+}
+
+template <int PaddedD>
+__device__ __forceinline__ int noncausal_shared_column(int row, int column) {
+    static_assert(PaddedD == 64 || PaddedD == 96 || PaddedD == 128);
+    // A 96-element row already advances the bank address by 64 bytes on odd rows.
+    // Permute within 32-element sectors using the remaining row bits.
+    if constexpr (PaddedD == 96) return column ^ (((row >> 1) & 3) << 3);
+    return common::swizzle_xor_64(row, column);
+}
+
+template <int Br, int Threads, int PaddedD, int D, bool Aligned>
+__device__ __forceinline__ void
+noncausal_stage_q(__nv_bfloat16* dst, const __nv_bfloat16* q, int q0, int end, int head, int tid,
+                  std::int64_t stride_d, std::int64_t stride_h, std::int64_t stride_t) {
+    constexpr int VecsPerRow = PaddedD / 8;
+    for (int chunk = tid; chunk < Br * VecsPerRow; chunk += Threads) {
+        const int row       = chunk / VecsPerRow;
+        const int d         = (chunk % VecsPerRow) * 8;
+        const bool in_range = q0 + row < end && d < D;
+        __nv_bfloat16* smem = &dst[row * PaddedD + noncausal_shared_column<PaddedD>(row, d)];
+        const __nv_bfloat16* global = noncausal_ptr(
+            q, stride_d, stride_h, stride_t, in_range ? d : 0, head, in_range ? q0 + row : q0);
+        if constexpr (Aligned) {
+            common::cp_async_zfill<16, Cache::cg>(smem, global, in_range ? 16 : 0);
+        } else {
+#pragma unroll
+            for (int i = 0; i < 8; ++i) smem[i] = in_range ? global[i] : __float2bfloat16_rn(0.F);
+        }
+    }
+}
+
+template <int Bc, int Threads, int PaddedD, int D, bool Aligned>
+__device__ __forceinline__ void
+noncausal_stage_kv(__nv_bfloat16* dst, const __nv_bfloat16* src, int key0, int end, int head,
+                   int tid, std::int64_t stride_d, std::int64_t stride_h, std::int64_t stride_t) {
+    constexpr int VecsPerRow = PaddedD / 8;
+    for (int chunk = tid; chunk < Bc * VecsPerRow; chunk += Threads) {
+        const int row       = chunk / VecsPerRow;
+        const int d         = (chunk % VecsPerRow) * 8;
+        const bool in_range = key0 + row < end && d < D;
+        __nv_bfloat16* smem = &dst[row * PaddedD + noncausal_shared_column<PaddedD>(row, d)];
+        const __nv_bfloat16* global =
+            noncausal_ptr(src, stride_d, stride_h, stride_t, in_range ? d : 0, head,
+                          in_range ? key0 + row : key0);
+        if constexpr (Aligned) {
+            common::cp_async_zfill<16, Cache::cg>(smem, global, in_range ? 16 : 0);
+        } else {
+#pragma unroll
+            for (int i = 0; i < 8; ++i) smem[i] = in_range ? global[i] : __float2bfloat16_rn(0.F);
+        }
+    }
+}
+
+template <bool Full, int D, int Bc>
+__device__ __forceinline__ float2 noncausal_probabilities(const float (&score)[Bc / 8][4],
+                                                          float maximum0, float maximum1,
+                                                          unsigned (&fragments)[Bc / 16][4]) {
+    constexpr float ScaleLog2E =
+        (D == 64 ? 0.125F : 0.11785113019775792073F) * 1.4426950408889634074F;
+    float sum0 = 0.F, sum1 = 0.F;
+#pragma unroll
+    for (int nt = 0; nt < Bc / 8; ++nt) {
+        const float p00 = Full || score[nt][0] > -CUDART_INF_F
+                              ? common::exp2_approx(__fmaf_rn(score[nt][0], ScaleLog2E, -maximum0))
+                              : 0.F;
+        const float p01 = Full || score[nt][1] > -CUDART_INF_F
+                              ? common::exp2_approx(__fmaf_rn(score[nt][1], ScaleLog2E, -maximum0))
+                              : 0.F;
+        const float p10 = Full || score[nt][2] > -CUDART_INF_F
+                              ? common::exp2_approx(__fmaf_rn(score[nt][2], ScaleLog2E, -maximum1))
+                              : 0.F;
+        const float p11 = Full || score[nt][3] > -CUDART_INF_F
+                              ? common::exp2_approx(__fmaf_rn(score[nt][3], ScaleLog2E, -maximum1))
+                              : 0.F;
+        sum0 += p00 + p01;
+        sum1 += p10 + p11;
+        const int pk                  = nt / 2;
+        fragments[pk][nt % 2 * 2]     = common::pack_bf16x2(p00, p01);
+        fragments[pk][nt % 2 * 2 + 1] = common::pack_bf16x2(p10, p11);
+    }
+    return {sum0, sum1};
+}
+
+template <int Br, int Bc, int PaddedD, int MinBlocks, int D = 72, bool Aligned = true>
+__launch_bounds__(Br * 2, MinBlocks) __global__ void noncausal_flash_kernel(
+    const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k,
+    const __nv_bfloat16* __restrict__ v, const NoncausalAttentionTile* __restrict__ tiles,
+    std::int32_t tokens, std::int32_t uniform_segment_length, __nv_bfloat16* __restrict__ out,
+    std::int64_t q_stride_d, std::int64_t q_stride_h, std::int64_t q_stride_t,
+    std::int64_t k_stride_d, std::int64_t k_stride_h, std::int64_t k_stride_t,
+    std::int64_t v_stride_d, std::int64_t v_stride_h, std::int64_t v_stride_t) {
+    static_assert(Br == 16 || Br == 32 || Br == 64 || Br == 128);
+    static_assert(Bc == 16 || Bc == 32 || Bc == 64 || Bc == 128);
+    static_assert(D == 64 || D == 72);
+    constexpr int Dp       = PaddedD;
+    constexpr int Threads  = Br * 2;
+    constexpr int QKNt     = Bc / 8;
+    constexpr int QKKs     = (D + 15) / 16;
+    constexpr int PVNt     = D / 8;
+    constexpr int PVKs     = Bc / 16;
+    constexpr int RowBytes = Dp * static_cast<int>(sizeof(__nv_bfloat16));
+    constexpr float ScaleLog2E =
+        (D == 64 ? 0.125F : 0.11785113019775792073F) * 1.4426950408889634074F;
+    constexpr unsigned FullMask = 0xffffffffu;
+
+    NoncausalAttentionTile tile;
+    if (tiles != nullptr) {
+        tile = tiles[blockIdx.x];
+    } else if (uniform_segment_length > 0) {
+        const int tiles_per_segment = (uniform_segment_length + Br - 1) / Br;
+        const int segment           = static_cast<int>(blockIdx.x) / tiles_per_segment;
+        const int tile_in_segment   = static_cast<int>(blockIdx.x) - segment * tiles_per_segment;
+        const int begin             = segment * uniform_segment_length;
+        tile = {begin + tile_in_segment * Br, begin, begin + uniform_segment_length, 0};
+    } else {
+        tile = {static_cast<std::int32_t>(blockIdx.x) * Br, 0, tokens, 0};
+    }
+    if (tile.q0 < 0) { return; }
+    const int head = static_cast<int>(blockIdx.y);
+    const int tid  = static_cast<int>(threadIdx.x);
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+
+    extern __shared__ __align__(16) __nv_bfloat16 shared[];
+    __nv_bfloat16* q_s = shared;
+    __nv_bfloat16* k_s = q_s + Br * Dp;
+    __nv_bfloat16* v_s = k_s + Bc * Dp;
+
+    const int gid       = lane >> 2;
+    const int lid       = lane & 3;
+    const int a_mat     = lane >> 3;
+    const int a_rin     = lane & 7;
+    const int a_rowoff  = a_rin + ((a_mat & 1) << 3);
+    const int b_rin     = lane & 7;
+    const int b_koff    = ((lane >> 3) & 1) << 3;
+    const int warp_row0 = warp * 16;
+
+    const unsigned q_sbase     = common::smem_addr(q_s);
+    const unsigned k_sbase     = common::smem_addr(k_s);
+    const unsigned v_sbase     = common::smem_addr(v_s);
+    const unsigned q_lane_base = q_sbase + static_cast<unsigned>((warp_row0 + a_rowoff) * RowBytes);
+    const unsigned q_as        = static_cast<unsigned>((a_mat >> 1) << 4);
+    const unsigned q_r         = static_cast<unsigned>((PaddedD == 96 ? a_rin >> 1 : a_rin) << 4);
+    const unsigned k_lane_base = k_sbase + static_cast<unsigned>(b_rin * RowBytes) +
+                                 static_cast<unsigned>((lane >> 4) * 8 * RowBytes);
+    const unsigned k_as        = static_cast<unsigned>((b_koff >> 3) << 4);
+    const unsigned k_r         = static_cast<unsigned>((PaddedD == 96 ? b_rin >> 1 : b_rin) << 4);
+    const unsigned v_lane_base = v_sbase + static_cast<unsigned>(((lane >> 3) & 1) * 8 * RowBytes) +
+                                 static_cast<unsigned>(b_rin * RowBytes);
+    const unsigned v_as = static_cast<unsigned>((lane >> 4) << 4);
+    const unsigned v_r  = static_cast<unsigned>((PaddedD == 96 ? b_rin >> 1 : b_rin) << 4);
+
+    noncausal_stage_q<Br, Threads, PaddedD, D, Aligned>(q_s, q, tile.q0, tile.end, head, tid,
+                                                        q_stride_d, q_stride_h, q_stride_t);
+
+    float acc[PVNt][4];
+#pragma unroll
+    for (int n = 0; n < PVNt; ++n) {
+#pragma unroll
+        for (int item = 0; item < 4; ++item) { acc[n][item] = 0.0f; }
+    }
+    float m0 = -CUDART_INF_F;
+    float m1 = -CUDART_INF_F;
+    float l0 = 0.0f;
+    float l1 = 0.0f;
+
+    common::cp_commit();
+    noncausal_stage_kv<Bc, Threads, PaddedD, D, Aligned>(k_s, k, tile.begin, tile.end, head, tid,
+                                                         k_stride_d, k_stride_h, k_stride_t);
+    common::cp_commit();
+
+    const int key_blocks = (tile.end - tile.begin + Bc - 1) / Bc;
+    for (int kb = 0; kb < key_blocks; ++kb) {
+        const int key0 = tile.begin + kb * Bc;
+        common::cp_wait<0>();
+        __syncthreads();
+
+        noncausal_stage_kv<Bc, Threads, PaddedD, D, Aligned>(v_s, v, key0, tile.end, head, tid,
+                                                             v_stride_d, v_stride_h, v_stride_t);
+        common::cp_commit();
+
+        float score[QKNt][4];
+#pragma unroll
+        for (int nt = 0; nt < QKNt; ++nt) {
+            score[nt][0] = score[nt][1] = score[nt][2] = score[nt][3] = 0.0f;
+        }
+        unsigned af[2][4];
+        unsigned bf[2][QKNt][2];
+        common::ldmatrix_x4(af[0][0], af[0][1], af[0][2], af[0][3],
+                            common::swizzle_xor_address(q_lane_base, 0u, q_as, q_r));
+#pragma unroll
+        for (int nt2 = 0; nt2 < QKNt; nt2 += 2) {
+            common::ldmatrix_x4(
+                bf[0][nt2][0], bf[0][nt2][1], bf[0][nt2 + 1][0], bf[0][nt2 + 1][1],
+                common::swizzle_xor_address(k_lane_base + static_cast<unsigned>(nt2 * 8 * RowBytes),
+                                            0u, k_as, k_r));
+        }
+#pragma unroll
+        for (int ks = 0; ks < QKKs; ++ks) {
+            const int cur = ks & 1;
+            const int nxt = cur ^ 1;
+            if (ks + 1 < QKKs) {
+                const unsigned ck = static_cast<unsigned>((ks + 1) << 5);
+                common::ldmatrix_x4(af[nxt][0], af[nxt][1], af[nxt][2], af[nxt][3],
+                                    common::swizzle_xor_address(q_lane_base, ck, q_as, q_r));
+#pragma unroll
+                for (int nt2 = 0; nt2 < QKNt; nt2 += 2) {
+                    common::ldmatrix_x4(bf[nxt][nt2][0], bf[nxt][nt2][1], bf[nxt][nt2 + 1][0],
+                                        bf[nxt][nt2 + 1][1],
+                                        common::swizzle_xor_address(
+                                            k_lane_base + static_cast<unsigned>(nt2 * 8 * RowBytes),
+                                            ck, k_as, k_r));
+                }
+            }
+#pragma unroll
+            for (int nt = 0; nt < QKNt; ++nt) {
+                common::mma_bf16(score[nt][0], score[nt][1], score[nt][2], score[nt][3], af[cur][0],
+                                 af[cur][1], af[cur][2], af[cur][3], bf[cur][nt][0],
+                                 bf[cur][nt][1]);
+            }
+        }
+
+        const int row0       = warp_row0 + gid;
+        const int row1       = row0 + 8;
+        const int query0     = tile.q0 + row0;
+        const int query1     = tile.q0 + row1;
+        const bool full_tile = tile.q0 + Br <= tile.end && key0 + Bc <= tile.end;
+        float block_max0     = -CUDART_INF_F;
+        float block_max1     = -CUDART_INF_F;
+        if (full_tile) {
+#pragma unroll
+            for (int nt = 0; nt < QKNt; ++nt) {
+                block_max0 = fmaxf(block_max0, fmaxf(score[nt][0], score[nt][1]));
+                block_max1 = fmaxf(block_max1, fmaxf(score[nt][2], score[nt][3]));
+            }
+        } else {
+#pragma unroll
+            for (int nt = 0; nt < QKNt; ++nt) {
+                const int key_a = key0 + nt * 8 + 2 * lid;
+                const int key_b = key_a + 1;
+                score[nt][0] = query0 < tile.end && key_a < tile.end ? score[nt][0] : -CUDART_INF_F;
+                score[nt][1] = query0 < tile.end && key_b < tile.end ? score[nt][1] : -CUDART_INF_F;
+                score[nt][2] = query1 < tile.end && key_a < tile.end ? score[nt][2] : -CUDART_INF_F;
+                score[nt][3] = query1 < tile.end && key_b < tile.end ? score[nt][3] : -CUDART_INF_F;
+                block_max0   = fmaxf(block_max0, fmaxf(score[nt][0], score[nt][1]));
+                block_max1   = fmaxf(block_max1, fmaxf(score[nt][2], score[nt][3]));
+            }
+        }
+        block_max0 = common::warp_max<4>(block_max0, FullMask);
+        block_max1 = common::warp_max<4>(block_max1, FullMask);
+
+        const float next_m0 = fmaxf(m0, block_max0);
+        const float next_m1 = fmaxf(m1, block_max1);
+        const float m0_l2   = next_m0 * ScaleLog2E;
+        const float m1_l2   = next_m1 * ScaleLog2E;
+        const float alpha0  = common::exp2_approx(__fmaf_rn(m0, ScaleLog2E, -m0_l2));
+        const float alpha1  = common::exp2_approx(__fmaf_rn(m1, ScaleLog2E, -m1_l2));
+
+        unsigned p_frag[PVKs][4];
+        float2 block_sum;
+        if constexpr (D == 64) {
+            if (full_tile)
+                block_sum = noncausal_probabilities<true, D, Bc>(score, m0_l2, m1_l2, p_frag);
+            else
+                block_sum = noncausal_probabilities<false, D, Bc>(score, m0_l2, m1_l2, p_frag);
+        } else {
+            block_sum = noncausal_probabilities<false, D, Bc>(score, m0_l2, m1_l2, p_frag);
+        }
+
+        l0 = __fmaf_rn(l0, alpha0, block_sum.x);
+        l1 = __fmaf_rn(l1, alpha1, block_sum.y);
+        m0 = next_m0;
+        m1 = next_m1;
+        if constexpr (D == 64) {
+            if (alpha0 != 1.F) {
+#pragma unroll
+                for (int n = 0; n < PVNt; ++n) {
+                    acc[n][0] *= alpha0;
+                    acc[n][1] *= alpha0;
+                }
+            }
+            if (alpha1 != 1.F) {
+#pragma unroll
+                for (int n = 0; n < PVNt; ++n) {
+                    acc[n][2] *= alpha1;
+                    acc[n][3] *= alpha1;
+                }
+            }
+        } else {
+#pragma unroll
+            for (int n = 0; n < PVNt; ++n) {
+                acc[n][0] *= alpha0;
+                acc[n][1] *= alpha0;
+                acc[n][2] *= alpha1;
+                acc[n][3] *= alpha1;
+            }
+        }
+
+        common::cp_wait<0>();
+        __syncthreads();
+        if (kb + 1 < key_blocks) {
+            noncausal_stage_kv<Bc, Threads, PaddedD, D, Aligned>(
+                k_s, k, key0 + Bc, tile.end, head, tid, k_stride_d, k_stride_h, k_stride_t);
+            common::cp_commit();
+        }
+
+        constexpr int PVTilePairs = (PVNt + 1) / 2;
+        constexpr int PVLoads     = PVKs * PVTilePairs;
+        unsigned vf[2][4];
+        common::ldmatrix_x4_t(vf[0][0], vf[0][1], vf[0][2], vf[0][3],
+                              common::swizzle_xor_address(v_lane_base, 0u, v_as, v_r));
+#pragma unroll
+        for (int load = 0; load < PVLoads; ++load) {
+            const int pk   = load / PVTilePairs;
+            const int n2   = (load % PVTilePairs) * 2;
+            const int cur  = load & 1;
+            const int next = cur ^ 1;
+            if (load + 1 < PVLoads) {
+                const int next_pk = (load + 1) / PVTilePairs;
+                const int next_n2 = ((load + 1) % PVTilePairs) * 2;
+                common::ldmatrix_x4_t(
+                    vf[next][0], vf[next][1], vf[next][2], vf[next][3],
+                    common::swizzle_xor_address(v_lane_base +
+                                                    static_cast<unsigned>(next_pk * 16 * RowBytes),
+                                                static_cast<unsigned>(next_n2 << 4), v_as, v_r));
+            }
+            common::mma_bf16(acc[n2][0], acc[n2][1], acc[n2][2], acc[n2][3], p_frag[pk][0],
+                             p_frag[pk][1], p_frag[pk][2], p_frag[pk][3], vf[cur][0], vf[cur][1]);
+            if (n2 + 1 < PVNt) {
+                common::mma_bf16(acc[n2 + 1][0], acc[n2 + 1][1], acc[n2 + 1][2], acc[n2 + 1][3],
+                                 p_frag[pk][0], p_frag[pk][1], p_frag[pk][2], p_frag[pk][3],
+                                 vf[cur][2], vf[cur][3]);
+            }
+        }
+    }
+
+    l0                 = common::warp_sum<4>(l0, FullMask);
+    l1                 = common::warp_sum<4>(l1, FullMask);
+    const float inv_l0 = l0 > 0.0f ? __frcp_rn(l0) : 0.0f;
+    const float inv_l1 = l1 > 0.0f ? __frcp_rn(l1) : 0.0f;
+#pragma unroll
+    for (int n = 0; n < PVNt; ++n) {
+        const int d0     = n * 8 + 2 * lid;
+        const int query0 = tile.q0 + warp_row0 + gid;
+        const int query1 = query0 + 8;
+        if (query0 < tile.end) {
+            const std::int64_t offset =
+                (static_cast<std::int64_t>(query0) * kNoncausalAttentionHeads + head) * D + d0;
+            if constexpr (Aligned)
+                common::store_vec(&out[offset],
+                                  common::pack_bf16x2(acc[n][0] * inv_l0, acc[n][1] * inv_l0));
+            else {
+                out[offset]     = __float2bfloat16_rn(acc[n][0] * inv_l0);
+                out[offset + 1] = __float2bfloat16_rn(acc[n][1] * inv_l0);
+            }
+        }
+        if (query1 < tile.end) {
+            const std::int64_t offset =
+                (static_cast<std::int64_t>(query1) * kNoncausalAttentionHeads + head) * D + d0;
+            if constexpr (Aligned)
+                common::store_vec(&out[offset],
+                                  common::pack_bf16x2(acc[n][2] * inv_l1, acc[n][3] * inv_l1));
+            else {
+                out[offset]     = __float2bfloat16_rn(acc[n][2] * inv_l1);
+                out[offset + 1] = __float2bfloat16_rn(acc[n][3] * inv_l1);
+            }
+        }
+    }
+}
+
+inline std::int64_t stride_elements(const Tensor& tensor, int dim) {
+    return tensor.nb[dim] / static_cast<std::int64_t>(sizeof(__nv_bfloat16));
+}
+
+template <int Br, int Bc, int PaddedD, int MinBlocks, int D, bool Aligned>
+void launch_flash_instance(const Tensor& q, const Tensor& k, const Tensor& v,
+                           const NoncausalAttentionTile* tiles, std::int32_t uniform_segment_length,
+                           std::int32_t query_tiles, Tensor& out, cudaStream_t stream) {
+    constexpr int kThreads   = Br * 2;
+    constexpr int kSmemBytes = (Br + 2 * Bc) * PaddedD * static_cast<int>(sizeof(__nv_bfloat16));
+    static_assert(kSmemBytes <= 48 * 1024);
+    const dim3 grid(static_cast<unsigned>(query_tiles),
+                    static_cast<unsigned>(kNoncausalAttentionHeads), 1u);
+    noncausal_flash_kernel<Br, Bc, PaddedD, MinBlocks, D, Aligned>
+        <<<grid, kThreads, kSmemBytes, stream>>>(
+            static_cast<const __nv_bfloat16*>(q.data), static_cast<const __nv_bfloat16*>(k.data),
+            static_cast<const __nv_bfloat16*>(v.data), tiles, q.ne[2], uniform_segment_length,
+            static_cast<__nv_bfloat16*>(out.data), stride_elements(q, 0), stride_elements(q, 1),
+            stride_elements(q, 2), stride_elements(k, 0), stride_elements(k, 1),
+            stride_elements(k, 2), stride_elements(v, 0), stride_elements(v, 1),
+            stride_elements(v, 2));
+    CUDA_CHECK(cudaGetLastError());
+}
+
+template <int Br, int Bc, int PaddedD = 128, int MinBlocks = 128 / Br, int D = 72>
+void launch_flash(const Tensor& q, const Tensor& k, const Tensor& v,
+                  const NoncausalAttentionTile* tiles, std::int32_t uniform_segment_length,
+                  std::int32_t query_tiles, Tensor& out, cudaStream_t stream) {
+    std::uintptr_t alignment =
+        reinterpret_cast<std::uintptr_t>(q.data) | reinterpret_cast<std::uintptr_t>(k.data) |
+        reinterpret_cast<std::uintptr_t>(v.data) | q.nb[2] | k.nb[2] | v.nb[2];
+    if ((alignment & 15) == 0 && (reinterpret_cast<std::uintptr_t>(out.data) & 3) == 0)
+        launch_flash_instance<Br, Bc, PaddedD, MinBlocks, D, true>(
+            q, k, v, tiles, uniform_segment_length, query_tiles, out, stream);
+    else
+        launch_flash_instance<Br, Bc, PaddedD, MinBlocks, D, false>(
+            q, k, v, tiles, uniform_segment_length, query_tiles, out, stream);
+}
+
+} // namespace ninfer::ops::detail

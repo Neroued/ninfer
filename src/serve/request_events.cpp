@@ -10,6 +10,8 @@ RequestLogContext make_request_log_context(std::uint64_t id, std::string protoco
                                            const PreparedRequest& prepared) {
     RequestLogContext context;
     context.id                                 = id;
+    context.http_request_id                    = metadata.http_request_id;
+    context.response_id                        = metadata.response_id;
     context.protocol                           = std::move(protocol);
     context.model                              = metadata.model;
     context.stream                             = metadata.stream;
@@ -41,6 +43,8 @@ RequestRejectionLogContext make_request_rejection_log_context(std::uint64_t id,
                                                               ApiError error) {
     RequestRejectionLogContext context;
     context.id                                 = id;
+    context.http_request_id                    = metadata.http_request_id;
+    context.response_id                        = metadata.response_id;
     context.protocol                           = std::move(protocol);
     context.model                              = metadata.model;
     context.stream                             = metadata.stream;

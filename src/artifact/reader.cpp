@@ -1,12 +1,13 @@
 #include "artifact/reader.h"
 
-#include "artifact/file_io.h"
 #include "artifact/formats.h"
 #include "artifact/layouts.h"
+#include "core/buffer.h"
 
 #include <algorithm>
 #include <array>
 #include <limits>
+#include <system_error>
 
 namespace ninfer::artifact {
 
@@ -16,12 +17,13 @@ struct Reader::Impl {
     ArtifactId id{};
     std::uint64_t entry_payload_start = 0;
     std::uint64_t file_bytes          = 0;
-    mutable std::vector<std::unique_ptr<InputFile>> files;
+    std::array<std::byte, kHeaderBytes> entry_header{};
+    mutable std::vector<std::unique_ptr<io::ReadOnlyFile>> files;
     mutable std::vector<std::optional<WeightGeometry>> geometries;
 
     explicit Impl(const std::filesystem::path& path) : entry(path) {
-        auto file = std::make_unique<InputFile>(entry);
-        std::array<std::byte, kHeaderBytes> header{};
+        auto file    = std::make_unique<io::ReadOnlyFile>(entry);
+        auto& header = entry_header;
         file->read_exact(0, header);
         if (!std::equal(kEntryMagic.begin(), kEntryMagic.end(), header.begin())) {
             if (std::equal(kEntryMagic.begin(), kEntryMagic.end() - 1, header.begin()) &&
@@ -60,30 +62,53 @@ struct Reader::Impl {
         geometries.resize(directory.objects.size());
     }
 
-    InputFile& file(std::size_t index) const {
+    io::ReadOnlyFile open_file(std::size_t index, io::ReadMode mode) const {
         if (index >= files.size()) { throw ArtifactError("invalid continuation index"); }
-        if (!files[index]) {
-            const auto& record = directory.files[index];
-            auto input         = std::make_unique<InputFile>(entry.parent_path() / *record.path);
-            std::array<std::byte, kHeaderBytes> header{};
-            input->read_exact(0, header);
+        const auto& record = directory.files[index];
+        io::ReadOnlyFile input(index ? entry.parent_path() / *record.path : entry, mode);
+        const auto prefix = index ? kPayloadAlignment : entry_payload_start;
+        if (input.bytes() != checked_add(prefix, record.payload_bytes, "file length"))
+            throw ArtifactError("file length differs from directory");
+        std::array<std::byte, kHeaderBytes> header{};
+        if (mode == io::ReadMode::Buffered) {
+            input.read_exact(0, header);
+        } else {
+            const auto window = io::direct_read_window(input.view(), 0, header.size());
+            HostBuffer buffer(window.bytes,
+                              std::max<std::size_t>(256, input.view().memory_alignment));
+            if (input.read_direct(window.offset, {static_cast<std::byte*>(buffer.data()),
+                                                  window.bytes}) < window.required)
+                throw ArtifactError("short direct file header");
+            std::copy_n(static_cast<const std::byte*>(buffer.data()), header.size(),
+                        header.begin());
+        }
+        if (index) {
             if (!std::equal(kPartMagic.begin(), kPartMagic.end(), header.begin()) ||
                 read_u64_le(header.data() + 8) != index ||
                 !std::equal(id.begin(), id.end(), header.begin() + 16)) {
                 throw ArtifactError(*record.path +
                                     ": continuation header does not belong to this entry");
             }
-            if (input->bytes() !=
-                checked_add(kPayloadAlignment, record.payload_bytes, "part length")) {
-                throw ArtifactError(*record.path + ": continuation length differs from directory");
-            }
-            files[index] = std::move(input);
+        } else if (header != entry_header) {
+            throw ArtifactError("entry header differs from loaded directory");
         }
+        return input;
+    }
+
+    io::ReadOnlyFile& file(std::size_t index) const {
+        if (index >= files.size()) { throw ArtifactError("invalid continuation index"); }
+        if (!files[index])
+            files[index] =
+                std::make_unique<io::ReadOnlyFile>(open_file(index, io::ReadMode::Buffered));
         return *files[index];
     }
 };
 
-Reader::Reader(const std::filesystem::path& path) : impl_(std::make_unique<Impl>(path)) {}
+Reader::Reader(const std::filesystem::path& path) {
+    try {
+        impl_ = std::make_unique<Impl>(path);
+    } catch (const std::system_error& e) { throw ArtifactError(e.what()); }
+}
 
 Reader::~Reader()                            = default;
 Reader::Reader(Reader&&) noexcept            = default;
@@ -145,12 +170,15 @@ std::vector<ReadSegment> Reader::segments(std::uint64_t offset, std::uint64_t by
 }
 
 void Reader::read_into(std::uint64_t offset, std::span<std::byte> destination) const {
-    for (const auto& segment : segments(offset, destination.size())) {
-        impl_->file(segment.file_index)
-            .read_exact(segment.file_offset,
-                        destination.subspan(static_cast<std::size_t>(segment.destination_offset),
-                                            static_cast<std::size_t>(segment.bytes)));
-    }
+    try {
+        for (const auto& segment : segments(offset, destination.size())) {
+            impl_->file(segment.file_index)
+                .read_exact(
+                    segment.file_offset,
+                    destination.subspan(static_cast<std::size_t>(segment.destination_offset),
+                                        static_cast<std::size_t>(segment.bytes)));
+        }
+    } catch (const std::system_error& e) { throw ArtifactError(e.what()); }
 }
 
 std::vector<std::byte> Reader::read_range(std::uint64_t offset, std::uint64_t bytes) const {
@@ -169,9 +197,10 @@ std::vector<std::byte> Reader::read_object(ObjectHandle handle) const {
     return read_range(object_offset(object), object_bytes(object));
 }
 
-std::size_t Reader::read_direct(std::size_t file_index, std::uint64_t file_offset,
-                                std::span<std::byte> destination) const {
-    return impl_->file(file_index).read_direct(file_offset, destination);
+io::ReadOnlyFile Reader::open_file(std::size_t file_index, io::ReadMode mode) const {
+    try {
+        return impl_->open_file(file_index, mode);
+    } catch (const std::system_error& e) { throw ArtifactError(e.what()); }
 }
 
 } // namespace ninfer::artifact

@@ -1,9 +1,9 @@
 // Performance bench for silu_mul at the real Qwen3.6-27B MLP shape
-// (intermediate = 17408). This binary is the ncu/nsys target; the GB/s it
-// prints is informational only -- the gate is ncu sustained DRAM %% (see
-// docs/op-development.md §8).
+// (intermediate = 17408). Interpret effective bandwidth with the payload and cache
+// conditions; see docs/maintainer/op-development.md §7.
 //   ./ninfer_silu_mul_bench --tokens 1,2,3,4,5,6,48
 #include "ninfer/ops/silu_mul.h"
+#include "core/buffer.h"
 #include "ninfer_bench_common.h"
 
 #include <cstdlib>
@@ -41,12 +41,13 @@ void run(int tokens) {
     DeviceBuffer g   = make_bf16(static_cast<std::size_t>(n), 101U);
     DeviceBuffer u   = make_bf16(static_cast<std::size_t>(n), 103U);
     DeviceBuffer out = make_zeros(static_cast<std::size_t>(n) * 2);
-    Tensor tg(g.p, DType::BF16, {kIntermediate, tokens});
-    Tensor tu(u.p, DType::BF16, {kIntermediate, tokens});
-    Tensor tout(out.p, DType::BF16, {kIntermediate, tokens});
+    Tensor tg(g.span(), DType::BF16, {kIntermediate, tokens});
+    Tensor tu(u.span(), DType::BF16, {kIntermediate, tokens});
+    Tensor tout(out.span(), DType::BF16, {kIntermediate, tokens});
 
     const double bytes = 3.0 * static_cast<double>(n) * 2.0; // read gate + read up + write out
-    const Result r     = bench_loop([&](cudaStream_t s) { ops::silu_mul(tg, tu, tout, s); }, bytes);
+    const Result r =
+        bench_loop([&](CudaExecutionView cuda) { ops::silu_mul(tg, tu, tout, cuda); }, bytes);
     char tag[96];
     std::snprintf(tag, sizeof(tag), "silu_mul [17408,%d]", tokens);
     print_result(tag, r);

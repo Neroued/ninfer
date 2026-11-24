@@ -26,6 +26,11 @@ The Qwen3.6-27B NVFP4 MTP3 phase table comes from a corpus C=1 point whose full 
 not published here. Qwen3.8 measurements use FP8 E4M3 row-256 KV; the Qwen3.6 measurements
 use INT8 group-64 KV. Each model page records its build and run conditions.
 
+Flash Next, GLM and Spark deployments have no published result page in this campaign.
+Their current support is listed in the [README](../README.md#supported-models-and-deployments).
+The Qwen3.8-27B measurements above describe a different architecture and artifact.
+Flash Next's current execution scope is documented [here](maintainer/qwen4_exp-model.md).
+
 ## Reading the results
 
 | Question | Metric to use |
@@ -46,7 +51,7 @@ and [Qwen3.8 completion outcomes](performance/qwen3.8-27b.md#completion-outcomes
 - [Serving benchmark runners](../tools/bench/README.md#serving-corpus-benchmark): usage and local report files.
 - [Engine and Op benchmarks](../bench/README.md): their separate measurement scopes and commands.
 - [Capability evaluation](../eval/README.md): evaluation workflow; published scores live in the
-  [model cards](README.md#model-artifacts), with a [README summary](../README.md#evaluation).
+  [model cards](../model-cards/), with a [README summary](../README.md#evaluation).
 - [Perplexity](perplexity.md): offline causal-scoring measurement and comparison rules.
 
 Model pages are the detailed result authority. README and model-card performance tables are

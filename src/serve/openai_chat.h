@@ -5,6 +5,7 @@
 
 #include "serve/request.h"
 #include "serve/request_json.h"
+#include "serve/tool_stream_state.h"
 
 #include <nlohmann/json.hpp>
 
@@ -54,12 +55,16 @@ public:
     void note_timing(const ninfer::GenerationTimingObservation& timing);
     std::string reasoning_delta(const std::string& text);
     std::string content_delta(const std::string& text);
+    std::vector<std::string> tool_start(const ninfer::ToolCallStart& event);
+    std::vector<std::string> tool_arguments(const ninfer::ToolArgumentsDelta& event);
+    std::vector<std::string> tool_end(const ninfer::ToolCallEnd& event);
     std::vector<std::string> finish(const GenerationOutcome& outcome);
 
 private:
     nlohmann::json live_timings_json() const;
 
     OpenAIChatResponseIdentity identity_;
+    ToolStreamState tools_;
     std::string reasoning_;
     std::string content_;
     std::optional<ninfer::GenerationTimingObservation> live_timing_;

@@ -2,18 +2,16 @@
 
 namespace ninfer::artifact {
 
-WeightView bind_view(const ParameterReference& reference,
-                     const MaterializedArtifact& materialized) {
-    if (reference.residency == Residency::Values) {
-        throw ArtifactError(reference.name + ": owning values do not have parent backing");
-    }
+WeightView bind_view(const ParameterReference& reference, const MaterializedArtifact& materialized,
+                     Device device) {
     WeightView out;
     out.shape             = reference.shape;
     std::uint64_t covered = 0;
     for (const auto& part : reference.binding.parts) {
-        const auto& parent = reference.residency == Residency::Device
+        const auto& parent = device.type() == DeviceType::CUDA
                                  ? materialized.device_parent(part.object)
                                  : materialized.host_parent(part.object);
+        if (parent.device != device) { throw ArtifactError("weight backing device differs"); }
         if (part.begin >= part.end || part.end > parent.geometry.elements) {
             throw ArtifactError(reference.name + ": invalid materialized region");
         }

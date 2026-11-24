@@ -1,353 +1,82 @@
-# Serve TTFT benchmark
+# Serve TTFT 与调度测量
 
-The measurement runner is a black-box client for an already-running `ninfer-serve`. It constructs a
-fixed request graph, sends only public HTTP requests, and measures time to first token (TTFT). It
-never starts or configures Serve, calls `Engine`, reads request logs, or labels an observed request
-as a cache hit, transfer, or eviction. A separate campaign controller owns the repetitive process
-lifecycle around that runner.
-
-The standard campaign has one resident `qwen3.8-27b/nvfp4` artifact, FP8 KV, one GPU, and one to
-eight active requests. Artifact, KV dtype, speculative backend, and model are not benchmark axes.
-The runner discovers the public model ID through `/v1/models`. The campaign controller applies the
-fixed Serve profile and gives every measured sample a fresh process.
+Runner 向已运行服务发送公开 HTTP 请求，记录首输出、后续流事件、结束与取消。
+Campaign controller 另行负责启动配置与逐 sample 的服务生命周期；二者不调用模型内部接口。
 
 ## Measurement contract
 
-Request JSON and data URLs are prepared before timing. Every request owns a preconnected HTTP/1.1
-connection:
+请求 JSON 和媒体编码在计时前准备，每条请求使用已连接的 HTTP 连接。
+TTFT 从写请求前开始，到第一个非空 text、reasoning 或 tool-argument delta 结束。
+响应头、角色声明和空增量不算首输出；首输出前失败没有 TTFT，之后失败保留已测值。
 
-```text
-t0 = immediately before the first request bytes are written
-tb = request body write completed
-ta = first protocol metadata emitted after Serve accepted the request
-t1 = first non-empty model text, reasoning, or tool-argument delta
-TTFT = t1 - t0
-```
+TTFT 包含上传、准备、排队与首次计算。后续报告 stream gaps、完成、取消和 transport closure。
+SSE event 不等于 token：spec 一次可发布多 token，网络也可能合并事件。
 
-Connection establishment and JSON serialization are outside TTFT. Body upload, Serve request
-preparation, media acquisition/preprocessing, admission, prefill, and the first model output are
-inside it. HTTP headers, assistant-role chunks, `response.created`, `message_start`, usage, empty
-deltas, and finish metadata are not model output.
+四种结果分别解释：请求图是否按约定构造、请求 outcome、所需机制是否实际观察到、性能数据。
+`not_observed` 与 `unavailable` 不同，慢或失败的已构造场景仍是有效证据。
+吞吐使用实际成功输出和完整 makespan，不用缺失 usage 的 bytes/event 数推算 token。
 
-A rejected request, timeout, cancellation, protocol failure, or disconnect before `t1` has no
-TTFT. A cancellation case is constructed only when the client transport terminates without a
-protocol terminal event within five seconds of the cancellation action. Rejection status/code is
-reported separately. A clean request records only its first
-accepted, first-output, and terminal events; later output deltas are consumed but do not bloat the
-artifact.
+## Workloads and resources
 
-`constructed=true` means the requested arrival graph and all required external event inequalities
-actually occurred. It does not mean the expected cache or scheduling optimization worked. A
-constructed case with unexpectedly high TTFT is a valid regression signal. The client deliberately
-does not use internal Serve diagnostics to reinterpret it.
+[Cases](cases.py)定义请求图，[profiles](profiles.py)定义服务配置，
+[冻结语料](../../../bench/fixtures/ttft/README.md)定义输入身份与 token 事实。
+内置 profiles 针对 Qwen3.8-27B NVFP4/FP8；换模型需核对其 tokenizer/template 和真实资源布局。
 
-## Layers
+场景包括冷热续接、共享前缀、工作集变化、Host 轮换、抢占/Replay、Vision、agent 历史和混合到达。
+具体集合由代码维护，名称不保证旧策略下的某种受害者仍会出现。
+资源压力按共享 Context 的真实分配、State、history 与引用判断，不恢复旧的独立槽数假设。
 
-```text
-bench/fixtures/ttft       frozen text, media, hashes, and token facts
-tools/streaming_http      byte transport and incremental SSE timestamps
-tools/ninfer_serve        public Chat, Responses, and Anthropic adapters
-tools/bench/ttft          request graphs, event coordination, and reports
-run_serve_ttft_campaign   profiles, fresh Serve lifecycle, artifacts, summary
-```
+固定到达记录计划时间与实际发送延迟，输出遵循 EOS；基于生成历史或压力事件的负载标记为
+条件性场景。改变请求图或测量合同后不能直接并入旧样本。
 
-Protocol is selected by the case, not by a CLI matrix: Chat covers ordinary scheduling and media,
-Responses covers `previous_response_id` sessions, and Anthropic Messages covers explicit
-`cache_control` boundaries.
-
-## Resource formulas
-
-For a request with expanded prompt tokens `p` and output limit `o`, the Main KV reservation used by
-the cases is:
-
-```text
-g = o - 1
-e = 64 * ceil((p + g) / 64)
-```
-
-The first generated token is produced at the prompt frontier, so only the remaining `o-1` tokens
-grow KV. Fixed pressure shapes are:
-
-| Shape | `p` | `o` | `e` |
-|---|---:|---:|---:|
-| short | 30 | 32 | 64 |
-| long source | 7680 | 16 | 7744 |
-| independent long prefill | 7680 | 32 | 7744 |
-| rotation source | 55000 | 32 | 55040 |
-| interferer | 127 | 256 | 384 |
-| decode holder | 127 | 4096 | 4224 |
-| unsafe borrower | 30 | 3000 | 3072 |
-| exact context | 8129 | 64 | 8192 |
-| 256K input | 260096 | 32 | 260160 |
-
-The resource-pressure graph is identical for all six pressure profiles:
-
-```text
-A: stored Responses long source completes
-B and C: two disposable interferers start together and both reach first output
-A2: previous_response_id=A resumes after B and C complete
-
-e(A) + e(B)     = 8128 <= 8192
-e(A) + e(B) + e(C) = 8512 > 8192
-```
-
-Changing the profile changes the legal placement of A; it does not change the requests.
-
-The six-session rotation uses six byte-distinct, early-divergent 55000-token Responses roots. Each
-root has `e=55040`; therefore four roots fit the 240000-token Device KV capacity, while five do not:
-
-```text
-4 * 55040 = 220160 <= 240000
-5 * 55040 = 275200 > 240000
-```
-
-After all six roots complete, the graph warms root 0 once and then branches from each original root
-in three sequential round-robin passes. Host KV makes retention physically possible while the
-number of parked owners and checkpoints forces the materialization planner beyond the small
-A/B/C pressure graph. The report declares paired round-2 versus round-1 TTFT comparisons for every
-rotation position; cross-campaign comparison also matches every role independently.
-
-## Serve profiles
-
-`tools/bench/ttft/profiles.py` is the executable profile catalog used by the campaign controller.
-The controller starts a fresh Serve process for every sample. The low-level runner validates only
-the profile label and cannot inspect whether a manually managed process really used these
-arguments. Serve completes its internal warmup before listening; that operational request has
-context-cache participation disabled regardless of profile, so every sample begins with an empty
-logical context cache. Before the first process, the controller stages the immutable standard
-artifact once in `/dev/shm/ninfer-artifacts/` with a source-identity-qualified name. Every Serve
-process then reads that tmpfs path; a later campaign reuses it while the source device, inode, size,
-and mtime remain unchanged. There is no disk fallback or user-facing cache option. The standard
-artifact and common arguments are:
-
-```bash
-SERVE=build/apps/ninfer-serve
-NINFER_WEIGHTS=out/qwen3_8_27b_nvfp4.ninfer
-COMMON=(--host 127.0.0.1 --port 18080 --kv-dtype fp8 \
-  --no-thinking --greedy --log-stats-interval-ms 0)
-
-"$SERVE" "$NINFER_WEIGHTS" "${COMMON[@]}" <profile arguments>
-```
-
-All capacities are tokens except values explicitly suffixed `-mib`. `device-state-slots` is extra
-checkpoint capacity beyond active lanes.
-
-| Profile label | Profile arguments |
-|---|---|
-| `text-cold-8k` | `--max-context 8192 --kv-capacity 8192 --max-concurrency 1 --no-prefix-reuse` |
-| `text-cold-64k` | `--max-context 65536 --kv-capacity 65536 --max-concurrency 1 --no-prefix-reuse` |
-| `text-cold-256k` | `--max-context 262144 --kv-capacity 262144 --max-concurrency 1 --no-prefix-reuse` |
-| `cache-state-working-set` | `--max-context 32768 --kv-capacity 32768 --max-concurrency 1 --prefill-chunk 1024 --spec dflash2 --draft-tokens 7 --lm-head-draft --device-state-slots 8 --host-state-slots 8 --host-kv-mib 0 --max-private-continuations 8 --max-shared-prefixes 8 --max-long-anchors-per-continuation 0` |
-| `cache-private-working-set` | `--max-context 32768 --kv-capacity 32768 --max-concurrency 1 --prefill-chunk 1024 --spec dflash2 --draft-tokens 7 --lm-head-draft --device-state-slots 2 --host-state-slots 2 --host-kv-mib 0 --max-private-continuations 8 --max-shared-prefixes 0 --max-long-anchors-per-continuation 0` |
-| `cache-hot` | `--max-context 8192 --kv-capacity 8192 --max-concurrency 1 --device-state-slots 2 --host-state-slots 0 --host-kv-mib 0 --max-private-continuations 2 --max-shared-prefixes 0 --max-long-anchors-per-continuation 0` |
-| `cache-pressure-device` | `--max-context 8192 --kv-capacity 16384 --max-concurrency 2 --device-state-slots 2 --host-state-slots 0 --host-kv-mib 0 --max-private-continuations 4 --max-shared-prefixes 0 --max-long-anchors-per-continuation 0` |
-| `cache-pressure-state-host` | `--max-context 8192 --kv-capacity 16384 --max-concurrency 2 --device-state-slots 0 --host-state-slots 4 --host-kv-mib 0 --max-private-continuations 4 --max-shared-prefixes 0 --max-long-anchors-per-continuation 0` |
-| `cache-pressure-kv-host` | `--max-context 8192 --kv-capacity 8192 --max-concurrency 2 --device-state-slots 2 --host-state-slots 0 --host-kv-mib 8192 --max-private-continuations 4 --max-shared-prefixes 0 --max-long-anchors-per-continuation 0` |
-| `cache-swap-64k-host` | `--max-context 65536 --kv-capacity 65536 --max-concurrency 2 --device-state-slots 4 --host-state-slots 0 --host-kv-mib 4608 --max-private-continuations 4 --max-shared-prefixes 0 --max-long-anchors-per-continuation 0` |
-| `cache-rotation-55k-host` | `--max-context 240000 --kv-capacity 240000 --max-concurrency 4 --max-pending-requests 32 --pending-timeout-ms 120000 --spec mtp --draft-tokens 3 --lm-head-draft --device-state-slots 2 --host-state-slots 24 --host-kv-mib 49152 --max-private-continuations 24 --max-shared-prefixes 24 --max-long-anchors-per-continuation 0` |
-| `cache-pressure-both-host` | `--max-context 8192 --kv-capacity 8192 --max-concurrency 2 --device-state-slots 0 --host-state-slots 4 --host-kv-mib 8192 --max-private-continuations 4 --max-shared-prefixes 0 --max-long-anchors-per-continuation 0` |
-| `cache-pressure-evict` | `--max-context 8192 --kv-capacity 8192 --max-concurrency 2 --device-state-slots 1 --host-state-slots 0 --host-kv-mib 0 --max-private-continuations 4 --max-shared-prefixes 0 --max-long-anchors-per-continuation 0` |
-| `cache-pressure-catalog` | `--max-context 8192 --kv-capacity 16384 --max-concurrency 2 --device-state-slots 2 --host-state-slots 0 --host-kv-mib 0 --max-private-continuations 2 --max-shared-prefixes 0 --max-long-anchors-per-continuation 0` |
-| `cache-off` | `--max-context 8192 --kv-capacity 8192 --max-concurrency 1 --no-prefix-reuse` |
-| `shared-prefix` | `--max-context 8192 --kv-capacity 16384 --max-concurrency 2 --device-state-slots 2 --host-state-slots 0 --host-kv-mib 0 --max-private-continuations 2 --max-shared-prefixes 1 --max-long-anchors-per-continuation 0` |
-| `shared-value` | `--max-context 16384 --kv-capacity 16384 --max-concurrency 1 --device-state-slots 3 --host-state-slots 0 --host-kv-mib 0 --max-private-continuations 1 --max-shared-prefixes 1 --max-long-anchors-per-continuation 0` |
-| `session-order` | `--max-context 8192 --kv-capacity 16384 --max-concurrency 2 --device-state-slots 8 --host-state-slots 0 --host-kv-mib 0 --max-private-continuations 4 --max-shared-prefixes 0 --max-long-anchors-per-continuation 0` |
-| `scheduler-overlap` | `--max-context 8192 --kv-capacity 16384 --max-concurrency 2 --prefill-chunk 1024 --no-prefix-reuse` |
-| `scheduler-prefill-128` | `--max-context 8192 --kv-capacity 16384 --max-concurrency 2 --prefill-chunk 128 --no-prefix-reuse` |
-| `scheduler-prefill-4096` | `--max-context 8192 --kv-capacity 16384 --max-concurrency 2 --prefill-chunk 4096 --no-prefix-reuse` |
-| `scheduler-backfill` | `--max-context 7744 --kv-capacity 7808 --max-concurrency 2 --pending-timeout-ms 120000 --no-prefix-reuse` |
-| `lane-limit-8` | `--max-context 4224 --kv-capacity 33792 --max-concurrency 8 --max-pending-requests 1 --pending-timeout-ms 120000 --no-prefix-reuse` |
-| `pending-timeout` | `--max-context 4224 --kv-capacity 4224 --max-concurrency 1 --max-pending-requests 1 --pending-timeout-ms 100 --no-prefix-reuse` |
-| `context-boundary` | `--max-context 8192 --kv-capacity 8192 --max-concurrency 1 --no-prefix-reuse` |
-| `vision-cache` | `--max-context 32768 --kv-capacity 32768 --max-concurrency 1 --device-state-slots 2 --host-state-slots 0 --host-kv-mib 0 --max-private-continuations 2 --max-shared-prefixes 0 --max-long-anchors-per-continuation 0 --vision --media-cache-mib 512 --media-live-mib 512` |
-| `vision-thread-1` | `--max-context 32768 --kv-capacity 32768 --max-concurrency 1 --device-state-slots 2 --host-state-slots 0 --host-kv-mib 0 --max-private-continuations 2 --max-shared-prefixes 0 --max-long-anchors-per-continuation 0 --vision --media-cache-mib 512 --media-live-mib 512 --media-preprocess-threads 1` |
-| `vision-concurrent` | `--max-context 32768 --kv-capacity 65536 --max-concurrency 2 --vision --media-cache-mib 512 --media-live-mib 1024 --no-prefix-reuse` |
-| `media-cache-tight` | `--max-context 8192 --kv-capacity 8192 --max-concurrency 1 --vision --media-cache-mib 16 --media-live-mib 128 --no-prefix-reuse` |
-| `vision-boundary` | `--max-context 65536 --kv-capacity 65536 --max-concurrency 1 --vision --no-prefix-reuse` |
-| `mixed-four` | `--max-context 8192 --kv-capacity 32768 --max-concurrency 4 --vision` |
-
-## Audited cases
-
-Baseline and cache cases:
-
-| Case | Profile | Request graph and covered behavior |
-|---|---|---|
-| `cold-short` | `text-cold-8k` | One 30-token prompt; ordinary short baseline. |
-| `cold-long-8k` | `text-cold-8k` | One 7680-token prefill. |
-| `cold-long-64k` | `text-cold-64k` | One 64512-token prefill. |
-| `cold-long-256k` | `text-cold-256k` | One 260096-token, hardware-resident extreme input. |
-| `mixed-four-ordered` | `mixed-four` | Continuation, independent cold long, short, and image requests are submitted one by one after the preceding request is observably accepted by Serve. The two long prompts diverge at the first system-content token. |
-| `mixed-four-concurrent` | `mixed-four` | The same four heterogeneous requests are released through one barrier; no frontend or Engine submission order is assumed. |
-| `shared-state-working-set-shift` | `cache-state-working-set` | A/B/C then D/E/F, with three repeated probe rounds and a final A probe in the same process. |
-| `private-state-working-set-shift` | `cache-private-working-set` | Shared disabled: complete-history A/B conversations followed by four C/D rounds. |
-| `shared-state-hot-prefix` | `cache-state-working-set` | Repeated A probes interleaved with one-shot B–F conversations. |
-| `anonymous-hot-continuation` | `cache-hot` | Chat source then exact full-history continuation; private typed rewrite. |
-| `session-hot-continuation` | `cache-hot` | Stored Responses source then `previous_response_id` continuation. |
-| `session-alternating` | `cache-pressure-device` | `A1, B1, A2, B2` across two stored Responses lineages. |
-| `session-alternating-64k-host-swap` | `cache-swap-64k-host` | Two early-divergent 64512-token sessions run as `A1, B1, A2, B2`; one fits Device, the pair requires two Host KV covers for bidirectional rotation. |
-| `session-rotation-55k-host` | `cache-rotation-55k-host` | Six early-divergent 55000-token stored Responses roots, one warm branch from root 0, then three sequential six-root rounds; covers the large materialization target graph behind sequential Host-KV rotation. |
-| `session-rotation-55k-two-cohort-stream` | `cache-rotation-55k-host` | Replays the complete sequential rotation estate, keeps two 900-token store-free Responses streams continuously active, creates six distinct second-cohort 55000-token roots, then runs three second-cohort resume rounds. This is the process-history, concurrency, and Host State descriptor-pressure graph reported in issue #144. |
-| `unmarked-common-prefix-miss` | `cache-hot` | Two standalone user messages share over 4096 tokens but no legal marker. |
-| `resume-after-interference-device` | `cache-pressure-device` | Fixed A/B/C/A2 graph with source placement available on Device. |
-| `resume-after-interference-state-host` | `cache-pressure-state-host` | Same graph with checkpoint State available only on Host. |
-| `resume-after-interference-kv-host` | `cache-pressure-kv-host` | Same graph with KV pressure and Host KV available. |
-| `resume-after-interference-both-host` | `cache-pressure-both-host` | Same graph with State and KV Host capacity. |
-| `resume-after-interference-evicted` | `cache-pressure-evict` | Source can publish initially, then pressure has no Host fallback. |
-| `resume-after-interference-catalog` | `cache-pressure-catalog` | Logical catalog fills while physical capacity remains. |
-| `continuation-cache-off` | `cache-off` | Stored Responses control with Engine prefix reuse disabled. |
-| `shared-sequential` | `shared-prefix` | Anthropic-marked system prefix followed by a second suffix. |
-| `shared-openai-explicit` | `shared-prefix` | OpenAI explicit system breakpoint followed by a different suffix. |
-| `shared-openai-implicit` | `shared-value` | OpenAI's default full-prompt candidate, private displacement, then the identical prompt. |
-| `shared-observed-promotion` | `shared-value` | Two independent unmarked Anthropic requests establish demand; a filler removes the private endpoint before a third identical request. |
-| `shared-fanout` | `shared-prefix` | Seed then two simultaneous branches from a 4149-token, non-page-aligned frontier. |
-| `shared-slot-retention` | `shared-value` | Equal-size marked A and B compete for `S=1` while physical capacity can retain A; a filler removes A's private fallback before A returns. |
-| `shared-value-replacement` | `shared-value` | A 4149-token system owner and a 5074-token tool candidate compete for `S=1`; a filler removes B's private fallback before B returns. |
-| `shared-tools-sequential` | `shared-prefix` | Two requests with the same marked 32-tool prefix. |
-| `shared-tools-changed` | `shared-prefix` | The first tool identity changes, invalidating the marked tool prefix. |
-
-Scheduling and boundary cases:
-
-| Case | Profile | Required external relation or boundary |
-|---|---|---|
-| `short-during-prefill-128` | `scheduler-prefill-128` | `long.accepted < short.sent < long.first`. |
-| `short-during-prefill-1024` | `scheduler-overlap` | Same arrival graph with the standard prefill chunk. |
-| `short-during-prefill-4096` | `scheduler-prefill-4096` | Same graph with the largest covered chunk. |
-| `short-during-decode` | `scheduler-overlap` | `holder.first < short.sent < holder.completed`. |
-| `protected-head-backfill` | `scheduler-backfill` | Safe short borrower passes a resource-blocked FIFO head. |
-| `protected-head-no-backfill` | `scheduler-backfill` | 3072-token borrower stays behind the head because it would keep blocking it. |
-| `active-lanes-full-8` | `lane-limit-8` | Eight holders reach first output before a ninth probe; covers the product lane ceiling. |
-| `session-publication-order` | `session-order` | Older child starts first but finishes after newer child; later continuation follows newer. |
-| `cancel-before-first` | `scheduler-overlap` | Cancel after acceptance and require transport termination without first output or terminal event, then run a probe. |
-| `cancel-after-first` | `scheduler-overlap` | Cancel an active decode after first output, require transport termination without terminal event, then run a probe. |
-| `pending-overflow` | `lane-limit-8` | Eight active + one pending; next request must be 429 `server_overloaded`. |
-| `pending-timeout` | `pending-timeout` | Blocked non-streaming request must be 503 `request_queue_timeout`. |
-| `context-exact` | `context-boundary` | `p + o - 1 = 8192` succeeds. |
-| `context-over` | `context-boundary` | 8193-token prompt is 400 `context_length_exceeded`. |
-
-Media cases:
-
-| Case | Profile | Request graph and covered behavior |
-|---|---|---|
-| `media-cold-image` | `vision-cache` | One image through acquisition, preprocess, Vision, and text prefill. |
-| `media-cold-image-video` | `vision-cache` | Interleaved image and video input. |
-| `media-prefix-continuation` | `vision-cache` | Same media and full history followed by text. |
-| `media-prefix-append` | `vision-cache` | Reused media history with one new suffix image. |
-| `media-prefix-changed` | `vision-cache` | A byte-distinct replacement changes an earlier media identity. |
-| `media-preprocess-warm` | `media-cache-tight` | Identical standalone image twice with context reuse disabled. |
-| `media-cache-thrash` | `media-cache-tight` | `A, B, C, A` against a 16 MiB preprocess cache. |
-| `many-image-28` | `vision-cache` | Legal 28-image request with 28752 expanded prompt tokens. |
-| `many-image-28-thread-1` | `vision-thread-1` | Same request with one host preprocessing worker. |
-| `text-during-media-prepare` | `vision-concurrent` | Media body completes, then short text arrives before media acceptance and must finish first. |
-| `media-during-text-decode` | `vision-concurrent` | Heavy media request arrives while a text holder decodes. |
-| `two-heavy-media-arrivals` | `vision-concurrent` | Two byte-distinct 28-image requests start through one barrier. |
-| `vision-disabled` | `text-cold-8k` | Image request is 400 `vision_disabled`. |
-| `vision-envelope-over` | `vision-boundary` | 33 images exceed the 32768 raw-patch envelope and return `media_budget_exceeded`. |
-
-The protected-head profile uses:
-
-```text
-e(holder)=4224, e(head)=7744, e(short)=64, e(unsafe)=3072, K=7808
-holder+head > K
-holder+short <= K and head+short <= K      # safe backfill
-holder+unsafe <= K but head+unsafe > K     # unsafe backfill
-```
-
-## Run and summarize
-
-The normal entry point is one managed command:
-
-```bash
-python3 tools/bench/run_serve_ttft_campaign.py --campaign resource --samples 5
-```
-
-`smoke` runs the short baseline. `resource` runs the six Device/Host/eviction/catalog comparisons,
-the 64K bidirectional Host-swap case, the original six-session 55K Host-rotation case, and its
-two-cohort concurrent-stream pressure case, plus the three State working-set/hot-prefix cases.
-The State profiles use DFlash2 K7, 32768-token KV capacity and no Host KV; their 2048-token roots
-accumulate checkpoint pressure within one sample process. `full` runs every audited case.
-`resource` is the default and `--samples` defaults to one.
-Repeat `--case NAME` instead of `--campaign` to run a focused subset through the same managed
-lifecycle, for example:
+## Run a campaign
 
 ```bash
 python3 tools/bench/run_serve_ttft_campaign.py \
-  --case session-hot-continuation \
-  --case resume-after-interference-device \
-  --case shared-sequential \
-  --samples 3
+  --serve build/rtx5090-dev/apps/ninfer-serve \
+  --artifact /explicit/qwen3_8_27b_nvfp4.ninfer \
+  --campaign resource --samples 1 --output-dir .agent-tmp/ttft/run
 ```
 
-The controller uses Qwen3.8-27B NVFP4 with FP8 KV, starts and stops a fresh Serve for every sample,
-shows the runner's live progress, retains the RAM artifact across campaigns until reboot or source
-replacement, and writes beneath:
+可通过重复 `--case` 选择场景，完整 catalog 和参数见 `--help`。
+`--profile-config` 使用 JSON 的 `common_args` 与 `profiles` 替换内置参数表，manifest 记录实际命令。
+比较不同版本时显式匹配物理预算、artifact、backend、观测和硬件条件。
 
-```text
-profiles/bench/ttft/qwen3_8_27b_nvfp4-fp8/<timestamp>-<campaign>/
-  manifest.json
-  raw/<profile>/<case>/sample-NNN.json
-  progress/<profile>/<case>/sample-NNN.log
-  serve/<profile>/<case>/sample-NNN.log
-  request-log/<profile>/<case>/sample-NNN.jsonl
-  summary.md
-  summary.json
-  summary.csv
-  failures.json                         # only when a run fails
-```
+每个 sample 使用新进程，warmup 在测量前完成。输出包括 manifest、raw client JSON、progress、
+Serve 日志、request JSONL 和 summary；失败也保留已有测量。
+Raw 输入和输出供后续身份分析，媒体 data URL 在测量后去重保存。
 
-The raw JSON is the external TTFT measurement authority. Progress and text Serve logs are
-operational diagnostics; the structured request log records internal timings for diagnosis and
-does not replace the external measurement. Complete, failed, and interrupted
-campaigns automatically produce the same summary bundle. `summary.md` is the human report;
-`summary.json` is the complete machine-readable aggregate; `summary.csv` contains typed TTFT,
-comparison, symmetric-order, rejection, and optional cross-campaign rows. `manifest.json` records
-both the source artifact and the actual tmpfs path used by Serve.
-
-The low-level runner remains available when a separately managed Serve process is intentional:
+访问独立管理的服务：
 
 ```bash
 python3 tools/bench/run_serve_ttft.py \
-  --base-url http://127.0.0.1:18080 \
-  --case shared-fanout \
+  --base-url http://127.0.0.1:18080 --case shared-fanout \
   --profile-label shared-prefix \
-  --output profiles/bench/ttft/shared-fanout-01.json
+  --request-log-jsonl .agent-tmp/ttft/server.jsonl \
+  --output .agent-tmp/ttft/shared-fanout.json
 ```
 
-Exit status is zero only for a constructed case. Raw results preserve external timestamps,
-request body bytes, outcome, HTTP status/code, compact event trace, first-output order, completion
-order, public model ID, and failed construction conditions.
+Profile label 是记录标签，不验证该服务的实际设置。
 
-The runner prints live progress to `stderr` and flushes every line. It reports profile validation,
-corpus loading, model discovery, case-graph construction, barriers, and each request's preparation,
-start, body upload, acceptance, first output, terminal outcome, waits, cancellation, and errors.
-A five-second heartbeat names the last stage and every active request while a long prefill or decode
-has no new public event. Stage lines use elapsed monotonic time and include TTFT or upload duration
-when that value becomes observable. The final JSON remains the only content written to `stdout`, so
-progress can be displayed interactively or redirected independently without changing report input.
-
-To re-aggregate one complete or partial campaign manually:
+## Interpretation and comparisons
 
 ```bash
-python3 tools/bench/summarize_serve_ttft.py \
-  profiles/bench/ttft/qwen3_8_27b_nvfp4-fp8/<campaign>
+python3 tools/bench/summarize_serve_ttft.py .agent-tmp/ttft/candidate \
+  --baseline .agent-tmp/ttft/baseline
 ```
 
-Add `--baseline <campaign>` for matching observations against an explicit prior campaign. The
-summarizer reads only runs declared by the campaign manifest, reports missing, invalid, and
-unconstructed samples, and links each issue back to raw/progress/Serve/request diagnostics.
+Client 测量与 server 内部观测通过真实 wire IDs 关联，不跨进程相减绝对时钟。
+Server first-output snapshot 可解释准备、queue、binding、pause、resident 和 HTTP residual；
+细分 GPU/Host/传输时间可能重叠，不能再次加到 wall time。缺失数据保持 unavailable，
+负 residual 保留为不一致测量。
 
-Successful constructed TTFT is grouped by public model, architecture category, case, profile, and
-request role. Each group reports raw samples, min, median, max, median absolute deviation, and
-relative span. Declared comparisons use `subject - baseline`, so a positive delta means the subject
-is slower; roles inside one case are paired per run, while cross-case comparisons use independent
-group medians. Symmetric barrier roles are ranked inside each run without assigning semantic
-meaning to arbitrary role names. The report does not publish QPS, throughput, P95, or inferred
-internal cache actions.
+启动资源保留 ranks 与 total allocations，独立于是否取得运行期 interval。
+Periodic occupancy 是采样最大值，只有 allocator 的真实高水位称为 peak。
+未完成目的仍占预留，自己的 Replay 不计跨请求 cache hit。
 
-## Deliberately absent cases
+分析 miss 先核对真实输入与完整 checkpoint 是否存在，再看选择与回收。
+最长相同 token 前缀不证明那个位置有 recurrent State；语义可复用上界与实际可保留恢复点分开解释。
 
-Public HTTP requests cannot precisely force or prove private long anchors, multiple independent
-cache markers, an invalid “KV without State” checkpoint, allocator-fragment geometry, one exact
-transaction/cancellation instruction boundary, or a particular partial page residency. Those are
-Engine tests, not black-box TTFT cases. Large-scale concurrency, QoS, preemption, multi-GPU,
-multi-model serving, artifact comparisons, and speculative-backend sweeps are outside the product
-workload and this benchmark.
+比较保留每次样本、离散性、失败与未构造场景。单 sample 只说明轨迹，
+显著异常才继续定位；微小差值不独立证明回退。精确 State/KV、lease 和事务边界由
+[行为测试](../../../tests/README.md)验证，HTTP 测量补充真实调度与时延证据。

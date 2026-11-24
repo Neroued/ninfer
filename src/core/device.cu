@@ -58,6 +58,10 @@ void destroy_event(cudaEvent_t& event) noexcept {
 
 } // namespace
 
+DeviceAllocationError::DeviceAllocationError(const char* operation, std::size_t requested_bytes)
+    : std::runtime_error(std::string(operation) + ": insufficient Device memory"),
+      requested_bytes_(requested_bytes) {}
+
 void cuda_check(cudaError_t err, const char* expr, const char* file, int line) {
     if (err == cudaSuccess) { return; }
     std::fprintf(stderr, "%s:%d: CUDA_CHECK(%s) failed: %s: %s\n", file, line, expr,
@@ -65,15 +69,15 @@ void cuda_check(cudaError_t err, const char* expr, const char* file, int line) {
     std::abort();
 }
 
-DeviceContext::DeviceContext(int device_id) : device(device_id) {
+DeviceContext::DeviceContext(int device_id) : device_(Device::cuda(device_id)) {
     const unsigned int sync_flags = sync_schedule_from_environment();
-    int count       = 0;
-    cudaError_t err = cudaGetDeviceCount(&count);
+    int count                     = 0;
+    cudaError_t err               = cudaGetDeviceCount(&count);
     if (err != cudaSuccess) {
         throw std::runtime_error(cuda_error_message("cudaGetDeviceCount failed", err));
     }
     if (count <= 0) { throw std::runtime_error("no CUDA devices available"); }
-    if (device_id < 0 || device_id >= count) { throw std::runtime_error("invalid CUDA device id"); }
+    if (device_id >= count) { throw std::invalid_argument("invalid CUDA device id"); }
 
     bind_to_current_thread();
 
@@ -82,7 +86,7 @@ DeviceContext::DeviceContext(int device_id) : device(device_id) {
         throw std::runtime_error(cuda_error_message("cudaSetDeviceFlags failed", err));
     }
 
-    err = cudaGetDeviceProperties(&props, device_id);
+    err = cudaGetDeviceProperties(&props_, device_id);
     if (err != cudaSuccess) {
         throw std::runtime_error(cuda_error_message("cudaGetDeviceProperties failed", err));
     }
@@ -102,60 +106,112 @@ DeviceContext::DeviceContext(int device_id) : device(device_id) {
             cuda_error_message("cudaStreamCreateWithFlags(transfer_stream) failed", err));
     }
 
-    stream          = compute;
-    transfer_stream = load;
+    stream_          = compute;
+    transfer_stream_ = load;
 }
 
 DeviceContext::~DeviceContext() {
-    if (stream != nullptr || transfer_stream != nullptr) { bind_to_current_thread_noexcept(); }
-    destroy_stream(transfer_stream);
-    destroy_stream(stream);
+    if (stream_ != nullptr || transfer_stream_ != nullptr) { bind_to_current_thread_noexcept(); }
+    destroy_stream(transfer_stream_);
+    destroy_stream(stream_);
 }
 
 DeviceContext::DeviceContext(DeviceContext&& other) noexcept
-    : device(other.device), stream(other.stream), transfer_stream(other.transfer_stream),
-      props(other.props) {
-    other.stream          = nullptr;
-    other.transfer_stream = nullptr;
+    : device_(other.device_), stream_(other.stream_), transfer_stream_(other.transfer_stream_),
+      props_(other.props_) {
+    other.stream_          = nullptr;
+    other.transfer_stream_ = nullptr;
 }
 
 DeviceContext& DeviceContext::operator=(DeviceContext&& other) noexcept {
     if (this == &other) { return *this; }
 
-    if (stream != nullptr || transfer_stream != nullptr) { bind_to_current_thread_noexcept(); }
-    destroy_stream(transfer_stream);
-    destroy_stream(stream);
+    if (stream_ != nullptr || transfer_stream_ != nullptr) { bind_to_current_thread_noexcept(); }
+    destroy_stream(transfer_stream_);
+    destroy_stream(stream_);
 
-    device          = other.device;
-    props           = other.props;
-    stream          = other.stream;
-    transfer_stream = other.transfer_stream;
+    device_          = other.device_;
+    props_           = other.props_;
+    stream_          = other.stream_;
+    transfer_stream_ = other.transfer_stream_;
 
-    other.stream          = nullptr;
-    other.transfer_stream = nullptr;
+    other.stream_          = nullptr;
+    other.transfer_stream_ = nullptr;
     return *this;
 }
 
 void DeviceContext::bind_to_current_thread() const {
-    const cudaError_t err = cudaSetDevice(device);
+    const cudaError_t err = cudaSetDevice(device_.index());
     if (err != cudaSuccess) {
         throw std::runtime_error(cuda_error_message("cudaSetDevice failed", err));
     }
 }
 
 void DeviceContext::bind_to_current_thread_noexcept() const noexcept {
-    log_cuda_error("cudaSetDevice", cudaSetDevice(device));
+    log_cuda_error("cudaSetDevice", cudaSetDevice(device_.index()));
 }
 
-int DeviceContext::compute_capability() const noexcept { return props.major * 10 + props.minor; }
+int DeviceContext::compute_capability() const noexcept { return props_.major * 10 + props_.minor; }
 
-int DeviceContext::multiprocessor_count() const noexcept { return props.multiProcessorCount; }
+int DeviceContext::multiprocessor_count() const noexcept { return props_.multiProcessorCount; }
 
-DeviceExecutionView DeviceContext::execution_view() const noexcept {
-    return {.stream = stream, .multiprocessor_count = multiprocessor_count()};
+CudaExecutionView DeviceContext::execution_view() const noexcept {
+    return {device(), stream_, multiprocessor_count()};
 }
 
-std::size_t DeviceContext::total_vram() const noexcept { return props.totalGlobalMem; }
+CudaExecutionView DeviceContext::transfer_view() const noexcept {
+    return {device(), transfer_stream_, multiprocessor_count()};
+}
+
+CudaExecutionView DeviceContext::execution_view(cudaStream_t borrowed_stream) const {
+    CudaDeviceScope scope(device());
+    int ordinal      = -1;
+    const auto error = cudaStreamGetDevice(borrowed_stream, &ordinal);
+    if (error != cudaSuccess) {
+        throw std::runtime_error(cuda_error_message("cudaStreamGetDevice failed", error));
+    }
+    if (ordinal != device_.index()) {
+        throw std::invalid_argument("stream belongs to another device");
+    }
+    return {device(), borrowed_stream, multiprocessor_count()};
+}
+
+CudaDeviceScope::CudaDeviceScope(Device device) {
+    if (device.type() != DeviceType::CUDA) {
+        throw std::invalid_argument("CUDA operation requires a CUDA device");
+    }
+    auto error = cudaGetDevice(&previous_);
+    if (error == cudaSuccess && previous_ != device.index()) {
+        error    = cudaSetDevice(device.index());
+        changed_ = error == cudaSuccess;
+    }
+    if (error != cudaSuccess) {
+        throw std::runtime_error(cuda_error_message("CUDA device selection failed", error));
+    }
+}
+
+CudaDeviceScope::~CudaDeviceScope() {
+    if (changed_) { log_cuda_error("restore CUDA device", cudaSetDevice(previous_)); }
+}
+
+CudaStream::CudaStream(const DeviceContext& device) : device_(device.device()) {
+    CudaDeviceScope scope(device_);
+    const auto error = cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking);
+    if (error != cudaSuccess) {
+        throw std::runtime_error(cuda_error_message("cudaStreamCreateWithFlags failed", error));
+    }
+}
+
+CudaStream::~CudaStream() {
+    try {
+        CudaDeviceScope scope(device_);
+        destroy_stream(stream_);
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "CUDA stream cleanup failed: %s\n", error.what());
+    }
+}
+
+std::size_t DeviceContext::total_vram() const noexcept { return props_.totalGlobalMem; }
 
 const char* DeviceContext::sync_mode() const {
     bind_to_current_thread();
@@ -170,9 +226,9 @@ const char* DeviceContext::sync_mode() const {
     throw std::runtime_error("unknown CUDA synchronization schedule");
 }
 
-void DeviceContext::synchronize() const { CUDA_CHECK(cudaStreamSynchronize(stream)); }
+void DeviceContext::synchronize() const { CUDA_CHECK(cudaStreamSynchronize(stream_)); }
 
-CudaEventTimer::CudaEventTimer(const DeviceContext& ctx) : CudaEventTimer(ctx, ctx.stream) {}
+CudaEventTimer::CudaEventTimer(const DeviceContext& ctx) : CudaEventTimer(ctx, ctx.stream()) {}
 
 CudaEventTimer::CudaEventTimer(const DeviceContext& ctx, cudaStream_t stream) : stream_(stream) {
     if (stream == nullptr) { throw std::invalid_argument("CUDA timer stream is null"); }
@@ -239,7 +295,7 @@ float CudaEventTimer::stop_ms() {
     return elapsed_ms();
 }
 
-CudaCompletionEvent::CudaCompletionEvent(const DeviceContext& ctx) : device_(ctx.device) {
+CudaCompletionEvent::CudaCompletionEvent(const DeviceContext& ctx) {
     ctx.bind_to_current_thread();
     const cudaError_t err = cudaEventCreateWithFlags(&event_, cudaEventDisableTiming);
     if (err != cudaSuccess) {
@@ -250,13 +306,12 @@ CudaCompletionEvent::CudaCompletionEvent(const DeviceContext& ctx) : device_(ctx
 CudaCompletionEvent::~CudaCompletionEvent() { destroy_event(event_); }
 
 CudaCompletionEvent::CudaCompletionEvent(CudaCompletionEvent&& other) noexcept
-    : device_(other.device_), event_(std::exchange(other.event_, nullptr)) {}
+    : event_(std::exchange(other.event_, nullptr)) {}
 
 CudaCompletionEvent& CudaCompletionEvent::operator=(CudaCompletionEvent&& other) noexcept {
     if (this == &other) { return *this; }
     destroy_event(event_);
-    device_ = other.device_;
-    event_  = std::exchange(other.event_, nullptr);
+    event_ = std::exchange(other.event_, nullptr);
     return *this;
 }
 
@@ -264,14 +319,38 @@ void CudaCompletionEvent::record(cudaStream_t stream) {
     if (event_ == nullptr || stream == nullptr) {
         throw std::logic_error("CUDA completion event is not recordable");
     }
-    CUDA_CHECK(cudaEventRecord(event_, stream));
+    const auto status = cudaEventRecord(event_, stream);
+    if (status != cudaSuccess) {
+        throw std::runtime_error(cuda_error_message("cudaEventRecord failed", status));
+    }
 }
 
 void CudaCompletionEvent::wait(cudaStream_t stream) const {
     if (event_ == nullptr || stream == nullptr) {
         throw std::logic_error("CUDA completion event is not waitable");
     }
-    CUDA_CHECK(cudaStreamWaitEvent(stream, event_, 0));
+    const auto status = cudaStreamWaitEvent(stream, event_, 0);
+    if (status != cudaSuccess) {
+        throw std::runtime_error(cuda_error_message("cudaStreamWaitEvent failed", status));
+    }
+}
+
+void CudaCompletionEvent::record_external(cudaStream_t stream) {
+    if (event_ == nullptr || stream == nullptr) {
+        throw std::logic_error("CUDA completion event is not recordable");
+    }
+    const auto status = cudaEventRecordWithFlags(event_, stream, cudaEventRecordExternal);
+    if (status != cudaSuccess) {
+        throw std::runtime_error(cuda_error_message("cudaEventRecordWithFlags failed", status));
+    }
+}
+
+void CudaCompletionEvent::wait_external(cudaStream_t stream) const {
+    if (event_ == nullptr || stream == nullptr)
+        throw std::logic_error("CUDA completion event is not waitable");
+    const auto status = cudaStreamWaitEvent(stream, event_, cudaEventWaitExternal);
+    if (status != cudaSuccess)
+        throw std::runtime_error(cuda_error_message("cudaStreamWaitEvent external failed", status));
 }
 
 bool CudaCompletionEvent::ready() const {
@@ -279,13 +358,15 @@ bool CudaCompletionEvent::ready() const {
     const cudaError_t status = cudaEventQuery(event_);
     if (status == cudaSuccess) { return true; }
     if (status == cudaErrorNotReady) { return false; }
-    CUDA_CHECK(status);
-    return false;
+    throw std::runtime_error(cuda_error_message("cudaEventQuery failed", status));
 }
 
 void CudaCompletionEvent::synchronize() const {
     if (event_ == nullptr) { throw std::logic_error("CUDA completion event is empty"); }
-    CUDA_CHECK(cudaEventSynchronize(event_));
+    const auto status = cudaEventSynchronize(event_);
+    if (status != cudaSuccess) {
+        throw std::runtime_error(cuda_error_message("cudaEventSynchronize failed", status));
+    }
 }
 
 } // namespace ninfer

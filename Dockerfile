@@ -10,16 +10,22 @@ RUN apt-get update \
         libavformat-dev \
         libavutil-dev \
         libcurl4-openssl-dev \
+        libhwloc-dev \
+        libjpeg-dev \
         libswscale-dev \
+        liburing-dev \
         ninja-build \
         pkg-config \
     && rm -rf /var/lib/apt/lists/*
+
+# Link against the toolkit stub when the build stage has no host GPU driver.
+RUN ln -s /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/libcuda.so.1
 
 WORKDIR /src
 COPY . .
 
 RUN cmake -S . -B /build -G Ninja \
-        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_BUILD_TYPE=Release -DNINFER_TARGET=rtx5090 \
         -DNINFER_BUILD_APPS=ON \
         -DBUILD_TESTING=OFF \
         -DNINFER_BUILD_BENCHMARKS=OFF \
@@ -35,11 +41,15 @@ RUN apt-get update \
         libavformat60 \
         libavutil58 \
         libcurl4t64 \
+        libhwloc15 \
+        libjpeg-turbo8 \
         libswscale7 \
+        liburing2 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /build/apps/ninfer /usr/local/bin/ninfer
 COPY --from=build /build/apps/ninfer-serve /usr/local/bin/ninfer-serve
+COPY --from=build /build/lib/ /usr/local/lib/
 
 WORKDIR /workspace
 EXPOSE 8080

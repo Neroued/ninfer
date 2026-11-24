@@ -1,7 +1,7 @@
 #include "ops/softmax_attention/dense/context/launch.h"
 
 #include "core/device.h"
-#include "ops/softmax_attention/dense/context/kernel.cuh"
+#include "ops/softmax_attention/kernels/context_query/paged.cuh"
 
 #include <algorithm>
 #include <cstdint>
@@ -47,58 +47,14 @@ void dispatch_tokens(std::int32_t tokens, Launch&& launch) {
 
 } // namespace
 
-ContextAttentionPlan context_attention_resolve_plan(std::int32_t tokens,
-                                                    ContextAttentionExecutionEnvelope envelope) {
-    if (tokens < 1 || tokens > 16) {
-        throw std::invalid_argument("context_softmax_attention plan: T must be 1..16");
-    }
-    if (envelope.min_context > envelope.max_context) {
-        throw std::invalid_argument("context_softmax_attention plan: invalid envelope");
-    }
-    const std::int32_t warps = (tokens + 3) / 4;
-    const bool direct        = envelope.max_context == 0;
-    const std::int32_t key_block =
-        direct || tokens <= 8 || envelope.max_context <= 65536u ? 32 : 64;
-    std::int32_t split_limit = 32;
-    if (tokens <= 8) {
-        split_limit =
-            envelope.max_context <= 131072u ? 32 : (envelope.max_context <= 196608u ? 48 : 64);
-    } else if (key_block == 64) {
-        split_limit =
-            envelope.max_context <= 131072u ? 32 : (envelope.max_context <= 196608u ? 38 : 40);
-    }
-    const std::uint32_t envelope_tiles =
-        (envelope.max_context + static_cast<std::uint32_t>(key_block) - 1u) /
-        static_cast<std::uint32_t>(key_block);
-    const std::int32_t splits =
-        direct ? 1 : std::min(split_limit, std::max(1, static_cast<std::int32_t>(envelope_tiles)));
-    return {
-        .route          = direct ? ContextAttentionRoute::Direct : ContextAttentionRoute::SplitKv,
-        .tokens         = tokens,
-        .warps          = warps,
-        .key_block      = key_block,
-        .split_capacity = splits,
-    };
-}
-
-const char* context_attention_route_name(ContextAttentionRoute route) {
-    switch (route) {
-    case ContextAttentionRoute::Direct:
-        return "direct";
-    case ContextAttentionRoute::SplitKv:
-        return "split_kv";
-    }
-    return "unknown";
-}
-
-void context_attention_launch(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
+void launch_context_attention(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
                               const Tensor& context_lengths, const Tensor& valid_columns,
                               const Tensor& table_rows, float scale,
-                              const PagedKVBatchLayerView& context,
+                              const ConstPagedKVBatchLayerView& context,
                               const ContextAttentionPlan& plan, Tensor& partial_acc,
                               Tensor& partial_m, Tensor& partial_l, Tensor& out,
                               cudaStream_t stream) {
-    dispatch_tokens(q.ne[2], [&]<int Tokens, int Warps>() {
+    dispatch_tokens(plan.tokens, [&]<int Tokens, int Warps>() {
         const bool direct = plan.route == ContextAttentionRoute::Direct;
         if (plan.warps != Warps || plan.split_capacity < 1 ||
             plan.split_capacity > kContextQueryMaxSplit) {
@@ -120,11 +76,11 @@ void context_attention_launch(const Tensor& q, const Tensor& query_k, const Tens
                     static_cast<const std::int32_t*>(context_lengths.data),
                     static_cast<const std::int32_t*>(valid_columns.data),
                     static_cast<const std::int32_t*>(table_rows.data),
-                    static_cast<const __nv_bfloat16*>(context.k_pages.data),
-                    static_cast<const __half*>(context.v_pages.data),
-                    static_cast<const std::int32_t*>(context.block_tables.data),
-                    context.k_pages.ne[2], context.block_tables.ne[0],
-                    context.block_tables.ne[0] * kPagedKVPageSize, 1, scale,
+                    static_cast<const __nv_bfloat16*>(context.k_pages.data()),
+                    static_cast<const __half*>(context.v_pages.data()),
+                    static_cast<const std::int64_t*>(context.k_pages.records.page_offsets.data),
+                    context.k_pages.records.page_offsets.ne[0],
+                    context.k_pages.records.page_offsets.ne[0] * kPagedKVPageSize, 1, scale,
                     static_cast<__nv_bfloat16*>(partial_acc.data),
                     static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data),
                     static_cast<__nv_bfloat16*>(out.data));
@@ -148,12 +104,12 @@ void context_attention_launch(const Tensor& q, const Tensor& query_k, const Tens
                     static_cast<const std::int32_t*>(context_lengths.data),
                     static_cast<const std::int32_t*>(valid_columns.data),
                     static_cast<const std::int32_t*>(table_rows.data),
-                    static_cast<const __nv_bfloat16*>(context.k_pages.data),
-                    static_cast<const __half*>(context.v_pages.data),
-                    static_cast<const std::int32_t*>(context.block_tables.data),
-                    context.k_pages.ne[2], context.block_tables.ne[0],
-                    context.block_tables.ne[0] * kPagedKVPageSize, plan.split_capacity, scale,
-                    static_cast<__nv_bfloat16*>(partial_acc.data),
+                    static_cast<const __nv_bfloat16*>(context.k_pages.data()),
+                    static_cast<const __half*>(context.v_pages.data()),
+                    static_cast<const std::int64_t*>(context.k_pages.records.page_offsets.data),
+                    context.k_pages.records.page_offsets.ne[0],
+                    context.k_pages.records.page_offsets.ne[0] * kPagedKVPageSize,
+                    plan.split_capacity, scale, static_cast<__nv_bfloat16*>(partial_acc.data),
                     static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data),
                     static_cast<__nv_bfloat16*>(out.data));
             CUDA_CHECK(cudaGetLastError());
@@ -164,7 +120,7 @@ void context_attention_launch(const Tensor& q, const Tensor& query_k, const Tens
                 static_cast<const float*>(partial_l.data),
                 static_cast<const std::int32_t*>(context_lengths.data),
                 static_cast<const std::int32_t*>(valid_columns.data),
-                context.block_tables.ne[0] * kPagedKVPageSize, plan.split_capacity,
+                context.k_pages.records.page_offsets.ne[0] * kPagedKVPageSize, plan.split_capacity,
                 static_cast<__nv_bfloat16*>(out.data));
             CUDA_CHECK(cudaGetLastError());
         };

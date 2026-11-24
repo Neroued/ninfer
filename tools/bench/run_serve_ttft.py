@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import os
 import queue
@@ -19,6 +20,7 @@ if __package__ in {None, ""}:
 
 from tools.bench.ttft.cases import CASES, get_case, run_case
 from tools.bench.ttft.corpus import DEFAULT_MANIFEST, Corpus
+from tools.bench.ttft.diagnostics import attach_generation_diagnostics
 from tools.bench.ttft.execution import CaseContext
 from tools.ninfer_serve.client import NInferServeClient
 
@@ -125,9 +127,35 @@ class StderrProgress:
         self._thread.join()
 
 
+def _externalize_media(value: Any, directory: Path) -> Any:
+    if isinstance(value, str) and value.startswith("data:"):
+        encoded = value.encode("utf-8")
+        digest = hashlib.sha256(encoded).hexdigest()
+        destination = directory / f"{digest}.data-url"
+        if not destination.exists():
+            directory.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(encoded)
+        return {"type": "data_url_file", "encoding": "utf-8",
+                "path": f"{directory.name}/{destination.name}", "sha256": digest}
+    if isinstance(value, dict):
+        return {key: _externalize_media(item, directory) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_externalize_media(item, directory) for item in value]
+    return value
+
+
 def _write(path: Path, value: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    stored = {
+        **value,
+        "requests": [
+            {**request, "request_payload": _externalize_media(
+                request["request_payload"], path.parent / f"{path.stem}-media",
+            )} if "request_payload" in request else request
+            for request in value.get("requests", [])
+        ],
+    }
+    path.write_text(json.dumps(stored, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -138,6 +166,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--timeout-seconds", type=float, default=600.0)
     parser.add_argument("--api-key-env", default="NINFER_API_KEY")
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--request-log-jsonl", type=Path,
+        help="local Serve JSONL log for observed-pressure mechanism graphs",
+    )
     args = parser.parse_args(argv)
     if args.timeout_seconds <= 0:
         parser.error("--timeout-seconds must be positive")
@@ -171,6 +203,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             model = client.discover_model()
             progress.event("model.ready", model=model)
             context = CaseContext(client, model, args.timeout_seconds, progress.emit)
+            if args.request_log_jsonl is not None:
+                context.notes["request_log_jsonl"] = str(args.request_log_jsonl.expanduser().resolve())
             progress.event("case.graph_start", description=definition.description)
             result = run_case(definition, context, corpus, args.profile_label)
             result["server"] = {"base_url": args.base_url.rstrip("/"), "model": model}
@@ -213,6 +247,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     result["started_at"] = started
     result["finished_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+    diagnostic_error = attach_generation_diagnostics(result, args.request_log_jsonl)
+    if diagnostic_error is not None:
+        result["diagnostic_error"] = diagnostic_error
     try:
         progress.event("result.write", path=str(args.output))
         try:
@@ -234,7 +271,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     finally:
         progress.close()
     print(json.dumps(result, ensure_ascii=False, indent=2))
-    return 0 if result.get("constructed") is True else 2
+    return 0 if result.get("constructed") is True and not result.get("failed_conditions") else 2
 
 
 if __name__ == "__main__":

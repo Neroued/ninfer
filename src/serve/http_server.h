@@ -1,10 +1,11 @@
 #pragma once
 
 #include "serve/generation_service.h"
+#include "serve/metrics.h"
 #include "serve/operational_log.h"
 #include "serve/openai_responses_store.h"
 #include "serve/request_log.h"
-#include "serve/serve_options.h"
+#include "product/config/options.h"
 
 #include <httplib.h>
 
@@ -27,7 +28,7 @@ void write_anthropic_error(httplib::Response& response, const ApiError& error,
 // cpp-httplib invokes the error handler for every application response with status >= 400. Only
 // an empty 413 is its own pre-routing payload-limit rejection; application-authored errors must be
 // left untouched.
-httplib::Server::HandlerResponse handle_unrendered_http_error(const ServeOptions& options,
+httplib::Server::HandlerResponse handle_unrendered_http_error(const product::ServeOptions& options,
                                                               const httplib::Request& request,
                                                               httplib::Response& response);
 
@@ -36,7 +37,7 @@ httplib::Server::HandlerResponse handle_unrendered_http_error(const ServeOptions
 
 class HttpServer {
 public:
-    HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> logger);
+    HttpServer(product::ServeOptions options, std::shared_ptr<spdlog::logger> logger);
 
     // Reserves the configured address before model loading. The service is attached only after its
     // Engine is ready, then listen() enters the blocking accept loop on the already-bound socket.
@@ -89,6 +90,9 @@ private:
     void handle_model(const httplib::Request& req, httplib::Response& res) const;
 
     void record_request_start(const RequestLogContext& context);
+    [[nodiscard]] ninfer::GenerationSchedulingObserver
+    scheduling_observer(std::uint64_t request_id, std::string http_request_id);
+    [[nodiscard]] ninfer::GenerationFirstTokenObserver first_token_observer();
     void record_request_rejected(const RequestRejectionLogContext& context);
     void record_request_done(const RequestLogContext& context, const GenerationOutcome& outcome);
     void record_request_failure(const RequestLogContext& context, const RequestFailure& failure);
@@ -98,11 +102,12 @@ private:
     void stop_stats_reporter();
 
     GenerationService* service_ = nullptr;
-    ServeOptions options_;
+    product::ServeOptions options_;
     std::string public_model_id_;
     OpenAIResponsesStore openai_responses_store_;
     OperationalLog operational_log_;
     JsonlRequestLog request_jsonl_;
+    Metrics metrics_;
     httplib::Server server_;
     std::atomic<std::uint64_t> request_seq_{0};
     std::mutex stats_mutex_;

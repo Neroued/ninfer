@@ -1,6 +1,6 @@
 #pragma once
 
-#include "ops/softmax_attention/dense/causal_cache/k8v4/schedule.cuh"
+#include "ops/softmax_attention/kernels/causal/k8v4/schedule.cuh"
 
 namespace ninfer::ops::detail {
 
@@ -16,6 +16,6 @@ struct K8V4KvGroupedInstance {
     using Merge                    = K8V4KvMergeSchedule;
 };
 
-using K8V4KvTiledInstance = K8V4KvTiledMmaSchedule<kMxfp8TiledQueryRows, 64>;
+using K8V4KvTiledInstance = K8V4KvTiledMmaSchedule<128, 64>;
 
 } // namespace ninfer::ops::detail

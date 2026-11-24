@@ -1,6 +1,7 @@
 #include "ninfer/ops/softmax_attention.h"
 
 #include "core/layout.h"
+#include "ops/common/host/operands.h"
 #include "ops/softmax_attention/dense/context/launch.h"
 
 #include <algorithm>
@@ -25,52 +26,31 @@ void require_profile(AttentionHeadGeometry geometry, const char* op) {
     }
 }
 
-void require_shape(const Tensor& tensor, std::int32_t n0, std::int32_t n1, std::int32_t n2,
-                   std::int32_t n3, const char* op, const char* name) {
-    if (tensor.ne[0] != n0 || tensor.ne[1] != n1 || tensor.ne[2] != n2 || tensor.ne[3] != n3) {
-        throw std::invalid_argument(std::string(op) + ": invalid shape for " + name);
-    }
-}
-
-void require_contiguous_nonnull(const Tensor& tensor, const char* op, const char* name) {
-    if (!tensor.is_contiguous()) {
-        throw std::invalid_argument(std::string(op) + ": " + name + " must be contiguous");
-    }
-    if (tensor.data == nullptr) {
-        throw std::invalid_argument(std::string(op) + ": " + name + " data must be non-null");
-    }
-}
-
-std::uint32_t validate_context(const PagedKVBatchLayerView& context, const char* op) {
+std::uint32_t validate_context(const ConstPagedKVBatchLayerView& context, const char* op,
+                               Device device) {
+    common::operand::device(context.device(), device, op, "cache");
     if (context.storage != KvCacheStorage::BFloat16 || context.num_kv_heads != kKVHeads ||
         context.head_dim != kHeadDim) {
         throw std::invalid_argument(std::string(op) + ": invalid context geometry or dtype");
     }
-    const std::int32_t physical_pages = context.k_pages.ne[2];
-    if (physical_pages <= 0 || context.v_pages.ne[2] != physical_pages ||
-        context.block_tables.ne[0] <= 0 || context.block_tables.ne[1] <= 0) {
+    const auto& offsets = context.k_pages.records.page_offsets;
+    if (offsets.ne[0] <= 0 || offsets.ne[1] <= 0 ||
+        context.k_pages.records.page_tokens != kPagedKVPageSize) {
         throw std::invalid_argument(std::string(op) + ": invalid context capacity");
     }
-    if (context.k_pages.dtype != DType::BF16 || context.v_pages.dtype != DType::FP16) {
-        throw std::invalid_argument(std::string(op) + ": context K/V must be BF16");
-    }
-    require_shape(context.k_pages, kHeadDim, kPagedKVPageSize, physical_pages, kKVHeads, op,
-                  "context k pages");
-    require_shape(context.v_pages, kHeadDim, kPagedKVPageSize, physical_pages, kKVHeads, op,
-                  "context v pages");
-    require_contiguous_nonnull(context.k_pages, op, "context k pages");
-    require_contiguous_nonnull(context.v_pages, op, "context v pages");
-    require_shape(context.block_tables, context.block_tables.ne[0], context.block_tables.ne[1], 1,
-                  1, op, "context block tables");
-    if (context.block_tables.dtype != DType::I32) {
-        throw std::invalid_argument(std::string(op) + ": context block tables must be I32");
-    }
-    require_contiguous_nonnull(context.block_tables, op, "context block tables");
-    if (context.k_scale_pages.data != nullptr || context.v_scale_pages.data != nullptr) {
+    common::operand::paged_plane(context.k_pages, DType::BF16,
+                                 {kHeadDim, kPagedKVPageSize, kKVHeads}, 16, op, "context K",
+                                 device);
+    common::operand::paged_plane(context.v_pages, DType::FP16,
+                                 {kHeadDim, kPagedKVPageSize, kKVHeads}, 16, op, "context V",
+                                 device);
+    common::operand::same_paged_records(context.k_pages, context.v_pages, op, "context K/V");
+    if (context.k_scale_pages.records.storage.data != nullptr ||
+        context.v_scale_pages.records.storage.data != nullptr) {
         throw std::invalid_argument(std::string(op) + ": BF16 context must not have scales");
     }
     const std::uint64_t logical_capacity =
-        static_cast<std::uint64_t>(context.block_tables.ne[0]) * kPagedKVPageSize;
+        static_cast<std::uint64_t>(context.k_pages.records.page_offsets.ne[0]) * kPagedKVPageSize;
     if (logical_capacity > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::overflow_error(std::string(op) + ": logical context capacity exceeds int32");
     }
@@ -84,8 +64,11 @@ struct PartialWorkspace {
 };
 
 template <class Allocator>
-PartialWorkspace allocate_workspace(Allocator& workspace, std::int32_t tokens, std::int32_t splits,
+PartialWorkspace allocate_workspace(Allocator& workspace, std::int32_t tokens,
+                                    const detail::ContextAttentionPlan& plan,
                                     std::int32_t batch_size) {
+    if (plan.route == detail::ContextAttentionRoute::Direct) return {};
+    const int splits = plan.split_capacity;
     return {
         workspace.alloc(DType::BF16, {kHeadDim, kQHeads, tokens, splits * batch_size}),
         workspace.alloc(DType::FP32, {kQHeads, tokens, splits * batch_size}),
@@ -107,9 +90,9 @@ std::size_t context_softmax_attention_workspace_capacity_bytes(
             "context_softmax_attention workspace: invalid envelope or token interval");
     }
     const auto endpoint_capacity = [&](std::int32_t tokens) {
-        const auto plan = detail::context_attention_resolve_plan(tokens, envelope);
+        const auto plan = detail::select_context_attention_plan(tokens, envelope);
         WorkspaceLayoutBuilder layout;
-        (void)allocate_workspace(layout, tokens, plan.split_capacity, batch_size);
+        (void)allocate_workspace(layout, tokens, plan, batch_size);
         return layout.peak_bytes(1);
     };
 
@@ -122,9 +105,14 @@ std::size_t context_softmax_attention_workspace_capacity_bytes(
 void context_softmax_attention(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
                                const Tensor& context_lengths, const Tensor& valid_columns,
                                const Tensor& table_rows, AttentionHeadGeometry geometry,
-                               float scale, const PagedKVBatchLayerView& context,
-                               ContextAttentionExecutionEnvelope envelope,
-                               WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
+                               float scale, const ConstPagedKVBatchLayerView& context,
+                               ContextAttentionExecutionEnvelope envelope, MemoryArena& workspace,
+                               Tensor& out, CudaExecutionView execution) {
+    if (workspace.device() != execution.device()) {
+        throw std::invalid_argument(
+            "context_softmax_attention: workspace belongs to another device");
+    }
+    const auto stream        = execution.stream();
     constexpr const char* op = "context_softmax_attention";
     require_profile(geometry, op);
     if (q.dtype != DType::BF16 || query_k.dtype != DType::BF16 || query_v.dtype != DType::BF16 ||
@@ -144,21 +132,21 @@ void context_softmax_attention(const Tensor& q, const Tensor& query_k, const Ten
     if (batch < 1 || batch > 8) {
         throw std::invalid_argument("context_softmax_attention: B must be 1..8");
     }
-    require_shape(q, kHeadDim, kQHeads, tokens, batch, op, "q");
-    require_shape(query_k, kHeadDim, kKVHeads, tokens, batch, op, "query k");
-    require_shape(query_v, kHeadDim, kKVHeads, tokens, batch, op, "query v");
-    require_shape(context_lengths, batch, 1, 1, 1, op, "context lengths");
-    require_shape(valid_columns, batch, 1, 1, 1, op, "valid columns");
-    require_shape(table_rows, batch, 1, 1, 1, op, "table rows");
-    require_shape(out, kHeadDim, kQHeads, tokens, batch, op, "out");
-    require_contiguous_nonnull(q, op, "q");
-    require_contiguous_nonnull(query_k, op, "query k");
-    require_contiguous_nonnull(query_v, op, "query v");
-    require_contiguous_nonnull(context_lengths, op, "context lengths");
-    require_contiguous_nonnull(valid_columns, op, "valid columns");
-    require_contiguous_nonnull(table_rows, op, "table rows");
-    require_contiguous_nonnull(out, op, "out");
-    const std::uint32_t logical_capacity = validate_context(context, op);
+    common::operand::shape(q, {kHeadDim, kQHeads, tokens, batch}, op, "q");
+    common::operand::shape(query_k, {kHeadDim, kKVHeads, tokens, batch}, op, "query k");
+    common::operand::shape(query_v, {kHeadDim, kKVHeads, tokens, batch}, op, "query v");
+    common::operand::shape(context_lengths, {batch, 1, 1, 1}, op, "context lengths");
+    common::operand::shape(valid_columns, {batch, 1, 1, 1}, op, "valid columns");
+    common::operand::shape(table_rows, {batch, 1, 1, 1}, op, "table rows");
+    common::operand::shape(out, {kHeadDim, kQHeads, tokens, batch}, op, "out");
+    common::operand::contiguous_nonnull(q, op, "q", execution.device());
+    common::operand::contiguous_nonnull(query_k, op, "query k", execution.device());
+    common::operand::contiguous_nonnull(query_v, op, "query v", execution.device());
+    common::operand::contiguous_nonnull(context_lengths, op, "context lengths", execution.device());
+    common::operand::contiguous_nonnull(valid_columns, op, "valid columns", execution.device());
+    common::operand::contiguous_nonnull(table_rows, op, "table rows", execution.device());
+    common::operand::contiguous_nonnull(out, op, "out", execution.device());
+    const std::uint32_t logical_capacity = validate_context(context, op, execution.device());
     if (envelope.min_context > envelope.max_context || envelope.max_context > logical_capacity) {
         throw std::invalid_argument("context_softmax_attention: invalid execution envelope");
     }
@@ -167,9 +155,9 @@ void context_softmax_attention(const Tensor& q, const Tensor& query_k, const Ten
     }
 
     auto scope               = workspace.scope();
-    const auto plan          = detail::context_attention_resolve_plan(tokens, envelope);
-    PartialWorkspace partial = allocate_workspace(workspace, tokens, plan.split_capacity, batch);
-    detail::context_attention_launch(q, query_k, query_v, context_lengths, valid_columns,
+    const auto plan          = detail::select_context_attention_plan(tokens, envelope);
+    PartialWorkspace partial = allocate_workspace(workspace, tokens, plan, batch);
+    detail::launch_context_attention(q, query_k, query_v, context_lengths, valid_columns,
                                      table_rows, scale, context, plan, partial.acc, partial.m,
                                      partial.l, out, stream);
 }

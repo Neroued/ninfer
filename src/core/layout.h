@@ -16,7 +16,10 @@ struct LayoutRegion {
     std::size_t bytes     = 0;
     std::size_t alignment = 1;
 
-    [[nodiscard]] DeviceSpan bind(DeviceSpan backing) const;
+    friend bool operator==(const LayoutRegion&, const LayoutRegion&) = default;
+
+    [[nodiscard]] MemorySpan bind(MemorySpan backing) const;
+    [[nodiscard]] ConstMemorySpan bind(ConstMemorySpan backing) const;
 };
 
 struct TensorRegion {
@@ -24,7 +27,7 @@ struct TensorRegion {
     DType dtype = DType::BF16;
     std::array<std::int32_t, 4> shape{1, 1, 1, 1};
 
-    [[nodiscard]] Tensor bind(DeviceSpan backing) const;
+    [[nodiscard]] Tensor bind(MemorySpan backing) const;
 };
 
 // Checked offset builder for project-owned backing allocations. Model-specific code owns the
@@ -60,7 +63,7 @@ private:
     std::size_t peak_   = 0;
 };
 
-// Dry-run counterpart of WorkspaceArena. Target allocation helpers can run against this builder
+// Dry-run counterpart of MemoryArena. Target allocation helpers can run against this builder
 // and the real arena, including identical nested scope lifetimes, without maintaining byte
 // formulas.
 class WorkspaceLayoutBuilder {
@@ -82,7 +85,7 @@ public:
 
     [[nodiscard]] Tensor alloc(DType dtype, std::initializer_list<std::int32_t> shape,
                                std::size_t alignment = 256);
-    [[nodiscard]] DeviceSpan alloc_bytes(std::size_t bytes, std::size_t alignment = 256);
+    [[nodiscard]] MemorySpan alloc_bytes(std::size_t bytes, std::size_t alignment = 256);
     [[nodiscard]] Scope scope() noexcept;
     [[nodiscard]] std::size_t peak_bytes(std::size_t alignment = 256) const;
 

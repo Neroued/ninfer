@@ -1,12 +1,11 @@
 #pragma once
 
+#include "core/device.h"
 #include "core/arena.h"
 #include "core/tensor.h"
 
 #include <cstddef>
 #include <cstdint>
-
-#include <cuda_runtime.h> // cudaStream_t
 
 namespace ninfer::ops {
 
@@ -20,17 +19,27 @@ enum SamplePurpose : std::int32_t {
     kSamplePurposeDFlash2Proposal       = 5,
 };
 
-// Device-resident sampling parameters. token_counts is an optional device I32
+// Borrowed round operand. Positions are contiguous packed vocabulary masks; null disables it.
+// Empty support is permitted only where the consuming Op defines it. sample() and
+// speculative_accept_* require a legal token at each consumed position; their caller carries
+// dead-end status separately and supplies safe filler for dead/unreachable positions.
+struct SamplingMask {
+    const std::uint32_t* words = nullptr;
+    std::int32_t stride        = 0;
+};
+
+// Device-resident sampling parameters and operands. token_counts is an optional device I32
 // [token_domain] committed generated-token occurrence-count array used by both penalties.
 struct SamplingConfig {
-    float temperature          = 0.0f; // <= 0 => greedy argmax (bit-identical to argmax())
-    std::int32_t top_k         = 20;   // runtime contract is [1,20]; Op defensively caps otherwise
-    float top_p                = 1.0f; // >= 1 => disabled
-    float min_p                = 0.0f; // <= 0 => disabled
-    float presence_penalty     = 0.0f;
-    float frequency_penalty    = 0.0f;
-    unsigned long long seed    = 0;
-    std::int32_t* token_counts = nullptr; // device [token_domain] i32, or null
+    float temperature       = 0.0f; // <= 0 => greedy argmax over allowed tokens
+    std::int32_t top_k      = 20;   // runtime contract is [1,20]; Op defensively caps otherwise
+    float top_p             = 1.0f; // >= 1 => disabled
+    float min_p             = 0.0f; // <= 0 => disabled
+    float presence_penalty  = 0.0f;
+    float frequency_penalty = 0.0f;
+    unsigned long long seed = 0;
+    const std::int32_t* token_counts = nullptr; // device [token_domain] i32, or null
+    SamplingMask mask;
 };
 
 // Caller-owned transient capacity for every parallel sampling-lane count in the inclusive
@@ -46,6 +55,8 @@ struct SamplingConfig {
  * [physical_rows,B], `out` and `logical_positions` are contiguous I32 [B], and only vocabulary
  * rows v in [0,token_domain) participate. `configs` is a device-resident contiguous
  * SamplingConfig[B] array. Greedy and stochastic rows may coexist in one invocation.
+ * A non-null config.mask excludes vocabulary rows before argmax/top-k and normalization. sample()
+ * consumes mask position zero; speculative acceptance consumes its corresponding verify position.
  *
  * For row b with configs[b].temperature<=0:
  *
@@ -67,18 +78,30 @@ struct SamplingConfig {
  *
  * Row b uses counter-based RNG key
  * (configs[b].seed,logical_positions[b],purpose), without mutable RNG state or dependence on the
- * compact row index. In every mode the selected token atomically increments
- * configs[b].token_counts when it is non-null. Non-null token-count arrays belonging to distinct
- * active requests must not alias. `out` must not overlap logits, configs, logical_positions, or any
- * token-count array. The Op writes all of out, uses caller-owned transient storage reported by
- * sampling_workspace_capacity_bytes(), and has no other persistent-state side effect.
+ * compact row index. Counts, masks and all inputs remain read-only. `out` must not overlap
+ * logits, configs, logical_positions or any token-count array. The Op writes all of out, uses
+ * caller-owned transient storage reported by sampling_workspace_capacity_bytes(), and has no
+ * persistent-state side effect. The caller commits its final output with the count-update Op.
  */
 void sample(const Tensor& logits, Tensor& out, std::int32_t token_domain,
             const SamplingConfig* configs, const Tensor& logical_positions, std::int32_t purpose,
-            WorkspaceArena& workspace, cudaStream_t stream);
+            MemoryArena& workspace, CudaExecutionView execution);
 
 // Adds every id in the contiguous non-empty I32 token_ids vector to the contiguous I32
 // [token_domain] committed count array. IDs must be in [0,token_domain).
-void increment_token_counts(const Tensor& token_ids, Tensor& token_counts, cudaStream_t stream);
+void increment_token_counts(const Tensor& token_ids, Tensor& token_counts,
+                            CudaExecutionView execution);
+
+// Adds the first valid_columns[b] IDs from I32 token_ids [T,B] to count slot slots[b] in
+// I32 token_counts [V,S]. T,V,S>0, B=1..8; valid_columns/slots are contiguous I32 [B].
+// 0<=valid_columns[b]<=T; live rows have slots[b] in [0,S). IDs are in [0,V), and counts
+// remain representable in I32. A zero-length row reads neither IDs
+// nor its slot. Repeated IDs or slots add all occurrences atomically. Inputs are contiguous;
+// counts has contiguous vocabulary entries and a non-overlapping, naturally aligned slot
+// stride. All storage belongs to execution.device(); counts overlaps no input. Only the
+// addressed counts change. Device metadata is replayable; no workspace or allocation.
+void increment_token_counts_batch(const Tensor& token_ids, const Tensor& valid_columns,
+                                  const Tensor& slots, Tensor& token_counts,
+                                  CudaExecutionView execution);
 
 } // namespace ninfer::ops

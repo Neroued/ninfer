@@ -1,10 +1,10 @@
 #pragma once
 
+#include "core/device.h"
 #include "core/weight.h"
 #include "core/arena.h"
 #include "core/tensor.h"
 
-#include <cuda_runtime.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -21,9 +21,8 @@ namespace ninfer::ops {
     std::int32_t max_batch_size);
 
 /**
- * Op: rmsnorm_dynamic_grouped_conv_prepare
+ * Offset-free RMSNorm, dynamic coefficient projection and grouped two-tap convolution.
  *
- * Math / indexing:
  *   H=5120, W=2..16, group width 16, G=320, sides=2, taps=2. For h=16*g+j:
  *
  *     inv[i,b] = rsqrt(sum_h residual[h,i,b]^2 / H + eps)
@@ -37,34 +36,25 @@ namespace ninfer::ops {
  *
  *     finish_delta[g,t,i,b] = d[1,t,g,i,b].
  *
- * Logical shapes / supported domain:
- *   residual/prepared are contiguous BF16 [5120,W,B], W is in [2,16] and B in [1,8];
- *   norm_weight is contiguous BF16 [5120]. base_kernel is the runtime view BF16 [5120,2,2] with
- * axes [channel,tap,side]; kernel_projection_weight is contiguous BF16 [1280,5120]; and
- *   finish_delta is contiguous BF16 [320,2,W,B]. eps is positive and finite. Position zero has
- *   no previous-tap contribution: the Op never reads another request or an earlier round.
+ * Residual/prepared are contiguous BF16 [H,W,B], norm_weight [H], base_kernel
+ * [H,2,2] with axes [channel,tap,side], and finish_delta [G,2,W,B]. The projection
+ * weight is contiguous BF16 [1280,H]. W is in [2,16], B in [1,8]; tensor and weight
+ * bases are 16-byte aligned. Eps is positive and finite. Position zero has no previous
+ * contribution; the Op never reads another request or an earlier round.
  *
- * Numeric:
- *   The oracle evaluates the complete formula naively in FP64 from the represented BF16 inputs.
- *   Both BF16 outputs are promoted and compared directly with those ideal values under their
- *   named reduction criteria. RMS reduction order, Tensor Core operand staging, projection
- *   factorization, split-K reduction, and private intermediate precision are implementation
- *   choices; neither n nor the input-side coefficient plane is an observable cast boundary.
+ * The normalized n and input-side coefficients are private intermediates, with no
+ * observable cast boundary.
  *
- * Effects:
- *   Writes every element of prepared and finish_delta and preserves every input. Inputs, the
- *   weight payload, both outputs, and live workspace must be pairwise non-overlapping. The Op has
- *   no persistent state side effect.
- *
- * Workspace:
- *   Caller-owned call-scoped storage sized by the capacity query above. The implementation does
- *   not allocate or retain device memory.
+ * Writes every element of prepared and finish_delta and preserves every input.
+ * Inputs, weight payload, both outputs and live workspace are pairwise disjoint.
+ * Workspace is caller-owned, call-scoped and sized by the query above. The Op does
+ * not allocate or retain device memory and has no persistent state effect.
  */
 void rmsnorm_dynamic_grouped_conv_prepare(const Tensor& residual, const Tensor& norm_weight,
                                           float eps, const Tensor& base_kernel,
                                           const Weight& kernel_projection_weight, Tensor& prepared,
-                                          Tensor& finish_delta, WorkspaceArena& workspace,
-                                          cudaStream_t stream);
+                                          Tensor& finish_delta, MemoryArena& workspace,
+                                          CudaExecutionView execution);
 
 /**
  * Returns the transient capacity required by linear_dynamic_grouped_conv_add for every width/batch
@@ -76,9 +66,8 @@ void rmsnorm_dynamic_grouped_conv_prepare(const Tensor& residual, const Tensor& 
     std::int32_t min_batch_size, std::int32_t max_batch_size);
 
 /**
- * Op: linear_dynamic_grouped_conv_add
+ * Projection followed by grouped two-tap convolution and residual addition.
  *
- * Math / indexing:
  *   H=5120, W=2..16, group width 16, G=320. Let C be 4096 or 17408 and h=16*g+j:
  *
  *     z[h,i,b] = sum_c projection_weight[h,c] * x[c,i,b]
@@ -87,31 +76,22 @@ void rmsnorm_dynamic_grouped_conv_prepare(const Tensor& residual, const Tensor& 
  *         (base_kernel[h,0,1] + finish_delta[g,0,i,b]) * z[h,i,b]
  *       + I(i>0) * (base_kernel[h,1,1] + finish_delta[g,1,i,b]) * z[h,i-1,b].
  *
- * Logical shapes / supported domain:
- *   x is contiguous BF16 [C,W,B]; projection_weight is Q8_G32_FP16 RowSplit [5120,C] with
- *   unpadded C; base_kernel is contiguous BF16 [5120,2,2] with axes [channel,tap,side];
- *   finish_delta is contiguous BF16 [320,2,W,B]; and residual is contiguous BF16 [5120,W,B].
- *   W is in [2,16] and B in [1,8]. Position zero has no previous-tap contribution: the Op never
+ * Contiguous BF16 x [C,W,B], base_kernel [H,2,2] with axes [channel,tap,side],
+ * finish_delta [G,2,W,B], and residual [H,W,B]. The projection weight is Q8_G32_FP16
+ * RowSplit [H,C] without padding. W is in [2,16], B in [1,8]; tensor and weight-plane
+ * bases are 16-byte aligned. Position zero has no previous contribution; the Op never
  * reads another request or an earlier round.
  *
- * Numeric:
- *   The oracle decodes each signed Q8 value with its stored FP16 group scale and evaluates the
- *   complete formula in FP64 from represented inputs. The projection is a private intermediate;
- *   the contract does not prescribe its storage or arithmetic precision. The implementation
- *   writes the final residual in BF16.
+ * Projected z is a private intermediate, with no observable cast boundary.
  *
- * Effects:
- *   Updates every element of residual in place and preserves x, projection_weight, base_kernel,
- *   and finish_delta. All operand storage, both weight planes, and live workspace must be pairwise
- *   non-overlapping. The Op has no persistent state side effect.
- *
- * Workspace:
- *   Caller-owned call-scoped storage sized by the capacity query above. The implementation does
- *   not allocate or retain device memory.
+ * Updates every residual element in place and preserves x, weights and finish_delta.
+ * All operand storage, both weight planes and live workspace are pairwise disjoint.
+ * Workspace is caller-owned, call-scoped and sized by the query above. The Op does
+ * not allocate or retain device memory and has no persistent state effect.
  */
 void linear_dynamic_grouped_conv_add(const Tensor& x, const Weight& projection_weight,
                                      const Tensor& base_kernel, const Tensor& finish_delta,
-                                     Tensor& residual, WorkspaceArena& workspace,
-                                     cudaStream_t stream);
+                                     Tensor& residual, MemoryArena& workspace,
+                                     CudaExecutionView execution);
 
 } // namespace ninfer::ops

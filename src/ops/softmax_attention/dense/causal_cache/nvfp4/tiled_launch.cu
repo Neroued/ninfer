@@ -1,7 +1,7 @@
 // Non-RDC compilation is required for the producer/consumer register redistribution.
 #include "ops/softmax_attention/dense/causal_cache/nvfp4/tiled_launch.h"
 #include "ops/softmax_attention/dense/causal_cache/nvfp4/instances.h"
-#include "ops/softmax_attention/dense/causal_cache/nvfp4/tiled_launch.cuh"
+#include "ops/softmax_attention/kernels/causal/nvfp4/tiled_launch.cuh"
 
 namespace ninfer::ops::detail {
 void nvfp4_kv_tiled_attention(const CausalAttentionOperands& p, Nvfp4KvReadView cache,

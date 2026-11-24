@@ -1,6 +1,7 @@
+#include "ninfer/ops/indexing.h"
+#include "core/buffer.h"
 // Public benchmark for the registered proposal token-id remap.
 
-#include "ninfer/ops/speculative_round.h"
 
 #include "ninfer_bench_common.h"
 
@@ -32,18 +33,20 @@ void run(int tokens) {
         host_tokens[static_cast<std::size_t>(i)] = (7919 * i) & (kMapSize - 1);
     }
 
-    DeviceBuffer map(host_map.size() * sizeof(std::int32_t));
-    DeviceBuffer proposals(host_tokens.size() * sizeof(std::int32_t));
-    map.copy_from_host(host_map.data(), map.bytes);
-    proposals.copy_from_host(host_tokens.data(), proposals.bytes);
-    Tensor proposal_tensor(proposals.p, DType::I32, {tokens});
+    DeviceBuffer map(ninfer::bench::device_context().device(),
+                     host_map.size() * sizeof(std::int32_t));
+    DeviceBuffer proposals(ninfer::bench::device_context().device(),
+                           host_tokens.size() * sizeof(std::int32_t));
+    map.copy_from_host(host_map.data(), map.size());
+    proposals.copy_from_host(host_tokens.data(), proposals.size());
+    Tensor proposal_tensor(proposals.span(), DType::I32, {tokens});
 
     SavedBuffer initial(proposals);
     const Result result = bench_loop_prepared(
-        [&](cudaStream_t stream) { initial.restore(stream); },
-        [&](cudaStream_t stream) {
-            ops::proposal_remap_token_ids(proposal_tensor, static_cast<const std::int32_t*>(map.p),
-                                          kMapSize, stream);
+        [&](CudaExecutionView cuda) { initial.restore(cuda); },
+        [&](CudaExecutionView cuda) {
+            ops::remap_ids_inplace(proposal_tensor, static_cast<const std::int32_t*>(map.data()),
+                                   kMapSize, cuda);
         },
         static_cast<double>(tokens) * 3.0 * sizeof(std::int32_t));
     char label[96];

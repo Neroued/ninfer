@@ -152,6 +152,67 @@ int main() {
             startup_output.find("CUDA initialized") == std::string::npos,
         "normal startup pretty output is noisy or incomplete");
 
+    std::string ranks_output;
+    {
+        StderrCapture capture;
+        {
+            ninfer::product::LoggingRuntime logging(
+                {.logger_name  = "ninfer",
+                 .color        = ninfer::product::LogColorMode::Never,
+                 .presentation = ninfer::product::LogPresentation::Tool});
+            ninfer::product::StartupLogRenderer startup(logging);
+            const auto observer = startup.observer();
+            for (std::uint32_t rank : {0U, 1U})
+                observer.callback({.phase         = ninfer::StartupPhase::WeightsMaterialize,
+                                   .status        = ninfer::StartupStatus::Begin,
+                                   .progress_unit = ninfer::StartupProgressUnit::Bytes,
+                                   .total         = 2ULL << 30,
+                                   .origin        = ninfer::StartupOrigin{rank, rank},
+                                   .invocation    = 1});
+            for (std::uint32_t rank : {1U, 0U}) {
+                ninfer::StartupEvent event{.phase  = ninfer::StartupPhase::WeightsMaterialize,
+                                           .status = ninfer::StartupStatus::Complete,
+                                           .progress_unit = ninfer::StartupProgressUnit::Bytes,
+                                           .current       = 2ULL << 30,
+                                           .total         = 2ULL << 30,
+                                           .elapsed_ns    = (rank + 1ULL) * 1'000'000'000,
+                                           .origin        = ninfer::StartupOrigin{rank, rank},
+                                           .invocation    = 1};
+                observer.callback(event);
+                observer.callback(event); // A boundary snapshot can repeat the terminal event.
+                event.status = ninfer::StartupStatus::Progress;
+                observer.callback(event); // Delayed diagnostics must not reopen the phase.
+            }
+            observer.callback({.phase      = ninfer::StartupPhase::ProgramInitialize,
+                               .status     = ninfer::StartupStatus::Failed,
+                               .origin     = ninfer::StartupOrigin{0, 0},
+                               .invocation = 2});
+            observer.callback({.phase      = ninfer::StartupPhase::CudaGraphPrepare,
+                               .status     = ninfer::StartupStatus::Complete,
+                               .elapsed_ns = 500'000'000,
+                               .origin     = ninfer::StartupOrigin{0, 0},
+                               .attempt    = 1,
+                               .invocation = 3});
+            observer.callback({.phase      = ninfer::StartupPhase::ProgramInitialize,
+                               .status     = ninfer::StartupStatus::Failed,
+                               .origin     = ninfer::StartupOrigin{1, 1},
+                               .invocation = 2});
+            logging.flush();
+        }
+        ranks_output = capture.finish();
+    }
+    failures += check(
+        line_count(ranks_output) == 7 &&
+            ranks_output.find("[rank 0/node 0] weights ready | 2.00 GiB | 1.0s | 2.00 GiB/s") !=
+                std::string::npos &&
+            ranks_output.find("[rank 1/node 1] weights ready | 2.00 GiB | 2.0s | 1.00 GiB/s") !=
+                std::string::npos &&
+            ranks_output.find("[rank 0/node 0] [attempt 2] CUDA graphs ready") !=
+                std::string::npos &&
+            ranks_output.find("[rank 0/node 0] startup phase failed") != std::string::npos &&
+            ranks_output.find("[rank 1/node 1] startup phase failed") != std::string::npos,
+        "distributed startup mixed rank timing, retries, or phase completion");
+
     std::string tool_output;
     {
         StderrCapture capture;

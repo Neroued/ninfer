@@ -1,0 +1,106 @@
+{
+  "run_id": "20261020T163759Z-d63ec28c",
+  "started_at": "2026-10-20T16:37:59.924170+00:00",
+  "finished_at": "2026-10-22T08:33:47.158236+00:00",
+  "harness_commit": "a928f899f9e026d0428e02d3a88983f7be72524f",
+  "evalscope_version": "1.10.0",
+  "artifact_id": "57cf9cd010e3475fac9481e8fc66fc0f",
+  "deployment": {
+    "hardware": "2 x NVIDIA DGX Spark",
+    "tp": 2,
+    "ep": 2,
+    "max_concurrency": 8,
+    "max_context": 262144,
+    "kv_dtype": "bf16",
+    "prefill_chunk": 4096,
+    "cuda_graph": true,
+    "vision": true,
+    "speculative_backend": "mtp",
+    "draft_tokens": 3,
+    "proposal_head": "optimized"
+  },
+  "generation": {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 20,
+    "min_p": 0.0,
+    "presence_penalty": 0.0,
+    "frequency_penalty": 0.0,
+    "thinking": true,
+    "reasoning_effort": "xhigh",
+    "max_tokens": 131072
+  },
+  "evaluation": {
+    "few_shot_num": 0,
+    "judge_strategy": "rule",
+    "dataset_hub": "modelscope",
+    "evaluator_seed": 42,
+    "metric": "mean accuracy over all generated samples; not pass@k"
+  },
+  "results": [
+    {
+      "dataset": "gpqa_diamond",
+      "name": "GPQA-Diamond",
+      "accuracy": 0.9179,
+      "correct": 727,
+      "scored": 792,
+      "questions": 198,
+      "repeats": 4,
+      "failed": 0,
+      "truncated": 2,
+      "unparsed": 2
+    },
+    {
+      "dataset": "aime26",
+      "name": "AIME 2026",
+      "accuracy": 0.9778,
+      "correct": 88,
+      "scored": 90,
+      "questions": 30,
+      "repeats": 3,
+      "failed": 0,
+      "truncated": 0,
+      "unparsed": 0
+    },
+    {
+      "dataset": "erqa",
+      "name": "ERQA",
+      "accuracy": 0.68,
+      "correct": 272,
+      "scored": 400,
+      "questions": 400,
+      "repeats": 1,
+      "failed": 0,
+      "truncated": 0,
+      "unparsed": 0
+    },
+    {
+      "dataset": "real_world_qa",
+      "name": "RealWorldQA",
+      "accuracy": 0.8575,
+      "correct": 656,
+      "scored": 765,
+      "questions": 765,
+      "repeats": 1,
+      "failed": 0,
+      "truncated": 0,
+      "unparsed": 0
+    },
+    {
+      "dataset": "mmmu_pro",
+      "name": "MMMU-Pro (standard, 10 options)",
+      "accuracy": 0.8081,
+      "correct": 1398,
+      "scored": 1730,
+      "questions": 1730,
+      "repeats": 1,
+      "failed": 0,
+      "truncated": 0,
+      "unparsed": 1
+    }
+  ],
+  "notes": [
+    "Original scorer outputs are retained, including truncated and unparsed responses.",
+    "Vision results were collected before JPEG decoder fix 58733a86."
+  ]
+}

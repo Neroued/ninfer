@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections.abc import Callable
 from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
@@ -164,7 +165,11 @@ class Coordinator:
         self.suite_name = suite_name
         self.cancel_event = cancel_event or threading.Event()
 
-    def run(self, resume_dir: Path | None = None) -> Path:
+    def run(
+        self,
+        resume_dir: Path | None = None,
+        on_started: Callable[[Path], None] | None = None,
+    ) -> Path:
         validate_suite(self.config, self.suite_name, for_run=True)
         fingerprint = self.config.fingerprint(self.suite_name)
         if resume_dir is None:
@@ -260,6 +265,9 @@ class Coordinator:
                 runnable.append(job)
 
         try:
+            write_summary(run_dir, run_id, "running", list(results_by_id.values()))
+            if on_started is not None:
+                on_started(run_dir)
             with ThreadPoolExecutor(
                 max_workers=self.config.runtime.max_parallel_jobs
             ) as pool:
@@ -290,12 +298,22 @@ class Coordinator:
                         results_by_id[job.id] = self._failed_result(
                             job, "failed", str(exc)
                         )
+                    write_summary(
+                        run_dir,
+                        run_id,
+                        "running",
+                        [
+                            results_by_id[job.id]
+                            for job in self.suite.jobs
+                            if job.id in results_by_id
+                        ],
+                    )
             ordered = [results_by_id[job.id] for job in self.suite.jobs]
             if self.cancel_event.is_set():
                 final_status = "cancelled"
             elif all(result.status == "completed" for result in ordered):
                 final_status = "completed"
-            elif any(result.status == "completed" for result in ordered):
+            elif any(result.status in {"completed", "partial"} for result in ordered):
                 final_status = "partial"
             else:
                 final_status = "failed"
@@ -375,7 +393,8 @@ class Coordinator:
             _atomic_json(job_dir / "job-result.json", result.to_dict())
             state.update_job(
                 job.id,
-                status="completed",
+                status=result.status,
+                error=result.error,
                 finished_at=datetime.now(timezone.utc).isoformat(),
                 result=str((job_dir / "job-result.json").relative_to(jobs_dir.parent)),
             )
@@ -388,7 +407,8 @@ class Coordinator:
                     completed=result.counts.completed,
                     total=plan.total,
                     unit=plan.unit,
-                    message="completed",
+                    message=result.status,
+                    level="info" if result.status == "completed" else "warning",
                 )
             )
             return result

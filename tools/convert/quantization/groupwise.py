@@ -60,6 +60,19 @@ def _canonical_scale_words(
     return torch.from_numpy(scale), torch.from_numpy(reciprocal)
 
 
+def _cuda_scale_words(
+    max_abs: torch.Tensor, qmax: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # Keep the same FP64 -> FP32 -> FP16 rounding boundaries as the host oracle.
+    scale = (max_abs.double() / qmax).float().half()
+    scale = torch.where((scale == 0) & (max_abs > 0), _FP16_MIN_SUBNORMAL, scale)
+    invalid = ~torch.isfinite(max_abs) | ((max_abs > 0) & ~torch.isfinite(scale))
+    if bool(invalid.any()):
+        raise ValueError("grouped quantization source or scale is not finite")
+    reciprocal = torch.where(scale > 0, scale.double().reciprocal().float(), 0.0)
+    return scale, reciprocal
+
+
 def pick_device(preferred: str | torch.device = "cuda") -> torch.device:
     device = torch.device(preferred)
     if device.type == "cuda" and not torch.cuda.is_available():
@@ -92,7 +105,7 @@ def quantize_matrix(
 
     geometry = row_split_geometry(spec, weight.shape)
     target = pick_device() if device is None else pick_device(device)
-    logical = weight.detach().to(device=target, dtype=torch.float32)
+    logical = weight.detach().to(device=target).float()
     if geometry.k_pad != geometry.k:
         physical = torch.zeros(
             (geometry.n, geometry.k_pad), dtype=torch.float32, device=target
@@ -102,9 +115,8 @@ def quantize_matrix(
 
     grouped = logical.reshape(geometry.n, geometry.groups_per_row, spec.group_size)
     max_abs = grouped.abs().amax(dim=2)
-    host_scales, host_reciprocal = _canonical_scale_words(max_abs, spec.qmax)
-    scales = host_scales.to(target)
-    reciprocal = host_reciprocal.to(target)
+    scale_words = _cuda_scale_words if target.type == "cuda" else _canonical_scale_words
+    scales, reciprocal = scale_words(max_abs, spec.qmax)
     codes = torch.clamp(
         torch.round(grouped * reciprocal.unsqueeze(-1)), spec.qmin, spec.qmax
     ).to(torch.int8)

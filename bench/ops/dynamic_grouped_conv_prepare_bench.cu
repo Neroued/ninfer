@@ -1,4 +1,5 @@
 #include "core/weight.h"
+#include "core/buffer.h"
 #include "ninfer/ops/dynamic_grouped_conv.h"
 
 #include "direct_bf16_weight.cuh"
@@ -75,23 +76,24 @@ Options parse_args(int argc, char** argv) {
 void run_batch(int width, std::int32_t batch_size, const Options& options,
                const Tensor& norm_weight, const Tensor& base_kernel,
                const Weight& projection_weight, DeviceBuffer& residual_storage,
-               DeviceBuffer& prepared_storage, DeviceBuffer& finish_storage,
-               WorkspaceArena& workspace, bench::L2FlushBuffer& flush, cudaStream_t stream) {
+               DeviceBuffer& prepared_storage, DeviceBuffer& finish_storage, MemoryArena& workspace,
+               bench::L2FlushBuffer& flush, CudaExecutionView cuda) {
     const std::int32_t tokens = width * batch_size;
-    Tensor residual(residual_storage.p, DType::BF16, {kHidden, width, batch_size});
-    Tensor prepared(prepared_storage.p, DType::BF16, {kHidden, width, batch_size});
-    Tensor finish_delta(finish_storage.p, DType::BF16, {kGroups, kTaps, width, batch_size});
-    const auto launch = [&](cudaStream_t launch_stream) {
+    Tensor residual(residual_storage.span(), DType::BF16, {kHidden, width, batch_size});
+    Tensor prepared(prepared_storage.span(), DType::BF16, {kHidden, width, batch_size});
+    Tensor finish_delta(finish_storage.span(), DType::BF16, {kGroups, kTaps, width, batch_size});
+    const auto launch = [&](CudaExecutionView cuda) {
         workspace.reset();
         ops::rmsnorm_dynamic_grouped_conv_prepare(residual, norm_weight, 1.0e-6F, base_kernel,
                                                   projection_weight, prepared, finish_delta,
-                                                  workspace, launch_stream);
+                                                  workspace, cuda);
     };
     workspace.reset_peak();
     TimedGraph graph;
-    graph.capture(stream, launch);
-    const ColdTiming timing = measure_cold_launch([&](cudaStream_t s) { graph.launch(s); }, flush,
-                                                  stream, options.warmup, options.repeat);
+    graph.capture(cuda, launch);
+    const ColdTiming timing =
+        measure_cold_launch([&](CudaExecutionView cuda) { graph.launch(cuda); }, flush, cuda,
+                            options.warmup, options.repeat);
     const double seconds    = timing.median_us * 1.0e-6;
     const double projection_flops = 2.0 * kCoefficientRows * kHidden * static_cast<double>(tokens);
     const double effective_tflops = projection_flops / seconds / 1.0e12;
@@ -123,12 +125,15 @@ int main(int argc, char** argv) {
         bench::L2FlushBuffer flush(options.flush_bytes);
         const std::size_t workspace_bytes =
             ops::rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(2, 16, 1, 8);
-        WorkspaceArena workspace(workspace_bytes);
-        Tensor norm_weight(norm.p, DType::BF16, {kHidden});
-        Tensor base_kernel(base.p, DType::BF16, {kHidden, kTaps, kSides});
+        ninfer::DeviceBuffer workspace_storage(ninfer::bench::device_context().device(),
+                                               workspace_bytes);
+        MemoryArena workspace(workspace_storage.span());
+        Tensor norm_weight(norm.span(), DType::BF16, {kHidden});
+        Tensor base_kernel(base.span(), DType::BF16, {kHidden, kTaps, kSides});
 
         cudaStream_t stream = nullptr;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        const auto cuda = ninfer::bench::device_context().execution_view(stream);
         std::printf("W,B,T,median_us,min_us,p95_us,effective_projection_tflops,workspace_bytes,"
                     "graph_nodes\n");
         for (int width = 2; width <= 16; ++width) {
@@ -136,7 +141,7 @@ int main(int argc, char** argv) {
             for (std::int32_t batch_size = 1; batch_size <= 8; ++batch_size) {
                 if (options.batch && options.batch != batch_size) continue;
                 run_batch(width, batch_size, options, norm_weight, base_kernel, projection.weight,
-                          residual, prepared, finish, workspace, flush, stream);
+                          residual, prepared, finish, workspace, flush, cuda);
             }
         }
         CUDA_CHECK(cudaStreamDestroy(stream));

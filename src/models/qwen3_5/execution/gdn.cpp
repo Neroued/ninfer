@@ -1,179 +1,57 @@
 #include "models/qwen3_5/execution/gdn.h"
-
-#include "ninfer/ops/gdn_gating_proj.h"
+#include "ninfer/ops/gdn_control.h"
 #include "ninfer/ops/gdn_input_proj.h"
-
-#include <algorithm>
-#include <cmath>
-#include <cstdlib>
-#include <optional>
-#include <stdexcept>
+#include "ninfer/ops/linear_split.h"
 
 namespace ninfer::models::qwen3_5::execution {
 
-namespace {
-
-std::optional<float> target_igdn_dx_override() {
-    static const std::optional<float> value = []() -> std::optional<float> {
-        const char* raw = std::getenv("NINFER_TARGET_IGDN_DX_OVERRIDE");
-        if (raw == nullptr || raw[0] == '\0') return std::nullopt;
-
-        char* end = nullptr;
-        const float parsed = std::strtof(raw, &end);
-
-        if (end == raw || *end != '\0' || !std::isfinite(parsed) || parsed <= 0.0F) {
-            throw std::invalid_argument(
-                "NINFER_TARGET_IGDN_DX_OVERRIDE must be a finite positive float");
-        }
-        return parsed;
-    }();
-    return value;
-}
-
-} // namespace
-
-std::size_t gdn_projection_workspace_bytes(const GdnParameters& parameters, std::int32_t first,
+std::size_t gdn_projection_workspace_bytes(const GdnProfile& parameters, std::int32_t first,
                                            std::int32_t last) {
-    if (first <= 0 || last < first) {
-        throw std::invalid_argument("GDN projection: invalid column interval");
-    }
-    if (const auto* single = std::get_if<LinearParameters>(&parameters.projection)) {
-        const auto& w = single->weight;
-        return ops::gdn_input_proj_workspace_capacity_bytes(w.qtype, w.n, w.k, single->policy,
-                                                            first, last);
-    }
-    return 0;
+    return ops::linear_split_workspace_capacity_bytes(parameters.projection,
+                                                      parameters.projection_rows, first, last);
 }
 
-std::size_t gdn_snapshot_workspace_bytes(const GdnParameters& parameters, const GdnConfig& config,
-                                         std::int32_t batch, std::int32_t first_width,
-                                         std::int32_t last_width) {
-    const auto* single = std::get_if<LinearParameters>(&parameters.projection);
-    std::size_t bytes;
-    if (single && single->weight.qtype != QType::Q8_G32_FP16) {
-        const auto& w = single->weight;
-        bytes         = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-            w.qtype, w.n, w.k, single->policy, batch, first_width, last_width);
-    } else {
-        bytes = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-            static_cast<std::int32_t>(config.key_width()),
-            static_cast<std::int32_t>(config.key_width()),
-            static_cast<std::int32_t>(config.value_width()), batch, first_width, last_width);
-    }
-    // The native overlap contract takes a disjoint span even for a zero-scratch fused route.
-    return std::max(std::size_t{1}, bytes);
+std::size_t gdn_snapshot_workspace_bytes(const GdnProfile& parameters, std::int32_t batch,
+                                         std::int32_t first_width, std::int32_t last_width) {
+    return ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(parameters.projection, batch,
+                                                                      first_width, last_width);
 }
 
-std::size_t gdn_record_workspace_bytes(const GdnParameters& parameters, const GdnConfig& config,
-                                       std::int32_t batch, std::int32_t first_width,
-                                       std::int32_t last_width) {
-    const auto* single = std::get_if<LinearParameters>(&parameters.projection);
-    std::size_t bytes;
-    if (single && single->weight.qtype != QType::Q8_G32_FP16) {
-        const auto& w = single->weight;
-        bytes         = ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
-            w.qtype, w.n, w.k, single->policy, batch, first_width, last_width);
-    } else {
-        bytes = ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
-            static_cast<std::int32_t>(config.key_width()),
-            static_cast<std::int32_t>(config.key_width()),
-            static_cast<std::int32_t>(config.value_width()), batch, first_width, last_width);
-    }
-    return std::max(std::size_t{1}, bytes);
+std::size_t gdn_record_workspace_bytes(const GdnProfile& parameters, std::int32_t batch,
+                                       std::int32_t first_width, std::int32_t last_width) {
+    return ops::gdn_input_proj_conv_record_workspace_capacity_bytes(parameters.projection, batch,
+                                                                    first_width, last_width);
 }
 
 void gdn_projection(const Tensor& hidden, const GdnParameters& parameters, Tensor& qkv, Tensor& z,
-                    WorkspaceArena& workspace, cudaStream_t stream) {
-    if (const auto* pair = std::get_if<ops::PairedProjectionWeights>(&parameters.projection)) {
-        ops::gdn_input_proj(hidden, pair->first, pair->second, qkv, z, stream);
-    } else {
-        const auto& single = std::get<LinearParameters>(parameters.projection);
-        if (const auto dx = target_igdn_dx_override();
-            dx.has_value() && single.weight.qtype == QType::NVFP4) {
-            Weight runtime_weight = single.weight;
-            runtime_weight.input_scale_divisor = *dx;
-            ops::gdn_input_proj(
-                hidden, runtime_weight, qkv, z, single.policy, workspace, stream);
-        } else {
-            ops::gdn_input_proj(
-                hidden, single.weight, qkv, z, single.policy, workspace, stream);
-        }
-    }
+                    MemoryArena& workspace, CudaExecutionView execution) {
+    std::array outputs{qkv, z};
+    ops::linear_split(hidden, parameters.projection, outputs, workspace, execution);
 }
 
 void gdn_norm_control(const Tensor& residual, const Tensor& norm, float epsilon,
                       const GdnParameters& parameters, Tensor& hidden, Tensor& g, Tensor& beta,
-                      WorkspaceArena& workspace, DeviceExecutionView execution) {
-    if (const auto* pair = std::get_if<ops::PairedProjectionWeights>(&parameters.control)) {
-        ops::gdn_norm_gating_proj(residual, norm, epsilon, pair->first, pair->second,
-                                  parameters.a_log, parameters.dt_bias, workspace, hidden, g, beta,
-                                  execution);
-    } else {
-        const auto& single = std::get<LinearParameters>(parameters.control);
-        ops::gdn_norm_gating_proj(residual, norm, epsilon, single.weight, parameters.a_log,
-                                  parameters.dt_bias, workspace, hidden, g, beta, execution);
-    }
+                      MemoryArena& workspace, CudaExecutionView execution) {
+    ops::gdn_norm_control_proj(residual, norm, epsilon, parameters.control, parameters.a_log,
+                               parameters.dt_bias, {hidden, {g, beta}}, workspace, execution);
 }
 
-void gdn_projection_snapshot(const Tensor& hidden, const GdnParameters& parameters,
-                             const GdnConfig& config, Tensor& conv_states,
-                             const Tensor& valid_columns, const Tensor& initial_slots,
-                             const Tensor& destination_slots, Tensor& query, Tensor& key,
-                             Tensor& value, Tensor& z, WorkspaceArena& workspace,
-                             cudaStream_t stream) {
-    auto scope = workspace.scope();
-    WorkspaceArena scratch(workspace.alloc_bytes(gdn_snapshot_workspace_bytes(
-        parameters, config, hidden.ne[2], hidden.ne[1], hidden.ne[1])));
-    if (const auto* pair = std::get_if<ops::PairedProjectionWeights>(&parameters.projection)) {
-        ops::gdn_input_proj_conv_snapshot(hidden, pair->first, pair->second, parameters.convolution,
-                                          conv_states, valid_columns, initial_slots,
-                                          destination_slots, query, key, value, z, scratch, stream);
-    } else {
-        const auto& single = std::get<LinearParameters>(parameters.projection);
-        if (const auto dx = target_igdn_dx_override();
-            dx.has_value() && single.weight.qtype == QType::NVFP4) {
-            Weight runtime_weight = single.weight;
-            runtime_weight.input_scale_divisor = *dx;
-            ops::gdn_input_proj_conv_snapshot(
-                hidden, runtime_weight, parameters.convolution, conv_states, valid_columns,
-                initial_slots, destination_slots, query, key, value, z, single.policy, scratch,
-                stream);
-        } else {
-            ops::gdn_input_proj_conv_snapshot(
-                hidden, single.weight, parameters.convolution, conv_states, valid_columns,
-                initial_slots, destination_slots, query, key, value, z, single.policy, scratch,
-                stream);
-        }
-    }
+void gdn_projection_update(const Tensor& hidden, const GdnParameters& parameters,
+                           StateFieldView source, StateFieldView destination,
+                           const Tensor& valid_columns, Tensor& query, Tensor& key, Tensor& value,
+                           Tensor& z, MemoryArena& workspace, CudaExecutionView execution) {
+    ops::gdn_input_proj_conv_update(hidden, parameters.projection, parameters.convolution, source,
+                                    destination, valid_columns, {query, key, value, z}, workspace,
+                                    execution);
 }
 
 void gdn_projection_record(const Tensor& hidden, const GdnParameters& parameters,
-                           const GdnConfig& config, const Tensor& conv_states,
-                           const Tensor& valid_columns, const Tensor& initial_slots,
-                           Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
-                           Tensor& z, WorkspaceArena& workspace, cudaStream_t stream) {
-    auto scope = workspace.scope();
-    WorkspaceArena scratch(workspace.alloc_bytes(
-        gdn_record_workspace_bytes(parameters, config, hidden.ne[2], hidden.ne[1], hidden.ne[1])));
-    if (const auto* pair = std::get_if<ops::PairedProjectionWeights>(&parameters.projection)) {
-        ops::gdn_input_proj_conv_record(hidden, pair->first, pair->second, parameters.convolution,
-                                        conv_states, valid_columns, initial_slots, conv_record,
-                                        query, key, value, z, scratch, stream);
-    } else {
-        const auto& single = std::get<LinearParameters>(parameters.projection);
-        if (const auto dx = target_igdn_dx_override();
-            dx.has_value() && single.weight.qtype == QType::NVFP4) {
-            Weight runtime_weight = single.weight;
-            runtime_weight.input_scale_divisor = *dx;
-            ops::gdn_input_proj_conv_record(
-                hidden, runtime_weight, parameters.convolution, conv_states, valid_columns,
-                initial_slots, conv_record, query, key, value, z, single.policy, scratch, stream);
-        } else {
-            ops::gdn_input_proj_conv_record(
-                hidden, single.weight, parameters.convolution, conv_states, valid_columns,
-                initial_slots, conv_record, query, key, value, z, single.policy, scratch, stream);
-        }
-    }
+                           StateFieldView source, const Tensor& valid_columns, Tensor& conv_record,
+                           Tensor& query, Tensor& key, Tensor& value, Tensor& z,
+                           MemoryArena& workspace, CudaExecutionView execution) {
+    ops::gdn_input_proj_conv_record(hidden, parameters.projection, parameters.convolution, source,
+                                    valid_columns, {query, key, value, z}, conv_record, workspace,
+                                    execution);
 }
 
 } // namespace ninfer::models::qwen3_5::execution

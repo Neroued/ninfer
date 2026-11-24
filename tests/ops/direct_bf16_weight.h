@@ -1,5 +1,7 @@
 #pragma once
 
+#include "cuda_fixture.h"
+#include "core/buffer.h"
 #include "core/weight.h"
 #include "ops/op_tester.h"
 
@@ -19,8 +21,13 @@ struct HostWeight {
     std::int32_t k = 0;
     std::vector<std::uint16_t> bits;
 
-    [[nodiscard]] Weight device_weight(const void* data) const {
+    [[nodiscard]] Weight device_weight(ConstMemorySpan storage) const {
+        const void* data = storage.data;
+        if (storage.bytes < bits.size() * sizeof(std::uint16_t)) {
+            throw std::out_of_range("BF16 weight backing is too small");
+        }
         Weight weight{};
+        weight.device          = storage.device;
         weight.payload         = data;
         weight.payload_bytes   = bits.size() * sizeof(std::uint16_t);
         weight.qtype           = QType::BF16;
@@ -78,15 +85,16 @@ inline double dot_fp64(const HostWeight& weight, std::int32_t row,
 class DeviceWeight {
 public:
     explicit DeviceWeight(HostWeight host_weight)
-        : host(std::move(host_weight)), device(host.bits.size() * sizeof(std::uint16_t)) {
-        device.copy_from_host(host.bits.data(), device.bytes);
+        : host(std::move(host_weight)), device(ninfer::test::cuda_environment().context.device(),
+                                               host.bits.size() * sizeof(std::uint16_t)) {
+        device.copy_from_host(host.bits.data(), device.size());
     }
 
-    [[nodiscard]] Weight view() const { return host.device_weight(device.p); }
+    [[nodiscard]] Weight view() const { return host.device_weight(device.span()); }
 
     int verify_preserved(std::string_view label) const {
         std::vector<std::uint16_t> after(host.bits.size());
-        device.copy_to_host(after.data(), device.bytes);
+        device.copy_to_host(after.data(), device.size());
         if (after == host.bits) { return 0; }
         std::cerr << label << ": direct BF16 weight was modified\n";
         return 1;

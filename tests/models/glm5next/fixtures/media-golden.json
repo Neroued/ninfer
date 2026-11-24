@@ -1,0 +1,2183 @@
+{
+  "reference": {
+    "processor_sha256": "7917c1641b14ff096af9e18324db98010837689d25d5e5a9c61acff4067b4d6e",
+    "torch": "2.11.0.dev20260210+cu128"
+  },
+  "cases": [
+    {
+      "name": "image-aligned",
+      "config": {
+        "image_processor": {
+          "do_rescale": true,
+          "patch_expand_factor": 1,
+          "merge_size": 2,
+          "image_mean": [
+            0.48145466,
+            0.4578275,
+            0.40821073
+          ],
+          "image_std": [
+            0.26862954,
+            0.26130258,
+            0.27577711
+          ],
+          "temporal_patch_size": 2,
+          "patch_size": 14,
+          "min_image_tokens": 16,
+          "max_image_tokens": 8000,
+          "image_processor_type": "Glm5NextImageProcessor"
+        },
+        "video_processor": {
+          "do_rescale": true,
+          "video_processor_type": "Glm5NextVideoProcessor",
+          "patch_expand_factor": 1,
+          "merge_size": 2,
+          "image_mean": [
+            0.48145466,
+            0.4578275,
+            0.40821073
+          ],
+          "image_std": [
+            0.26862954,
+            0.26130258,
+            0.27577711
+          ],
+          "temporal_patch_size": 2,
+          "patch_size": 14,
+          "min_image_tokens": 16,
+          "max_image_tokens": 240000,
+          "fps": 2
+        },
+        "processor_class": "Glm5NextProcessor"
+      },
+      "input": {
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "Describe: "
+              },
+              {
+                "type": "image"
+              },
+              {
+                "type": "text",
+                "text": " Done."
+              }
+            ]
+          }
+        ],
+        "options": {}
+      },
+      "media": [
+        {
+          "message": 0,
+          "part": 1,
+          "file": "image-aligned.png"
+        }
+      ],
+      "ids": [
+        264,
+        265,
+        266,
+        82,
+        101,
+        97,
+        115,
+        111,
+        110,
+        105,
+        110,
+        103,
+        32,
+        69,
+        102,
+        102,
+        111,
+        114,
+        116,
+        58,
+        32,
+        77,
+        97,
+        120,
+        267,
+        68,
+        101,
+        115,
+        99,
+        114,
+        105,
+        98,
+        101,
+        58,
+        32,
+        280,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        281,
+        32,
+        68,
+        111,
+        110,
+        101,
+        46,
+        268,
+        270
+      ],
+      "expected": [
+        {
+          "grid": [
+            1,
+            8,
+            8
+          ],
+          "timestamps": [],
+          "spans": [
+            [
+              36,
+              16
+            ]
+          ],
+          "patch_sha256": "6802b63aa347799df4be9c81b0b7112e5a5d7d09355325585010552d7f54ce0f"
+        }
+      ]
+    },
+    {
+      "name": "image-pad",
+      "config": {
+        "image_processor": {
+          "do_rescale": true,
+          "patch_expand_factor": 1,
+          "merge_size": 2,
+          "image_mean": [
+            0.48145466,
+            0.4578275,
+            0.40821073
+          ],
+          "image_std": [
+            0.26862954,
+            0.26130258,
+            0.27577711
+          ],
+          "temporal_patch_size": 2,
+          "patch_size": 14,
+          "min_image_tokens": 16,
+          "max_image_tokens": 8000,
+          "image_processor_type": "Glm5NextImageProcessor"
+        },
+        "video_processor": {
+          "do_rescale": true,
+          "video_processor_type": "Glm5NextVideoProcessor",
+          "patch_expand_factor": 1,
+          "merge_size": 2,
+          "image_mean": [
+            0.48145466,
+            0.4578275,
+            0.40821073
+          ],
+          "image_std": [
+            0.26862954,
+            0.26130258,
+            0.27577711
+          ],
+          "temporal_patch_size": 2,
+          "patch_size": 14,
+          "min_image_tokens": 16,
+          "max_image_tokens": 240000,
+          "fps": 2
+        },
+        "processor_class": "Glm5NextProcessor"
+      },
+      "input": {
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "Describe: "
+              },
+              {
+                "type": "image"
+              },
+              {
+                "type": "text",
+                "text": " Done."
+              }
+            ]
+          }
+        ],
+        "options": {}
+      },
+      "media": [
+        {
+          "message": 0,
+          "part": 1,
+          "file": "image-pad.png"
+        }
+      ],
+      "ids": [
+        264,
+        265,
+        266,
+        82,
+        101,
+        97,
+        115,
+        111,
+        110,
+        105,
+        110,
+        103,
+        32,
+        69,
+        102,
+        102,
+        111,
+        114,
+        116,
+        58,
+        32,
+        77,
+        97,
+        120,
+        267,
+        68,
+        101,
+        115,
+        99,
+        114,
+        105,
+        98,
+        101,
+        58,
+        32,
+        280,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        281,
+        32,
+        68,
+        111,
+        110,
+        101,
+        46,
+        268,
+        270
+      ],
+      "expected": [
+        {
+          "grid": [
+            1,
+            8,
+            10
+          ],
+          "timestamps": [],
+          "spans": [
+            [
+              36,
+              20
+            ]
+          ],
+          "patch_sha256": "84ba09f1282306fe177b6a537d8713b022a7b42990905e3017a52042a5031c05"
+        }
+      ]
+    },
+    {
+      "name": "image-upscale",
+      "config": {
+        "image_processor": {
+          "do_rescale": true,
+          "patch_expand_factor": 1,
+          "merge_size": 2,
+          "image_mean": [
+            0.48145466,
+            0.4578275,
+            0.40821073
+          ],
+          "image_std": [
+            0.26862954,
+            0.26130258,
+            0.27577711
+          ],
+          "temporal_patch_size": 2,
+          "patch_size": 14,
+          "min_image_tokens": 16,
+          "max_image_tokens": 8000,
+          "image_processor_type": "Glm5NextImageProcessor"
+        },
+        "video_processor": {
+          "do_rescale": true,
+          "video_processor_type": "Glm5NextVideoProcessor",
+          "patch_expand_factor": 1,
+          "merge_size": 2,
+          "image_mean": [
+            0.48145466,
+            0.4578275,
+            0.40821073
+          ],
+          "image_std": [
+            0.26862954,
+            0.26130258,
+            0.27577711
+          ],
+          "temporal_patch_size": 2,
+          "patch_size": 14,
+          "min_image_tokens": 16,
+          "max_image_tokens": 240000,
+          "fps": 2
+        },
+        "processor_class": "Glm5NextProcessor"
+      },
+      "input": {
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "Describe: "
+              },
+              {
+                "type": "image"
+              },
+              {
+                "type": "text",
+                "text": " Done."
+              }
+            ]
+          }
+        ],
+        "options": {}
+      },
+      "media": [
+        {
+          "message": 0,
+          "part": 1,
+          "file": "image-upscale.png"
+        }
+      ],
+      "ids": [
+        264,
+        265,
+        266,
+        82,
+        101,
+        97,
+        115,
+        111,
+        110,
+        105,
+        110,
+        103,
+        32,
+        69,
+        102,
+        102,
+        111,
+        114,
+        116,
+        58,
+        32,
+        77,
+        97,
+        120,
+        267,
+        68,
+        101,
+        115,
+        99,
+        114,
+        105,
+        98,
+        101,
+        58,
+        32,
+        280,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        281,
+        32,
+        68,
+        111,
+        110,
+        101,
+        46,
+        268,
+        270
+      ],
+      "expected": [
+        {
+          "grid": [
+            1,
+            8,
+            10
+          ],
+          "timestamps": [],
+          "spans": [
+            [
+              36,
+              20
+            ]
+          ],
+          "patch_sha256": "6880e2a3e8490cecf9aa96d0d83165d232888a054fcc9c5de8846bad0885d189"
+        }
+      ]
+    },
+    {
+      "name": "image-downscale",
+      "config": {
+        "image_processor": {
+          "do_rescale": true,
+          "patch_expand_factor": 1,
+          "merge_size": 2,
+          "image_mean": [
+            0.48145466,
+            0.4578275,
+            0.40821073
+          ],
+          "image_std": [
+            0.26862954,
+            0.26130258,
+            0.27577711
+          ],
+          "temporal_patch_size": 2,
+          "patch_size": 14,
+          "min_image_tokens": 16,
+          "max_image_tokens": 16,
+          "image_processor_type": "Glm5NextImageProcessor"
+        },
+        "video_processor": {
+          "do_rescale": true,
+          "video_processor_type": "Glm5NextVideoProcessor",
+          "patch_expand_factor": 1,
+          "merge_size": 2,
+          "image_mean": [
+            0.48145466,
+            0.4578275,
+            0.40821073
+          ],
+          "image_std": [
+            0.26862954,
+            0.26130258,
+            0.27577711
+          ],
+          "temporal_patch_size": 2,
+          "patch_size": 14,
+          "min_image_tokens": 16,
+          "max_image_tokens": 240000,
+          "fps": 2
+        },
+        "processor_class": "Glm5NextProcessor"
+      },
+      "input": {
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "Describe: "
+              },
+              {
+                "type": "image"
+              },
+              {
+                "type": "text",
+                "text": " Done."
+              }
+            ]
+          }
+        ],
+        "options": {}
+      },
+      "media": [
+        {
+          "message": 0,
+          "part": 1,
+          "file": "image-downscale.png"
+        }
+      ],
+      "ids": [
+        264,
+        265,
+        266,
+        82,
+        101,
+        97,
+        115,
+        111,
+        110,
+        105,
+        110,
+        103,
+        32,
+        69,
+        102,
+        102,
+        111,
+        114,
+        116,
+        58,
+        32,
+        77,
+        97,
+        120,
+        267,
+        68,
+        101,
+        115,
+        99,
+        114,
+        105,
+        98,
+        101,
+        58,
+        32,
+        280,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        281,
+        32,
+        68,
+        111,
+        110,
+        101,
+        46,
+        268,
+        270
+      ],
+      "expected": [
+        {
+          "grid": [
+            1,
+            6,
+            10
+          ],
+          "timestamps": [],
+          "spans": [
+            [
+              36,
+              15
+            ]
+          ],
+          "patch_sha256": "a5144153cb636c4cf53f9e623f44e6b89e2ec4d1e80f8bc994c9de04df970810"
+        }
+      ]
+    },
+    {
+      "name": "image-jpeg",
+      "config": {
+        "image_processor": {
+          "do_rescale": true,
+          "patch_expand_factor": 1,
+          "merge_size": 2,
+          "image_mean": [
+            0.48145466,
+            0.4578275,
+            0.40821073
+          ],
+          "image_std": [
+            0.26862954,
+            0.26130258,
+            0.27577711
+          ],
+          "temporal_patch_size": 2,
+          "patch_size": 14,
+          "min_image_tokens": 16,
+          "max_image_tokens": 8000,
+          "image_processor_type": "Glm5NextImageProcessor"
+        },
+        "video_processor": {
+          "do_rescale": true,
+          "video_processor_type": "Glm5NextVideoProcessor",
+          "patch_expand_factor": 1,
+          "merge_size": 2,
+          "image_mean": [
+            0.48145466,
+            0.4578275,
+            0.40821073
+          ],
+          "image_std": [
+            0.26862954,
+            0.26130258,
+            0.27577711
+          ],
+          "temporal_patch_size": 2,
+          "patch_size": 14,
+          "min_image_tokens": 16,
+          "max_image_tokens": 240000,
+          "fps": 2
+        },
+        "processor_class": "Glm5NextProcessor"
+      },
+      "input": {
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "Describe: "
+              },
+              {
+                "type": "image"
+              },
+              {
+                "type": "text",
+                "text": " Done."
+              }
+            ]
+          }
+        ],
+        "options": {}
+      },
+      "media": [
+        {
+          "message": 0,
+          "part": 1,
+          "file": "image-jpeg.jpg"
+        }
+      ],
+      "ids": [
+        264,
+        265,
+        266,
+        82,
+        101,
+        97,
+        115,
+        111,
+        110,
+        105,
+        110,
+        103,
+        32,
+        69,
+        102,
+        102,
+        111,
+        114,
+        116,
+        58,
+        32,
+        77,
+        97,
+        120,
+        267,
+        68,
+        101,
+        115,
+        99,
+        114,
+        105,
+        98,
+        101,
+        58,
+        32,
+        280,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        281,
+        32,
+        68,
+        111,
+        110,
+        101,
+        46,
+        268,
+        270
+      ],
+      "expected": [
+        {
+          "grid": [
+            1,
+            8,
+            8
+          ],
+          "timestamps": [],
+          "spans": [
+            [
+              36,
+              16
+            ]
+          ],
+          "patch_sha256": "2d93ee3e93fbbdcfd6b9bfe72e0506211afcca619fcecec3a9e236d56162106e"
+        }
+      ]
+    },
+    {
+      "name": "video-short",
+      "config": {
+        "image_processor": {
+          "do_rescale": true,
+          "patch_expand_factor": 1,
+          "merge_size": 2,
+          "image_mean": [
+            0.48145466,
+            0.4578275,
+            0.40821073
+          ],
+          "image_std": [
+            0.26862954,
+            0.26130258,
+            0.27577711
+          ],
+          "temporal_patch_size": 2,
+          "patch_size": 14,
+          "min_image_tokens": 16,
+          "max_image_tokens": 8000,
+          "image_processor_type": "Glm5NextImageProcessor"
+        },
+        "video_processor": {
+          "do_rescale": true,
+          "video_processor_type": "Glm5NextVideoProcessor",
+          "patch_expand_factor": 1,
+          "merge_size": 2,
+          "image_mean": [
+            0.48145466,
+            0.4578275,
+            0.40821073
+          ],
+          "image_std": [
+            0.26862954,
+            0.26130258,
+            0.27577711
+          ],
+          "temporal_patch_size": 2,
+          "patch_size": 14,
+          "min_image_tokens": 16,
+          "max_image_tokens": 8000,
+          "fps": 2
+        },
+        "processor_class": "Glm5NextProcessor"
+      },
+      "input": {
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "Describe: "
+              },
+              {
+                "type": "video"
+              },
+              {
+                "type": "text",
+                "text": " Done."
+              }
+            ]
+          }
+        ],
+        "options": {}
+      },
+      "media": [
+        {
+          "message": 0,
+          "part": 1,
+          "file": "video-short.mkv"
+        }
+      ],
+      "ids": [
+        264,
+        265,
+        266,
+        82,
+        101,
+        97,
+        115,
+        111,
+        110,
+        105,
+        110,
+        103,
+        32,
+        69,
+        102,
+        102,
+        111,
+        114,
+        116,
+        58,
+        32,
+        77,
+        97,
+        120,
+        267,
+        68,
+        101,
+        115,
+        99,
+        114,
+        105,
+        98,
+        101,
+        58,
+        32,
+        283,
+        280,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        281,
+        48,
+        46,
+        48,
+        32,
+        115,
+        101,
+        99,
+        111,
+        110,
+        100,
+        115,
+        284,
+        32,
+        68,
+        111,
+        110,
+        101,
+        46,
+        268,
+        270
+      ],
+      "expected": [
+        {
+          "grid": [
+            1,
+            8,
+            10
+          ],
+          "timestamps": [
+            0
+          ],
+          "spans": [
+            [
+              37,
+              20
+            ]
+          ],
+          "patch_sha256": "4b9ac14def000554cdd0ecc1240447153ccbc3474fca80f2e966e7154f781d88"
+        }
+      ]
+    },
+    {
+      "name": "video-odd",
+      "config": {
+        "image_processor": {
+          "do_rescale": true,
+          "patch_expand_factor": 1,
+          "merge_size": 2,
+          "image_mean": [
+            0.48145466,
+            0.4578275,
+            0.40821073
+          ],
+          "image_std": [
+            0.26862954,
+            0.26130258,
+            0.27577711
+          ],
+          "temporal_patch_size": 2,
+          "patch_size": 14,
+          "min_image_tokens": 16,
+          "max_image_tokens": 8000,
+          "image_processor_type": "Glm5NextImageProcessor"
+        },
+        "video_processor": {
+          "do_rescale": true,
+          "video_processor_type": "Glm5NextVideoProcessor",
+          "patch_expand_factor": 1,
+          "merge_size": 2,
+          "image_mean": [
+            0.48145466,
+            0.4578275,
+            0.40821073
+          ],
+          "image_std": [
+            0.26862954,
+            0.26130258,
+            0.27577711
+          ],
+          "temporal_patch_size": 2,
+          "patch_size": 14,
+          "min_image_tokens": 16,
+          "max_image_tokens": 8000,
+          "fps": 2
+        },
+        "processor_class": "Glm5NextProcessor"
+      },
+      "input": {
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "Describe: "
+              },
+              {
+                "type": "video"
+              },
+              {
+                "type": "text",
+                "text": " Done."
+              }
+            ]
+          }
+        ],
+        "options": {}
+      },
+      "media": [
+        {
+          "message": 0,
+          "part": 1,
+          "file": "video-odd.mkv"
+        }
+      ],
+      "ids": [
+        264,
+        265,
+        266,
+        82,
+        101,
+        97,
+        115,
+        111,
+        110,
+        105,
+        110,
+        103,
+        32,
+        69,
+        102,
+        102,
+        111,
+        114,
+        116,
+        58,
+        32,
+        77,
+        97,
+        120,
+        267,
+        68,
+        101,
+        115,
+        99,
+        114,
+        105,
+        98,
+        101,
+        58,
+        32,
+        283,
+        280,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        281,
+        48,
+        46,
+        48,
+        32,
+        115,
+        101,
+        99,
+        111,
+        110,
+        100,
+        115,
+        280,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        281,
+        50,
+        46,
+        48,
+        32,
+        115,
+        101,
+        99,
+        111,
+        110,
+        100,
+        115,
+        284,
+        32,
+        68,
+        111,
+        110,
+        101,
+        46,
+        268,
+        270
+      ],
+      "expected": [
+        {
+          "grid": [
+            2,
+            6,
+            8
+          ],
+          "timestamps": [
+            0,
+            2
+          ],
+          "spans": [
+            [
+              37,
+              12
+            ],
+            [
+              62,
+              12
+            ]
+          ],
+          "patch_sha256": "b5b02d7b1e6ab405f90e9278e67c79dc71ce103c75faa03b143250248f05514d"
+        }
+      ]
+    },
+    {
+      "name": "video-dense",
+      "config": {
+        "image_processor": {
+          "do_rescale": true,
+          "patch_expand_factor": 1,
+          "merge_size": 2,
+          "image_mean": [
+            0.48145466,
+            0.4578275,
+            0.40821073
+          ],
+          "image_std": [
+            0.26862954,
+            0.26130258,
+            0.27577711
+          ],
+          "temporal_patch_size": 2,
+          "patch_size": 14,
+          "min_image_tokens": 16,
+          "max_image_tokens": 8000,
+          "image_processor_type": "Glm5NextImageProcessor"
+        },
+        "video_processor": {
+          "do_rescale": true,
+          "video_processor_type": "Glm5NextVideoProcessor",
+          "patch_expand_factor": 1,
+          "merge_size": 2,
+          "image_mean": [
+            0.48145466,
+            0.4578275,
+            0.40821073
+          ],
+          "image_std": [
+            0.26862954,
+            0.26130258,
+            0.27577711
+          ],
+          "temporal_patch_size": 2,
+          "patch_size": 14,
+          "min_image_tokens": 16,
+          "max_image_tokens": 8000,
+          "fps": 2
+        },
+        "processor_class": "Glm5NextProcessor"
+      },
+      "input": {
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "Describe: "
+              },
+              {
+                "type": "video"
+              },
+              {
+                "type": "text",
+                "text": " Done."
+              }
+            ]
+          }
+        ],
+        "options": {}
+      },
+      "media": [
+        {
+          "message": 0,
+          "part": 1,
+          "file": "video-dense.mkv"
+        }
+      ],
+      "ids": [
+        264,
+        265,
+        266,
+        82,
+        101,
+        97,
+        115,
+        111,
+        110,
+        105,
+        110,
+        103,
+        32,
+        69,
+        102,
+        102,
+        111,
+        114,
+        116,
+        58,
+        32,
+        77,
+        97,
+        120,
+        267,
+        68,
+        101,
+        115,
+        99,
+        114,
+        105,
+        98,
+        101,
+        58,
+        32,
+        283,
+        280,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        281,
+        48,
+        46,
+        48,
+        32,
+        115,
+        101,
+        99,
+        111,
+        110,
+        100,
+        115,
+        280,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        281,
+        49,
+        46,
+        48,
+        32,
+        115,
+        101,
+        99,
+        111,
+        110,
+        100,
+        115,
+        284,
+        32,
+        68,
+        111,
+        110,
+        101,
+        46,
+        268,
+        270
+      ],
+      "expected": [
+        {
+          "grid": [
+            2,
+            6,
+            8
+          ],
+          "timestamps": [
+            0,
+            1
+          ],
+          "spans": [
+            [
+              37,
+              12
+            ],
+            [
+              62,
+              12
+            ]
+          ],
+          "patch_sha256": "cb9dfa6b58c9a285d5346fd4a26d4c35c1c5ba5a616b6398ede071261317a09e"
+        }
+      ]
+    },
+    {
+      "name": "video-rotated",
+      "config": {
+        "image_processor": {
+          "do_rescale": true,
+          "patch_expand_factor": 1,
+          "merge_size": 2,
+          "image_mean": [
+            0.48145466,
+            0.4578275,
+            0.40821073
+          ],
+          "image_std": [
+            0.26862954,
+            0.26130258,
+            0.27577711
+          ],
+          "temporal_patch_size": 2,
+          "patch_size": 14,
+          "min_image_tokens": 16,
+          "max_image_tokens": 8000,
+          "image_processor_type": "Glm5NextImageProcessor"
+        },
+        "video_processor": {
+          "do_rescale": true,
+          "video_processor_type": "Glm5NextVideoProcessor",
+          "patch_expand_factor": 1,
+          "merge_size": 2,
+          "image_mean": [
+            0.48145466,
+            0.4578275,
+            0.40821073
+          ],
+          "image_std": [
+            0.26862954,
+            0.26130258,
+            0.27577711
+          ],
+          "temporal_patch_size": 2,
+          "patch_size": 14,
+          "min_image_tokens": 16,
+          "max_image_tokens": 8000,
+          "fps": 2
+        },
+        "processor_class": "Glm5NextProcessor"
+      },
+      "input": {
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "Describe: "
+              },
+              {
+                "type": "video"
+              },
+              {
+                "type": "text",
+                "text": " Done."
+              }
+            ]
+          }
+        ],
+        "options": {}
+      },
+      "media": [
+        {
+          "message": 0,
+          "part": 1,
+          "file": "video-rotated.mov"
+        }
+      ],
+      "ids": [
+        264,
+        265,
+        266,
+        82,
+        101,
+        97,
+        115,
+        111,
+        110,
+        105,
+        110,
+        103,
+        32,
+        69,
+        102,
+        102,
+        111,
+        114,
+        116,
+        58,
+        32,
+        77,
+        97,
+        120,
+        267,
+        68,
+        101,
+        115,
+        99,
+        114,
+        105,
+        98,
+        101,
+        58,
+        32,
+        283,
+        280,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        281,
+        48,
+        46,
+        48,
+        32,
+        115,
+        101,
+        99,
+        111,
+        110,
+        100,
+        115,
+        280,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        281,
+        50,
+        46,
+        48,
+        32,
+        115,
+        101,
+        99,
+        111,
+        110,
+        100,
+        115,
+        284,
+        32,
+        68,
+        111,
+        110,
+        101,
+        46,
+        268,
+        270
+      ],
+      "expected": [
+        {
+          "grid": [
+            2,
+            8,
+            6
+          ],
+          "timestamps": [
+            0,
+            2
+          ],
+          "spans": [
+            [
+              37,
+              12
+            ],
+            [
+              62,
+              12
+            ]
+          ],
+          "patch_sha256": "72ada698938d5f0c795053a23276e7adeecca21321b89b3de044d36251a0ce68"
+        }
+      ]
+    },
+    {
+      "name": "video-linspace",
+      "config": {
+        "image_processor": {
+          "do_rescale": true,
+          "patch_expand_factor": 1,
+          "merge_size": 2,
+          "image_mean": [
+            0.48145466,
+            0.4578275,
+            0.40821073
+          ],
+          "image_std": [
+            0.26862954,
+            0.26130258,
+            0.27577711
+          ],
+          "temporal_patch_size": 2,
+          "patch_size": 14,
+          "min_image_tokens": 16,
+          "max_image_tokens": 8000,
+          "image_processor_type": "Glm5NextImageProcessor"
+        },
+        "video_processor": {
+          "do_rescale": true,
+          "video_processor_type": "Glm5NextVideoProcessor",
+          "patch_expand_factor": 1,
+          "merge_size": 2,
+          "image_mean": [
+            0.48145466,
+            0.4578275,
+            0.40821073
+          ],
+          "image_std": [
+            0.26862954,
+            0.26130258,
+            0.27577711
+          ],
+          "temporal_patch_size": 2,
+          "patch_size": 14,
+          "min_image_tokens": 16,
+          "max_image_tokens": 8000,
+          "fps": 2
+        },
+        "processor_class": "Glm5NextProcessor"
+      },
+      "input": {
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "Describe: "
+              },
+              {
+                "type": "video"
+              },
+              {
+                "type": "text",
+                "text": " Done."
+              }
+            ]
+          }
+        ],
+        "options": {}
+      },
+      "media": [
+        {
+          "message": 0,
+          "part": 1,
+          "file": "video-linspace.mkv"
+        }
+      ],
+      "ids": [
+        264,
+        265,
+        266,
+        82,
+        101,
+        97,
+        115,
+        111,
+        110,
+        105,
+        110,
+        103,
+        32,
+        69,
+        102,
+        102,
+        111,
+        114,
+        116,
+        58,
+        32,
+        77,
+        97,
+        120,
+        267,
+        68,
+        101,
+        115,
+        99,
+        114,
+        105,
+        98,
+        101,
+        58,
+        32,
+        283,
+        280,
+        282,
+        282,
+        282,
+        282,
+        281,
+        48,
+        46,
+        48,
+        32,
+        115,
+        101,
+        99,
+        111,
+        110,
+        100,
+        115,
+        280,
+        282,
+        282,
+        282,
+        282,
+        281,
+        48,
+        46,
+        48,
+        32,
+        115,
+        101,
+        99,
+        111,
+        110,
+        100,
+        115,
+        280,
+        282,
+        282,
+        282,
+        282,
+        281,
+        49,
+        46,
+        48,
+        32,
+        115,
+        101,
+        99,
+        111,
+        110,
+        100,
+        115,
+        280,
+        282,
+        282,
+        282,
+        282,
+        281,
+        50,
+        46,
+        48,
+        32,
+        115,
+        101,
+        99,
+        111,
+        110,
+        100,
+        115,
+        280,
+        282,
+        282,
+        282,
+        282,
+        281,
+        51,
+        46,
+        48,
+        32,
+        115,
+        101,
+        99,
+        111,
+        110,
+        100,
+        115,
+        280,
+        282,
+        282,
+        282,
+        282,
+        281,
+        52,
+        46,
+        48,
+        32,
+        115,
+        101,
+        99,
+        111,
+        110,
+        100,
+        115,
+        280,
+        282,
+        282,
+        282,
+        282,
+        281,
+        53,
+        46,
+        48,
+        32,
+        115,
+        101,
+        99,
+        111,
+        110,
+        100,
+        115,
+        280,
+        282,
+        282,
+        282,
+        282,
+        281,
+        55,
+        46,
+        48,
+        32,
+        115,
+        101,
+        99,
+        111,
+        110,
+        100,
+        115,
+        280,
+        282,
+        282,
+        282,
+        282,
+        281,
+        55,
+        46,
+        48,
+        32,
+        115,
+        101,
+        99,
+        111,
+        110,
+        100,
+        115,
+        280,
+        282,
+        282,
+        282,
+        282,
+        281,
+        56,
+        46,
+        48,
+        32,
+        115,
+        101,
+        99,
+        111,
+        110,
+        100,
+        115,
+        280,
+        282,
+        282,
+        282,
+        282,
+        281,
+        49,
+        48,
+        46,
+        48,
+        32,
+        115,
+        101,
+        99,
+        111,
+        110,
+        100,
+        115,
+        280,
+        282,
+        282,
+        282,
+        282,
+        281,
+        49,
+        49,
+        46,
+        48,
+        32,
+        115,
+        101,
+        99,
+        111,
+        110,
+        100,
+        115,
+        284,
+        32,
+        68,
+        111,
+        110,
+        101,
+        46,
+        268,
+        270
+      ],
+      "expected": [
+        {
+          "grid": [
+            12,
+            4,
+            4
+          ],
+          "timestamps": [
+            0,
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            7,
+            7,
+            8,
+            10,
+            11
+          ],
+          "spans": [
+            [
+              37,
+              4
+            ],
+            [
+              54,
+              4
+            ],
+            [
+              71,
+              4
+            ],
+            [
+              88,
+              4
+            ],
+            [
+              105,
+              4
+            ],
+            [
+              122,
+              4
+            ],
+            [
+              139,
+              4
+            ],
+            [
+              156,
+              4
+            ],
+            [
+              173,
+              4
+            ],
+            [
+              190,
+              4
+            ],
+            [
+              207,
+              4
+            ],
+            [
+              225,
+              4
+            ]
+          ],
+          "patch_sha256": "2101ad22e5ced3d91e7c526f631c667b2e36423ff31035f85e2531f3cb8e76fb"
+        }
+      ]
+    },
+    {
+      "name": "tool-media-order",
+      "config": {
+        "image_processor": {
+          "do_rescale": true,
+          "patch_expand_factor": 1,
+          "merge_size": 2,
+          "image_mean": [
+            0.48145466,
+            0.4578275,
+            0.40821073
+          ],
+          "image_std": [
+            0.26862954,
+            0.26130258,
+            0.27577711
+          ],
+          "temporal_patch_size": 2,
+          "patch_size": 14,
+          "min_image_tokens": 16,
+          "max_image_tokens": 8000,
+          "image_processor_type": "Glm5NextImageProcessor"
+        },
+        "video_processor": {
+          "do_rescale": true,
+          "video_processor_type": "Glm5NextVideoProcessor",
+          "patch_expand_factor": 1,
+          "merge_size": 2,
+          "image_mean": [
+            0.48145466,
+            0.4578275,
+            0.40821073
+          ],
+          "image_std": [
+            0.26862954,
+            0.26130258,
+            0.27577711
+          ],
+          "temporal_patch_size": 2,
+          "patch_size": 14,
+          "min_image_tokens": 16,
+          "max_image_tokens": 240000,
+          "fps": 2
+        },
+        "processor_class": "Glm5NextProcessor"
+      },
+      "input": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Look"
+          },
+          {
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": "r",
+            "tool_calls": [
+              {
+                "id": "A",
+                "type": "function",
+                "function": {
+                  "name": "A",
+                  "arguments": {}
+                }
+              },
+              {
+                "id": "B",
+                "type": "function",
+                "function": {
+                  "name": "B",
+                  "arguments": {}
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "content": [
+              {
+                "type": "image"
+              }
+            ],
+            "tool_call_id": "B"
+          },
+          {
+            "role": "tool",
+            "content": [
+              {
+                "type": "image"
+              }
+            ],
+            "tool_call_id": "A"
+          }
+        ],
+        "options": {}
+      },
+      "media": [
+        {
+          "message": 2,
+          "part": 0,
+          "file": "image-pad.png"
+        },
+        {
+          "message": 3,
+          "part": 0,
+          "file": "image-aligned.png"
+        }
+      ],
+      "ids": [
+        264,
+        265,
+        266,
+        82,
+        101,
+        97,
+        115,
+        111,
+        110,
+        105,
+        110,
+        103,
+        32,
+        69,
+        102,
+        102,
+        111,
+        114,
+        116,
+        58,
+        32,
+        77,
+        97,
+        120,
+        267,
+        76,
+        111,
+        111,
+        107,
+        268,
+        270,
+        114,
+        271,
+        272,
+        65,
+        273,
+        272,
+        66,
+        273,
+        269,
+        278,
+        280,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        281,
+        279,
+        278,
+        280,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        282,
+        281,
+        279,
+        268,
+        270
+      ],
+      "expected": [
+        {
+          "grid": [
+            1,
+            8,
+            8
+          ],
+          "timestamps": [],
+          "spans": [
+            [
+              42,
+              16
+            ]
+          ],
+          "patch_sha256": "6802b63aa347799df4be9c81b0b7112e5a5d7d09355325585010552d7f54ce0f"
+        },
+        {
+          "grid": [
+            1,
+            8,
+            10
+          ],
+          "timestamps": [],
+          "spans": [
+            [
+              62,
+              20
+            ]
+          ],
+          "patch_sha256": "84ba09f1282306fe177b6a537d8713b022a7b42990905e3017a52042a5031c05"
+        }
+      ]
+    }
+  ]
+}

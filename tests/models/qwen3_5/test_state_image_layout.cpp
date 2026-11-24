@@ -27,7 +27,6 @@ q36::StateImageDeviceLayout plan(bool dflash) {
                 .value_heads    = 2,
                 .value_head_dim = 4,
                 .key_head_dim   = 3,
-                .slot_count     = 2,
                 .conv_dtype     = ninfer::DType::BF16,
             },
         .hidden = 7,
@@ -36,35 +35,27 @@ q36::StateImageDeviceLayout plan(bool dflash) {
         spec.dflash_local =
             q36::DFlashLocalStateSpec{.layers = 2, .capacity = 17, .kv_heads = 2, .head_dim = 4};
     }
-    ninfer::LayoutBuilder builder;
-    return q36::plan_state_image_device_pool(builder, spec);
+    return q36::plan_state_image_layout(spec);
 }
 
 } // namespace
 
 int main() {
-    const q36::StateImageDeviceLayout common = plan(false);
-    const auto common_work                   = q36::state_image_transfer_work(common.host);
-    expect(common_work.payload_bytes == common.host.linear_conv.bytes +
-                                            common.host.linear_recurrent.bytes +
-                                            common.host.continuation_hidden.bytes,
-           "common StateImage work payload includes layout padding");
-    expect(common_work.copy_operations == 2 * common.host.spec.linear.layers + 1,
-           "common StateImage work does not match physical CUDA copies");
-
-    const q36::StateImageDeviceLayout dflash = plan(true);
-    const auto full_work                     = q36::state_image_transfer_work(dflash.host);
-    const auto local_work                    = q36::dflash_local_transfer_work(dflash.host);
-    const std::uint64_t local_bytes =
-        2ULL * dflash.host.dflash_local_layer_bytes * dflash.host.spec.dflash_local->layers;
-    expect(local_work.payload_bytes == local_bytes &&
-               local_work.copy_operations == 2 * dflash.host.spec.dflash_local->layers,
-           "DFlash-local work does not match physical K/V layer copies");
-    expect(full_work.payload_bytes == common_work.payload_bytes + local_work.payload_bytes &&
-               full_work.copy_operations ==
-                   common_work.copy_operations + local_work.copy_operations,
-           "full DFlash StateImage work is not common plus local state");
-
+    const auto common      = plan(false);
+    const auto common_work = common.images.transfer_work();
+    expect(common_work.payload_bytes == common.images.image_bytes &&
+               common_work.copy_operations == 1,
+           "complete image work includes actual alignment bytes in one copy");
+    const auto dflash      = plan(true);
+    const auto full_work   = dflash.images.transfer_work();
+    const auto local_bytes = dflash.dflash_local->group.bytes;
+    expect(local_bytes == 2ULL * 2 * 4 * 128 * 2 * 2,
+           "local group includes both K/V for every layer");
+    expect(full_work.payload_bytes == common_work.payload_bytes + local_bytes &&
+               full_work.copy_operations == 1,
+           "full image copy includes common and local fields in one contiguous range");
+    expect(dflash.images.image_bytes % dflash.images.alignment == 0,
+           "complete image is independently aligned for either memory domain");
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

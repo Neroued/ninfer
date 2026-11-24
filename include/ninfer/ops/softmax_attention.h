@@ -3,10 +3,10 @@
 #include "ninfer/ops/attention_geometry.h"
 
 #include "core/arena.h"
+#include "core/device.h"
 #include "core/paged_kv_cache.h"
 #include "core/tensor.h"
 
-#include <cuda_runtime.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -26,54 +26,33 @@ struct ContextAttentionExecutionEnvelope {
 };
 
 /**
- * Shared numerical contract.
+ * Scaled dot-product attention over each entry's visible key set J:
+ *   kvh = floor(h / (Hq/Hkv)); score[j] = scale * dot(q[:,h,i], K[:,kvh,j]);
+ *   out[:,h,i] = BF16(sum_j softmax(score)[j] * V[:,kvh,j]).
  *
- * Every entry computes stable scaled dot-product Softmax Attention. Query head h reads KV head
- * floor(h / (Hq/Hkv)). Public BF16 inputs and persistent cache rows are interpreted after their
- * storage boundary. In the BFloat16 cache profile, K is stored as BF16 and V as
- * FP16_RNE(BF16 input). For a declared visible key set J, the independent mathematical oracle is
- *
- *   score[j]       = scale * dot(FP64(q[:,h,i]), FP64(k[:,kvh,j]))
- *   probability[j] = exp(score[j] - max(score)) / sum_x exp(score[x] - max(score))
- *   ideal[:,h,i]   = sum_j probability[j] * FP64(v[:,kvh,j]).
- *
- * Dot products, stable Softmax, and the value reduction are evaluated naively in FP64. The BF16
- * Op output is promoted to FP64 for comparison; storage rounding belongs to the Op criterion and
- * is not reproduced by the oracle.
- *
- * Quantized cache rows use the exact persistent representation defined by kv_cache_append.
- * INT8 and FP8 K rows represent R*K; NVFP4 and K8V4 additionally store R*V, where R=H256/16
- * is the fixed orthonormal Hadamard transform. The oracle evaluates R*q from the public BF16 q
- * in FP64, uses exact decoded persistent K/V values, and applies R^T to the complete value
- * reduction when V is rotated. This is the same logical formula in the cache's stored basis.
- * It does not quantize or round q, probabilities, partial sums or decoded vectors to copy a
- * kernel's private arithmetic. Newly appended rows cross their specified persistent codec
- * boundary before attention observes them.
- *
- * Kernels may select native BF16/FP16/INT8/FP8 operands, internal reductions, staging precision
- * and decomposition. These are qualified implementation profiles, not extra public tensor
- * boundaries. Every cache route is checked directly against the independent mathematical oracle
- * with its named numerical criterion; route-to-route parity is supplementary evidence only.
- * Those criteria apply to the registered geometries, tested extents, conformance matrix, and
- * target-representative activation range; they are not universal error bounds for arbitrary
- * adversarial BF16 tensors.
+ * Inputs are interpreted in their represented dtype. BFloat16 caches store BF16 K and
+ * FP16_RNE(BF16 input) V. Quantized rows follow kv_cache_append's persistent representation.
+ * INT8/FP8 keys represent R*K, R=H256/16; their logits use R*q and decoded keys. NVFP4/K8V4
+ * additionally store R*V and apply R^T after the complete value reduction. Newly appended rows
+ * cross the persistent codec boundary before attention consumes them. Internal MMA operands,
+ * softmax probabilities and partial sums are not additional public tensor boundaries.
  */
 
 /**
  * Dense, non-causal single-segment attention.
  *
- * The registered profile is D=72, Hq=Hkv=16, scale=1/sqrt(72). q/k/v are BF16 [72,16,T]
+ * The registered profiles are D in {64,72}, Hq=Hkv=16, scale=1/sqrt(D). q/k/v are BF16 [D,16,T]
  * with contiguous feature and head dimensions; their token stride may be padded. out is contiguous
- * BF16 [72,16,T]. Every query attends all T keys. q/k/v/out are mutually non-overlapping, inputs
- * are unchanged, out is completely overwritten, and the Op has no persistent state side effect.
- * The single segment needs no transient workspace.
+ * BF16 [D,16,T], with T>0. Every query attends all T keys. q/k/v/out are mutually non-overlapping,
+ * inputs are unchanged, out is completely overwritten, and the Op has no persistent state side
+ * effect. The single segment needs no transient workspace.
  */
 void softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
-                       AttentionHeadGeometry geometry, float scale, WorkspaceArena& workspace,
-                       Tensor& out, cudaStream_t stream);
+                       AttentionHeadGeometry geometry, float scale, MemoryArena& workspace,
+                       Tensor& out, CudaExecutionView execution);
 
 /**
- * Packed block-diagonal dense attention for the same D72/H16 profile.
+ * Packed block-diagonal dense attention for the same D64/D72, H16 profiles.
  *
  * cu_seqlens is contiguous device I32 [S+1], starts at 0, ends at T, and is strictly increasing.
  * Each range [cu_seqlens[s],cu_seqlens[s+1]) is an independent non-causal segment; no score crosses
@@ -83,7 +62,7 @@ void softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
  */
 void packed_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                               AttentionHeadGeometry geometry, float scale, const Tensor& cu_seqlens,
-                              WorkspaceArena& workspace, Tensor& out, cudaStream_t stream);
+                              MemoryArena& workspace, Tensor& out, CudaExecutionView execution);
 
 /**
  * Equal-length form of packed_softmax_attention. T is divisible by segment_length and consecutive
@@ -92,7 +71,8 @@ void packed_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
  */
 void packed_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                               AttentionHeadGeometry geometry, float scale,
-                              std::int32_t segment_length, Tensor& out, cudaStream_t stream);
+                              std::int32_t segment_length, Tensor& out,
+                              CudaExecutionView execution);
 
 /**
  * Return caller-owned transient capacity for every legal (T,S) pair in the inclusive envelope.
@@ -109,7 +89,7 @@ void packed_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
  * The registered profiles are [D,Hq,Hkv]=[256,24,4] (group 6) and [256,16,2] (group 8), with
  * scale=1/sqrt(256). q/out are contiguous BF16 [D,Hq,W,B], k/v are contiguous BF16
  * [D,Hkv,W,B], positions are contiguous device I32 [W,B], kv_table_rows is contiguous device I32
- * [B], and the cache is BF16, INT8-G64, row-scaled FP8-E4M3FN, NVFP4-G16, or K8V4. valid_columns is
+ * [B], and the cache is BF16, INT8-G64, FP8-E4M3FN-G128/UE8M0, NVFP4-G16, or K8V4. valid_columns is
  * either contiguous device I32 [B] or an empty Tensor meaning every row has W live columns. This
  * dense/masked topology is chosen by the caller and never inferred by copying device metadata to
  * the host. B=1 accepts every positive W in the current prompt/decode domain; B=2..8 accepts
@@ -117,54 +97,60 @@ void packed_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
  *
  * Let Vb be W for dense input or valid_columns[b] otherwise. For live column j<Vb with absolute
  * position p=positions[j,b], query head h attends cache rows [0,p] through table row
- * kv_table_rows[b]. The current k/v row is appended before it is observed, so the formula is the
- * shared oracle above over J=[0,p]. Each masked row has a live prefix [0,Vb); its live positions
- * are sequential and address populated histories. A nonempty row repeats its last live position
- * through the inert tail; an empty row uses zero positions. Other tail values are safe dummies.
+ * kv_table_rows[b]. The current k/v row is appended before it is observed, so the formula above
+ * uses J=[0,p]. Each masked row has a live prefix [0,Vb); its live positions are sequential and
+ * address populated histories. A nonempty row repeats its last live position through the inert
+ * tail; an empty row uses zero positions. Other tail values are safe dummies.
  * Tail columns do not mutate cache and produce exact BF16 zero.
  *
- * Attention consumes the paged cache directly. Caller-owned transient storage is bounded by the
- * capacity query below; implementations that need no partial state return zero capacity.
+ * Cache planes share packed page records selected by an I64 byte-offset table. Row and head
+ * strides describe fields inside one record. Attention consumes this cache directly.
+ * Caller-owned transient storage is bounded by the capacity query below; implementations that
+ * need no partial state return zero capacity.
  *
  * The caller guarantees that the maximum p+1 over live rows lies within envelope. The envelope is
  * a host launch/workspace resource promise over that batch maximum, not a mask and not persistent
  * state. A masked physical width may exceed max_visible_keys when its live prefix is shorter.
  * With fixed tensor views, geometry and cache storage, calls with W<=16 remain CUDA Graph
  * update-compatible across valid envelopes. Live row lengths determine the KV work partition within
- * each capture. Inputs, output, every cache plane/table, and live workspace suballocations are
- * pairwise non-overlapping. The Op overwrites every addressed cache row but owns no cache
- * allocation, frontier, request identity, or commit authority.
+ * each capture. Inputs, output, addressed cache fields, the offset table, and live workspace
+ * suballocations are pairwise non-overlapping. The Op overwrites every addressed cache row but owns
+ * no cache allocation, frontier, request identity, or commit authority. `execution` supplies the
+ * stream and positive physical SM count used for launch and workspace planning; capacity queries
+ * must use the same count as execution.
  */
 void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                               const Tensor& positions, const Tensor& valid_columns,
                               const Tensor& kv_table_rows, AttentionHeadGeometry geometry,
                               float scale, PagedKVBatchLayerView cache,
-                              CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
-                              Tensor& out, cudaStream_t stream);
+                              CausalAttentionExecutionEnvelope envelope, MemoryArena& workspace,
+                              Tensor& out, CudaExecutionView execution);
 
 /**
  * Read-only single-sequence causal attention over an already populated cache.
  *
  * q/out are contiguous BF16 [256,24|16,T], positions is contiguous sequential device I32 [T],
- * and cache geometry, visible rows, scale, numerical oracle, envelope, alias, and workspace rules
- * are the same as causal_softmax_attention. The Op accepts no new K/V and leaves every cache byte
- * unchanged; out is completely overwritten.
+ * and cache geometry, visible rows, scale, numerical semantics, envelope, alias, and workspace
+ * rules are the same as causal_softmax_attention. The Op accepts no new K/V and leaves every cache
+ * byte unchanged; out is completely overwritten.
  */
 void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
                                      AttentionHeadGeometry geometry, float scale,
-                                     const PagedKVLayerView& cache,
+                                     const ConstPagedKVLayerView& cache,
                                      CausalAttentionExecutionEnvelope envelope,
-                                     WorkspaceArena& workspace, Tensor& out, cudaStream_t stream);
+                                     MemoryArena& workspace, Tensor& out,
+                                     CudaExecutionView execution);
 
 /**
  * Return transient capacity for every W in the inclusive interval at one exact batch size. The
- * head geometry, cache dtype, and execution envelope are fixed implementation-profile inputs.
+ * head geometry, cache dtype, execution envelope and device SM count are fixed
+ * implementation-profile inputs.
  * Invalid profiles or intervals throw. The returned capacity may be zero.
  */
 [[nodiscard]] std::size_t causal_softmax_attention_workspace_capacity_bytes(
     AttentionHeadGeometry geometry, KvCacheStorage cache_storage,
     CausalAttentionExecutionEnvelope envelope, std::int32_t batch_size, std::int32_t min_tokens,
-    std::int32_t max_tokens);
+    std::int32_t max_tokens, std::int32_t multiprocessor_count);
 
 /**
  * Non-causal grouped-query attention over persistent context plus one live query block.
@@ -172,8 +158,9 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
  * The registered profile is D=128, Hq=32, Hkv=8 (group 4), scale=1/sqrt(128), T=1..16, and
  * B=1..8. q/out are contiguous BF16 [128,32,T,B], query_k/query_v are contiguous BF16
  * [128,8,T,B], and context_lengths, valid_columns, and table_rows are contiguous device I32 [B].
- * The read-only paged BFloat16 context uses head-major BF16 K and FP16 V planes
- * [128,64,Nphysical,8].
+ * The read-only BFloat16 context stores BF16 K and FP16 V fields [128,64,8] within each
+ * packed page record. Its I64 [logical_pages,table_rows] table contains arena-relative byte
+ * offsets; table_rows selects a row of that table.
  *
  * For row b, let L=context_lengths[b] and V=valid_columns[b]. Every live query i<V attends the
  * complete logical set consisting of context rows [0,L) followed by every temporary query K/V row
@@ -189,13 +176,14 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
 void context_softmax_attention(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
                                const Tensor& context_lengths, const Tensor& valid_columns,
                                const Tensor& table_rows, AttentionHeadGeometry geometry,
-                               float scale, const PagedKVBatchLayerView& context,
-                               ContextAttentionExecutionEnvelope envelope,
-                               WorkspaceArena& workspace, Tensor& out, cudaStream_t stream);
+                               float scale, const ConstPagedKVBatchLayerView& context,
+                               ContextAttentionExecutionEnvelope envelope, MemoryArena& workspace,
+                               Tensor& out, CudaExecutionView execution);
 
 /**
  * Return transient capacity for every T in the inclusive optimized interval at the exact batch
  * size. The execution envelope is fixed; invalid profiles or intervals throw.
+ * An envelope with max_context=0 requires no transient storage.
  */
 [[nodiscard]] std::size_t context_softmax_attention_workspace_capacity_bytes(
     AttentionHeadGeometry geometry, ContextAttentionExecutionEnvelope envelope,

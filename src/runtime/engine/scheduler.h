@@ -2,8 +2,8 @@
 
 #include "ninfer/types.h"
 #include "runtime/contract/execution.h"
-#include "runtime/engine/admission_policy.h"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -12,83 +12,16 @@
 #include <optional>
 #include <span>
 #include <stdexcept>
-#include <string>
 #include <vector>
 
 namespace ninfer::runtime {
 
+// Membership and fairness only. Native stores own every physical reservation.
 template <class Request>
 class Scheduler {
 public:
     using RequestPtr     = std::shared_ptr<Request>;
     using SequenceHandle = typename Request::SequenceHandle;
-
-    enum class ExecutionAction : std::uint8_t {
-        Prefill,
-        Decode,
-        Wait,
-    };
-
-    class AdmissionGrant {
-    public:
-        AdmissionGrant(AdmissionGrant&&) noexcept            = default;
-        AdmissionGrant& operator=(AdmissionGrant&&) noexcept = default;
-        AdmissionGrant(const AdmissionGrant&)                = delete;
-        AdmissionGrant& operator=(const AdmissionGrant&)     = delete;
-
-        [[nodiscard]] std::uint64_t request_id() const noexcept { return request_id_; }
-
-        [[nodiscard]] BackfillClass backfill_class() const noexcept { return backfill_class_; }
-
-        [[nodiscard]] std::uint64_t protection_epoch() const noexcept { return protection_epoch_; }
-
-        [[nodiscard]] ProgramResourceRevision resource_revision() const noexcept {
-            return resource_revision_;
-        }
-
-        [[nodiscard]] std::uint64_t service_work_quanta() const noexcept {
-            return service_work_quanta_;
-        }
-
-    private:
-        AdmissionGrant(std::uint64_t request_id, BackfillClass backfill_class,
-                       std::uint64_t protection_epoch, ProgramResourceRevision resource_revision,
-                       std::uint64_t service_work_quanta) noexcept
-            : request_id_(request_id), backfill_class_(backfill_class),
-              protection_epoch_(protection_epoch), resource_revision_(resource_revision),
-              service_work_quanta_(service_work_quanta) {}
-
-        std::uint64_t request_id_       = 0;
-        BackfillClass backfill_class_   = BackfillClass::None;
-        std::uint64_t protection_epoch_ = 0;
-        ProgramResourceRevision resource_revision_;
-        std::uint64_t service_work_quanta_ = 0;
-
-        friend class Scheduler;
-    };
-
-    class FifoSnapshot {
-    public:
-        [[nodiscard]] bool empty() const noexcept { return requests_.empty(); }
-
-        [[nodiscard]] const RequestPtr& head() const {
-            if (requests_.empty()) { throw std::logic_error("FIFO snapshot has no head"); }
-            return requests_.front();
-        }
-
-        [[nodiscard]] std::span<const RequestPtr> backfill_candidates() const noexcept {
-            if (requests_.size() <= 1) { return {}; }
-            return {requests_.data() + 1, requests_.size() - 1};
-        }
-
-    private:
-        explicit FifoSnapshot(const std::deque<RequestPtr>& pending)
-            : requests_(pending.begin(), pending.end()) {}
-
-        std::vector<RequestPtr> requests_;
-
-        friend class Scheduler;
-    };
 
     struct RoundMembership {
         std::array<std::uint32_t, kMaximumConcurrency> lanes{};
@@ -129,19 +62,6 @@ public:
         }
     };
 
-    struct ActiveAdmissionSet {
-        std::array<ActiveAdmissionSnapshot, kMaximumConcurrency> requests{};
-        std::size_t size = 0;
-
-        [[nodiscard]] std::span<const ActiveAdmissionSnapshot> span() const noexcept {
-            return {requests.data(), size};
-        }
-    };
-
-    [[nodiscard]] static FifoSnapshot fifo_snapshot(const std::deque<RequestPtr>& pending) {
-        return FifoSnapshot(pending);
-    }
-
     template <class Slots>
     [[nodiscard]] RoundMembership build_round_membership(const Slots& slots,
                                                          std::uint32_t max_concurrency) const {
@@ -160,8 +80,10 @@ public:
             membership.lanes[membership.size]     = lane;
             membership.sequences[membership.size] = *request->sequence;
             membership.budgets[membership.size]   = RoundBudget{
-                  .generated_tokens_remaining =
-                    request->output.model_token_budget_remaining(request->budget->remaining()),
+                  .generated_tokens_remaining = request->recovery_pending
+                                                    ? 1U
+                                                    : request->output.model_token_budget_remaining(
+                                                        request->budget->remaining()),
             };
             if (membership.budgets[membership.size].generated_tokens_remaining == 0) {
                 throw std::logic_error("decode-ready request has no licensed model tokens");
@@ -203,167 +125,150 @@ public:
     }
 
     template <class Slots>
-    [[nodiscard]] ActiveAdmissionSet active_admission_set(const Slots& slots,
-                                                          std::uint32_t max_concurrency) const {
-        ActiveAdmissionSet active;
-        for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
-            const auto& request = slots[lane];
-            if (request == nullptr) { continue; }
-            if (request->remaining_service_work == 0) {
-                throw std::logic_error("active request has no admission accounting");
+    [[nodiscard]] std::optional<std::uint32_t>
+    next_prefill(const Slots& slots, std::uint32_t concurrency) const noexcept {
+        for (std::uint32_t offset = 0; offset < concurrency; ++offset) {
+            const std::uint32_t lane = (prefill_cursor_ + offset) % concurrency;
+            const auto& request      = slots[lane];
+            if (request && (request->is_prefilling() || request->is_replaying()) &&
+                !request->capture_pending) {
+                return lane;
             }
-            active.requests[active.size++] = ActiveAdmissionSnapshot{
-                .request_id     = request->id,
-                .backfill_epoch = request->backfill_epoch,
-                .backfill_class = request->backfill_class,
-            };
-        }
-        return active;
-    }
-
-    static void consume_service_work(Request& request, std::uint64_t work) {
-        if (work == 0 || work > request.remaining_service_work) {
-            throw std::logic_error("request service projection consumed " + std::to_string(work) +
-                                   " quanta with " +
-                                   std::to_string(request.remaining_service_work) + " remaining");
-        }
-        request.remaining_service_work -= work;
-    }
-
-    [[nodiscard]] bool should_attempt_admission(bool have_pending, bool admission_check_pending,
-                                                bool have_decode, bool previous_unit_was_decode,
-                                                bool context_transaction) const noexcept {
-        return have_pending && admission_check_pending && !context_transaction && !prefill_lane_ &&
-               (!have_decode || previous_unit_was_decode);
-    }
-
-    [[nodiscard]] ExecutionAction choose_execution(bool have_decode, bool prefill_runnable,
-                                                   bool previous_unit_was_decode) const noexcept {
-        if (prefill_runnable) {
-            return have_decode && !previous_unit_was_decode ? ExecutionAction::Decode
-                                                            : ExecutionAction::Prefill;
-        }
-        return have_decode ? ExecutionAction::Decode : ExecutionAction::Wait;
-    }
-
-    [[nodiscard]] std::optional<std::uint32_t> prefill_lane() const noexcept {
-        return prefill_lane_;
-    }
-
-    [[nodiscard]] std::optional<std::uint64_t> protection_epoch() const noexcept {
-        return protection_ ? std::optional<std::uint64_t>(protection_->epoch_id) : std::nullopt;
-    }
-
-    void set_prefill_lane(std::uint32_t lane) {
-        if (prefill_lane_) { throw std::logic_error("multiple requests own staged prefill"); }
-        prefill_lane_ = lane;
-    }
-
-    void clear_prefill_lane(std::uint32_t lane) {
-        if (!prefill_lane_ || *prefill_lane_ != lane) {
-            throw std::logic_error("request does not own staged prefill");
-        }
-        prefill_lane_.reset();
-    }
-
-    void observe_fifo_head(std::optional<std::uint64_t> request_id) noexcept {
-        if (fifo_head_id_ == request_id) { return; }
-        fifo_head_id_ = request_id;
-        protection_.reset();
-    }
-
-    void on_waiting_removed(std::uint64_t request_id) noexcept {
-        if (fifo_head_id_ && *fifo_head_id_ == request_id) {
-            fifo_head_id_.reset();
-            protection_.reset();
-        }
-    }
-
-    [[nodiscard]] AdmissionGrant grant_head(std::uint64_t request_id,
-                                            std::uint64_t service_work_quanta) const {
-        if (!fifo_head_id_ || *fifo_head_id_ != request_id || request_id == 0 ||
-            service_work_quanta == 0) {
-            throw std::logic_error("head admission is not bound to the observed FIFO head");
-        }
-        return AdmissionGrant(request_id, BackfillClass::None, 0, {}, service_work_quanta);
-    }
-
-    [[nodiscard]] bool protect_blocked_head(std::uint64_t request_id,
-                                            std::span<const ActiveAdmissionSnapshot> active,
-                                            ProgramResourceRevision resource_revision) {
-        if (!fifo_head_id_ || *fifo_head_id_ != request_id) {
-            throw std::logic_error("blocked admission does not match the observed FIFO head");
-        }
-        if (!protection_) {
-            protection_.emplace(make_admission_protection(next_protection_epoch_++, request_id,
-                                                          resource_revision, active));
-        } else if (protection_->head_request_id != request_id) {
-            throw std::logic_error("protected head changed without a FIFO transition");
-        } else {
-            rebind_admission_protection(*protection_, active, resource_revision);
-        }
-        return protection_has_live_donor(*protection_, active);
-    }
-
-    [[nodiscard]] std::optional<AdmissionGrant>
-    qualify_backfill(std::uint64_t request_id, std::uint64_t service_work_quanta,
-                     std::span<const ActiveAdmissionSnapshot> active,
-                     ProgramResourceRevision program_proof_revision) const {
-        if (!fifo_head_id_ || !protection_ || protection_->head_request_id != *fifo_head_id_) {
-            throw std::logic_error("backfill qualification has no open protected head");
-        }
-        if (request_id == 0 || request_id == *fifo_head_id_ || service_work_quanta == 0) {
-            throw std::logic_error("backfill candidate has invalid scheduling identity");
-        }
-        if (persistent_backfill_is_authorized(*protection_, request_id, active,
-                                              program_proof_revision)) {
-            return AdmissionGrant(request_id, BackfillClass::Persistent, protection_->epoch_id,
-                                  program_proof_revision, service_work_quanta);
         }
         return std::nullopt;
     }
 
-    [[nodiscard]] bool validate_grant(const AdmissionGrant& grant) const noexcept {
-        if (grant.request_id_ == 0 || grant.service_work_quanta_ == 0) { return false; }
-        if (grant.backfill_class_ == BackfillClass::None) {
-            return grant.protection_epoch_ == 0 && grant.resource_revision_.value == 0 &&
-                   fifo_head_id_ && *fifo_head_id_ == grant.request_id_;
-        }
-        if (!fifo_head_id_ || !protection_ || protection_->head_request_id != *fifo_head_id_ ||
-            protection_->epoch_id != grant.protection_epoch_ ||
-            protection_->resource_revision != grant.resource_revision_ ||
-            grant.request_id_ == *fifo_head_id_) {
-            return false;
-        }
-        return grant.backfill_class_ == BackfillClass::Persistent;
+    void prefill_executed(std::uint32_t lane, std::uint32_t concurrency) noexcept {
+        prefill_cursor_ = (lane + 1U) % concurrency;
     }
 
-    void commit_admission(AdmissionGrant&& grant) {
-        if (!validate_grant(grant)) {
-            throw std::logic_error("admission grant is stale or inconsistent");
-        }
-        if (grant.backfill_class_ == BackfillClass::None) {
-            fifo_head_id_.reset();
-            protection_.reset();
-            grant.request_id_          = 0;
-            grant.service_work_quanta_ = 0;
-            return;
-        }
-        grant.request_id_          = 0;
-        grant.service_work_quanta_ = 0;
+    // Queue/capacity changes start a bounded pass. Ordinary decode cycles only continue
+    // an unfinished pass; they do not restart failed admission checks.
+    void begin_admission_scan() noexcept { admission_scan_requested_ = true; }
+
+    [[nodiscard]] bool admission_scan_pending() const noexcept {
+        return admission_scan_requested_ || !admission_scan_remaining_.empty();
     }
 
-    void reset() noexcept {
-        prefill_lane_.reset();
-        fifo_head_id_.reset();
-        protection_.reset();
+    void admission_candidate_checked(std::uint64_t request_id) noexcept {
+        std::erase(admission_scan_remaining_, request_id);
+        if (request_id != admission_scan_head_) { scan_after_ = request_id; }
     }
+
+    // Only a successful younger admission consumes the older request's bypass allowance.
+    [[nodiscard]] std::vector<RequestPtr> fresh_candidates(const std::deque<RequestPtr>& fresh,
+                                                           std::uint32_t concurrency) {
+        std::vector<RequestPtr> candidates;
+        if (fresh.empty()) {
+            admission_scan_requested_ = false;
+            admission_scan_remaining_.clear();
+            return candidates;
+        }
+        admission_scan_head_ = fresh.front()->id;
+        std::size_t limit    = fresh.size();
+        for (std::size_t i = 0; i < fresh.size(); ++i) {
+            if (fresh[i]->admission_bypasses >= concurrency) {
+                limit = i + 1;
+                break;
+            }
+        }
+        if (admission_scan_requested_) {
+            admission_scan_remaining_.clear();
+            for (std::size_t i = 0; i < limit; ++i) {
+                admission_scan_remaining_.push_back(fresh[i]->id);
+            }
+            admission_scan_requested_ = false;
+        } else {
+            // Cancellation and a newly exhausted bypass allowance can remove eligibility
+            // while the pass is in progress. Keep tickets, not queue positions or iterators.
+            std::erase_if(admission_scan_remaining_, [&](std::uint64_t id) {
+                return std::none_of(fresh.begin(), fresh.begin() + limit,
+                                    [id](const auto& request) { return request->id == id; });
+            });
+        }
+        if (admission_scan_remaining_.empty()) { return candidates; }
+        candidates.push_back(fresh.front());
+        std::vector<RequestPtr> younger;
+        for (std::size_t i = 1; i < limit; ++i) {
+            if (std::find(admission_scan_remaining_.begin(), admission_scan_remaining_.end(),
+                          fresh[i]->id) != admission_scan_remaining_.end()) {
+                younger.push_back(fresh[i]);
+            }
+        }
+        std::sort(younger.begin(), younger.end(),
+                  [](const auto& a, const auto& b) { return a->id < b->id; });
+        const auto next = std::find_if(younger.begin(), younger.end(), [&](const auto& request) {
+            return request->id > scan_after_;
+        });
+        std::rotate(younger.begin(), next, younger.end());
+        const auto count = std::min<std::size_t>(concurrency, younger.size());
+        candidates.insert(candidates.end(), younger.begin(), younger.begin() + count);
+        return candidates;
+    }
+
+    void admitted(const std::deque<RequestPtr>& fresh, const Request& admitted,
+                  std::uint32_t concurrency) const {
+        for (const auto& skipped : fresh) {
+            if (skipped->id == admitted.id) { return; }
+            if (skipped->admission_bypasses >= concurrency) {
+                throw std::logic_error("fresh admission exceeded the FIFO bypass allowance");
+            }
+            ++skipped->admission_bypasses;
+        }
+        throw std::logic_error("admitted request is absent from the fresh queue");
+    }
+
+    template <class Slots>
+    [[nodiscard]] std::optional<std::uint32_t>
+    youngest_victim(const Slots& slots, std::uint32_t concurrency,
+                    std::optional<std::uint64_t> priority_ticket = std::nullopt,
+                    std::span<const std::uint32_t> excluded      = {}) const noexcept {
+        std::optional<std::uint32_t> oldest;
+        std::optional<std::uint32_t> youngest;
+        for (std::uint32_t lane = 0; lane < concurrency; ++lane) {
+            const auto& request = slots[lane];
+            if (!request || request->is_materializing() || request->is_model_finished()) {
+                continue;
+            }
+            if (!oldest || request->id < slots[*oldest]->id) { oldest = lane; }
+            if (!request->recovery_pending &&
+                std::find(excluded.begin(), excluded.end(), lane) == excluded.end() &&
+                (!priority_ticket || request->id > *priority_ticket) &&
+                (!youngest || request->id > slots[*youngest]->id)) {
+                youngest = lane;
+            }
+        }
+        if (!priority_ticket && youngest == oldest) { return std::nullopt; }
+        return youngest;
+    }
+
+    void preempted() noexcept {
+        restoration_event_ = false;
+        // The paused request waits for a capacity event. Its free lane can immediately
+        // serve another request that fits the remaining physical capacity.
+        begin_admission_scan();
+    }
+
+    // Completion, cancellation or a committed permanent shrink can make a snapshot fit.
+    // Returning speculative scratch at the end of an ordinary unit does not call this.
+    void capacity_released() noexcept { restoration_event_ = true; }
+
+    [[nodiscard]] bool should_restore(bool have_paused, bool resident_empty) const noexcept {
+        return have_paused && (resident_empty || restoration_event_);
+    }
+
+    // A successful restore keeps priority through replay and its first new execution unit.
+    void restoration_blocked() noexcept { restoration_event_ = false; }
+
+    void paused_queue_empty() noexcept { restoration_event_ = false; }
 
 private:
-    std::optional<std::uint32_t> prefill_lane_;
-    std::optional<std::uint64_t> fifo_head_id_;
-    std::optional<AdmissionProtection> protection_;
-    std::uint64_t next_protection_epoch_ = 1;
+    std::uint32_t prefill_cursor_      = 0;
+    std::uint64_t scan_after_          = 0;
+    std::uint64_t admission_scan_head_ = 0;
+    std::vector<std::uint64_t> admission_scan_remaining_;
+    bool admission_scan_requested_ = false;
+    bool restoration_event_        = false;
 };
 
 } // namespace ninfer::runtime

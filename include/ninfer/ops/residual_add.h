@@ -1,22 +1,17 @@
 #pragma once
 
+#include "core/device.h"
 #include "core/tensor.h"
 
-#include <cuda_runtime.h> // cudaStream_t
 
 namespace ninfer::ops {
 
 /**
- * Elementwise residual update:
+ * x[i] = x[i] + y[i].
  *
- *   ideal[i] = x[i] + y[i].
- *
- * `y` and `x` are non-overlapping, same-shaped contiguous BF16 tensors. The Op updates all of x
- * in place and leaves y unchanged. The oracle evaluates `ideal` in FP64 from the represented
- * inputs. The updated BF16 x is promoted and compared directly with that result; output storage
- * rounding belongs to the Op's numerical criterion, not the oracle. Private kernel arithmetic is
- * implementation-defined. The Op uses no workspace or other persistent state.
+ * x/y are same-shaped, contiguous, non-overlapping BF16 tensors.
+ * Updates x in place and preserves y. Empty tensors perform no device work.
  */
-void residual_add(const Tensor& y, Tensor& x, cudaStream_t stream);
+void residual_add(const Tensor& y, Tensor& x, CudaExecutionView execution);
 
 } // namespace ninfer::ops

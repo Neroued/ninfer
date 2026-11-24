@@ -58,11 +58,34 @@ void set_contiguous_strides(Tensor& tensor) {
 
 } // namespace
 
-Tensor::Tensor(void* data_in, DType dtype_in, std::initializer_list<std::int32_t> shape)
-    : data(data_in), dtype(dtype_in) {
+Tensor Tensor::metadata(DType dtype, std::initializer_list<std::int32_t> shape) {
+    Tensor result;
+    result.dtype          = dtype;
     const auto normalized = normalize_shape(shape);
-    for (int i = 0; i < 4; ++i) { ne[i] = normalized[i]; }
-    set_contiguous_strides(*this);
+    for (int i = 0; i < 4; ++i) { result.ne[i] = normalized[i]; }
+    set_contiguous_strides(result);
+    return result;
+}
+
+Tensor::Tensor(void* data_in, Device device_in, DType dtype,
+               std::initializer_list<std::int32_t> shape)
+    : Tensor(metadata(dtype, shape)) {
+    if (data_in == nullptr || device_in.type() == DeviceType::None) {
+        throw std::invalid_argument("tensor binding requires backing and device");
+    }
+    data   = data_in;
+    device = device_in;
+}
+
+Tensor::Tensor(MemorySpan memory, DType dtype, std::initializer_list<std::int32_t> shape)
+    : Tensor(metadata(dtype, shape)) {
+    if (bytes() > memory.bytes) { throw std::out_of_range("tensor exceeds backing memory"); }
+    if (memory.data == nullptr && memory.device.type() == DeviceType::None && !memory.host_pinned) {
+        return;
+    }
+    validate_memory(memory);
+    data   = memory.data;
+    device = memory.device;
 }
 
 std::int64_t Tensor::numel() const { return shape_numel(ne); }
@@ -104,7 +127,10 @@ Tensor Tensor::view(std::initializer_list<std::int32_t> shape) const {
         throw std::invalid_argument("view element count mismatch");
     }
 
-    return Tensor(data, dtype, shape);
+    Tensor result = metadata(dtype, shape);
+    result.data   = data;
+    result.device = device;
+    return result;
 }
 
 Tensor Tensor::reshape(std::initializer_list<std::int32_t> shape) const { return view(shape); }

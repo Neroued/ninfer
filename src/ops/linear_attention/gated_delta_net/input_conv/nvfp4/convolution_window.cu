@@ -1,0 +1,108 @@
+#include "ops/linear_attention/gated_delta_net/input_conv/kernels/output.cuh"
+#include "core/weight.h"
+#include "ops/linear_attention/gated_delta_net/input_conv/nvfp4/launch.h"
+#include "core/device.h"
+#include "ops/linear/kernels/nvfp4/nvfp4_schedule.cuh"
+#include "ops/linear/kernels/nvfp4/nvfp4_template_launch.cuh"
+#include <array>
+#include <cstddef>
+#include <utility>
+
+namespace ninfer::ops::detail {
+using ConvGeometry = GdnConvGeometry<6144>;
+
+namespace {
+
+using Launch = void (*)(const Tensor&, const Weight&, const Tensor&, const ConstStateFieldView&,
+                        const Tensor&, const gdn_input::HistoryDestination&, Tensor&, Tensor&,
+                        Tensor&, Tensor&, cudaStream_t);
+using RecordLaunch = void (*)(const Tensor&, const Weight&, const Tensor&,
+                              const ConstStateFieldView&, const Tensor&, Tensor&, Tensor&, Tensor&,
+                              Tensor&, Tensor&, cudaStream_t);
+
+template <int ActiveTokens, class Publish>
+void launch_exact(const Tensor& x, const Weight& weight, const Tensor& conv_weight,
+                  const ConstStateFieldView& conv_states, const Tensor& valid_columns,
+                  Tensor& query, Tensor& key, Tensor& value, Tensor& z, Publish publish,
+                  cudaStream_t stream) {
+    using Geometry = Nvfp4N16384K5120;
+    using Schedule =
+        Nvfp4A16SimtSchedule<4, 1, 2, (ActiveTokens >= 17 && ActiveTokens <= 20) ? 8 : 16,
+                             ActiveTokens, 1,
+                             ActiveTokens == 2 ? Nvfp4SimtActivationAccess::SharedPhase
+                                               : Nvfp4SimtActivationAccess::TokenPacked,
+                             Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 1,
+                             Nvfp4SimtBlockOrder::RowsContiguous, 1>;
+    static_assert(Schedule::kBlockTokens == ActiveTokens);
+
+    launch_nvfp4_a16_simt<
+        Nvfp4ScheduleInstance<Schedule, Geometry::kInputRows, ActiveTokens, true>>(
+        nvfp4_a16_operands(x, weight),
+        make_gdn_conv_output<ConvGeometry, ActiveTokens>(conv_weight, conv_states, valid_columns,
+                                                         query, key, value, z, publish),
+        GdnConvRowEpilogue<ActiveTokens>{}, stream);
+}
+
+template <int ActiveTokens>
+void launch_snapshot_exact(const Tensor& x, const Weight& weight, const Tensor& conv_weight,
+                           const ConstStateFieldView& conv_states, const Tensor& valid_columns,
+                           const gdn_input::HistoryDestination& destination, Tensor& query,
+                           Tensor& key, Tensor& value, Tensor& z, cudaStream_t stream) {
+    launch_exact<ActiveTokens>(
+        x, weight, conv_weight, conv_states, valid_columns, query, key, value, z,
+        make_snapshot_history_publish(destination, ConvGeometry::channels), stream);
+}
+
+template <int ActiveTokens>
+void launch_record_exact(const Tensor& x, const Weight& weight, const Tensor& conv_weight,
+                         const ConstStateFieldView& conv_states, const Tensor& valid_columns,
+                         Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value, Tensor& z,
+                         cudaStream_t stream) {
+    launch_exact<ActiveTokens>(x, weight, conv_weight, conv_states, valid_columns, query, key,
+                               value, z,
+                               RecordColumnPublish{static_cast<__nv_bfloat16*>(conv_record.data),
+                                                   ConvGeometry::channels, ActiveTokens},
+                               stream);
+}
+
+template <std::size_t... Offsets>
+constexpr auto make_launchers(std::index_sequence<Offsets...>) {
+    return std::array<Launch, sizeof...(Offsets)>{
+        &launch_snapshot_exact<2 + static_cast<int>(Offsets)>...};
+}
+
+template <std::size_t... Offsets>
+constexpr auto make_record_launchers(std::index_sequence<Offsets...>) {
+    return std::array<RecordLaunch, sizeof...(Offsets)>{
+        &launch_record_exact<2 + static_cast<int>(Offsets)>...};
+}
+
+constexpr auto kLaunchers       = make_launchers(std::make_index_sequence<16 - 2 + 1>{});
+constexpr auto kRecordLaunchers = make_record_launchers(std::make_index_sequence<16 - 2 + 1>{});
+
+} // namespace
+
+void launch_nvfp4_gdn_snapshot_small_t(const Tensor& x, const Weight& weight,
+                                       const Tensor& conv_weight,
+                                       const ConstStateFieldView& conv_states,
+                                       const Tensor& valid_columns,
+                                       const gdn_input::HistoryDestination& destination,
+                                       Tensor& query, Tensor& key, Tensor& value, Tensor& z,
+                                       cudaStream_t stream) {
+    const std::size_t index = static_cast<std::size_t>(x.ne[1] - 2);
+    kLaunchers[index](x, weight, conv_weight, conv_states, valid_columns, destination, query, key,
+                      value, z, stream);
+}
+
+void launch_nvfp4_gdn_record_small_t(const Tensor& x, const Weight& weight,
+                                     const Tensor& conv_weight,
+                                     const ConstStateFieldView& conv_states,
+                                     const Tensor& valid_columns, Tensor& conv_record,
+                                     Tensor& query, Tensor& key, Tensor& value, Tensor& z,
+                                     cudaStream_t stream) {
+    const std::size_t index = static_cast<std::size_t>(x.ne[1] - 2);
+    kRecordLaunchers[index](x, weight, conv_weight, conv_states, valid_columns, conv_record, query,
+                            key, value, z, stream);
+}
+
+} // namespace ninfer::ops::detail

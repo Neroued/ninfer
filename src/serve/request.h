@@ -11,6 +11,7 @@
 // by Engine; media sources remain unresolved until the product service acquires
 // owning bytes.
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -44,7 +45,7 @@ private:
 
 // Server-side context needed while parsing/validating a request.
 struct RequestLimits {
-    int default_max_tokens = 8192;
+    std::uint32_t default_max_tokens = 8192;
 };
 
 enum class ContentKind {
@@ -80,6 +81,8 @@ struct ToolDefinition {
     std::string name;
     std::string description;
     std::string input_schema_json;
+    std::string schema_param; // Original protocol path; never included in the model prompt.
+    bool strict = false;
     std::optional<std::string> input_examples_json;
     std::optional<CacheBoundary> cache_boundary_after;
 };
@@ -90,13 +93,14 @@ struct ToolCall {
     std::string arguments_json;
 };
 
-enum class ToolChoiceMode {
-    Auto,
-    None,
-};
+using ToolChoiceMode = ninfer::ToolChoiceMode;
+using ToolChoice     = ninfer::ToolChoice;
 
-struct ToolChoice {
-    ToolChoiceMode mode = ToolChoiceMode::Auto;
+struct MessageContentBoundary {
+    std::size_t parts           = 0;
+    std::size_t tool_calls      = 0;
+    std::size_t reasoning_bytes = 0;
+    std::optional<CacheBoundary> cache_boundary_after;
 };
 
 struct ChatTurn {
@@ -111,6 +115,7 @@ struct ChatTurn {
     std::string reasoning_content; // assistant thinking carried across turns (round-tripped to the
                                    // template)
     std::optional<CacheBoundary> cache_boundary_after;
+    std::vector<MessageContentBoundary> content_boundaries;
 };
 
 // Sampling overrides that have an executable Engine meaning. Protocol-only
@@ -171,13 +176,15 @@ requested_reasoning_effort_name(RequestedReasoningEffort effort) noexcept {
 }
 
 struct GenerationRequest {
+    std::optional<OutputConstraint> constraint;
+    std::string constraint_param;
     std::vector<ChatTurn> messages;
     std::vector<ToolDefinition> tools;
     std::size_t tool_name_max_length = 64;
     ToolChoice tool_choice;
     std::vector<std::string> stop_strings;
     bool stop_strings_apply_to_reasoning = false;
-    int max_tokens                       = 0; // resolved budget; zero means immediate output limit
+    std::uint32_t max_tokens             = 0; // resolved budget; zero means immediate output limit
     std::optional<bool> enable_thinking;      // unset => use the server default
     std::optional<std::uint32_t> thinking_budget;
     std::optional<RequestedReasoningEffort> reasoning_effort;
@@ -188,7 +195,18 @@ struct GenerationRequest {
     SamplingParams sampling;
 
     [[nodiscard]] bool uses_tools() const noexcept {
-        return !tools.empty() && tool_choice.mode != ToolChoiceMode::None;
+        return !tools.empty() && tool_choice.mode != ToolChoiceMode::None &&
+               (!tool_choice.allowed_names || !tool_choice.allowed_names->empty());
+    }
+
+    [[nodiscard]] bool constrains_tools() const noexcept {
+        if (tools.empty() || constraint) return false;
+        if (!uses_tools()) return true;
+        if (tool_choice.mode == ToolChoiceMode::Required || !tool_choice.parallel ||
+            tool_choice.allowed_names || tool_choice.constraints == ToolConstraintMode::Basic)
+            return true;
+        return std::any_of(tools.begin(), tools.end(),
+                           [](const auto& tool) { return tool.strict; });
     }
 
     [[nodiscard]] std::size_t media_item_count() const noexcept {

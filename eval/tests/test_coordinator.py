@@ -2,7 +2,9 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+from ninfer_eval.backends.mock import MockBackend
 from ninfer_eval.config import load_config
 from ninfer_eval.coordinator import Coordinator, load_resume_config
 
@@ -83,6 +85,32 @@ runtime:
                 event["job_id"] for event in events if event["kind"] == "job_skipped"
             }
             self.assertEqual(skipped, {"first", "second"})
+
+    def test_partial_result_is_persisted_and_retried_on_resume(self):
+        normalize = MockBackend.normalize
+
+        def partial(backend, context, run):
+            result = normalize(backend, context, run)
+            result.status = "partial"
+            result.error = "incomplete"
+            return result
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config = load_config(self.make_config(Path(tmp)))
+            announced = []
+            with patch.object(MockBackend, "normalize", partial):
+                run_dir = Coordinator(config, "all").run(on_started=announced.append)
+            self.assertEqual(announced, [run_dir])
+            self.assertEqual(
+                json.loads((run_dir / "summary.json").read_text())["status"], "partial"
+            )
+            state = json.loads((run_dir / "state.json").read_text())
+            self.assertEqual(state["jobs"]["first"]["status"], "partial")
+            Coordinator(config, "all").run(resume_dir=run_dir)
+            self.assertEqual(
+                json.loads((run_dir / "summary.json").read_text())["status"],
+                "completed",
+            )
 
 
 if __name__ == "__main__":

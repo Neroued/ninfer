@@ -7,9 +7,9 @@
 //   ./ninfer_causal_conv1d_silu_bench --snapshot --channels 8192 --tokens 6 --slots 7
 // Printed logical GB/s is informational; NCU determines the applicable resource roofline.
 #include "ninfer/ops/causal_conv1d_silu.h"
-#include "ninfer/ops/scatter.h"
+#include "core/buffer.h"
 #include "core/device.h"
-#include "ninfer_bench_common.h"
+#include "op_measurement.cuh"
 
 #include <cstddef>
 #include <cstdint>
@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <optional>
 #include <vector>
 
 using namespace ninfer;
@@ -27,6 +28,7 @@ namespace {
 constexpr std::size_t kFlushBytes = std::size_t{256} << 20;
 
 struct Options {
+    measurement::Options timing;
     std::int32_t channels     = 8192;
     std::int32_t tokens       = 1024;
     std::int32_t slots        = 7;
@@ -39,36 +41,40 @@ struct Options {
     bool distinct = false;
     bool snapshot = false;
     bool split    = false;
-    bool legacy   = false;
     bool cold     = false;
+    bool in_place = false;
 };
 
-// The candidate partition for a channel extent. Which partitions are registered is the entry's
-// business, not the benchmark's: this builds the obvious one and lets the entry accept or reject
-// it.
+// The split-output fixture uses two key ranges followed by the remaining value rows; the
+// public Op validates the requested channel geometry.
 constexpr std::int32_t kSplitKeyDim = 2048;
 
 bool split_partition(std::int32_t channels, std::int32_t& key_dim, std::int32_t& value_dim) {
-    key_dim   = kSplitKeyDim;
-    value_dim = channels - 2 * kSplitKeyDim;
+    key_dim   = channels == 5120 ? 1024 : kSplitKeyDim;
+    value_dim = channels - 2 * key_dim;
     return value_dim > 0;
 }
 
 Result time_stage(const Options& options, const launch_fn& launch, double bytes_moved,
-                  const launch_fn& restore = {}) {
-    if (!options.cold) {
-        return restore ? bench_loop_prepared(restore, launch, bytes_moved)
-                       : bench_loop(launch, bytes_moved);
-    }
-    constexpr int kColdWarmup = 20;
-    constexpr int kColdRepeat = 40;
+                  const launch_fn& restore = {}, const measurement::Row* row = nullptr,
+                  measurement::Csv* csv = nullptr) {
     bench::L2FlushBuffer flush(kFlushBytes);
-    const ColdTiming timing =
-        restore ? measure_cold_launch_prepared(restore, launch, flush, nullptr, kColdWarmup,
-                                               kColdRepeat)
-                : measure_cold_launch(launch, flush, nullptr, kColdWarmup, kColdRepeat);
+    const auto cuda     = device_context().execution_view();
+    const auto measured = measurement::measure(
+        launch,
+        [&](CudaExecutionView execution) {
+            if (restore) restore(execution);
+        },
+        flush, cuda, options.timing, options.timing.execution, options.cold ? "cold" : "warm");
+    if (csv && row) {
+        csv->write(*row, measured, options.timing.execution, options.cold ? "cold" : "warm",
+                   std::to_string(static_cast<std::uint64_t>(bytes_moved)) + ',' +
+                       std::to_string(options.batch) + ',' +
+                       (options.in_place ? "alias" : "distinct"));
+    }
+    const auto& timing = measured.gpu;
     Result result;
-    result.n_runs        = kColdRepeat;
+    result.n_runs        = options.timing.repeat;
     result.median_us     = timing.median_us;
     result.min_us        = timing.min_us;
     result.p95_us        = timing.p95_us;
@@ -78,13 +84,7 @@ Result time_stage(const Options& options, const launch_fn& launch, double bytes_
 }
 
 std::string cache_tag(const Options& options, const char* entry) {
-    return options.cold ? std::string(entry) + "-cold" : std::string(entry);
-}
-
-__global__ void copy_u128_kernel(const uint4* src, uint4* dst, std::size_t n4) {
-    const std::size_t start  = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
-    const std::size_t stride = static_cast<std::size_t>(blockDim.x) * gridDim.x;
-    for (std::size_t i = start; i < n4; i += stride) { dst[i] = src[i]; }
+    return std::string(entry) + (options.cold ? "-cold-" : "-warm-") + options.timing.execution;
 }
 
 DeviceBuffer make_varied_bf16(std::size_t n, std::uint32_t seed) {
@@ -95,31 +95,9 @@ DeviceBuffer make_varied_bf16(std::size_t n, std::uint32_t seed) {
         const float u = static_cast<float>((state >> 8) & 0x00ffffffu) * (1.0f / 16777216.0f);
         h[i]          = f32_to_bf16(2.0f * u - 1.0f);
     }
-    DeviceBuffer d(n * 2u);
-    cudaMemcpy(d.p, h.data(), n * 2u, cudaMemcpyHostToDevice);
+    DeviceBuffer d(ninfer::bench::device_context().device(), n * 2u);
+    cudaMemcpy(d.data(), h.data(), n * 2u, cudaMemcpyHostToDevice);
     return d;
-}
-
-void copy_bytes_launch(const DeviceBuffer& src, DeviceBuffer& dst, std::size_t copy_bytes,
-                       cudaStream_t stream) {
-    constexpr int kBlock            = 256;
-    constexpr std::size_t kVecBytes = sizeof(uint4);
-    const std::size_t n4            = (copy_bytes + kVecBytes - 1u) / kVecBytes;
-    const int grid                  = static_cast<int>((n4 + kBlock - 1) / kBlock);
-    copy_u128_kernel<<<grid, kBlock, 0, stream>>>(static_cast<const uint4*>(src.p),
-                                                  static_cast<uint4*>(dst.p), n4);
-    CUDA_CHECK(cudaGetLastError());
-}
-
-void run_copy_baseline(const Options& options, double bytes, const char* tag) {
-    const auto copy_bytes   = static_cast<std::size_t>(bytes / 2.0);
-    const auto padded_bytes = (copy_bytes + sizeof(uint4) - 1u) & ~(sizeof(uint4) - 1u);
-    DeviceBuffer src        = make_varied_bf16(padded_bytes / 2u, 0xc001c0deU);
-    DeviceBuffer dst        = make_zeros(padded_bytes);
-
-    const Result r = time_stage(
-        options, [&](cudaStream_t s) { copy_bytes_launch(src, dst, copy_bytes, s); }, bytes);
-    print_result(tag, r);
 }
 
 std::string shape_tag(const char* mode, std::int32_t channels, std::int32_t tokens,
@@ -140,23 +118,23 @@ void run_prefill(const Options& options, bool distinct) {
     DeviceBuffer out       = make_zeros(n * 2u);
 
     SavedBuffer initial(state_in);
-    const auto restore = [&](cudaStream_t stream) { initial.restore(stream); };
-    Tensor tx(x.p, DType::BF16, {options.channels, options.tokens});
-    Tensor tw(weight.p, DType::BF16, {options.channels, 4});
-    Tensor tin(state_in.p, DType::BF16, {options.channels, 3});
-    Tensor tout_state(state_out.p, DType::BF16, {options.channels, 3});
-    Tensor tout(out.p, DType::BF16, {options.channels, options.tokens});
+    const auto restore = [&](CudaExecutionView cuda) { initial.restore(cuda); };
+    Tensor tx(x.span(), DType::BF16, {options.channels, options.tokens});
+    Tensor tw(weight.span(), DType::BF16, {options.channels, 4});
+    Tensor tin(state_in.span(), DType::BF16, {options.channels, 3});
+    Tensor tout_state(state_out.span(), DType::BF16, {options.channels, 3});
+    Tensor tout(out.span(), DType::BF16, {options.channels, options.tokens});
 
     // Informational compulsory traffic: x/out, the four-tap weight, and state read/write. NCU
     // counters remain the performance authority.
     const double bytes = 4.0 * static_cast<double>(n) + 20.0 * options.channels;
     const Result r     = time_stage(
         options,
-        [&](cudaStream_t s) {
+        [&](CudaExecutionView cuda) {
             if (distinct) {
-                ops::causal_conv1d_silu(tx, tw, tin, tout_state, tout, s);
+                ops::causal_conv1d_silu(tx, tw, tin, tout_state, tout, cuda);
             } else {
-                ops::causal_conv1d_silu(tx, tw, tin, tout, s);
+                ops::causal_conv1d_silu(tx, tw, tin, tout, cuda);
             }
         },
         bytes, restore);
@@ -167,92 +145,79 @@ void run_prefill(const Options& options, bool distinct) {
 
 // Split-output prefill. The destinations partition the channel extent the way the GDN caller
 // does: two key-sized ranges followed by the value range.
-void run_split(const Options& options) {
+void run_split(const Options& options, measurement::Csv* csv) {
     std::int32_t key_dim   = 0;
     std::int32_t value_dim = 0;
     if (!split_partition(options.channels, key_dim, value_dim)) {
         std::printf("SKIP: --channels %d leaves no value rows\n", options.channels);
         return;
     }
-    const std::size_t n       = static_cast<std::size_t>(options.channels) * options.tokens;
-    const std::size_t state_n = static_cast<std::size_t>(options.channels) * 3u;
+    const std::size_t n =
+        static_cast<std::size_t>(options.channels) * options.tokens * options.batch;
+    const std::size_t state_n = static_cast<std::size_t>(options.channels) * 3u * options.batch;
 
     DeviceBuffer x = make_varied_bf16(n, 0x12345678U);
     DeviceBuffer weight =
         make_varied_bf16(static_cast<std::size_t>(options.channels) * 4u, 0x87654321U);
     DeviceBuffer state_in  = make_varied_bf16(state_n, 0x31415926U);
-    DeviceBuffer state_out = make_zeros(state_n * 2u);
-    DeviceBuffer q         = make_zeros(static_cast<std::size_t>(key_dim) * options.tokens * 2u);
-    DeviceBuffer k         = make_zeros(static_cast<std::size_t>(key_dim) * options.tokens * 2u);
-    DeviceBuffer v         = make_zeros(static_cast<std::size_t>(value_dim) * options.tokens * 2u);
+    DeviceBuffer state_out = options.in_place ? DeviceBuffer{} : make_zeros(state_n * 2u);
+    std::optional<SavedBuffer> initial;
+    if (options.in_place) initial.emplace(state_in);
+    DeviceBuffer q =
+        make_zeros(static_cast<std::size_t>(key_dim) * options.tokens * options.batch * 2u);
+    DeviceBuffer k =
+        make_zeros(static_cast<std::size_t>(key_dim) * options.tokens * options.batch * 2u);
+    DeviceBuffer v =
+        make_zeros(static_cast<std::size_t>(value_dim) * options.tokens * options.batch * 2u);
 
-    Tensor tx(x.p, DType::BF16, {options.channels, options.tokens});
-    Tensor tw(weight.p, DType::BF16, {options.channels, 4});
-    Tensor tin(state_in.p, DType::BF16, {options.channels, 3});
-    Tensor tout_state(state_out.p, DType::BF16, {options.channels, 3});
-    Tensor tq(q.p, DType::BF16, {key_dim, options.tokens});
-    Tensor tk(k.p, DType::BF16, {key_dim, options.tokens});
-    Tensor tv(v.p, DType::BF16, {value_dim, options.tokens});
+    Tensor tw(weight.span(), DType::BF16, {options.channels, 4});
 
-    // x in, q+k+v out, the four-tap weight and both states. NCU counters remain the performance
-    // authority.
-    const double bytes = 4.0 * static_cast<double>(n) + 20.0 * options.channels;
-    const Result r     = time_stage(
-        options,
-        [&](cudaStream_t s) {
-            ops::causal_conv1d_silu_split(tx, tw, tin, tout_state, tq, tk, tv, s);
-        },
-        bytes);
-    const std::string tag =
-        shape_tag(cache_tag(options, "split").c_str(), options.channels, options.tokens);
-    print_result(tag.c_str(), r);
-}
+    struct Views {
+        Tensor x, state_in, state_out, q, k, v;
+    };
 
-// The stage the split entry replaced: one packed convolution into a [C,T] plane, then three
-// column extractions out of it. Temporary, for the implementation decision only.
-void run_legacy_stage(const Options& options) {
-    std::int32_t key_dim   = 0;
-    std::int32_t value_dim = 0;
-    if (!split_partition(options.channels, key_dim, value_dim)) {
-        std::printf("SKIP: --channels %d leaves no value rows\n", options.channels);
-        return;
+    std::vector<Views> rows;
+    const auto x_bytes = std::size_t(options.channels) * options.tokens * 2;
+    const auto h_bytes = std::size_t(options.channels) * 3 * 2;
+    const auto q_bytes = std::size_t(key_dim) * options.tokens * 2;
+    const auto v_bytes = std::size_t(value_dim) * options.tokens * 2;
+    for (int b = 0; b < options.batch; ++b) {
+        const auto dest = options.in_place ? state_in.span() : state_out.span();
+        rows.push_back(
+            {Tensor(x.span().subspan(b * x_bytes, x_bytes), DType::BF16,
+                    {options.channels, options.tokens}),
+             Tensor(state_in.span().subspan(b * h_bytes, h_bytes), DType::BF16,
+                    {options.channels, 3}),
+             Tensor(dest.subspan(b * h_bytes, h_bytes), DType::BF16, {options.channels, 3}),
+             Tensor(q.span().subspan(b * q_bytes, q_bytes), DType::BF16, {key_dim, options.tokens}),
+             Tensor(k.span().subspan(b * q_bytes, q_bytes), DType::BF16, {key_dim, options.tokens}),
+             Tensor(v.span().subspan(b * v_bytes, v_bytes), DType::BF16,
+                    {value_dim, options.tokens})});
     }
-    const std::size_t n       = static_cast<std::size_t>(options.channels) * options.tokens;
-    const std::size_t state_n = static_cast<std::size_t>(options.channels) * 3u;
-
-    DeviceBuffer x = make_varied_bf16(n, 0x12345678U);
-    DeviceBuffer weight =
-        make_varied_bf16(static_cast<std::size_t>(options.channels) * 4u, 0x87654321U);
-    DeviceBuffer state_in  = make_varied_bf16(state_n, 0x31415926U);
-    DeviceBuffer state_out = make_zeros(state_n * 2u);
-    DeviceBuffer packed    = make_zeros(n * 2u);
-    DeviceBuffer q         = make_zeros(static_cast<std::size_t>(key_dim) * options.tokens * 2u);
-    DeviceBuffer k         = make_zeros(static_cast<std::size_t>(key_dim) * options.tokens * 2u);
-    DeviceBuffer v         = make_zeros(static_cast<std::size_t>(value_dim) * options.tokens * 2u);
-
-    Tensor tx(x.p, DType::BF16, {options.channels, options.tokens});
-    Tensor tw(weight.p, DType::BF16, {options.channels, 4});
-    Tensor tin(state_in.p, DType::BF16, {options.channels, 3});
-    Tensor tout_state(state_out.p, DType::BF16, {options.channels, 3});
-    Tensor tpacked(packed.p, DType::BF16, {options.channels, options.tokens});
-    Tensor tq(q.p, DType::BF16, {key_dim, options.tokens});
-    Tensor tk(k.p, DType::BF16, {key_dim, options.tokens});
-    Tensor tv(v.p, DType::BF16, {value_dim, options.tokens});
-
-    // The convolution moves x in and the packed plane out; the three extractions read that plane
-    // back and write the same bytes again.
-    const double bytes = 8.0 * static_cast<double>(n) + 20.0 * options.channels;
-    const Result r     = time_stage(
+    // B native 2D calls. Count each call's boundary payload; cache reuse is not DRAM traffic.
+    const double bytes =
+        options.batch * (4.0 * options.channels * options.tokens + 20.0 * options.channels);
+    measurement::Row row;
+    row.op            = "causal_conv_split";
+    row.format        = "bf16";
+    row.policy        = "a16";
+    row.conv_channels = options.channels;
+    row.tokens        = options.tokens;
+    row.batch         = options.batch;
+    const launch_fn restore =
+        options.in_place ? launch_fn([&](CudaExecutionView cuda) { initial->restore(cuda); })
+                         : launch_fn{};
+    const Result r = time_stage(
         options,
-        [&](cudaStream_t s) {
-            ops::causal_conv1d_silu(tx, tw, tin, tout_state, tpacked, s);
-            ops::extract_bf16_columns(tpacked, 0, tq, s);
-            ops::extract_bf16_columns(tpacked, key_dim, tk, s);
-            ops::extract_bf16_columns(tpacked, 2 * key_dim, tv, s);
+        [&](CudaExecutionView cuda) {
+            for (auto& views : rows)
+                ops::causal_conv1d_silu_split(views.x, tw, views.state_in, views.state_out, views.q,
+                                              views.k, views.v, cuda);
         },
-        bytes);
+        bytes, restore, &row, csv);
     const std::string tag =
-        shape_tag(cache_tag(options, "legacy-stage").c_str(), options.channels, options.tokens);
+        shape_tag(cache_tag(options, options.in_place ? "split-alias" : "split").c_str(),
+                  options.channels, options.tokens, options.batch);
     print_result(tag.c_str(), r);
 }
 
@@ -265,19 +230,18 @@ void run_decode(const Options& options) {
     DeviceBuffer out    = make_zeros(channels * 2u);
 
     SavedBuffer initial(state);
-    const auto restore = [&](cudaStream_t stream) { initial.restore(stream); };
-    Tensor tx(x.p, DType::BF16, {options.channels, 1});
-    Tensor tw(weight.p, DType::BF16, {options.channels, 4});
-    Tensor ts(state.p, DType::BF16, {options.channels, 3});
-    Tensor tout(out.p, DType::BF16, {options.channels, 1});
+    const auto restore = [&](CudaExecutionView cuda) { initial.restore(cuda); };
+    Tensor tx(x.span(), DType::BF16, {options.channels, 1});
+    Tensor tw(weight.span(), DType::BF16, {options.channels, 4});
+    Tensor ts(state.span(), DType::BF16, {options.channels, 3});
+    Tensor tout(out.span(), DType::BF16, {options.channels, 1});
 
     const double bytes = 24.0 * options.channels;
     const Result r     = time_stage(
-        options, [&](cudaStream_t s) { ops::causal_conv1d_silu(tx, tw, ts, tout, s); }, bytes,
-        restore);
+        options, [&](CudaExecutionView cuda) { ops::causal_conv1d_silu(tx, tw, ts, tout, cuda); },
+        bytes, restore);
     const std::string tag = shape_tag(cache_tag(options, "decode").c_str(), options.channels, 1);
     print_result(tag.c_str(), r);
-    run_copy_baseline(options, bytes, cache_tag(options, "copy same-byte decode baseline").c_str());
 }
 
 void run_snapshot(const Options& options) {
@@ -291,14 +255,15 @@ void run_snapshot(const Options& options) {
     DeviceBuffer x = make_varied_bf16(n, 0x12345678U);
     DeviceBuffer weight =
         make_varied_bf16(static_cast<std::size_t>(options.channels) * 4u, 0x87654321U);
-    DeviceBuffer states = make_varied_bf16(state_n, 0x31415926U);
+    DeviceBuffer states    = make_varied_bf16(state_n, 0x31415926U);
+    DeviceBuffer snapshots = make_zeros(state_n * sizeof(std::uint16_t));
     DeviceBuffer initial_slot =
-        make_zeros(static_cast<std::size_t>(options.batch) * sizeof(std::int32_t));
+        make_zeros(static_cast<std::size_t>(options.batch) * sizeof(std::int64_t));
     DeviceBuffer snapshot_base_slot =
         make_zeros(static_cast<std::size_t>(options.batch) * sizeof(std::int32_t));
     DeviceBuffer valid_columns;
     DeviceBuffer out = make_zeros(n * 2u);
-    std::vector<std::int32_t> initial_host(static_cast<std::size_t>(options.batch));
+    std::vector<std::int64_t> initial_host(static_cast<std::size_t>(options.batch));
     std::vector<std::int32_t> base_host(static_cast<std::size_t>(options.batch));
     if (options.batch == 1) {
         initial_host[0] = options.initial_slot;
@@ -308,28 +273,34 @@ void run_snapshot(const Options& options) {
             initial_host[static_cast<std::size_t>(row)] = options.batch * options.tokens + row;
         }
     }
-    CUDA_CHECK(cudaMemcpy(initial_slot.p, initial_host.data(), initial_slot.bytes,
+    for (auto& offset : initial_host) offset *= 6LL * options.channels;
+    CUDA_CHECK(cudaMemcpy(initial_slot.data(), initial_host.data(), initial_slot.size(),
                           cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(snapshot_base_slot.p, base_host.data(), snapshot_base_slot.bytes,
+    CUDA_CHECK(cudaMemcpy(snapshot_base_slot.data(), base_host.data(), snapshot_base_slot.size(),
                           cudaMemcpyHostToDevice));
     if (!options.valid_columns.empty()) {
         valid_columns = make_zeros(options.valid_columns.size() * sizeof(std::int32_t));
-        CUDA_CHECK(cudaMemcpy(valid_columns.p, options.valid_columns.data(), valid_columns.bytes,
-                              cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(valid_columns.data(), options.valid_columns.data(),
+                              valid_columns.size(), cudaMemcpyHostToDevice));
     }
 
     SavedBuffer initial(states);
-    const auto restore = [&](cudaStream_t stream) { initial.restore(stream); };
-    Tensor tx(x.p, DType::BF16, {options.channels, options.tokens, options.batch});
-    Tensor tw(weight.p, DType::BF16, {options.channels, 4});
-    Tensor ts(states.p, DType::BF16, {options.channels, 3, slots});
+    const auto restore = [&](CudaExecutionView cuda) { initial.restore(cuda); };
+    Tensor tx(x.span(), DType::BF16, {options.channels, options.tokens, options.batch});
+    Tensor tw(weight.span(), DType::BF16, {options.channels, 4});
     Tensor tvalid;
     if (!options.valid_columns.empty()) {
-        tvalid = Tensor(valid_columns.p, DType::I32, {options.batch});
+        tvalid = Tensor(valid_columns.span(), DType::I32, {options.batch});
     }
-    Tensor tslot(initial_slot.p, DType::I32, {options.batch});
-    Tensor tsnapshot_base(snapshot_base_slot.p, DType::I32, {options.batch});
-    Tensor tout(out.p, DType::BF16, {options.channels, options.tokens, options.batch});
+    Tensor tslot(initial_slot.span(), DType::I64, {options.batch});
+    const StateFieldView source{
+        {states.span(), tslot},
+        {{{0, std::size_t(options.channels) * 6, 2}, DType::BF16, {options.channels, 3, 1, 1}},
+         1,
+         0}};
+    Tensor snapshot(snapshots.span(), DType::BF16, {options.channels, 3, slots});
+    Tensor tsnapshot_base(snapshot_base_slot.span(), DType::I32, {options.batch});
+    Tensor tout(out.span(), DType::BF16, {options.channels, options.tokens, options.batch});
 
     // The selected history and four weights are reusable across T; each token reads x, writes out,
     // and publishes three BF16 state columns.
@@ -337,8 +308,9 @@ void run_snapshot(const Options& options) {
                          10.0 * static_cast<double>(n);
     const Result r = time_stage(
         options,
-        [&](cudaStream_t s) {
-            ops::causal_conv1d_silu_snapshot(tx, tw, ts, tvalid, tslot, tsnapshot_base, tout, s);
+        [&](CudaExecutionView cuda) {
+            ops::causal_conv1d_silu_snapshot(tx, tw, source, snapshot, tvalid, tsnapshot_base, tout,
+                                             cuda);
         },
         bytes, restore);
     const std::string tag = shape_tag(
@@ -351,35 +323,15 @@ void run_snapshot(const Options& options) {
 void print_usage(const char* program) {
     std::fprintf(stderr,
                  "usage: %s [--decode] [--prefill] [--distinct] [--snapshot] [--split] "
-                 "[--legacy-stage] [--cache warm|cold] [--channels C] [--tokens T[,T...]] "
+                 "[--inplace] [--cache warm|cold] [--execution graph|eager] "
+                 "[--warmup N] [--repeat N] [--channels C] [--tokens T[,T...]] "
                  "[--batch B] [--valid-columns V0,V1,...] [--slots S] "
-                 "[--initial-slot I]\n",
+                 "[--initial-slot I] [--csv-out PATH (split only)]\n"
+                 "Split --batch B measures B native 2D calls with independent histories.\n",
                  program);
 }
 
-bool parse_positive(const char* text, std::int32_t& value) {
-    const long parsed = std::strtol(text, nullptr, 10);
-    if (parsed <= 0 || parsed > INT32_MAX) { return false; }
-    value = static_cast<std::int32_t>(parsed);
-    return true;
-}
-
-bool parse_valid_columns(const char* text, std::vector<std::int32_t>& values) {
-    values.clear();
-    const char* cursor = text;
-    while (*cursor != '\0') {
-        char* end        = nullptr;
-        const long value = std::strtol(cursor, &end, 10);
-        if (end == cursor || value <= 0 || value > INT32_MAX) { return false; }
-        values.push_back(static_cast<std::int32_t>(value));
-        if (*end == '\0') return true;
-        if (*end != ',') return false;
-        cursor = end + 1;
-    }
-    return false;
-}
-
-bool parse_options(int argc, char** argv, Options& options) {
+bool parse_options(int argc, char** argv, Options& options) try {
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--decode")) {
             options.decode = true;
@@ -391,8 +343,14 @@ bool parse_options(int argc, char** argv, Options& options) {
             options.snapshot = true;
         } else if (!std::strcmp(argv[i], "--split")) {
             options.split = true;
-        } else if (!std::strcmp(argv[i], "--legacy-stage")) {
-            options.legacy = true;
+        } else if (!std::strcmp(argv[i], "--inplace")) {
+            options.in_place = true;
+        } else if ((!std::strcmp(argv[i], "--execution") || !std::strcmp(argv[i], "--warmup") ||
+                    !std::strcmp(argv[i], "--repeat") || !std::strcmp(argv[i], "--csv-out")) &&
+                   i + 1 < argc) {
+            const std::string_view flag = argv[i++];
+            if (!measurement::parse(options.timing, flag, argv[i])) return false;
+            if (options.timing.execution == "both") return false;
         } else if (!std::strcmp(argv[i], "--cache") && i + 1 < argc) {
             const char* value = argv[++i];
             if (!std::strcmp(value, "cold")) {
@@ -403,58 +361,51 @@ bool parse_options(int argc, char** argv, Options& options) {
                 return false;
             }
         } else if (!std::strcmp(argv[i], "--valid-columns") && i + 1 < argc) {
-            if (!parse_valid_columns(argv[++i], options.valid_columns)) { return false; }
+            options.valid_columns = measurement::integers(argv[++i]);
         } else if ((!std::strcmp(argv[i], "--channels") || !std::strcmp(argv[i], "--tokens") ||
                     !std::strcmp(argv[i], "--slots") || !std::strcmp(argv[i], "--initial-slot") ||
                     !std::strcmp(argv[i], "--batch")) &&
                    i + 1 < argc) {
             const char* flag = argv[i++];
             if (!std::strcmp(flag, "--initial-slot")) {
-                const long parsed = std::strtol(argv[i], nullptr, 10);
-                if (parsed < 0 || parsed > INT32_MAX) { return false; }
-                options.initial_slot = static_cast<std::int32_t>(parsed);
+                options.initial_slot = measurement::integer(argv[i], 0);
             } else if (!std::strcmp(flag, "--tokens")) {
-                options.token_list.clear();
-                const char* cursor = argv[i];
-                while (*cursor != 0) {
-                    char* end         = nullptr;
-                    const long parsed = std::strtol(cursor, &end, 10);
-                    if (end == cursor || parsed <= 0 || parsed > INT32_MAX) { return false; }
-                    options.token_list.push_back(static_cast<std::int32_t>(parsed));
-                    cursor = (*end == ',') ? end + 1 : end;
-                }
-                if (options.token_list.empty()) { return false; }
+                options.token_list = measurement::integers(argv[i]);
             } else {
                 std::int32_t* destination = !std::strcmp(flag, "--channels") ? &options.channels
                                             : !std::strcmp(flag, "--batch")  ? &options.batch
                                                                              : &options.slots;
-                if (!parse_positive(argv[i], *destination)) { return false; }
+                *destination              = measurement::integer(argv[i]);
             }
         } else {
             return false;
         }
     }
     if (!options.decode && !options.prefill && !options.distinct && !options.snapshot &&
-        !options.split && !options.legacy) {
+        !options.split) {
         options.decode = options.prefill = true;
     }
-    if (options.batch > 8 ||
-        ((!options.snapshot) && (options.batch != 1 || !options.valid_columns.empty())) ||
+    if (options.batch > 8 || (options.in_place && !options.split) ||
+        (!options.snapshot && !options.split && options.batch != 1) ||
+        (!options.snapshot && !options.valid_columns.empty()) ||
         (!options.valid_columns.empty() &&
          options.valid_columns.size() != static_cast<std::size_t>(options.batch))) {
         return false;
     }
+    if (!options.timing.csv_out.empty() && (!options.split || options.decode || options.prefill ||
+                                            options.distinct || options.snapshot))
+        return false;
     for (const std::int32_t tokens : options.token_list.empty()
                                          ? std::vector<std::int32_t>{options.tokens}
                                          : options.token_list) {
-        if (options.batch > 1 && tokens > 16) { return false; }
+        if (options.snapshot && options.batch > 1 && tokens > 16) { return false; }
         if (options.snapshot && options.batch == 1 && tokens > options.slots) { return false; }
         for (const std::int32_t valid : options.valid_columns) {
             if (valid > tokens) { return false; }
         }
     }
     return !options.snapshot || options.batch > 1 || options.initial_slot < options.slots;
-}
+} catch (const std::invalid_argument&) { return false; }
 
 } // namespace
 
@@ -471,6 +422,9 @@ int main(int argc, char** argv) {
         return 2;
     }
 
+    std::optional<measurement::Csv> csv;
+    if (!options.timing.csv_out.empty())
+        csv.emplace(options.timing.csv_out, "logical_bytes,calls,state_form");
     std::vector<std::int32_t> tokens = options.token_list;
     if (tokens.empty()) { tokens.push_back(options.tokens); }
     for (const std::int32_t t : tokens) {
@@ -480,8 +434,7 @@ int main(int argc, char** argv) {
         if (point.prefill) run_prefill(point, false);
         if (point.distinct) run_prefill(point, true);
         if (point.snapshot) run_snapshot(point);
-        if (point.legacy) run_legacy_stage(point);
-        if (point.split) run_split(point);
+        if (point.split) run_split(point, csv ? &*csv : nullptr);
     }
     return 0;
 }

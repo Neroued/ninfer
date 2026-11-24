@@ -1,5 +1,6 @@
 // Public-Op benchmark for variable-width DFlash2 pair and context-K RMSNorm+RoPE profiles.
 #include "ninfer/ops/rmsnorm_rope.h"
+#include "core/buffer.h"
 
 #include "ninfer_bench_common.h"
 
@@ -127,14 +128,13 @@ std::vector<std::int32_t> host_positions(int tokens) {
 }
 
 bench::Result measure(const Options& options, const bench::launch_fn& restore,
-                      const bench::launch_fn& launch, double bytes, cudaStream_t stream) {
+                      const bench::launch_fn& launch, double bytes, CudaExecutionView cuda) {
     bench::TimedGraph graph;
-    if (options.execution == Execution::Graph) graph.capture(stream, launch);
+    if (options.execution == Execution::Graph) graph.capture(cuda, launch);
     const auto timing =
         options.execution == Execution::Graph
-            ? bench::measure_graph_prepared(restore, graph, stream, options.warmup, options.repeat)
-            : bench::measure_launch_prepared(restore, launch, stream, options.warmup,
-                                             options.repeat);
+            ? bench::measure_graph_prepared(restore, graph, cuda, options.warmup, options.repeat)
+            : bench::measure_launch_prepared(restore, launch, cuda, options.warmup, options.repeat);
     bench::Result result;
     result.n_runs    = options.repeat;
     result.median_us = timing.median_us;
@@ -144,11 +144,13 @@ bench::Result measure(const Options& options, const bench::launch_fn& restore,
     return result;
 }
 
-void run_pair(const Options& options, int width, int batch, cudaStream_t stream) {
+void run_pair(const Options& options, int width, int batch, CudaExecutionView cuda) {
+    const auto stream         = cuda.stream();
     const int tokens          = width * batch;
     const auto positions_host = host_positions(tokens);
-    DeviceBuffer positions(positions_host.size() * sizeof(std::int32_t));
-    positions.copy_from_host(positions_host.data(), positions.bytes);
+    DeviceBuffer positions(ninfer::bench::device_context().device(),
+                           positions_host.size() * sizeof(std::int32_t));
+    positions.copy_from_host(positions_host.data(), positions.size());
     DeviceBuffer q =
         bench::make_bf16(static_cast<std::size_t>(kHeadDim) * kQueryHeads * tokens, 101U);
     DeviceBuffer k =
@@ -157,72 +159,74 @@ void run_pair(const Options& options, int width, int batch, cudaStream_t stream)
     DeviceBuffer k_weight = bench::make_bf16(kHeadDim, 107U, .8F, 1.2F);
     bench::SavedBuffer initial_q(q);
     bench::SavedBuffer initial_k(k);
-    const auto restore = [&](cudaStream_t stream) {
-        initial_q.restore(stream);
-        initial_k.restore(stream);
+    const auto restore = [&](CudaExecutionView cuda) {
+        initial_q.restore(cuda);
+        initial_k.restore(cuda);
     };
-    Tensor t_positions(positions.p, DType::I32, {width, batch});
-    Tensor t_q(q.p, DType::BF16, {kHeadDim, kQueryHeads, width, batch});
-    Tensor t_k(k.p, DType::BF16, {kHeadDim, kKeyHeads, width, batch});
-    Tensor t_q_weight(q_weight.p, DType::BF16, {kHeadDim});
-    Tensor t_k_weight(k_weight.p, DType::BF16, {kHeadDim});
-    const auto launch = [&](cudaStream_t launch_stream) {
-        ops::rmsnorm_rope(t_positions, t_q_weight, t_k_weight, t_q, t_k, launch_stream);
+    Tensor t_positions(positions.span(), DType::I32, {width, batch});
+    Tensor t_q(q.span(), DType::BF16, {kHeadDim, kQueryHeads, width, batch});
+    Tensor t_k(k.span(), DType::BF16, {kHeadDim, kKeyHeads, width, batch});
+    Tensor t_q_weight(q_weight.span(), DType::BF16, {kHeadDim});
+    Tensor t_k_weight(k_weight.span(), DType::BF16, {kHeadDim});
+    const auto launch = [&](CudaExecutionView cuda) {
+        ops::rmsnorm_rope(t_positions, t_q_weight, t_k_weight, t_q, t_k, cuda);
     };
     if (options.profile) {
         for (int index = 0; index < options.warmup; ++index) {
-            restore(stream);
-            launch(stream);
+            restore(cuda);
+            launch(cuda);
         }
         CUDA_CHECK(cudaStreamSynchronize(stream));
-        restore(stream);
+        restore(cuda);
         CUDA_CHECK(cudaStreamSynchronize(stream));
         CUDA_CHECK(cudaProfilerStart());
-        launch(stream);
+        launch(cuda);
         CUDA_CHECK(cudaStreamSynchronize(stream));
         CUDA_CHECK(cudaProfilerStop());
         return;
     }
     const double bytes =
         2.0 * static_cast<double>(kHeadDim) * (kQueryHeads + kKeyHeads) * tokens * 2.0;
-    const bench::Result timing = measure(options, restore, launch, bytes, stream);
+    const bench::Result timing = measure(options, restore, launch, bytes, cuda);
     std::printf("form=pair W=%d B=%d T=%d heads_per_cta=8 execution=%s median=%.3f us min=%.3f us "
                 "p95=%.3f us useful=%.1f GB/s graph_repetitions=%d cache=warm\n",
                 width, batch, tokens, options.execution == Execution::Graph ? "graph" : "eager",
                 timing.median_us, timing.min_us, timing.p95_us, timing.gbs, 1);
 }
 
-void run_single(const Options& options, int tokens, cudaStream_t stream) {
+void run_single(const Options& options, int tokens, CudaExecutionView cuda) {
+    const auto stream         = cuda.stream();
     const auto positions_host = host_positions(tokens);
-    DeviceBuffer positions(positions_host.size() * sizeof(std::int32_t));
-    positions.copy_from_host(positions_host.data(), positions.bytes);
+    DeviceBuffer positions(ninfer::bench::device_context().device(),
+                           positions_host.size() * sizeof(std::int32_t));
+    positions.copy_from_host(positions_host.data(), positions.size());
     DeviceBuffer x =
         bench::make_bf16(static_cast<std::size_t>(kHeadDim) * kKeyHeads * tokens, 109U);
     DeviceBuffer weight = bench::make_bf16(kHeadDim, 111U, .8F, 1.2F);
     bench::SavedBuffer initial_x(x);
-    const auto restore = [&](cudaStream_t stream) { initial_x.restore(stream); };
-    Tensor t_positions(positions.p, DType::I32, {tokens});
-    Tensor t_x(x.p, DType::BF16, {kHeadDim, kKeyHeads, tokens});
-    Tensor t_weight(weight.p, DType::BF16, {kHeadDim});
-    const auto launch = [&](cudaStream_t launch_stream) {
-        ops::rmsnorm_rope(t_positions, t_weight, t_x, launch_stream);
+    const auto restore = [&](CudaExecutionView cuda) { initial_x.restore(cuda); };
+    Tensor t_positions(positions.span(), DType::I32, {tokens});
+    Tensor t_x(x.span(), DType::BF16, {kHeadDim, kKeyHeads, tokens});
+    Tensor t_weight(weight.span(), DType::BF16, {kHeadDim});
+    const auto launch = [&](CudaExecutionView cuda) {
+        ops::rmsnorm_rope(t_positions, t_weight, t_x, cuda);
     };
     if (options.profile) {
         for (int index = 0; index < options.warmup; ++index) {
-            restore(stream);
-            launch(stream);
+            restore(cuda);
+            launch(cuda);
         }
         CUDA_CHECK(cudaStreamSynchronize(stream));
-        restore(stream);
+        restore(cuda);
         CUDA_CHECK(cudaStreamSynchronize(stream));
         CUDA_CHECK(cudaProfilerStart());
-        launch(stream);
+        launch(cuda);
         CUDA_CHECK(cudaStreamSynchronize(stream));
         CUDA_CHECK(cudaProfilerStop());
         return;
     }
     const double bytes         = 2.0 * static_cast<double>(kHeadDim) * kKeyHeads * tokens * 2.0;
-    const bench::Result timing = measure(options, restore, launch, bytes, stream);
+    const bench::Result timing = measure(options, restore, launch, bytes, cuda);
     std::printf("form=single T=%d heads_per_cta=8 execution=%s median=%.3f us min=%.3f us "
                 "p95=%.3f us useful=%.1f GB/s graph_repetitions=%d cache=warm\n",
                 tokens, options.execution == Execution::Graph ? "graph" : "eager", timing.median_us,
@@ -241,11 +245,12 @@ int main(int argc, char** argv) {
         Options options     = parse_options(argc, argv);
         cudaStream_t stream = nullptr;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        const auto cuda = ninfer::bench::device_context().execution_view(stream);
         if (options.form == Form::Pair) {
             for (int width : options.widths)
-                for (int batch : options.batches) run_pair(options, width, batch, stream);
+                for (int batch : options.batches) run_pair(options, width, batch, cuda);
         } else {
-            for (int tokens : options.tokens) run_single(options, tokens, stream);
+            for (int tokens : options.tokens) run_single(options, tokens, cuda);
         }
         CUDA_CHECK(cudaStreamDestroy(stream));
         return 0;

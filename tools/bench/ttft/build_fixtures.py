@@ -355,7 +355,7 @@ def _write_images() -> list[Path]:
 
 def _many_image_messages(paths: Sequence[Path], prompt: str) -> list[dict[str, Any]]:
     content: list[dict[str, str]] = [
-        {"type": "image", "image": _relative(path)} for path in paths
+        {"type": "image", "image": f"../media/{path.name}"} for path in paths
     ]
     content.append({"type": "text", "text": prompt})
     return [{"role": "user", "content": content}]
@@ -636,7 +636,6 @@ def build(tokenizer_path: Path) -> None:
             "long-256k-32": _existing_case("long_niah_256k", 260096, 32),
             "interferer-256": _existing_case("scenario_story_zh_scifi", 127, 256),
             "holder-4096": _existing_case("scenario_story_zh_scifi", 127, 4096),
-            "medium-3000": _existing_case("text_smoke_zh", 30, 3000),
             "context-exact": _file_record(
                 exact_path, prompt_tokens=8129, max_output_tokens=64
             ),

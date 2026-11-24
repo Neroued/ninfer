@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/buffer.h"
 #include "core/weight.h"
 #include "ninfer_bench_common.h"
 
@@ -19,7 +20,7 @@ struct DirectBf16Weight {
     Weight weight{};
 
     [[nodiscard]] std::uint64_t model_weight_bytes() const noexcept {
-        return static_cast<std::uint64_t>(storage.bytes);
+        return static_cast<std::uint64_t>(storage.size());
     }
 };
 
@@ -39,16 +40,17 @@ inline std::size_t direct_bf16_bytes(std::int32_t n, std::int32_t k) {
 } // namespace detail
 
 inline DirectBf16Weight make_direct_bf16_weight(std::int32_t n, std::int32_t k,
-                                                std::uint32_t seed = 0x51U) {
+                                                std::uint32_t seed = 0x51U, float extent = 0.05F) {
     const std::size_t bytes = detail::direct_bf16_bytes(n, k);
-    DirectBf16Weight result{DeviceBuffer(bytes), {}};
+    DirectBf16Weight result{DeviceBuffer(ninfer::bench::device_context().device(), bytes), {}};
     const std::uint64_t elements = static_cast<std::uint64_t>(n) * k;
-    CUDA_CHECK(fixture::fill_values(static_cast<__nv_bfloat16*>(result.storage.p), elements, seed,
-                                    -0.05F, 0.05F));
+    CUDA_CHECK(fixture::fill_values(static_cast<__nv_bfloat16*>(result.storage.data()), elements,
+                                    seed, -extent, extent));
     CUDA_CHECK(cudaDeviceSynchronize());
 
     Weight& weight         = result.weight;
-    weight.payload         = result.storage.p;
+    weight.device          = result.storage.device();
+    weight.payload         = result.storage.data();
     weight.payload_bytes   = bytes;
     weight.qtype           = QType::BF16;
     weight.shape[0]        = n;
@@ -56,7 +58,7 @@ inline DirectBf16Weight make_direct_bf16_weight(std::int32_t n, std::int32_t k,
     weight.padded_shape[0] = n;
     weight.padded_shape[1] = k;
     weight.ndim            = 2;
-    weight.qdata           = result.storage.p;
+    weight.qdata           = result.storage.data();
     weight.n               = n;
     weight.k               = k;
     weight.layout          = QuantLayout::Contiguous;

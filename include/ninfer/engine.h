@@ -46,6 +46,13 @@ public:
     [[nodiscard]] explicit operator bool() const noexcept;
     [[nodiscard]] const ResolvedSamplingParameters& resolved_sampling() const noexcept;
 
+    // Waits for initial admission or successful completion without execution. Errors and
+    // cancellation are reported before returning. Does not consume output or the handle;
+    // wait() still delivers the stream start and result. Calls on one handle must be serial.
+    void wait_for_admission(const CancellationView& cancellation = {});
+
+    // A terminal result or request error is visible after logical scheduling membership is
+    // released and the corresponding Engine snapshot is published.
     GenerationResult wait(OutputSink* sink = nullptr, const CancellationView& cancellation = {});
 
 private:
@@ -54,6 +61,10 @@ private:
     std::unique_ptr<Impl> impl_;
 
     friend class Engine;
+};
+
+struct MeasurementOptions {
+    bool profile = false;
 };
 
 class Engine {
@@ -102,13 +113,18 @@ public:
                               const CancellationView& cancellation = {});
 
     [[nodiscard]] const EngineOptions& options() const;
-    [[nodiscard]] LoadSummary load_summary() const;
-    [[nodiscard]] MemorySummary memory_summary() const;
-    [[nodiscard]] RuntimeStats runtime_stats() const;
-    [[nodiscard]] MediaCacheSummary media_cache_summary() const;
+    [[nodiscard]] const EngineDescription& description() const;
+    [[nodiscard]] const StartupReport& startup_report() const;
+    [[nodiscard]] EngineSnapshot snapshot() const;
     [[nodiscard]] bool is_available() const;
 
-    void reset_memory_peaks() noexcept;
+    // Synchronous boundaries on the execution thread. Previously submitted requests and their
+    // cleanup complete before the boundary; concurrent submissions wait until it finishes.
+    // Begin resets window peaks and optionally starts the profiler on every execution rank.
+    // End includes final retirement and returns the completed window's resource observations.
+    [[nodiscard]] EngineSnapshot begin_measurement(MeasurementOptions options = {});
+    [[nodiscard]] EngineSnapshot end_measurement();
+    void reset_measurement_peaks();
 
 private:
     class Impl;

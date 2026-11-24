@@ -1,0 +1,139 @@
+#pragma once
+
+#include "core/device.h"
+#include "core/record_view.h"
+#include "core/tensor.h"
+#include <cstdint>
+#include <span>
+
+namespace ninfer::ops {
+
+/**
+ * destination[:,indices[i]] = source[:,i].
+ *
+ * Source [D,V] and destination [D,T] are BF16 with contiguous features and explicit,
+ * non-overlapping BF16-aligned column strides. Indices [V] is contiguous I32.
+ * Indices lie in [0,T), with no duplicates when deterministic overwrite order is required.
+ * Copies BF16 bits exactly and preserves unselected columns. Inputs and destination do not
+ * overlap. An empty source does no work. No workspace or other state is used.
+ */
+void scatter(const Tensor& source, const Tensor& indices, Tensor& destination,
+             CudaExecutionView execution);
+
+// destination.record[b].field[:] = source[:,b]. Source is BF16 [D,B]; the field is
+// BF16 [D] with contiguous features and I64 record offsets [B]. Copies bits exactly.
+// Selected fields are distinct and disjoint from the inputs. Unselected storage is preserved.
+void scatter(const Tensor& source, const StateFieldView& destination, CudaExecutionView execution);
+
+/**
+ * destination[:,j,lanes[b]] = source[:,j,b], for j < valid_columns[b].
+ *
+ * Source is contiguous BF16 [D,W,B]; lanes and valid_columns are contiguous I32 [B].
+ * Destination is a BF16 [D,W,C] view with contiguous features and explicit column/lane strides.
+ * A feature slice retains its parent's strides. D is divisible by eight and every BF16 column
+ * starts at a 16-byte-aligned address. Inputs and destination do not overlap.
+ *
+ * The caller supplies distinct lanes in [0,C), counts in [0,W], and disjoint destination
+ * columns/lanes. Copies BF16 bits exactly; invalid tails, unselected lanes and features outside
+ * the destination slice are preserved. Zero counts read no source values. No workspace is used.
+ */
+void scatter_bf16_batch(const Tensor& source, const Tensor& lanes, const Tensor& valid_columns,
+                        Tensor& destination, CudaExecutionView execution);
+
+/**
+ * destination[d,t] = source[feature_offset+d,t].
+ *
+ * Source [D,T] and destination [F,T] are non-overlapping contiguous BF16 matrices with positive
+ * extents. The feature interval [feature_offset,feature_offset+F) lies within [0,D). Copies BF16
+ * bits exactly, writes all of destination and preserves source. No workspace is used.
+ */
+void extract_bf16_features(const Tensor& source, std::int32_t feature_offset, Tensor& destination,
+                           CudaExecutionView execution);
+
+/**
+ * out[:,b] = source[:,selectors[b],b].
+ * Source is contiguous BF16 [D,T,B], selectors is contiguous I32 [B] in [0,T), and
+ * out is distinct contiguous BF16 [D,B]. Copies BF16 bits exactly. No workspace or state.
+ */
+void gather_bf16_batch_columns(const Tensor& source, const Tensor& selectors, Tensor& out,
+                               CudaExecutionView execution);
+
+// out[:,t,b] = source[:,t,rows[b]], or represented zero when rows[b]==-1.
+// Source [D,T,S] and out [D,T,B] are contiguous BF16, I32 or I64 with positive extents;
+// rows is contiguous Device I32 [B], with values in {-1} union [0,S). Read rows may repeat.
+// Copies bits exactly, writes all output, and consumes current selectors under Graph replay.
+// Output is disjoint from inputs. No workspace or state is used.
+void gather_batch_rows(const Tensor& source, const Tensor& rows, Tensor& out,
+                       CudaExecutionView execution);
+
+// out[:,b] = source.record[b].field[:] when active[b]>0, otherwise BF16 +0.
+// Out is contiguous BF16 [D,B]; source is a single-layer contiguous BF16 [D] field with
+// Device I64 offsets [B]. Active is Device I32 [B] with nonnegative values. Inactive rows
+// read neither offsets nor fields. Copies bits exactly; output and accessed inputs are disjoint.
+void gather(const ConstStateFieldView& source, const Tensor& active, Tensor& out,
+            CudaExecutionView execution);
+
+// For columns[b]>=0, destination.record[b].field[:]=source[:,columns[b],b]; -1 preserves the
+// destination and reads no source or record offset. Source is contiguous BF16 or I32 [D,T,B],
+// columns is contiguous I32 [B], B=1..8, and destination has same-dtype contiguous [D] fields
+// with I64 record offsets [B]. Live columns are in range and destination fields are distinct.
+// Inputs and selected destination fields are
+// disjoint. Copies represented bits exactly, preserves all unselected storage, owns no
+// workspace, and consumes current Device selectors under Graph replay.
+void scatter_batch_columns(const Tensor& source, const Tensor& columns,
+                           const StateFieldView& destination, CudaExecutionView execution);
+
+struct StateGather {
+    ConstStateFieldView source;
+    Tensor active;
+    Tensor output;
+};
+
+struct StateColumnScatter {
+    Tensor source, columns;
+    StateFieldView destination;
+};
+
+// Apply independent field assignments in one submission. Each of up to eight entries has its
+// own D>0, B=1..8 and BF16/I32 dtype. State fields are single-layer dense [D], selected by
+// contiguous Device I64 [B] byte offsets. Dense operands have contiguous features and explicit
+// non-overlapping, naturally aligned outer strides. Entries may use different backing arenas.
+//
+// Gather: output[:,b] = source.record[b].field when active[b]>0, otherwise represented zero.
+// Output is [D,B], active is contiguous I32 [B]; inactive rows read neither offsets nor fields.
+// Scatter: destination.record[b].field = source[:,columns[b],b] for columns[b]>=0. Source is
+// [D,T,B], columns is contiguous I32 [B] in {-1} union [0,T); -1 accesses neither source nor
+// offset and preserves destination. Selected destinations are distinct across all entries.
+//
+// Copies bits exactly. Inputs and outputs are disjoint, including across entries; selected
+// State-address alias constraints are caller guarantees. Unselected State storage is preserved.
+// Host descriptors are captured by value and Device selectors are read on replay. No workspace,
+// hidden allocation, descriptor upload or persistent metadata. An empty list performs no work.
+void gather_state_fields(std::span<const StateGather> fields, CudaExecutionView execution);
+void scatter_state_fields(std::span<const StateColumnScatter> fields, CudaExecutionView execution);
+
+/**
+ * ids[i] = id_map[ids[i]]. The nonempty I32 ids vector is contiguous and updated in place.
+ * id_map is a distinct device I32 array [count]; input ids lie in [0,count).
+ */
+void remap_ids_inplace(Tensor& ids, const std::int32_t* id_map, std::int32_t count,
+                       CudaExecutionView execution);
+
+/**
+ * out[0:D,t] = first[:,t]; out[D:2D,t] = second[:,t].
+ * First/second are contiguous BF16 [D,T], out is contiguous BF16 [2D,T]; D,T are positive.
+ * Copies BF16 bits exactly. Inputs and output do not alias; no workspace or state.
+ */
+void concat_bf16_features(const Tensor& first, const Tensor& second, Tensor& out,
+                          CudaExecutionView execution);
+
+/**
+ * Split contiguous BF16 source [14336,T] into successive feature intervals of widths
+ * 6144,1024,6144,1024. First/third outputs are [256,24,T]; second/fourth are [256,4,T].
+ * All tensors are contiguous, pairwise non-overlapping. Writes each BF16 bit exactly;
+ * T is positive and every output is overwritten. No workspace or state.
+ */
+void split_bf16_features(const Tensor& source, Tensor& first, Tensor& second, Tensor& third,
+                         Tensor& fourth, CudaExecutionView execution);
+
+} // namespace ninfer::ops

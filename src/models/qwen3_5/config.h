@@ -1,5 +1,7 @@
 #pragma once
 
+#include "models/common/qwen/vision/parameters.h"
+
 #include "models/load_options.h"
 #include "models/registry.h"
 
@@ -88,20 +90,6 @@ struct TextConfig {
     std::variant<DenseConfig, MoeConfig> ffn;
 };
 
-struct VisionConfig {
-    std::uint32_t depth                   = 0;
-    std::uint32_t hidden_size             = 0;
-    std::uint32_t intermediate_size       = 0;
-    std::uint32_t num_heads               = 0;
-    std::uint32_t patch_size              = 0;
-    std::uint32_t temporal_patch_size     = 0;
-    std::uint32_t spatial_merge_size      = 0;
-    std::uint32_t num_position_embeddings = 0;
-    std::uint32_t position_grid_side      = 0;
-    [[nodiscard]] std::uint64_t patch_width() const;
-    [[nodiscard]] std::uint64_t merger_width() const;
-};
-
 struct DFlash2Config {
     std::uint32_t conv_kernel_size = 0;
     std::uint32_t conv_group_size  = 0;
@@ -140,10 +128,12 @@ struct DraftConfig {
 
 struct Config {
     TextConfig text;
-    std::optional<VisionConfig> vision;
+    std::optional<qwen::VisionConfig> vision;
     bool mtp = false;
     std::optional<DraftConfig> draft;
 };
+
+[[nodiscard]] ModelSamplingDefaults default_sampling(Architecture architecture);
 
 [[nodiscard]] Config parse_config(const artifact::Directory& directory, const LoadOptions& options);
 

@@ -1,9 +1,9 @@
 // Cold-cache CUDA Graph benchmark for candidate_selector_path.
 
 #include "ninfer/ops/candidate_selector.h"
+#include "core/buffer.h"
 
-#include "ninfer_bench_common.h"
-#include "ops/candidate_selector/bf16/candidate_selector_path_plan.h"
+#include "op_measurement.cuh"
 
 #include <cuda_runtime.h>
 
@@ -51,17 +51,17 @@ Options parse_options(int argc, char** argv) {
             return argv[++index];
         };
         if (!std::strcmp(argv[index], "--steps")) {
-            options.steps = std::atoi(next("steps"));
+            options.steps = measurement::integer(next("steps"), 0);
         } else if (!std::strcmp(argv[index], "--batch")) {
-            options.batch_size = std::atoi(next("batch"));
+            options.batch_size = measurement::integer(next("batch"), 0);
         } else if (!std::strcmp(argv[index], "--warmup")) {
-            options.warmup = std::atoi(next("warmup"));
+            options.warmup = measurement::integer(next("warmup"), 0);
         } else if (!std::strcmp(argv[index], "--repeat")) {
-            options.repeat = std::atoi(next("repeat"));
+            options.repeat = measurement::integer(next("repeat"));
         } else if (!std::strcmp(argv[index], "--flush-mib")) {
-            const long mib = std::strtol(next("flush MiB"), nullptr, 10);
-            if (mib <= 0) { throw std::invalid_argument("flush MiB must be positive"); }
-            options.flush_bytes = static_cast<std::size_t>(mib) << 20;
+            const auto mib = measurement::integer<std::size_t>(
+                next("flush MiB"), 1, std::numeric_limits<std::size_t>::max() >> 20);
+            options.flush_bytes = mib << 20;
         } else if (!std::strcmp(argv[index], "--help") || !std::strcmp(argv[index], "-h")) {
             std::printf("usage: %s [--steps 1..15] [--batch 1..8] [--warmup N] [--repeat N] "
                         "[--flush-mib N]\n",
@@ -93,19 +93,27 @@ struct Fixture {
     std::array<float, kCandidates * kMaxSteps * 8> host_unary{};
     std::array<std::int32_t, 8> host_anchors{};
     std::array<std::int32_t, 8> host_positions{};
-    DeviceBuffer candidate_ids{host_candidates.size() * sizeof(std::int32_t)};
-    DeviceBuffer unary_scores{host_unary.size() * sizeof(float)};
+    DeviceBuffer candidate_ids{ninfer::bench::device_context().device(),
+                               host_candidates.size() * sizeof(std::int32_t)};
+    DeviceBuffer unary_scores{ninfer::bench::device_context().device(),
+                              host_unary.size() * sizeof(float)};
     DeviceBuffer projected_hidden =
         make_bf16(static_cast<std::size_t>(kRank) * kMaxSteps * 8, 101U);
-    DeviceBuffer anchors{host_anchors.size() * sizeof(std::int32_t)};
-    DeviceBuffer predecessor_codebook{static_cast<std::size_t>(kRank) * kCodebookRows *
-                                      sizeof(std::uint16_t)};
-    DeviceBuffer successor_codebook{static_cast<std::size_t>(kRank) * kCodebookRows *
-                                    sizeof(std::uint16_t)};
-    DeviceBuffer base_positions{host_positions.size() * sizeof(std::int32_t)};
-    DeviceBuffer configs{8 * sizeof(ops::SamplingConfig)};
-    DeviceBuffer drafts{static_cast<std::size_t>(kMaxSteps) * 8 * sizeof(std::int32_t)};
-    DeviceBuffer proposal_q{static_cast<std::size_t>(kCandidates) * kMaxSteps * 8 * sizeof(float)};
+    DeviceBuffer anchors{ninfer::bench::device_context().device(),
+                         host_anchors.size() * sizeof(std::int32_t)};
+    DeviceBuffer predecessor_codebook{ninfer::bench::device_context().device(),
+                                      static_cast<std::size_t>(kRank) * kCodebookRows *
+                                          sizeof(std::uint16_t)};
+    DeviceBuffer successor_codebook{ninfer::bench::device_context().device(),
+                                    static_cast<std::size_t>(kRank) * kCodebookRows *
+                                        sizeof(std::uint16_t)};
+    DeviceBuffer base_positions{ninfer::bench::device_context().device(),
+                                host_positions.size() * sizeof(std::int32_t)};
+    DeviceBuffer configs{ninfer::bench::device_context().device(), 8 * sizeof(ops::SamplingConfig)};
+    DeviceBuffer drafts{ninfer::bench::device_context().device(),
+                        static_cast<std::size_t>(kMaxSteps) * 8 * sizeof(std::int32_t)};
+    DeviceBuffer proposal_q{ninfer::bench::device_context().device(),
+                            static_cast<std::size_t>(kCandidates) * kMaxSteps * 8 * sizeof(float)};
 
     explicit Fixture(int steps) : kSteps(steps) {
         for (std::int32_t batch = 0; batch < 8; ++batch) {
@@ -121,14 +129,14 @@ struct Fixture {
                 }
             }
         }
-        candidate_ids.copy_from_host(host_candidates.data(), candidate_ids.bytes);
-        unary_scores.copy_from_host(host_unary.data(), unary_scores.bytes);
-        anchors.copy_from_host(host_anchors.data(), anchors.bytes);
-        base_positions.copy_from_host(host_positions.data(), base_positions.bytes);
-        CUDA_CHECK(fixture::fill_values(static_cast<__nv_bfloat16*>(predecessor_codebook.p),
-                                        predecessor_codebook.bytes / 2, 201U, -.05F, .05F));
-        CUDA_CHECK(fixture::fill_values(static_cast<__nv_bfloat16*>(successor_codebook.p),
-                                        successor_codebook.bytes / 2, 203U, -.05F, .05F));
+        candidate_ids.copy_from_host(host_candidates.data(), candidate_ids.size());
+        unary_scores.copy_from_host(host_unary.data(), unary_scores.size());
+        anchors.copy_from_host(host_anchors.data(), anchors.size());
+        base_positions.copy_from_host(host_positions.data(), base_positions.size());
+        CUDA_CHECK(fixture::fill_values(static_cast<__nv_bfloat16*>(predecessor_codebook.data()),
+                                        predecessor_codebook.size() / 2, 201U, -.05F, .05F));
+        CUDA_CHECK(fixture::fill_values(static_cast<__nv_bfloat16*>(successor_codebook.data()),
+                                        successor_codebook.size() / 2, 203U, -.05F, .05F));
     }
 
     void set_mode(Mode mode, std::int32_t batch_size) {
@@ -144,20 +152,20 @@ struct Fixture {
     void tensors(std::int32_t batch_size, Tensor& ids, Tensor& unary, Tensor& hidden,
                  Tensor& anchor, Tensor& predecessor, Tensor& successor, Tensor& positions,
                  Tensor& draft, Tensor& q) {
-        ids         = Tensor(candidate_ids.p, DType::I32, {kCandidates, kSteps, batch_size});
-        unary       = Tensor(unary_scores.p, DType::FP32, {kCandidates, kSteps, batch_size});
-        hidden      = Tensor(projected_hidden.p, DType::BF16, {kRank, kSteps, batch_size});
-        anchor      = Tensor(anchors.p, DType::I32, {batch_size});
-        predecessor = Tensor(predecessor_codebook.p, DType::BF16, {kRank, kCodebookRows});
-        successor   = Tensor(successor_codebook.p, DType::BF16, {kRank, kCodebookRows});
-        positions   = Tensor(base_positions.p, DType::I32, {batch_size});
-        draft       = Tensor(drafts.p, DType::I32, {kSteps, batch_size});
-        q           = Tensor(proposal_q.p, DType::FP32, {kCandidates, kSteps, batch_size});
+        ids         = Tensor(candidate_ids.span(), DType::I32, {kCandidates, kSteps, batch_size});
+        unary       = Tensor(unary_scores.span(), DType::FP32, {kCandidates, kSteps, batch_size});
+        hidden      = Tensor(projected_hidden.span(), DType::BF16, {kRank, kSteps, batch_size});
+        anchor      = Tensor(anchors.span(), DType::I32, {batch_size});
+        predecessor = Tensor(predecessor_codebook.span(), DType::BF16, {kRank, kCodebookRows});
+        successor   = Tensor(successor_codebook.span(), DType::BF16, {kRank, kCodebookRows});
+        positions   = Tensor(base_positions.span(), DType::I32, {batch_size});
+        draft       = Tensor(drafts.span(), DType::I32, {kSteps, batch_size});
+        q           = Tensor(proposal_q.span(), DType::FP32, {kCandidates, kSteps, batch_size});
     }
 };
 
 void run(std::int32_t batch_size, Mode mode, const Options& options, Fixture& fixture,
-         bench::L2FlushBuffer& flush, cudaStream_t stream) {
+         bench::L2FlushBuffer& flush, CudaExecutionView cuda) {
     fixture.set_mode(mode, batch_size);
     Tensor ids;
     Tensor unary;
@@ -170,21 +178,22 @@ void run(std::int32_t batch_size, Mode mode, const Options& options, Fixture& fi
     Tensor q;
     fixture.tensors(batch_size, ids, unary, hidden, anchor, predecessor, successor, positions,
                     draft, q);
-    const auto* configs = static_cast<const ops::SamplingConfig*>(fixture.configs.p);
+    const auto* configs = static_cast<const ops::SamplingConfig*>(fixture.configs.data());
 
-    const auto route    = ops::detail::candidate_selector_path_route(fixture.kSteps, batch_size);
     const auto capacity = ops::candidate_selector_path_workspace_capacity_bytes(
         fixture.kSteps, fixture.kSteps, batch_size, batch_size);
-    WorkspaceArena workspace(std::max<std::size_t>(capacity, 1));
+    ninfer::DeviceBuffer workspace_storage(ninfer::bench::device_context().device(),
+                                           std::max<std::size_t>(capacity, 1));
+    MemoryArena workspace(workspace_storage.span());
     TimedGraph graph;
-    graph.capture(stream, [&](cudaStream_t s) {
+    graph.capture(cuda, [&](CudaExecutionView cuda) {
         ops::candidate_selector_path(ids, unary, hidden, anchor, predecessor, successor, positions,
-                                     configs, draft, q, workspace, s);
+                                     configs, draft, q, workspace, cuda);
     });
-    const auto timing = measure_cold_graph(graph, flush, stream, options.warmup, options.repeat);
-    std::printf("%d,%d,%s,%s,%.3f,%.3f,%.3f,%zu,%zu\n", fixture.kSteps, batch_size, mode_name(mode),
-                ops::detail::selector_route_name(route), timing.median_us, timing.min_us,
-                timing.p95_us, graph.nodes(), workspace.peak_used());
+    const auto timing = measure_cold_graph(graph, flush, cuda, options.warmup, options.repeat);
+    std::printf("%d,%d,%s,%.3f,%.3f,%.3f,%zu,%zu\n", fixture.kSteps, batch_size, mode_name(mode),
+                timing.median_us, timing.min_us, timing.p95_us, graph.nodes(),
+                workspace.peak_used());
 }
 
 } // namespace
@@ -200,6 +209,7 @@ int main(int argc, char** argv) {
         bench::L2FlushBuffer flush(options.flush_bytes);
         cudaStream_t stream = nullptr;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        const auto cuda = ninfer::bench::device_context().execution_view(stream);
         int device = 0;
         CUDA_CHECK(cudaGetDevice(&device));
         cudaDeviceProp properties{};
@@ -207,7 +217,7 @@ int main(int argc, char** argv) {
         std::printf("# gpu=%s public=candidate_selector_path geometry=C16_K1..15_R256 "
                     "cache=cold flush_mib=%zu execution=graph\n",
                     properties.name, options.flush_bytes >> 20);
-        std::printf("K,B,mode,route,median_us,min_us,p95_us,graph_nodes,workspace_bytes\n");
+        std::printf("K,B,mode,median_us,min_us,p95_us,graph_nodes,workspace_bytes\n");
         for (int steps = 1; steps <= 15; ++steps) {
             if (options.steps && options.steps != steps) continue;
             Fixture fixture(steps);
@@ -215,7 +225,7 @@ int main(int argc, char** argv) {
                 if (options.batch_size != 0 && options.batch_size != batch_size) continue;
                 for (const Mode mode : std::array{Mode::Greedy, Mode::Stochastic, Mode::Mixed}) {
                     if (mode == Mode::Mixed && batch_size == 1) continue;
-                    run(batch_size, mode, options, fixture, flush, stream);
+                    run(batch_size, mode, options, fixture, flush, cuda);
                 }
             }
         }

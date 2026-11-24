@@ -1,87 +1,68 @@
 #pragma once
 
-// ninfer::ops - fused gate/up projection followed by SwiGLU.
-
 #include "core/weight.h"
 #include "core/arena.h"
 #include "core/tensor.h"
 #include "ninfer/ops/linear.h"
 
-#include <cuda_runtime.h>
+#include "core/device.h"
 
 #include <cstddef>
 #include <cstdint>
 
 namespace ninfer::ops {
 
-/**
- * Returns the transient capacity required by LinearSwiGLU for every T in the inclusive
- * [min_tokens,max_tokens] interval. The QType and dimensions are the fixed implementation profile.
- * Invalid profiles or intervals throw; a legal static-zero route returns zero.
- */
+// Capacity for every extent in the inclusive interval; invalid profiles or intervals throw.
 [[nodiscard]] std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype,
                                                                  std::int32_t gate_up_rows,
                                                                  std::int32_t input_rows,
                                                                  std::int32_t min_tokens,
                                                                  std::int32_t max_tokens);
 
-/**
- * Policy-bearing capacity query. Q4/Q8 use A16 under every policy. NVFP4 uses A16 under
- * A16Only/AllowA8 through T=16; AllowA4 accepts every positive T. Row-scaled FP8 accepts all
- * policies, with A8 permitted by AllowA8/AllowA4.
- * A permissive policy covers whichever qualified route the private resolver selects across the
- * requested interval.
- */
 [[nodiscard]] std::size_t
 linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gate_up_rows,
                                        std::int32_t input_rows, LinearPolicy policy,
                                        std::int32_t min_tokens, std::int32_t max_tokens);
 
 /**
- * Op: linear_swiglu
+ * out[i,t] = SiLU((W_gate * x)[i,t]) * (W_up * x)[i,t].
  *
- * Math / indexing:
- *   gate_up = Linear(x, gate_up_weight); M=gate_up_rows/2;
- *   ideal[i,t] = SiLU(gate_up[i,t]) * gate_up[M+i,t].
+ * x [K,T] and out [M,T] are contiguous, 16-byte-aligned BF16 matrices.
+ * gate_up_weight [2*M,K] stores all M gate rows followed by their matching M up rows.
+ * Registered BF16, Q4_G64_FP16, Q8_G32_FP16, FP8_E4M3FN_ROW_BF16 and NVFP4 geometries
+ * use their native stored representation. Inputs and weight storage must not overlap out.
+ * Writes the entire output and has no persistent state.
  *
- * Logical shapes / supported domain:
- *   T may be any positive value. The registered profiles are:
- *   - Q4_G64_FP16 weight [34816,5120], x [5120,T], out [17408,T];
- *   - Q8_G32_FP16 weight [12288,2048], x [2048,T], out [6144,T];
- *   - Q8_G32_FP16 weight [34816,5120], x [5120,T], out [17408,T];
- *   - NVFP4 BlockScaleK16M128x4 weight [34816,5120], x [5120,T], out [17408,T];
- *   - FP8_E4M3FN_ROW_BF16 RowScale weight [34816,5120], x [5120,T], out [17408,T].
- *   Inputs and output are contiguous BF16. Q4/Q8 scales are FP16, NVFP4 scales are E4M3FN, and
- *   row-scaled FP8 has one BF16 multiplier per gate/up parent row. Gate rows `[0,17408)` precede
- *   their matching up rows `[17408,34816)`.
- *
- * Numeric:
- *   The oracle exact-decodes the registered weight and evaluates `ideal` naively in FP64 from the
- *   represented inputs. The BF16 output is promoted and compared directly with that result; output
- *   storage rounding belongs to LinearSwiGLU's named activation-compute criterion, not the oracle.
- *   Production routes may fuse or materialize gate/up and may choose their natural accumulator,
- *   staging, and workspace precision; those private choices are not semantic rounding boundaries.
- *   AllowA8/AllowA4 permit FP8 activation quantization; route thresholds are implementation
- * choices.
- *
- * Effects:
- *   Writes the full output; x/weight and output must not alias.
- *
- * Workspace:
- *   Caller-owned transient storage reported by linear_swiglu_workspace_capacity_bytes(),
- *   scoped to the call. Q8, NVFP4 A16, and row-scaled FP8 A16 require zero bytes; A4/A8 routes use
- *   caller-owned activation storage and may use private projection storage. There is no persistent
- *   state side effect.
+ * BF16/Q4/Q8 use A16 under every policy. FP8 permits A8 with AllowA8/AllowA4.
+ * NVFP4 permits A4 with AllowA4; A16Only/AllowA8 support only T <= 16 for NVFP4.
+ * Otherwise every positive T is admitted. The overload without a policy uses A16Only.
+ * Caller workspace covers the complete operation and is scoped to the call.
  */
 void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, LinearPolicy policy,
-                   WorkspaceArena& ws, cudaStream_t stream);
+                   MemoryArena& ws, CudaExecutionView execution);
+
+void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, MemoryArena& ws,
+                   CudaExecutionView execution);
+
+// Explicit clamped product: SiLU(min(gate, limit)) * clamp(up, -limit, limit).
+// limit must be finite and positive. Clamping is supported by registered BF16, Q8-G32/FP16 and
+// NVFP4 geometries; unsupported combinations throw. Gate/up accumulators feed the product without
+// an intermediate BF16 rounding boundary. Other operands/effects follow linear_swiglu.
+void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, float limit,
+                   LinearPolicy policy, MemoryArena& ws, CudaExecutionView execution);
 
 /**
- * A16-only convenience form. Q4/Q8 and row-scaled FP8 retain their complete positive-T domain.
- * NVFP4 is admitted only through T=16; larger NVFP4 extents require the policy-bearing AllowA4
- * form.
+ * g = W_gate*x + bias_gate; u = W_up*x + bias_up;
+ * out[i,t] = SiLU(min(g[i,t],limit)) * clamp(u[i,t],-limit,limit).
+ *
+ * Registered contiguous BF16 [2*M,K] weights and naturally aligned BF16 bias [2*M]
+ * both use [gate;up] row order. Uses A16 computation with finite positive limit.
+ * The projection and bias feed the product without intermediate BF16 rounding.
+ * x/out follow linear_swiglu's matrix and alias requirements; out also overlaps no bias.
+ * Inputs are preserved. No workspace, hidden allocation or persistent state;
+ * supports CUDA Graph replay.
  */
-void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, WorkspaceArena& ws,
-                   cudaStream_t stream);
+void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, const Tensor& bias, Tensor& out,
+                   float limit, CudaExecutionView execution);
 
 } // namespace ninfer::ops

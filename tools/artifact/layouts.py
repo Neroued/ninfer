@@ -16,8 +16,10 @@ from typing import Sequence
 
 from .formats import (
     DirectFormat,
+    Fp8BlockFormat,
     Fp8RowFormat,
     Nvfp4Format,
+    Nf4Format,
     NumericFormat,
     QuantFormat,
     get_format,
@@ -56,6 +58,7 @@ class RowSplitGeometry:
 
 @dataclass(frozen=True, slots=True)
 class BlockScaleGeometry:
+    matrices: int
     n: int
     k: int
     groups_per_row: int
@@ -64,6 +67,19 @@ class BlockScaleGeometry:
     scale_plane_offset: int
     scale_plane_bytes: int
     weight_divisor_offset: int
+    payload_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class Fp8BlockGeometry:
+    matrices: int
+    n: int
+    k: int
+    scale_rows: int
+    scale_columns: int
+    code_plane_bytes: int
+    scale_plane_offset: int
+    scale_plane_bytes: int
     payload_bytes: int
 
 
@@ -77,6 +93,23 @@ class RowScaleGeometry:
     payload_bytes: int
 
 
+@dataclass(frozen=True, slots=True)
+class RowPagedGeometry:
+    n: int
+    k: int
+    row_bytes: int
+    rows_per_page: int
+    page_count: int
+    weight_divisor_offset: int
+    payload_bytes: int
+
+    def row_offset(self, row: int) -> int:
+        if not 0 <= row < self.n:
+            raise ValueError("row exceeds paged tensor")
+        page, slot = divmod(row, self.rows_per_page)
+        return page * 4096 + slot * self.row_bytes
+
+
 CONTIGUOUS_LE_V1 = Layout("contiguous_le_v1", 256, frozenset(("bf16", "fp32", "int32")))
 ROW_SPLIT_K128_V1 = Layout(
     "row_split_k128_v1",
@@ -88,10 +121,21 @@ BLOCK_SCALE_K16_M128X4_V1 = Layout(
     256,
     frozenset(("nvfp4",)),
 )
+BATCHED_BLOCK_SCALE_K16_M128X4_V1 = Layout(
+    "batched_block_scale_k16_m128x4_v1", 256, frozenset(("nvfp4",))
+)
+BLOCK_SCALE_M128_K128_V1 = Layout(
+    "block_scale_m128_k128_v1",
+    256,
+    frozenset(("fp8_e4m3fn_block128x128_bf16",)),
+)
 ROW_SCALE_V1 = Layout(
     "row_scale_v1",
     256,
     frozenset(("fp8_e4m3fn_row_bf16",)),
+)
+ROW_PAGED_G16_4K_V1 = Layout(
+    "row_paged_g16_4k_v1", 4096, frozenset(("nf4_g16_e4m3fn",))
 )
 
 LAYOUTS = MappingProxyType(
@@ -101,7 +145,10 @@ LAYOUTS = MappingProxyType(
             CONTIGUOUS_LE_V1,
             ROW_SPLIT_K128_V1,
             BLOCK_SCALE_K16_M128X4_V1,
+            BATCHED_BLOCK_SCALE_K16_M128X4_V1,
+            BLOCK_SCALE_M128_K128_V1,
             ROW_SCALE_V1,
+            ROW_PAGED_G16_4K_V1,
         )
     }
 )
@@ -203,17 +250,22 @@ def block_scale_geometry(
     spec = _format(format)
     if not isinstance(spec, Nvfp4Format):
         raise ValueError("block_scale_k16_m128x4_v1 requires NVFP4")
-    n, k = _shape(shape, rank=2)
+    dims = _shape(shape)
+    if len(dims) not in (2, 3):
+        raise ValueError("NVFP4 requires [N,K] or [E,N,K]")
+    n, k = dims[-2:]
+    matrices = dims[0] if len(dims) == 3 else 1
     if n % 128 != 0 or k % 64 != 0:
         raise ValueError(
             "block_scale_k16_m128x4_v1 requires N divisible by 128 "
             "and K divisible by 64"
         )
-    code_plane_bytes = n * k // 2
+    code_plane_bytes = matrices * n * k // 2
     scale_plane_offset = align_up(code_plane_bytes, PLANE_ALIGNMENT)
-    scale_plane_bytes = n * k // spec.group_size
+    scale_plane_bytes = matrices * n * k // spec.group_size
     weight_divisor_offset = scale_plane_offset + scale_plane_bytes
     return BlockScaleGeometry(
+        matrices=matrices,
         n=n,
         k=k,
         groups_per_row=k // spec.group_size,
@@ -222,7 +274,37 @@ def block_scale_geometry(
         scale_plane_offset=scale_plane_offset,
         scale_plane_bytes=scale_plane_bytes,
         weight_divisor_offset=weight_divisor_offset,
-        payload_bytes=weight_divisor_offset + 4,
+        payload_bytes=weight_divisor_offset + 4 * matrices,
+    )
+
+
+def fp8_block_geometry(
+    format: str | Fp8BlockFormat, shape: Sequence[int]
+) -> Fp8BlockGeometry:
+    spec = _format(format)
+    if not isinstance(spec, Fp8BlockFormat):
+        raise ValueError("block_scale_m128_k128_v1 requires block-scaled FP8")
+    dims = _shape(shape)
+    if len(dims) not in (2, 3):
+        raise ValueError("block-scaled FP8 requires [N,K] or [E,N,K]")
+    n, k = dims[-2:]
+    if n % spec.block_rows or k % spec.block_columns:
+        raise ValueError("block-scaled FP8 requires N and K divisible by 128")
+    matrices = dims[0] if len(dims) == 3 else 1
+    code_bytes = matrices * n * k
+    offset = align_up(code_bytes, PLANE_ALIGNMENT)
+    scale_rows, scale_columns = n // spec.block_rows, k // spec.block_columns
+    scale_bytes = matrices * scale_rows * scale_columns * 2
+    return Fp8BlockGeometry(
+        matrices,
+        n,
+        k,
+        scale_rows,
+        scale_columns,
+        code_bytes,
+        offset,
+        scale_bytes,
+        offset + scale_bytes,
     )
 
 
@@ -243,6 +325,24 @@ def row_scale_geometry(
         scale_plane_offset=scale_plane_offset,
         scale_plane_bytes=scale_plane_bytes,
         payload_bytes=scale_plane_offset + scale_plane_bytes,
+    )
+
+
+def row_paged_geometry(
+    format: str | Nf4Format, shape: Sequence[int]
+) -> RowPagedGeometry:
+    if not isinstance(_format(format), Nf4Format):
+        raise ValueError("row_paged_g16_4k_v1 requires NF4 G16")
+    n, k = _shape(shape, rank=2)
+    if k % 16:
+        raise ValueError("paged NF4 requires K divisible by 16")
+    row_bytes = k // 2 + k // 16
+    rows_per_page = 4096 // row_bytes
+    if rows_per_page == 0:
+        raise ValueError("encoded NF4 row exceeds 4096 bytes")
+    pages = (n + rows_per_page - 1) // rows_per_page
+    return RowPagedGeometry(
+        n, k, row_bytes, rows_per_page, pages, pages * 4096, pages * 4096 + 4
     )
 
 
@@ -268,12 +368,17 @@ def encoded_size(
         if not isinstance(numeric_spec, QuantFormat):
             raise ValueError("row_split_k128_v1 requires a grouped quantized format")
         return row_split_geometry(numeric_spec, shape).payload_bytes
-    if layout_spec is BLOCK_SCALE_K16_M128X4_V1:
+    if layout_spec in (BLOCK_SCALE_K16_M128X4_V1, BATCHED_BLOCK_SCALE_K16_M128X4_V1):
         if not isinstance(numeric_spec, Nvfp4Format):
             raise ValueError("block_scale_k16_m128x4_v1 requires NVFP4")
+        _shape(shape, rank=2 if layout_spec is BLOCK_SCALE_K16_M128X4_V1 else 3)
         return block_scale_geometry(numeric_spec, shape).payload_bytes
+    if layout_spec is BLOCK_SCALE_M128_K128_V1:
+        return fp8_block_geometry(numeric_spec, shape).payload_bytes
     if layout_spec is ROW_SCALE_V1:
         if not isinstance(numeric_spec, Fp8RowFormat):
             raise ValueError("row_scale_v1 requires a row-scaled FP8 format")
         return row_scale_geometry(numeric_spec, shape).payload_bytes
+    if layout_spec is ROW_PAGED_G16_4K_V1:
+        return row_paged_geometry(numeric_spec, shape).payload_bytes
     raise ValueError(f"unsupported tensor layout: {layout_spec.name!r}")

@@ -9,6 +9,7 @@
 namespace ninfer::product {
 
 [[nodiscard]] inline SpeculativeBackend parse_speculative_backend(std::string_view value) {
+    if (value == "none") { return SpeculativeBackend::None; }
     if (value == "mtp") { return SpeculativeBackend::Mtp; }
     if (value == "dflash") { return SpeculativeBackend::DFlash; }
     if (value == "dflash2") { return SpeculativeBackend::DFlash2; }
@@ -33,8 +34,8 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
     switch (options.backend) {
     case SpeculativeBackend::None:
         if (options.draft_tokens != 0 || options.proposal_head != ProposalHead::Full) {
-            throw std::invalid_argument(
-                "--draft-tokens and --lm-head-draft require --spec mtp|dflash|dflash2");
+            throw std::invalid_argument("nonzero drafts or an optimized proposal head require an "
+                                        "enabled speculative backend");
         }
         return;
     case SpeculativeBackend::Mtp:

@@ -1,14 +1,12 @@
-// Cold-cache benchmark and candidate tuner for the Qwen3.6-35B-A3B Q8 LinearAdd Op.
+// Cold-cache public-Op benchmark for Q8 LinearAdd.
 
 #include "core/weight.h"
+#include "core/buffer.h"
 #include "ninfer/ops/linear_add.h"
-#include "ninfer/ops/residual_add.h"
 
 #include "core/device.h"
-#include "ninfer_bench_common.h"
+#include "op_measurement.cuh"
 #include "quantized_weight.cuh"
-#include "ops/linear_add/q8/q8_linear_add_kernels.h"
-#include "ops/linear_add/q8/q8_linear_add_plan.h"
 
 #include <cuda_runtime.h>
 
@@ -40,34 +38,13 @@ struct Options {
     int warmup = 5;
     int repeat = 30;
     std::string csv_out;
-    bool profile         = false;
-    bool production_only = false;
+    bool profile = false;
 };
 
 struct Result {
-    std::string path;
     std::int32_t t;
     bench::ColdTiming timing;
 };
-
-std::vector<std::int32_t> parse_t_sweep(std::string_view raw) {
-    std::vector<std::int32_t> result;
-    std::size_t begin = 0;
-    while (begin < raw.size()) {
-        const std::size_t end = raw.find(',', begin);
-        const std::string token(
-            raw.substr(begin, end == std::string_view::npos ? raw.size() - begin : end - begin));
-        const long value = std::stol(token);
-        if (value <= 0 || value > std::numeric_limits<std::int32_t>::max()) {
-            throw std::invalid_argument("--t-sweep values must be positive int32");
-        }
-        result.push_back(static_cast<std::int32_t>(value));
-        if (end == std::string_view::npos) { break; }
-        begin = end + 1;
-    }
-    if (result.empty()) { throw std::invalid_argument("--t-sweep must not be empty"); }
-    return result;
-}
 
 Options parse_options(int argc, char** argv) {
     Options options;
@@ -78,22 +55,20 @@ Options parse_options(int argc, char** argv) {
             return argv[i];
         };
         if (arg == "--t-sweep") {
-            options.t_sweep = parse_t_sweep(next("--t-sweep value"));
+            options.t_sweep = bench::measurement::integers(next("--t-sweep value"));
         } else if (arg == "--k") {
-            options.hidden = std::stoi(std::string(next("--k value")));
+            options.hidden = bench::measurement::integer(next("--k value"));
         } else if (arg == "--warmup") {
-            options.warmup = std::stoi(std::string(next("--warmup value")));
+            options.warmup = bench::measurement::integer(next("--warmup value"), 0);
         } else if (arg == "--repeat") {
-            options.repeat = std::stoi(std::string(next("--repeat value")));
+            options.repeat = bench::measurement::integer(next("--repeat value"));
         } else if (arg == "--csv-out") {
             options.csv_out = next("--csv-out path");
         } else if (arg == "--profile") {
             options.profile = true;
-        } else if (arg == "--production-only") {
-            options.production_only = true;
         } else if (arg == "--help" || arg == "-h") {
             std::printf("Usage: %s [--k 4096|6144] [--t-sweep 1,2,...] [--warmup N] [--repeat N] "
-                        "[--csv-out PATH] [--profile] [--production-only]\n",
+                        "[--csv-out PATH] [--profile]\n",
                         argv[0]);
             std::exit(0);
         } else {
@@ -112,16 +87,16 @@ Options parse_options(int argc, char** argv) {
     return options;
 }
 
-void append(std::vector<Result>& results, const char* path, std::int32_t t, std::int32_t hidden,
+void append(std::vector<Result>& results, std::int32_t t, std::int32_t hidden,
             bench::ColdTiming timing, std::size_t weight_bytes) {
     const double useful_flops = 2.0 * kRows * hidden * static_cast<double>(t);
     const double useful_bytes =
         static_cast<double>(weight_bytes) + 2.0 * static_cast<double>((hidden + 2 * kRows) * t);
     const double tflops = useful_flops / timing.median_us / 1.0e6;
     const double gbs    = useful_bytes / timing.median_us / 1.0e3;
-    std::printf("T=%-4d %-32s median=%8.3f us  useful=%7.2f TFLOP/s %7.1f GB/s\n", t, path,
-                timing.median_us, tflops, gbs);
-    results.push_back({path, t, timing});
+    std::printf("T=%-4d median=%8.3f us  useful=%7.2f TFLOP/s %7.1f GB/s\n", t, timing.median_us,
+                tflops, gbs);
+    results.push_back({t, timing});
 }
 
 void write_csv(const Options& options, const std::vector<Result>& results) {
@@ -129,15 +104,13 @@ void write_csv(const Options& options, const std::vector<Result>& results) {
     const std::filesystem::path path(options.csv_out);
     if (!path.parent_path().empty()) { std::filesystem::create_directories(path.parent_path()); }
     std::ofstream out(path);
-    out << "path,T,median_us,min_us,p95_us,warmup,repeat\n";
+    out << "N,K,T,median_us,min_us,p95_us,warmup,repeat\n";
     for (const Result& result : results) {
-        out << result.path << ',' << result.t << ',' << result.timing.median_us << ','
-            << result.timing.min_us << ',' << result.timing.p95_us << ',' << options.warmup << ','
-            << options.repeat << '\n';
+        out << kRows << ',' << options.hidden << ',' << result.t << ',' << result.timing.median_us
+            << ',' << result.timing.min_us << ',' << result.timing.p95_us << ',' << options.warmup
+            << ',' << options.repeat << '\n';
     }
 }
-
-
 
 } // namespace
 
@@ -151,100 +124,41 @@ int main(int argc, char** argv) {
 
         cudaStream_t stream = nullptr;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        const auto cuda = ninfer::bench::device_context().execution_view(stream);
         ninfer::bench::L2FlushBuffer flush(kFlushBytes);
         ninfer::DeviceBuffer input =
             bench::make_bf16(static_cast<std::size_t>(options.hidden) * max_t, 101U);
         ninfer::DeviceBuffer residual =
             bench::make_bf16(static_cast<std::size_t>(kRows) * max_t, 103U);
         bench::SavedBuffer residual_initial(residual);
-        const auto restore                  = [&](cudaStream_t s) { residual_initial.restore(s); };
+        const auto restore = [&](CudaExecutionView cuda) { residual_initial.restore(cuda); };
         bench::PackedQuantizedWeight packed = bench::make_row_split_weight(
             QType::Q8_G32_FP16, kRows, options.hidden, options.hidden, 501U);
         const std::size_t workspace_capacity = ops::linear_add_workspace_capacity_bytes(
             QType::Q8_G32_FP16, kRows, options.hidden, min_t, max_t);
-        WorkspaceArena workspace(std::max<std::size_t>(workspace_capacity, 256));
+        ninfer::DeviceBuffer workspace_storage(ninfer::bench::device_context().device(),
+                                               std::max<std::size_t>(workspace_capacity, 256));
+        MemoryArena workspace(workspace_storage.span());
         std::vector<Result> results;
 
         for (const std::int32_t t : options.t_sweep) {
-            Tensor x(input.p, DType::BF16, {options.hidden, t});
-            Tensor out(residual.p, DType::BF16, {kRows, t});
-            const auto plan =
-                ops::detail::q8_linear_add_resolve_plan({kRows, options.hidden, options.hidden, t});
+            Tensor x(input.span(), DType::BF16, {options.hidden, t});
+            Tensor out(residual.span(), DType::BF16, {kRows, t});
 
             if (options.profile) {
-                ops::linear_add(x, packed.weight, out, workspace, stream);
+                ops::linear_add(x, packed.weight, out, workspace, cuda);
                 CUDA_CHECK(cudaStreamSynchronize(stream));
-                std::printf("profile T=%d route=%s\n", t,
-                            ops::detail::q8_linear_add_schedule_name(plan.schedule));
+                std::printf("profile op=linear_add T=%d\n", t);
                 continue;
             }
 
-            const auto run = [&](const char* path, auto&& launch) {
-                append(results, path, t, options.hidden,
-                       bench::measure_cold_launch_prepared(restore, launch, flush, stream,
-                                                           options.warmup, options.repeat),
-                       packed.storage.bytes);
+            const auto launch = [&](CudaExecutionView cuda) {
+                ops::linear_add(x, packed.weight, out, workspace, cuda);
             };
-            run(ops::detail::q8_linear_add_schedule_name(plan.schedule),
-                [&](cudaStream_t candidate_stream) {
-                    ops::linear_add(x, packed.weight, out, workspace, candidate_stream);
-                });
-            if (options.production_only) { continue; }
-
-            if (t == 1 && options.hidden == 6144) {
-                run("decode_r4", [&](cudaStream_t candidate_stream) {
-                    ops::detail::q8_linear_add_decode_r4_launch(x, packed.weight, out,
-                                                                candidate_stream);
-                });
-                run("decode_r8", [&](cudaStream_t candidate_stream) {
-                    ops::detail::q8_linear_add_decode_r8_launch(x, packed.weight, out,
-                                                                candidate_stream);
-                });
-                run("decode_r16", [&](cudaStream_t candidate_stream) {
-                    ops::detail::q8_linear_add_decode_r16_launch(x, packed.weight, out,
-                                                                 candidate_stream);
-                });
-            }
-            run("simt_r8_c4", [&](cudaStream_t candidate_stream) {
-                ops::detail::q8_linear_add_simt_r8_c4_launch(x, packed.weight, out,
-                                                             candidate_stream);
-            });
-            run("simt_r8_c8", [&](cudaStream_t candidate_stream) {
-                ops::detail::q8_linear_add_simt_r8_c8_launch(x, packed.weight, out,
-                                                             candidate_stream);
-            });
-            if (t >= 2 && t <= 48) {
-                run("splitk_mma_exact_t", [&](cudaStream_t candidate_stream) {
-                    ops::detail::q8_linear_add_splitk_mma_launch(x, packed.weight, out,
-                                                                 candidate_stream);
-                });
-            }
-#define RUN_MMA(NAME)                                                                              \
-    run(#NAME, [&](cudaStream_t candidate_stream) {                                                \
-        ops::detail::q8_linear_add_##NAME##_launch(x, packed.weight, out, candidate_stream);       \
-    })
-            RUN_MMA(mma_r32_c32);
-            RUN_MMA(mma_r32_c48);
-            RUN_MMA(mma_r32_c64);
-            RUN_MMA(mma_r32_c80);
-            RUN_MMA(mma_r32_c96);
-            RUN_MMA(mma_r32_c112);
-            RUN_MMA(mma_r32_c128);
-            RUN_MMA(mma_r48_c64);
-            RUN_MMA(mma_r48_c80);
-            RUN_MMA(mma_r48_c96);
-            RUN_MMA(mma_r48_c112);
-            RUN_MMA(mma_r48_c128);
-            RUN_MMA(mma_r64_c32);
-            RUN_MMA(mma_r64_c48);
-            RUN_MMA(mma_r64_c64);
-            RUN_MMA(mma_r64_c80);
-            RUN_MMA(mma_r64_c96);
-            RUN_MMA(mma_r64_c112);
-            RUN_MMA(mma_r64_c128);
-            RUN_MMA(mma_r128_c64);
-            RUN_MMA(mma_r128_c80);
-#undef RUN_MMA
+            append(results, t, options.hidden,
+                   bench::measure_cold_launch_prepared(restore, launch, flush, cuda, options.warmup,
+                                                       options.repeat),
+                   packed.storage.size());
         }
 
         CUDA_CHECK(cudaStreamSynchronize(stream));

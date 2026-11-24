@@ -1,12 +1,12 @@
 #include "ops/softmax_attention/dense/causal_cache/k8v4/tiled_launch.h"
 #include "ops/softmax_attention/dense/causal_cache/k8v4/instances.h"
-#include "ops/softmax_attention/dense/causal_cache/k8v4/tile_io.cuh"
-#include "ops/softmax_attention/common/mxfp8_tiled_launch.cuh"
-#include "ops/softmax_attention/common/causal_tiled_merge.cuh"
+
+#include "ops/softmax_attention/kernels/causal/mxfp8_tiled_launch.cuh"
+#include "ops/softmax_attention/kernels/causal/tiled_merge.cuh"
 
 namespace ninfer::ops::detail {
 void k8v4_kv_tiled_attention(const CausalAttentionOperands& p, K8V4KvReadView cache,
-                             CausalKvPartition partition, WorkspaceArena& workspace,
+                             CausalKvPartition partition, MemoryArena& workspace,
                              cudaStream_t stream) {
     auto scope = workspace.scope();
     const auto partial =

@@ -1,5 +1,6 @@
 // Public warm-cache Graph benchmark for the fused tail-pack RMSNorm contract.
 #include "ninfer/ops/rmsnorm_pack_tail.h"
+#include "core/buffer.h"
 #include "ninfer_bench_common.h"
 #include <cstdlib>
 #include <stdexcept>
@@ -39,19 +40,19 @@ Options parse(int argc, char** argv) {
     return out;
 }
 
-void run(int width, int batch, const Options& options, cudaStream_t stream) {
+void run(int width, int batch, const Options& options, CudaExecutionView cuda) {
     const int columns   = (width - 1) * batch;
-    DeviceBuffer input  = make_bf16(5120ULL * width * batch, 101U),
-                 weight = make_bf16(5120, 103U, .8F, 1.2F),
-                 output = make_zeros(5120ULL * columns * 2);
-    Tensor x(input.p, DType::BF16, {5120, width, batch}), w(weight.p, DType::BF16, {5120}),
-        y(output.p, DType::BF16, {5120, columns});
+    DeviceBuffer input  = make_bf16(5120ULL * width * batch, 101U);
+    DeviceBuffer weight = make_bf16(5120, 103U, .8F, 1.2F);
+    DeviceBuffer output = make_zeros(5120ULL * columns * 2);
+    Tensor x(input.span(), DType::BF16, {5120, width, batch}),
+        w(weight.span(), DType::BF16, {5120}), y(output.span(), DType::BF16, {5120, columns});
     TimedGraph graph;
     constexpr int repeats = 32;
-    graph.capture(stream, [&](cudaStream_t s) {
-        for (int i = 0; i < repeats; ++i) { ops::rmsnorm_pack_tail(x, w, y, s); }
+    graph.capture(cuda, [&](CudaExecutionView cuda) {
+        for (int i = 0; i < repeats; ++i) { ops::rmsnorm_pack_tail(x, w, y, cuda); }
     });
-    const auto timing = measure_graph(graph, stream, options.warmup, options.repeat);
+    const auto timing = measure_graph(graph, cuda, options.warmup, options.repeat);
     std::printf("%d,%d,%d,%d,%.3f,%.3f,%.3f,%zu\n", width, batch, columns, 512,
                 timing.median_us / repeats, timing.min_us / repeats, timing.p95_us / repeats,
                 graph.nodes());
@@ -68,13 +69,14 @@ int main(int argc, char** argv) {
         const auto options  = parse(argc, argv);
         cudaStream_t stream = nullptr;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        const auto cuda = ninfer::bench::device_context().execution_view(stream);
         std::puts("W,B,U,threads,median_us,min_us,p95_us,graph_repetitions");
         for (int width = 2; width <= 16; ++width)
             for (int batch = 1; batch <= 8; ++batch) {
                 if ((options.width && width != options.width) ||
                     (options.batch && batch != options.batch))
                     continue;
-                run(width, batch, options, stream);
+                run(width, batch, options, cuda);
             }
         CUDA_CHECK(cudaStreamDestroy(stream));
         return 0;

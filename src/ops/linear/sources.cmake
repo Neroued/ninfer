@@ -1,11 +1,8 @@
-target_sources(ninfer_ops PRIVATE
-  "${CMAKE_CURRENT_LIST_DIR}/linear.cpp"
-)
-
-include("${CMAKE_CURRENT_LIST_DIR}/bf16/sources.cmake")
-include("${CMAKE_CURRENT_LIST_DIR}/fp8/sources.cmake")
-include("${CMAKE_CURRENT_LIST_DIR}/nvfp4/sources.cmake")
-include("${CMAKE_CURRENT_LIST_DIR}/q4/sources.cmake")
-include("${CMAKE_CURRENT_LIST_DIR}/q5/sources.cmake")
-include("${CMAKE_CURRENT_LIST_DIR}/q6/sources.cmake")
-include("${CMAKE_CURRENT_LIST_DIR}/q8/sources.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/kernels/sources.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/projection/sources.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/split/sources.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/add/sources.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/bias/sources.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/swiglu/sources.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/pair/sources.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/topk/sources.cmake")

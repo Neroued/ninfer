@@ -53,7 +53,7 @@ struct GdnReplayRecords {
     GdnReplayRecordSpec spec;
 
     GdnReplayRecords() = default;
-    GdnReplayRecords(DeviceSpan backing, const GdnReplayRecordLayout& layout);
+    GdnReplayRecords(MemorySpan backing, const GdnReplayRecordLayout& layout);
 
     [[nodiscard]] GdnReplayRecordLayer layer(std::int32_t layer, std::int32_t rows) const;
 };

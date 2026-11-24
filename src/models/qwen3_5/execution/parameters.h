@@ -1,5 +1,9 @@
 #pragma once
 
+#include "models/common/qwen/vision/parameters.h"
+
+#include "models/qwen3_5/execution/dense_mlp.h"
+#include "models/common/moe/execution.h"
 #include "models/qwen3_5/model.h"
 #include "ninfer/ops/weight_input.h"
 
@@ -22,21 +26,18 @@ using LinearParameters = ops::SingleProjectionWeight;
     return static_cast<std::int32_t>(value);
 }
 
-struct DenseParameters {
-    LinearParameters gate_up;
-    LinearParameters down;
-};
-
-using FfnParameters = std::variant<DenseParameters, ops::SparseMoeWeights>;
+using FfnParameters = std::variant<DenseParameters, moe::Parameters>;
 
 struct AttentionParameters {
     ops::ProjectionWeights projection;
+    std::array<std::int32_t, 4> projection_rows;
     Tensor query_norm, key_norm;
     LinearParameters output;
 };
 
 struct GdnParameters {
     ops::ProjectionWeights projection;
+    std::array<std::int32_t, 2> projection_rows;
     ops::ProjectionWeights control;
     Tensor a_log, dt_bias, convolution, norm;
     LinearParameters output;
@@ -46,7 +47,7 @@ struct BlockParameters {
     Tensor input_norm, post_attention_norm;
     std::variant<AttentionParameters, GdnParameters> mixer;
     FfnParameters ffn;
-    ops::SparseMoeHints projection_prefetch;
+    ops::MoeExecutionHints projection_prefetch;
 };
 
 struct TextParameters {
@@ -58,8 +59,9 @@ struct TextParameters {
 
 struct MtpProjectionParameters {
     LinearParameters packed;
+    std::array<std::int32_t, 4> output_rows;
     // Dense MTP projects K/V and Q/gate independently in its incremental path.
-    // MoE MTP uses its existing complete-parent Attention projection.
+    // MoE MTP uses a complete-parent LinearSplit.
     std::optional<std::array<LinearParameters, 4>> rows;
 };
 
@@ -71,27 +73,6 @@ struct MtpParameters {
     LinearParameters output;
     FfnParameters ffn;
     LinearParameters output_head;
-};
-
-struct NormParameters {
-    Tensor weight, bias;
-};
-
-struct VisionBlockParameters {
-    NormParameters norm1, norm2;
-    LinearParameters qkv;
-    Tensor qkv_bias;
-    LinearParameters output, fc1, fc2;
-    Tensor output_bias, fc1_bias, fc2_bias;
-};
-
-struct VisionParameters {
-    LinearParameters patch_embedding;
-    Tensor patch_embedding_bias, position_embedding;
-    std::vector<VisionBlockParameters> layers;
-    NormParameters merger_norm;
-    LinearParameters merger_fc1, merger_fc2;
-    Tensor merger_fc1_bias, merger_fc2_bias;
 };
 
 struct DynamicConvParameters {
@@ -128,20 +109,21 @@ struct ProposalParameters {
 };
 
 // Cold native preparation for the fixed model implementation. This owner is stable before
-// startup sizing, execution, or Graph capture; all weight addresses borrow the source Model.
+// startup sizing, execution, or Graph capture; all weight addresses borrow the source ModelShard.
 // Shape-dependent kernel selection and scratch remain with the calling implementation and Op.
 class Parameters {
 public:
-    explicit Parameters(const Model& source);
+    explicit Parameters(const ModelShard& source, std::shared_ptr<const ModelProfile> profile);
     Parameters(const Parameters&)            = delete;
     Parameters& operator=(const Parameters&) = delete;
     Parameters(Parameters&&)                 = delete;
     Parameters& operator=(Parameters&&)      = delete;
 
-    const Model& model;
+    const ModelShard& model;
+    const std::shared_ptr<const ModelProfile> profile;
     TextParameters text;
     std::optional<MtpParameters> mtp;
-    std::optional<VisionParameters> vision;
+    std::optional<qwen::VisionParameters> vision;
     std::optional<DraftParameters> draft;
     std::optional<ProposalParameters> proposal;
 };

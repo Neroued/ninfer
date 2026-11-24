@@ -1,23 +1,20 @@
 cmake_minimum_required(VERSION 3.28)
 
-# The current implementation is compiled only for sm_120a. Set and validate the
-# architecture before CUDA compiler detection so CMake never injects a generic
-# host-toolchain default or accepts an unsupported target.
-if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-  set(CMAKE_CUDA_ARCHITECTURES 120a CACHE STRING "CUDA architectures to build")
-endif()
-if(NOT CMAKE_CUDA_ARCHITECTURES STREQUAL "120a")
-  message(FATAL_ERROR
-    "NInfer supports only CMAKE_CUDA_ARCHITECTURES=120a; got "
-    "'${CMAKE_CUDA_ARCHITECTURES}'")
-endif()
+include(cmake/NinferPlatform.cmake)
 
 project(ninfer LANGUAGES C CXX CUDA)
+ninfer_validate_platform()
 
 # --- Global settings ---------------------------------------------------------
+option(NINFER_BUILD_ENGINE "Build models, frontend and Engine" ON)
 option(NINFER_BUILD_APPS "Build the NInfer CLI, server and perplexity evaluator" ON)
 option(BUILD_TESTING "Build NInfer tests" OFF)
 option(NINFER_BUILD_BENCHMARKS "Build NInfer benchmarks" OFF)
+option(NINFER_ENABLE_DISTRIBUTED "Build distributed execution and NCCL communication" OFF)
+
+if(NINFER_BUILD_APPS AND NOT NINFER_BUILD_ENGINE)
+  message(FATAL_ERROR "NINFER_BUILD_APPS requires NINFER_BUILD_ENGINE")
+endif()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -35,12 +32,45 @@ endif()
 
 # Tests also exercise product input, logging and protocol adapters.
 set(NINFER_BUILD_PRODUCT_SUPPORT OFF)
-if(NINFER_BUILD_APPS OR BUILD_TESTING)
+if(NINFER_BUILD_ENGINE AND (NINFER_BUILD_APPS OR BUILD_TESTING))
   set(NINFER_BUILD_PRODUCT_SUPPORT ON)
 endif()
 
 include(cmake/Dependencies.cmake)
 include(cmake/NinferTargets.cmake)
+
+# Project binaries share the same libraries and CUDA runtime. These defaults are
+# set after third-party targets so their build policies remain independent.
+set(CMAKE_CUDA_RUNTIME_LIBRARY Shared)
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}/lib")
+set(CMAKE_BUILD_RPATH_USE_ORIGIN ON)
+set(CMAKE_LINK_DEPENDS_NO_SHARED ON)
+
+# Model families to compile. "all" keeps every family. A semicolon list omits the
+# other families (their frontend/execution/session sources and model libs), shrinking
+# the image. qwen3_5 is the anchor family and is always compiled; qwen4_exp and
+# glm5next are optional and only built when named (or via "all").
+set(NINFER_MODEL_FAMILIES "all" CACHE STRING "Model families to build (all; or a ;-list of qwen3_5;qwen4_exp;glm5next)")
+set_property(CACHE NINFER_MODEL_FAMILIES PROPERTY STRINGS all qwen3_5 qwen4_exp glm5next)
+
+set(NINFER_BUILD_MODEL_QWEN3_5 1)
+set(NINFER_BUILD_MODEL_QWEN4_EXP 0)
+set(NINFER_BUILD_MODEL_GLM5NEXT 0)
+if(NINFER_MODEL_FAMILIES STREQUAL "all")
+  set(NINFER_BUILD_MODEL_QWEN4_EXP 1)
+  set(NINFER_BUILD_MODEL_GLM5NEXT 1)
+else()
+  foreach(family IN LISTS NINFER_MODEL_FAMILIES)
+    if(family STREQUAL "qwen4_exp")
+      set(NINFER_BUILD_MODEL_QWEN4_EXP 1)
+    elseif(family STREQUAL "glm5next")
+      set(NINFER_BUILD_MODEL_GLM5NEXT 1)
+    elseif(NOT family STREQUAL "qwen3_5")
+      message(WARNING "NINFER_MODEL_FAMILIES: unknown family '${family}'")
+    endif()
+  endforeach()
+endif()
+message(STATUS "NInfer model families: qwen3_5=on qwen4_exp=${NINFER_BUILD_MODEL_QWEN4_EXP} glm5next=${NINFER_BUILD_MODEL_GLM5NEXT}")
 
 # --- Subdirectories ----------------------------------------------------------
 add_subdirectory(src)

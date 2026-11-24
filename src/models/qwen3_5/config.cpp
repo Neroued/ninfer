@@ -176,7 +176,7 @@ TextConfig text(const Json& value, bool mtp) {
     return out;
 }
 
-VisionConfig vision(const Json& value) {
+qwen::VisionConfig vision(const Json& value) {
     require_members(value,
                     {"model_type", "depth", "hidden_size", "intermediate_size", "num_heads",
                      "patch_size", "temporal_patch_size", "spatial_merge_size",
@@ -186,7 +186,7 @@ VisionConfig vision(const Json& value) {
         value.at("model_type") != "qwen3_5_moe_vision") {
         throw ArtifactError("unknown Vision model_type");
     }
-    VisionConfig out;
+    qwen::VisionConfig out;
     out.depth                   = dimension(value, "depth");
     out.hidden_size             = dimension(value, "hidden_size");
     out.intermediate_size       = dimension(value, "intermediate_size");
@@ -289,16 +289,6 @@ std::uint64_t GdnConfig::conv_channels() const {
                                  value_width(), "GDN convolution channels");
 }
 
-std::uint64_t VisionConfig::patch_width() const {
-    return artifact::checked_mul(artifact::checked_mul(3, temporal_patch_size, "patch channels"),
-                                 std::uint64_t(patch_size) * patch_size, "patch width");
-}
-
-std::uint64_t VisionConfig::merger_width() const {
-    return artifact::checked_mul(std::uint64_t(spatial_merge_size) * spatial_merge_size,
-                                 hidden_size, "merger width");
-}
-
 Config parse_config(const artifact::Directory& directory, const LoadOptions& options) {
     try {
         if (options.purpose != EnginePurpose::Generation &&
@@ -339,6 +329,23 @@ Config parse_config(const artifact::Directory& directory, const LoadOptions& opt
     } catch (const std::exception& error) {
         throw ArtifactError(std::string("Qwen3.5 config: ") + error.what());
     }
+}
+
+ModelSamplingDefaults default_sampling(Architecture architecture) {
+    ModelSamplingDefaults sampling;
+    sampling.thinking     = {.temperature      = 1.0F,
+                             .top_k            = 20,
+                             .top_p            = 0.95F,
+                             .min_p            = 0.0F,
+                             .presence_penalty = architecture == Architecture::Qwen3_5Moe ? 1.5F : 0.0F,
+                             .frequency_penalty = 0.0F};
+    sampling.non_thinking = {.temperature       = 0.7F,
+                             .top_k             = 20,
+                             .top_p             = 0.80F,
+                             .min_p             = 0.0F,
+                             .presence_penalty  = 1.5F,
+                             .frequency_penalty = 0.0F};
+    return sampling;
 }
 
 } // namespace ninfer::models::qwen3_5

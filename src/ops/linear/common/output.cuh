@@ -1,6 +1,7 @@
 #pragma once
 
-#include "ops/common/memory.cuh"
+#include "ops/common/cuda/memory.cuh"
+
 #include <cuda_bf16.h>
 
 #include <cstdint>
@@ -22,7 +23,7 @@ struct LinearBf16Output {
     }
 
     __device__ __forceinline__ void store_vector(int row, int token, uint4 values) const {
-        store_vec(at(row, token), values);
+        common::store_vec(at(row, token), values);
     }
 };
 
@@ -74,7 +75,8 @@ struct LinearBf16SegmentOutput {
     }
 
     __device__ __forceinline__ void store_vector(int row, int token, uint4 values) const {
-        store_vec(data + static_cast<std::int64_t>(token) * rows + row - parent_row_begin, values);
+        common::store_vec(data + static_cast<std::int64_t>(token) * rows + row - parent_row_begin,
+                          values);
     }
 };
 
@@ -129,6 +131,23 @@ __device__ __forceinline__ auto linear_output_tile(Output output, int row_begin)
         return output.template bind_tile<TileRows>(row_begin);
     else
         return output;
+}
+
+// A vector is already the final BF16 result. Output views without a vector store
+// retain their scalar addressing, including strided or split destinations.
+template <class Output>
+__device__ __forceinline__ void linear_store_bf16_vector(Output output, int row, int token,
+                                                         uint4 values) {
+    if constexpr (requires { output.store_vector(row, token, values); }) {
+        output.store_vector(row, token, values);
+    } else {
+        const unsigned words[]{values.x, values.y, values.z, values.w};
+#pragma unroll
+        for (int i = 0; i < 8; ++i)
+            output.store(row + i, token,
+                         __bfloat162float(__ushort_as_bfloat16(
+                             static_cast<unsigned short>(words[i / 2] >> ((i & 1) * 16)))));
+    }
 }
 
 } // namespace ninfer::ops::detail

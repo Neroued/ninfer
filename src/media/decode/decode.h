@@ -67,16 +67,27 @@ struct VideoInfo {
     std::vector<int> indices;
 };
 
-// Exact display geometry without RGB conversion. Image probing decodes the first displayed frame
-// so codec crop and orientation match decode_image(). Video probing walks the selected frame
-// sequence so frame-count, truncation, pixel-budget, crop, and sampling semantics match
-// decode_video(), but it does not materialize RGB frames.
-ImageInfo inspect_image(std::span<const std::uint8_t> bytes, const Policy& policy);
-VideoInfo inspect_video(std::span<const std::uint8_t> bytes, const Policy& policy,
-                        double target_fps, int min_frames, int max_frames);
+struct VideoSource {
+    int total_frames           = 0;
+    double fps                 = 0.0;
+    double duration            = 0.0;
+    std::uint64_t coded_pixels = 0;
+};
 
+// A model selects unique source frames. A truncated tail is permitted only after minimum_frames.
+// Repetition and temporal padding belong to the model processor.
+struct VideoSelection {
+    VideoSource source;
+    std::vector<int> indices;
+    int minimum_frames = 1;
+};
+
+ImageInfo inspect_image(std::span<const std::uint8_t> bytes, const Policy& policy);
+VideoSource probe_video(std::span<const std::uint8_t> bytes, const Policy& policy);
+VideoInfo inspect_video(std::span<const std::uint8_t> bytes, const Policy& policy,
+                        const VideoSelection& selection);
 Image decode_image(std::span<const std::uint8_t> bytes, const Policy& policy);
-Video decode_video(std::span<const std::uint8_t> bytes, const Policy& policy, double target_fps,
-                   int min_frames, int max_frames);
+Video decode_video(std::span<const std::uint8_t> bytes, const Policy& policy,
+                   const VideoSelection& selection);
 
 } // namespace ninfer::media::decode

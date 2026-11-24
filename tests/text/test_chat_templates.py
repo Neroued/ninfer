@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[2]
 RENDERER = ROOT / "build" / "tests" / "ninfer_jinja_test"
 SOURCES = {
     version: (ROOT / "tools" / "chat_templates" / f"{version}.jinja").read_text()
-    for version in ("qwen3_6", "qwen3_8")
+    for version in ("qwen3_6", "qwen3_8", "qwen3_8_flash_next")
 }
 
 
@@ -250,6 +250,41 @@ class ChatTemplates(unittest.TestCase):
                 preserve_thinking=False,
             ),
             dict(messages=[message("system", "no user")], add_generation_prompt=True),
+            dict(
+                messages=[message("user", "hi")],
+                add_generation_prompt=True,
+                reasoning_effort="high",
+            ),
+            dict(
+                messages=[message("user", "hi")],
+                add_generation_prompt=True,
+                reasoning_effort="max",
+            ),
+            dict(
+                messages=[message("user", "hi")],
+                add_generation_prompt=True,
+                reasoning_effort="minimal",
+            ),
+            dict(
+                messages=[message("user", "hi")],
+                add_generation_prompt=True,
+                reasoning_effort="none",
+            ),
+            dict(
+                messages=[message("user", "hi")],
+                add_generation_prompt=True,
+                reasoning_effort="none",
+                enable_thinking=True,
+            ),
+            dict(
+                messages=[
+                    message("user", "code"),
+                    message("assistant", "  def f():\n    "),
+                ],
+                add_generation_prompt=False,
+                continue_final_message=True,
+                enable_thinking=False,
+            ),
         ]
         cases = [(name, context) for name in SOURCES for context in contexts]
         result = subprocess.run(
@@ -277,6 +312,79 @@ class ChatTemplates(unittest.TestCase):
                 else:
                     self.assertTrue(got["ok"], got.get("error"))
                     self.assertEqual(got["text"], expected)
+
+    def test_flash_next_effort_aliases_and_defaults(self):
+        version = "qwen3_8_flash_next"
+        history = [message("user", "question")]
+        for alias, native in (("high", "xhigh"), ("max", "xhigh"), ("minimal", "low")):
+            self.assertEqual(
+                self.render(
+                    version, history, reasoning_effort=alias, add_generation_prompt=True
+                ),
+                self.render(
+                    version,
+                    history,
+                    reasoning_effort=native,
+                    add_generation_prompt=True,
+                ),
+            )
+        self.assertEqual(
+            self.render(
+                version, history, reasoning_effort="none", add_generation_prompt=True
+            ),
+            self.render(
+                version, history, enable_thinking=False, add_generation_prompt=True
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "conflicts"):
+            self.render(version, history, reasoning_effort="none", enable_thinking=True)
+        default = TEMPLATES[version].render(
+            messages=history, add_generation_prompt=True
+        )
+        self.assertIn("Reasoning effort is set to xhigh.", default)
+        self.assertEqual(
+            default,
+            TEMPLATES["qwen3_8"].render(messages=history, add_generation_prompt=True),
+        )
+
+    def test_flash_next_continuation_preserves_whitespace(self):
+        content = "  def f():\n    "
+        text = self.render(
+            "qwen3_8_flash_next",
+            [message("user", "code"), message("assistant", content)],
+            continue_final_message=True,
+            enable_thinking=False,
+        )
+        self.assertEqual(
+            text, "<|im_start|>user\ncode<|im_end|>\n<|im_start|>assistant\n" + content
+        )
+
+    def test_flash_next_generated_history_preserves_prefix(self):
+        version = "qwen3_8_flash_next"
+        user = message("user", "question")
+        for thinking in (False, True):
+            prologue = self.render(
+                version, [user], enable_thinking=thinking, add_generation_prompt=True
+            )
+            reasoning = "reason" if thinking else ""
+            generated = (
+                "reason\n</think>\n\n" if thinking else ""
+            ) + "answer<|im_end|>\n"
+            history = [
+                user,
+                message("assistant", "answer", reasoning_content=reasoning),
+            ]
+            self.assertEqual(
+                self.render(version, history, enable_thinking=thinking),
+                prologue + generated,
+            )
+            self.assertTrue(
+                self.render(
+                    version,
+                    history + [message("user", "next")],
+                    enable_thinking=thinking,
+                ).startswith(prologue + generated)
+            )
 
 
 if __name__ == "__main__":

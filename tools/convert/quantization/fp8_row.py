@@ -1,4 +1,4 @@
-"""Row-wise BF16-to-FP8 quantization with the existing exact rounding boundaries."""
+"""Independent FP8 reduction groups with exact BF16-scale rounding boundaries."""
 
 from __future__ import annotations
 
@@ -107,15 +107,40 @@ def _quantize_host_rows(host: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return codes, scale_words
 
 
-def quantize_bf16_rows(weight: torch.Tensor) -> RowScaledFp8Words:
-    """Quantize BF16 ``[N,K]`` values to E4M3FN codes and BF16 row scales."""
+def quantize_fp32_rows(weight: torch.Tensor) -> RowScaledFp8Words:
+    """Quantize FP32 rows independently to E4M3FN codes and BF16 scales."""
 
-    if weight.dtype != torch.bfloat16 or weight.dim() != 2:
-        raise TypeError("FP8 quantization source must be a rank-two BF16 tensor")
+    if weight.dtype != torch.float32 or weight.dim() != 2:
+        raise TypeError("FP8 quantization source must be a rank-two FP32 tensor")
     if any(dim <= 0 for dim in weight.shape):
         raise ValueError("FP8 quantization source dimensions must be positive")
+    if weight.is_cuda:
+        values = weight.detach()
+        maximum = values.abs().amax(dim=1)
+        zero = maximum == 0
+        scales = (maximum.double() / 448.0).float().bfloat16()
+        scales = torch.where((scales == 0) & ~zero, 2.0**-133, scales)
+        reciprocal = torch.where(~zero, scales.double().reciprocal().float(), 0.0)
+        # FP32 multiplication is the same single rounding as the host's exact
+        # FP64 product of two FP32 operands followed by its FP32 cast.
+        normalized = values * reciprocal[:, None]
+        if not bool(torch.isfinite(normalized).all()):
+            raise ValueError("FP8 quantization source or normalization is not finite")
+        codes = (
+            normalized.clamp(-448.0, 448.0).to(torch.float8_e4m3fn).view(torch.uint8)
+        )
+        codes[zero] = 0
+        return RowScaledFp8Words(codes, scales)
     host = weight.detach().to(device="cpu", dtype=torch.float32).numpy()
     code_words, scale_words = _quantize_host_rows(host)
     codes = torch.from_numpy(code_words.copy())
     signed_scales = torch.from_numpy(scale_words.view(np.int16).copy())
     return RowScaledFp8Words(codes, signed_scales.view(torch.bfloat16))
+
+
+def quantize_bf16_rows(weight: torch.Tensor) -> RowScaledFp8Words:
+    """Quantize BF16 ``[N,K]`` values to E4M3FN codes and BF16 row scales."""
+
+    if weight.dtype != torch.bfloat16 or weight.dim() != 2:
+        raise TypeError("FP8 quantization source must be a rank-two BF16 tensor")
+    return quantize_fp32_rows(weight.float())

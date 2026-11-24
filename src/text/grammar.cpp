@@ -1,0 +1,440 @@
+#include "text/grammar.h"
+#include "text/json_schema.h"
+#include "text/unicode.h"
+
+#include <xgrammar/xgrammar.h>
+#include "fsm_builder.h"
+#include "grammar_functor.h"
+#include "grammar_impl.h"
+#include "json_string_grammar.h"
+#include "regex_converter.h"
+
+#include <algorithm>
+#include <chrono>
+#include <map>
+#include <mutex>
+#include <stdexcept>
+
+namespace ninfer::text {
+namespace {
+class WorkTimer {
+public:
+    WorkTimer(bool enabled, double& seconds) : seconds_(enabled ? &seconds : nullptr) {
+        if (seconds_) started_ = std::chrono::steady_clock::now();
+    }
+
+    ~WorkTimer() {
+        if (seconds_)
+            *seconds_ +=
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - started_).count();
+    }
+private:
+    double* seconds_;
+    std::chrono::steady_clock::time_point started_;
+};
+
+ConstraintCacheAccess cache_access(xgrammar::CompilationCacheAccess access) {
+    switch (access) {
+    case xgrammar::CompilationCacheAccess::kHit:
+        return ConstraintCacheAccess::Hit;
+    case xgrammar::CompilationCacheAccess::kBuilt:
+        return ConstraintCacheAccess::Built;
+    case xgrammar::CompilationCacheAccess::kWaited:
+        return ConstraintCacheAccess::Waited;
+    }
+    throw std::logic_error("invalid compilation cache observation");
+}
+
+void validate_utf8(std::string_view value) {
+    for (std::size_t offset = 0; offset < value.size();) {
+        offset += unicode_internal::utf8_codepoint_at(value, offset, "output constraint").length;
+    }
+}
+
+// Text publication consumes Unicode scalar values, including in negated regex classes.
+class ScalarRegex final : public xgrammar::GrammarMutator {
+    int32_t VisitCharacterClass(const GrammarExpr& expression) final {
+        using Range = xgrammar::GrammarBuilder::CharacterClassElement;
+        std::vector<Range> ranges;
+        const bool negative = expression[0] != 0;
+        for (int i = 1; i < expression.size(); i += 2) {
+            const int lo = expression[i], hi = expression[i + 1];
+            if (negative) {
+                ranges.push_back({lo, hi});
+            } else {
+                if (lo <= 0xd7ff) ranges.push_back({lo, std::min(hi, 0xd7ff)});
+                if (hi >= 0xe000) ranges.push_back({std::max(lo, 0xe000), hi});
+            }
+        }
+        if (negative) ranges.push_back({0xd800, 0xdfff});
+        std::sort(ranges.begin(), ranges.end(),
+                  [](const auto& a, const auto& b) { return a.lower < b.lower; });
+        std::vector<Range> merged;
+        for (const auto& range : ranges) {
+            if (!merged.empty() && range.lower <= merged.back().upper + 1)
+                merged.back().upper = std::max(merged.back().upper, range.upper);
+            else
+                merged.push_back(range);
+        }
+        return builder_->AddCharacterClass(merged, negative);
+    }
+
+    int32_t VisitCharacterClassStar(const GrammarExpr& expression) final {
+        return builder_->AddRepeatFromExpr("scalar", VisitCharacterClass(expression), 0, -1);
+    }
+};
+
+xgrammar::Grammar choice_grammar(const std::vector<std::string>& choices) {
+    if (choices.empty()) throw std::invalid_argument("choice requires at least one string");
+    xgrammar::GrammarBuilder builder;
+    std::vector<int32_t> alternatives;
+    alternatives.reserve(choices.size());
+    for (const auto& value : choices) {
+        validate_utf8(value);
+        alternatives.push_back(builder.AddByteString(value));
+    }
+    return xgrammar::GrammarNormalizer::Apply(
+        builder.Get(builder.AddRuleWithHint("root", builder.AddChoices(alternatives))));
+}
+
+// Consume through the first complete delimiter, including tokens that cross it.
+xgrammar::Grammar reasoning_prefix(std::string_view delimiter) {
+    auto body = xgrammar::GrammarFSMBuilder::TagDispatch({{}, false, {std::string(delimiter)}});
+    if (!body) throw std::logic_error("invalid reasoning delimiter");
+    const auto ends = body->GetEnds();
+    int tail        = body->AddState();
+    for (int end : ends) body->GetFsm().AddEpsilonEdge(end, tail);
+    for (unsigned char byte : delimiter) {
+        const int next = body->AddState();
+        body->GetFsm().AddEdge(tail, next, byte, byte);
+        tail = next;
+    }
+    xgrammar::GrammarBuilder builder;
+    const auto value = xgrammar::AddScalarStringFSM(
+        builder, xgrammar::FSMWithStartEnd(body->GetFsm(), body->GetStart(), {tail}), "reasoning",
+        false);
+    return xgrammar::GrammarNormalizer::Apply(builder.Get(builder.AddRuleWithHint("root", value)));
+}
+
+void validate(const xgrammar::Grammar& grammar, const std::vector<std::string>& vocab,
+              const std::vector<std::int32_t>& eos) {
+    for (int i = 0; i < grammar->NumRules(); ++i) {
+        const auto& rule = grammar->GetRule(i);
+        if (rule.max_tokens >= 0 || rule.max_chars >= 0 || !rule.capture_name.empty() ||
+            rule.is_lazy || rule.temperature || grammar->GetSuffixStopInfo(i)) {
+            throw std::invalid_argument(
+                "GBNF rules cannot set budgets, captures, lazy matching or temperature");
+        }
+    }
+    using Type = xgrammar::Grammar::Impl::GrammarExprType;
+    for (int i = 0; i < grammar->NumGrammarExprs(); ++i) {
+        const auto expression = grammar->GetGrammarExpr(i);
+        if (expression.type == Type::kTagDispatch || expression.type == Type::kTokenTagDispatch ||
+            expression.type == Type::kRegex || expression.type == Type::kByteFSM ||
+            expression.type == Type::kSubstring) {
+            throw std::invalid_argument("grammar uses an extension outside the GBNF contract");
+        }
+        if (expression.type == Type::kToken || expression.type == Type::kExcludeToken) {
+            for (int id : expression) {
+                if (id < 0 || static_cast<std::size_t>(id) >= vocab.size() || vocab[id].empty() ||
+                    std::find(eos.begin(), eos.end(), id) != eos.end()) {
+                    throw std::invalid_argument(
+                        "GBNF token references must name ordinary vocabulary tokens");
+                }
+            }
+        }
+    }
+}
+} // namespace
+
+RequestErrorKind constraint_error_kind(OutputConstraintKind kind) {
+    switch (kind) {
+    case OutputConstraintKind::Grammar:
+        return RequestErrorKind::InvalidGrammar;
+    case OutputConstraintKind::Choice:
+        return RequestErrorKind::InvalidChoice;
+    case OutputConstraintKind::Regex:
+        return RequestErrorKind::InvalidRegex;
+    case OutputConstraintKind::JsonObject:
+    case OutputConstraintKind::JsonSchema:
+        return RequestErrorKind::InvalidJsonSchema;
+    }
+    throw std::invalid_argument("unknown output constraint kind");
+}
+
+class GrammarVocabulary::Impl {
+public:
+    explicit Impl(std::vector<std::string> value) : pieces(std::move(value)) {}
+
+    std::vector<std::string> pieces;
+    mutable std::mutex mutex;
+    mutable std::map<unsigned char, std::vector<std::int32_t>> indexes;
+};
+
+GrammarVocabulary::GrammarVocabulary(std::vector<std::string> pieces)
+    : impl_(std::make_unique<Impl>(std::move(pieces))) {}
+
+GrammarVocabulary::~GrammarVocabulary() = default;
+
+const std::vector<std::string>& GrammarVocabulary::pieces() const noexcept { return impl_->pieces; }
+
+const std::vector<std::int32_t>& GrammarVocabulary::containing(unsigned char byte) const {
+    std::lock_guard lock(impl_->mutex);
+    const auto found = impl_->indexes.find(byte);
+    if (found != impl_->indexes.end()) return found->second;
+    std::vector<std::int32_t> ids;
+    for (std::size_t i = 0; i < impl_->pieces.size(); ++i)
+        if (impl_->pieces[i].find(static_cast<char>(byte)) != std::string::npos)
+            ids.push_back(static_cast<std::int32_t>(i));
+    return impl_->indexes.emplace(byte, std::move(ids)).first->second;
+}
+
+class GrammarCompiler::Impl {
+public:
+    Impl(std::vector<std::string> vocab_, std::vector<std::int32_t> eos_, std::size_t bytes)
+        : vocabulary(std::make_shared<GrammarVocabulary>(std::move(vocab_))),
+          vocab(vocabulary->pieces()), eos(std::move(eos_)),
+          tokenizer(vocab, xgrammar::VocabType::RAW, static_cast<int>(vocab.size()), eos),
+          compiler(tokenizer, 1, true, static_cast<std::int64_t>(bytes)) {}
+
+    std::shared_ptr<const GrammarVocabulary> vocabulary;
+    const std::vector<std::string>& vocab;
+    std::vector<std::int32_t> eos;
+    xgrammar::TokenizerInfo tokenizer;
+    xgrammar::GrammarCompiler compiler;
+};
+
+class GrammarSession::Impl {
+public:
+    Impl(const xgrammar::CompiledGrammar& grammar, int vocab)
+        : matcher(grammar), vocabulary(vocab), words((vocab + 31) / 32) {}
+
+    xgrammar::GrammarMatcher matcher;
+    int vocabulary;
+    std::size_t words;
+    int tentative = 0;
+    ConstraintObservation observed;
+    std::shared_ptr<const GrammarVocabulary> token_bytes;
+    std::unique_ptr<GrammarStateConstraint> state;
+
+    void fill(std::span<std::uint32_t> target) {
+        if (matcher.IsTerminated()) {
+            std::fill(target.begin(), target.end(), 0);
+            return;
+        }
+        std::int64_t shape[] = {1, static_cast<std::int64_t>(words)};
+        DLTensor tensor{target.data(), {kDLCPU, 0}, 2, {kDLInt, 32, 1}, shape, nullptr, 0};
+        matcher.FillNextTokenBitmask(&tensor);
+        if (vocabulary % 32) { target.back() &= (1u << (vocabulary % 32)) - 1u; }
+        if (state) state->filter(target);
+    }
+};
+
+GrammarCompiler::GrammarCompiler(std::vector<std::string> vocab, std::vector<std::int32_t> eos,
+                                 std::size_t bytes)
+    : impl_(std::make_unique<Impl>(std::move(vocab), std::move(eos), bytes)) {}
+
+GrammarCompiler::~GrammarCompiler() = default;
+
+std::shared_ptr<const GrammarVocabulary> GrammarCompiler::vocabulary() const {
+    return impl_->vocabulary;
+}
+
+std::unique_ptr<GrammarSession>
+GrammarCompiler::compile_model(std::string_view identity,
+                               const std::function<xgrammar::Grammar()>& build,
+                               std::string_view close, std::string_view continuation,
+                               std::unique_ptr<GrammarStateConstraint> state) {
+    const std::string key =
+        "model:" + std::to_string(close.size()) + ":" + std::string(close) + std::string(identity);
+    xgrammar::CompilationCacheAccess access;
+    auto compiled = impl_->compiler.CompileCachedGrammar(
+        key,
+        [&] {
+            auto grammar = build();
+            return close.empty() ? grammar
+                                 : xgrammar::Grammar::Concat({reasoning_prefix(close), grammar});
+        },
+        &access);
+    auto session =
+        std::make_unique<GrammarSession::Impl>(compiled, static_cast<int>(impl_->vocab.size()));
+    session->observed.cache = cache_access(access);
+    session->token_bytes    = impl_->vocabulary;
+    session->state          = std::move(state);
+    if (!continuation.empty()) {
+        if (!session->matcher.AcceptString(std::string(continuation)) ||
+            (session->state && !session->state->accept(continuation)))
+            throw RequestError(RequestErrorKind::InvalidToolConstraint,
+                               "assistant continuation is not a prefix of the tool constraint");
+        if (session->state) session->state->confirm();
+    }
+    return std::unique_ptr<GrammarSession>(new GrammarSession(std::move(session)));
+}
+
+std::unique_ptr<GrammarSession> GrammarCompiler::compile(const OutputConstraint& constraint,
+                                                         std::string_view close,
+                                                         std::string_view continuation) {
+    const auto error_kind = constraint_error_kind(constraint.kind);
+    try {
+        auto choices = constraint.choices;
+        if (constraint.kind == OutputConstraintKind::Choice) {
+            if (!constraint.source.empty())
+                throw std::invalid_argument("choice uses literal alternatives, not source text");
+            std::sort(choices.begin(), choices.end());
+            choices.erase(std::unique(choices.begin(), choices.end()), choices.end());
+        } else if (!choices.empty()) {
+            throw std::invalid_argument("literal alternatives require a choice constraint");
+        }
+        std::string key = std::to_string(static_cast<int>(constraint.kind)) + ":" +
+                          std::to_string(close.size()) + ":" + std::string(close) +
+                          constraint.source;
+        for (const auto& value : choices) key += std::to_string(value.size()) + ":" + value;
+        xgrammar::CompilationCacheAccess access;
+        auto compiled = impl_->compiler.CompileCachedGrammar(
+            key,
+            [&] {
+                auto grammar = [&]() -> xgrammar::Grammar {
+                    if (constraint.kind == OutputConstraintKind::Grammar) {
+                        auto parsed = xgrammar::Grammar::FromEBNF(constraint.source, "root");
+                        validate(parsed, impl_->vocab, impl_->eos);
+                        return parsed;
+                    } else if (constraint.kind == OutputConstraintKind::Choice) {
+                        return choice_grammar(choices);
+                    } else if (constraint.kind == OutputConstraintKind::Regex) {
+                        validate_utf8(constraint.source);
+                        return xgrammar::GrammarNormalizer::Apply(
+                            ScalarRegex().Apply(xgrammar::Grammar::FromRegex(
+                                xgrammar::NormalizeRegexPattern(constraint.source, true))));
+                    } else {
+                        return build_json_grammar(constraint);
+                    }
+                }();
+                if (!close.empty())
+                    grammar = xgrammar::Grammar::Concat({reasoning_prefix(close), grammar});
+                return grammar;
+            },
+            &access);
+        auto session =
+            std::make_unique<GrammarSession::Impl>(compiled, static_cast<int>(impl_->vocab.size()));
+        session->observed.cache = cache_access(access);
+        if (!continuation.empty() && !session->matcher.AcceptString(std::string(continuation))) {
+            throw std::invalid_argument("assistant continuation is not a prefix of the grammar");
+        }
+        return std::unique_ptr<GrammarSession>(new GrammarSession(std::move(session)));
+    } catch (const xgrammar::JSONSchemaCompileError& error) {
+        RequestErrorKind kind = RequestErrorKind::InvalidJsonSchema;
+        if (error.kind == xgrammar::SchemaErrorType::kUnsupportedSchema)
+            kind = RequestErrorKind::UnsupportedJsonSchema;
+        else if (error.kind == xgrammar::SchemaErrorType::kUnsatisfiableSchema)
+            kind = RequestErrorKind::UnsatisfiableJsonSchema;
+        throw RequestError(kind,
+                           std::string(error.what()) + " at " +
+                               (error.pointer.empty() ? "/" : error.pointer),
+                           error.pointer);
+    } catch (const xgrammar::LogFatalError& error) {
+        throw RequestError(error_kind, error.what());
+    } catch (const RequestError&) { throw; } catch (const std::invalid_argument& error) {
+        throw RequestError(error_kind, error.what());
+    }
+}
+
+GrammarSession::GrammarSession(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
+
+GrammarSession::~GrammarSession()                                    = default;
+GrammarSession::GrammarSession(GrammarSession&&) noexcept            = default;
+GrammarSession& GrammarSession::operator=(GrammarSession&&) noexcept = default;
+
+std::size_t GrammarSession::mask_words() const noexcept { return impl_->words; }
+
+std::uint32_t GrammarSession::masks(std::span<const std::int32_t> drafts,
+                                    std::span<std::uint32_t> words) {
+    if (drafts.size() >= 32 || impl_->tentative ||
+        words.size() != (drafts.size() + 1) * impl_->words) {
+        throw std::logic_error("invalid grammar lookahead transaction");
+    }
+    WorkTimer timer(impl_->observed.timings_collected, impl_->observed.mask_seconds);
+    int advanced       = 0;
+    bool reachable     = true;
+    std::uint32_t dead = 0;
+    try {
+        for (std::size_t position = 0; position <= drafts.size(); ++position) {
+            auto mask = words.subspan(position * impl_->words, impl_->words);
+            if (reachable && !impl_->matcher.IsTerminated()) {
+                impl_->fill(mask);
+                ++impl_->observed.mask_positions;
+                if (std::all_of(mask.begin(), mask.end(), [](auto word) { return word == 0; })) {
+                    dead |= 1u << position;
+                    reachable = false;
+                    mask[0]   = 1;
+                }
+            } else {
+                std::fill(mask.begin(), mask.end(), 0);
+                mask[0] = 1;
+            }
+            if (position == drafts.size()) { break; }
+            // Rejected proposals are expected; advance only through the allowed token set.
+            const auto draft = drafts[position];
+            if (reachable && !impl_->matcher.IsTerminated() && draft >= 0 &&
+                draft < impl_->vocabulary && (mask[draft / 32] & (1u << (draft % 32))) != 0 &&
+                impl_->matcher.AcceptToken(draft)) {
+                ++advanced;
+                if (impl_->state && !impl_->state->accept(impl_->token_bytes->pieces()[draft]))
+                    throw std::logic_error("grammar state mask admitted an invalid draft");
+            } else {
+                reachable = false;
+            }
+        }
+    } catch (...) {
+        if (advanced) { impl_->matcher.Rollback(advanced); }
+        if (impl_->state) impl_->state->discard();
+        throw;
+    }
+    if (advanced) { impl_->matcher.Rollback(advanced); }
+    if (impl_->state) impl_->state->discard();
+    return dead;
+}
+
+void GrammarSession::accept(std::int32_t token) { accept(std::span(&token, 1)); }
+
+void GrammarSession::accept(std::span<const std::int32_t> tokens) {
+    WorkTimer timer(impl_->observed.timings_collected, impl_->observed.matcher_seconds);
+    for (const auto token : tokens) {
+        if (impl_->matcher.IsTerminated() || !impl_->matcher.AcceptToken(token))
+            throw std::logic_error("selected token violates the request grammar");
+        ++impl_->tentative;
+        if (impl_->state && !impl_->state->accept(impl_->token_bytes->pieces()[token])) {
+            discard();
+            throw std::logic_error("selected token violates the request grammar state");
+        }
+    }
+}
+
+void GrammarSession::observe(bool timings, double prepare_seconds) noexcept {
+    impl_->observed.timings_collected = timings;
+    impl_->observed.prepare_seconds   = timings ? prepare_seconds : 0.0;
+}
+
+void GrammarSession::uploaded(std::size_t bytes) noexcept {
+    impl_->observed.mask_upload_bytes += bytes;
+}
+
+ConstraintObservation GrammarSession::observation() const {
+    if (impl_->tentative) throw std::logic_error("cannot publish tentative grammar state");
+    auto result       = impl_->observed;
+    result.terminated = impl_->matcher.IsTerminated();
+    result.complete   = result.terminated || impl_->matcher.IsCompleted();
+    return result;
+}
+
+void GrammarSession::confirm() noexcept {
+    impl_->tentative = 0;
+    if (impl_->state) impl_->state->confirm();
+}
+
+void GrammarSession::discard() {
+    WorkTimer timer(impl_->observed.timings_collected, impl_->observed.matcher_seconds);
+    if (impl_->tentative) { impl_->matcher.Rollback(impl_->tentative); }
+    impl_->tentative = 0;
+    if (impl_->state) impl_->state->discard();
+}
+} // namespace ninfer::text

@@ -47,6 +47,8 @@ CodepointSpan utf8_codepoint_at(std::string_view text, std::size_t offset,
     if (offset >= text.size()) {
         throw std::out_of_range("UTF-8 codepoint offset exceeds " + std::string(context));
     }
+    const auto first = static_cast<unsigned char>(text[offset]);
+    if (first < 0x80U) { return {first, offset, 1}; }
     utf8proc_int32_t codepoint = 0;
     const utf8proc_ssize_t length =
         utf8proc_iterate(reinterpret_cast<const utf8proc_uint8_t*>(text.data() + offset),
@@ -79,6 +81,9 @@ std::string codepoint_to_utf8(std::int32_t codepoint) {
 }
 
 bool is_letter(std::int32_t codepoint) noexcept {
+    if (static_cast<std::uint32_t>(codepoint) < 0x80U) {
+        return (codepoint >= 'A' && codepoint <= 'Z') || (codepoint >= 'a' && codepoint <= 'z');
+    }
     switch (utf8proc_category(codepoint)) {
     case UTF8PROC_CATEGORY_LU:
     case UTF8PROC_CATEGORY_LL:
@@ -92,6 +97,7 @@ bool is_letter(std::int32_t codepoint) noexcept {
 }
 
 bool is_mark(std::int32_t codepoint) noexcept {
+    if (static_cast<std::uint32_t>(codepoint) < 0x80U) { return false; }
     switch (utf8proc_category(codepoint)) {
     case UTF8PROC_CATEGORY_MN:
     case UTF8PROC_CATEGORY_MC:
@@ -103,6 +109,9 @@ bool is_mark(std::int32_t codepoint) noexcept {
 }
 
 bool is_number(std::int32_t codepoint) noexcept {
+    if (static_cast<std::uint32_t>(codepoint) < 0x80U) {
+        return codepoint >= '0' && codepoint <= '9';
+    }
     switch (utf8proc_category(codepoint)) {
     case UTF8PROC_CATEGORY_ND:
     case UTF8PROC_CATEGORY_NL:
@@ -114,7 +123,8 @@ bool is_number(std::int32_t codepoint) noexcept {
 }
 
 bool is_whitespace(std::int32_t codepoint) noexcept {
-    if (is_ascii_whitespace(codepoint)) { return true; }
+    if (static_cast<std::uint32_t>(codepoint) < 0x80U) { return is_ascii_whitespace(codepoint); }
+    if (codepoint == 0x85) return true; // NEXT LINE is White_Space but has category Cc.
     switch (utf8proc_category(codepoint)) {
     case UTF8PROC_CATEGORY_ZS:
     case UTF8PROC_CATEGORY_ZL:
@@ -123,6 +133,10 @@ bool is_whitespace(std::int32_t codepoint) noexcept {
     default:
         return false;
     }
+}
+
+bool is_python_whitespace(std::int32_t codepoint) noexcept {
+    return (codepoint >= 0x1c && codepoint <= 0x1f) || is_whitespace(codepoint);
 }
 
 } // namespace ninfer::text::unicode_internal

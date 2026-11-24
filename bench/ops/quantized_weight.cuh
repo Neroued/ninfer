@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/buffer.h"
 #include "core/weight.h"
 #include "ninfer_bench_common.h"
 
@@ -172,7 +173,8 @@ inline PackedQuantizedWeight make_row_split_weight(QType qtype, std::int32_t n, 
     }
 
     PackedQuantizedWeight result{
-        DeviceBuffer(static_cast<std::size_t>(payload_bytes)),
+        DeviceBuffer(ninfer::bench::device_context().device(),
+                     static_cast<std::size_t>(payload_bytes)),
         {},
         low_bytes,
         high_offset,
@@ -180,21 +182,22 @@ inline PackedQuantizedWeight make_row_split_weight(QType qtype, std::int32_t n, 
         scale_offset,
         scale_bytes,
     };
-    CUDA_CHECK(cudaMemset(result.storage.p, 0, result.storage.bytes));
+    CUDA_CHECK(cudaMemset(result.storage.data(), 0, result.storage.size()));
     const int bits = qtype == QType::Q4_G64_FP16   ? 4
                      : qtype == QType::Q5_G64_FP16 ? 5
                      : qtype == QType::Q6_G64_FP16 ? 6
                                                    : 8;
     detail::fill_row_split_kernel<<<detail::launch_grid(groups), 256>>>(
-        static_cast<std::uint8_t*>(result.storage.p),
-        high_bytes ? static_cast<std::uint8_t*>(result.storage.p) + high_offset : nullptr,
-        reinterpret_cast<__half*>(static_cast<std::uint8_t*>(result.storage.p) + scale_offset),
+        static_cast<std::uint8_t*>(result.storage.data()),
+        high_bytes ? static_cast<std::uint8_t*>(result.storage.data()) + high_offset : nullptr,
+        reinterpret_cast<__half*>(static_cast<std::uint8_t*>(result.storage.data()) + scale_offset),
         groups, k, padded_k, bits, seed, extent);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 
     Weight& weight          = result.weight;
-    weight.payload          = result.storage.p;
+    weight.device           = result.storage.device();
+    weight.payload          = result.storage.data();
     weight.payload_bytes    = payload_bytes;
     weight.high_plane_bytes = high_bytes;
     weight.qtype            = qtype;
@@ -204,11 +207,11 @@ inline PackedQuantizedWeight make_row_split_weight(QType qtype, std::int32_t n, 
     weight.padded_shape[0]  = n;
     weight.padded_shape[1]  = padded_k;
     weight.ndim             = 2;
-    weight.qdata            = result.storage.p;
-    weight.qhigh            = high_bytes == 0
-                                  ? nullptr
-                                  : static_cast<const std::uint8_t*>(result.storage.p) + result.high_offset;
-    weight.scales      = static_cast<const std::uint8_t*>(result.storage.p) + result.scale_offset;
+    weight.qdata            = result.storage.data();
+    weight.qhigh            = high_bytes == 0 ? nullptr
+                                              : static_cast<const std::uint8_t*>(result.storage.data()) +
+                                         result.high_offset;
+    weight.scales = static_cast<const std::uint8_t*>(result.storage.data()) + result.scale_offset;
     weight.n           = n;
     weight.k           = k;
     weight.group       = geometry.group_size;
@@ -237,7 +240,8 @@ inline PackedQuantizedWeight make_nvfp4_weight(std::int32_t n, std::int32_t k,
     }
 
     PackedQuantizedWeight result{
-        DeviceBuffer(static_cast<std::size_t>(payload_bytes)),
+        DeviceBuffer(ninfer::bench::device_context().device(),
+                     static_cast<std::size_t>(payload_bytes)),
         {},
         code_bytes,
         0,
@@ -245,19 +249,20 @@ inline PackedQuantizedWeight make_nvfp4_weight(std::int32_t n, std::int32_t k,
         scale_offset,
         scale_bytes,
     };
-    CUDA_CHECK(cudaMemset(result.storage.p, 0, result.storage.bytes));
+    CUDA_CHECK(cudaMemset(result.storage.data(), 0, result.storage.size()));
     constexpr float kWeightDivisor = 128.0F;
     detail::fill_nvfp4_weight_kernel<<<detail::launch_grid(code_bytes), 256>>>(
-        static_cast<std::uint8_t*>(result.storage.p),
-        static_cast<std::uint8_t*>(result.storage.p) + scale_offset, elements, k, seed, extent,
+        static_cast<std::uint8_t*>(result.storage.data()),
+        static_cast<std::uint8_t*>(result.storage.data()) + scale_offset, elements, k, seed, extent,
         kWeightDivisor);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
-    CUDA_CHECK(cudaMemcpy(static_cast<std::uint8_t*>(result.storage.p) + divisor_offset,
+    CUDA_CHECK(cudaMemcpy(static_cast<std::uint8_t*>(result.storage.data()) + divisor_offset,
                           &kWeightDivisor, sizeof(kWeightDivisor), cudaMemcpyHostToDevice));
 
     Weight& weight              = result.weight;
-    weight.payload              = result.storage.p;
+    weight.device               = result.storage.device();
+    weight.payload              = result.storage.data();
     weight.payload_bytes        = payload_bytes;
     weight.qtype                = QType::NVFP4;
     weight.layout               = QuantLayout::BlockScaleK16M128x4;
@@ -269,9 +274,9 @@ inline PackedQuantizedWeight make_nvfp4_weight(std::int32_t n, std::int32_t k,
     weight.shape[1]             = k;
     weight.padded_shape[0]      = n;
     weight.padded_shape[1]      = k;
-    weight.qdata                = result.storage.p;
+    weight.qdata                = result.storage.data();
     weight.qhigh                = nullptr;
-    weight.scales               = static_cast<std::uint8_t*>(result.storage.p) + scale_offset;
+    weight.scales               = static_cast<std::uint8_t*>(result.storage.data()) + scale_offset;
     weight.n                    = n;
     weight.k                    = k;
     weight.weight_scale_divisor = kWeightDivisor;
@@ -295,7 +300,8 @@ inline PackedQuantizedWeight make_fp8_weight(std::int32_t n, std::int32_t k,
     }
 
     PackedQuantizedWeight result{
-        DeviceBuffer(static_cast<std::size_t>(payload_bytes)),
+        DeviceBuffer(ninfer::bench::device_context().device(),
+                     static_cast<std::size_t>(payload_bytes)),
         {},
         code_bytes,
         0,
@@ -303,17 +309,18 @@ inline PackedQuantizedWeight make_fp8_weight(std::int32_t n, std::int32_t k,
         scale_offset,
         scale_bytes,
     };
-    CUDA_CHECK(cudaMemset(result.storage.p, 0, result.storage.bytes));
+    CUDA_CHECK(cudaMemset(result.storage.data(), 0, result.storage.size()));
     detail::fill_fp8_weight_kernel<<<detail::launch_grid(code_bytes), 256>>>(
-        static_cast<std::uint8_t*>(result.storage.p),
-        reinterpret_cast<__nv_bfloat16*>(static_cast<std::uint8_t*>(result.storage.p) +
+        static_cast<std::uint8_t*>(result.storage.data()),
+        reinterpret_cast<__nv_bfloat16*>(static_cast<std::uint8_t*>(result.storage.data()) +
                                          scale_offset),
         code_bytes, n, seed, extent);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 
     Weight& weight          = result.weight;
-    weight.payload          = result.storage.p;
+    weight.device           = result.storage.device();
+    weight.payload          = result.storage.data();
     weight.payload_bytes    = payload_bytes;
     weight.high_plane_bytes = 0;
     weight.qtype            = QType::FP8_E4M3FN_ROW_BF16;
@@ -326,9 +333,9 @@ inline PackedQuantizedWeight make_fp8_weight(std::int32_t n, std::int32_t k,
     weight.shape[1]         = k;
     weight.padded_shape[0]  = n;
     weight.padded_shape[1]  = k;
-    weight.qdata            = result.storage.p;
+    weight.qdata            = result.storage.data();
     weight.qhigh            = nullptr;
-    weight.scales           = static_cast<std::uint8_t*>(result.storage.p) + scale_offset;
+    weight.scales           = static_cast<std::uint8_t*>(result.storage.data()) + scale_offset;
     weight.n                = n;
     weight.k                = k;
     weight.scale_ne[0]      = n;

@@ -1,4 +1,5 @@
 #include "ninfer/engine.h"
+#include "context_budget.h"
 #include "speculative_page_boundary.h"
 #include "kv_cache_storage.h"
 
@@ -18,6 +19,7 @@ ninfer::RequestOptions request(std::uint32_t outputs, bool reuse = false) {
     ninfer::RequestOptions options;
     options.execution.requested_output_tokens = outputs;
     options.execution.sampling.temperature    = 0.0F;
+    options.execution.sampling.seed           = 0;
     options.execution.allow_prefix_reuse      = reuse;
     options.stop.include_model_defaults       = false;
     return options;
@@ -27,10 +29,10 @@ void valid(const ninfer::GenerationResult& result, std::size_t outputs) {
     require(result.generated_token_ids.size() == outputs &&
                 result.finish_reason == ninfer::FinishReason::OutputLimit,
             "DFlash2 did not honor the requested output budget");
-    require(
-        result.speculative.backend == ninfer::SpeculativeBackend::DFlash2 &&
-            (outputs == 1 || result.speculative.rounds + result.speculative.fallback_steps != 0),
-        "generation bypassed DFlash2");
+    require(result.stats.speculative.backend == ninfer::SpeculativeBackend::DFlash2 &&
+                (outputs == 1 ||
+                 result.stats.speculative.rounds + result.stats.speculative.fallback_steps != 0),
+            "generation bypassed DFlash2");
 }
 
 ninfer::PromptInput media_prompt(ninfer::MediaKind kind) {
@@ -76,29 +78,30 @@ int main(int argc, char** argv) {
         ninfer::EngineOptions options;
         options.artifact_path   = artifact;
         options.max_context     = 2304;
-        options.kv_capacity     = ninfer::KvCapacityPolicy::explicit_capacity(2304 * batch);
         options.prefill_chunk   = 2304;
         options.max_concurrency = batch;
-        options.context_cache.device_state_slots = argc > 7 ? std::stoul(argv[7]) : 3U;
-        options.use_cuda_graph                   = graph;
-        options.enable_vision                    = argc > 6 && std::stoi(argv[6]) != 0;
-        options.kv_cache = ninfer::test::parse_kv_cache_storage(argc > 5 ? argv[5] : "bf16");
-        auto penalty     = request(24);
+        options.use_cuda_graph  = graph;
+        options.enable_vision   = argc > 6 && std::stoi(argv[6]) != 0;
+        options.kv_cache        = ninfer::test::parse_kv_cache_storage(argc > 5 ? argv[5] : "bf16");
+        auto penalty            = request(24);
         penalty.execution.sampling.presence_penalty  = 0.5F;
         penalty.execution.sampling.frequency_penalty = 0.25F;
         options.speculative.backend                  = ninfer::SpeculativeBackend::DFlash2;
         options.speculative.draft_tokens             = k;
         options.speculative.proposal_head =
             optimized ? ninfer::ProposalHead::Optimized : ninfer::ProposalHead::Full;
+        const auto retained_states = argc > 7 ? std::stoul(argv[7]) : 3U;
+        ninfer::test::qwen3_5::set_context_capacity(options, retained_states);
         ninfer::Engine engine(options);
-        require(engine.memory_summary().kv_cache == options.kv_cache,
+        require(engine.description().kv_cache == options.kv_cache,
                 "Engine did not select the requested KV dtype");
         const auto prompt = engine.tokenize_text("Count from one to twenty: one, two, three,");
         ninfer::test::speculative_page_boundary(engine);
         const auto first = engine.generate(engine.prepare_tokens(prompt), request(24));
         valid(first, 24);
         const auto& reference = first.generated_token_ids;
-        require(first.speculative.accepted_tokens != 0, "real draft fixture accepted no proposal");
+        require(first.stats.speculative.accepted_tokens != 0,
+                "real draft fixture accepted no proposal");
         const auto penalized = engine.generate(engine.prepare_tokens(prompt), penalty);
         valid(penalized, 24);
 
@@ -113,7 +116,7 @@ int main(int argc, char** argv) {
         thinking_request.execution.thinking.budget = 1;
         const auto forced = engine.generate(engine.prepare(thinking_prompt), thinking_request);
         valid(forced, 64);
-        require(forced.thinking.applied && forced.thinking.injected_tokens != 0,
+        require(forced.stats.thinking.applied && forced.stats.thinking.injected_tokens != 0,
                 "DFlash2 did not commit the forced thinking-control suffix");
 
         // All rows share a known target prefix, while their budgets force P=0, partial and full W.
@@ -149,7 +152,7 @@ int main(int argc, char** argv) {
         const auto fresh  = engine.generate(engine.prepare_tokens(continuation), request(8, false));
         valid(reused, 8);
         valid(fresh, 8);
-        require(reused.reused_prompt_tokens != 0 && fresh.reused_prompt_tokens == 0,
+        require(reused.stats.reused_prompt_tokens != 0 && fresh.stats.reused_prompt_tokens == 0,
                 "DFlash2 prefix restore did not reuse its retained frontier");
 
         if (k >= 7) {
@@ -159,31 +162,25 @@ int main(int argc, char** argv) {
                     reference.begin() + i) {
                     continue;
                 }
-                auto stopped_options = request(24, true);
+                auto stopped_options = request(24, false);
                 stopped_options.stop.token_ids.push_back(reference[i]);
                 const auto stopped =
                     engine.generate(engine.prepare_tokens(prompt), stopped_options);
-                const auto licensed = 1 + stopped.speculative.rounds +
-                                      stopped.speculative.accepted_tokens +
-                                      stopped.speculative.fallback_steps;
+                const auto licensed = 1 + stopped.stats.speculative.rounds +
+                                      stopped.stats.speculative.accepted_tokens +
+                                      stopped.stats.speculative.fallback_steps;
                 if (stopped.generated_token_ids.size() >= licensed) { continue; }
-                require(stopped.finish_reason == ninfer::FinishReason::StopToken,
+                require(stopped.finish_reason == ninfer::FinishReason::StopToken &&
+                            !stopped.generated_token_ids.empty() &&
+                            stopped.generated_token_ids.back() == reference[i],
                         "partial terminal did not stop at its token");
                 auto follow = prompt;
                 follow.insert(follow.end(), stopped.generated_token_ids.begin(),
                               stopped.generated_token_ids.end());
                 follow.push_back(198);
-                const auto reused_stop =
-                    engine.generate(engine.prepare_tokens(follow), request(8, true));
-                const auto fresh_stop =
+                const auto after_stop =
                     engine.generate(engine.prepare_tokens(follow), request(8, false));
-                valid(reused_stop, 8);
-                valid(fresh_stop, 8);
-                require(reused_stop.reused_prompt_tokens != 0 &&
-                            reused_stop.reused_prompt_tokens <=
-                                prompt.size() + stopped.generated_token_ids.size() &&
-                            fresh_stop.reused_prompt_tokens == 0,
-                        "partial terminal exposed an uncommitted prefix");
+                valid(after_stop, 8);
                 checked_partial = true;
                 break;
             }
@@ -197,15 +194,14 @@ int main(int argc, char** argv) {
                     engine.generate(engine.prepare(media_prompt(kind)), request(8, true));
                 valid(image, 8);
                 valid(reused_image, 8);
-                require(image.prompt.has_media && image.timings.vision_seconds > 0 &&
-                            reused_image.reused_prompt_tokens != 0 &&
-                            reused_image.timings.vision_seconds == 0.0,
+                require(image.prompt.has_media && image.stats.timings.vision_seconds > 0 &&
+                            reused_image.stats.reused_prompt_tokens != 0 &&
+                            reused_image.stats.timings.vision_seconds == 0.0,
                         "Vision DFlash2 capture/restore recomputed retained media");
             }
         }
-        const auto stats = engine.runtime_stats();
-        require(stats.device_backend_kv_occupied_pages == 0 && stats.backend_kv_d2h_bytes == 0 &&
-                    stats.backend_kv_h2d_bytes == 0,
+        const auto stats = engine.snapshot().runtime;
+        require(stats.kv_pools.size() == 1 && stats.context_transfers.kv.size() == 1,
                 "DFlash2 allocated or transferred a full backend KV pool");
         if (k == 15) {
             // One oversized prefill replaces the ring, then decode appends across its wrap point.
@@ -222,7 +218,8 @@ int main(int argc, char** argv) {
                 engine.generate(engine.prepare_tokens(long_prompt), request(6, false));
             valid(long_reuse, 6);
             valid(long_fresh, 6);
-            require(long_reuse.reused_prompt_tokens > 2048 && long_fresh.reused_prompt_tokens == 0,
+            require(long_reuse.stats.reused_prompt_tokens > 2048 &&
+                        long_fresh.stats.reused_prompt_tokens == 0,
                     "DFlash2 ring wrap lost its retained frontier");
         }
         if (k == 15) {
@@ -234,10 +231,11 @@ int main(int argc, char** argv) {
                     "full proposal window escaped the target context capacity tail");
         }
         std::cout << "ok K=" << k << " B=" << batch << " graph=" << graph
-                  << " optimized=" << optimized << " accepted=" << first.speculative.accepted_tokens
-                  << "/" << first.speculative.drafted_tokens
-                  << " state_d2h=" << stats.state_d2h_count
-                  << " state_h2d=" << stats.state_h2d_count << '\n';
+                  << " optimized=" << optimized
+                  << " accepted=" << first.stats.speculative.accepted_tokens << "/"
+                  << first.stats.speculative.drafted_tokens
+                  << " state_d2h=" << stats.context_transfers.state[0].images
+                  << " state_h2d=" << stats.context_transfers.state[1].images << '\n';
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

@@ -1,4 +1,5 @@
 #include "media/decode/decode.h"
+#include "media/decode/jpeg.h"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -45,6 +46,10 @@ void validate_input(std::span<const std::uint8_t> bytes, const Policy& policy) {
     if (bytes.size() > policy.max_bytes) {
         throw Error(ErrorKind::BudgetExceeded, "media bytes exceed byte limit");
     }
+}
+
+bool is_jpeg(std::span<const std::uint8_t> bytes) {
+    return bytes.size() >= 2 && bytes[0] == 0xff && bytes[1] == 0xd8;
 }
 
 int exif_orientation(std::span<const std::uint8_t> bytes) {
@@ -104,6 +109,49 @@ int exif_orientation(std::span<const std::uint8_t> bytes) {
         marker += 2 + length;
     }
     return 1;
+}
+
+Image apply_orientation(Image image, int orientation) {
+    if (orientation == 1) { return image; }
+    const int width  = image.width;
+    const int height = image.height;
+    const bool swap  = orientation >= 5;
+    Image rotated;
+    rotated.width  = swap ? height : width;
+    rotated.height = swap ? width : height;
+    rotated.rgb.resize(image.rgb.size());
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            int rx = 0;
+            int ry = 0;
+            if (orientation == 2) {
+                rx = width - 1 - x;
+                ry = y;
+            } else if (orientation == 3) {
+                rx = width - 1 - x;
+                ry = height - 1 - y;
+            } else if (orientation == 4) {
+                rx = x;
+                ry = height - 1 - y;
+            } else if (orientation == 5) {
+                rx = y;
+                ry = x;
+            } else if (orientation == 6) {
+                rx = height - 1 - y;
+                ry = x;
+            } else if (orientation == 7) {
+                rx = height - 1 - y;
+                ry = width - 1 - x;
+            } else { // orientation 8
+                rx = y;
+                ry = width - 1 - x;
+            }
+            const std::size_t src = (static_cast<std::size_t>(y) * width + x) * 3;
+            const std::size_t dst = (static_cast<std::size_t>(ry) * rotated.width + rx) * 3;
+            std::copy_n(image.rgb.data() + src, 3, rotated.rgb.data() + dst);
+        }
+    }
+    return rotated;
 }
 
 struct BufferCursor {
@@ -293,9 +341,10 @@ public:
                            (descriptor->flags & AV_PIX_FMT_FLAG_ALPHA) != 0;
         const AVPixelFormat destination_format = alpha ? AV_PIX_FMT_RGBA : AV_PIX_FMT_RGB24;
         AvImageBuffer converted(width, height, destination_format);
+        constexpr int conversion_flags = SWS_BILINEAR | SWS_FULL_CHR_H_INT | SWS_ACCURATE_RND;
         sws_ = sws_getCachedContext(sws_, width, height, static_cast<AVPixelFormat>(frame->format),
-                                    width, height, destination_format, SWS_POINT, nullptr, nullptr,
-                                    nullptr);
+                                    width, height, destination_format, conversion_flags, nullptr,
+                                    nullptr, nullptr);
         if (sws_ == nullptr) { throw std::runtime_error("failed to create media color converter"); }
         const int rows = sws_scale(sws_, frame->data, frame->linesize, 0, height, converted.data(),
                                    converted.linesize());
@@ -325,45 +374,7 @@ public:
                 }
             }
         }
-        if (orientation == 1) { return out; }
-        Image rotated;
-        const bool swap = orientation >= 5;
-        rotated.width   = swap ? height : width;
-        rotated.height  = swap ? width : height;
-        rotated.rgb.resize(out.rgb.size());
-        for (int y = 0; y < height; ++y) {
-            for (int x = 0; x < width; ++x) {
-                int rx = 0;
-                int ry = 0;
-                if (orientation == 2) {
-                    rx = width - 1 - x;
-                    ry = y;
-                } else if (orientation == 3) {
-                    rx = width - 1 - x;
-                    ry = height - 1 - y;
-                } else if (orientation == 4) {
-                    rx = x;
-                    ry = height - 1 - y;
-                } else if (orientation == 5) {
-                    rx = y;
-                    ry = x;
-                } else if (orientation == 6) {
-                    rx = height - 1 - y;
-                    ry = x;
-                } else if (orientation == 7) {
-                    rx = height - 1 - y;
-                    ry = width - 1 - x;
-                } else { // orientation 8
-                    rx = y;
-                    ry = width - 1 - x;
-                }
-                const std::size_t src = (static_cast<std::size_t>(y) * width + x) * 3;
-                const std::size_t dst_index =
-                    (static_cast<std::size_t>(ry) * rotated.width + rx) * 3;
-                std::copy_n(out.rgb.data() + src, 3, rotated.rgb.data() + dst_index);
-            }
-        }
-        return rotated;
+        return apply_orientation(std::move(out), orientation);
     }
 
 private:
@@ -374,7 +385,10 @@ private:
         av_packet_free(&packet_);
         avcodec_free_context(&codec_);
         if (format_ != nullptr) { avformat_close_input(&format_); }
-        if (io_ != nullptr) { avio_context_free(&io_); }
+        if (io_ != nullptr) {
+            av_freep(&io_->buffer);
+            avio_context_free(&io_);
+        }
     }
 
     AVFormatContext* format_ = nullptr;
@@ -450,39 +464,9 @@ int count_frames(std::span<const std::uint8_t> input, const Policy& policy) {
     return count;
 }
 
-std::vector<int> sample_indices(int total, double source_fps, double target_fps, int min_frames,
-                                int max_frames) {
-    if (total <= 0 || source_fps <= 0.0 || target_fps <= 0.0 || min_frames <= 0 ||
-        max_frames < min_frames) {
-        throw std::invalid_argument("invalid video sampling configuration");
-    }
-    int count = static_cast<int>(static_cast<double>(total) / source_fps * target_fps);
-    count     = std::min({std::max(count, min_frames), max_frames, total});
-    std::vector<int> indices(static_cast<std::size_t>(count));
-    if (count == 1) {
-        indices[0] = 0;
-        return indices;
-    }
-    for (int i = 0; i < count; ++i) {
-        const double value                   = static_cast<double>(i) * (total - 1) / (count - 1);
-        indices[static_cast<std::size_t>(i)] = static_cast<int>(std::nearbyint(value));
-    }
-    return indices;
-}
-
-struct VideoPlan {
-    int total_frames   = 0;
-    int minimum_frames = 0;
-    double fps         = 0.0;
-    double duration    = 0.0;
-    int orientation    = 1;
-    std::vector<int> indices;
-};
-
-VideoPlan make_video_plan(std::span<const std::uint8_t> bytes, const Policy& policy,
-                          double target_fps, int min_frames, int max_frames) {
+VideoSource probe_source(std::span<const std::uint8_t> bytes, const Policy& policy) {
     Decoder probe(bytes, policy.max_decoded_pixels);
-    VideoPlan plan;
+    VideoSource plan;
     plan.fps          = fps_of(probe.stream());
     plan.total_frames = probe.stream()->nb_frames > 0 &&
                                 probe.stream()->nb_frames <= std::numeric_limits<int>::max()
@@ -500,16 +484,8 @@ VideoPlan make_video_plan(std::span<const std::uint8_t> bytes, const Policy& pol
     if (plan.total_frames > policy.max_video_source_frames) {
         throw Error(ErrorKind::BudgetExceeded, "video source frame count exceeds processor limit");
     }
-    plan.indices = sample_indices(plan.total_frames, plan.fps, target_fps, min_frames, max_frames);
-    const std::uint64_t coded_pixels =
-        static_cast<std::uint64_t>(std::max(probe.stream()->codecpar->width, 0)) *
-        static_cast<std::uint64_t>(std::max(probe.stream()->codecpar->height, 0));
-    if (coded_pixels != 0 && plan.indices.size() > policy.max_decoded_video_pixels / coded_pixels) {
-        throw Error(ErrorKind::BudgetExceeded,
-                    "sampled source video pixels exceed processor limit");
-    }
-    plan.minimum_frames = std::min(min_frames, plan.total_frames);
-    plan.orientation    = orientation_from_rotation(rotation_of(probe.stream()));
+    plan.coded_pixels = static_cast<std::uint64_t>(std::max(probe.stream()->codecpar->width, 0)) *
+                        static_cast<std::uint64_t>(std::max(probe.stream()->codecpar->height, 0));
     return plan;
 }
 
@@ -520,8 +496,23 @@ struct VideoScan {
 
 template <typename Retain>
 VideoScan scan_video(std::span<const std::uint8_t> bytes, const Policy& policy,
-                     const VideoPlan& plan, Retain&& retain) {
+                     const VideoSelection& plan, Retain&& retain) {
     Decoder decoder(bytes, policy.max_decoded_pixels);
+    if (plan.indices.empty() || plan.minimum_frames < 1 ||
+        static_cast<std::size_t>(plan.minimum_frames) > plan.indices.size())
+        throw std::invalid_argument("video selection requires a nonempty minimum prefix");
+    int previous = -1;
+    for (const auto index : plan.indices) {
+        if (index <= previous || index >= plan.source.total_frames)
+            throw std::invalid_argument(
+                "video selection must contain increasing source frame indices");
+        previous = index;
+    }
+    if (plan.source.coded_pixels &&
+        plan.indices.size() > policy.max_decoded_video_pixels / plan.source.coded_pixels)
+        throw Error(ErrorKind::BudgetExceeded,
+                    "sampled source video pixels exceed processor limit");
+    const auto orientation = orientation_from_rotation(rotation_of(decoder.stream()));
     VideoScan scan;
     std::size_t wanted            = 0;
     int decoded                   = 0;
@@ -530,7 +521,7 @@ VideoScan scan_video(std::span<const std::uint8_t> bytes, const Policy& policy,
         if (policy.checkpoint) { policy.checkpoint(); }
         decoded = index + 1;
         if (wanted < plan.indices.size() && index == plan.indices[wanted]) {
-            const ImageInfo info = frame_info(frame, plan.orientation, policy.max_decoded_pixels);
+            const ImageInfo info       = frame_info(frame, orientation, policy.max_decoded_pixels);
             const std::uint64_t pixels = static_cast<std::uint64_t>(frame->width) *
                                          static_cast<std::uint64_t>(frame->height);
             if (retained_pixels > policy.max_decoded_video_pixels ||
@@ -540,7 +531,7 @@ VideoScan scan_video(std::span<const std::uint8_t> bytes, const Policy& policy,
             }
             retained_pixels += pixels;
             if (wanted == 0) { scan.first_frame = info; }
-            retain(decoder, frame, plan.orientation);
+            retain(decoder, frame, orientation);
             ++wanted;
         }
         return wanted != plan.indices.size();
@@ -562,11 +553,13 @@ VideoScan scan_video(std::span<const std::uint8_t> bytes, const Policy& policy,
 ImageInfo inspect_image(std::span<const std::uint8_t> bytes, const Policy& policy) {
     validate_input(bytes, policy);
     if (policy.checkpoint) { policy.checkpoint(); }
-    Decoder decoder(bytes, policy.max_decoded_pixels);
-    int orientation = exif_orientation(bytes);
-    if (orientation == 1) {
-        orientation = orientation_from_rotation(rotation_of(decoder.stream()));
+    if (is_jpeg(bytes)) {
+        ImageInfo result = detail::inspect_jpeg(bytes, policy);
+        if (exif_orientation(bytes) >= 5) { std::swap(result.width, result.height); }
+        return result;
     }
+    Decoder decoder(bytes, policy.max_decoded_pixels);
+    const int orientation = orientation_from_rotation(rotation_of(decoder.stream()));
     ImageInfo result;
     decoder.frames([&](int index, const AVFrame* frame) {
         if (policy.checkpoint) { policy.checkpoint(); }
@@ -582,32 +575,38 @@ ImageInfo inspect_image(std::span<const std::uint8_t> bytes, const Policy& polic
     return result;
 }
 
-VideoInfo inspect_video(std::span<const std::uint8_t> bytes, const Policy& policy,
-                        double target_fps, int min_frames, int max_frames) {
+VideoSource probe_video(std::span<const std::uint8_t> bytes, const Policy& policy) {
     validate_input(bytes, policy);
-    if (policy.checkpoint) { policy.checkpoint(); }
-    VideoPlan plan       = make_video_plan(bytes, policy, target_fps, min_frames, max_frames);
+    if (policy.checkpoint) policy.checkpoint();
+    return probe_source(bytes, policy);
+}
+
+VideoInfo inspect_video(std::span<const std::uint8_t> bytes, const Policy& policy,
+                        const VideoSelection& plan) {
+    validate_input(bytes, policy);
+    if (policy.checkpoint) policy.checkpoint();
     const VideoScan scan = scan_video(bytes, policy, plan, [](Decoder&, const AVFrame*, int) {});
     VideoInfo out;
     out.width          = scan.first_frame.width;
     out.height         = scan.first_frame.height;
-    out.total_frames   = plan.total_frames;
+    out.total_frames   = plan.source.total_frames;
     out.sampled_frames = scan.sampled_frames;
-    out.fps            = plan.fps;
-    out.duration =
-        plan.duration > 0.0 ? plan.duration : static_cast<double>(plan.total_frames) / plan.fps;
-    out.indices = std::move(plan.indices);
+    out.fps            = plan.source.fps;
+    out.duration       = plan.source.duration > 0.0
+                             ? plan.source.duration
+                             : static_cast<double>(plan.source.total_frames) / plan.source.fps;
+    out.indices.assign(plan.indices.begin(), plan.indices.begin() + scan.sampled_frames);
     return out;
 }
 
 Image decode_image(std::span<const std::uint8_t> bytes, const Policy& policy) {
     validate_input(bytes, policy);
     if (policy.checkpoint) { policy.checkpoint(); }
-    Decoder decoder(bytes, policy.max_decoded_pixels);
-    int orientation = exif_orientation(bytes);
-    if (orientation == 1) {
-        orientation = orientation_from_rotation(rotation_of(decoder.stream()));
+    if (is_jpeg(bytes)) {
+        return apply_orientation(detail::decode_jpeg(bytes, policy), exif_orientation(bytes));
     }
+    Decoder decoder(bytes, policy.max_decoded_pixels);
+    const int orientation = orientation_from_rotation(rotation_of(decoder.stream()));
     Image result;
     decoder.frames([&](int index, const AVFrame* frame) {
         if (policy.checkpoint) { policy.checkpoint(); }
@@ -621,24 +620,24 @@ Image decode_image(std::span<const std::uint8_t> bytes, const Policy& policy) {
     return result;
 }
 
-Video decode_video(std::span<const std::uint8_t> bytes, const Policy& policy, double target_fps,
-                   int min_frames, int max_frames) {
+Video decode_video(std::span<const std::uint8_t> bytes, const Policy& policy,
+                   const VideoSelection& plan) {
     validate_input(bytes, policy);
-    if (policy.checkpoint) { policy.checkpoint(); }
-    VideoPlan plan = make_video_plan(bytes, policy, target_fps, min_frames, max_frames);
+    if (policy.checkpoint) policy.checkpoint();
     Video out;
-    out.total_frames = plan.total_frames;
-    out.fps          = plan.fps;
-    out.duration =
-        plan.duration > 0.0 ? plan.duration : static_cast<double>(plan.total_frames) / plan.fps;
+    out.total_frames = plan.source.total_frames;
+    out.fps          = plan.source.fps;
+    out.duration     = plan.source.duration > 0.0
+                           ? plan.source.duration
+                           : static_cast<double>(plan.source.total_frames) / plan.source.fps;
     out.frames.reserve(plan.indices.size());
     const VideoScan scan = scan_video(
         bytes, policy, plan, [&](Decoder& decoder, const AVFrame* frame, int orientation) {
             out.frames.push_back(decoder.rgb(frame, orientation, true));
         });
-    out.width   = scan.first_frame.width;
-    out.height  = scan.first_frame.height;
-    out.indices = std::move(plan.indices);
+    out.width  = scan.first_frame.width;
+    out.height = scan.first_frame.height;
+    out.indices.assign(plan.indices.begin(), plan.indices.begin() + out.frames.size());
     return out;
 }
 

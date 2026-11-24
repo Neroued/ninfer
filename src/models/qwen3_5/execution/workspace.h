@@ -43,11 +43,6 @@ TextPrefillRoots text_prefill_roots(Allocator& allocator, const TextConfig& conf
     return out;
 }
 
-template <class Allocator>
-Tensor visual_scatter_indices(Allocator& allocator, std::int32_t tokens) {
-    return vector(allocator, DType::I32, tokens);
-}
-
 struct TextAttentionProjectionRoots {
     Tensor hidden;
     Tensor query;
@@ -237,22 +232,6 @@ DFlashContextLayerRoots dflash_context_layer(Allocator& allocator, const TextCon
         matrix(allocator, DType::BF16, dimension(config.attention.key_width()), tokens),
         matrix(allocator, DType::BF16, dimension(config.attention.key_width()), tokens),
         matrix(allocator, DType::BF16, dimension(config.attention.key_width()), tokens),
-    };
-}
-
-struct DFlashProposalRoots {
-    Tensor ids;
-    Tensor positions;
-    Tensor residual;
-};
-
-template <class Allocator>
-DFlashProposalRoots dflash_proposal(Allocator& allocator, const TextConfig& target,
-                                    const DraftConfig& config, std::int32_t tokens) {
-    return {
-        vector(allocator, DType::I32, tokens),
-        vector(allocator, DType::I32, tokens),
-        matrix(allocator, DType::BF16, dimension(target.hidden_size), tokens),
     };
 }
 

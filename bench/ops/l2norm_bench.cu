@@ -4,7 +4,8 @@
 // Narrow one-case profiling example:
 //   ./ninfer_l2norm_bench --tokens 1024
 #include "ninfer/ops/l2norm.h"
-#include "ninfer_bench_common.h"
+#include "core/buffer.h"
+#include "op_measurement.cuh"
 
 #include <cuda_bf16.h>
 
@@ -17,52 +18,27 @@ using namespace ninfer::bench;
 
 namespace {
 
-template <int Block>
-__global__ void l2norm_payload_control(const __nv_bfloat162* x, __nv_bfloat162* out, int d,
-                                       std::int64_t rows) {
-    constexpr int kWarpsPerBlock = Block / 32;
-    const int lane               = static_cast<int>(threadIdx.x) & 31;
-    const int warp               = static_cast<int>(threadIdx.x) >> 5;
-    const std::int64_t row       = static_cast<std::int64_t>(blockIdx.x) * kWarpsPerBlock + warp;
-    if (row >= rows) { return; }
-    const int pairs             = d / 2;
-    const std::int64_t row_base = row * static_cast<std::int64_t>(pairs);
-    for (int pair = lane; pair < pairs; pair += 32) { out[row_base + pair] = x[row_base + pair]; }
-}
-
-void run(int d, int heads, int tokens, bool control) {
+void run(int d, int heads, int tokens) {
     const int rows   = heads * tokens;
     const auto n     = static_cast<std::size_t>(d) * static_cast<std::size_t>(rows);
     DeviceBuffer x   = make_bf16(n, 101U);
     DeviceBuffer out = make_zeros(n * 2);
 
-    Tensor tx(x.p, DType::BF16, {d, heads, tokens});
-    Tensor tout(out.p, DType::BF16, {d, heads, tokens});
+    Tensor tx(x.span(), DType::BF16, {d, heads, tokens});
+    Tensor tout(out.span(), DType::BF16, {d, heads, tokens});
 
-    const double bytes  = 2.0 * static_cast<double>(n) * 2.0;
-    const Result result = bench_loop(
-        [&](cudaStream_t stream) {
-            if (control) {
-                constexpr int block = 512;
-                const unsigned grid = static_cast<unsigned>((rows + block / 32 - 1) / (block / 32));
-                l2norm_payload_control<block>
-                    <<<grid, block, 0, stream>>>(static_cast<const __nv_bfloat162*>(x.p),
-                                                 static_cast<__nv_bfloat162*>(out.p), d, rows);
-            } else {
-                ops::l2norm(tx, 1.0e-6f, tout, stream);
-            }
-        },
-        bytes);
+    const double bytes = 2.0 * static_cast<double>(n) * 2.0;
+    const Result result =
+        bench_loop([&](CudaExecutionView cuda) { ops::l2norm(tx, 1.0e-6f, tout, cuda); }, bytes);
 
     char tag[80];
-    std::snprintf(tag, sizeof(tag), "%s T=%-4d [D=%d,heads=%d]", control ? "control" : "l2norm",
-                  tokens, d, heads);
+    std::snprintf(tag, sizeof(tag), "l2norm T=%-4d [D=%d,heads=%d]", tokens, d, heads);
     print_result(tag, result);
 }
 
 } // namespace
 
-int main(int argc, char** argv) {
+int main(int argc, char** argv) try {
     int device_count = 0;
     if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
         std::printf("SKIP: no usable CUDA device\n");
@@ -74,24 +50,21 @@ int main(int argc, char** argv) {
     int selected_tokens = 0;
     bool decode         = false;
     bool prefill        = false;
-    bool control        = false;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--d") && i + 1 < argc) {
-            d = std::atoi(argv[++i]);
+            d = measurement::integer(argv[++i]);
         } else if (!std::strcmp(argv[i], "--heads") && i + 1 < argc) {
-            heads = std::atoi(argv[++i]);
+            heads = measurement::integer(argv[++i]);
         } else if (!std::strcmp(argv[i], "--tokens") && i + 1 < argc) {
-            selected_tokens = std::atoi(argv[++i]);
+            selected_tokens = measurement::integer(argv[++i], 0);
         } else if (!std::strcmp(argv[i], "--decode")) {
             decode = true;
         } else if (!std::strcmp(argv[i], "--prefill")) {
             prefill = true;
-        } else if (!std::strcmp(argv[i], "--control")) {
-            control = true;
         } else {
             std::fprintf(stderr,
                          "usage: %s [--decode] [--prefill] [--tokens T] "
-                         "[--d D] [--heads H] [--control]\n",
+                         "[--d D] [--heads H]\n",
                          argv[0]);
             return 2;
         }
@@ -102,13 +75,17 @@ int main(int argc, char** argv) {
     }
 
     if (selected_tokens > 0) {
-        run(d, heads, selected_tokens, control);
+        run(d, heads, selected_tokens);
         return 0;
     }
     if (!decode && !prefill) { decode = prefill = true; }
     if (decode) {
-        for (int tokens = 1; tokens <= 6; ++tokens) { run(d, heads, tokens, control); }
+        for (int tokens = 1; tokens <= 6; ++tokens) { run(d, heads, tokens); }
     }
-    if (prefill) { run(d, heads, 1024, control); }
+    if (prefill) { run(d, heads, 1024); }
     return 0;
+} catch (const std::exception& error) {
+
+    std::fprintf(stderr, "ninfer_l2norm_bench: %s\n", error.what());
+    return 2;
 }

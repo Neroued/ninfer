@@ -1,5 +1,5 @@
 #pragma once
-#include "ops/softmax_attention/dense/causal_cache/nvfp4/schedule.cuh"
+#include "ops/softmax_attention/kernels/causal/nvfp4/schedule.cuh"
 
 namespace ninfer::ops::detail {
 template <class G, int Tokens>

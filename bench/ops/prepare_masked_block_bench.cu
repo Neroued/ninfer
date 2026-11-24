@@ -1,6 +1,8 @@
 // Public-Op benchmark for the exact anchor-and-mask block transform.
 
-#include "ninfer/ops/prepare_masked_block.h"
+#include "common/roofline.h"
+#include "ninfer/ops/sequence.h"
+#include "core/buffer.h"
 
 #include "core/device.h"
 #include "ninfer_bench_common.h"
@@ -25,7 +27,6 @@ namespace {
 
 constexpr std::int32_t kMaskId    = 248077;
 constexpr std::size_t kFlushBytes = std::size_t{256} << 20;
-constexpr double kRtx5090DramGBs  = 1792.0;
 
 enum class Execution : std::uint8_t { Eager, Graph, Both };
 enum class CacheMode : std::uint8_t { Cold, Warm, Both };
@@ -143,25 +144,30 @@ Options parse_options(int argc, char** argv) {
 class Case {
 public:
     explicit Case(std::int32_t block_size)
-        : block_size_(block_size), anchor_(sizeof(std::int32_t)), length_(sizeof(std::int32_t)),
-          valid_(sizeof(std::int32_t)),
-          ids_(static_cast<std::size_t>(block_size) * sizeof(std::int32_t)),
-          positions_(static_cast<std::size_t>(block_size) * sizeof(std::int32_t)),
-          anchor_tensor_(anchor_.p, DType::I32, {1}), length_tensor_(length_.p, DType::I32, {1}),
-          valid_tensor_(valid_.p, DType::I32, {1}),
-          ids_tensor_(ids_.p, DType::I32, {block_size, 1}),
-          positions_tensor_(positions_.p, DType::I32, {block_size, 1}) {
+        : block_size_(block_size),
+          anchor_(ninfer::bench::device_context().device(), sizeof(std::int32_t)),
+          length_(ninfer::bench::device_context().device(), sizeof(std::int32_t)),
+          valid_(ninfer::bench::device_context().device(), sizeof(std::int32_t)),
+          ids_(ninfer::bench::device_context().device(),
+               static_cast<std::size_t>(block_size) * sizeof(std::int32_t)),
+          positions_(ninfer::bench::device_context().device(),
+                     static_cast<std::size_t>(block_size) * sizeof(std::int32_t)),
+          anchor_tensor_(anchor_.span(), DType::I32, {1}),
+          length_tensor_(length_.span(), DType::I32, {1}),
+          valid_tensor_(valid_.span(), DType::I32, {1}),
+          ids_tensor_(ids_.span(), DType::I32, {block_size, 1}),
+          positions_tensor_(positions_.span(), DType::I32, {block_size, 1}) {
         const std::int32_t anchor = 42;
         const std::int32_t length = 4096;
         const std::int32_t valid  = block_size;
-        CUDA_CHECK(cudaMemcpy(anchor_.p, &anchor, sizeof(anchor), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(length_.p, &length, sizeof(length), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(valid_.p, &valid, sizeof(valid), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(anchor_.data(), &anchor, sizeof(anchor), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(length_.data(), &length, sizeof(length), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(valid_.data(), &valid, sizeof(valid), cudaMemcpyHostToDevice));
     }
 
-    void launch(cudaStream_t stream) {
+    void launch(CudaExecutionView cuda) {
         ops::prepare_masked_block(anchor_tensor_, length_tensor_, valid_tensor_, kMaskId,
-                                  ids_tensor_, positions_tensor_, stream);
+                                  ids_tensor_, positions_tensor_, cuda);
     }
 
 private:
@@ -186,16 +192,16 @@ const char* cache_name(CacheState cache) { return cache == CacheState::Cold ? "c
 
 bench::ColdTiming measure(Case& data, Execution execution, CacheState cache,
                           bench::TimedGraph* graph, bench::L2FlushBuffer& flush,
-                          cudaStream_t stream, int warmup, int repeat) {
+                          CudaExecutionView cuda, int warmup, int repeat) {
     if (execution == Execution::Eager) {
-        const auto launch = [&](cudaStream_t launch_stream) { data.launch(launch_stream); };
+        const auto launch = [&](CudaExecutionView cuda) { data.launch(cuda); };
         return cache == CacheState::Cold
-                   ? bench::measure_cold_launch(launch, flush, stream, warmup, repeat)
-                   : bench::measure_launch(launch, stream, warmup, repeat);
+                   ? bench::measure_cold_launch(launch, flush, cuda, warmup, repeat)
+                   : bench::measure_launch(launch, cuda, warmup, repeat);
     }
     return cache == CacheState::Cold
-               ? bench::measure_cold_graph(*graph, flush, stream, warmup, repeat)
-               : bench::measure_graph(*graph, stream, warmup, repeat);
+               ? bench::measure_cold_graph(*graph, flush, cuda, warmup, repeat)
+               : bench::measure_graph(*graph, cuda, warmup, repeat);
 }
 
 void report(const Result& result) {
@@ -206,7 +212,7 @@ void report(const Result& result) {
                 "(%7.4f%% of %.0f)\n",
                 execution_name(result.execution), cache_name(result.cache), result.block_size,
                 result.timing.median_us, result.timing.min_us, result.timing.p95_us, gbps,
-                gbps / kRtx5090DramGBs * 100.0, kRtx5090DramGBs);
+                gbps / bench::kRoofline.memory_gbs * 100.0, bench::kRoofline.memory_gbs);
 }
 
 void write_csv(const Options& options, const std::vector<Result>& results) {
@@ -224,21 +230,23 @@ void write_csv(const Options& options, const std::vector<Result>& results) {
     }
 }
 
-void profile(Case& data, const Options& options, bench::L2FlushBuffer& flush, cudaStream_t stream) {
+void profile(Case& data, const Options& options, bench::L2FlushBuffer& flush,
+             CudaExecutionView cuda) {
+    const auto stream         = cuda.stream();
     const Execution execution = options.execution;
     const CacheState cache = options.cache == CacheMode::Cold ? CacheState::Cold : CacheState::Warm;
     bench::TimedGraph graph;
     if (execution == Execution::Graph) {
-        data.launch(stream);
+        data.launch(cuda);
         CUDA_CHECK(cudaStreamSynchronize(stream));
-        graph.capture(stream, [&](cudaStream_t launch_stream) { data.launch(launch_stream); });
-        for (int index = 0; index < options.warmup; ++index) { graph.launch(stream); }
+        graph.capture(cuda, [&](CudaExecutionView cuda) { data.launch(cuda); });
+        for (int index = 0; index < options.warmup; ++index) { graph.launch(cuda); }
     } else {
-        for (int index = 0; index < options.warmup; ++index) { data.launch(stream); }
+        for (int index = 0; index < options.warmup; ++index) { data.launch(cuda); }
     }
     CUDA_CHECK(cudaStreamSynchronize(stream));
     if (cache == CacheState::Cold) {
-        bench::flush_l2(flush, stream);
+        bench::flush_l2(flush, cuda);
         CUDA_CHECK(cudaStreamSynchronize(stream));
     }
     std::printf("PROFILE entry=prepare_masked_block dispatch=public execution=%s cache=%s\n",
@@ -246,9 +254,9 @@ void profile(Case& data, const Options& options, bench::L2FlushBuffer& flush, cu
     std::fflush(stdout);
     CUDA_CHECK(cudaProfilerStart());
     if (execution == Execution::Graph)
-        graph.launch(stream);
+        graph.launch(cuda);
     else
-        data.launch(stream);
+        data.launch(cuda);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     CUDA_CHECK(cudaProfilerStop());
 }
@@ -265,11 +273,12 @@ int main(int argc, char** argv) {
         const Options options = parse_options(argc, argv);
         cudaStream_t stream   = nullptr;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        const auto cuda = ninfer::bench::device_context().execution_view(stream);
         bench::L2FlushBuffer flush(kFlushBytes);
 
         if (options.profile) {
             Case data(options.block_sizes.front());
-            profile(data, options, flush, stream);
+            profile(data, options, flush, cuda);
             CUDA_CHECK(cudaStreamDestroy(stream));
             return 0;
         }
@@ -279,10 +288,9 @@ int main(int argc, char** argv) {
             Case data(block_size);
             bench::TimedGraph graph;
             if (options.execution != Execution::Eager) {
-                data.launch(stream);
+                data.launch(cuda);
                 CUDA_CHECK(cudaStreamSynchronize(stream));
-                graph.capture(stream,
-                              [&](cudaStream_t launch_stream) { data.launch(launch_stream); });
+                graph.capture(cuda, [&](CudaExecutionView cuda) { data.launch(cuda); });
             }
             for (const Execution execution : {Execution::Eager, Execution::Graph}) {
                 if ((options.execution == Execution::Eager && execution != Execution::Eager) ||
@@ -296,7 +304,7 @@ int main(int argc, char** argv) {
                     }
                     Result result{block_size, execution, cache,
                                   static_cast<double>(2 + 2 * block_size) * sizeof(std::int32_t),
-                                  measure(data, execution, cache, &graph, flush, stream,
+                                  measure(data, execution, cache, &graph, flush, cuda,
                                           options.warmup, options.repeat)};
                     report(result);
                     results.push_back(result);

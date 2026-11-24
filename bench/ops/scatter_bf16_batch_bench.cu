@@ -1,5 +1,6 @@
 // Measures five public feature-slice captures into a strided lane-owned pool.
-#include "ninfer/ops/scatter.h"
+#include "ninfer/ops/indexing.h"
+#include "core/buffer.h"
 #include "core/device.h"
 #include "ninfer_bench_common.h"
 
@@ -104,15 +105,20 @@ __global__ void initialize_bits(unsigned* values, std::size_t n, unsigned salt) 
 }
 
 struct Case {
-    DeviceBuffer source, lanes, valid, destination;
+    DeviceBuffer source;
+    DeviceBuffer lanes;
+    DeviceBuffer valid;
+    DeviceBuffer destination;
     Tensor l, v;
     std::array<Tensor, 5> x, y;
     std::size_t live = 0;
 
     Case(int d, int w, int b, const std::string& mode)
-        : source(std::size_t(5) * d * w * b * 2), lanes(b * 4), valid(b * 4),
-          destination(std::size_t(5) * d * w * 8 * 2), l(lanes.p, DType::I32, {b}),
-          v(valid.p, DType::I32, {b}) {
+        : source(ninfer::bench::device_context().device(), std::size_t(5) * d * w * b * 2),
+          lanes(ninfer::bench::device_context().device(), b * 4),
+          valid(ninfer::bench::device_context().device(), b * 4),
+          destination(bench::make_buffer(std::size_t(5) * d * w * 8 * 2)),
+          l(lanes.span(), DType::I32, {b}), v(valid.span(), DType::I32, {b}) {
         constexpr int order[]{7, 0, 4, 2, 6, 1, 5, 3};
         std::vector<int> hl(b), hv(b);
         for (int i = 0; i < b; ++i) {
@@ -126,28 +132,28 @@ struct Case {
                                      : 0;
             live += hv[i];
         }
-        CUDA_CHECK(cudaMemcpy(lanes.p, hl.data(), b * 4, cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(valid.p, hv.data(), b * 4, cudaMemcpyHostToDevice));
-        initialize_bits<<<(source.bytes / 4 + 255) / 256, 256>>>(static_cast<unsigned*>(source.p),
-                                                                 source.bytes / 4, 12345);
-        initialize_bits<<<(destination.bytes / 4 + 255) / 256, 256>>>(
-            static_cast<unsigned*>(destination.p), destination.bytes / 4, 91357);
+        CUDA_CHECK(cudaMemcpy(lanes.data(), hl.data(), b * 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(valid.data(), hv.data(), b * 4, cudaMemcpyHostToDevice));
+        initialize_bits<<<(source.size() / 4 + 255) / 256, 256>>>(
+            static_cast<unsigned*>(source.data()), source.size() / 4, 12345);
+        initialize_bits<<<(destination.size() / 4 + 255) / 256, 256>>>(
+            static_cast<unsigned*>(destination.data()), destination.size() / 4, 91357);
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
         for (int slice = 0; slice < 5; ++slice) {
-            x[slice] = Tensor(static_cast<char*>(source.p) + std::size_t(slice) * d * w * b * 2,
+            x[slice] = Tensor(source.span().subspan(std::size_t(slice) * d * w * b * 2),
                               DType::BF16, {d, w, b});
-            y[slice] =
-                Tensor(static_cast<char*>(destination.p) + slice * d * 2, DType::BF16, {d, w, 8});
+            y[slice] = Tensor(destination.span().subspan(std::size_t(slice) * d * 2), DType::BF16,
+                              {d, w, 8});
             y[slice].nb[1] = std::int64_t(5) * d * 2;
             y[slice].nb[2] = std::int64_t(5) * d * w * 2;
             y[slice].nb[3] = std::int64_t(5) * d * w * 8 * 2;
         }
     }
 
-    void launch(cudaStream_t stream) {
+    void launch(CudaExecutionView cuda) {
         for (int slice = 0; slice < 5; ++slice)
-            ops::scatter_bf16_batch(x[slice], l, v, y[slice], stream);
+            ops::scatter_bf16_batch(x[slice], l, v, y[slice], cuda);
     }
 };
 } // namespace
@@ -158,7 +164,7 @@ int main(int argc, char** argv) {
         int devices     = 0;
         CUDA_CHECK(cudaGetDeviceCount(&devices));
         if (!devices) return 77;
-        DeviceContext device;
+        auto& device = ninfer::bench::device_context();
         bench::L2FlushBuffer flush(std::size_t{256} << 20);
         std::ofstream csv;
         if (!o.csv.empty()) {
@@ -175,42 +181,44 @@ int main(int argc, char** argv) {
                 Case data(o.rows, w, b, o.counts);
                 bench::TimedGraph graph;
                 if (o.execution == "graph") {
-                    data.launch(device.stream);
-                    CUDA_CHECK(cudaStreamSynchronize(device.stream));
-                    graph.capture(device.stream, [&](cudaStream_t stream) {
-                        for (int call = 0; call < o.graph_calls; ++call) data.launch(stream);
+                    data.launch(device.execution_view());
+                    CUDA_CHECK(cudaStreamSynchronize(device.stream()));
+                    graph.capture(device.execution_view(), [&](CudaExecutionView cuda) {
+                        for (int call = 0; call < o.graph_calls; ++call) data.launch(cuda);
                     });
                 }
-                const auto launch = [&](cudaStream_t stream) { data.launch(stream); };
+                const auto launch = [&](CudaExecutionView cuda) { data.launch(cuda); };
                 if (o.profile) {
                     for (int i = 0; i < o.warmup; ++i) {
                         if (o.execution == "graph")
-                            graph.launch(device.stream);
+                            graph.launch(device.execution_view());
                         else
-                            data.launch(device.stream);
+                            data.launch(device.execution_view());
                     }
-                    if (o.cache == "cold") bench::flush_l2(flush, device.stream);
-                    CUDA_CHECK(cudaStreamSynchronize(device.stream));
+                    if (o.cache == "cold") bench::flush_l2(flush, device.execution_view());
+                    CUDA_CHECK(cudaStreamSynchronize(device.stream()));
                     CUDA_CHECK(cudaProfilerStart());
                     if (o.execution == "graph")
-                        graph.launch(device.stream);
+                        graph.launch(device.execution_view());
                     else
-                        data.launch(device.stream);
-                    CUDA_CHECK(cudaStreamSynchronize(device.stream));
+                        data.launch(device.execution_view());
+                    CUDA_CHECK(cudaStreamSynchronize(device.stream()));
                     CUDA_CHECK(cudaProfilerStop());
                     return 0;
                 }
                 bench::ColdTiming time;
                 if (o.execution == "graph")
                     time = o.cache == "cold"
-                               ? bench::measure_cold_graph(graph, flush, device.stream, o.warmup,
-                                                           o.repeat)
-                               : bench::measure_graph(graph, device.stream, o.warmup, o.repeat);
+                               ? bench::measure_cold_graph(graph, flush, device.execution_view(),
+                                                           o.warmup, o.repeat)
+                               : bench::measure_graph(graph, device.execution_view(), o.warmup,
+                                                      o.repeat);
                 else
                     time = o.cache == "cold"
-                               ? bench::measure_cold_launch(launch, flush, device.stream, o.warmup,
-                                                            o.repeat)
-                               : bench::measure_launch(launch, device.stream, o.warmup, o.repeat);
+                               ? bench::measure_cold_launch(launch, flush, device.execution_view(),
+                                                            o.warmup, o.repeat)
+                               : bench::measure_launch(launch, device.execution_view(), o.warmup,
+                                                       o.repeat);
                 time.median_us /= o.graph_calls;
                 time.min_us /= o.graph_calls;
                 time.p95_us /= o.graph_calls;

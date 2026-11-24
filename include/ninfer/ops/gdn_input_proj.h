@@ -1,240 +1,127 @@
 #pragma once
 
-// ninfer::ops - fused GDN Q/K/V/Z input projections.
-
-#include "core/weight.h"
 #include "core/arena.h"
+#include "core/device.h"
+#include "core/record_view.h"
 #include "core/tensor.h"
-#include "ninfer/ops/linear.h"
-
-#include <cuda_runtime.h>
+#include "ninfer/ops/projection_weights.h"
 
 #include <cstddef>
 #include <cstdint>
 
 namespace ninfer::ops {
 
-/**
- * Op: gdn_input_proj
- *
- * Math / indexing:
- *   qkv[:,t] = concat(qk_weight * x[:,t], value_z_weight[0:6144,:] * x[:,t])
- *   z[:,t]   = value_z_weight[6144:12288,:] * x[:,t]
- *
- * Logical shapes:
- *   x [5120,T], qk weight/output rows 4096, value/z rows 6144 each, qkv [10240,T],
- *   z [6144,T]. T may be any positive value. x, qkv, and z are contiguous BF16.
- *   qk_weight is Q4_G64_FP16 RowSplit [4096,5120] and value_z_weight is one
- *   Q5_G64_FP16 RowSplit parent [12288,5120] in [value,z] row order, both with FP16 scales.
- *
- * Numeric:
- *   The oracle exact-decodes both weight parents and evaluates all four logical projections
- *   naively in FP64 from the represented input. The BF16 qkv and z outputs are promoted and
- *   compared directly with those ideal values; final output storage rounding belongs to
- *   GdnInputProj's named A16 criterion, not the oracle. Production routes may choose their
- *   private precision independently; every registered route writes both final allocations.
- *
- * Effects:
- *   Writes the full qkv and z outputs; inputs and outputs must not alias.
- *
- * Workspace:
- *   No transient bytes are required.
- */
-void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
-                    Tensor& qkv, Tensor& z, cudaStream_t stream);
+struct GdnConvOutputs {
+    Tensor query, key, value, z;
+};
 
-/**
- * Single-parent GDN projection. Registered parent forms are:
- *
- * - Q8_G32_FP16 RowSplit [12288,2048], with stored row counts [2048,2048,4096,4096];
- * - NVFP4 BlockScaleK16M128x4 [16384,5120], with stored row counts [2048,2048,6144,6144].
- * - FP8_E4M3FN_ROW_BF16 RowScale [16384,5120], with stored row counts
- *   [2048,2048,6144,6144].
- *
- * The first three ranges are written contiguously to qkv and the final range is written to z.
- * Q8 uses A16 under every policy. NVFP4 uses A16 under A16Only/AllowA8; AllowA4 permits
- * private activation quantization at every positive T. FP8 accepts all policies; AllowA8/AllowA4
- * selects A16 through T=7 and private activation quantization followed by A8 Tensor Core
- * contraction at every T>=8. Every route writes the two independent final allocations directly.
- * The complete projection is evaluated against the same exact-decode/naive-FP64 oracle;
- * activation quantization and the production reduction profile are private effects covered by the
- * selected criterion. x, both persistent weight planes, qkv, z, and the live workspace must be
- * mutually non-overlapping.
- *
- * The policy-bearing form uses caller-owned call-scoped transient storage sized by
- * gdn_input_proj_workspace_capacity_bytes(). A16 requires zero bytes. The convenience overload
- * selects A16Only and requires no transient workspace.
- */
-[[nodiscard]] std::size_t
-gdn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int32_t parent_rows,
-                                        std::int32_t input_rows, LinearPolicy policy,
-                                        std::int32_t min_tokens, std::int32_t max_tokens);
+struct GdnConvSnapshotState {
+    ConstStateFieldView source; // Read-only BF16 [C,3] field selected by device I64 byte offsets.
+    Tensor snapshots;           // Contiguous BF16 [C,3,N] temporary histories.
+    Tensor snapshot_bases;      // Read-only device I32 [B], reserves [base,base+T).
+};
 
-void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Tensor& qkv, Tensor& z,
-                    LinearPolicy policy, WorkspaceArena& workspace, cudaStream_t stream);
-
-/**
- * Applies the A16-only single-parent GDN projection without transient workspace.
- */
-void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Tensor& qkv, Tensor& z,
-                    cudaStream_t stream);
-
-/**
- * Returns the transient capacity required by the registered two-parent Q4/Q5 or single-parent Q8
- * snapshot profile. `batch_size` is exact and the query covers every W in the inclusive width
- * interval. B=1 preserves the format-specific fused/composed resolver. B=2..8 uses aggregate
- * projection plus one BF16 [C,B*W] projected plane. The query throws for an unregistered row
- * profile or unsupported B/W domain.
- */
-[[nodiscard]] std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-    std::int32_t query_rows, std::int32_t key_rows, std::int32_t value_rows,
-    std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width);
-
-/**
- * Returns the transient capacity for a registered [16384,5120] NVFP4 or row-scaled FP8 snapshot
- * profile. `batch_size` is exact and the query covers every W in the inclusive width interval.
- * B=1 preserves the format-specific fused/materialized resolver; B=2..8 covers its aggregate
- * projection mechanism plus any projected BF16 plane selected by the complete-Op plan.
- */
-[[nodiscard]] std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-    QType parent_qtype, std::int32_t parent_rows, std::int32_t input_rows, LinearPolicy policy,
-    std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width);
+// The single-token form writes the new BF16 [C,3] history directly to destination records.
+// Each row's source and destination fields are disjoint or exactly alias the complete [C,3]
+// field. Destination fields are distinct across rows and cannot overwrite another row's source.
+// Other math and workspace requirements match the snapshot form below, with T=1.
+void gdn_input_proj_conv_update(const Tensor& x, const ProjectionWeights& weights,
+                                const Tensor& conv_weight, ConstStateFieldView source,
+                                StateFieldView destination, const Tensor& valid_columns,
+                                GdnConvOutputs outputs, MemoryArena& workspace,
+                                CudaExecutionView execution);
 
 /**
  * Op: gdn_input_proj_conv_snapshot
  *
  * Math / indexing:
- *   For each row b, let p[:,j,b] be the concatenated q/k/value projection of x[:,j,b], while
- *   z[:,j,b] is the independent z projection. Starting from the BF16 width-three history selected
- *   by initial_state_slots[b], evaluate the width-four depthwise convolution over p, apply SiLU,
- *   and publish its channel ranges to query, key, and value. After valid column j, write the new
- *   width-three history to snapshot_base_slots[b]+j. Z bypasses convolution.
+ *   Let p=concat(Wq*x,Wk*x,Wv*x) and z=Wz*x. For each batch row b, read the width-three
+ *   history selected by source.records.byte_offsets[b]. At each valid token t, evaluate the
+ * four-tap causal depthwise convolution over history and p[:,t,b], apply SiLU, and split its
+ *   channels to query/key/value. Publish the resulting width-three history at
+ *   snapshot_bases[b]+t. Z bypasses convolution.
  *
- * Logical shapes:
- *   The 27B registered form has x [5120,W,B], Q4 q/k weight [4096,5120], one Q5 value/z parent
- *   [12288,5120], conv_weight [10240,4], conv_states [10240,3,Slots], query/key [2048,W,B],
- *   value/z [6144,W,B], and I32 selectors [B]. B=1 accepts every positive W; B=2..8 accepts
- *   W=1..16. `valid_columns` is empty for a dense invocation or I32 [B] for a mixed-width batch.
- *   A mixed-width invocation has B>=1 and every valid extent lies in [1,W].
+ * Logical shapes / supported domain:
+ *   H=input rows, Q=query/key rows (2048 unless stated), V=value/z rows, C=2*Q+V.
+ *   Single Q8-G32/FP16 weights use [12288,2048] (V=4096), [16384,2560] (V=6144), or
+ *   on DGX Spark [8192,2560] (Q=1024,V=3072). FP8 row-scale and NVFP4 block-scale
+ *   weights use [16384,5120] (V=6144). Paired Q4-G64/FP16 [4096,5120] and Q5-G64/FP16
+ *   [12288,5120] use V=6144. The logical row order is [q,k,v,z]. Q8 and paired weights
+ *   use A16. Single-parent LinearPolicy permits A8 for FP8 or A4 for NVFP4.
  *
- * Numeric:
- *   The oracle exact-decodes packed weights and evaluates projection, convolution, SiLU, z, and
- *   every snapshot value naively in FP64 from represented inputs. BF16 query/key/value/z and
- *   snapshots are promoted and compared directly with those ideal values; their final storage
- *   rounding belongs to the Op's named A16 criterion, not the oracle. Former unfused projection
- *   tensors are not observable cast boundaries; production routes use their natural private
- *   accumulator and staging precision. This two-parent Q4/Q5 form does not quantize activation;
- *   the single-parent policy-bearing form below defines its own permitted compute profiles.
+ *   x BF16 [H,T,B], conv_weight BF16 [C,4], query/key BF16 [Q,T,B], value/z BF16 [V,T,B].
+ *   Source is a BF16 [C,3] field in each record, selected by device I64 [B] byte offsets.
+ *   Snapshots are contiguous BF16 [C,3,N]; snapshot_bases is contiguous device I32 [B].
+ *   Fields, snapshots and other data tensors are 16-byte aligned; data tensors are contiguous.
+ *   B=1 accepts every positive T; B=2..8 accepts T=1..16. Empty valid_columns means every
+ *   row is dense; otherwise it is device I32 [B] with each extent in [1,T]. Projection
+ *   processes all M=B*T safe columns.
  *
- * Effects:
- *   Each row writes query/key/value through its valid prefix and exact zero to its invalid tail;
- *   z is projected for all B*W safe input columns. A row writes only its valid destination state
- *   prefix. The caller reserves disjoint complete [base,base+W) intervals, prevents one row from
- *   overwriting another row's initial slot, and may overlap a row's own initial slot with its
- *   destination after that initial history has been loaded. Other slots are unchanged. Newly
- *   projected convolution channels remain private to the call while published snapshots are BF16.
+ * Numeric / effects:
+ *   Projection, convolution and SiLU form one computation. Private projected values are
+ *   not an observable BF16 boundary. Outputs and published histories are BF16.
+ *   Query/key/value are exact zero in invalid tails; z is written for every physical
+ *   column. Only valid destination snapshot rows are written. The caller reserves disjoint
+ *   complete [base,base+T) intervals and prevents a row from overwriting another row's source.
+ *   A source field is disjoint from the snapshot destination or exactly aliases one complete
+ *   [C,3] row in its own reservation; partial overlap is not allowed.
+ *   Other snapshot rows are unchanged. Tensor operands are disjoint. Selected source fields
+ *   overlap no operands except their own permitted snapshot destination. Weight parents and
+ *   call-local scratch overlap no accessed fields or tensors. Valid byte offsets, field bounds,
+ *   and cross-row alias relationships are caller promises.
+ *
+ * Workspace / execution:
+ *   Uses scoped storage at the caller arena cursor; earlier allocations may hold operands.
+ *   A zero capacity performs no allocation. The query covers the complete computation.
+ * Capture/replay uses execution.stream() and consumes device metadata at replay.
  */
-void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
-                                  const Weight& value_z_weight, const Tensor& conv_weight,
-                                  Tensor& conv_states, const Tensor& valid_columns,
-                                  const Tensor& initial_state_slots,
-                                  const Tensor& snapshot_base_slots, Tensor& query, Tensor& key,
-                                  Tensor& value, Tensor& z, WorkspaceArena& ws,
-                                  cudaStream_t stream);
+void gdn_input_proj_conv_snapshot(const Tensor& x, const ProjectionWeights& weights,
+                                  const Tensor& conv_weight, GdnConvSnapshotState state,
+                                  const Tensor& valid_columns, GdnConvOutputs outputs,
+                                  MemoryArena& workspace, CudaExecutionView execution);
 
-/**
- * Single-parent form of gdn_input_proj_conv_snapshot. Registered parents are Q8_G32_FP16 RowSplit
- * [12288,2048], NVFP4 BlockScaleK16M128x4 [16384,5120], and FP8_E4M3FN_ROW_BF16 RowScale
- * [16384,5120], all in q/k/value/z row order. All policies permit Q8 A16. NVFP4 uses A16
- * under A16Only/AllowA8; AllowA4 may use A4. FP8 may use A8 under AllowA8/AllowA4. B=1 accepts
- * every positive W for FP8; the batched domain is B=2..8 and W=1..16. Tensor operands, the complete
- * FP8 parent, and live workspace must be mutually non-overlapping, except that the read-only
- * initial_state_slots and snapshot_base_slots selectors may alias each other; same-row state-slot
- * overlap remains governed by the snapshot state contract.
- */
-void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value_z_weight,
-                                  const Tensor& conv_weight, Tensor& conv_states,
-                                  const Tensor& valid_columns, const Tensor& initial_state_slots,
-                                  const Tensor& snapshot_base_slots, Tensor& query, Tensor& key,
-                                  Tensor& value, Tensor& z, LinearPolicy policy, WorkspaceArena& ws,
-                                  cudaStream_t stream);
-
-/**
- * Applies the A16-only single-parent form. FP8 accepts every positive W for dense B=1; the batched
- * domain is B=2..8 and W=1..16.
- */
-void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value_z_weight,
-                                  const Tensor& conv_weight, Tensor& conv_states,
-                                  const Tensor& valid_columns, const Tensor& initial_state_slots,
-                                  const Tensor& snapshot_base_slots, Tensor& query, Tensor& key,
-                                  Tensor& value, Tensor& z, WorkspaceArena& ws,
-                                  cudaStream_t stream);
-
-/**
- * Returns the transient capacity for the registered Q4/Q5 or Q8 record-producing profile.
- * `batch_size` is exact, and the inclusive T interval must lie within ReplaySSM's B=1..8,
- * T=2..16 execution domain. These profiles require no transient storage because materialized
- * projection writes directly to caller-owned conv_record.
- */
-[[nodiscard]] std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
-    std::int32_t query_rows, std::int32_t key_rows, std::int32_t value_rows,
-    std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width);
-
-/**
- * Returns the transient capacity for a registered [16384,5120] NVFP4 or row-scaled FP8
- * record-producing profile. Fused and materialized A16 routes require no storage. AllowA4/AllowA8
- * returns only the activation-quantization workspace selected by this complete-Op route;
- * conv_record is caller-owned.
- */
-[[nodiscard]] std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
-    QType parent_qtype, std::int32_t parent_rows, std::int32_t input_rows, LinearPolicy policy,
-    std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width);
+[[nodiscard]] std::size_t
+gdn_input_proj_conv_snapshot_workspace_capacity_bytes(const ProjectionProfile& weights,
+                                                      std::int32_t batch, std::int32_t min_tokens,
+                                                      std::int32_t max_tokens);
 
 /**
  * Op: gdn_input_proj_conv_record
  *
- * For each batch row, evaluates the registered projection, width-four causal convolution, SiLU,
- * and q/k/value/z split from the BF16 history selected by initial_state_slots. It writes each BF16
- * newest history column to conv_record [C,T,B]. Query, key,
- * and value are zero in each row's invalid tail; z is projected for every physical column.
+ * Evaluates the same projection/convolution/SiLU computation from a read-only source history.
+ * Supported weights, tensor layouts, valid prefixes and output effects match snapshot above;
+ * the record domain is B=1..8, T=2..16. conv_record is contiguous, 16-byte-aligned BF16 [C,T,B].
+ * Only its valid prefix is defined. It receives each newest projected history column.
  *
- * The execution domain is B=1..8 and T=2..16. valid_columns is empty for dense input or device
- * I32 [B], with each caller-supplied extent in [1,T]. conv_states is a read-only BF16 [C,3,S]
- * state-pool view, and initial_state_slots contains absolute slots in [0,S). Source state is not
- * modified. Only the valid prefix of conv_record is semantically defined. Outputs and valid
- * record columns are bit-identical to the corresponding snapshot execution from the same initial
- * history, inputs, physical T/B, format and policy; records equal its newest history columns.
- * A private convolution intermediate need not be rounded to BF16 before use.
+ * Query/key/value/z and valid record columns are bit-identical to snapshot from the same
+ * initial history, represented inputs, physical T/B and activation permission. Records equal
+ * the newest column of each corresponding snapshot. Source history is never modified.
+ * The record's BF16 publication does not require rounding private convolution intermediates.
  *
- * The two-parent form registers Q4 q/k [4096,5120] and the Q5 value/z parent [12288,5120]. All
- * tensor operands, outputs, conv_record, source state, and live workspace must be disjoint.
+ * All tensor operands are disjoint from one another, the weight parents and call-local scratch.
+ * Materialized computation may write projection directly to conv_record. Workspace queries
+ * cover the complete Op and the supplied inclusive T interval. Capture/replay is supported.
  */
-void gdn_input_proj_conv_record(const Tensor& x, const Weight& qk_weight,
-                                const Weight& value_z_weight, const Tensor& conv_weight,
-                                const Tensor& conv_states, const Tensor& valid_columns,
-                                const Tensor& initial_state_slots, Tensor& conv_record,
-                                Tensor& query, Tensor& key, Tensor& value, Tensor& z,
-                                WorkspaceArena& workspace, cudaStream_t stream);
+void gdn_input_proj_conv_record(const Tensor& x, const ProjectionWeights& weights,
+                                const Tensor& conv_weight, ConstStateFieldView state,
+                                const Tensor& valid_columns, GdnConvOutputs outputs,
+                                Tensor& conv_record, MemoryArena& workspace,
+                                CudaExecutionView execution);
 
-/**
- * Single-parent record-producing form. Registered parents are Q8_G32_FP16 [12288,2048], NVFP4
- * [16384,5120], and FP8_E4M3FN_ROW_BF16 [16384,5120]. All policies permit Q8 A16; NVFP4
- * uses A16 under A16Only/AllowA8 and may use A4 under AllowA4. FP8 may use A8 under
- * AllowA8/AllowA4. Record and snapshot share arithmetic route selection. Every tensor operand, the
- * complete FP8 parent, and live workspace must be mutually non-overlapping.
- */
-void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z_weight,
-                                const Tensor& conv_weight, const Tensor& conv_states,
-                                const Tensor& valid_columns, const Tensor& initial_state_slots,
-                                Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
-                                Tensor& z, LinearPolicy policy, WorkspaceArena& workspace,
-                                cudaStream_t stream);
+[[nodiscard]] std::size_t
+gdn_input_proj_conv_record_workspace_capacity_bytes(const ProjectionProfile& weights,
+                                                    std::int32_t batch, std::int32_t min_tokens,
+                                                    std::int32_t max_tokens);
 
-/** Applies the A16-only single-parent record-producing form. */
-void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z_weight,
-                                const Tensor& conv_weight, const Tensor& conv_states,
-                                const Tensor& valid_columns, const Tensor& initial_state_slots,
-                                Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
-                                Tensor& z, WorkspaceArena& workspace, cudaStream_t stream);
+[[nodiscard]] inline std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+    const ProjectionWeights& weights, std::int32_t batch, std::int32_t first, std::int32_t last) {
+    return gdn_input_proj_conv_snapshot_workspace_capacity_bytes(projection_profile(weights), batch,
+                                                                 first, last);
+}
 
+[[nodiscard]] inline std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
+    const ProjectionWeights& weights, std::int32_t batch, std::int32_t first, std::int32_t last) {
+    return gdn_input_proj_conv_record_workspace_capacity_bytes(projection_profile(weights), batch,
+                                                               first, last);
+}
 } // namespace ninfer::ops

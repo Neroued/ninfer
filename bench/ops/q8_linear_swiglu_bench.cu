@@ -1,10 +1,11 @@
 // Complete public-Op benchmark for the registered Q8 LinearSwiGLU profiles.
 
 #include "core/weight.h"
+#include "core/buffer.h"
 #include "ninfer/ops/linear_swiglu.h"
 
 #include "core/device.h"
-#include "ninfer_bench_common.h"
+#include "op_measurement.cuh"
 #include "quantized_weight.cuh"
 
 #include <cuda_runtime.h>
@@ -55,25 +56,6 @@ struct Result {
     std::size_t graph_nodes;
 };
 
-std::vector<std::int32_t> parse_t_sweep(std::string_view raw) {
-    std::vector<std::int32_t> result;
-    std::size_t begin = 0;
-    while (begin < raw.size()) {
-        const std::size_t end = raw.find(',', begin);
-        const std::string token(
-            raw.substr(begin, end == std::string_view::npos ? raw.size() - begin : end - begin));
-        const long value = std::stol(token);
-        if (value <= 0 || value > std::numeric_limits<std::int32_t>::max()) {
-            throw std::invalid_argument("--t-sweep values must be positive int32");
-        }
-        result.push_back(static_cast<std::int32_t>(value));
-        if (end == std::string_view::npos) { break; }
-        begin = end + 1;
-    }
-    if (result.empty()) { throw std::invalid_argument("--t-sweep must not be empty"); }
-    return result;
-}
-
 Options parse_options(int argc, char** argv) {
     Options options;
     for (int i = 1; i < argc; ++i) {
@@ -83,13 +65,13 @@ Options parse_options(int argc, char** argv) {
             return argv[i];
         };
         if (arg == "--t-sweep") {
-            options.t_sweep = parse_t_sweep(next("--t-sweep value"));
+            options.t_sweep = bench::measurement::integers(next("--t-sweep value"));
         } else if (arg == "--problem") {
             options.problem = next("--problem value");
         } else if (arg == "--warmup") {
-            options.warmup = std::stoi(std::string(next("--warmup value")));
+            options.warmup = bench::measurement::integer(next("--warmup value"), 0);
         } else if (arg == "--repeat") {
-            options.repeat = std::stoi(std::string(next("--repeat value")));
+            options.repeat = bench::measurement::integer(next("--repeat value"));
         } else if (arg == "--csv-out") {
             options.csv_out = next("--csv-out path");
         } else if (arg == "--profile") {
@@ -171,44 +153,48 @@ int main(int argc, char** argv) {
     try {
         const Options options  = parse_options(argc, argv);
         const Problem& problem = options.problem == kDFlash2.name ? kDFlash2 : kCompanion;
-        DeviceContext context;
-        const cudaStream_t stream = context.stream;
-        std::printf("# gpu=%s sm=%d%d cuda_runtime=%d cache=cold\n", context.props.name,
-                    context.props.major, context.props.minor, CUDART_VERSION);
+        auto& context          = ninfer::bench::device_context();
+        const auto cuda        = context.execution_view();
+        const auto stream      = cuda.stream();
+        std::printf("# gpu=%s sm=%d%d cuda_runtime=%d cache=cold\n", context.properties().name,
+                    context.properties().major, context.properties().minor, CUDART_VERSION);
         const auto [minimum, maximum] =
             std::minmax_element(options.t_sweep.begin(), options.t_sweep.end());
         bench::L2FlushBuffer flush(kFlushBytes);
         DeviceBuffer input =
             bench::make_bf16(static_cast<std::size_t>(problem.hidden) * (*maximum), 101U);
-        DeviceBuffer output(static_cast<std::size_t>(problem.output_rows) * (*maximum) * 2);
+        DeviceBuffer output(ninfer::bench::device_context().device(),
+                            static_cast<std::size_t>(problem.output_rows) * (*maximum) * 2);
         auto packed         = bench::make_row_split_weight(QType::Q8_G32_FP16, problem.gate_up_rows,
                                                            problem.hidden, problem.hidden, 501U);
         const auto capacity = ops::linear_swiglu_workspace_capacity_bytes(
             QType::Q8_G32_FP16, problem.gate_up_rows, problem.hidden, ops::LinearPolicy::A16Only,
             *minimum, *maximum);
-        WorkspaceArena workspace(std::max<std::size_t>(capacity, 1));
+        ninfer::DeviceBuffer workspace_storage(ninfer::bench::device_context().device(),
+                                               std::max<std::size_t>(capacity, 1));
+        MemoryArena workspace(workspace_storage.span());
         std::vector<Result> results;
         for (const auto t : options.t_sweep) {
-            Tensor x(input.p, DType::BF16, {problem.hidden, t});
-            Tensor out(output.p, DType::BF16, {problem.output_rows, t});
-            const auto body = [&](cudaStream_t launch_stream) {
+            Tensor x(input.span(), DType::BF16, {problem.hidden, t});
+            Tensor out(output.span(), DType::BF16, {problem.output_rows, t});
+            const auto body = [&](CudaExecutionView cuda) {
                 ops::linear_swiglu(x, packed.weight, out, ops::LinearPolicy::A16Only, workspace,
-                                   launch_stream);
+                                   cuda);
             };
             bench::TimedGraph graph;
-            if (options.graph) graph.capture(stream, body);
+            if (options.graph) graph.capture(cuda, body);
             if (options.profile) {
                 const auto launch = [&] {
                     if (options.graph)
-                        graph.launch(stream);
+                        graph.launch(cuda);
                     else
-                        body(stream);
+                        body(cuda);
                 };
                 for (int i = 0; i < options.warmup; ++i) {
-                    bench::flush_l2(flush, stream);
+                    bench::flush_l2(flush, cuda);
                     launch();
                 }
-                bench::flush_l2(flush, stream);
+                bench::flush_l2(flush, cuda);
                 CUDA_CHECK(cudaStreamSynchronize(stream));
                 std::printf(
                     "PROFILE entry=linear_swiglu problem=%s T=%d execution=%s graph_nodes=%zu\n",
@@ -219,11 +205,10 @@ int main(int argc, char** argv) {
                 CUDA_CHECK(cudaProfilerStop());
                 continue;
             }
-            const auto timing = options.graph
-                                    ? bench::measure_cold_graph(graph, flush, stream,
-                                                                options.warmup, options.repeat)
-                                    : bench::measure_cold_launch(body, flush, stream,
-                                                                 options.warmup, options.repeat);
+            const auto timing =
+                options.graph
+                    ? bench::measure_cold_graph(graph, flush, cuda, options.warmup, options.repeat)
+                    : bench::measure_cold_launch(body, flush, cuda, options.warmup, options.repeat);
             const auto exact  = ops::linear_swiglu_workspace_capacity_bytes(
                 QType::Q8_G32_FP16, problem.gate_up_rows, problem.hidden,
                 ops::LinearPolicy::A16Only, t, t);

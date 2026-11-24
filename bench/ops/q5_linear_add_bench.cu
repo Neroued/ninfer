@@ -5,12 +5,14 @@
 // evicting L2; both run outside the timed interval. One complete public ops::linear_add call is
 // captured per graph, and the reported node count is the captured graph's real node count.
 
+#include "common/roofline.h"
 #include "core/weight.h"
+#include "core/buffer.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_add.h"
 
 #include "core/device.h"
-#include "ninfer_bench_common.h"
+#include "op_measurement.cuh"
 #include "quantized_weight.cuh"
 
 #include <cuda_runtime.h>
@@ -33,10 +35,6 @@ constexpr std::int32_t kRows           = 5120;
 constexpr std::size_t kDefaultFlushMiB = 256;
 constexpr int kDefaultWarmup           = 5;
 constexpr int kDefaultRepeat           = 50;
-constexpr double kDramSpecGBs          = 1792.0;
-// NVIDIA's GB202 table reports dense/sparse pairs at boost clock; keep the accumulator precision
-// explicit. SIMT and split-K routes report no Tensor Core ratio.
-constexpr double kBf16Fp32AccumulateTFLOPs = 209.5;
 
 struct Options {
     std::int32_t hidden = 0;
@@ -48,25 +46,6 @@ struct Options {
     std::uint64_t flush_bytes = kDefaultFlushMiB << 20;
     std::string csv_out;
 };
-
-std::vector<std::int32_t> parse_tokens(std::string_view raw) {
-    std::vector<std::int32_t> result;
-    std::size_t begin = 0;
-    while (begin < raw.size()) {
-        const std::size_t end = raw.find(',', begin);
-        const std::string token(
-            raw.substr(begin, end == std::string_view::npos ? raw.size() - begin : end - begin));
-        const long value = std::stol(token);
-        if (value <= 0 || value > std::numeric_limits<std::int32_t>::max()) {
-            throw std::invalid_argument("--t-sweep values must be positive int32");
-        }
-        result.push_back(static_cast<std::int32_t>(value));
-        if (end == std::string_view::npos) { break; }
-        begin = end + 1;
-    }
-    if (result.empty()) { throw std::invalid_argument("--t-sweep must not be empty"); }
-    return result;
-}
 
 void usage(const char* argv0) {
     std::printf("Usage:\n"
@@ -90,13 +69,13 @@ Options parse_options(int argc, char** argv) {
             return argv[index];
         };
         if (argument == "--k") {
-            options.hidden = std::stoi(std::string(next("--k value")));
+            options.hidden = bench::measurement::integer(next("--k value"));
         } else if (argument == "--t-sweep") {
-            options.tokens = parse_tokens(next("--t-sweep value"));
+            options.tokens = bench::measurement::integers(next("--t-sweep value"));
         } else if (argument == "--warmup") {
-            options.warmup = std::stoi(std::string(next("--warmup value")));
+            options.warmup = bench::measurement::integer(next("--warmup value"), 0);
         } else if (argument == "--repeat") {
-            options.repeat = std::stoi(std::string(next("--repeat value")));
+            options.repeat = bench::measurement::integer(next("--repeat value"));
         } else if (argument == "--execution") {
             const std::string mode(next("--execution value"));
             if (mode == "graph") {
@@ -108,7 +87,8 @@ Options parse_options(int argc, char** argv) {
             }
         } else if (argument == "--flush-mib") {
             options.flush_bytes =
-                static_cast<std::uint64_t>(std::stoll(std::string(next("--flush-mib value"))))
+                bench::measurement::integer<std::uint64_t>(
+                    next("--flush-mib value"), 1, std::numeric_limits<std::uint64_t>::max() >> 20)
                 << 20;
         } else if (argument == "--csv-out") {
             options.csv_out = std::string(next("--csv-out value"));
@@ -162,6 +142,7 @@ int main(int argc, char** argv) {
 
         cudaStream_t stream = nullptr;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        const auto cuda = ninfer::bench::device_context().execution_view(stream);
         bench::L2FlushBuffer flush(options.flush_bytes);
         DeviceBuffer input =
             bench::make_bf16(static_cast<std::size_t>(options.hidden) * max_t, 101U);
@@ -178,14 +159,16 @@ int main(int argc, char** argv) {
         // The A16 routes report a zero-capacity profile, and the arena type rejects a zero-byte
         // allocation, so the owning arena is non-empty here. Every row still reports how many of
         // those bytes the public Op actually consumes.
-        WorkspaceArena workspace(std::max<std::size_t>(workspace_capacity, 256));
+        ninfer::DeviceBuffer workspace_storage(ninfer::bench::device_context().device(),
+                                               std::max<std::size_t>(workspace_capacity, 256));
+        MemoryArena workspace(workspace_storage.span());
 
         if (options.profile) {
             const std::int32_t tokens = options.tokens.front();
-            Tensor x(input.p, DType::BF16, {options.hidden, tokens});
-            Tensor out(residual.p, DType::BF16, {kRows, tokens});
+            Tensor x(input.span(), DType::BF16, {options.hidden, tokens});
+            Tensor out(residual.span(), DType::BF16, {kRows, tokens});
             workspace.reset();
-            ops::linear_add(x, packed.weight, out, ops::LinearPolicy::A16Only, workspace, stream);
+            ops::linear_add(x, packed.weight, out, ops::LinearPolicy::A16Only, workspace, cuda);
             CUDA_CHECK(cudaStreamSynchronize(stream));
             std::printf("profile op=linear_add qtype=q5_g64_fp16 rows=%d k=%d T=%d "
                         "workspace_sweep=%zu workspace_exact=%zu workspace_used=%zu\n",
@@ -208,29 +191,26 @@ int main(int argc, char** argv) {
         rows.reserve(options.tokens.size());
 
         for (const std::int32_t tokens : options.tokens) {
-            Tensor x(input.p, DType::BF16, {options.hidden, tokens});
-            Tensor out(residual.p, DType::BF16, {kRows, tokens});
-            const auto restore = [&](cudaStream_t prepare_stream) {
-                residual_initial.restore(prepare_stream);
-            };
-            const auto body = [&](cudaStream_t launch_stream) {
-                ops::linear_add(x, packed.weight, out, ops::LinearPolicy::A16Only, workspace,
-                                launch_stream);
+            Tensor x(input.span(), DType::BF16, {options.hidden, tokens});
+            Tensor out(residual.span(), DType::BF16, {kRows, tokens});
+            const auto restore = [&](CudaExecutionView cuda) { residual_initial.restore(cuda); };
+            const auto body    = [&](CudaExecutionView cuda) {
+                ops::linear_add(x, packed.weight, out, ops::LinearPolicy::A16Only, workspace, cuda);
             };
 
             bench::TimedGraph graph;
-            if (options.graph) graph.capture(stream, body);
+            if (options.graph) graph.capture(cuda, body);
 
             const bench::ColdTiming timing =
-                options.graph ? bench::measure_cold_graph_prepared(restore, graph, flush, stream,
+                options.graph ? bench::measure_cold_graph_prepared(restore, graph, flush, cuda,
                                                                    options.warmup, options.repeat)
-                              : bench::measure_cold_launch_prepared(restore, body, flush, stream,
+                              : bench::measure_cold_launch_prepared(restore, body, flush, cuda,
                                                                     options.warmup, options.repeat);
 
             // Evidence for the public zero-extra-workspace contract: consume from a freshly reset
             // arena in a single untimed call and report what the Op actually took.
             workspace.reset();
-            body(stream);
+            body(cuda);
             CUDA_CHECK(cudaStreamSynchronize(stream));
             const std::size_t workspace_used = workspace.used();
 
@@ -278,7 +258,7 @@ int main(int argc, char** argv) {
                              row.timing.median_us, row.timing.min_us, row.timing.p95_us,
                              static_cast<unsigned long long>(row.weight_bytes),
                              static_cast<unsigned long long>(row.logical_bytes),
-                             row.projection_flops, gbs, gbs / kDramSpecGBs * 100.0,
+                             row.projection_flops, gbs, gbs / bench::kRoofline.memory_gbs * 100.0,
                              row.projection_flops / seconds / 1.0e12, row.workspace_sweep_bytes,
                              row.workspace_exact_bytes, row.workspace_used_bytes);
             }

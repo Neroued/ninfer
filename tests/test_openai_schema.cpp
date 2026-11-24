@@ -1,3 +1,4 @@
+#include "serve_tool_stream_fixture.h"
 #include "serve/generation_service.h"
 #include "serve/openai_chat.h"
 #include "serve/openai_common.h"
@@ -17,6 +18,7 @@ namespace {
 
 using Json = ninfer::serve::RequestJson;
 using namespace ninfer::serve;
+using ninfer::product::ServeOptions;
 
 int check(bool condition, const std::string& label) {
     if (condition) { return 0; }
@@ -49,9 +51,9 @@ Json base_request() {
 
 OpenAIChatRequest parse(Json body) { return parse_chat_completion_request(body, limits()); }
 
-ResolvedPromptSemantics semantics(const GenerationRequest& request) {
+PromptOptionInputs semantics(const GenerationRequest& request) {
     ServeOptions server;
-    return resolve_prompt_semantics(request, server);
+    return collect_prompt_options(request, server);
 }
 
 ninfer::PromptInput prompt(const GenerationRequest& request) {
@@ -60,7 +62,7 @@ ninfer::PromptInput prompt(const GenerationRequest& request) {
 
 ninfer::RequestOptions options(const GenerationRequest& request) {
     ServeOptions server;
-    return to_request_options(request, server, semantics(request), true);
+    return to_request_options(request, server, true);
 }
 
 Json parse_sse(const std::string& event) {
@@ -146,7 +148,6 @@ int test_standard_field_policy() {
     rejected("logit_bias", Json{{"12", 1}}, "logit_bias_not_supported");
     rejected("logprobs", true, "logprobs_not_supported");
     rejected("top_logprobs", 2, "logprobs_not_supported");
-    rejected("response_format", Json{{"type", "json_schema"}}, "response_format_not_supported");
     rejected("modalities", Json::array({"text", "audio"}), "modality_not_supported");
     rejected("web_search_options", Json::object(), "web_search_not_supported");
     rejected("moderation", Json::object(), "moderation_not_supported");
@@ -186,35 +187,197 @@ int test_standard_field_policy() {
     return failures;
 }
 
-int test_constrained_decoding_extensions() {
-    int failures                                           = 0;
-    const std::vector<std::pair<const char*, Json>> active = {
-        {"grammar", "root ::= \"yes\" | \"no\""},
-        {"structured_outputs", Json{{"json", Json{{"type", "object"}}}}},
-        {"guided_json", Json{{"type", "object"}}},
-        {"guided_regex", "[a-z]+"},
-        {"guided_choice", Json::array({"yes", "no"})},
-        {"guided_grammar", "root ::= \"yes\" | \"no\""},
-    };
-    for (const auto& [field, value] : active) {
-        Json body            = base_request();
-        body[field]          = value;
-        const ApiError error = api_error([&] { (void)parse(body); });
-        failures +=
-            check(error.param == field && error.code == "constrained_decoding_not_supported" &&
-                      error.message.find(field) != std::string::npos,
-                  std::string(field) + " constrained decoding is explicitly rejected");
+int test_prompt_cache_boundaries() {
+    using Location = ninfer::PromptCacheMarkerLocation;
+    using Evidence = ninfer::SharedCandidateEvidence;
+    int failures   = 0;
+    for (const char* role : {"user", "system", "developer"}) {
+        Json body = base_request();
+        body["messages"].push_back(Json{{"role", role}, {"content", "complete message"}});
+        const auto prepared = prompt(parse(body).generation);
+        const auto& markers = prepared.context_cache.markers;
+        failures += check(prepared.context_cache.allow_engine_automatic_shared_prefixes,
+                          "default OpenAI policy suppressed structural prefix candidates");
+        failures += check(
+            markers.size() == 1 && markers[0].location == Location::MessagePartBoundary &&
+                markers[0].after_message_count == 2 && markers[0].after_message_part_count == 1 &&
+                markers[0].evidence == Evidence::DefaultAutomatic,
+            std::string(role) + " automatic cache ends at the final source part");
     }
 
-    Json neutral                  = base_request();
-    neutral["grammar"]            = "";
-    neutral["structured_outputs"] = nullptr;
-    neutral["guided_json"]        = nullptr;
-    neutral["guided_regex"]       = nullptr;
-    neutral["guided_choice"]      = nullptr;
-    neutral["guided_grammar"]     = nullptr;
-    failures += check(parse(neutral).generation.messages.size() == 1,
-                      "neutral constrained-decoding extension values are accepted");
+    Json multipart                      = base_request();
+    multipart["messages"][0]["content"] = Json::array(
+        {Json{{"type", "text"}, {"text", "first"}}, Json{{"type", "text"}, {"text", "second"}}});
+    multipart["prompt_cache_options"] = Json{{"mode", "implicit"}};
+    const auto requested              = prompt(parse(multipart).generation);
+    failures += check(requested.context_cache.allow_engine_automatic_shared_prefixes,
+                      "implicit policy suppressed structural prefix candidates");
+    failures +=
+        check(requested.context_cache.markers.size() == 1 &&
+                  requested.context_cache.markers[0].location == Location::MessagePartBoundary &&
+                  requested.context_cache.markers[0].after_message_part_count == 2 &&
+                  requested.context_cache.markers[0].evidence == Evidence::RequestedAutomatic,
+              "requested implicit caching uses the final source part");
+    multipart["prompt_cache_options"] = Json{{"mode", "explicit"}};
+    const auto disabled               = prompt(parse(multipart).generation);
+    failures += check(disabled.context_cache.markers.empty() &&
+                          !disabled.context_cache.allow_engine_automatic_shared_prefixes,
+                      "explicit mode without markers disables automatic shared writes");
+
+    Json marked                      = base_request();
+    marked["messages"][0]["content"] = Json::array();
+    for (int index = 0; index < 4; ++index) {
+        marked["messages"][0]["content"].push_back(
+            Json{{"type", "text"},
+                 {"text", "section " + std::to_string(index)},
+                 {"prompt_cache_breakpoint", Json{{"mode", "explicit"}}}});
+    }
+    const auto merged = prompt(parse(marked).generation);
+    failures += check(merged.context_cache.markers.size() == 4,
+                      "automatic caching reuses an explicitly marked final part");
+    for (std::size_t index = 0; index < merged.context_cache.markers.size(); ++index) {
+        const auto& marker = merged.context_cache.markers[index];
+        failures += check(
+            marker.location == Location::MessagePartBoundary &&
+                marker.after_message_part_count == index + 1 &&
+                ninfer::has_shared_candidate_evidence(marker.evidence, Evidence::ExplicitBoundary),
+            "explicit part locations survive automatic merging");
+    }
+    failures +=
+        check(merged.context_cache.markers.size() == 4 &&
+                  ninfer::has_shared_candidate_evidence(
+                      merged.context_cache.markers.back().evidence, Evidence::DefaultAutomatic),
+              "the final explicit part also carries the automatic opportunity");
+    marked["messages"][0]["content"].push_back(Json{{"type", "text"}, {"text", "new tail"}});
+    const auto full = prompt(parse(marked).generation);
+    failures += check(full.context_cache.markers.size() == 4,
+                      "automatic caching yields to four explicit boundaries");
+    for (std::size_t index = 0; index < full.context_cache.markers.size(); ++index) {
+        const auto& marker = full.context_cache.markers[index];
+        failures += check(marker.location == Location::MessagePartBoundary &&
+                              marker.after_message_part_count == index + 1 &&
+                              marker.evidence == Evidence::ExplicitBoundary,
+                          "a later implicit target does not displace an explicit boundary");
+    }
+
+    Json assistant = base_request();
+    assistant["messages"].push_back(Json{{"role", "assistant"}, {"content", "partial answer"}});
+    const auto assistant_prompt = prompt(parse(assistant).generation);
+    failures += check(assistant_prompt.context_cache.markers.size() == 1 &&
+                          assistant_prompt.context_cache.markers[0].location ==
+                              Location::MessagePartBoundary &&
+                          assistant_prompt.context_cache.markers[0].after_message_count == 2,
+                      "assistant content retains its part boundary for continuation");
+
+    Json tool = base_request();
+    tool["messages"].push_back(
+        Json{{"role", "assistant"},
+             {"tool_calls",
+              Json::array({Json{{"id", "call_cache"},
+                                {"type", "function"},
+                                {"function", Json{{"name", "lookup"}, {"arguments", "{}"}}}}})}});
+    tool["messages"].push_back(
+        Json{{"role", "tool"}, {"tool_call_id", "call_cache"}, {"content", "result"}});
+    const auto tool_prompt = prompt(parse(tool).generation);
+    failures +=
+        check(tool_prompt.context_cache.markers.size() == 1 &&
+                  tool_prompt.context_cache.markers[0].location == Location::MessagePartBoundary &&
+                  tool_prompt.context_cache.markers[0].after_message_count == 3,
+              "tool results retain their content boundary when a result group grows");
+    return failures;
+}
+
+int test_constrained_decoding_extensions() {
+    int failures               = 0;
+    Json body                  = base_request();
+    body["structured_outputs"] = Json{{"choice", {"", "yes", "你好"}}};
+    const auto choice          = options(parse(body).generation).constraint;
+    failures += check(choice == ninfer::OutputConstraint::choice({"", "yes", "你好"}),
+                      "choice literals were changed in Engine translation");
+    body["structured_outputs"] = Json{{"regex", ""}};
+    failures +=
+        check(options(parse(body).generation).constraint == ninfer::OutputConstraint::regex(""),
+              "empty regex was dropped in Engine translation");
+    for (const auto& value : {Json{{"choice", Json::array()}}, Json{{"choice", {"a", 1}}},
+                              Json{{"regex", 7}}, Json{{"regex", "a"}, {"choice", {"a"}}}}) {
+        body["structured_outputs"] = value;
+        failures += check(api_error([&] { (void)parse(body); }).status == 400,
+                          "invalid choice/regex request accepted");
+    }
+    for (const auto kind :
+         {ninfer::RequestErrorKind::InvalidChoice, ninfer::RequestErrorKind::InvalidRegex}) {
+        const auto param = kind == ninfer::RequestErrorKind::InvalidChoice
+                               ? "structured_outputs.choice"
+                               : "structured_outputs.regex";
+        const auto error = request_error_to_api_error(ninfer::RequestError(kind, "invalid"), param);
+        failures += check(error.status == 400 && error.param == param &&
+                              error.code == (kind == ninfer::RequestErrorKind::InvalidChoice
+                                                 ? "invalid_choice"
+                                                 : "invalid_regex"),
+                          "choice/regex error was misclassified");
+    }
+    body["structured_outputs"] = Json{{"grammar", "root ::= \"yes\" | \"no\""}};
+    const auto parsed          = parse(body);
+    failures += check(parsed.generation.constraint->source == "root ::= \"yes\" | \"no\"" &&
+                          options(parsed.generation).constraint == parsed.generation.constraint,
+                      "GBNF must survive protocol-to-Engine translation");
+    body["stop"] = "yes";
+    failures +=
+        check(parse(body).generation.constraint && !parse(body).generation.stop_strings.empty(),
+              "grammar/custom-stop request did not reach the Frontend");
+    for (const auto& value : {Json{{"grammar", ""}}, Json{{"json", Json::object()}}, Json("bad")}) {
+        body                       = base_request();
+        body["structured_outputs"] = value;
+        failures += check(api_error([&] { (void)parse(body); }).status == 400,
+                          "malformed structured_outputs accepted");
+    }
+    for (const char* alias :
+         {"grammar", "guided_json", "guided_regex", "guided_choice", "guided_grammar"}) {
+        body        = base_request();
+        body[alias] = "root ::= \"yes\"";
+        failures += check(api_error([&] { (void)parse(body); }).param == alias,
+                          "unsupported constrained-decoding alias accepted");
+    }
+    body                    = base_request();
+    body["response_format"] = Json{{"type", "json_object"}};
+    failures += check(options(parse(body).generation).constraint->kind ==
+                          ninfer::OutputConstraintKind::JsonObject,
+                      "JSON object mode lost in Engine translation");
+    const Json schema = {
+        {"type", "object"},
+        {"properties", {{"description", {{"type", "string"}}}, {"a", {{"type", "integer"}}}}}};
+    body["response_format"] =
+        Json{{"type", "json_schema"},
+             {"json_schema", {{"name", "answer"}, {"strict", false}, {"schema", schema}}}};
+    const auto typed = parse(body).generation;
+    failures += check(typed.constraint->kind == ninfer::OutputConstraintKind::JsonSchema &&
+                          typed.constraint->source == schema.dump() &&
+                          typed.constraint_param == "response_format.json_schema.schema",
+                      "JSON schema source/order or diagnostic location lost");
+    body["tools"] = Json::array(
+        {Json{{"type", "function"},
+              {"function", {{"name", "lookup"}, {"parameters", {{"type", "object"}}}}}}});
+    const auto combined = parse(body).generation;
+    failures +=
+        check(combined.constraint && combined.uses_tools(), "JSON output blocked active tools");
+    const std::vector<std::string> schema_paths{combined.tools[0].schema_param};
+    const auto tool_error = request_error_to_api_error(
+        ninfer::RequestError(ninfer::RequestErrorKind::UnsupportedJsonSchema, "bad tool schema",
+                             "/0/parameters/properties/x/format",
+                             ninfer::RequestErrorSource::Tools),
+        combined.constraint_param, schema_paths);
+    failures += check(tool_error.param == "tools/0/function/parameters/properties/x/format",
+                      "combined request attributed tool error to body schema");
+    body["structured_outputs"] = Json{{"grammar", "root ::= \"x\""}};
+    failures +=
+        check(api_error([&] { (void)parse(body); }).status == 400, "conflicting formats accepted");
+    const auto error = request_error_to_api_error(
+        ninfer::RequestError(ninfer::RequestErrorKind::UnsupportedJsonSchema, "unsupported keyword",
+                             "/properties/x/format"),
+        typed.constraint_param);
+    failures += check(error.param == "response_format.json_schema.schema/properties/x/format" &&
+                          error.code == "unsupported_json_schema",
+                      "schema error lost its source path");
     return failures;
 }
 
@@ -232,8 +395,19 @@ int test_tools() {
     body["tools"]                     = Json::array({function_tool()});
     const OpenAIChatRequest automatic = parse(body);
     failures += check(automatic.generation.uses_tools(), "function tools default to auto");
+    failures += check(automatic.generation.constrains_tools() &&
+                          !options(automatic.generation).output.preserve_special_tokens,
+                      "ordinary auto tools must receive basic constraints");
     failures += check(prompt(automatic.generation).options.tool_jsons.size() == 1,
                       "auto tools reach PromptInput");
+    body["tool_constraints"] = "auto";
+    failures += check(!parse(body).generation.constrains_tools(),
+                      "explicit auto did not select request-driven constraints");
+    body["tool_choice"] = "required";
+    failures +=
+        check(parse(body).generation.constrains_tools(), "auto relaxed required tool choice");
+    body.erase("tool_choice");
+    body.erase("tool_constraints");
 
     body["tools"][0]["future_item_field"]                 = "ignored";
     body["tools"][0]["function"]["future_function_field"] = "ignored";
@@ -245,16 +419,18 @@ int test_tools() {
     body["tool_choice"]          = "none";
     body["parallel_tool_calls"]  = false;
     const OpenAIChatRequest none = parse(body);
-    failures +=
-        check(!none.generation.uses_tools() && prompt(none.generation).options.tool_jsons.empty(),
-              "tool_choice none makes parallel_tool_calls neutral and removes executable tools");
+    failures += check(!none.generation.uses_tools() &&
+                          prompt(none.generation).options.tool_jsons.size() == 1,
+                      "tool_choice none keeps declarations in the prompt");
 
     body["tool_choice"] = "required";
-    failures += check(api_error([&] { (void)parse(body); }).code == "tool_choice_not_supported",
-                      "required tool choice rejected");
+    failures += check(parse(body).generation.tool_choice.mode == ToolChoiceMode::Required,
+                      "required choice reaches generation");
     body["tool_choice"] = Json{{"type", "function"}, {"function", Json{{"name", "weather"}}}};
-    failures += check(api_error([&] { (void)parse(body); }).code == "tool_choice_not_supported",
-                      "named tool choice rejected");
+    failures += check(parse(body).generation.tool_choice.allowed_names ==
+                              std::vector<std::string>{"weather"} &&
+                          !parse(body).generation.tool_choice.parallel,
+                      "named choice selects exactly one invocation");
 
     body          = base_request();
     body["tools"] = Json::array({function_tool(), function_tool("search")});
@@ -264,23 +440,23 @@ int test_tools() {
               Json{{"mode", "auto"},
                    {"tools", Json::array({Json{{"type", "function"}, {"name", "search"}}})}}}};
     const GenerationRequest allowed = parse(body).generation;
-    failures += check(allowed.tools.size() == 1 && allowed.tools[0].name == "search" &&
-                          prompt(allowed).options.tool_jsons.size() == 1,
-                      "allowed_tools auto narrows the executable function set");
+    failures += check(allowed.tools.size() == 2 &&
+                          allowed.tool_choice.allowed_names == std::vector<std::string>{"search"} &&
+                          prompt(allowed).options.tool_jsons.size() == 2,
+                      "allowed_tools preserves declarations and selects callable names");
 
     body["tool_choice"] =
         Json{{"type", "allowed_tools"},
              {"mode", "auto"},
              {"tools", Json::array({Json{{"type", "function"}, {"name", "weather"}}})}};
     const GenerationRequest direct_allowed = parse(body).generation;
-    failures += check(direct_allowed.tools.size() == 1 && direct_allowed.tools[0].name == "weather",
-                      "direct allowed_tools compatibility shape is accepted");
-    body["tool_choice"]["mode"]     = "required";
-    const ApiError required_allowed = api_error([&] { (void)parse(body); });
     failures +=
-        check(required_allowed.code == "tool_choice_not_supported" &&
-                  required_allowed.message.find("at least one tool call") != std::string::npos,
-              "required allowed_tools reports the unenforceable guarantee");
+        check(direct_allowed.tools.size() == 2 &&
+                  direct_allowed.tool_choice.allowed_names == std::vector<std::string>{"weather"},
+              "direct allowed_tools compatibility shape is accepted");
+    body["tool_choice"]["mode"] = "required";
+    failures += check(parse(body).generation.tool_choice.mode == ToolChoiceMode::Required,
+                      "allowed_tools required reaches generation");
     body["tool_choice"]["mode"]             = "auto";
     body["tool_choice"]["tools"][0]["name"] = "missing";
     failures += check(api_error([&] { (void)parse(body); }).param == "tool_choice",
@@ -288,8 +464,11 @@ int test_tools() {
 
     body          = base_request();
     body["tools"] = Json::array({function_tool("weather", true)});
-    failures += check(api_error([&] { (void)parse(body); }).code == "strict_tools_not_supported",
-                      "strict tools rejected");
+    failures += check(
+        parse(body).generation.tools[0].strict &&
+            Json::parse(
+                prompt(parse(body).generation).options.tool_jsons[0])["function"]["strict"] == true,
+        "strict survives prompt and request translation");
     body["tools"] = Json::array({Json{{"type", "custom"}, {"name", "shell"}}});
     failures += check(api_error([&] { (void)parse(body); }).code == "tool_type_not_supported",
                       "custom tools rejected");
@@ -297,9 +476,8 @@ int test_tools() {
     body                        = base_request();
     body["tools"]               = Json::array({function_tool()});
     body["parallel_tool_calls"] = false;
-    failures +=
-        check(api_error([&] { (void)parse(body); }).code == "parallel_tool_calls_not_supported",
-              "parallel_tool_calls=false rejected when tools exist");
+    failures += check(!parse(body).generation.tool_choice.parallel,
+                      "parallel_tool_calls=false reaches generation");
     body.erase("tools");
     failures += check(parse(body).generation.tools.empty(),
                       "parallel_tool_calls=false is neutral without tools");
@@ -593,17 +771,17 @@ int test_stops_and_ranges() {
 
 GenerationOutcome sample_outcome() {
     GenerationOutcome outcome;
-    outcome.text                                = "answer";
-    outcome.reasoning                           = "thought";
-    outcome.prompt_tokens                       = 20;
-    outcome.completion_tokens                   = 7;
-    outcome.reasoning_tokens                    = 3;
-    outcome.finish_reason                       = ninfer::FinishReason::StopToken;
-    outcome.metrics.prefix_cache_hit_tokens     = 12;
-    outcome.metrics.prompt_wall_seconds         = 0.04;
-    outcome.metrics.generation_wall_seconds     = 0.03;
-    outcome.metrics.speculative_draft_tokens    = 9;
-    outcome.metrics.speculative_accepted_tokens = 6;
+    outcome.text                                  = "answer";
+    outcome.reasoning                             = "thought";
+    outcome.prompt_tokens                         = 20;
+    outcome.completion_tokens                     = 7;
+    outcome.reasoning_tokens                      = 3;
+    outcome.finish_reason                         = ninfer::FinishReason::StopToken;
+    outcome.stats.reused_prompt_tokens            = 12;
+    outcome.stats.timings.prompt_wall_seconds     = 0.04;
+    outcome.stats.timings.generation_wall_seconds = 0.03;
+    outcome.stats.speculative.drafted_tokens      = 9;
+    outcome.stats.speculative.accepted_tokens     = 6;
     return outcome;
 }
 
@@ -648,6 +826,15 @@ int test_aggregate_response() {
         call["id"].get<std::string>().starts_with("call_") && call["function"]["name"] == "Edit" &&
             !Json::parse(call["function"]["arguments"].get<std::string>()).contains("replace_all"),
         "OpenAI adapter owns wire tool-call identifiers");
+    outcome.finish_reason    = ninfer::FinishReason::OutputLimit;
+    outcome.stats.constraint = ninfer::ConstraintObservation{
+        .branch = ninfer::ConstraintOutputBranch::Tools, .complete = true, .terminated = false};
+    response = Json::parse(make_chat_completion_response(identity(), outcome));
+    failures += check(response["choices"][0]["finish_reason"] == "length" &&
+                          response["choices"][0]["message"]["tool_calls"].size() == 1 &&
+                          response["constraint"]["complete"] == true &&
+                          response["constraint"]["terminated"] == false,
+                      "length limit lost a completed call or hid the interruption");
     return failures;
 }
 
@@ -664,7 +851,9 @@ int test_stream_response() {
                           content["choices"][0]["delta"]["content"] == "ans",
                       "stream separates reasoning and content deltas");
 
-    GenerationOutcome outcome             = sample_outcome();
+    GenerationOutcome outcome = sample_outcome();
+    outcome.stats.constraint  = ninfer::ConstraintObservation{
+         .branch = ninfer::ConstraintOutputBranch::Content, .complete = true, .terminated = true};
     const std::vector<std::string> events = stream.finish(outcome);
     failures +=
         check(events.size() == 4, "finish emits buffered suffix, terminal, usage, and done");
@@ -679,6 +868,11 @@ int test_stream_response() {
                           usage["timings"]["predicted_n"] == 7,
                       "dedicated stream usage carries token accounting and terminal timings");
     failures += check(events.back() == "data: [DONE]\n\n", "stream ends with DONE sentinel");
+    failures += check(usage["constraint"]["branch"] == "content" &&
+                          usage["constraint"]["terminated"] == true &&
+                          !parse_sse(events[0]).contains("constraint") &&
+                          !parse_sse(events[1]).contains("constraint"),
+                      "Chat constraint state must appear once, with terminal usage");
 
     OpenAIChatStream mismatch(identity(), false);
     (void)mismatch.start();
@@ -691,15 +885,23 @@ int test_stream_response() {
     GenerationOutcome tool_outcome;
     tool_outcome.tool_calls.push_back(ninfer::GeneratedToolCall{
         .name = "Edit", .arguments_json = R"({"file_path":"/tmp/probe.cpp"})"});
-    tool_outcome.finish_reason                 = ninfer::FinishReason::StopToken;
-    const std::vector<std::string> tool_events = tool_stream.finish(tool_outcome);
-    const Json tool_delta                      = parse_sse(tool_events[0]);
+    tool_outcome.finish_reason = ninfer::FinishReason::StopToken;
+    const auto tool_events     = emit_tools(tool_stream, tool_outcome.tool_calls);
+    const auto tool_finish     = tool_stream.finish(tool_outcome);
+    const Json tool_delta      = parse_sse(tool_events[0]);
     failures += check(
         tool_delta["choices"][0]["delta"]["tool_calls"][0]["id"].get<std::string>().starts_with(
             "call_") &&
             tool_delta["choices"][0]["delta"]["tool_calls"][0]["function"]["name"] == "Edit" &&
-            parse_sse(tool_events[1])["choices"][0]["finish_reason"] == "tool_calls",
+            parse_sse(tool_finish[0])["choices"][0]["finish_reason"] == "tool_calls",
         "stream encoder owns stable OpenAI tool-call shape");
+    OpenAIChatStream interrupted(identity(), false);
+    (void)interrupted.start();
+    tool_outcome.finish_reason = ninfer::FinishReason::OutputLimit;
+    (void)emit_tools(interrupted, tool_outcome.tool_calls);
+    const auto partial_events = interrupted.finish(tool_outcome);
+    failures += check(parse_sse(partial_events[0])["choices"][0]["finish_reason"] == "length",
+                      "streamed completed call hid a later truncation");
     return failures;
 }
 
@@ -782,6 +984,7 @@ int main() {
     int failures = 0;
     failures += test_request_envelope_and_sampling();
     failures += test_standard_field_policy();
+    failures += test_prompt_cache_boundaries();
     failures += test_constrained_decoding_extensions();
     failures += test_tools();
     failures += test_messages_and_media();

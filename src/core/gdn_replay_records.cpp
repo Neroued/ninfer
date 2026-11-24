@@ -51,7 +51,7 @@ void require_region(const TensorRegion& region, DType dtype,
         throw std::logic_error(std::string("GDN replay ") + label +
                                " layout does not match its spec");
     }
-    const Tensor expected(nullptr, dtype, {shape[0], shape[1], shape[2], shape[3]});
+    const auto expected = Tensor::metadata(dtype, {shape[0], shape[1], shape[2], shape[3]});
     if (region.region.bytes != expected.bytes()) {
         throw std::logic_error(std::string("GDN replay ") + label +
                                " layout has an inconsistent byte size");
@@ -116,7 +116,7 @@ std::size_t GdnReplayRecordLayout::payload_bytes() const noexcept {
     return conv.region.bytes + key.region.bytes + value.region.bytes + gate.region.bytes;
 }
 
-GdnReplayRecords::GdnReplayRecords(DeviceSpan backing, const GdnReplayRecordLayout& layout)
+GdnReplayRecords::GdnReplayRecords(MemorySpan backing, const GdnReplayRecordLayout& layout)
     : conv(layout.conv.bind(backing)), key(layout.key.bind(backing)),
       value(layout.value.bind(backing)), gate(layout.gate.bind(backing)), spec(layout.spec) {
     validate_layout(layout);

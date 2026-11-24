@@ -29,31 +29,36 @@ inline CUtensorMap make_indexer_key_map(const IndexerArguments& a, std::size_t s
     return map;
 }
 
+template <class Arguments>
 struct IndexerTmaStorage {
     static constexpr int Stages = 2;
     __nv_bfloat16 keys[Stages * 64 * 128];
     std::uint64_t ready[Stages];
-    ScoreWorkMap<kIndexerMaxWindowQueries / 4> jobs;
+    std::conditional_t<Arguments::ragged, RaggedScoreJobs<kIndexerMaxWindowQueries>,
+                       ScoreWorkMap<kIndexerMaxWindowQueries / 4>>
+        jobs;
 };
 
-inline constexpr std::size_t kIndexerTmaSharedBytes = sizeof(IndexerTmaStorage);
+template <class Arguments>
+inline constexpr std::size_t kIndexerTmaSharedBytes = sizeof(IndexerTmaStorage<Arguments>);
 
 __device__ __forceinline__ int indexer_tma_key_offset(int row, int d) {
     const int logical = row / 16 * 2048 + d / 64 * 1024 + row % 16 * 64 + d % 64;
     return logical ^ (((logical / 64) & 7) * 8);
 }
 
+template <class Arguments>
 __global__
-__launch_bounds__(128) void indexer_score_tma_kernel(const __grid_constant__ IndexerArguments a,
+__launch_bounds__(128) void indexer_score_tma_kernel(const __grid_constant__ Arguments a,
                                                      const __grid_constant__ CUtensorMap map) {
-    constexpr int Stages = IndexerTmaStorage::Stages;
+    constexpr int Stages = IndexerTmaStorage<Arguments>::Stages;
     constexpr int Tile = 4, Threads = 128, KeyGroups = 4, WarpKeys = 16, NT = 2;
     if (a.columns <= kIndexerSelected) return;
     extern __shared__ __align__(1024) unsigned char shared[];
-    auto& s    = *reinterpret_cast<IndexerTmaStorage*>(shared);
+    auto& s    = *reinterpret_cast<IndexerTmaStorage<Arguments>*>(shared);
     auto& jobs = s.jobs;
     if (!jobs.template build<Tile>(a)) return;
-    const int total = jobs.prefix[jobs.groups];
+    const int total = indexer_score_jobs(jobs);
     if (blockIdx.x >= total) return;
     const int tid = threadIdx.x, lane = tid % 32, warp = tid / 32;
     const int per_row = (a.width + Tile - 1) / Tile;
@@ -65,13 +70,14 @@ __launch_bounds__(128) void indexer_score_tma_kernel(const __grid_constant__ Ind
     }
     __syncthreads();
     const auto stage = [&](int job, int buffer) {
-        const int group = jobs.group_for(job), b = group / per_row;
-        const int first = (job - jobs.prefix[group]) * 64;
-        const int rows = min(64, jobs.length[group] - first), full_pages = rows / 16;
+        const int group = jobs.group_for(job), b = Arguments::ragged ? 0 : group / per_row;
+        const int first   = (job - indexer_score_job_begin(jobs, group)) * 64;
+        const int segment = indexer_segment(a, indexer_score_start(jobs, group, 0), b);
+        const int rows = min(64, indexer_score_length(jobs, group) - first), full_pages = rows / 16;
         auto* tile = s.keys + buffer * 64 * 128;
         if (tid == 0) {
             common::cta_mbarrier_arrive_expect_tx(&s.ready[buffer], full_pages * 4096);
-            const auto* table = a.tables + std::int64_t(a.table_rows[b]) * a.table_stride;
+            const auto* table = a.tables + std::int64_t(a.table_rows[segment]) * a.table_stride;
 #pragma unroll
             for (int page = 0; page < 4; ++page) {
                 if (page < full_pages) {
@@ -87,7 +93,7 @@ __launch_bounds__(128) void indexer_score_tma_kernel(const __grid_constant__ Ind
                 const int row = tail_first + i / 16, d = i % 16 * 8;
                 auto* out = tile + indexer_tma_key_offset(row, d);
                 if (row < rows)
-                    common::cp_async<16, Cache::cg>(out, a.key(b, first + row) + d);
+                    common::cp_async<16, Cache::cg>(out, a.key(segment, first + row) + d);
                 else
                     common::store_vec(out, make_int4(0, 0, 0, 0));
             }
@@ -99,16 +105,24 @@ __launch_bounds__(128) void indexer_score_tma_kernel(const __grid_constant__ Ind
     unsigned qf[8][4];
     int previous = -1, limit[2], slot[2];
     for (int job = blockIdx.x, iteration = 0; job < total; job += gridDim.x, ++iteration) {
-        const int group = jobs.group_for(job), b = group / per_row;
-        const int q0 = group % per_row * Tile, first = (job - jobs.prefix[group]) * 64;
+        const int group = jobs.group_for(job), b = Arguments::ragged ? 0 : group / per_row;
+        const int q0     = indexer_score_start(jobs, group, group % per_row * Tile),
+                  first  = (job - indexer_score_job_begin(jobs, group)) * 64;
         const int buffer = iteration % Stages;
         if (group != previous) {
+            const int q_end = indexer_score_end(jobs, group, a.width);
 #pragma unroll
             for (int half = 0; half < 2; ++half) {
                 const int row = warp / KeyGroups * 16 + lane / 4 + half * 8;
                 const int t   = q0 + row / 4;
                 slot[half]    = b * a.width + t;
-                limit[half]   = t < a.width ? a.visible(slot[half]) : 0;
+                limit[half]   = [&] {
+                    if (t >= q_end) return 0;
+                    if constexpr (Arguments::ragged)
+                        return jobs.tiles[group].visible(t);
+                    else
+                        return a.visible(slot[half]);
+                }();
 #pragma unroll
                 for (int k = 0; k < 8; ++k) {
 #pragma unroll
@@ -125,7 +139,7 @@ __launch_bounds__(128) void indexer_score_tma_kernel(const __grid_constant__ Ind
             previous = group;
         }
         if (tid == 0) common::cta_mbarrier_wait(&s.ready[buffer], (iteration / Stages) & 1);
-        if (min(64, jobs.length[group] - first) % 16) common::cp_wait<0>();
+        if (min(64, indexer_score_length(jobs, group) - first) % 16) common::cp_wait<0>();
         __syncthreads();
         const int next = job + gridDim.x;
         if (next < total) stage(next, 1 - buffer);

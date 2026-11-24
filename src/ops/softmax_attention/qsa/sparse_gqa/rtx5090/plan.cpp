@@ -306,6 +306,31 @@ SparseGqaPlan select_sparse_gqa_plan(KvCacheStorage storage, int tokens, int bat
     return plan;
 }
 
+int sparse_gqa_long_direct_tokens(ContextBucket bucket) {
+    return bucket == ContextBucket::K2 ? 0 : 1024;
+}
+
+SparseGqaPackedWindows sparse_gqa_packed_windows(KvCacheStorage storage, int kv_heads,
+                                                 ContextBucket bucket, bool peeled_run) {
+    if (bucket == ContextBucket::K2) return {kSparseGqaSlab};
+    // Short BF16 windows restore the split parallelism of compact segment histories.
+    // Longer segments reuse their cache across a wider window. The 24/4 FP8 path
+    // keeps its warp-addressed key gathering at 128 queries.
+    if (kv_heads == 1) return {kSparseGqaSlab};
+    if (storage == KvCacheStorage::BFloat16) {
+        // The 128-query split schedule reduces scratch and latency in the short
+        // run beside a direct span. Unpeeled 24/4 batches retain the wide window.
+        return {64, kv_heads == 4 && !peeled_run ? 256 : 128};
+    }
+    if (kv_heads == 2 && storage == KvCacheStorage::Fp8E4m3fnGroup128Ue8m0) return {256};
+    return {128};
+}
+
+SparseGqaPlan select_sparse_gqa_packed_window_plan(KvCacheStorage storage, int width, int, int,
+                                                   int kv_heads, ContextBucket bucket, int sms) {
+    return select_sparse_gqa_plan(storage, width, 1, kv_heads, bucket, sms);
+}
+
 SparseGqaLaunchPlan select_sparse_gqa_launch(KvCacheStorage storage, int kv_heads, ContextBucket,
                                              SparseGqaPlan plan, int queries, int, int sms,
                                              bool vector_cache) {

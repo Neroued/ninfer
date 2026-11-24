@@ -4,17 +4,16 @@
 namespace ninfer::ops::detail::qsa {
 
 template <KvCacheStorage Storage, int N, int Queries, bool Vector,
-          SparseGqaLoad Load = SparseGqaLoad::Direct, int KvHeads>
+          SparseGqaLoad Load = SparseGqaLoad::Direct, int KvHeads, bool Ragged>
 __device__ __forceinline__ void
-sparse_gqa_all_select(SparseGqaKernelArguments<KvHeads> a,
+sparse_gqa_all_select(SparseGqaKernelArguments<KvHeads, Ragged> a,
                       SparseGqaStorage<Storage, N, Queries, Load>& s, std::int64_t first, int head,
                       std::uint16_t* qs) {
     constexpr int Nt = N / 8, Ks = N / 16;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid / 32;
     const auto total   = std::int64_t(a.tokens) * a.batch;
-    const int b        = first / a.tokens;
-    const auto last    = min(first + Queries, std::int64_t(b) * a.tokens + a.valid[b]);
-    const int end      = last > first ? a.positions[last - 1] + 1 : 0;
+    const auto last    = a.packet_end(first, Queries);
+    const int end = last > first ? (Ragged ? a.work(last - 1).size : a.positions[last - 1] + 1) : 0;
     const auto q       = first + warp;
     const bool live    = q < last;
     const int position = live ? a.positions[q] : -1;
@@ -133,9 +132,9 @@ sparse_gqa_all_select(SparseGqaKernelArguments<KvHeads> a,
 }
 
 template <KvCacheStorage Storage, int N, int Queries, bool Vector,
-          SparseGqaLoad Load = SparseGqaLoad::Direct, int KvHeads>
+          SparseGqaLoad Load = SparseGqaLoad::Direct, int KvHeads, bool Ragged>
 __launch_bounds__(Queries * 32) __global__
-    void sparse_gqa_all_select_kernel(SparseGqaKernelArguments<KvHeads> a) {
+    void sparse_gqa_all_select_kernel(SparseGqaKernelArguments<KvHeads, Ragged> a) {
     extern __shared__ __align__(16) unsigned char smem[];
     auto& s          = *reinterpret_cast<SparseGqaStorage<Storage, N, Queries, Load>*>(smem);
     const auto first = a.begin + std::int64_t(a.group_query(blockIdx.x)) * Queries,

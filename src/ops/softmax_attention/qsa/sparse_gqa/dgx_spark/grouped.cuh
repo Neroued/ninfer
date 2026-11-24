@@ -19,7 +19,8 @@ struct SparseGqaGroupedInstance {
         std::size_t(kQueries * 12 * 256 * sizeof(float)));
 };
 
-void launch_sparse_gqa_fp8_grouped(const SparseGqaArguments& arguments, int kv_heads, int splits,
+template <class Arguments>
+void launch_sparse_gqa_fp8_grouped(const Arguments& arguments, int kv_heads, int splits,
                                    int queries, CudaExecutionView execution);
 
 } // namespace ninfer::ops::detail::qsa

@@ -69,9 +69,10 @@ OpGraphProfile qsa_indexer_graph_profile(ContextBucket bucket, std::int32_t batc
     return detail::make_op_graph_profile(words);
 }
 
-void qsa_indexer(const Tensor& query, const ConstQsaIndexCacheView& cache,
-                 const QsaBatchView& batch, ContextBucket bucket, MemoryArena& workspace,
-                 QsaBlockSelection& out, CudaExecutionView execution) {
+namespace {
+void indexer(const Tensor& query, const ConstQsaIndexCacheView& cache, const QsaBatchView& batch,
+             ContextBucket bucket, MemoryArena& workspace, QsaBlockSelection& out,
+             CudaExecutionView execution, const RaggedSequenceView* ragged = nullptr) {
     ContextBucketRange{bucket}.validate(ContextBucket::K256, "qsa_indexer");
     if (workspace.device() != execution.device()) {
         throw std::invalid_argument("QSA workspace belongs to another device");
@@ -81,8 +82,8 @@ void qsa_indexer(const Tensor& query, const ConstQsaIndexCacheView& cache,
     v.require(tokens >= 1 && rows >= 1, "T/B");
     v.dense(query, DType::BF16, {128, 4, tokens, rows}, 16, "query");
     v.dense(batch.positions, DType::I32, {tokens, rows, 1, 1}, 4, "positions");
-    v.metadata(batch.valid_columns, rows, "valid columns");
-    v.metadata(batch.table_rows, rows, "table rows");
+    v.metadata(batch.valid_columns, ragged ? ragged->num_seqs() : rows, "valid columns");
+    v.metadata(batch.table_rows, ragged ? ragged->num_seqs() : rows, "table rows");
     common::operand::paged_plane(cache.keys, DType::BF16, {128, 16, 1}, 2, "qsa_indexer",
                                  "index pages", execution.device());
     v.require(cache.keys.records.page_tokens == 64 && cache.keys.plane.geometry.tokens_per_row == 4,
@@ -90,30 +91,45 @@ void qsa_indexer(const Tensor& query, const ConstQsaIndexCacheView& cache,
     const auto& table = cache.keys.records.page_offsets;
     v.dense(out.block_ids, DType::I32, {512, tokens, rows, 1}, 4, "block ids");
     v.dense(out.block_counts, DType::I32, {tokens, rows, 1, 1}, 4, "block counts");
-    const Tensor* inputs[]{&query, &table, &batch.positions, &batch.valid_columns,
-                           &batch.table_rows};
+    const Tensor* inputs[]{&query,
+                           &table,
+                           &batch.positions,
+                           &batch.valid_columns,
+                           &batch.table_rows,
+                           ragged ? &ragged->cu_seqlens : nullptr,
+                           ragged ? &ragged->token_to_seq : nullptr};
     v.require(!v.overlap(out.block_ids, out.block_counts), "output overlap");
     for (const auto* dst : {&out.block_ids, &out.block_counts})
-        for (const auto* src : inputs) v.require(!v.overlap(*dst, *src), "output/input overlap");
+        for (const auto* src : inputs)
+            if (src) v.require(!v.overlap(*dst, *src), "output/input overlap");
     const auto plan    = detail::qsa::select_indexer_plan(tokens, rows, bucket);
     auto scope         = workspace.scope();
     const auto scratch = detail::qsa::allocate_indexer_workspace(workspace, plan);
     for (const auto* work : {&scratch.scores, &scratch.candidates}) {
         if (!work->data) continue;
         for (const auto* src : inputs)
-            v.require(!v.overlap(*work, *src), "workspace/input overlap");
+            if (src) v.require(!v.overlap(*work, *src), "workspace/input overlap");
         for (const auto* dst : {&out.block_ids, &out.block_counts})
             v.require(!v.overlap(*work, *dst), "workspace/output overlap");
     }
-    detail::qsa::launch_indexer(query, cache, batch, plan, scratch, out, execution);
+    detail::qsa::launch_indexer(query, cache, batch, plan, scratch, out, execution,
+                                ragged && ragged->num_seqs() > 1 ? ragged : nullptr);
+}
+} // namespace
+
+void qsa_indexer(const Tensor& query, const ConstQsaIndexCacheView& cache,
+                 const QsaBatchView& batch, ContextBucket bucket, MemoryArena& workspace,
+                 QsaBlockSelection& out, CudaExecutionView execution) {
+    indexer(query, cache, batch, bucket, workspace, out, execution);
 }
 
 std::size_t qsa_indexer_ragged_workspace_capacity_bytes(ContextBucketRange buckets, int min_tokens,
                                                         int max_tokens, int min_segments,
                                                         int max_segments) {
-    const auto widths = common::operand::ragged_envelope(min_tokens, max_tokens, min_segments,
-                                                         max_segments, "qsa_indexer");
-    return qsa_indexer_workspace_capacity_bytes(buckets, 1, widths.first, widths.last);
+    (void)common::operand::ragged_envelope(min_tokens, max_tokens, min_segments, max_segments,
+                                           "qsa_indexer");
+    return qsa_indexer_workspace_capacity_bytes(buckets, 1, std::max(min_tokens, min_segments),
+                                                max_tokens);
 }
 
 void qsa_indexer(const Tensor& query, const ConstQsaIndexCacheView& cache,
@@ -128,25 +144,8 @@ void qsa_indexer(const Tensor& query, const ConstQsaIndexCacheView& cache,
     operand::tensor(query, DType::BF16, {128, 4, n}, 16, op, "query", device);
     operand::tensor(out.block_ids, DType::I32, {512, n}, 4, op, "block ids", device);
     operand::tensor(out.block_counts, DType::I32, {n}, 4, op, "block counts", device);
-    const std::array outputs{operand::range(out.block_ids, op),
-                             operand::range(out.block_counts, op)};
-    operand::disjoint(outputs, op);
-    const auto table = operand::blocks(cache.keys.records.page_offsets, op);
-    for (const auto range : outputs) {
-        v.require(!operand::overlaps(table, range), "output overlaps page table");
-        for (const Tensor* input : {&query, &batch.positions, &batch.table_rows, &seq.cu_seqlens,
-                                    &seq.seq_lengths, &seq.token_to_seq})
-            operand::disjoint(range, operand::range(*input, op), op);
-    }
-    for (int s = 0; s < seq.num_seqs(); ++s) {
-        const int begin = seq.segment_begin(s), len = seq.segment_length(s);
-        const QsaBatchView segment{batch.positions.slice(0, begin, len),
-                                   seq.seq_lengths.slice(0, s, 1), batch.table_rows.slice(0, s, 1)};
-        QsaBlockSelection result{out.block_ids.slice(1, begin, len),
-                                 out.block_counts.slice(0, begin, len)};
-        qsa_indexer(query.slice(2, begin, len), cache, segment, bucket, workspace, result,
-                    execution);
-    }
+    const QsaBatchView flat{batch.positions, seq.seq_lengths, batch.table_rows};
+    indexer(query, cache, flat, bucket, workspace, out, execution, &seq);
 }
 
 } // namespace ninfer::ops

@@ -6,8 +6,8 @@
 
 namespace ninfer::ops::detail::qsa {
 
-template <int KvHeads>
-__device__ __forceinline__ void sparse_gqa_store(const SparseGqaKernelArguments<KvHeads>& a,
+template <int KvHeads, bool Ragged>
+__device__ __forceinline__ void sparse_gqa_store(const SparseGqaKernelArguments<KvHeads, Ragged>& a,
                                                  std::int64_t q, int h, int d, float x, float y) {
     const auto offset = (q * a.query_heads + h) * 256 + d;
     const float2 gate =
@@ -17,10 +17,10 @@ __device__ __forceinline__ void sparse_gqa_store(const SparseGqaKernelArguments<
     *reinterpret_cast<unsigned*>(a.out + offset) = common::pack_bf16x2(x, y);
 }
 
-template <int KvHeads>
-__device__ __forceinline__ void sparse_gqa_store_vector(const SparseGqaKernelArguments<KvHeads>& a,
-                                                        std::int64_t q, int h,
-                                                        const float (&values)[8], uint4 gates) {
+template <int KvHeads, bool Ragged>
+__device__ __forceinline__ void
+sparse_gqa_store_vector(const SparseGqaKernelArguments<KvHeads, Ragged>& a, std::int64_t q, int h,
+                        const float (&values)[8], uint4 gates) {
     const unsigned words[4]{gates.x, gates.y, gates.z, gates.w};
     unsigned output[4];
 #pragma unroll
@@ -36,19 +36,19 @@ __device__ __forceinline__ void sparse_gqa_store_vector(const SparseGqaKernelArg
     common::store_vec(a.out + offset, make_uint4(output[0], output[1], output[2], output[3]));
 }
 
-template <int KvHeads>
-__device__ __forceinline__ void sparse_gqa_store_vector(const SparseGqaKernelArguments<KvHeads>& a,
-                                                        std::int64_t q, int h,
-                                                        const float (&values)[8]) {
+template <int KvHeads, bool Ragged>
+__device__ __forceinline__ void
+sparse_gqa_store_vector(const SparseGqaKernelArguments<KvHeads, Ragged>& a, std::int64_t q, int h,
+                        const float (&values)[8]) {
     const auto offset = (q * a.query_heads + h) * 256 + threadIdx.x % 32 * 8;
     sparse_gqa_store_vector(a, q, h, values, common::load_vec<uint4>(a.gate + offset));
 }
 
 // One warp writes its six-head group. Fetch the following head's gates while
 // processing the current FP32 row, rather than serializing 24 narrow gate loads.
-template <bool Inverse, int KvHeads>
+template <bool Inverse, int KvHeads, bool Ragged>
 __device__ __forceinline__ void
-sparse_gqa_compact_store_vector(const SparseGqaKernelArguments<KvHeads>& a, std::int64_t q,
+sparse_gqa_compact_store_vector(const SparseGqaKernelArguments<KvHeads, Ragged>& a, std::int64_t q,
                                 int first_head, const float* rows) {
     static_assert(KvHeads == 2 || KvHeads == 4);
     const int lane  = threadIdx.x % 32;
@@ -69,9 +69,10 @@ sparse_gqa_compact_store_vector(const SparseGqaKernelArguments<KvHeads>& a, std:
 
 // A warp holds a complete FP32 value row. Basis inversion precedes the elementwise gate;
 // only the final public output crosses BF16 storage.
-template <int KvHeads>
-__device__ __forceinline__ void sparse_gqa_inverse_gate(const SparseGqaKernelArguments<KvHeads>& a,
-                                                        std::int64_t q, int h, float (&values)[8]) {
+template <int KvHeads, bool Ragged>
+__device__ __forceinline__ void
+sparse_gqa_inverse_gate(const SparseGqaKernelArguments<KvHeads, Ragged>& a, std::int64_t q, int h,
+                        float (&values)[8]) {
     const int lane = threadIdx.x % 32;
     kv::normalized_hadamard_d256_inplace(values, lane);
 #pragma unroll
@@ -83,8 +84,8 @@ __device__ __forceinline__ void sparse_gqa_inverse_gate(const SparseGqaKernelArg
     }
 }
 
-template <int Warps, int Queries, int KvHeads>
-__device__ void sparse_gqa_inverse_rows(const SparseGqaKernelArguments<KvHeads>& a,
+template <int Warps, int Queries, int KvHeads, bool Ragged>
+__device__ void sparse_gqa_inverse_rows(const SparseGqaKernelArguments<KvHeads, Ragged>& a,
                                         std::int64_t first, std::int64_t last, int head,
                                         const float* rows) {
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;

@@ -1,5 +1,6 @@
 #include "ops/suite.h"
-#include "ops/ragged_fixture.h"
+#include "packed_fixture.h"
+#include "ops/softmax_attention/qsa/sparse_gqa/plan.h"
 #include "ops/graph_patch_check.h"
 #include "core/platform.h"
 #include "kv_cache_storage.h"
@@ -7,6 +8,7 @@
 #include "cuda_fixture.h"
 #include "core/buffer.h"
 #include "core/decode_graph.h"
+#include <numeric>
 #include <utility>
 
 using namespace ninfer;
@@ -121,43 +123,349 @@ int run(DeviceContext& device, int t, int b, int history, bool padded = false, i
     return failures;
 }
 
-int ragged_sparse(KvCacheStorage storage) {
-    RaggedFixture ragged({1, 17, 3});
-    constexpr int width = 17;
+int ragged_sparse(KvCacheStorage storage, std::vector<int> lengths, int kv_heads, bool natural,
+                  bool prefix_only, bool graph, ContextBucket forced_bucket = ContextBucket::K2) {
+    RaggedFixture ragged(std::move(lengths));
+    const int width = *std::max_element(ragged.lengths.begin(), ragged.lengths.end());
     const int n = ragged.tokens(), s = ragged.segments();
-    Fixture f(width, s, 112, false, storage);
-    f.reset();
-    f.valid = ragged.lengths;
-    f.lengths.copy_from_host(f.valid.data(), s * 4);
-    for (int b = 0; b < s; ++b)
-        for (int t = f.valid[b]; t < width; ++t) f.visible[b * width + t].clear();
-    const int elements = 256 * f.q_heads;
-    auto q             = to_device(ragged.pack(f.qhost, width, elements));
-    auto gate          = to_device(ragged.pack(f.ghost, width, elements));
-    auto pos           = to_device(ragged.pack(f.positions, width, 1));
-    auto ids           = to_device(ragged.pack(f.ids, width, 512));
-    auto counts        = to_device(ragged.pack(f.counts, width, 1));
-    const ops::QsaRaggedBatchView batch{ragged.view, Tensor(pos.span(), DType::I32, {n}),
-                                        f.batch.table_rows};
-    const ops::QsaBlockSelection selected{Tensor(ids.span(), DType::I32, {512, n}),
-                                          Tensor(counts.span(), DType::I32, {n})};
-    GuardedDeviceBuffer output(n * elements * 2ULL);
-    Tensor out(output.span(), DType::BF16, {256, f.q_heads, n});
-    const auto execution = cuda_environment().default_execution;
+    const int history = prefix_only ? 192 : 2064;
+    Fixture f(width, s, history, natural, storage, natural, kv_heads == 1 ? 12 : 24, kv_heads);
+    f.bucket             = std::max(f.bucket, forced_bucket);
+    const int elements   = 256 * f.q_heads;
+    const auto shape     = Tensor::metadata(DType::BF16, {256, f.q_heads, n});
+    const auto flat      = Tensor::metadata(DType::I32, {n});
+    const auto ids       = Tensor::metadata(DType::I32, {512, n});
+    const auto prefix    = qsa::prefix_bytes({ragged.view.cu_seqlens, ragged.view.seq_lengths,
+                                              ragged.view.token_to_seq, shape, shape, shape, flat,
+                                              f.batch.table_rows, ids, flat});
+    const auto execution = cuda_environment().context.execution_view();
     const auto bytes     = ops::qsa_sparse_gqa_ragged_workspace_capacity_bytes(
         storage, f.q_heads, f.kv_heads, f.bucket, n, n, s, s, execution.multiprocessor_count());
-    GuardedDeviceBuffer scratch(std::max<std::size_t>(256, bytes));
-    MemoryArena arena(scratch.span());
-    ops::qsa_sparse_gqa(Tensor(q.span(), DType::BF16, {256, f.q_heads, n}),
-                        Tensor(gate.span(), DType::BF16, {256, f.q_heads, n}), f.cache, batch,
-                        selected, f.bucket, arena, out, execution);
-    cuda_synchronize();
-    const auto padded =
-        ragged.unpack(from_device<std::uint16_t>(output.data(), n * elements), width, elements);
-    f.out.copy_from_host(padded.data(), padded.size() * 2);
-    return verify(f, "ragged QSA sparse attention") + output.verify_guards("ragged output") +
-           scratch.verify_guards("ragged workspace") +
-           (arena.used() != 0 || arena.peak_used() > bytes);
+    GuardedDeviceBuffer backing(prefix + bytes);
+    MemoryArena arena(backing.span());
+    const auto seq  = qsa::packed_metadata(arena, ragged);
+    const auto q    = qsa::packed_tensor(arena, DType::BF16, {256, f.q_heads, n});
+    const auto gate = qsa::packed_tensor(arena, DType::BF16, {256, f.q_heads, n});
+    auto out        = qsa::packed_tensor(arena, DType::BF16, {256, f.q_heads, n});
+    const ops::QsaRaggedBatchView batch{seq, qsa::packed_tensor(arena, DType::I32, {n}),
+                                        qsa::packed_tensor(arena, DType::I32, {s})};
+    const ops::QsaBlockSelection selected{qsa::packed_tensor(arena, DType::I32, {512, n}),
+                                          qsa::packed_tensor(arena, DType::I32, {n})};
+    qsa::finish_prefix(arena, prefix);
+    const auto launch = [&] {
+        ops::qsa_sparse_gqa(q, gate, f.cache, batch, selected, f.bucket, arena, out, execution);
+    };
+    DecodeGraphDefinition definition;
+    DecodeGraphExecutable executable;
+    int failures = 0;
+    for (int phase = 0; phase < (graph ? 2 : 1); ++phase) {
+        std::vector<int> ends(s), caps(s);
+        for (int b = 0; b < s; ++b) {
+            if (prefix_only) {
+                ends[b] = ragged.lengths[b] + (b % 3) * 5;
+                caps[b] = 512;
+            } else {
+                constexpr int count_cases[]{0, 1, 511, 512};
+                caps[b] = count_cases[(b + phase) % 4];
+                ends[b] =
+                    caps[b] >= 511 ? 2055 + (b + phase) % 4 : ragged.lengths[b] + 3 + b * phase;
+            }
+        }
+        f.reset(phase, 512, 0.7F, ragged.lengths, ends, caps);
+        const auto upload = [](const Tensor& dst, const auto& words) {
+            CUDA_CHECK(cudaMemcpy(dst.data, words.data(), dst.bytes(), cudaMemcpyHostToDevice));
+        };
+        const auto q_words    = ragged.pack(f.qhost, width, elements);
+        const auto gate_words = ragged.pack(f.ghost, width, elements);
+        const auto positions  = ragged.pack(f.positions, width, 1);
+        const auto counts     = ragged.pack(f.counts, width, 1);
+        const auto blocks     = ragged.pack(f.ids, width, 512);
+        upload(q, q_words);
+        upload(gate, gate_words);
+        upload(batch.positions, positions);
+        upload(batch.table_rows, f.selectors);
+        upload(selected.block_counts, counts);
+        upload(selected.block_ids, blocks);
+        CUDA_CHECK(cudaMemset(out.data, 0xff, out.bytes()));
+        CUDA_CHECK(cudaStreamSynchronize(nullptr));
+        if (graph) {
+            if (phase == 0) {
+                definition.capture(execution.stream(), launch);
+                executable.instantiate(definition);
+            }
+            executable.launch(execution.stream());
+        } else {
+            launch();
+        }
+        cuda_synchronize();
+        const auto preserved = [&](const char* name, const Tensor& t, const auto& expected) {
+            using Word = typename std::decay_t<decltype(expected)>::value_type;
+            return verify_exact(name, from_device<Word>(t.data, expected.size()), expected);
+        };
+        failures += preserved("packed query", q, q_words);
+        failures += preserved("packed gate", gate, gate_words);
+        failures += preserved("packed positions", batch.positions, positions);
+        failures += preserved("packed table rows", batch.table_rows, f.selectors);
+        failures += preserved("packed block counts", selected.block_counts, counts);
+        failures += preserved("packed block ids", selected.block_ids, blocks);
+        failures += preserved("packed cu_seqlens", seq.cu_seqlens, ragged.prefix);
+        failures += preserved("packed seq_lengths", seq.seq_lengths, ragged.lengths);
+        failures += preserved("packed token_to_seq", seq.token_to_seq, ragged.mapping);
+        const auto padded =
+            ragged.unpack(from_device<std::uint16_t>(out.data, n * elements), width, elements);
+        f.out.copy_from_host(padded.data(), padded.size() * 2);
+        failures += verify(f, "ragged QSA sparse attention");
+    }
+    return failures + backing.verify_guards("ragged sparse GQA workspace") +
+           (arena.used() != prefix || arena.peak_used() != prefix + bytes);
+}
+
+// Enumerate every launched window and compute the three-plane alignment without
+// the production capacity query's projection or direct-query bound.
+std::size_t run_layout_oracle(KvCacheStorage storage, int qh, int kh, ContextBucket bucket, int n,
+                              int segments, int sms, bool single = false, bool peeled = false) {
+    using namespace ops::detail::qsa;
+    const int width =
+        single ? n : sparse_gqa_packed_windows(storage, kh, bucket, peeled).limit(n, segments);
+    std::size_t result = 0;
+    for (int begin = 0; begin < n; begin += width) {
+        const int count = std::min(width, n - begin);
+        const auto plan = single ? select_sparse_gqa_plan(storage, count, 1, kh, bucket, sms)
+                                 : select_sparse_gqa_packed_window_plan(storage, count, n, segments,
+                                                                        kh, bucket, sms);
+        if (!plan.partial) continue;
+        const auto scalars = std::size_t(qh) * count * std::max(plan.splits, plan.natural_splits);
+        const auto bytes   = scalars * sizeof(float);
+        result             = std::max(result, 257 * bytes + ((bytes + 255) & ~std::size_t(255)));
+    }
+    return result;
+}
+
+std::size_t packed_partition_oracle(KvCacheStorage storage, int qh, int kh, ContextBucket bucket,
+                                    std::span<const int> lengths, int sms) {
+    if (lengths.size() == 1)
+        return run_layout_oracle(storage, qh, kh, bucket, lengths.front(), 1, sms, true);
+    const int cutoff  = ops::detail::qsa::sparse_gqa_long_direct_tokens(bucket);
+    const bool peeled = cutoff && std::any_of(lengths.begin(), lengths.end(),
+                                              [=](int length) { return length >= cutoff; });
+    std::size_t peak  = 0;
+    int n = 0, s = 0;
+    const auto finish_run = [&] {
+        if (s)
+            peak = std::max(peak,
+                            run_layout_oracle(storage, qh, kh, bucket, n, s, sms, false, peeled));
+        n = s = 0;
+    };
+    for (const int length : lengths) {
+        if (cutoff && length >= cutoff) {
+            finish_run();
+        } else {
+            n += length;
+            ++s;
+        }
+    }
+    finish_run();
+    return peak;
+}
+
+int ragged_capacity() {
+    int failures = 0;
+    for (const int sms : {48, 70, 96, 160, 170, 192}) {
+        for (const int kh : {1, 2, 4}) {
+#if !NINFER_TARGET_RTX5090
+            if (kh == 4) continue;
+#endif
+            const int qh = kh == 1 ? 12 : 24;
+            for (const auto storage :
+                 {KvCacheStorage::BFloat16, KvCacheStorage::Fp8E4m3fnGroup128Ue8m0}) {
+                for (const auto bounds : {std::array{1, 40, 1, 5}, std::array{62, 135, 2, 3},
+                                          std::array{255, 269, 2, 2}, std::array{1, 512, 2, 2}}) {
+                    const auto [lo, hi, min_s, max_s] = bounds;
+                    constexpr ContextBucketRange buckets{ContextBucket::K32, ContextBucket::K64};
+                    std::size_t peak = 0;
+                    buckets.for_each([&](ContextBucket bucket) {
+                        for (int n = lo; n <= hi; ++n)
+                            for (int segments = min_s; segments <= std::min(max_s, n); ++segments)
+                                peak =
+                                    std::max(peak, run_layout_oracle(storage, qh, kh, bucket, n,
+                                                                     segments, sms, segments == 1));
+                    });
+                    failures += peak != ops::qsa_sparse_gqa_ragged_workspace_capacity_bytes(
+                                            storage, qh, kh, buckets, lo, hi, min_s, max_s, sms);
+                }
+            }
+        }
+    }
+
+    constexpr auto storage = KvCacheStorage::BFloat16;
+    constexpr auto bucket  = ContextBucket::K64;
+    const int sms          = cuda_environment().context.execution_view().multiprocessor_count();
+    std::size_t high       = 0;
+    int witness = 0, hi = 256;
+    const auto low = run_layout_oracle(storage, 24, 2, bucket, 2, 2, sms);
+    for (int n = 3; n <= hi; ++n) {
+        const auto bytes = run_layout_oracle(storage, 24, 2, bucket, n, 2, sms);
+        if (bytes > high) {
+            high    = bytes;
+            witness = n;
+        } else if (high > low && bytes < high) {
+            hi = n;
+            break;
+        }
+    }
+    const auto envelope = ops::qsa_sparse_gqa_ragged_workspace_capacity_bytes(
+        storage, 24, 2, bucket, 2, hi, 2, 2, sms);
+    failures += high != envelope || high <= low ||
+                high <= run_layout_oracle(storage, 24, 2, bucket, hi, 2, sms);
+    if (!witness) return failures + 1;
+    // ragged_sparse checks actual arena peak against the point capacity.
+    failures += envelope != ops::qsa_sparse_gqa_ragged_workspace_capacity_bytes(
+                                storage, 24, 2, bucket, witness, witness, 2, 2, sms);
+    failures +=
+        ragged_sparse(storage, {witness / 2, witness - witness / 2}, 2, true, true, false, bucket);
+#if NINFER_TARGET_RTX5090
+    const int window = ops::detail::qsa::sparse_gqa_packed_windows(storage, 2, bucket).short_width;
+    failures += ragged_sparse(storage, {window / 2, window / 2 + 3}, 2, true, true, false, bucket);
+#endif
+    return failures;
+}
+
+int peeled_capacity() {
+    constexpr auto bucket  = ContextBucket::K64;
+    constexpr auto storage = KvCacheStorage::BFloat16;
+    const int cutoff       = ops::detail::qsa::sparse_gqa_long_direct_tokens(bucket);
+    int failures           = 0;
+    // Enumerate all ordered two-segment partitions. These envelopes include a
+    // cutoff straddle, a bounded-window remainder, and the absence of an
+    // unpeeled partition when both segments cannot fit below the cutoff.
+    for (const int kh : {2, 4}) {
+        if (!NINFER_TARGET_RTX5090 && kh == 4) continue;
+        for (const int sms : {48, 170}) {
+            for (const int n : {cutoff - 1, cutoff + 1, cutoff + 129, 2 * cutoff + 3, 4096}) {
+                std::size_t peak = 0;
+                for (int first = 1; first < n; ++first) {
+                    const std::array lengths{first, n - first};
+                    peak = std::max(peak,
+                                    packed_partition_oracle(storage, 24, kh, bucket, lengths, sms));
+                }
+                failures += peak != ops::qsa_sparse_gqa_ragged_workspace_capacity_bytes(
+                                        storage, 24, kh, bucket, n, n, 2, 2, sms);
+            }
+        }
+    }
+    // Three segments allow a short run on either side of a peeled span, a
+    // two-segment run, and the need to reserve a segment outside that run.
+    const int n = cutoff + 136, sms = 48;
+    auto peak = run_layout_oracle(storage, 24, 2, bucket, n, 3, sms);
+    for (int first = 1; first <= n - cutoff; ++first)
+        for (int second = 1; second <= n - cutoff - first; ++second) {
+            const int long_segment = n - first - second;
+            for (const auto lengths :
+                 {std::array{long_segment, first, second}, std::array{first, long_segment, second},
+                  std::array{first, second, long_segment}}) {
+                peak =
+                    std::max(peak, packed_partition_oracle(storage, 24, 2, bucket, lengths, sms));
+            }
+        }
+    failures += peak != ops::qsa_sparse_gqa_ragged_workspace_capacity_bytes(storage, 24, 2, bucket,
+                                                                            n, n, 3, 3, sms);
+    return failures;
+}
+
+int peeled_sparse(std::vector<int> lengths, int kh, bool graph) {
+    constexpr auto storage = KvCacheStorage::BFloat16;
+    constexpr auto bucket  = ContextBucket::K64;
+    const RaggedFixture ragged(std::move(lengths));
+    const int n = ragged.tokens(), s = ragged.segments(), qh = kh == 1 ? 12 : 24;
+    const auto execution = cuda_environment().context.execution_view();
+    const int sms        = execution.multiprocessor_count();
+    const auto bytes     = packed_partition_oracle(storage, qh, kh, bucket, ragged.lengths, sms);
+    const auto capacity  = ops::qsa_sparse_gqa_ragged_workspace_capacity_bytes(
+        storage, qh, kh, bucket, n, n, s, s, sms);
+    const int max_length  = *std::max_element(ragged.lengths.begin(), ragged.lengths.end());
+    const int table_width = (2056 + max_length + 63) / 64;
+    KVPageGeometry geometry;
+    geometry.planes = {{DType::BF16, 256, kh, 256, 1}, {DType::FP16, 256, kh, 256, 1}};
+    tool::PackedKVFixture pages(execution.device(), geometry, s);
+    DeviceBuffer table(execution.device(), std::size_t(table_width) * s * sizeof(std::int64_t));
+    const Tensor page_offsets(table.span(), DType::I64, {table_width, s});
+    const PagedKVBatchLayerView cache{
+        pages.plane(0, page_offsets), pages.plane(1, page_offsets), {}, {}, 256, kh, storage};
+    std::vector<std::int64_t> tables(std::size_t(table_width) * s);
+    std::vector<std::uint16_t> values(std::size_t(s) * kh * 64 * 256);
+    std::vector<int> dirty_pages(s);
+    std::iota(dirty_pages.begin(), dirty_pages.end(), 0);
+    for (int i = 0; i < s; ++i) {
+        std::fill_n(tables.data() + i * table_width, table_width, pages.physical_offset(i));
+        std::fill_n(values.data() + std::size_t(i) * kh * 64 * 256, kh * 64 * 256,
+                    ninfer::test::qsa::sparse::half((i % 2 ? -1.F : 1.F) * (1.F + i / 32.F)));
+    }
+    table.copy_from_host(tables.data(), page_offsets.bytes());
+    initialize_plane(pages, 0, std::uint16_t{0}, s);
+    upload_pages(pages, 1, std::span<const std::uint16_t>(values), dirty_pages);
+
+    const auto activation = Tensor::metadata(DType::BF16, {256, qh, n});
+    const auto position   = Tensor::metadata(DType::I32, {n});
+    const auto prefix     = qsa::prefix_bytes({activation, activation, activation, position,
+                                               Tensor::metadata(DType::I32, {s}),
+                                               Tensor::metadata(DType::I32, {512, n}), position});
+    GuardedDeviceBuffer backing(prefix + bytes);
+    MemoryArena arena(backing.span());
+    const auto query = qsa::packed_tensor(arena, DType::BF16, {256, qh, n});
+    const auto gate  = qsa::packed_tensor(arena, DType::BF16, {256, qh, n});
+    auto out         = qsa::packed_tensor(arena, DType::BF16, {256, qh, n});
+    const ops::QsaRaggedBatchView batch{ragged.view, qsa::packed_tensor(arena, DType::I32, {n}),
+                                        qsa::packed_tensor(arena, DType::I32, {s})};
+    const std::vector<int> counts(n, 1);
+    const ops::QsaBlockSelection blocks{qsa::packed_tensor(arena, DType::I32, {512, n}),
+                                        qsa::packed_tensor(arena, DType::I32, {n}, counts.data())};
+    qsa::finish_prefix(arena, prefix);
+    for (const auto* t : {&query, &gate, &blocks.block_ids})
+        CUDA_CHECK(cudaMemset(t->data, 0, t->bytes()));
+
+    const auto launch = [&] {
+        ops::qsa_sparse_gqa(query, gate, cache, batch, blocks, bucket, arena, out, execution);
+    };
+    DecodeGraphDefinition definition;
+    DecodeGraphExecutable executable;
+    int failures = bytes > capacity;
+    for (int phase = 0; phase <= int(graph); ++phase) {
+        std::vector<int> positions(n), rows(s);
+        for (int b = 0; b < s; ++b) {
+            rows[b] = phase ? b : s - 1 - b;
+            std::iota(positions.begin() + ragged.prefix[b],
+                      positions.begin() + ragged.prefix[b + 1], 2051 + phase);
+        }
+        CUDA_CHECK(cudaMemcpy(batch.positions.data, positions.data(), batch.positions.bytes(),
+                              cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(batch.table_rows.data, rows.data(), batch.table_rows.bytes(),
+                              cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemset(out.data, 0xff, out.bytes()));
+        CUDA_CHECK(cudaStreamSynchronize(nullptr));
+        if (graph) {
+            if (phase == 0) {
+                definition.capture(execution.stream(), launch);
+                executable.instantiate(definition);
+            }
+            executable.launch(execution.stream());
+        } else {
+            launch();
+        }
+        cuda_synchronize();
+        const auto words           = from_device<std::uint16_t>(out.data, out.numel());
+        const std::size_t features = 256 * qh;
+        for (int b = 0; b < s; ++b) {
+            // Every attended value is the same for this table row. Softmax
+            // weights sum to one, and the zero gate scales the result by 1/2.
+            const int row       = rows[b];
+            const auto expected = f32_to_bf16((row % 2 ? -0.5F : 0.5F) * (1.F + row / 32.F));
+            const auto begin    = words.begin() + features * ragged.prefix[b];
+            const auto end      = words.begin() + features * ragged.prefix[b + 1];
+            failures += std::any_of(begin, end, [&](auto word) { return word != expected; });
+        }
+    }
+    return failures + (arena.used() != prefix || arena.peak_used() != prefix + bytes) +
+           backing.verify_guards("peeled packed sparse arena") + !pages.guards_intact();
 }
 
 int gate_rounding(DeviceContext& device, KvCacheStorage storage = KvCacheStorage::BFloat16,
@@ -170,7 +478,8 @@ int gate_rounding(DeviceContext& device, KvCacheStorage storage = KvCacheStorage
     const int page = f.tables[f.selectors[0] * f.table_stride];
     for (int h = 0; h < f.kv_heads; ++h)
         for (int d = 0; d < 256; ++d)
-            f.values.host[f.values.offset(d, h, 0, page)] = half(1.00390625f);
+            f.values.host[f.values.offset(d, h, 0, page)] =
+                ninfer::test::qsa::sparse::half(1.00390625f);
     f.upload();
     if (f.encoded_value) {
         auto& v = *f.encoded_value;
@@ -195,7 +504,8 @@ int gate_rounding(DeviceContext& device, KvCacheStorage storage = KvCacheStorage
                     if (v.format.encoding == cache_reference::Encoding::Fp8)
                         v.scales.host[sb + g] = 127;
                     else
-                        cache_reference::write_u16(v.scales.host, sb + 2 * g, half(1.00390625f));
+                        cache_reference::write_u16(v.scales.host, sb + 2 * g,
+                                                   ninfer::test::qsa::sparse::half(1.00390625f));
                 }
             }
         }
@@ -319,8 +629,8 @@ int graph_update(DeviceContext& device, int tokens, int batch,
     DecodeGraphExecutable graph;
     int failures = 0;
     for (int history : {64, 2051, 8192, 64, 0}) {
-        f.history                     = std::max(1, history);
-        f.bucket                      = ops::select_context_bucket(history);
+        f.history = std::max(1, history);
+        f.bucket  = ops::select_context_bucket(history);
         f.reset(history ? 0 : 2);
         DecodeGraphDefinition definition;
         definition.capture(device.stream(), [&] { f.launch(workspace, device.execution_view()); });
@@ -575,8 +885,21 @@ void add_case(OpSuite& suite, int t, int b, int history, bool padded = false, in
 }
 
 void add_cases(OpSuite& suite, KvCacheStorage storage) {
-    suite.add(std::string("sparse_gqa/") + kv_cache_storage_name(storage) + "/ragged",
-              [=] { return ragged_sparse(storage); }, {{"format", kv_cache_storage_name(storage)}});
+    const std::string label =
+        std::string("sparse_gqa/") + kv_cache_storage_name(storage) + "/ragged";
+    for (const bool natural : {false, true})
+        suite.add(label + (natural ? "/natural" : "/aligned"),
+                  [=] {
+                      return ragged_sparse(storage, {1, 2, 3, 5, 7, 9, 15, 17, 33}, natural ? 1 : 2,
+                                           natural, false, false);
+                  },
+                  {{"format", kv_cache_storage_name(storage)}});
+    suite.add(label + "/packets",
+              [=] {
+                  return ragged_sparse(storage, {5, 5, 7, 9, 15, 17, 33, 65, 127, 129}, 2, false,
+                                       true, false);
+              },
+              {{"format", kv_cache_storage_name(storage)}});
     const std::string prefix = std::string("sparse_gqa/") + kv_cache_storage_name(storage);
     const auto special       = [&](std::string id, auto run, const char* execution = "eager") {
         suite.add(prefix + "/" + id, [=] { return run(cuda_environment().context); },
@@ -876,6 +1199,53 @@ int main(int argc, char** argv) {
                                      KvCacheStorage::Fp8E4m3fnGroup128Ue8m0, 1, false);
               },
               {{"format", "fp8"}, {"execution", "graph"}});
+    suite.add("sparse_gqa/ragged/capacity", ragged_capacity, {{"format", "fp8"}});
+    suite.add("sparse_gqa/ragged/peeled_capacity", peeled_capacity, {{"format", "fp8"}});
+    suite.add("sparse_gqa/ragged/peeled_long_first",
+              [] { return peeled_sparse({4095, 1}, 1, false); }, {{"format", "bf16"}});
+    suite.add("sparse_gqa/ragged/peeled_long_last",
+              [] { return peeled_sparse({1, 4095}, 2, true); }, {{"format", "bf16"}});
+    suite.add("sparse_gqa/ragged/peeled_many_short",
+              [] {
+                  std::vector<int> lengths(33, 1);
+                  lengths.front() = 3584;
+                  return peeled_sparse(std::move(lengths), 1, false);
+              },
+              {{"format", "bf16"}});
+    suite.add("sparse_gqa/ragged/peeled_window_remainder",
+              [] { return peeled_sparse({1024, 63}, 2, false); }, {{"format", "bf16"}});
+    suite.add("sparse_gqa/ragged/peeled_wide_short_run",
+              [] {
+                  return peeled_sparse({3584, 128, 128, 128, 128}, NINFER_TARGET_RTX5090 ? 4 : 2,
+                                       false);
+              },
+              {{"format", "bf16"}});
+    suite.add("sparse_gqa/ragged/peeled_between_short_runs",
+              [] { return peeled_sparse({128, 1024, 63, 1024, 5}, 2, false); },
+              {{"format", "bf16"}});
+    suite.add("sparse_gqa/ragged/replay",
+              [] {
+                  return ragged_sparse(KvCacheStorage::Fp8E4m3fnGroup128Ue8m0, {1, 2, 3, 5, 7, 9},
+                                       2, false, false, true);
+              },
+              {{"format", "fp8"}, {"execution", "graph"}});
+#if NINFER_TARGET_RTX5090
+    suite.add("sparse_gqa/ragged/24_4_packets",
+              [] {
+                  return ragged_sparse(KvCacheStorage::Fp8KeyNvfp4Value, {5, 5, 7, 9}, 4, true,
+                                       true, false);
+              },
+              {{"format", "k8v4"}});
+    suite.add("sparse_gqa/ragged/12_1_rotated_prefix_crossing",
+              [] {
+                  return ragged_sparse(KvCacheStorage::Nvfp4Group16, {127, 129}, 1, false, true,
+                                       false);
+              },
+              {{"format", "nvfp4"}});
+#endif
+    suite.add("sparse_gqa/ragged/single",
+              [] { return ragged_sparse(KvCacheStorage::BFloat16, {5}, 1, false, true, false); },
+              {{"format", "bf16"}});
     suite.add(
         "sparse_gqa/bf16/bucket_graph_patch",
         [] { return graph_patch(cuda_environment().context, KvCacheStorage::BFloat16, 2, true); },

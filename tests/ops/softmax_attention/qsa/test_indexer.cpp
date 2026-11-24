@@ -1,5 +1,5 @@
 #include "ops/suite.h"
-#include "ops/ragged_fixture.h"
+#include "packed_fixture.h"
 #include "ops/graph_patch_check.h"
 #include "kv_cache_storage.h"
 #include "indexer_fixture.h"
@@ -180,41 +180,160 @@ int rejects(F&& call) {
     return 1;
 }
 
-int ragged_indexer() {
-    RaggedFixture ragged({1, 3, 17});
-    constexpr int width = 17;
+int ragged_indexer(std::vector<int> lengths, int layout, Pattern pattern, ContextBucket bucket) {
+    RaggedFixture ragged(std::move(lengths));
+    const int width = *std::max_element(ragged.lengths.begin(), ragged.lengths.end());
     const int n = ragged.tokens(), s = ragged.segments();
-    Fixture f(width, s, 2081, 0, Pattern::Dense);
-    const std::vector<int> ends{67, 66, 2081};
+    std::vector<int> ends(s);
+    for (int b = 0; b < s; ++b) {
+        ends[b] = 2044 + 4 * (b % 3);
+        if (bucket == ContextBucket::K2) ends[b] = std::min(ends[b], 2048);
+    }
+    // Exercise both score partitions in one native window on a context spanning 4096 pools.
+    if (s == 2 && width == 66) ends = {2120, 16404};
+    if (s == 2 && width == 127) ends[1] = 2055;
+    if (s == 2 && width == 128) ends = {2180, 2048};
+    const int history = *std::max_element(ends.begin(), ends.end());
+    Fixture f(width, s, history, layout, pattern, bucket);
     f.reset(0, ends, ragged.lengths);
-    auto q   = to_device(ragged.pack(f.q_host, width, 128 * 4));
-    auto pos = to_device(ragged.pack(f.positions, width, 1));
-    const ops::QsaRaggedBatchView batch{ragged.view, Tensor(pos.span(), DType::I32, {n}),
-                                        f.batch.table_rows};
-    GuardedDeviceBuffer ids(512 * n * 4ULL), counts(n * 4ULL);
-    ops::QsaBlockSelection selection{Tensor(ids.span(), DType::I32, {512, n}),
-                                     Tensor(counts.span(), DType::I32, {n})};
-    const auto bytes = ops::qsa_indexer_ragged_workspace_capacity_bytes(f.bucket, n, n, s, s);
-    GuardedDeviceBuffer scratch(std::max<std::size_t>(256, bytes));
-    MemoryArena arena(scratch.span());
-    const Tensor query(q.span(), DType::BF16, {128, 4, n});
+    for (int b = 0; b < s; ++b) {
+        const int c = ends[b] / 4;
+        if (c <= 512) {
+            // These rows do not resolve any key or table, including in a scored launch.
+            const int row = f.table_rows[b];
+            std::fill_n(f.tables.begin() + row * f.table_stride, f.table_width, -1);
+            const auto base = std::size_t(b) * width * 512;
+            std::fill_n(f.q_host.begin() + base, std::size_t(width) * 512, 0x7fc1);
+        } else if (c % 16) {
+            const int page = f.tables[f.table_rows[b] * f.table_stride + c / 16];
+            std::fill_n(f.k_host.begin() + page * f.key_page_stride + (c % 16) * 128,
+                        (16 - c % 16) * 128, 0x7f80);
+        }
+    }
+    f.q.copy_from_host(f.q_host.data(), f.q_host.size() * 2);
+    f.packed->upload_plane(0, Tensor({f.k_host.data(), f.k_host.size() * 2, Device::cpu()},
+                                     DType::BF16, {128, 16, 1, f.pages}));
+    f.table_offsets = f.packed->table_offsets(f.tables);
+    f.table.copy_from_host(f.table_offsets.data(), f.table_offsets.size() * 8);
+
+    const auto query_shape  = Tensor::metadata(DType::BF16, {128, 4, n});
+    const auto ids_shape    = Tensor::metadata(DType::I32, {512, n});
+    const auto counts_shape = Tensor::metadata(DType::I32, {n});
+    const auto prefix       = qsa::prefix_bytes({ragged.view.cu_seqlens, ragged.view.seq_lengths,
+                                                 ragged.view.token_to_seq, query_shape, counts_shape,
+                                                 f.batch.table_rows, ids_shape, counts_shape});
+    const auto bytes        = ops::qsa_indexer_ragged_workspace_capacity_bytes(bucket, n, n, s, s);
+    GuardedDeviceBuffer backing(prefix + bytes);
+    MemoryArena arena(backing.span());
+    const auto seq        = qsa::packed_metadata(arena, ragged);
+    const auto packed_q   = ragged.pack(f.q_host, width, 512);
+    const auto packed_pos = ragged.pack(f.positions, width, 1);
+    const Tensor query    = qsa::packed_tensor(arena, DType::BF16, {128, 4, n}, packed_q.data());
+    const ops::QsaRaggedBatchView batch{
+        seq, qsa::packed_tensor(arena, DType::I32, {n}, packed_pos.data()),
+        qsa::packed_tensor(arena, DType::I32, {s}, f.table_rows.data())};
+    ops::QsaBlockSelection selection{qsa::packed_tensor(arena, DType::I32, {512, n}),
+                                     qsa::packed_tensor(arena, DType::I32, {n})};
+    qsa::finish_prefix(arena, prefix);
+    CUDA_CHECK(cudaStreamSynchronize(nullptr));
     const auto execution = cuda_environment().default_execution;
     auto alias           = selection;
-    alias.block_counts   = ragged.view.token_to_seq;
-    const auto failures  = rejects(
-        [&] { ops::qsa_indexer(query, f.cache, batch, f.bucket, arena, alias, execution); });
-    ops::qsa_indexer(query, f.cache, batch, f.bucket, arena, selection, execution);
+    alias.block_counts   = seq.token_to_seq;
+    int failures =
+        rejects([&] { ops::qsa_indexer(query, f.cache, batch, bucket, arena, alias, execution); });
+    if (bytes) {
+        auto short_storage = backing.span().subspan(prefix, bytes - 1);
+        MemoryArena short_arena(short_storage);
+        try {
+            ops::qsa_indexer(query, f.cache, batch, bucket, short_arena, selection, execution);
+            ++failures;
+        } catch (const std::bad_alloc&) { failures += short_arena.used() != 0; }
+    }
+    ops::qsa_indexer(query, f.cache, batch, bucket, arena, selection, execution);
     cuda_synchronize();
-    const auto padded_ids    = ragged.unpack(from_device<int>(ids.data(), 512 * n), width, 512);
-    const auto padded_counts = ragged.unpack(from_device<int>(counts.data(), n), width, 1);
+    const auto padded_ids =
+        ragged.unpack(from_device<int>(selection.block_ids.data, 512 * n), width, 512);
+    const auto padded_counts =
+        ragged.unpack(from_device<int>(selection.block_counts.data, n), width, 1);
     f.ids.copy_from_host(padded_ids.data(), padded_ids.size() * 4);
     f.counts.copy_from_host(padded_counts.data(), padded_counts.size() * 4);
-    return failures + verify(f, "ragged QSA indexer") + ids.verify_guards("ragged indices") +
-           counts.verify_guards("ragged counts") +
-           verify_exact("QSA token mapping preserved",
-                        from_device<int>(ragged.view.token_to_seq.data, n), ragged.mapping) +
-           scratch.verify_guards("ragged indexer workspace") +
-           (arena.used() != 0 || arena.peak_used() > bytes);
+    return failures + verify(f, "ragged QSA indexer") +
+           verify_exact("QSA token mapping preserved", from_device<int>(seq.token_to_seq.data, n),
+                        ragged.mapping) +
+           backing.verify_guards("ragged indexer workspace") +
+           (arena.used() != prefix || arena.peak_used() != prefix + bytes);
+}
+
+int ragged_indexer_graph() {
+    RaggedFixture ragged({2, 3});
+    constexpr int width = 3;
+    const int n         = ragged.tokens();
+    Fixture f(width, 2, 2060, 0, Pattern::Dyadic, ContextBucket::K8);
+    const auto execution = cuda_environment().context.execution_view();
+    GuardedDeviceBuffer q(n * 512 * 2), pos(n * 4), rows(2 * 4), ids(n * 512 * 4), counts(n * 4);
+    const Tensor query(q.span(), DType::BF16, {128, 4, n});
+    const ops::QsaRaggedBatchView batch{ragged.view, Tensor(pos.span(), DType::I32, {n}),
+                                        Tensor(rows.span(), DType::I32, {2})};
+    ops::QsaBlockSelection selected{Tensor(ids.span(), DType::I32, {512, n}),
+                                    Tensor(counts.span(), DType::I32, {n})};
+    const auto bytes = ops::qsa_indexer_ragged_workspace_capacity_bytes(f.bucket, n, n, 2, 2);
+    GuardedDeviceBuffer backing(bytes);
+    MemoryArena arena(backing.span());
+    DecodeGraphDefinition definition;
+    DecodeGraphExecutable graph;
+    int failures = 0;
+    for (const int phase : {0, 1}) {
+        const std::array ends = phase == 0 ? std::array{2060, 2048} : std::array{2048, 2060};
+        f.reset(phase, ends, ragged.lengths);
+        const int inert = 1 - phase;
+        const int row   = f.table_rows[inert];
+        std::fill_n(f.table_offsets.begin() + row * f.table_stride, f.table_width, -1);
+        f.table.copy_from_host(f.table_offsets.data(), f.table_offsets.size() * 8);
+        std::fill_n(f.q_host.begin() + inert * width * 512, width * 512, 0x7fc1);
+        const auto packed_q   = ragged.pack(f.q_host, width, 512);
+        const auto packed_pos = ragged.pack(f.positions, width, 1);
+        q.copy_from_host(packed_q.data(), packed_q.size() * 2);
+        pos.copy_from_host(packed_pos.data(), packed_pos.size() * 4);
+        rows.copy_from_host(f.table_rows.data(), f.table_rows.size() * 4);
+        CUDA_CHECK(cudaStreamSynchronize(nullptr));
+        if (phase == 0) {
+            definition.capture(execution.stream(), [&] {
+                ops::qsa_indexer(query, f.cache, batch, f.bucket, arena, selected, execution);
+            });
+            graph.instantiate(definition);
+        }
+        graph.launch(execution.stream());
+        cuda_synchronize(execution.stream());
+        const auto got_ids    = ragged.unpack(from_device<int>(ids.data(), n * 512), width, 512);
+        const auto got_counts = ragged.unpack(from_device<int>(counts.data(), n), width, 1);
+        f.ids.copy_from_host(got_ids.data(), got_ids.size() * 4);
+        f.counts.copy_from_host(got_counts.data(), got_counts.size() * 4);
+        failures += verify(f, "packed threshold replay", false);
+    }
+    return failures + backing.verify_guards("packed replay scratch") +
+           (arena.used() != 0 || arena.peak_used() != bytes);
+}
+
+int ragged_capacity() {
+    constexpr ops::ContextBucketRange range{ContextBucket::K2, ContextBucket::K256};
+    int failures = 0;
+    for (const auto interval : {std::array{1, 9, 1, 9}, std::array{3, 10, 5, 8},
+                                std::array{60, 132, 4, 12}, std::array{127, 129, 129, 150}}) {
+        const auto [lo, hi, min_s, max_s] = interval;
+        range.for_each([&](ContextBucket bucket) {
+            std::size_t high_water = 0;
+            for (int n = lo; n <= hi; ++n)
+                for (int segments = min_s; segments <= std::min(n, max_s); ++segments)
+                    high_water = std::max(
+                        high_water, ops::qsa_indexer_workspace_capacity_bytes(bucket, 1, n, n));
+            failures += high_water != ops::qsa_indexer_ragged_workspace_capacity_bytes(
+                                          bucket, lo, hi, min_s, max_s);
+        });
+    }
+    return failures + rejects([&] {
+               (void)ops::qsa_indexer_ragged_workspace_capacity_bytes(ContextBucket::K512, 1, 1, 1,
+                                                                      1);
+           });
 }
 
 int flat_graph_patch(DeviceContext& device) {
@@ -463,7 +582,25 @@ int single_partition_workspace(DeviceContext& device) {
 
 int main(int argc, char** argv) {
     OpSuite suite;
-    suite.add("qsa_indexer/ragged", ragged_indexer);
+    suite.add("qsa_indexer/ragged/window_127_2",
+              [] { return ragged_indexer({127, 2}, 1, Pattern::Dense, ContextBucket::K8); });
+    suite.add("qsa_indexer/ragged/window_63_66",
+              [] { return ragged_indexer({63, 66}, 0, Pattern::Dyadic, ContextBucket::K32); });
+    suite.add("qsa_indexer/ragged/contained_score_window",
+              [] { return ragged_indexer({128, 2}, 0, Pattern::Dyadic, ContextBucket::K32); });
+    suite.add("qsa_indexer/ragged/threshold_ties", [] {
+        return ragged_indexer(std::vector<int>(160, 1), 0, Pattern::Zero, ContextBucket::K32);
+    });
+    suite.add("qsa_indexer/ragged/simt", [] {
+        return ragged_indexer(std::vector<int>(160, 1), 1, Pattern::Dyadic, ContextBucket::K32);
+    });
+    suite.add("qsa_indexer/ragged/select_all", [] {
+        return ragged_indexer(std::vector<int>(160, 1), 0, Pattern::Dense, ContextBucket::K2);
+    });
+    suite.add("qsa_indexer/ragged/single",
+              [] { return ragged_indexer({65}, 0, Pattern::Dyadic, ContextBucket::K2); });
+    suite.add("qsa_indexer/ragged/capacity", ragged_capacity);
+    suite.add("qsa_indexer/ragged/graph_threshold", ragged_indexer_graph, {{"execution", "graph"}});
     suite.add("qsa_indexer/flat_graph_patch",
               [] { return flat_graph_patch(cuda_environment().context); },
               {{"execution", "graph"}});

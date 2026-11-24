@@ -6,18 +6,18 @@
 
 namespace ninfer::ops::detail::qsa {
 namespace {
-template <int QueryTile, bool VectorCache, int MaxQueries, bool BatchedLoop>
-void launch_score(IndexerArguments a, IndexerWindowPlan plan, cudaStream_t stream) {
+template <int QueryTile, bool VectorCache, int MaxQueries, bool BatchedLoop, class Arguments>
+void launch_score(Arguments a, IndexerWindowPlan plan, cudaStream_t stream) {
     constexpr int threads = QueryTile > 16 ? QueryTile * 8 : 128;
     constexpr int bytes   = (QueryTile * 4 + kIndexerKeyTile) * 128 * sizeof(__nv_bfloat16);
     constexpr auto kernel =
-        indexer_score_mma_kernel<QueryTile, VectorCache, MaxQueries, BatchedLoop>;
+        indexer_score_mma_kernel<QueryTile, VectorCache, MaxQueries, BatchedLoop, Arguments>;
     const int shared = common::prepare_shared<bytes, kernel, true>();
     kernel<<<plan.score_workers, threads, shared, stream>>>(a);
 }
 
-template <bool VectorCache, int MaxQueries, bool BatchedLoop>
-void launch_score(IndexerArguments a, IndexerWindowPlan plan, cudaStream_t stream) {
+template <bool VectorCache, int MaxQueries, bool BatchedLoop, class Arguments>
+void launch_score(Arguments a, IndexerWindowPlan plan, cudaStream_t stream) {
     if (plan.query_tile == 4)
         launch_score<4, VectorCache, MaxQueries, BatchedLoop>(a, plan, stream);
     else if (plan.query_tile == 8)
@@ -28,7 +28,8 @@ void launch_score(IndexerArguments a, IndexerWindowPlan plan, cudaStream_t strea
         launch_score<32, VectorCache, MaxQueries, BatchedLoop>(a, plan, stream);
 }
 
-void launch_window(IndexerArguments a, IndexerWindowPlan plan, bool vector_cache,
+template <class Arguments>
+void launch_window(Arguments a, IndexerWindowPlan plan, bool vector_cache,
                    CudaExecutionView execution) {
     const auto stream = execution.stream();
     if (a.partitions == 0) {
@@ -49,7 +50,9 @@ void launch_window(IndexerArguments a, IndexerWindowPlan plan, bool vector_cache
         }
     };
     const int slots = a.width * a.batch;
-    if (slots > kIndexerMaxWindowQueries)
+    if constexpr (Arguments::ragged)
+        submit.template operator()<64, false>();
+    else if (slots > kIndexerMaxWindowQueries)
         submit.template operator()<kIndexerMaxWindowQueries, true>();
     else if (slots > 64)
         submit.template operator()<kIndexerMaxWindowQueries, false>();
@@ -58,14 +61,40 @@ void launch_window(IndexerArguments a, IndexerWindowPlan plan, bool vector_cache
 }
 } // namespace
 
-void launch_indexer_windows(IndexerArguments input, IndexerPlan plan, std::size_t,
-                            std::size_t key_alignment, CudaExecutionView execution) {
+template <class Arguments>
+void launch_indexer_windows(Arguments input, IndexerPlan plan, std::size_t,
+                            std::size_t key_alignment, CudaExecutionView execution,
+                            std::span<const std::int32_t> offsets) {
     const bool vector_cache = common::operand::aligned(input.keys, 16) &&
                               input.key_row_stride % 8 == 0 && key_alignment % 16 == 0;
-    for_each_indexer_window(input, plan, [&](IndexerArguments a) {
-        const auto window =
+    if constexpr (Arguments::ragged) {
+        if (input.partitions == 0) {
+            launch_indexer_select_all(
+                input, indexer_workers(2, execution.multiprocessor_count(), input.tokens),
+                execution.stream());
+            return;
+        }
+    }
+    for_each_indexer_window(input, plan, [&](Arguments a) {
+        auto window =
             select_indexer_window(plan, a.width, a.batch, execution.multiprocessor_count(), false);
+        if constexpr (Arguments::ragged) {
+            if (const auto row = single_segment_indexer_window(a, offsets)) {
+                launch_window(*row, window, vector_cache, execution);
+                return;
+            }
+            const int mean     = 1 + (a.tokens - 1) / a.segments;
+            const int estimate = std::min(a.width, mean);
+            window = select_indexer_window(plan, estimate, (a.width + estimate - 1) / estimate,
+                                           execution.multiprocessor_count(), false);
+        }
         launch_window(a, window, vector_cache, execution);
     });
 }
+
+template void launch_indexer_windows(IndexerArguments, IndexerPlan, std::size_t, std::size_t,
+                                     CudaExecutionView, std::span<const std::int32_t>);
+template void launch_indexer_windows(RaggedIndexerArguments, IndexerPlan, std::size_t, std::size_t,
+                                     CudaExecutionView, std::span<const std::int32_t>);
+
 } // namespace ninfer::ops::detail::qsa

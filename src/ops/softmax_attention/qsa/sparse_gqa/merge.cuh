@@ -6,10 +6,10 @@
 
 namespace ninfer::ops::detail::qsa {
 
-template <KvCacheStorage Storage, int KvHeads>
-__device__ __forceinline__ void sparse_gqa_merge_row(const SparseGqaKernelArguments<KvHeads>& a,
-                                                     std::int64_t q, int h, SparseGqaWork work,
-                                                     float* weights) {
+template <KvCacheStorage Storage, int KvHeads, bool Ragged>
+__device__ __forceinline__ void
+sparse_gqa_merge_row(const SparseGqaKernelArguments<KvHeads, Ragged>& a, std::int64_t q, int h,
+                     SparseGqaWork work, float* weights) {
     const int lane = threadIdx.x % 32;
     float inverse;
     if (work.splits == 1) {
@@ -49,8 +49,8 @@ __device__ __forceinline__ void sparse_gqa_merge_row(const SparseGqaKernelArgume
     sparse_gqa_store_vector(a, q, h, values);
 }
 
-template <KvCacheStorage Storage, int KvHeads>
-__global__ void sparse_gqa_merge_kernel(SparseGqaKernelArguments<KvHeads> a) {
+template <KvCacheStorage Storage, int KvHeads, bool Ragged>
+__global__ void sparse_gqa_merge_kernel(SparseGqaKernelArguments<KvHeads, Ragged> a) {
     if (!a.numerator) return;
     const auto q = a.begin + a.head_query(blockIdx.x);
     const int h = a.head_index(blockIdx.x), d = threadIdx.x * 2;
@@ -109,8 +109,8 @@ __global__ void sparse_gqa_merge_kernel(SparseGqaKernelArguments<KvHeads> a) {
         sparse_gqa_store(a, q, h, d, x * inv, y * inv);
 }
 
-template <KvCacheStorage Storage, int Heads, int KvHeads>
-__global__ void sparse_gqa_merge_warp_kernel(SparseGqaKernelArguments<KvHeads> a) {
+template <KvCacheStorage Storage, int Heads, int KvHeads, bool Ragged>
+__global__ void sparse_gqa_merge_warp_kernel(SparseGqaKernelArguments<KvHeads, Ragged> a) {
     if (!a.numerator) return;
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
     constexpr int groups = (a.query_heads + Heads - 1) / Heads;

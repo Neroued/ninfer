@@ -8,8 +8,8 @@
 namespace ninfer::ops::detail::qsa {
 
 template <KvCacheStorage Storage, int N, int Warps, bool VectorCache,
-          SparseGqaLoad Load = SparseGqaLoad::Direct, int KvHeads>
-__device__ __forceinline__ void sparse_gqa_mma(SparseGqaKernelArguments<KvHeads> a,
+          SparseGqaLoad Load = SparseGqaLoad::Direct, int KvHeads, bool Ragged>
+__device__ __forceinline__ void sparse_gqa_mma(SparseGqaKernelArguments<KvHeads, Ragged> a,
                                                SparseGqaStorage<Storage, N, Warps, Load>& s,
                                                std::int64_t q, int head, int split) {
     constexpr int NK = N / Warps, QKNt = NK / 8, PVKs = NK / 16;
@@ -201,8 +201,8 @@ __device__ __forceinline__ void sparse_gqa_mma(SparseGqaKernelArguments<KvHeads>
 }
 
 template <KvCacheStorage Storage, int N, int Warps, bool VectorCache, SparseGqaLoad Load,
-          int KvHeads>
-__device__ __forceinline__ void sparse_gqa_compute(SparseGqaKernelArguments<KvHeads> a,
+          int KvHeads, bool Ragged>
+__device__ __forceinline__ void sparse_gqa_compute(SparseGqaKernelArguments<KvHeads, Ragged> a,
                                                    SparseGqaStorage<Storage, N, Warps, Load>& s,
                                                    std::int64_t q, int head, int split) {
     sparse_gqa_mma<Storage, N, Warps, VectorCache, Load>(a, s, q, head, split);
@@ -217,13 +217,15 @@ __device__ __forceinline__ void sparse_gqa_compute(SparseGqaKernelArguments<KvHe
 }
 
 template <KvCacheStorage Storage, int N, int Warps, bool VectorCache,
-          SparseGqaLoad Load = SparseGqaLoad::Direct, int KvHeads>
+          SparseGqaLoad Load = SparseGqaLoad::Direct, int KvHeads, bool Ragged>
 __launch_bounds__(Warps * 32) __global__
-    void sparse_gqa_mma_kernel(SparseGqaKernelArguments<KvHeads> a) {
+    void sparse_gqa_mma_kernel(SparseGqaKernelArguments<KvHeads, Ragged> a) {
     extern __shared__ __align__(16) unsigned char smem[];
     auto& s = *reinterpret_cast<SparseGqaStorage<Storage, N, Warps, Load>*>(smem);
+    const auto block = sparse_gqa_group_block(a, blockIdx.x);
     sparse_gqa_compute<Storage, N, Warps, VectorCache, Load>(
-        a, s, a.begin + a.group_query(blockIdx.x), a.group_head(blockIdx.x), blockIdx.y);
+        a, s, a.begin + a.group_query(block), a.group_head(block),
+        sparse_gqa_split(a, blockIdx.x, blockIdx.y));
 }
 
 } // namespace ninfer::ops::detail::qsa

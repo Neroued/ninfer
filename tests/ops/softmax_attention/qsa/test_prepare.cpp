@@ -1,6 +1,6 @@
 #include "core/platform.h"
 #include "ops/suite.h"
-#include "ops/ragged_fixture.h"
+#include "packed_fixture.h"
 #include "kv_cache_storage.h"
 #include "prepare_fixture.h"
 #include "cuda_fixture.h"
@@ -292,37 +292,71 @@ int rejects(const char* label, F&& call) {
     return 1;
 }
 
-int ragged_prepare(bool kv_only) {
-    RaggedFixture ragged({1, 3, 17});
-    constexpr int width = 17;
+void seed_carried_axes(Fixture& f, int phase) {
+    for (int b = 0; b < f.B; ++b) {
+        if (f.bases[b] % 4 == 0) continue;
+        for (int a = 0; a < 3; ++a)
+            f.first.at(a, f.slots.at(b)) = 11 + 47 * a + 137 * b + 253 * phase;
+    }
+}
+
+int ragged_prepare(bool kv_only, KvCacheStorage storage, int kv_heads, bool prefix_arena) {
+    RaggedFixture ragged(prefix_arena ? std::vector{1, 2, 3, 5, 7, 9, 15, 17, 33, 65, 127, 129}
+                                      : std::vector{1, 2, 3, 5, 7});
+    const int width = *std::max_element(ragged.lengths.begin(), ragged.lengths.end());
     const int n = ragged.tokens(), s = ragged.segments(), axes = kv_only ? 1 : 3;
-    Fixture f(width, s, axes);
+    Fixture f(width, s, axes, 0, 0, 0, storage, kv_heads);
     f.kv_only = kv_only;
     f.reset(1, true);
+    seed_carried_axes(f, 1);
     f.valid.host = ragged.lengths;
     f.valid.upload();
-    const std::vector<int> destinations{3, 4, 1};
-    std::vector<std::int64_t> after_raw(s), after_rope(s);
+    // Rows 0 and 4 share a read-only source. Row 0 publishes disjointly, row 4 uses
+    // its original slot, and the other rows publish in place.
+    const auto original_slots = f.slots.host;
+    f.slots.at(4)             = f.slots.at(0);
+    f.slots.upload();
+    std::vector<int> destinations = original_slots;
+    destinations[0]               = 0;
+    const auto rope_slot          = [s](int slot) { return s + 1 - slot; };
+    auto initial_rope             = f.first.host;
+    for (int slot = 0; slot < s + 2; ++slot)
+        for (int a = 0; a < 3; ++a)
+            initial_rope[f.first.index(a, rope_slot(slot))] = f.first.at(a, slot);
+    std::vector<std::int64_t> before_raw(s), before_rope(s), after_raw(s), after_rope(s);
     for (int b = 0; b < s; ++b) {
-        after_raw[b]  = destinations[b] * f.tail.view.nb[2];
-        after_rope[b] = destinations[b] * f.first.view.nb[1];
+        before_raw[b]  = f.slots.at(b) * f.tail.view.nb[2];
+        before_rope[b] = rope_slot(f.slots.at(b)) * f.first.view.nb[1];
+        after_raw[b]   = destinations[b] * f.tail.view.nb[2];
+        after_rope[b]  = rope_slot(destinations[b]) * f.first.view.nb[1];
     }
+    auto br = to_device(before_raw), bc = to_device(before_rope);
     auto dr = to_device(after_raw), dc = to_device(after_rope);
-    auto after                            = f.before;
-    after.raw_keys.records.byte_offsets   = Tensor(dr.span(), DType::I64, {s});
+    const std::size_t raw_shift = axes == 1 ? 2 : 0;
+    GuardedDeviceBuffer raw(f.tail.host.size() * 2 + raw_shift);
+    auto raw_state = raw.span().subspan(raw_shift, f.tail.host.size() * 2);
+    CUDA_CHECK(
+        cudaMemcpy(raw_state.data, f.tail.host.data(), raw_state.bytes, cudaMemcpyHostToDevice));
+    auto coords_state         = to_device(initial_rope);
+    f.before.raw_keys.records = {raw_state, Tensor(br.span(), DType::I64, {s})};
+    f.before.raw_keys.field.tensor.region.alignment = raw_shift ? 2 : 4;
+    f.before.first_rope.records         = {coords_state.span(), Tensor(bc.span(), DType::I64, {s})};
+    auto after                          = f.before;
+    after.raw_keys.records.byte_offsets = Tensor(dr.span(), DType::I64, {s});
     after.first_rope.records.byte_offsets = Tensor(dc.span(), DType::I64, {s});
     auto expected_tail                    = f.tail.host;
-    auto expected_rope                    = f.first.host;
-    std::vector<int> coords(n * axes), pos = ragged.pack(f.positions.host, width, 1);
+    auto expected_rope                    = initial_rope;
+    const int axis_stride                 = n + 9;
+    std::vector<int> coords(axis_stride * axes, -1), pos = ragged.pack(f.positions.host, width, 1);
     for (int b = 0; b < s; ++b) {
         const int base = f.bases[b], count = ragged.lengths[b], src = f.slots.at(b),
                   dst       = destinations[b];
         const int remainder = (base + count) % 4, first = base + count - remainder - base;
         for (int a = 0; a < axes; ++a)
             for (int t = 0; t < count; ++t)
-                coords[a * n + ragged.prefix[b] + t] = f.rope.at(t, a, b);
+                coords[a * axis_stride + ragged.prefix[b] + t] = f.rope.at(t, a, b);
         for (int a = 0; a < 3; ++a)
-            expected_rope[f.first.index(a, dst)] =
+            expected_rope[f.first.index(a, rope_slot(dst))] =
                 !remainder
                     ? 0
                     : (first < 0 ? f.first.at(a, src) : f.rope.at(first, axes == 1 ? 0 : a, b));
@@ -339,23 +373,51 @@ int ragged_prepare(bool kv_only) {
     auto diq = to_device(ragged.pack(f.iq.host, width, 128 * 4));
     auto dik = to_device(ragged.pack(f.ik.host, width, 128));
     auto dp = to_device(pos), rope = to_device(coords);
-    const ops::QsaRaggedBatchView batch{ragged.view, Tensor(dp.span(), DType::I32, {n}),
-                                        f.batch.table_rows};
-    const Tensor rope_positions(rope.span(), DType::I32, {n, axes});
-    const ops::QsaProjectionView projected{Tensor(dq.span(), DType::BF16, {256, f.query_heads, n}),
-                                           Tensor(dk.span(), DType::BF16, {256, f.kv_heads, n}),
-                                           Tensor(dv.span(), DType::BF16, {256, f.kv_heads, n}),
-                                           Tensor(diq.span(), DType::BF16, {128, 4, n}),
-                                           Tensor(dik.span(), DType::BF16, {128, n})};
+    ops::QsaRaggedBatchView batch{ragged.view, Tensor(dp.span(), DType::I32, {n}),
+                                  f.batch.table_rows};
+    auto rope_positions  = Tensor(rope.span(), DType::I32, {axis_stride, axes});
+    rope_positions.ne[0] = n;
+    ops::QsaProjectionView projected{Tensor(dq.span(), DType::BF16, {256, f.query_heads, n}),
+                                     Tensor(dk.span(), DType::BF16, {256, f.kv_heads, n}),
+                                     Tensor(dv.span(), DType::BF16, {256, f.kv_heads, n}),
+                                     Tensor(diq.span(), DType::BF16, {128, 4, n}),
+                                     Tensor(dik.span(), DType::BF16, {128, n})};
     const auto bytes = kv_only
                            ? ops::qsa_prepare_kv_update_ragged_workspace_capacity_bytes(n, n, s, s)
                            : ops::qsa_prepare_update_ragged_workspace_capacity_bytes(n, n, s, s);
-    GuardedDeviceBuffer scratch(bytes);
+    const auto prefix =
+        prefix_arena ? qsa::prefix_bytes({projected.query, projected.key, projected.value,
+                                          projected.index_query, projected.index_key,
+                                          batch.positions, batch.table_rows, ragged.view.cu_seqlens,
+                                          ragged.view.seq_lengths, ragged.view.token_to_seq,
+                                          Tensor(rope.span(), DType::I32, {axis_stride, axes})})
+                     : 0;
+    GuardedDeviceBuffer scratch(prefix);
     MemoryArena arena(scratch.span());
+    const auto copy = [&](Tensor t) {
+        const auto span = arena.alloc_bytes(t.bytes(), 256);
+        CUDA_CHECK(cudaMemcpy(span.data, t.data, t.bytes(), cudaMemcpyDeviceToDevice));
+        t.data = span.data;
+        return t;
+    };
+    if (prefix_arena) {
+        projected.query       = copy(projected.query);
+        projected.key         = copy(projected.key);
+        projected.value       = copy(projected.value);
+        projected.index_query = copy(projected.index_query);
+        projected.index_key   = copy(projected.index_key);
+        batch.positions       = copy(batch.positions);
+        batch.table_rows      = copy(batch.table_rows);
+        batch.ragged          = qsa::packed_metadata(arena, ragged);
+        rope_positions        = copy(Tensor(rope.span(), DType::I32, {axis_stride, axes}));
+        rope_positions.ne[0]  = n;
+        qsa::finish_prefix(arena, prefix);
+    }
     auto query = projected.query, index_query = projected.index_query;
     query.nb[3] += 16;
+    CUDA_CHECK(cudaStreamSynchronize(nullptr));
     const auto execution = cuda_environment().default_execution;
-    int failures         = 0;
+    int failures         = bytes != 0;
     if (kv_only)
         ops::qsa_prepare_kv_update({projected.key, projected.value, projected.index_key},
                                    f.parameters.kv, batch, rope_positions, f.before, f.cache, after,
@@ -384,7 +446,7 @@ int ragged_prepare(bool kv_only) {
             ops::qsa_prepare_update(projected, f.parameters, alias, rope_positions, f.before,
                                     f.cache, after, query, index_query, arena, execution);
         });
-        failures += arena.peak_used() != 0;
+        failures += arena.peak_used() != prefix;
         ops::qsa_prepare_update(projected, f.parameters, batch, rope_positions, f.before, f.cache,
                                 after, query, index_query, arena, execution);
     }
@@ -398,12 +460,126 @@ int ragged_prepare(bool kv_only) {
         f.out_iq.device->copy_from_host(padded_iq.data(), padded_iq.size() * 2);
     }
     return failures + verify(f, "ragged QSA prepare", true) +
-           verify_exact("ragged raw tails and untouched slots", f.tail.download(), expected_tail) +
-           verify_exact("ragged tail coordinates and untouched slots", f.first.download(),
+           verify_exact("ragged raw tails and untouched slots",
+                        from_device<std::uint16_t>(raw_state.data, expected_tail.size()),
+                        expected_tail) +
+           verify_exact("ragged tail coordinates and untouched slots",
+                        from_device<int>(coords_state.data(), expected_rope.size()),
                         expected_rope) +
            f.tail.guards("ragged raw tail") + f.first.guards("ragged coordinates") +
            scratch.verify_guards("ragged prepare workspace") +
-           (arena.used() != 0 || arena.peak_used() > bytes);
+           raw.verify_guards("ragged raw state") +
+           (arena.used() != prefix || arena.peak_used() != prefix);
+}
+
+int ragged_prepare_graph() {
+    RaggedFixture ragged({1, 2, 5});
+    const int n = ragged.tokens(), s = ragged.segments(), width = 5;
+    Fixture f(width, s, 1);
+    const auto execution = cuda_environment().context.execution_view();
+    GuardedDeviceBuffer backing(0);
+    MemoryArena arena(backing.span());
+    GuardedDeviceBuffer q(n * 256 * f.query_heads * 2ULL), iq(n * 512 * 2ULL);
+    GuardedDeviceBuffer k(n * 256 * f.kv_heads * 2ULL), v(k.bytes()), ik(n * 128 * 2ULL);
+    GuardedDeviceBuffer output(q.bytes()), index_output(iq.bytes()), pos(n * 4), rho(n * 4);
+    auto out    = Tensor(output.span(), DType::BF16, {256, f.query_heads, n});
+    auto out_iq = Tensor(index_output.span(), DType::BF16, {128, 4, n});
+    const ops::QsaProjectionView projected{Tensor(q.span(), DType::BF16, {256, f.query_heads, n}),
+                                           Tensor(k.span(), DType::BF16, {256, f.kv_heads, n}),
+                                           Tensor(v.span(), DType::BF16, {256, f.kv_heads, n}),
+                                           Tensor(iq.span(), DType::BF16, {128, 4, n}),
+                                           Tensor(ik.span(), DType::BF16, {128, n})};
+    const ops::QsaRaggedBatchView batch{ragged.view, Tensor(pos.span(), DType::I32, {n}),
+                                        f.batch.table_rows};
+    const Tensor rope(rho.span(), DType::I32, {n, 1});
+    const auto launch = [&] {
+        ops::qsa_prepare_update(projected, f.parameters, batch, rope, f.before, f.cache, f.before,
+                                out, out_iq, arena, execution);
+    };
+
+    DecodeGraphDefinition definition;
+    DecodeGraphExecutable graph;
+    int failures = 0;
+    // F=61 with one token leaves an unfinished carry. F=62 with two tokens completes
+    // the carried pool. Replay moves both sources and destinations to different records.
+    for (const int phase : {1, 2}) {
+        f.reset(phase, true);
+        seed_carried_axes(f, phase);
+        f.valid.host = ragged.lengths;
+        if (phase == 2) {
+            const auto raw   = f.tail.host;
+            const auto first = f.first.host;
+            for (int b = 0; b < s; ++b) {
+                const int original = f.slots.at(b), slot = (original + 1) % (s + 2);
+                for (int j = 0; j < 3; ++j) {
+                    f.first.at(j, slot) = first[f.first.index(j, original)];
+                    for (int c = 0; c < 128; ++c)
+                        f.tail.at(c, j, slot) = raw[f.tail.index(c, j, original)];
+                }
+                f.slots.at(b) = slot;
+            }
+        }
+        f.valid.upload();
+        f.tail.upload();
+        f.first.upload();
+        f.slots.upload();
+        f.upload_offsets();
+        const auto set = [&](GuardedDeviceBuffer& buffer, const auto& words, int features) {
+            const auto packed = ragged.pack(words, width, features);
+            buffer.copy_from_host(packed.data(), packed.size() * sizeof(packed[0]));
+        };
+        set(q, f.q.host, 256 * f.query_heads);
+        set(k, f.k.host, 256 * f.kv_heads);
+        set(v, f.v.host, 256 * f.kv_heads);
+        set(iq, f.iq.host, 512);
+        set(ik, f.ik.host, 128);
+        set(pos, f.positions.host, 1);
+        set(rho, f.rope.host, 1);
+        auto expected_raw  = f.tail.host;
+        auto expected_rope = f.first.host;
+        for (int b = 0; b < s; ++b) {
+            const int slot = f.slots.at(b), base = f.bases[b];
+            // Construct the chronological pending sequence and remove completed pools.
+            std::vector<std::array<std::uint16_t, 128>> pending;
+            std::array<int, 3> coord{};
+            for (int j = 0; j < base % 4; ++j) {
+                auto& raw = pending.emplace_back();
+                for (int c = 0; c < 128; ++c) raw[c] = f.tail.at(c, j, slot);
+            }
+            if (!pending.empty())
+                for (int a = 0; a < 3; ++a) coord[a] = f.first.at(a, slot);
+            for (int t = 0; t < ragged.lengths[b]; ++t) {
+                if (pending.empty()) coord.fill(f.rope.at(t, 0, b));
+                auto& raw = pending.emplace_back();
+                for (int c = 0; c < 128; ++c) raw[c] = f.ik.at(c, t, b);
+                if (pending.size() == 4) pending.clear();
+            }
+            for (int j = 0; j < 3; ++j) {
+                expected_rope[f.first.index(j, slot)] = pending.empty() ? 0 : coord[j];
+                for (int c = 0; c < 128; ++c)
+                    expected_raw[f.tail.index(c, j, slot)] =
+                        j < int(pending.size()) ? pending[j][c] : 0;
+            }
+        }
+        CUDA_CHECK(cudaStreamSynchronize(nullptr));
+        if (phase == 1) {
+            definition.capture(execution.stream(), launch);
+            graph.instantiate(definition);
+        }
+        graph.launch(execution.stream());
+        cuda_synchronize(execution.stream());
+        const auto download = [&](Tensor result, Buffer<std::uint16_t>& dst, int features) {
+            auto padded = ragged.unpack(from_device<std::uint16_t>(result.data, result.numel()),
+                                        width, features);
+            dst.device->copy_from_host(padded.data(), padded.size() * 2);
+        };
+        download(out, f.out_q, 256 * f.query_heads);
+        download(out_iq, f.out_iq, 512);
+        failures += verify(f, "packed A=1 prepare replay", true);
+        failures += verify_exact("graph raw tails", f.tail.download(), expected_raw);
+        failures += verify_exact("graph carried coordinates", f.first.download(), expected_rope);
+    }
+    return failures + (arena.peak_used() != 0);
 }
 
 int run(DeviceContext& device, int t, int b, int axes, int alias, int layout, int capacity = 0,
@@ -764,10 +940,6 @@ int scale_edges(DeviceContext& device, KvCacheStorage storage, bool kv_only = fa
 
 int main(int argc, char** argv) {
     OpSuite suite;
-    suite.add("qsa_prepare/bf16/ragged", [] { return ragged_prepare(false); },
-              {{"format", "bf16"}});
-    suite.add("qsa_prepare_kv/bf16/ragged", [] { return ragged_prepare(true); },
-              {{"format", "bf16"}});
     for (auto storage : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64,
                          KvCacheStorage::Fp8E4m3fnGroup128Ue8m0, KvCacheStorage::Nvfp4Group16,
                          KvCacheStorage::Fp8KeyNvfp4Value}) {
@@ -780,6 +952,28 @@ int main(int argc, char** argv) {
                    {"execution", "graph"},
                    {"suite", "concurrency"}});
     }
+    suite.add("qsa_prepare/bf16/ragged/graph_a1", ragged_prepare_graph,
+              {{"format", "bf16"}, {"execution", "graph"}});
+    for (const auto storage : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64,
+                               KvCacheStorage::Fp8E4m3fnGroup128Ue8m0, KvCacheStorage::Nvfp4Group16,
+                               KvCacheStorage::Fp8KeyNvfp4Value})
+        for (const int kv_heads : {1, 2, 4}) {
+#if NINFER_TARGET_SPARK
+            if (kv_heads == 4) continue;
+#endif
+            for (const bool kv_only : {false, true}) {
+                const std::string format = kv_cache_storage_name(storage);
+                const std::string op     = kv_only ? "qsa_prepare_kv" : "qsa_prepare";
+                suite.add(op + "/" + format + "/ragged/h" + std::to_string(kv_heads),
+                          [=] {
+                              return ragged_prepare(kv_only, storage, kv_heads,
+                                                    storage == KvCacheStorage::BFloat16 &&
+                                                        kv_heads == 2);
+                          },
+                          {{"format", format}});
+            }
+        }
+
     suite.add("qsa_prepare/bf16/concurrency/b129",
               [] {
                   return run(cuda_environment().context, 1, 129, 1, 0, 0, 0,

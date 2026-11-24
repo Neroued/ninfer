@@ -19,11 +19,11 @@ bool identical(const Tensor& a, const Tensor& b) {
     return true;
 }
 
-template <bool StridedRope>
 void validate_kv(const detail::qsa::ViewValidation& v, const QsaKvProjectionView& p,
                  const QsaKvPrepareParameters& parameters, const QsaBatchView& batch,
                  const Tensor& rope_positions, const ConstQsaTailStateView& before,
-                 QsaCacheView cache, QsaRawRecordWriteView records) {
+                 QsaCacheView cache, QsaRawRecordWriteView records,
+                 const RaggedSequenceView* ragged = nullptr) {
     const int tokens = p.key.ne[2], rows = p.key.ne[3], axes = rope_positions.ne[1];
     const int kv_heads = p.key.ne[1];
     v.require(detail::qsa::registered_query_heads(kv_heads) != 0, "unsupported head geometry");
@@ -39,20 +39,22 @@ void validate_kv(const detail::qsa::ViewValidation& v, const QsaKvProjectionView
     v.dense(p.index_key, DType::BF16, {128, tokens, rows, 1}, 16, "index-key projection");
     v.dense(parameters.key_norm, DType::BF16, {256, 1, 1, 1}, 2, "key norm");
     v.dense(parameters.index_key_norm, DType::BF16, {128, 1, 1, 1}, 2, "index-key norm");
-    v.dense(batch.positions, DType::I32, {tokens, rows, 1, 1}, 4, "positions");
-    if constexpr (StridedRope) {
-        v.require(rows == 1, "strided coordinate rows");
-        v.columns(rope_positions, DType::I32, tokens, axes, rows, "RoPE positions");
+    if (ragged) {
+        v.require(rows == 1 && tokens == ragged->total_tokens(), "packed extent");
+        common::operand::ragged_batch(*ragged, batch.positions, batch.table_rows, v.op, v.device);
+        v.columns(rope_positions, DType::I32, tokens, axes, 1, "RoPE positions");
+        v.state(before, ragged->num_seqs());
     } else {
+        v.dense(batch.positions, DType::I32, {tokens, rows, 1, 1}, 4, "positions");
         v.dense(rope_positions, DType::I32, {tokens, axes, rows, 1}, 4, "RoPE positions");
+        v.metadata(batch.valid_columns, rows, "valid columns");
+        v.metadata(batch.table_rows, rows, "table rows");
+        v.metadata(records.offsets, rows, "record offsets");
+        v.state(before, rows);
+        const int capacity = records.raw_keys.ne[1];
+        v.columns(records.raw_keys, DType::BF16, 128, capacity, rows, "raw records");
+        v.columns(records.rope_positions, DType::I32, 3, capacity, rows, "coordinate records");
     }
-    v.metadata(batch.valid_columns, rows, "valid columns");
-    v.metadata(batch.table_rows, rows, "table rows");
-    v.metadata(records.offsets, rows, "record offsets");
-    v.state(before, rows);
-    const int capacity = records.raw_keys.ne[1];
-    v.columns(records.raw_keys, DType::BF16, 128, capacity, rows, "raw records");
-    v.columns(records.rope_positions, DType::I32, 3, capacity, rows, "coordinate records");
 
     const auto& main = cache.main;
     v.require(main.head_dim == 256 && main.num_kv_heads == kv_heads, "cache geometry");
@@ -82,14 +84,12 @@ void validate_kv(const detail::qsa::ViewValidation& v, const QsaKvProjectionView
     v.require(cache.index.keys.plane.geometry.tokens_per_row == 4, "index record geometry");
 }
 
-template <bool StridedRope>
-void prepare(const QsaProjectionView& p, const QsaPrepareParameters& parameters,
-             const QsaBatchView& batch, const Tensor& rope_positions,
-             const ConstQsaTailStateView& before, QsaCacheView cache, QsaRawRecordWriteView records,
-             Tensor& query, Tensor& index_query, CudaExecutionView execution) {
-    const detail::qsa::ViewValidation v{"qsa_prepare", execution.device()};
-    validate_kv<StridedRope>(v, {p.key, p.value, p.index_key}, parameters.kv, batch, rope_positions,
-                             before, cache, records);
+void validate_queries(const detail::qsa::ViewValidation& v, const QsaProjectionView& p,
+                      const QsaPrepareParameters& parameters, const QsaBatchView& batch,
+                      const Tensor& rope_positions, const ConstQsaTailStateView& before,
+                      QsaRawRecordWriteView records, const Tensor& query, const Tensor& index_query,
+                      const RaggedSequenceView* ragged = nullptr,
+                      const QsaTailStateView* after    = nullptr) {
     const int tokens = p.key.ne[2], rows = p.key.ne[3],
               query_heads = detail::qsa::registered_query_heads(p.key.ne[1]);
     v.dense(p.query, DType::BF16, {256, query_heads, tokens, rows}, 16, "query projection");
@@ -111,7 +111,7 @@ void prepare(const QsaProjectionView& p, const QsaPrepareParameters& parameters,
                  &parameters.kv.index_key_norm, &batch.positions, &batch.valid_columns,
                  &batch.table_rows, &rope_positions, &before.raw_keys.records.byte_offsets,
                  &before.first_rope.records.byte_offsets, &records.offsets}) {
-            if constexpr (StridedRope) {
+            if (ragged) {
                 if (in == &rope_positions) {
                     v.require(
                         !common::operand::overlaps(common::operand::blocks(rope_positions, v.op),
@@ -120,24 +120,17 @@ void prepare(const QsaProjectionView& p, const QsaPrepareParameters& parameters,
                     continue;
                 }
             }
-            v.require(!v.overlap(*out, *in), "output/parameter overlap");
+            if (in->data) v.require(!v.overlap(*out, *in), "output/parameter overlap");
         }
     }
-    detail::qsa::launch_prepare<StridedRope>(p, parameters, batch, rope_positions, before, cache,
-                                             records, query, index_query, execution);
+    if (ragged) {
+        for (const auto* out : {&query, &index_query})
+            for (const auto* in :
+                 {&ragged->cu_seqlens, &ragged->seq_lengths, &ragged->token_to_seq,
+                  &after->raw_keys.records.byte_offsets, &after->first_rope.records.byte_offsets})
+                v.require(!v.overlap(*out, *in), "output/metadata overlap");
+    }
 }
-
-template <bool StridedRope>
-void prepare_kv(const QsaKvProjectionView& p, const QsaKvPrepareParameters& parameters,
-                const QsaBatchView& batch, const Tensor& rope_positions,
-                const ConstQsaTailStateView& before, QsaCacheView cache,
-                QsaRawRecordWriteView records, CudaExecutionView execution) {
-    const detail::qsa::ViewValidation v{"qsa_prepare_kv", execution.device()};
-    validate_kv<StridedRope>(v, p, parameters, batch, rope_positions, before, cache, records);
-    detail::qsa::launch_prepare_kv<StridedRope>(p, parameters, batch, rope_positions, before, cache,
-                                                records, execution);
-}
-
 
 } // namespace
 
@@ -146,116 +139,52 @@ void qsa_prepare(const QsaProjectionView& p, const QsaPrepareParameters& paramet
                  const ConstQsaTailStateView& before, QsaCacheView cache,
                  QsaRawRecordWriteView records, Tensor& query, Tensor& index_query,
                  CudaExecutionView execution) {
-    prepare<false>(p, parameters, batch, rope_positions, before, cache, records, query, index_query,
-                   execution);
+    const detail::qsa::ViewValidation v{"qsa_prepare", execution.device()};
+    validate_kv(v, {p.key, p.value, p.index_key}, parameters.kv, batch, rope_positions, before,
+                cache, records);
+    validate_queries(v, p, parameters, batch, rope_positions, before, records, query, index_query);
+    detail::qsa::launch_prepare(p, parameters, batch, rope_positions, before, cache, records, query,
+                                index_query, execution);
 }
 
 void qsa_prepare_kv(const QsaKvProjectionView& p, const QsaKvPrepareParameters& parameters,
                     const QsaBatchView& batch, const Tensor& rope_positions,
                     const ConstQsaTailStateView& before, QsaCacheView cache,
                     QsaRawRecordWriteView records, CudaExecutionView execution) {
-    prepare_kv<false>(p, parameters, batch, rope_positions, before, cache, records, execution);
+    const detail::qsa::ViewValidation v{"qsa_prepare_kv", execution.device()};
+    validate_kv(v, p, parameters, batch, rope_positions, before, cache, records);
+    detail::qsa::launch_prepare_kv(p, parameters, batch, rope_positions, before, cache, records,
+                                   execution);
 }
 
 namespace {
-namespace operand                       = common::operand;
-constexpr const char* ragged_prepare_op = "qsa_prepare_update";
-
-template <class Arena>
-QsaRawRecordWriteView allocate_prepare_records(Arena& arena, int width, Tensor offsets = {}) {
-    return {arena.alloc(DType::BF16, {128, width, 1}, 256),
-            arena.alloc(DType::I32, {3, width, 1}, 256), offsets};
+QsaBatchView packed_metadata(const QsaRaggedBatchView& batch) {
+    return {batch.positions, batch.ragged.seq_lengths, batch.table_rows};
 }
 
-QsaKvProjectionView kv_columns(const QsaKvProjectionView& p, int begin, int length) {
-    return {p.key.slice(2, begin, length), p.value.slice(2, begin, length),
-            p.index_key.slice(1, begin, length)};
-}
-
-template <class Prepare>
-void prepare_update(const QsaKvProjectionView& kv, const QsaKvPrepareParameters& params,
-                    const QsaRaggedBatchView& batch, const Tensor& rope,
-                    const ConstQsaTailStateView& before, QsaTailStateView after,
-                    MemoryArena& workspace, std::span<const Tensor* const> queries,
-                    std::span<const Tensor* const> query_outputs, Prepare prepare,
-                    CudaExecutionView execution) {
-    const auto& seq         = batch.ragged;
-    const auto device       = execution.device();
-    constexpr const auto op = ragged_prepare_op;
-    operand::ragged_batch(seq, batch.positions, batch.table_rows, op, device);
-    operand::device(workspace.device(), device, op, "workspace");
-    const int n = seq.total_tokens(), axes = rope.ne[1], heads = kv.key.ne[1];
-    const detail::qsa::ViewValidation v{op, device};
-    v.require(axes == 1 || axes == 3, "coordinate axes");
-    v.columns(rope, DType::I32, n, axes, 1, "RoPE positions");
-    v.state(before, seq.num_seqs());
-    v.state(after, seq.num_seqs());
-    operand::tensor(kv.key, DType::BF16, {256, heads, n}, 16, op, "key projection", device);
-    operand::tensor(kv.value, DType::BF16, {256, heads, n}, 16, op, "value projection", device);
-    operand::tensor(kv.index_key, DType::BF16, {128, n}, 16, op, "index-key projection", device);
-    const Tensor* tensors[] = {&kv.key,
-                               &kv.value,
-                               &kv.index_key,
-                               &params.key_norm,
-                               &params.index_key_norm,
-                               &batch.positions,
-                               &batch.table_rows,
-                               &seq.cu_seqlens,
-                               &seq.seq_lengths,
-                               &seq.token_to_seq,
-                               &before.raw_keys.records.byte_offsets,
-                               &before.first_rope.records.byte_offsets,
-                               &after.raw_keys.records.byte_offsets,
-                               &after.first_rope.records.byte_offsets};
-    const auto coordinates  = operand::blocks(rope, op);
-    for (const auto* output : query_outputs) {
-        const auto range = operand::range(*output, op);
-        v.require(!operand::overlaps(coordinates, range), "output/coordinate overlap");
-        for (const auto* input : tensors) operand::disjoint(range, operand::range(*input, op), op);
-    }
-    for (int s = 0; s < seq.num_seqs(); ++s) {
-        const int begin = seq.segment_begin(s), len = seq.segment_length(s);
-        auto scope = workspace.scope();
-        const QsaBatchView segment{batch.positions.slice(0, begin, len),
-                                   seq.seq_lengths.slice(0, s, 1), batch.table_rows.slice(0, s, 1)};
-        const ConstQsaTailStateView src{operand::state_row(before.raw_keys, s),
-                                        operand::state_row(before.first_rope, s)};
-        const QsaTailStateView dst{operand::state_row(after.raw_keys, s),
-                                   operand::state_row(after.first_rope, s)};
-        const auto records =
-            allocate_prepare_records(workspace, len, seq.cu_seqlens.slice(0, 0, 1));
-        for (const auto* t : {&records.raw_keys, &records.rope_positions}) {
-            const auto scratch = operand::range(*t, op);
-            v.require(!operand::overlaps(coordinates, scratch), "workspace/coordinate overlap");
-            for (const auto* input : tensors)
-                operand::disjoint(scratch, operand::range(*input, op), op);
-            for (const auto* input : queries)
-                operand::disjoint(scratch, operand::range(*input, op), op);
-        }
-        prepare(kv_columns(kv, begin, len), segment, rope.slice(0, begin, len), src, records, begin,
-                len);
-        qsa_tail_extract(src,
-                         {records.raw_keys, records.rope_positions,
-                          batch.positions.slice(0, begin, 1), segment.valid_columns},
-                         segment.valid_columns, dst, {}, execution);
-    }
+void validate_update(const detail::qsa::ViewValidation& v, const QsaKvProjectionView& p,
+                     const QsaKvPrepareParameters& parameters, const QsaRaggedBatchView& batch,
+                     const Tensor& rope, const ConstQsaTailStateView& before, QsaCacheView cache,
+                     QsaTailStateView after, MemoryArena& workspace) {
+    common::operand::device(workspace.device(), v.device, v.op, "workspace");
+    validate_kv(v, p, parameters, packed_metadata(batch), rope, before, cache, {}, &batch.ragged);
+    v.state(after, batch.ragged.num_seqs());
 }
 } // namespace
 
 std::size_t qsa_prepare_kv_update_ragged_workspace_capacity_bytes(int min_tokens, int max_tokens,
                                                                   int min_segments,
                                                                   int max_segments) {
-    const auto widths = operand::ragged_envelope(min_tokens, max_tokens, min_segments, max_segments,
-                                                 ragged_prepare_op);
-    WorkspaceLayoutBuilder layout;
-    (void)allocate_prepare_records(layout, widths.last);
-    return layout.peak_bytes(1);
+    (void)common::operand::ragged_envelope(min_tokens, max_tokens, min_segments, max_segments,
+                                           "qsa_prepare_kv_update");
+    return 0;
 }
 
 std::size_t qsa_prepare_update_ragged_workspace_capacity_bytes(int min_tokens, int max_tokens,
                                                                int min_segments, int max_segments) {
-    return qsa_prepare_kv_update_ragged_workspace_capacity_bytes(min_tokens, max_tokens,
-                                                                 min_segments, max_segments);
+    (void)common::operand::ragged_envelope(min_tokens, max_tokens, min_segments, max_segments,
+                                           "qsa_prepare_update");
+    return 0;
 }
 
 void qsa_prepare_update(const QsaProjectionView& p, const QsaPrepareParameters& parameters,
@@ -263,39 +192,13 @@ void qsa_prepare_update(const QsaProjectionView& p, const QsaPrepareParameters& 
                         const ConstQsaTailStateView& before, QsaCacheView cache,
                         QsaTailStateView after, Tensor& query, Tensor& index_query,
                         MemoryArena& workspace, CudaExecutionView execution) {
-    const int n = batch.ragged.total_tokens(), h = detail::qsa::registered_query_heads(p.key.ne[1]);
-    const auto device       = execution.device();
-    constexpr const auto op = ragged_prepare_op;
-    for (const auto* t : std::array<const Tensor*, 2>{&p.query, &query})
-        operand::tensor(*t, DType::BF16, {256, h, n}, 16, op, "query", device);
-    for (const auto* t : std::array<const Tensor*, 2>{&p.index_query, &index_query})
-        operand::tensor(*t, DType::BF16, {128, 4, n}, 16, op, "index query", device);
-    const Tensor* outputs[] = {&query, &index_query};
-    operand::disjoint(operand::range(query, op), operand::range(index_query, op), op);
-    for (const auto* out : outputs) {
-        const auto range = operand::range(*out, op);
-        for (const auto* in :
-             {&p.query, &p.index_query, &parameters.query_norm, &parameters.index_query_norm}) {
-            const bool paired =
-                (out == &query && in == &p.query) || (out == &index_query && in == &p.index_query);
-            if (paired && identical(*out, *in)) continue;
-            operand::disjoint(range, operand::range(*in, op), op);
-        }
-    }
-    const Tensor* queries[] = {&p.query,     &p.index_query,         &query,
-                               &index_query, &parameters.query_norm, &parameters.index_query_norm};
-    prepare_update(
-        {p.key, p.value, p.index_key}, parameters.kv, batch, rope, before, after, workspace,
-        queries, outputs,
-        [&](const QsaKvProjectionView& kv, const QsaBatchView& segment, const Tensor& coords,
-            const ConstQsaTailStateView& src, QsaRawRecordWriteView records, int begin, int len) {
-            auto out = query.slice(2, begin, len);
-            auto iq  = index_query.slice(2, begin, len);
-            prepare<true>({p.query.slice(2, begin, len), kv.key, kv.value,
-                           p.index_query.slice(2, begin, len), kv.index_key},
-                          parameters, segment, coords, src, cache, records, out, iq, execution);
-        },
-        execution);
+    const detail::qsa::ViewValidation v{"qsa_prepare_update", execution.device()};
+    validate_update(v, {p.key, p.value, p.index_key}, parameters.kv, batch, rope, before, cache,
+                    after, workspace);
+    validate_queries(v, p, parameters, packed_metadata(batch), rope, before, {}, query, index_query,
+                     &batch.ragged, &after);
+    detail::qsa::launch_prepare_update(p, parameters, batch, rope, before, cache, after, query,
+                                       index_query, execution);
 }
 
 void qsa_prepare_kv_update(const QsaKvProjectionView& p, const QsaKvPrepareParameters& parameters,
@@ -303,13 +206,10 @@ void qsa_prepare_kv_update(const QsaKvProjectionView& p, const QsaKvPrepareParam
                            const ConstQsaTailStateView& before, QsaCacheView cache,
                            QsaTailStateView after, MemoryArena& workspace,
                            CudaExecutionView execution) {
-    prepare_update(
-        p, parameters, batch, rope, before, after, workspace, {}, {},
-        [&](const QsaKvProjectionView& kv, const QsaBatchView& segment, const Tensor& coords,
-            const ConstQsaTailStateView& src, QsaRawRecordWriteView records, int, int) {
-            prepare_kv<true>(kv, parameters, segment, coords, src, cache, records, execution);
-        },
-        execution);
+    const detail::qsa::ViewValidation v{"qsa_prepare_kv_update", execution.device()};
+    validate_update(v, p, parameters, batch, rope, before, cache, after, workspace);
+    detail::qsa::launch_prepare_kv_update(p, parameters, batch, rope, before, cache, after,
+                                          execution);
 }
 
 } // namespace ninfer::ops

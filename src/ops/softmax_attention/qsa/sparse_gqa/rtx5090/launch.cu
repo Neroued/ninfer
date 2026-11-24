@@ -7,11 +7,17 @@
 
 namespace ninfer::ops::detail::qsa {
 namespace {
-template <KvCacheStorage Storage, bool VectorCache, int KvHeads>
-void launch(const SparseGqaArguments& arguments, SparseGqaPlan plan,
+template <KvCacheStorage Storage, bool VectorCache, int KvHeads, bool Ragged>
+void launch(const SparseGqaInput<Ragged>& arguments, SparseGqaPlan plan,
             SparseGqaLaunchPlan launch_plan, int queries, CudaExecutionView execution) {
-    SparseGqaKernelArguments<KvHeads> a{arguments};
+    SparseGqaKernelArguments<KvHeads, Ragged> a{arguments};
     a.splits             = launch_plan.splits;
+    const auto grid      = [&](int groups) {
+        if constexpr (Ragged) {
+            if (a.adjacent_splits) return dim3(groups * a.kv_heads * a.splits);
+        }
+        return dim3(groups * a.kv_heads, a.splits);
+    };
     constexpr bool Async = kSparseQuantized<Storage> && VectorCache;
     const auto compact = [&]<int N, int Warps, SparseGqaLoad Load, bool Prefix, bool Delay = false,
                              bool WarpAddresses = false>() {
@@ -19,14 +25,13 @@ void launch(const SparseGqaArguments& arguments, SparseGqaPlan plan,
                                                            Load == SparseGqaLoad::Reused, Delay);
         constexpr auto kernel =
             sparse_gqa_compact_kernel<Storage, N, Warps, VectorCache, Load, Prefix, Delay, KvHeads,
-                                      resident, WarpAddresses>;
+                                        resident, WarpAddresses, Ragged>;
         constexpr int bytes =
             sizeof(SparseGqaStorage<Storage, N, Warps, Load, SparseGqaWarpSplit::Sequence, 8>);
         const int shared     = common::prepare_shared<bytes, kernel, true>();
         constexpr int packet = Warps / (HeadGeometry<KvHeads>::ratio / 6);
         const int groups     = Prefix ? (queries + packet - 1) / packet : queries;
-        kernel<<<dim3(groups * a.kv_heads, a.splits), Warps * 32, shared, execution.stream()>>>(
-            a, queries);
+        kernel<<<grid(groups), Warps * 32, shared, execution.stream()>>>(a, queries);
     };
     const auto submit = [&]<int N, int Warps, bool Prefix, bool Delay = false>() {
         if constexpr (KvHeads == 4 && Storage == KvCacheStorage::Fp8E4m3fnGroup128Ue8m0 &&
@@ -76,7 +81,7 @@ void launch(const SparseGqaArguments& arguments, SparseGqaPlan plan,
     } else if (plan.instance == SparseGqaInstance::FullPrefix) {
         constexpr auto load = Async ? SparseGqaLoad::InPlace : SparseGqaLoad::Direct;
         constexpr auto kernel =
-            sparse_gqa_all_select_kernel<Storage, 64, 4, VectorCache, load, KvHeads>;
+            sparse_gqa_all_select_kernel<Storage, 64, 4, VectorCache, load, KvHeads, Ragged>;
         constexpr int bytes =
             (sizeof(SparseGqaStorage<Storage, 64, 4, load>) + 15) / 16 * 16 + 4 * 16 * 256 * 2;
         const int shared = common::prepare_shared<bytes, kernel, true>();
@@ -84,18 +89,18 @@ void launch(const SparseGqaArguments& arguments, SparseGqaPlan plan,
     } else if constexpr (Async) {
         if (launch_plan.load == SparseGqaLoad::InPlace)
             sparse_gqa_mma_kernel<Storage, 32, 2, VectorCache, SparseGqaLoad::InPlace>
-                <<<dim3(queries * a.kv_heads, a.splits), 64,
+                <<<grid(queries), 64,
                    sizeof(SparseGqaStorage<Storage, 32, 2, SparseGqaLoad::InPlace>),
                    execution.stream()>>>(a);
         else
             sparse_gqa_mma_kernel<Storage, 32, 2, VectorCache, SparseGqaLoad::Staged>
-                <<<dim3(queries * a.kv_heads, a.splits), 64,
+                <<<grid(queries), 64,
                    sizeof(SparseGqaStorage<Storage, 32, 2, SparseGqaLoad::Staged>),
                    execution.stream()>>>(a);
     } else {
         sparse_gqa_mma_kernel<Storage, 32, 2, VectorCache>
-            <<<dim3(queries * a.kv_heads, a.splits), 64, sizeof(SparseGqaStorage<Storage, 32, 2>),
-               execution.stream()>>>(a);
+            <<<grid(queries), 64, sizeof(SparseGqaStorage<Storage, 32, 2>), execution.stream()>>>(
+                a);
     }
     if (plan.merge_node) {
         if (!plan.partial) {
@@ -115,15 +120,18 @@ void launch(const SparseGqaArguments& arguments, SparseGqaPlan plan,
 
 } // namespace
 
-void launch_sparse_gqa_instance(SparseGqaArguments a, KvCacheStorage storage, int kv_heads,
+template <class Arguments>
+void launch_sparse_gqa_instance(Arguments a, KvCacheStorage storage, int kv_heads,
                                 SparseGqaPlan plan, SparseGqaLaunchPlan launch_plan, int queries,
                                 CudaExecutionView execution) {
+    constexpr bool Ragged = std::is_same_v<Arguments, RaggedSparseGqaArguments>;
+    if constexpr (Ragged) plan.merge_node = plan.partial;
     const auto dispatch = [&]<KvCacheStorage Storage>() {
         const auto geometry = [&]<int KvHeads>() {
             if (launch_plan.vector_cache)
-                launch<Storage, true, KvHeads>(a, plan, launch_plan, queries, execution);
+                launch<Storage, true, KvHeads, Ragged>(a, plan, launch_plan, queries, execution);
             else
-                launch<Storage, false, KvHeads>(a, plan, launch_plan, queries, execution);
+                launch<Storage, false, KvHeads, Ragged>(a, plan, launch_plan, queries, execution);
         };
         if (kv_heads == 1)
             geometry.template operator()<1>();
@@ -152,4 +160,11 @@ void launch_sparse_gqa_instance(SparseGqaArguments a, KvCacheStorage storage, in
         break; // Validated by the public wrapper.
     }
 }
+
+template void launch_sparse_gqa_instance(SparseGqaArguments, KvCacheStorage, int, SparseGqaPlan,
+                                         SparseGqaLaunchPlan, int, CudaExecutionView);
+template void launch_sparse_gqa_instance(RaggedSparseGqaArguments, KvCacheStorage, int,
+                                         SparseGqaPlan, SparseGqaLaunchPlan, int,
+                                         CudaExecutionView);
+
 } // namespace ninfer::ops::detail::qsa

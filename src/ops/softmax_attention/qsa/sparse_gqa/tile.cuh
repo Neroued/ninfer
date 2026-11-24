@@ -83,9 +83,9 @@ sparse_gqa_wait_stage(SparseGqaStorage<Storage, N, Warps, Load, Split, PaddedHea
 }
 
 template <KvCacheStorage Storage, int N, int Warps, SparseGqaLoad Load, SparseGqaWarpSplit Split,
-          int PaddedHeads>
+          int PaddedHeads, class Arguments>
 __device__ void
-sparse_gqa_addresses(const SparseGqaArguments& a,
+sparse_gqa_addresses(const Arguments& a,
                      SparseGqaStorage<Storage, N, Warps, Load, Split, PaddedHeads>& s,
                      SparseGqaWork work, std::int64_t q, int head, int start, int end) {
     const int i = threadIdx.x;
@@ -95,7 +95,7 @@ sparse_gqa_addresses(const SparseGqaArguments& a,
         const int g          = ordinal < work.count
                                    ? (work.count == work.complete ? ordinal : a.ids[q * 512 + ordinal])
                                    : work.complete;
-        const int table_row  = a.table_rows[q / a.tokens];
+        const int table_row  = a.table_row(q);
         const auto page      = a.tables[std::int64_t(table_row) * a.table_stride + g / 16];
         const int row        = 4 * (g % 16);
         s.addresses.key[i]   = page + head * a.key.head + row * a.key.row;
@@ -115,8 +115,11 @@ struct SparseGqaWarpAddresses {
 
 // A single warp keeps one block's page/row in each of its first four lanes.
 // Exchange addresses before row-validity branches so every lane joins each shuffle.
-__device__ __forceinline__ SparseGqaWarpAddresses sparse_gqa_warp_addresses(
-    const SparseGqaArguments& a, SparseGqaWork work, std::int64_t q, int start, int end) {
+template <class Arguments>
+__device__ __forceinline__ SparseGqaWarpAddresses sparse_gqa_warp_addresses(const Arguments& a,
+                                                                            SparseGqaWork work,
+                                                                            std::int64_t q,
+                                                                            int start, int end) {
     const int lane = threadIdx.x;
     SparseGqaWarpAddresses result;
     if (lane < 4 && start + lane * 4 < end) {
@@ -124,7 +127,7 @@ __device__ __forceinline__ SparseGqaWarpAddresses sparse_gqa_warp_addresses(
         const int g         = ordinal < work.count
                                   ? (work.count == work.complete ? ordinal : a.ids[q * 512 + ordinal])
                                   : work.complete;
-        const int table_row = a.table_rows[q / a.tokens];
+        const int table_row = a.table_row(q);
         result.page         = a.tables[std::int64_t(table_row) * a.table_stride + g / 16];
         result.row          = 4 * (g % 16);
     }

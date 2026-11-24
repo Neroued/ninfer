@@ -6,9 +6,9 @@
 
 namespace ninfer::ops::detail::qsa {
 template <KvCacheStorage Storage, int N, int Parts, bool Vector, SparseGqaLoad Load,
-          int PrefixQueries = 0, bool SharedScales = false, int KvHeads>
-__launch_bounds__(Parts * 32) __global__
-    void sparse_gqa_columns_kernel(const __grid_constant__ SparseGqaKernelArguments<KvHeads> a) {
+          int PrefixQueries = 0, bool SharedScales = false, int KvHeads, bool Ragged>
+__launch_bounds__(Parts * 32) __global__ void sparse_gqa_columns_kernel(
+    const __grid_constant__ SparseGqaKernelArguments<KvHeads, Ragged> a) {
     static_assert(N >= 16 && N % 16 == 0 && Parts > 0 && 256 % (Parts * 8) == 0);
     extern __shared__ __align__(16) unsigned char shared[];
     using Tile     = SparseGqaOutputTile<Storage, N, Parts, Vector, Load, SharedScales>;

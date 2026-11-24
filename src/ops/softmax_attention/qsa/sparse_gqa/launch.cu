@@ -1,5 +1,6 @@
 #include "ops/softmax_attention/qsa/sparse_gqa/plan.h"
 #include "ops/common/host/operands.h"
+#include "core/platform.h"
 
 #include <algorithm>
 
@@ -8,8 +9,8 @@ namespace ninfer::ops::detail::qsa {
 void launch_sparse_gqa(const Tensor& query, const Tensor& gate,
                        const ConstPagedKVBatchLayerView& cache, const QsaBatchView& batch,
                        const QsaBlockSelection& selected, ContextBucket bucket, SparseGqaPlan plan,
-                       const SparseGqaWorkspace& scratch, Tensor& out,
-                       CudaExecutionView execution) {
+                       const SparseGqaWorkspace& scratch, Tensor& out, CudaExecutionView execution,
+                       const Tensor* token_to_seq, std::int64_t window_begin, int window_queries) {
     const auto i32  = [](const Tensor& t) { return static_cast<const int*>(t.data); };
     const auto page = [](const ConstPagedPlaneView& t) {
         return SparseGqaPage{static_cast<const std::uint8_t*>(t.data()),
@@ -45,14 +46,26 @@ void launch_sparse_gqa(const Tensor& query, const Tensor& gate,
                t.head_stride_bytes() % 16 == 0 && t.plane.tensor.region.alignment % 16 == 0;
     };
     const bool vector_cache = aligned(cache.k_pages) && aligned(cache.v_pages);
-    const auto queries      = std::int64_t(a.tokens) * a.batch;
-    for (a.begin = 0; a.begin < queries; a.begin += kSparseGqaSlab) {
-        const int n = int(std::min<std::int64_t>(kSparseGqaSlab, queries - a.begin));
-        const auto selected_launch =
-            select_sparse_gqa_launch(cache.storage, cache.num_kv_heads, bucket, plan, n, a.batch,
-                                     execution.multiprocessor_count(), vector_cache);
-        launch_sparse_gqa_instance(a, cache.storage, cache.num_kv_heads, plan, selected_launch, n,
-                                   execution);
+    if (token_to_seq) {
+        a.begin           = window_begin;
+        const auto launch = select_sparse_gqa_launch(
+            cache.storage, cache.num_kv_heads, bucket, plan, window_queries, 1,
+            execution.multiprocessor_count(), vector_cache);
+        const bool adjacent =
+            NINFER_TARGET_RTX5090 && bucket > ContextBucket::K2 && launch.splits > 1;
+        launch_sparse_gqa_instance(
+            RaggedSparseGqaArguments{a, i32(*token_to_seq), window_queries, adjacent},
+            cache.storage, cache.num_kv_heads, plan, launch, window_queries, execution);
+    } else {
+        const auto queries = std::int64_t(a.tokens) * a.batch;
+        for (a.begin = 0; a.begin < queries; a.begin += kSparseGqaSlab) {
+            const int n = int(std::min<std::int64_t>(kSparseGqaSlab, queries - a.begin));
+            const auto selected_launch =
+                select_sparse_gqa_launch(cache.storage, cache.num_kv_heads, bucket, plan, n,
+                                         a.batch, execution.multiprocessor_count(), vector_cache);
+            launch_sparse_gqa_instance(a, cache.storage, cache.num_kv_heads, plan, selected_launch,
+                                       n, execution);
+        }
     }
     CUDA_CHECK(cudaGetLastError());
 }

@@ -2,6 +2,7 @@
 
 #include <cuda_bf16.h>
 #include <cstdint>
+#include <type_traits>
 
 namespace ninfer::ops::detail::qsa {
 
@@ -10,6 +11,7 @@ inline constexpr int kIndexerSelected         = 512;
 inline constexpr int kIndexerKeyTile          = 64;
 
 struct IndexerArguments {
+    static constexpr bool ragged = false;
     const __nv_bfloat16 *query, *keys;
     const std::int32_t *positions, *valid, *table_rows;
     const std::int64_t* tables;
@@ -51,5 +53,23 @@ struct IndexerArguments {
                (g % 16) * key_row_stride;
     }
 };
+
+struct RaggedIndexerArguments : IndexerArguments {
+    const int *token_to_seq, *cu_seqlens;
+    int segments;
+    static constexpr bool ragged = true;
+
+    __device__ std::int64_t column(int slot) const { return begin + slot; }
+
+    __device__ int visible(int slot) const { return (positions[column(slot)] + 1) / 4; }
+};
+
+template <class Arguments>
+__device__ int indexer_segment(const Arguments& a, int slot, int row) {
+    if constexpr (Arguments::ragged)
+        return a.token_to_seq[a.column(slot)];
+    else
+        return row;
+}
 
 } // namespace ninfer::ops::detail::qsa

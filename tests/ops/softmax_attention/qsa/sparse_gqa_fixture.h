@@ -136,7 +136,9 @@ struct Fixture {
                     Tensor(sizes.span(), DType::I32, {T, B})};
     }
 
-    void reset(int phase = 0, int cap = 512, float magnitude = 1.0F) {
+    void reset(int phase = 0, int cap = 512, float magnitude = 1.0F,
+               std::span<const int> packed_lengths = {}, std::span<const int> packed_ends = {},
+               std::span<const int> caps = {}) {
         std::fill(positions.begin(), positions.end(), -1);
         std::fill(ids.begin(), ids.end(), -1);
         std::fill(counts.begin(), counts.end(), -1);
@@ -161,6 +163,10 @@ struct Fixture {
             }
             live = std::min(live, live_limit);
             if (phase == 2) live = 0;
+            if (!packed_lengths.empty()) {
+                live = packed_lengths[b];
+                end  = packed_ends[b];
+            }
             ends[b]      = end;
             valid[b]     = live;
             selectors[b] = live ? (b + phase) % B + 1 : -1;
@@ -180,7 +186,7 @@ struct Fixture {
                 if (t < valid[b]) {
                     const int p = ends[b] - valid[b] + t, C = (p + 1) / 4;
                     positions[m] = p;
-                    counts[m]    = std::min(C, cap);
+                    counts[m]    = std::min(C, caps.empty() ? cap : caps[b]);
                     int step     = C > 0 ? (hash(m + phase * 71) % C) | 1 : 1;
                     while (C > 0 && std::gcd(step, C) != 1) step += 2;
                     std::array<int, 512> groups;
@@ -241,7 +247,11 @@ struct Fixture {
                                               (page * 128 + h * 64 + token) * 256 + d);
                                           keys.host[offset + d] =
                                               f32_to_bf16(sample(seed + 701) * magnitude);
-                                          values.host[offset + d] = half(sample(seed + 1311));
+                                          values.host[offset + d] =
+                                              half(packed_lengths.empty()
+                                                       ? sample(seed + 1311)
+                                                       : (page / table_width % 2 ? 1.0F : -1.0F) *
+                                                             (0.55F + 0.06F * sample(seed + 1311)));
                                       }
                                   }
                           }

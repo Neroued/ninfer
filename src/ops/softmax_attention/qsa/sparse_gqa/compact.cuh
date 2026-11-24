@@ -60,9 +60,9 @@ compact_probabilities(float (&score)[Tiles][4], OnlineSoftmaxRow (&state)[2], fl
 }
 
 template <KvCacheStorage Storage, int N, int Warps, bool Vector, SparseGqaLoad Load, bool Prefix,
-          bool DelaySoftmax = false, bool WarpAddresses = false, int KvHeads>
+          bool DelaySoftmax = false, bool WarpAddresses = false, int KvHeads, bool Ragged>
 __device__ __forceinline__ void
-sparse_gqa_compact(const SparseGqaKernelArguments<KvHeads>& a,
+sparse_gqa_compact(const SparseGqaKernelArguments<KvHeads, Ragged>& a,
                    SparseGqaStorage<Storage, N, Warps, Load, SparseGqaWarpSplit::Sequence, 8>& s,
                    std::int64_t first, int head, int split,
                    int packed = Prefix ? Warps / (HeadGeometry<KvHeads>::ratio / 6) : 1) {
@@ -83,14 +83,14 @@ sparse_gqa_compact(const SparseGqaKernelArguments<KvHeads>& a,
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
     const int gid = lane / 4, lid = lane % 4;
     const auto total = std::int64_t(a.tokens) * a.batch;
-    const int batch  = first / a.tokens;
-    const auto last  = min(first + packed, std::int64_t(batch) * a.tokens + a.valid[batch]);
+    const auto last  = a.packet_end(first, packed);
     const auto q     = first + (Prefix ? warp / HeadPackets : 0);
     const int packet = warp % HeadPackets, first_head = head * a.ratio + packet * 6;
     const bool live = q < last;
     auto work       = a.work(first);
     if constexpr (Prefix) {
-        const int end   = last > first ? a.positions[last - 1] + 1 : 0;
+        const int end =
+            last > first ? (Ragged ? a.work(last - 1).size : a.positions[last - 1] + 1) : 0;
         const int tiles = (end + N - 1) / N;
         work            = {end / 4, end / 4, end, tiles, min(a.splits, tiles)};
     }
@@ -324,14 +324,14 @@ sparse_gqa_compact(const SparseGqaKernelArguments<KvHeads>& a,
 
 template <KvCacheStorage Storage, int N, int Warps, bool Vector, SparseGqaLoad Load,
           bool Prefix = false, bool DelaySoftmax = false, int KvHeads, int MinBlocks = 1,
-          bool WarpAddresses = false>
-__launch_bounds__(Warps * 32, MinBlocks) __global__
-    void sparse_gqa_compact_kernel(const __grid_constant__ SparseGqaKernelArguments<KvHeads> a,
-                                   int slab_queries) {
+          bool WarpAddresses = false, bool Ragged>
+__launch_bounds__(Warps * 32, MinBlocks) __global__ void sparse_gqa_compact_kernel(
+    const __grid_constant__ SparseGqaKernelArguments<KvHeads, Ragged> a, int slab_queries) {
     extern __shared__ __align__(16) unsigned char smem[];
     auto& s = *reinterpret_cast<
         SparseGqaStorage<Storage, N, Warps, Load, SparseGqaWarpSplit::Sequence, 8>*>(smem);
-    const auto group      = std::int64_t(a.group_query(blockIdx.x));
+    const auto group =
+        std::int64_t(a.group_query(Prefix ? blockIdx.x : sparse_gqa_group_block(a, blockIdx.x)));
     constexpr int Queries = Warps / (HeadGeometry<KvHeads>::ratio / 6);
     auto first            = a.begin + group * (Prefix ? Queries : 1);
     int packed            = Prefix ? Queries : 1;
@@ -342,7 +342,7 @@ __launch_bounds__(Warps * 32, MinBlocks) __global__
         first             = a.begin + (group ? leading + (group - 1) * Queries : 0);
         if (!group) packed = leading;
     }
-    const int head = a.group_head(blockIdx.x);
+    const int head = a.group_head(Prefix ? blockIdx.x : sparse_gqa_group_block(a, blockIdx.x));
     if constexpr (Prefix) {
         if (sparse_gqa_all_selected<Queries>(a, first, packed))
             sparse_gqa_compact<Storage, N, Warps, Vector, Load, true, DelaySoftmax, WarpAddresses>(
@@ -357,6 +357,6 @@ __launch_bounds__(Warps * 32, MinBlocks) __global__
         }
     } else
         sparse_gqa_compact<Storage, N, Warps, Vector, Load, false, DelaySoftmax, WarpAddresses>(
-            a, s, first, head, blockIdx.y);
+            a, s, first, head, sparse_gqa_split(a, blockIdx.x, blockIdx.y));
 }
 } // namespace ninfer::ops::detail::qsa

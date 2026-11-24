@@ -5,9 +5,9 @@
 
 namespace ninfer::ops::detail::qsa {
 template <KvCacheStorage Storage, int N, int Parts, int Queries, bool Vector, SparseGqaLoad Load,
-          int KvHeads>
+          int KvHeads, bool Ragged>
 __global__ __launch_bounds__(Queries* Parts * 24) void sparse_gqa_grouped_kernel(
-    const __grid_constant__ SparseGqaKernelArguments<KvHeads> a) {
+    const __grid_constant__ SparseGqaKernelArguments<KvHeads, Ragged> a) {
     static_assert(Queries % 4 == 0 && N % 16 == 0 && 256 % (Parts * 8) == 0);
     // Twelve heads per query occupy consecutive MMA rows, without per-query padding.
     constexpr int Rows = Queries * 12, Warps = Rows / 16 * Parts, Columns = 256 / Parts / 8;
@@ -20,9 +20,8 @@ __global__ __launch_bounds__(Queries* Parts * 24) void sparse_gqa_grouped_kernel
                total = std::int64_t(a.tokens) * a.batch;
     const int head = a.group_head(blockIdx.x), tid = threadIdx.x, lane = tid % 32, warp = tid / 32;
     if (!sparse_gqa_all_selected<Queries>(a, first)) return;
-    const int b     = first / a.tokens;
-    const auto last = min(first + Queries, std::int64_t(b) * a.tokens + a.valid[b]);
-    const int end   = last > first ? a.positions[last - 1] + 1 : 0;
+    const auto last = a.packet_end(first, Queries);
+    const int end = last > first ? (Ragged ? a.work(last - 1).size : a.positions[last - 1] + 1) : 0;
     if constexpr (kSparseQuantized<Storage>) {
         for (int row = warp; row < Rows; row += Warps) {
             const auto q = first + row / 12;

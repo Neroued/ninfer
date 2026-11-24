@@ -1,5 +1,5 @@
 #pragma once
-#include "ops/softmax_attention/qsa/indexer/arguments.h"
+#include "ops/softmax_attention/qsa/indexer/work_map.cuh"
 #include "ops/common/cuda/mma.cuh"
 #include "ops/common/cuda/pipeline.cuh"
 
@@ -60,28 +60,32 @@ struct ScoreWorkMap {
     }
 };
 
-template <int Tile, bool Vector, int Stages, bool RetainKeys = false, int MapCapacity = 32>
+template <int Tile, bool Vector, int Stages, bool RetainKeys = false, int MapCapacity = 32,
+          class Arguments = IndexerArguments>
 __global__ __launch_bounds__(Tile > 16 ? Tile * 8 : 128) void indexer_score_pipeline_kernel(
-    const __grid_constant__ IndexerArguments a) {
+    const __grid_constant__ Arguments a) {
     constexpr int Threads = Tile > 16 ? Tile * 8 : 128, KeyGroups = Tile > 16 ? 1 : 16 / Tile,
                   WarpKeys = 64 / KeyGroups, NT = WarpKeys / 8;
     if (a.columns <= kIndexerSelected) return;
     static_assert(Tile >= 4 && Tile <= 128 && (Tile & (Tile - 1)) == 0);
     static_assert(Stages == 1 || Stages == 2);
-    __shared__ ScoreWorkMap<MapCapacity> jobs;
+    __shared__ std::conditional_t<Arguments::ragged, RaggedScoreJobs<MapCapacity>,
+                                  ScoreWorkMap<MapCapacity>>
+        jobs;
     extern __shared__ __align__(1024) __nv_bfloat16 pipe_keys[];
     if (!jobs.template build<Tile>(a)) return;
     const int tid = threadIdx.x, lane = tid % 32, warp = tid / 32,
               per_row = (a.width + Tile - 1) / Tile;
     const auto stage  = [&](int job, int buffer) {
-        const int group = jobs.group_for(job), b = group / per_row,
-                  g0 = (job - jobs.prefix[group]) * 64;
+        const int group = jobs.group_for(job), b = Arguments::ragged ? 0 : group / per_row,
+                  g0      = (job - indexer_score_job_begin(jobs, group)) * 64;
+        const int segment = indexer_segment(a, indexer_score_start(jobs, group, 0), b);
         auto* dst    = pipe_keys + buffer * 64 * 128;
         for (int i = tid; i < 64 * 16; i += Threads) {
             const int row = i / 16, d = i % 16 * 8;
             auto* out = dst + row * 128 + (d ^ ((row & 7) << 3));
-            if (g0 + row < jobs.length[group]) {
-                const auto* in = a.key(b, g0 + row) + d;
+            if (g0 + row < indexer_score_length(jobs, group)) {
+                const auto* in = a.key(segment, g0 + row) + d;
                 if constexpr (Vector) {
                     if constexpr (RetainKeys)
                         common::cp_async_cache_hint<Cache::cg>(out, in, 16,
@@ -97,22 +101,30 @@ __global__ __launch_bounds__(Tile > 16 ? Tile * 8 : 128) void indexer_score_pipe
         }
         common::cp_commit();
     };
-    const int total = jobs.prefix[jobs.groups];
+    const int total = indexer_score_jobs(jobs);
     if (blockIdx.x >= total) return;
     if constexpr (Stages == 2) stage(blockIdx.x, 0);
     unsigned qf[8][4];
     int previous = -1, limit[2], slot[2];
     for (int job = blockIdx.x, step_job = 0; job < total; job += gridDim.x, ++step_job) {
-        const int group = jobs.group_for(job), b = group / per_row, q0 = group % per_row * Tile,
-                  g0     = (job - jobs.prefix[group]) * 64;
+        const int group = jobs.group_for(job), b = Arguments::ragged ? 0 : group / per_row,
+                  q0     = indexer_score_start(jobs, group, group % per_row * Tile),
+                  g0     = (job - indexer_score_job_begin(jobs, group)) * 64;
         const int buffer = Stages == 2 ? step_job % 2 : 0;
         if constexpr (Stages == 1) stage(job, buffer);
         if (group != previous) {
+            const int q_end = indexer_score_end(jobs, group, a.width);
 #pragma unroll
             for (int half = 0; half < 2; ++half) {
                 const int row = warp / KeyGroups * 16 + lane / 4 + half * 8, t = q0 + row / 4;
                 slot[half]  = b * a.width + t;
-                limit[half] = t < a.width ? a.visible(slot[half]) : 0;
+                limit[half] = [&] {
+                    if (t >= q_end) return 0;
+                    if constexpr (Arguments::ragged)
+                        return jobs.tiles[group].visible(t);
+                    else
+                        return a.visible(slot[half]);
+                }();
 #pragma unroll
                 for (int k = 0; k < 8; ++k) {
 #pragma unroll

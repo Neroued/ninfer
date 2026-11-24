@@ -133,8 +133,8 @@ __device__ __forceinline__ int4 sparse_gqa_expand_prepared(const std::uint8_t* d
 // Q is transformed only in registers and the existing shared prologue space. No A8/A4 operand
 // or additional global Q tensor is formed. Padded head rows match the chosen contraction.
 template <KvCacheStorage Storage, int Warps, int Queries, int PaddedHeads = 16, int PacketHeads = 0,
-          int KvHeads>
-__device__ void sparse_gqa_prepare_query(const SparseGqaKernelArguments<KvHeads>& a,
+          int KvHeads, bool Ragged>
+__device__ void sparse_gqa_prepare_query(const SparseGqaKernelArguments<KvHeads, Ragged>& a,
                                          std::int64_t first, std::int64_t last, int head,
                                          std::uint16_t* target) {
     const int tid = threadIdx.x, lane = tid % 32, warp = tid / 32;

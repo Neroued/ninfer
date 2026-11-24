@@ -3,7 +3,8 @@
 namespace ninfer::ops::detail::qsa {
 void launch_indexer(const Tensor& query, const ConstQsaIndexCacheView& cache,
                     const QsaBatchView& batch, IndexerPlan plan, const IndexerWorkspace& scratch,
-                    QsaBlockSelection& out, CudaExecutionView execution) {
+                    QsaBlockSelection& out, CudaExecutionView execution,
+                    const RaggedSequenceView* ragged) {
     const auto i32 = [](const Tensor& t) { return static_cast<const std::int32_t*>(t.data); };
     const IndexerArguments input{
         static_cast<const __nv_bfloat16*>(query.data),
@@ -24,9 +25,14 @@ void launch_indexer(const Tensor& query, const ConstQsaIndexCacheView& cache,
         plan.window_tokens,
         plan.columns,
         plan.partitions};
-    launch_indexer_windows(input, plan,
-                           cache.keys.records.storage.bytes - cache.keys.plane.tensor.region.offset,
-                           cache.keys.plane.tensor.region.alignment, execution);
+    const auto& region = cache.keys.plane.tensor.region;
+    const auto bytes   = cache.keys.records.storage.bytes - region.offset;
+    if (ragged)
+        launch_indexer_windows(RaggedIndexerArguments{input, i32(ragged->token_to_seq),
+                                                      i32(ragged->cu_seqlens), ragged->num_seqs()},
+                               plan, bytes, region.alignment, execution, ragged->host_cu_seqlens);
+    else
+        launch_indexer_windows(input, plan, bytes, region.alignment, execution);
     CUDA_CHECK(cudaGetLastError());
 }
 } // namespace ninfer::ops::detail::qsa

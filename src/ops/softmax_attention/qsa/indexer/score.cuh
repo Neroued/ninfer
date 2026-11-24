@@ -8,10 +8,9 @@ namespace ninfer::ops::detail::qsa {
 
 __device__ __forceinline__ int indexer_swizzle(int row, int d) { return d ^ ((row & 7) << 3); }
 
-template <int QueryTile, bool VectorCache, int MaxQueries = 64>
-__device__ __forceinline__ void indexer_score_mma(const IndexerArguments& a, int worker, int stride,
-                                                  IndexerJobs<MaxQueries>& jobs,
-                                                  __nv_bfloat16* shared) {
+template <int QueryTile, bool VectorCache, class Arguments, class Jobs>
+__device__ __forceinline__ void indexer_score_mma(const Arguments& a, int worker, int stride,
+                                                  Jobs& jobs, __nv_bfloat16* shared) {
     static_assert(QueryTile == 4 || QueryTile == 8 || QueryTile == 16 || QueryTile == 32);
     constexpr int Threads   = QueryTile > 16 ? QueryTile * 8 : 128;
     constexpr int KeyGroups = QueryTile > 16 ? 1 : 16 / QueryTile;
@@ -23,17 +22,31 @@ __device__ __forceinline__ void indexer_score_mma(const IndexerArguments& a, int
     const int tid = threadIdx.x, lane = tid % 32, warp = tid / 32;
     const int per_row  = (a.width + QueryTile - 1) / QueryTile;
     int previous_group = -1;
-    for (int job = worker; job < jobs.prefix[jobs.groups]; job += stride) {
-        const int group = jobs.group_for(job), b = group / per_row;
-        const int q0     = (group % per_row) * QueryTile;
-        const int g0     = (job - jobs.prefix[group]) * kIndexerKeyTile;
-        const int length = jobs.tile_visible(a, b, q0, QueryTile);
+    for (int job = worker; job < indexer_score_jobs(jobs); job += stride) {
+        const int group  = jobs.group_for(job);
+        const int b      = Arguments::ragged ? 0 : group / per_row;
+        const int q0     = indexer_score_start(jobs, group, (group % per_row) * QueryTile);
+        const int g0     = (job - indexer_score_job_begin(jobs, group)) * kIndexerKeyTile;
+        const int length = [&] {
+            if constexpr (Arguments::ragged)
+                return indexer_score_length(jobs, group);
+            else
+                return jobs.tile_visible(a, b, q0, QueryTile);
+        }();
+        const int segment  = indexer_segment(a, q0, b);
+        const int q_end    = indexer_score_end(jobs, group, a.width);
+        const auto visible = [&](int slot) {
+            if constexpr (Arguments::ragged)
+                return jobs.tiles[group].visible(slot);
+            else
+                return jobs.visible[slot];
+        };
         for (int chunk = tid; group != previous_group && chunk < QueryTile * 4 * 16;
              chunk += Threads) {
             const int row = chunk / 16, d = (chunk % 16) * 8;
             const int t = q0 + row / 4, slot = b * a.width + t;
             auto* dst = qs + row * 128 + indexer_swizzle(row, d);
-            if (t < a.width && jobs.visible[slot] > kIndexerSelected) {
+            if (t < q_end && visible(slot) > kIndexerSelected) {
                 const auto* src = a.query + a.column(slot) * 512 + (row % 4) * 128 + d;
                 common::cp_async<16, Cache::cg>(dst, src);
             } else
@@ -44,7 +57,7 @@ __device__ __forceinline__ void indexer_score_mma(const IndexerArguments& a, int
             const int row = chunk / 16, d = (chunk % 16) * 8;
             auto* dst = ks + row * 128 + indexer_swizzle(row, d);
             if (g0 + row < length) {
-                const auto* src = a.key(b, g0 + row) + d;
+                const auto* src = a.key(segment, g0 + row) + d;
                 if constexpr (VectorCache)
                     common::cp_async<16, Cache::cg>(dst, src);
                 else {
@@ -88,18 +101,21 @@ __device__ __forceinline__ void indexer_score_mma(const IndexerArguments& a, int
                 const int row = (warp / KeyGroups) * 16 + lane / 4 + (j / 2) * 8;
                 const int t = q0 + row / 4, slot = b * a.width + t;
                 const int g = g0 + (warp % KeyGroups) * WarpKeys + nt * 8 + (lane % 4) * 2 + j % 2;
-                if (row % 4 == 0 && t < a.width && jobs.visible[slot] > kIndexerSelected &&
-                    g < jobs.visible[slot])
+                if (row % 4 == 0 && t < q_end && visible(slot) > kIndexerSelected &&
+                    g < visible(slot))
                     a.scores[std::int64_t(slot) * a.columns + g] = value;
             }
         __syncthreads();
     }
 }
 
-template <int QueryTile, bool VectorCache, int MaxQueries = 64, bool BatchedLoop = false>
+template <int QueryTile, bool VectorCache, int MaxQueries = 64, bool BatchedLoop = false,
+          class Arguments = IndexerArguments>
 __global__ __launch_bounds__((QueryTile > 16 ? QueryTile * 8 : 128)) void indexer_score_mma_kernel(
-    const __grid_constant__ IndexerArguments a) {
-    __shared__ IndexerJobs<MaxQueries> jobs;
+    const __grid_constant__ Arguments a) {
+    __shared__
+        std::conditional_t<Arguments::ragged, RaggedScoreJobs<MaxQueries>, IndexerJobs<MaxQueries>>
+            jobs;
     extern __shared__ __align__(16) __nv_bfloat16 shared[];
     for_each_indexer_job_group<MaxQueries, BatchedLoop>(
         a, [&](const auto& group, int worker, int stride) {

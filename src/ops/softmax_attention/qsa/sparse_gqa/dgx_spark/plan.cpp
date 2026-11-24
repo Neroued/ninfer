@@ -63,6 +63,37 @@ SparseGqaPlan select_sparse_gqa_plan(KvCacheStorage storage, int tokens, int bat
     return plan;
 }
 
+int sparse_gqa_long_direct_tokens(ContextBucket bucket) {
+    return bucket == ContextBucket::K2 ? 0 : 512;
+}
+
+SparseGqaPackedWindows sparse_gqa_packed_windows(KvCacheStorage storage, int, ContextBucket bucket,
+                                                 bool) {
+    // The two-split Columns32 path at width 64 recovers parallelism for short
+    // deep-history segments. At longer segment lengths the wider window retains reuse.
+    if (bucket >= ContextBucket::K64) {
+        if (storage == KvCacheStorage::BFloat16) return {64, 256};
+        // Keep short FP8 histories resident while preserving the large-segment direct path.
+        if (storage == KvCacheStorage::Fp8E4m3fnGroup128Ue8m0) return {64, kSparseGqaSlab};
+    }
+    return {kSparseGqaSlab};
+}
+
+SparseGqaPlan select_sparse_gqa_packed_window_plan(KvCacheStorage storage, int width,
+                                                   int total_tokens, int segments, int kv_heads,
+                                                   ContextBucket bucket, int sms) {
+    auto plan = select_sparse_gqa_plan(storage, width, 1, kv_heads, bucket, sms);
+    if (storage == KvCacheStorage::BFloat16 && bucket > ContextBucket::K2 &&
+        total_tokens <= kSparseGqaPackedSkewQueries && plan.instance == SparseGqaInstance::Mma) {
+        const int mean   = 1 + (width - 1) / segments;
+        const int target = select_sparse_gqa_plan(storage, mean, 1, kv_heads, bucket, sms).splits;
+        plan.splits      = std::max(plan.splits, target);
+        plan.min_split_tiles = 8;
+        plan.partial         = plan.splits > 1;
+    }
+    return plan;
+}
+
 SparseGqaLaunchPlan select_sparse_gqa_launch(KvCacheStorage storage, int kv_heads,
                                              ContextBucket bucket, SparseGqaPlan plan, int queries,
                                              int batch, int sms, bool vector) {

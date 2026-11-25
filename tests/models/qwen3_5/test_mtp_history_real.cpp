@@ -256,7 +256,7 @@ public:
         work.inputs.push_back(input);
         if (purpose == q35::ForwardPurpose::Control) {
             work.control_last_tokens = {input.tokens.back()};
-            work.sampling            = {{{}, false}};
+            work.sampling            = {{.constrained = false, .sample = false}};
         }
         const auto hidden = native_.rank().resources.frame.spec.hidden;
         std::optional<runtime::ExecutionTicket> ticket;
@@ -264,8 +264,10 @@ public:
         std::vector<std::uint16_t> embeddings;
         DeviceBuffer visual_storage;
         if (visual) {
-            // Isolate embedding-coordinate alignment from image encoding. These exact embeddings
-            // are consumed by Main and must also feed the shifted MTP token positions.
+            // Isolate embedding-coordinate alignment from image encoding. Text-only Prefill
+            // routes to the packed path, whereas real visual prefill takes the single-sequence
+            // forward/align_mtp_history path shared with Replay.
+            work.purpose = q35::ForwardPurpose::Replay;
             manual = std::make_unique<q35::detail::ComputeOperation>(
                 runtime::ExecutionRequest<q35::ExecutionTypes>{{}, {}, {.operation = work}});
             native_.rank().initialize_inputs(*manual);
@@ -342,6 +344,78 @@ public:
         oracle_.compare(lane, rows_[lane].backend_frontier);
     }
 
+    void packed_prefill(std::array<int, kBatch> counts) {
+        q35::ForwardWork work;
+        work.purpose = q35::ForwardPurpose::Prefill;
+        work.shape   = native_.session_plan.batch_execution->exact(kBatch, kBatch);
+        int total    = 0;
+        for (std::uint32_t lane = 0; lane < kBatch; ++lane) {
+            const auto base  = rows_[lane].main_frontier;
+            const auto count = counts[lane];
+            require(count > 0, "packed prefill test requires positive counts");
+            work.rows.push_back(rows_[lane]);
+            q35::InputWindow input;
+            input.tokens.resize(count);
+            input.rope_positions.resize(3 * count);
+            for (int i = 0; i < count; ++i) {
+                input.tokens[i] = 198 + (base + i) % 29;
+                for (int axis = 0; axis < 3; ++axis)
+                    input.rope_positions[axis * count + i] = static_cast<int>(base + i) + 2 * axis;
+            }
+            work.inputs.push_back(std::move(input));
+            total += count;
+        }
+        const auto inputs = work.inputs;
+        const auto ticket = submit({.operation = std::move(work)}, runtime::FrameKind::Compute);
+        (void)result(ticket);
+        const auto hidden = native_.rank().resources.frame.spec.hidden;
+        const auto produced =
+            read<std::uint16_t>(native_.rank().resources.frame.input_view(total, 1).hidden);
+        (void)native_.executor().commit(ticket, {});
+        retire(ticket);
+        int offset = 0;
+        for (std::uint32_t lane = 0; lane < kBatch; ++lane) {
+            const auto base   = rows_[lane].main_frontier;
+            const auto count  = counts[lane];
+            const auto& input = inputs[lane];
+            const int skip    = base == 0 ? 1 : 0;
+            if (count > skip) {
+                HistoryInput expected;
+                expected.width  = count - skip;
+                expected.batch  = 1;
+                expected.counts = {expected.width};
+                expected.lanes  = {static_cast<int>(lane)};
+                expected.conditioning.resize(std::size_t(hidden) * expected.width);
+                expected.ids.resize(expected.width);
+                expected.positions.resize(expected.width);
+                expected.rope.resize(3 * expected.width);
+                for (int i = 0; i < expected.width; ++i) {
+                    const auto p = base + i + skip - 1;
+                    const auto* h =
+                        p < base ? hidden_[lane].data() + std::size_t(p) * hidden
+                                 : produced.data() + std::size_t(offset + p - base) * hidden;
+                    std::copy_n(h, hidden, expected.conditioning.data() + std::size_t(i) * hidden);
+                    expected.ids[i]       = input.tokens[i + skip];
+                    expected.positions[i] = p;
+                    for (int axis = 0; axis < 3; ++axis)
+                        expected.rope[axis * expected.width + i] =
+                            p < base ? rows_[lane].tail_rope_position[axis]
+                                     : input.rope_positions[axis * count + p - base];
+                }
+                oracle_.history(expected);
+            }
+            hidden_[lane].insert(hidden_[lane].end(),
+                                 produced.begin() + std::size_t(offset) * hidden,
+                                 produced.begin() + std::size_t(offset + count) * hidden);
+            rows_[lane].main_frontier += count;
+            rows_[lane].backend_frontier = rows_[lane].main_frontier - 1;
+            for (int axis = 0; axis < 3; ++axis)
+                rows_[lane].tail_rope_position[axis] = input.rope_positions[axis * count + count - 1];
+            oracle_.compare(lane, rows_[lane].backend_frontier);
+            offset += count;
+        }
+    }
+
     void checkpoint_clone() {
         q35::Work work;
         work.context.operations.emplace_back(
@@ -374,7 +448,7 @@ public:
         work.rows         = {rows_[1]};
         work.inputs       = {q35::InputWindow{}};
         work.sample       = q35::SamplePurpose::FirstToken;
-        work.sampling     = {{{}, false}};
+        work.sampling     = {{.constrained = false, .sample = true}};
         const auto ticket = submit({.operation = std::move(work)}, runtime::FrameKind::Compute);
         auto value        = std::get<q35::ForwardResult>(result(ticket).output);
         require(value.generated && value.generated->counts == std::vector<std::uint32_t>{1},
@@ -618,6 +692,9 @@ int main() {
         cases.reset_for_visual_root();
         cases.decode({1, 0}, false);
         cases.decode({1, 1}, false);
+        cases.reset_for_visual_root();
+        cases.packed_prefill({4, 1});
+        cases.packed_prefill({5, 6});
         std::cout << "OK MTP independent Main-conditioning oracle ["
                   << (use_graph ? "graph" : "eager") << "]: " << cases.checks() << " KV checks\n";
     } catch (const std::exception& error) {

@@ -28,11 +28,10 @@ Router 的 correction bias 只改变选择，最终系数来自未加 bias 的 s
 
 KDA 的 Q/K/V 经因果卷积和 SiLU；forget/output gate 通过各自低秩投影产生。
 它使用逐 key 维的 decay，recurrent State 为 FP32，卷积 history 为 BF16。
-长 Prefill 采用完整更新，短 speculative verify 保存 transition inputs，接受后 fold。
+长 Prefill 采用完整更新，短 speculative verify 从只读初始 State 产生不透明私有 transition records，接受后从同一初始 State 折叠采用前缀。
 
-Record 固定同次执行实际消费的 represented inputs；fold 重放相同有限精度 transition。
-Chunked Prefill 的数学精度与 recurrent record/fold 的精确关系分别验证，不能要求不同算法逐位相同。
-公共设计见[Speculative 执行](speculative-decoding.md#replayssm)，接口见
+Verify readout、fold state 与 Chunked Prefill 均按表示后的输入对照独立数值参考验收，不要求不同实现逐位相同；
+卷积 history 按 BF16 words 精确搬运。公共设计见[Speculative 执行](speculative-decoding.md#replayssm)，接口见
 [KDA](../../include/ninfer/ops/kimi_delta_attention.h)和
 [fold](../../include/ninfer/ops/kda_replay.h)。
 

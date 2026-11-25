@@ -51,8 +51,8 @@ alias 与资源要求。实际注册 shape 在实现中维护。头文件不记�
 文档也不复制这些声明。
 
 Observable 中间舍入属于合同；私有 accumulator、reduction tree、staging 和执行分解由实现决定。
-随机 Op 显式接收 seed、逻辑位置及所需概率输入。Exact transform 或 ReplaySSM 的精确关系按其
-专门合同说明，不能推广为所有浮点实现逐 bit 一致。
+随机 Op 显式接收 seed、逻辑位置及所需概率输入。Exact transform/codec 及各 Op 明确声明的精确
+写域（如卷积 history words、零尾与未触及槽位）按其专门合同说明，不能推广为所有浮点实现逐 bit 一致。
 
 CUDA Op 接收 owning DeviceContext 传下来的 CudaExecutionView，CPU Op 借用 CpuExecutionView。
 检查真实 operands 和 workspace 的位置；不在调用点从 tensor 与裸 stream 临时拼装执行环境。
@@ -83,9 +83,9 @@ Host scope 退出不结束 GPU 使用，复用仍遵循 stream 与消费者寿�
 解码权重、执行完整公式；不复制生产路线的激活量化、内部 cast、reduction 或 workspace 精度。
 融合参考计算完整公式，不拼接若干生产 Op 的舍入输出。模型输出正常、两条实现一致都不能替代数学参考。
 
-Exact transform/codec 使用独立精确参考。ReplaySSM 等明确承诺与某次执行相同的合同，
-使用同一初始状态、同一物理输入块和对应 trajectory 检查；较短输入的另一次投影不是该参考。
-它的精确关系与原始 recurrence 的数学精度分别验收。
+Exact transform/codec 使用独立精确参考。ReplaySSM 的 readout 与 fold state 按数学语义对照独立
+数值参考验收，并检查从同一初始状态连续多轮采用后的轨迹；卷积 history 与未触及写域仍按精确 words 检查，
+详细合同见[Speculative 执行](speculative-decoding.md#replayssm)。
 
 Criterion 由公开数值政策或表示决定，不由 target、私有精度、T 或某个 case 决定。
 Linear-family 的 `A16Only`、`AllowA8`、`AllowA4` 分别使用 A16、A8、A4 要求，

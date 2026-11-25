@@ -317,14 +317,8 @@ void mtp_history(MtpExecutionView state, const MtpInputs& inputs,
                             static_cast<std::uint64_t>(columns));
     auto scope              = state.workspace.scope();
     const auto [key, value] = project_history(state, inputs, columns);
-    for (int s = 0; s < ragged.num_seqs(); ++s) {
-        const auto begin = ragged.segment_begin(s), len = ragged.segment_length(s);
-        const auto count = static_cast<std::uint32_t>(len);
-        ops::kv_cache_append_prefix(
-            key.slice(2, begin, len), value.slice(2, begin, len),
-            inputs.cache_positions.slice(0, begin, len), inputs.valid_columns.slice(0, s, 1),
-            inputs.kv_table_rows.slice(0, s, 1), {count, count}, state.cache, state.execution);
-    }
+    ops::kv_cache_append(key, value, ragged, inputs.cache_positions.view({columns}),
+                         inputs.kv_table_rows, state.cache, state.execution);
 }
 
 void mtp_propose(MtpExecutionView state, const Tensor& hidden, Tensor& full_logits, Tensor& ids,

@@ -7,6 +7,7 @@
 #include "cuda_fixture.h"
 #include "core/buffer.h"
 #include "ops/op_tester.h"
+#include "ops/ragged_fixture.h"
 #include "core/decode_graph.h"
 #include "core/device.h"
 
@@ -862,9 +863,259 @@ int full_prefix_case(int kv_heads, KvCacheStorage storage, int width, int batch,
     return failures;
 }
 
+int full_ragged_case(int kv_heads, KvCacheStorage storage, std::vector<int> lengths,
+                     bool captured) {
+    const auto layout        = test_cache_layout(storage);
+    RaggedFixture ragged(std::move(lengths));
+    const int tokens         = ragged.tokens();
+    const int segments       = ragged.segments();
+    const int max_len        = *std::max_element(ragged.lengths.begin(), ragged.lengths.end());
+    const int logical_pages  = (max_len + 70 + kPage - 1) / kPage;
+    const int table_rows     = segments + 2;
+    const int physical_pages = 2 * logical_pages * table_rows + 1;
+    const auto input_count   = static_cast<std::size_t>(kFullHeadDim) * kv_heads * tokens;
+    std::vector<std::uint16_t> input_k(input_count), input_v(input_count);
+    for (std::size_t i = 0; i < input_count; ++i) {
+        input_k[i] =
+            f32_to_bf16(static_cast<float>(static_cast<int>((i * 41 + 17) % 257) - 128) / 64);
+        input_v[i] =
+            f32_to_bf16(static_cast<float>(static_cast<int>((i * 19 + 7) % 251) - 125) / 32);
+    }
+    std::fill_n(input_k.begin(), kFullHeadDim, std::uint16_t{0});
+    std::vector<std::int32_t> positions(tokens), rows(segments);
+    std::vector<std::int32_t> mapping(logical_pages * table_rows);
+    for (std::size_t i = 0; i < mapping.size(); ++i) mapping[i] = static_cast<int>(2 * i + 1);
+
+    GuardedDeviceBuffer d_k(input_count * sizeof(std::uint16_t));
+    GuardedDeviceBuffer d_v(input_count * sizeof(std::uint16_t));
+    GuardedDeviceBuffer d_positions(positions.size() * sizeof(std::int32_t));
+    GuardedDeviceBuffer d_rows(rows.size() * sizeof(std::int32_t));
+    d_k.copy_from_host(input_k.data(), input_count * sizeof(std::uint16_t));
+    d_v.copy_from_host(input_v.data(), input_count * sizeof(std::uint16_t));
+
+    const auto plane_bytes = [&](const TestVectorLayout& vector, bool scales) {
+        return static_cast<std::size_t>(scales ? vector.scale_extent : vector.code_extent) * kPage *
+               kv_heads * physical_pages *
+               dtype_size(scales ? vector.scale_dtype : vector.code_dtype);
+    };
+    const std::array<std::size_t, 4> sizes{
+        plane_bytes(layout.key, false), plane_bytes(layout.value, false),
+        plane_bytes(layout.key, true), plane_bytes(layout.value, true)};
+    std::array<GuardedDeviceBuffer, 4> storage_buffers{
+        GuardedDeviceBuffer(sizes[0]), GuardedDeviceBuffer(sizes[1]),
+        GuardedDeviceBuffer(std::max<std::size_t>(1, sizes[2])),
+        GuardedDeviceBuffer(std::max<std::size_t>(1, sizes[3]))};
+    FullCacheFixture fixture(layout, kv_heads, physical_pages, mapping, logical_pages,
+                             {storage_buffers[0].span(), storage_buffers[1].span(),
+                              storage_buffers[2].span(), storage_buffers[3].span()});
+    const auto planes = fixture.view(kv_heads, storage);
+    const PagedKVBatchLayerView cache{
+        planes.k_pages, planes.v_pages, planes.k_scale_pages, planes.v_scale_pages, kFullHeadDim,
+        kv_heads,       storage};
+    Tensor k(d_k.span(), DType::BF16, {kFullHeadDim, kv_heads, tokens});
+    Tensor v(d_v.span(), DType::BF16, {kFullHeadDim, kv_heads, tokens});
+    Tensor p(d_positions.span(), DType::I32, {tokens});
+    Tensor r(d_rows.span(), DType::I32, {segments});
+    auto& device      = cuda_environment().context;
+    const auto launch = [&] {
+        ops::kv_cache_append(k, v, ragged.view, p, r, cache, device.execution_view());
+    };
+    int failures = 0;
+    DecodeGraphDefinition definition;
+    DecodeGraphKernelSlice slice;
+    DecodeGraphExecutable graph;
+    if (captured) {
+        definition.capture(device.stream(), [&] { slice.capture(device.stream(), launch); });
+        if (slice.size() != 1) {
+            std::cerr << "D256 ragged " << kv_cache_storage_name(storage)
+                      << ": expected 1 captured kernel, got " << slice.size() << '\n';
+            ++failures;
+        }
+        graph.instantiate(definition);
+    }
+    for (int pass = 0; pass < 3; ++pass) {
+        std::array<std::vector<std::uint8_t>, 4> expected;
+        for (int plane = 0; plane < 4; ++plane) {
+            expected[plane].assign(sizes[plane], static_cast<std::uint8_t>(0xa5 + plane));
+            if (sizes[plane])
+                storage_buffers[plane].copy_from_host(expected[plane].data(), sizes[plane]);
+        }
+        for (int s = 0; s < segments; ++s) {
+            rows[s]        = (segments - 1 - s + pass) % table_rows;
+            const int base = s == 0 ? 0 : (s == 1 ? 63 : 61 + ((s + pass) % 7));
+            const int beg  = ragged.prefix[s];
+            const int len  = ragged.lengths[s];
+            for (int t = 0; t < len; ++t) {
+                const int token    = beg + t;
+                const int position = base + t;
+                positions[token]   = position;
+                const int page     = mapping[rows[s] * logical_pages + position / kPage];
+                for (int head = 0; head < kv_heads; ++head) {
+                    const auto source = full_input_index(0, head, token, kv_heads);
+                    for (int side = 0; side < 2; ++side) {
+                        const auto& vector = side == 0 ? layout.key : layout.value;
+                        const auto& input  = side == 0 ? input_k : input_v;
+                        const auto encoded =
+                            encode_prefix_vector(std::span<const std::uint16_t, kFullHeadDim>(
+                                                     input.data() + source, kFullHeadDim),
+                                                 storage, side == 0);
+                        const auto code_offset = full_cache_index(vector.code_extent, 0, head,
+                                                                  position, page, kv_heads) *
+                                                 dtype_size(vector.code_dtype);
+                        const auto code_bytes = vector.code_extent * dtype_size(vector.code_dtype);
+                        std::copy_n(encoded.data.begin(), code_bytes,
+                                    expected[side].begin() + code_offset);
+                        if (vector.scale_extent) {
+                            const auto scale_offset = full_cache_index(vector.scale_extent, 0, head,
+                                                                       position, page, kv_heads) *
+                                                      dtype_size(vector.scale_dtype);
+                            const auto scale_bytes =
+                                vector.scale_extent * dtype_size(vector.scale_dtype);
+                            std::copy_n(encoded.scales.begin(), scale_bytes,
+                                        expected[side + 2].begin() + scale_offset);
+                        }
+                    }
+                }
+            }
+        }
+        d_positions.copy_from_host(positions.data(), positions.size() * sizeof(std::int32_t));
+        d_rows.copy_from_host(rows.data(), rows.size() * sizeof(std::int32_t));
+        fixture.upload();
+        if (captured)
+            graph.launch(device.stream());
+        else
+            launch();
+        device.synchronize();
+        fixture.copy_back();
+        failures += !fixture.guards_intact();
+        for (int plane = 0; plane < 4; ++plane) {
+            if (!sizes[plane]) continue;
+            const auto label = "D256 ragged " + std::string(kv_cache_storage_name(storage)) +
+                               " Hkv=" + std::to_string(kv_heads) +
+                               " pass=" + std::to_string(pass) + " plane=" + std::to_string(plane);
+            failures +=
+                verify_exact(label.c_str(),
+                             from_device<std::uint8_t>(storage_buffers[plane].data(), sizes[plane]),
+                             expected[plane]);
+            failures += storage_buffers[plane].verify_guards(label.c_str());
+        }
+    }
+    failures += verify_exact("ragged input K unchanged",
+                             from_device<std::uint16_t>(d_k.data(), input_count), input_k);
+    failures += verify_exact("ragged input V unchanged",
+                             from_device<std::uint16_t>(d_v.data(), input_count), input_v);
+    failures += verify_exact("ragged positions unchanged",
+                             from_device<std::int32_t>(d_positions.data(), positions.size()),
+                             positions);
+    failures += verify_exact("ragged table rows unchanged",
+                             from_device<std::int32_t>(d_rows.data(), rows.size()), rows);
+    failures += verify_exact("ragged cu_seqlens unchanged",
+                             from_device<std::int32_t>(ragged.d_prefix, ragged.prefix.size()),
+                             ragged.prefix);
+    failures += verify_exact("ragged seq_lengths unchanged",
+                             from_device<std::int32_t>(ragged.d_lengths, ragged.lengths.size()),
+                             ragged.lengths);
+    failures += verify_exact("ragged token_to_seq unchanged",
+                             from_device<std::int32_t>(ragged.d_mapping, ragged.mapping.size()),
+                             ragged.mapping);
+    failures += fixture.verify_offsets();
+    failures += d_k.verify_guards("ragged input K") + d_v.verify_guards("ragged input V") +
+                d_positions.verify_guards("ragged positions") +
+                d_rows.verify_guards("ragged table rows");
+    return failures;
+}
+
+int full_ragged_admission_case() {
+    auto& device             = cuda_environment().context;
+    const auto exec          = device.execution_view();
+    constexpr int kv_heads   = 2;
+    const auto layout        = test_cache_layout(KvCacheStorage::BFloat16);
+    RaggedFixture ragged({2, 3});
+    const int tokens         = ragged.tokens();
+    const int segments       = ragged.segments();
+    const int logical_pages  = 1;
+    const int physical_pages = 4;
+    std::vector<std::int32_t> mapping{0, 1};
+    const auto plane_bytes =
+        static_cast<std::size_t>(kFullHeadDim) * kPage * kv_heads * physical_pages * 2;
+    GuardedDeviceBuffer buf_k(plane_bytes), buf_v(plane_bytes);
+    FullCacheFixture fixture(layout, kv_heads, physical_pages, mapping, logical_pages,
+                             {buf_k.span(), buf_v.span(), {}, {}});
+    const auto planes = fixture.view(kv_heads, KvCacheStorage::BFloat16);
+    const PagedKVBatchLayerView cache{
+        planes.k_pages, planes.v_pages, planes.k_scale_pages, planes.v_scale_pages, kFullHeadDim,
+        kv_heads,       KvCacheStorage::BFloat16};
+    const auto dev         = device.device();
+    const auto input_bytes = static_cast<std::size_t>(kFullHeadDim) * kv_heads * tokens * 2;
+    DeviceBuffer d_k(dev, input_bytes + 16), d_v(dev, input_bytes + 16);
+    DeviceBuffer d_pos(dev, tokens * sizeof(std::int32_t)),
+        d_rows(dev, segments * sizeof(std::int32_t));
+    Tensor k(d_k.span().subspan(0, input_bytes), DType::BF16, {kFullHeadDim, kv_heads, tokens});
+    Tensor v(d_v.span().subspan(0, input_bytes), DType::BF16, {kFullHeadDim, kv_heads, tokens});
+    Tensor p(d_pos.span(), DType::I32, {tokens});
+    Tensor r(d_rows.span(), DType::I32, {segments});
+
+    int failures         = 0;
+    const auto expect_ia = [&](const char* label, auto&& fn) {
+        try {
+            fn();
+            std::cerr << "kv_cache_append ragged admission did not reject: " << label << '\n';
+            ++failures;
+        } catch (const std::invalid_argument&) {}
+    };
+
+    expect_ia("unaligned k", [&] {
+        Tensor bad(d_k.span().subspan(2, input_bytes), DType::BF16,
+                   {kFullHeadDim, kv_heads, tokens});
+        ops::kv_cache_append(bad, v, ragged.view, p, r, cache, exec);
+    });
+    expect_ia("unaligned v", [&] {
+        Tensor bad(d_v.span().subspan(2, input_bytes), DType::BF16,
+                   {kFullHeadDim, kv_heads, tokens});
+        ops::kv_cache_append(k, bad, ragged.view, p, r, cache, exec);
+    });
+    expect_ia("mismatched k token count", [&] {
+        Tensor bad = k.slice(2, 0, tokens - 1);
+        ops::kv_cache_append(bad, v, ragged.view, p, r, cache, exec);
+    });
+    expect_ia("unsupported kv_heads", [&] {
+        DeviceBuffer d_big(dev, static_cast<std::size_t>(kFullHeadDim) * 8 * tokens * 2);
+        Tensor bad(d_big.span(), DType::BF16, {kFullHeadDim, 8, tokens});
+        ops::kv_cache_append(bad, bad, ragged.view, p, r, cache, exec);
+    });
+    expect_ia("segment exceeds cache capacity", [&] {
+        RaggedFixture too_long({kPage + 1});
+        DeviceBuffer d_long_k(dev,
+                              static_cast<std::size_t>(kFullHeadDim) * kv_heads * (kPage + 1) * 2);
+        DeviceBuffer d_long_v(dev,
+                              static_cast<std::size_t>(kFullHeadDim) * kv_heads * (kPage + 1) * 2);
+        DeviceBuffer d_long_p(dev, (kPage + 1) * sizeof(std::int32_t));
+        DeviceBuffer d_one_r(dev, sizeof(std::int32_t));
+        Tensor lk(d_long_k.span(), DType::BF16, {kFullHeadDim, kv_heads, kPage + 1});
+        Tensor lv(d_long_v.span(), DType::BF16, {kFullHeadDim, kv_heads, kPage + 1});
+        Tensor lp(d_long_p.span(), DType::I32, {kPage + 1});
+        Tensor lr(d_one_r.span(), DType::I32, {1});
+        ops::kv_cache_append(lk, lv, too_long.view, lp, lr, cache, exec);
+    });
+    expect_ia("aliasing k with cache storage", [&] {
+        Tensor aliased(cache.k_pages.records.storage.subspan(0, input_bytes), DType::BF16,
+                       {kFullHeadDim, kv_heads, tokens});
+        ops::kv_cache_append(aliased, v, ragged.view, p, r, cache, exec);
+    });
+    expect_ia("non-increasing host_cu_seqlens", [&] {
+        auto bad_ragged                 = ragged.view;
+        const std::array<int, 3> bad_cu = {0, 2, 2};
+        bad_ragged.host_cu_seqlens      = bad_cu;
+        ops::kv_cache_append(k, v, bad_ragged, p, r, cache, exec);
+    });
+    return failures;
+}
+
 } // namespace
 
 void add_full_append_cases(ninfer::test::OpSuite& suite) {
+    suite.add("append/ragged/d256/admission", [] { return full_ragged_admission_case(); },
+              {{"execution", "eager"}});
     for (auto storage : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64,
                          KvCacheStorage::Fp8E4m3fnGroup128Ue8m0, KvCacheStorage::Nvfp4Group16,
                          KvCacheStorage::Fp8KeyNvfp4Value}) {
@@ -878,6 +1129,12 @@ void add_full_append_cases(ninfer::test::OpSuite& suite) {
         suite.add("append/prefix/d256/" + format + "/h2/ragged-b17",
                   [=] { return full_prefix_case(2, storage, 3, 17, false); },
                   {{"format", format}, {"execution", "eager"}, {"suite", "concurrency"}});
+        suite.add("append/ragged/d256/" + format + "/h2/s17",
+                  [=] {
+                      return full_ragged_case(
+                          2, storage, {1, 2, 3, 1, 7, 4, 2, 5, 1, 8, 3, 2, 6, 1, 4, 2, 9}, false);
+                  },
+                  {{"format", format}, {"execution", "eager"}, {"suite", "concurrency"}});
         for (int heads : {2, 4}) {
             const auto base = "append/prefix/d256/" + format + "/h" + std::to_string(heads);
             suite.add(base + "/ragged-b8-graph",
@@ -886,6 +1143,10 @@ void add_full_append_cases(ninfer::test::OpSuite& suite) {
             suite.add(base + "/w129",
                       [=] { return full_prefix_case(heads, storage, 129, 1, false); },
                       {{"format", format}, {"execution", "eager"}});
+            suite.add("append/ragged/d256/" + format + "/h" + std::to_string(heads) +
+                          "/multi-graph",
+                      [=] { return full_ragged_case(heads, storage, {1, 5, 65, 3}, true); },
+                      {{"format", format}, {"execution", "graph"}});
         }
     }
 }

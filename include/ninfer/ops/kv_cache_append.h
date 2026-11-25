@@ -4,6 +4,7 @@
 #include "core/cyclic_kv_cache.h"
 #include "core/paged_kv_cache.h"
 #include "core/tensor.h"
+#include "ninfer/ops/ragged.h"
 
 
 #include <cstdint>
@@ -42,6 +43,23 @@ struct KVCacheAppendPrefixExecutionEnvelope {
  */
 void kv_cache_append(const Tensor& k, const Tensor& v, const Tensor& positions,
                      PagedKVLayerView cache, CudaExecutionView execution);
+
+/**
+ * Append every packed K/V row of a ragged batch to batched paged growing-cache storage.
+ *
+ * k/v are contiguous 16-byte-aligned BF16 [256,4|2,N] for N=ragged.total_tokens(), positions is
+ * contiguous device I32 [N], and table_rows is contiguous device I32 [S] for S=ragged.num_seqs().
+ * Each packed token t in [0,N) belongs to segment s=ragged.token_to_seq[t] and is encoded at
+ * logical position positions[t] through page table row table_rows[s] using the exact codec and
+ * layout rules of single-sequence kv_cache_append. Every addressed code/value and scale is
+ * overwritten, no unrelated cache row is read or written, inputs are unchanged, and cache storage
+ * does not overlap any input, metadata tensor, or page offset table. The caller guarantees
+ * nonnegative materialized logical positions within cache capacity and distinct destination slots
+ * across packed tokens.
+ */
+void kv_cache_append(const Tensor& k, const Tensor& v, const RaggedSequenceView& ragged,
+                     const Tensor& positions, const Tensor& table_rows,
+                     PagedKVBatchLayerView cache, CudaExecutionView execution);
 
 /**
  * Append device-selected BF16 prefixes to batched paged growing-cache storage.

@@ -44,6 +44,13 @@ void kv_cache_append_dispatch(const Tensor& k, const Tensor& v, const Tensor& po
                            stream);
 }
 
+void kv_cache_append_dispatch(const Tensor& k, const Tensor& v, const RaggedSequenceView& ragged,
+                              const Tensor& positions, const Tensor& table_rows,
+                              PagedKVBatchLayerView cache, cudaStream_t stream) {
+    kv::launch_paged_write_ragged(k, v, positions, ragged.token_to_seq, ragged.seq_lengths,
+                                  table_rows, cache, 0, stream);
+}
+
 void kv_cache_append_prefix_dispatch(const Tensor& k, const Tensor& v, const Tensor& positions,
                                      const Tensor& counts, const Tensor& table_rows,
                                      PagedKVBatchLayerView cache,

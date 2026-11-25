@@ -392,14 +392,9 @@ void RankProgramImpl::after_main() {
     const auto* source    = std::get_if<ForwardWork>(&f.request.work.operation);
     const bool mtp_decode = parameters.mtp && source && source->kind == ForwardKind::Ordinary;
     if (f.packed) {
-        const auto rank = parameters.profile->local.rank;
-        for (const auto b : f.packed->segments) {
-            const auto last = f.sample.slice(1, f.packed->last_columns[b], 1);
-            const auto destination =
-                resources.states->sample_hidden(f.rows[b].states.at(rank).destination);
-            copy_bytes_async({destination.data, destination.bytes(), cuda.device()},
-                             {last.data, last.bytes(), cuda.device()}, cuda);
-        }
+        ops::scatter_ragged_last_columns(
+            f.sample.slice(1, 0, f.tokens), f.packed->ragged,
+            resources.states->sample_hidden(f.batch.destination_offsets), cuda);
         if (parameters.mtp) align_packed_mtp();
     } else if (!f.verify && !mtp_decode) {
         if (parameters.mtp)

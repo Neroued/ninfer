@@ -224,19 +224,9 @@ void RankProgramImpl::forward_packed_prefill(const ForwardWork& work) {
         if (parameters.mtp) align_packed_history(f.batch, packed, f.hidden);
         if (parameters.draft) append_packed_dflash_context(f.batch, packed.update.ragged);
 
-        const auto& ragged = packed.update.ragged;
-        const auto own     = packed.update.owner_tokens[parameters.profile->local.rank];
-        const auto* offsets =
-            static_cast<const std::int64_t*>(host(layout.destination_offsets).data);
-        for (int s = 0; s < ragged.num_seqs(); ++s) {
-            const auto last   = ragged.host_cu_seqlens[s + 1] - 1;
-            const auto source = f.hidden.slice(1, last, 1);
-            const bool local  = last >= extent(own.begin) && last < extent(own.begin + own.size);
-            const auto destination =
-                resources.states.image(local).tensor(resources.plan.state.hidden, offsets[s]);
-            copy_bytes_async({destination.data, destination.bytes(), cuda.device()},
-                             {source.data, source.bytes(), cuda.device()}, cuda);
-        }
+        ops::scatter_ragged_last_columns(f.hidden, packed.update.ragged,
+                                         resources.states.hidden(f.batch.destination_offsets),
+                                         cuda);
         if (f.timed_prefill) prefill_timer->record_stop();
     }
     const int sampled = extent(packed.sampled_members.size());

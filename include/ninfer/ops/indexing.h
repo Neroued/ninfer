@@ -3,6 +3,7 @@
 #include "core/device.h"
 #include "core/record_view.h"
 #include "core/tensor.h"
+#include "ninfer/ops/ragged.h"
 #include <cstdint>
 #include <span>
 
@@ -86,6 +87,15 @@ void gather(const ConstStateFieldView& source, const Tensor& active, Tensor& out
 // workspace, and consumes current Device selectors under Graph replay.
 void scatter_batch_columns(const Tensor& source, const Tensor& columns,
                            const StateFieldView& destination, CudaExecutionView execution);
+
+// For each segment s in [0, ragged.num_seqs()), destination.record[s].field[:] =
+// source[:, ragged.cu_seqlens[s+1]-1]. Source is contiguous BF16 or I32 [D,N] for
+// N=ragged.total_tokens(), and destination has same-dtype single-layer contiguous [D] fields with
+// Device I64 record offsets [S] for S=ragged.num_seqs(). Selected destination fields are distinct
+// and disjoint from inputs. Copies represented bits exactly, preserves inputs and unselected
+// storage, owns no workspace, and consumes current Device offsets under Graph replay.
+void scatter_ragged_last_columns(const Tensor& source, const RaggedSequenceView& ragged,
+                                 const StateFieldView& destination, CudaExecutionView execution);
 
 struct StateGather {
     ConstStateFieldView source;

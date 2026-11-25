@@ -26,6 +26,19 @@ __global__ void scatter_columns_kernel(const Word* source, const int* columns,
             source[(std::int64_t(row) * tokens + column) * features + d];
 }
 
+template <class Word>
+__global__ void scatter_ragged_last_columns_kernel(const Word* source,
+                                                   const std::int32_t* cu_seqlens,
+                                                   const std::int64_t* offsets, Word* destination,
+                                                   int features) {
+    const int segment                   = blockIdx.y;
+    const int column                    = cu_seqlens[segment + 1] - 1;
+    const std::int64_t destination_base = offsets[segment] / sizeof(Word);
+    const std::int64_t source_base      = std::int64_t(column) * features;
+    for (int d = blockIdx.x * blockDim.x + threadIdx.x; d < features; d += blockDim.x * gridDim.x)
+        destination[destination_base + d] = source[source_base + d];
+}
+
 __global__ void gather_bf16_batch_columns_kernel(const __nv_bfloat16* source,
                                                  const std::int32_t* selectors, __nv_bfloat16* out,
                                                  std::int32_t rows, std::int32_t cols) {
@@ -135,6 +148,45 @@ void scatter_batch_columns(const Tensor& source, const Tensor& columns,
                 static_cast<const int*>(columns.data) + offset,
                 static_cast<const std::int64_t*>(destination.records.byte_offsets.data) + offset,
                 operand::state_field_base<Word>(destination), d, t);
+        };
+        if (source.dtype == DType::BF16)
+            launch.template operator()<std::uint16_t>();
+        else
+            launch.template operator()<std::uint32_t>();
+    });
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void scatter_ragged_last_columns(const Tensor& source, const RaggedSequenceView& ragged,
+                                 const StateFieldView& destination, CudaExecutionView execution) {
+    namespace operand        = common::operand;
+    constexpr const char* op = "scatter_ragged_last_columns";
+    const auto device        = execution.device();
+    operand::ragged_sequence(ragged, op, device);
+    const int d = source.ne[0], n = ragged.total_tokens(), s = ragged.num_seqs();
+    if (d <= 0 || (source.dtype != DType::BF16 && source.dtype != DType::I32))
+        throw std::invalid_argument("scatter_ragged_last_columns: invalid shape or type");
+    const auto bytes = dtype_size(source.dtype);
+    operand::tensor(source, source.dtype, {d, n}, bytes, op, "source", device);
+    operand::state_field(destination, source.dtype, {d}, bytes, op, "destination", device);
+    operand::tensor(destination.records.byte_offsets, DType::I64, {s}, 8, op, "offsets", device);
+    if (destination.field.layers != 1)
+        throw std::invalid_argument("scatter_ragged_last_columns: expected a single-layer field");
+    const auto storage =
+        operand::range(destination.records.storage.data, destination.records.storage.bytes, op);
+    for (const auto input : {operand::range(source, op), operand::range(ragged.cu_seqlens, op),
+                             operand::range(ragged.seq_lengths, op),
+                             operand::range(ragged.token_to_seq, op),
+                             operand::range(destination.records.byte_offsets, op)})
+        operand::disjoint(storage, input, op);
+    common::for_each_token_slice(s, 1, [&](int offset, int count) {
+        const dim3 grid(std::min(32, div_up(d, 256)), count);
+        const auto launch = [&]<class Word>() {
+            scatter_ragged_last_columns_kernel<<<grid, 256, 0, execution.stream()>>>(
+                static_cast<const Word*>(source.data),
+                static_cast<const std::int32_t*>(ragged.cu_seqlens.data) + offset,
+                static_cast<const std::int64_t*>(destination.records.byte_offsets.data) + offset,
+                operand::state_field_base<Word>(destination), d);
         };
         if (source.dtype == DType::BF16)
             launch.template operator()<std::uint16_t>();

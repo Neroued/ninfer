@@ -1,6 +1,7 @@
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/execution/draft.h"
 #include "models/qwen3_5/execution/text.h"
+#include "ninfer/ops/indexing.h"
 
 #include <algorithm>
 
@@ -51,13 +52,11 @@ void RankProgramImpl::finish_packed_prefill(ComputeOperation& operation) {
     const auto& frame   = resources.frame;
     const auto& storage = *frame.packed_prefill;
     const auto hidden   = frame.input_view(ragged.total_tokens(), 1).hidden;
-    const auto* destinations =
-        static_cast<const std::int64_t*>(storage.host.destination_offsets.data);
     if (backend == SpeculativeBackend::Mtp) align_packed_mtp_history(operation);
-    for (int s = 0; s < ragged.num_seqs(); ++s) {
-        const int begin = ragged.segment_begin(s), len = ragged.segment_length(s);
-        if (resources.dflash) {
-            auto& draft      = *resources.dflash;
+    if (resources.dflash) {
+        auto& draft = *resources.dflash;
+        for (int s = 0; s < ragged.num_seqs(); ++s) {
+            const int begin = ragged.segment_begin(s), len = ragged.segment_length(s);
             const auto count = static_cast<std::uint32_t>(len);
             execution::draft_append_context(
                 {parameters, resources.work, device.execution_view(), draft.local,
@@ -69,11 +68,12 @@ void RankProgramImpl::finish_packed_prefill(ComputeOperation& operation) {
                 storage.device.destination_offsets.slice(0, s, 1),
                 storage.device.backend_tables.slice(0, s, 1), {count, count});
         }
-        const auto source = hidden.slice(1, begin + len - 1, 1);
-        const auto target = resources.state_images.continuation_hidden(destinations[s]);
-        CUDA_CHECK(cudaMemcpyAsync(target.data, source.data, target.bytes(),
-                                   cudaMemcpyDeviceToDevice, device.stream()));
     }
+    ops::scatter_ragged_last_columns(
+        hidden, ragged,
+        resources.state_images.continuation_hidden(
+            storage.device.destination_offsets.slice(0, 0, ragged.num_seqs())),
+        device.execution_view());
 }
 
 void RankProgramImpl::progress() {

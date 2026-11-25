@@ -155,6 +155,10 @@ BufferLayout plan_buffers(LayoutBuilder& b, const Config& c, const EngineOptions
         };
         out.packed_main = packed(device_ple);
         if (c.mtp) out.packed_history = packed(false);
+        out.prefill_sampled_offsets =
+            tensor(DType::I64, {batch}, "prefill sampled State offsets");
+        out.host_region.bytes = out.prefill_sampled_offsets->region.offset +
+                                out.prefill_sampled_offsets->region.bytes - out.host_region.offset;
         out.prefill_sampled_hidden = tensor(DType::BF16, {hidden, batch}, "prefill sampled hidden");
         if (c.mtp)
             out.prefill_aligned =

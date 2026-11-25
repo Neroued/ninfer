@@ -51,7 +51,7 @@ struct BufferLayout {
     TensorRegion prefill_sample;
     std::optional<TensorRegion> prefill_conditioning;
     std::optional<PackedInputLayout> packed_main, packed_history;
-    std::optional<TensorRegion> prefill_sampled_hidden, prefill_aligned;
+    std::optional<TensorRegion> prefill_sampled_offsets, prefill_sampled_hidden, prefill_aligned;
     TensorRegion pending_sample;
     std::optional<TensorRegion> pending_conditioning;
     QsaRecordLayout main_qsa;

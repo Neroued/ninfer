@@ -158,7 +158,7 @@ struct PackedDFlashMetadata {
 template <class T>
 struct PackedPrefillMetadata {
     RaggedPrefillMetadata<T> ragged;
-    T main_tables, backend_tables, source_offsets, destination_offsets;
+    T main_tables, backend_tables, source_offsets, destination_offsets, sampled_offsets;
     T sampling_positions, live_rows, residency_slots;
     std::optional<PackedMtpMetadata<T>> mtp;
     std::optional<PackedDFlashMetadata<T>> dflash;
@@ -167,7 +167,7 @@ struct PackedPrefillMetadata {
 struct PackedPrefillLayout {
     PackedPrefillMetadata<TensorRegion> metadata;
     LayoutRegion device, host, sampling;
-    TensorRegion sampled_hidden, sampled_rows, sample_slots, last_columns;
+    TensorRegion sampled_hidden, sampled_rows, sample_slots;
 };
 
 struct FrameHostLayout {
@@ -249,7 +249,7 @@ struct PackedPrefillFrame {
     const ops::SamplingConfig* sampling;
     std::span<ops::SamplingConfig> host_sampling;
     Tensor sampled_hidden;
-    std::span<std::int32_t> sampled_rows, sample_slots, last_columns;
+    std::span<std::int32_t> sampled_rows, sample_slots;
 
     PackedPrefillFrame(MemorySpan device, MemorySpan host, const PackedPrefillLayout&);
 };

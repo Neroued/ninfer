@@ -174,16 +174,9 @@ void RankProgramImpl::launch_decision(ComputeOperation& operation) {
         const auto samples  = operation.packed_prefill->sampled_count;
         const auto cuda     = device.execution_view();
         auto sampled_hidden = packed->sampled_hidden.slice(1, 0, samples);
-        for (int slot = 0; slot < samples; ++slot) {
-            const auto row    = packed->sampled_rows[slot];
-            const auto column = packed->last_columns[row];
-            const auto source = column >= 0 ? frame.hidden.slice(1, column, 1)
-                                            : resources.state_images.continuation_hidden(
-                                                  operation.rows[row].state_offsets.source);
-            auto target       = sampled_hidden.slice(1, slot, 1);
-            CUDA_CHECK(cudaMemcpyAsync(target.data, source.data, target.bytes(),
-                                       cudaMemcpyDeviceToDevice, device.stream()));
-        }
+        ops::gather(resources.state_images.continuation_hidden(
+                        packed->device.sampled_offsets.slice(0, 0, samples)),
+                    packed->device.live_rows.slice(0, 0, samples), sampled_hidden, cuda);
         auto logits = prefix(frame.logits, {rows, samples});
         execution::project(sampled_hidden, parameters.text.output_head, logits, resources.work,
                            cuda);

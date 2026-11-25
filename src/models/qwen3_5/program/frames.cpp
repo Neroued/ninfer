@@ -70,6 +70,7 @@ PackedPrefillLayout plan_packed_prefill(LayoutBuilder& device, LayoutBuilder& ho
     m.backend_tables      = rows(DType::I32, "packed backend tables");
     m.source_offsets      = rows(DType::I64, "packed source State offsets");
     m.destination_offsets = rows(DType::I64, "packed destination State offsets");
+    m.sampled_offsets     = rows(DType::I64, "packed sampled State offsets");
     m.sampling_positions  = rows(DType::I32, "packed sampling positions");
     m.live_rows           = rows(DType::I32, "packed sampling live rows");
     m.residency_slots     = rows(DType::I32, "packed sampling residency slots");
@@ -95,7 +96,6 @@ PackedPrefillLayout plan_packed_prefill(LayoutBuilder& device, LayoutBuilder& ho
     out.sampled_hidden = add(device, DType::BF16, {spec.hidden, batch}, "packed sampled hidden");
     out.sampled_rows   = add(host, DType::I32, {batch}, "packed sampled members");
     out.sample_slots   = add(host, DType::I32, {batch}, "packed member sampling slots");
-    out.last_columns   = add(host, DType::I32, {batch}, "packed member last columns");
     return out;
 }
 
@@ -108,7 +108,8 @@ PackedPrefillMetadata<Tensor> bind_packed_metadata(const PackedPrefillMetadata<T
     };
     PackedPrefillMetadata<Tensor> out{
         ragged(m.ragged),       bind(m.main_tables),         bind(m.backend_tables),
-        bind(m.source_offsets), bind(m.destination_offsets), bind(m.sampling_positions),
+        bind(m.source_offsets), bind(m.destination_offsets), bind(m.sampled_offsets),
+        bind(m.sampling_positions),
         bind(m.live_rows),      bind(m.residency_slots),     {},
         {}};
     if (m.mtp) {
@@ -309,8 +310,7 @@ PackedPrefillFrame::PackedPrefillFrame(MemorySpan device_backing, MemorySpan hos
                     static_cast<std::size_t>(host.live_rows.ne[0])),
       sampled_hidden(layout.sampled_hidden.bind(device_backing)),
       sampled_rows(host_i32(layout.sampled_rows, host_backing)),
-      sample_slots(host_i32(layout.sample_slots, host_backing)),
-      last_columns(host_i32(layout.last_columns, host_backing)) {
+      sample_slots(host_i32(layout.sample_slots, host_backing)) {
     std::memset(host_storage.data, 0, host_storage.bytes);
 }
 

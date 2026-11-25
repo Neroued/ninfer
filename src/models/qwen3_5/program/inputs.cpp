@@ -227,6 +227,7 @@ void RankProgramImpl::initialize_packed_prefill(ComputeOperation& operation,
     const auto backend_tables     = host_values<std::int32_t>(meta.backend_tables);
     const auto source             = host_values<std::int64_t>(meta.source_offsets);
     const auto destination        = host_values<std::int64_t>(meta.destination_offsets);
+    const auto sampled_offsets    = host_values<std::int64_t>(meta.sampled_offsets);
     const auto sampling_positions = host_values<std::int32_t>(meta.sampling_positions);
     const auto sample_live        = host_values<std::int32_t>(meta.live_rows);
     const auto sample_residencies = host_values<std::int32_t>(meta.residency_slots);
@@ -242,7 +243,6 @@ void RankProgramImpl::initialize_packed_prefill(ComputeOperation& operation,
         const auto len    = static_cast<int>(processed[b]);
         bind_row(frame.host_ingress, b, row);
         frame.host_ingress.valid_columns[b] = len;
-        storage.last_columns[b]             = -1;
         if (len) {
             lengths[segments]        = len;
             main_tables[segments]    = frame.host_ingress.main_table_rows[b];
@@ -270,7 +270,6 @@ void RankProgramImpl::initialize_packed_prefill(ComputeOperation& operation,
             }
             ++segments;
             col += len;
-            storage.last_columns[b] = col - 1;
         }
         storage.sample_slots[b] = -1;
         if (!operation.sampling.empty() && operation.sampling[b].sample) {
@@ -278,6 +277,8 @@ void RankProgramImpl::initialize_packed_prefill(ComputeOperation& operation,
             storage.sampled_rows[slot]  = static_cast<std::int32_t>(b);
             storage.sample_slots[b]     = slot;
             storage.host_sampling[slot] = sampling_config(row, operation.sampling[b], slot);
+            sampled_offsets[slot] =
+                len ? row.state_offsets.destination : row.state_offsets.source;
             sampling_positions[slot]    = static_cast<std::int32_t>(row.main_frontier) + len;
             sample_live[slot]           = 1;
             sample_residencies[slot]    = frame.host_ingress.residency_slots[b];

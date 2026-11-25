@@ -533,6 +533,10 @@ void RankProgramImpl::install_sampling(bool speculative) {
         auto* configs = static_cast<ops::SamplingConfig*>(host_tensor(*buffers.sampling).data);
         auto* positions =
             static_cast<std::int32_t*>(host_tensor(buffers.batch.sampling_positions).data);
+        auto* sampled_offsets =
+            f.packed ? static_cast<std::int64_t*>(host_tensor(*buffers.prefill_sampled_offsets).data)
+                     : nullptr;
+        const auto rank = parameters.profile->local.rank;
         for (std::size_t b = 0; b < batch; ++b) {
             const auto& row = f.rows[member(b)];
             configs[b]      = sampling_config(row.sampling);
@@ -548,6 +552,10 @@ void RankProgramImpl::install_sampling(bool speculative) {
             positions[b] = row.sampling_position;
             static_cast<int*>(host_tensor(buffers.batch.count_slots).data)[b] =
                 row.member.residency.lane.value;
+            if (sampled_offsets) {
+                const auto& offsets = row.states.at(rank);
+                sampled_offsets[b]  = row.ids.empty() ? offsets.source : offsets.destination;
+            }
         }
         const auto upload = [&](const TensorRegion& region, std::size_t bytes) {
             copy_bytes_async({device_tensor(region).data, bytes, cuda.device()},
@@ -558,6 +566,7 @@ void RankProgramImpl::install_sampling(bool speculative) {
         if (f.packed) {
             upload(buffers.batch.count_slots, batch * sizeof(*positions));
             upload(buffers.batch.sampling_positions, batch * sizeof(*positions));
+            upload(*buffers.prefill_sampled_offsets, batch * sizeof(*sampled_offsets));
         } else {
             upload(buffers.batch.count_slots, buffers.batch.sampling_positions.region.offset +
                                                   buffers.batch.sampling_positions.region.bytes -
@@ -584,19 +593,12 @@ void RankProgramImpl::prepare_decision() {
             if (f.first_sample) {
                 Tensor sample;
                 if (f.packed) {
-                    const auto rank = parameters.profile->local.rank;
                     sample = device_tensor(*buffers.prefill_sampled_hidden).slice(1, 0, batch);
-                    for (int i = 0; i < batch; ++i) {
-                        const auto b   = f.packed->sampled_members[i];
-                        const auto col = f.packed->last_columns[b];
-                        const auto input =
-                            col >= 0
-                                ? f.sample.slice(1, col, 1)
-                                : resources.states->sample_hidden(f.rows[b].states.at(rank).source);
-                        const auto output = sample.slice(1, i, 1);
-                        copy_bytes_async({output.data, output.bytes(), cuda.device()},
-                                         {input.data, input.bytes(), cuda.device()}, cuda);
-                    }
+                    ops::gather(resources.states->sample_hidden(
+                                    device_tensor(*buffers.prefill_sampled_offsets)
+                                        .slice(0, 0, batch)),
+                                device_tensor(buffers.batch.live_rows).slice(0, 0, batch), sample,
+                                cuda);
                 } else {
                     sample = f.tokens ? f.sample.slice(1, f.tokens - 1, 1) : f.sample;
                 }

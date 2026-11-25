@@ -64,8 +64,10 @@ Encoder 的 scale 舍入、零值与尾部规则由对应实现及独立数值�
 `A16Only`、`AllowA8`、`AllowA4` 表达允许的 activation 表示集合。融合共享量化取相关 Use
 的交集；许可不承诺实际执行某种 MMA。验证标准按公开许可选择，见[Op 开发](op-development.md#数值验证)。
 
-权重格式与运行时 KV codec 分开。KV 的精确编码由
-[kv_cache_format.h](../../include/ninfer/kv_cache_format.h)维护；它不改变源权重。
+权重格式与运行时 KV / linear attention 状态表示分开。KV 的精确编码由
+[kv_cache_format.h](../../include/ninfer/kv_cache_format.h)维护，linear attention recurrent
+State 的存储表示由 [linear_state_format.h](../../include/ninfer/linear_state_format.h)维护；
+它们不改变源权重。
 格式 registry 和布局寻址分别见 [formats](../../src/artifact/formats.cpp)、
 [layouts](../../src/artifact/layouts.cpp)和 [Weight views](../../src/core/weight_view.h)。
 

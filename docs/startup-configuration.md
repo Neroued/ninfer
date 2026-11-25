@@ -83,6 +83,7 @@ are not opened.
 | `engine.device` | `--device` | Nonnegative int / 0 | Local device; distributed ranks declare devices separately |
 | `engine.max_context` | `--max-context` | Positive uint32 / 8192 | Per-request input plus generation limit |
 | `engine.kv_dtype` | `--kv-dtype` | `bf16/int8/fp8/nvfp4/k8v4` / `bf16` | Runtime KV representation; GLM latent KV supports BF16 and FP8 |
+| `engine.linear_state_dtype` | `--linear-state-dtype` | `fp32/bf16` / `fp32` | Runtime linear-attention (GDN/KDA) recurrent state representation; conv history stays BF16 |
 | `engine.context_capacity` | `--context-capacity` | Positive bytes or `auto` / `auto` | Shared Device KV/State capacity per rank |
 | `engine.memory_headroom` | `--memory-headroom` | Nonnegative bytes / `512MiB` | Per-rank startup planning allowance; `0B` adds no headroom |
 | `engine.prefill_chunk` | `--prefill-chunk` | Positive multiple of 128 or `default` | Qwen4Exp, GLM5Next and CPU expert offload default to 4096; other paths to 1024; bounded by max context |
@@ -91,7 +92,7 @@ are not opened.
 | `engine.max_pending_requests` | `--max-pending-requests` | Positive uint32 / 16 | Additional waiting requests |
 | `engine.pending_timeout` | `--pending-timeout` | Positive duration / `30s` | Deadline before execution; not a generation time limit |
 
-Weight formats are stored in the artifact and are independent of `kv_dtype`. Optional components
+Weight formats are stored in the artifact and are independent of `kv_dtype` and `linear_state_dtype`. Optional components
 must be present when enabled. Supported model/deployment combinations are listed in the
 [README](../README.md#supported-models-and-deployments).
 

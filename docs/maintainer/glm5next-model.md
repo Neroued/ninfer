@@ -27,7 +27,7 @@ Router 的 correction bias 只改变选择，最终系数来自未加 bias 的 s
 ## KDA 与 ReplaySSM
 
 KDA 的 Q/K/V 经因果卷积和 SiLU；forget/output gate 通过各自低秩投影产生。
-它使用逐 key 维的 decay，recurrent State 为 FP32，卷积 history 为 BF16。
+它使用逐 key 维的 decay，recurrent State 支持 FP32（默认）或 BF16（`engine.linear_state_dtype`），内部递推维持 FP32，卷积 history 为 BF16。
 长 Prefill 采用完整更新，短 speculative verify 从只读初始 State 产生不透明私有 transition records，接受后从同一初始 State 折叠采用前缀。
 
 Verify readout、fold state 与 Chunked Prefill 均按表示后的输入对照独立数值参考验收，不要求不同实现逐位相同；
@@ -70,7 +70,7 @@ DFlash2 自身的参数保留 companion 的原始浮点表示。Embedding 和 fu
 Main 绑定，因而 full 不表示强制 BF16。`--proposal` 另生成完整词表 Q4 A16 head，MTP 与
 DFlash2 均可选择它；这不改变 target head 或 DFlash2 decoder 权重。
 
-Latent 使用已有 `kv_dtype=bf16|fp8`。Indexer 默认 FP8，
+Latent 使用已有 `kv_dtype=bf16|fp8`，KDA recurrent State 使用 `linear_state_dtype=fp32|bf16`。Indexer 默认 FP8，
 `NINFER_KPOOL_INDEXER_BF16=1` 在启动选择 BF16 并传给各 rank，不另设 Engine KV 选项。
 FP8 cache 共用 E4M3FN/G128/UE8M0 codec；latent 保留原始基底，index keys 使用归一化 H128 基底。
 Raw tail/records 保留 BF16。Prepare 的 FP8 编码消费 FP32 norm/pooling 结果，不先舍入到 BF16。

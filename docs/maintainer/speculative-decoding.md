@@ -89,7 +89,8 @@ stem、投影和状态更新，不执行无用的 query、attention、FFN 或 he
 ## ReplaySSM
 
 GDN/KDA 的 verify 从只读的初始 recurrent state $S_0$ 出发，产生 BF16 readout 和紧凑的私有转移
-records。每列保存表示后的 raw key、求解出的 FP32 修正 $\delta_t$ 和 FP32 衰减 $\alpha_t$。
+records。$S_0$ 与折叠结果 $S_m$ 的存储格式遵循 `linear_state_dtype`（默认 FP32，可选 BF16，写回时单次
+RNE 舍入），内部递推累加维持 FP32。每列保存表示后的 raw key、求解出的 FP32 修正 $\delta_t$ 和 FP32 衰减 $\alpha_t$。
 GDN 使用每个 value head 的标量衰减，KDA 使用每个 key channel 的衰减。由于修正由 verify
 求解，records 只可从当时观察到的同一 $S_0$ 折叠。
 

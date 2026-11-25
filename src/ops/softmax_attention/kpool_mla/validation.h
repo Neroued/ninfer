@@ -14,6 +14,15 @@ inline void require(bool condition, const char* message) {
     if (!condition) throw std::invalid_argument(std::string(kOperation) + ": " + message);
 }
 
+// With S nonempty segments, every total N >= S is attainable. The workspace
+// plans for packed calls depend on N alone, except when every segment is a singleton.
+inline int packed_extent_start(int min_tokens, int max_tokens, int min_segments, int max_segments,
+                               const char* op) {
+    (void)operand::ragged_envelope(min_tokens, max_tokens, min_segments, max_segments, op);
+    const int first = std::max({min_tokens, min_segments, 2});
+    return max_segments >= 2 && first <= max_tokens ? first : 0;
+}
+
 inline std::array<operand::Range, 2> weight_operands(const Weight& w, int rows, int columns,
                                                      Device device) {
     operand::device(w.device, device, kOperation, "matrix weight");

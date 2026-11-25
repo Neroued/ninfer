@@ -19,13 +19,21 @@ __device__ __forceinline__ int row_factor_offset(int row, int column) {
 
 // Native U_K is reduction-major; U_V is output-major. Transpose U_K fragments on
 // chip. Both maps reuse a weight tile across queries, including different requests.
+#ifdef NINFER_KPOOL_PACKED
+#    define NINFER_MLA_KERNEL(name) packed_##name
+#    define NINFER_MLA_ARGUMENTS    PackedSparseMlaArguments
+#else
+#    define NINFER_MLA_KERNEL(name) name
+#    define NINFER_MLA_ARGUMENTS    SparseMlaArguments
+#endif
 template <bool Key, int Queries, int Rows = 64, int K = 32, bool Merge = false, bool Fp8 = false,
           bool Mxfp8 = false>
 __global__
 __launch_bounds__(Rows > 128 ? 512
                   : Rows > 64
                       ? 256
-                      : 128) void mla_factor_kernel(const __grid_constant__ SparseMlaArguments a) {
+                      : 128) void NINFER_MLA_KERNEL(mla_factor_kernel)(const __grid_constant__
+                                                                           NINFER_MLA_ARGUMENTS a) {
     constexpr int Outputs = Key ? 512 : 256, Reduction = Key ? 256 : 512;
     constexpr int Threads  = Rows > 128 ? 512 : Rows > 64 ? 256 : 128;
     constexpr int WarpRows = Rows / 16, WarpColumns = Threads / 32 / WarpRows,
@@ -38,8 +46,14 @@ __launch_bounds__(Rows > 128 ? 512
     const int q0 = blockIdx.x / (Outputs / Rows) * Queries;
     __shared__ int live[Queries];
     // A singleton softmax is exactly one; its query map cannot affect the result.
+#ifdef NINFER_KPOOL_PACKED
+    const int size    = tid < Queries ? a.work(q0 + tid).size : 0;
+    const bool active = size > (Key ? 1 : 0);
+    if (tid < Queries) live[tid] = active ? min(size, 2) : 0;
+#else
     const bool active = tid < Queries && a.work(q0 + tid).size > (Key ? 1 : 0);
     if (tid < Queries) live[tid] = active;
+#endif
     if (!__syncthreads_or(active)) {
         if constexpr (!Key)
             for (int i = tid; i < Queries * Rows; i += Threads) {
@@ -135,8 +149,14 @@ __launch_bounds__(Rows > 128 ? 512
                         continue;
                     }
                 }
+#ifdef NINFER_KPOOL_PACKED
+                const int value_head = live[q] == 1 ? 0 : head;
+                const auto* src      = Key ? a.query + ((a.begin + q0 + q) * 64 + head) * 256
+                                           : a.mapped + ((q0 + q) * 64 + value_head) * 512;
+#else
                 const auto* src = Key ? a.query + ((a.begin + q0 + q) * 64 + head) * 256
                                       : a.mapped + ((q0 + q) * 64 + head) * 512;
+#endif
                 common::cp_async<16>(dst, src + k0 + k);
             } else
                 common::store_vec(dst, make_int4(0, 0, 0, 0));
@@ -287,4 +307,7 @@ __launch_bounds__(Rows > 128 ? 512
             }
     }
 }
+
+#undef NINFER_MLA_ARGUMENTS
+#undef NINFER_MLA_KERNEL
 } // namespace ninfer::ops::detail::kpool

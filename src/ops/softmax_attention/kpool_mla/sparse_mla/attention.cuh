@@ -41,9 +41,19 @@ struct MlaAttentionStorage {
 // gathered pool serves QK and PV, and is reused across all head groups in the CTA.
 // Independent head groups double-buffer P as well as KV; completion barriers let
 // one group begin its next QK while another finishes PV on the preceding tile.
+#ifdef NINFER_KPOOL_PACKED
+#    define NINFER_MLA_KERNEL(name)      packed_##name
+#    define NINFER_MLA_ARGUMENTS         PackedSparseMlaArguments
+#    define NINFER_MLA_SEGMENT(a, local) ((a).segment(local))
+#else
+#    define NINFER_MLA_KERNEL(name)      name
+#    define NINFER_MLA_ARGUMENTS         SparseMlaArguments
+#    define NINFER_MLA_SEGMENT(a, local) (((a).begin + (local)) / (a).tokens)
+#endif
 template <int Tokens, int HeadGroups, bool IndependentHeads>
-__global__ __launch_bounds__(64 * HeadGroups, HeadGroups == 2 ? 2 : 1) void mla_attention_kernel(
-    const __grid_constant__ SparseMlaArguments a, const __grid_constant__ CUtensorMap map) {
+__global__ __launch_bounds__(64 * HeadGroups, HeadGroups == 2 ? 2 : 1) void NINFER_MLA_KERNEL(
+    mla_attention_kernel)(const __grid_constant__ NINFER_MLA_ARGUMENTS a,
+                          const __grid_constant__ CUtensorMap map) {
     constexpr int Parts = 2, Stages = 2;
     constexpr int Threads = 32 * Parts * HeadGroups;
     const int local = blockIdx.x / (4 / HeadGroups), split = blockIdx.y;
@@ -61,19 +71,31 @@ __global__ __launch_bounds__(64 * HeadGroups, HeadGroups == 2 ? 2 : 1) void mla_
     const int tid = threadIdx.x, lane = tid % 32, part = tid / 32 % Parts;
     const int row = lane / 4, col = lane % 4;
     const auto* table =
-        a.tables + std::int64_t(a.table_rows[(a.begin + local) / a.tokens]) * a.table_stride;
+        a.tables + std::int64_t(a.table_rows[NINFER_MLA_SEGMENT(a, local)]) * a.table_stride;
     if (work.size == 1) {
         // No complete pool was selected. The only member of J is the first token
         // of the incomplete tail, so u=c independently of query and U_K.
+#ifdef NINFER_KPOOL_PACKED
+        // The latent is shared by every head. Publish it once for the value map.
+        if (head_base != 0) return;
+#endif
         const int token   = work.end - 1;
         const auto* value = reinterpret_cast<const __nv_bfloat16*>(
                                 reinterpret_cast<const char*>(a.latent) + table[token / 64]) +
                             (token % 64) * 512;
+#ifdef NINFER_KPOOL_PACKED
+        for (int i = tid; i < 256; i += Threads) {
+            const int head = 0, d = i * 2;
+            const auto pair = *reinterpret_cast<const __nv_bfloat162*>(value + d);
+            *reinterpret_cast<__nv_bfloat162*>(a.mapped + (local * 64 + head) * 512 + d) = pair;
+        }
+#else
         for (int i = tid; i < 16 * HeadGroups * 256; i += Threads) {
             const int head = head_base + i / 256, d = (i % 256) * 2;
             const auto pair = *reinterpret_cast<const __nv_bfloat162*>(value + d);
             *reinterpret_cast<__nv_bfloat162*>(a.mapped + (local * 64 + head) * 512 + d) = pair;
         }
+#endif
         return;
     }
     extern __shared__ __align__(1024) unsigned char partitioned_shared[];
@@ -329,8 +351,8 @@ __global__ __launch_bounds__(64 * HeadGroups, HeadGroups == 2 ? 2 : 1) void mla_
     }
 }
 
-__global__
-__launch_bounds__(256) void mla_merge_kernel(const __grid_constant__ SparseMlaArguments a) {
+__global__ __launch_bounds__(256) void NINFER_MLA_KERNEL(mla_merge_kernel)(
+    const __grid_constant__ NINFER_MLA_ARGUMENTS a) {
     if (a.splits == 1) return;
     const int local = blockIdx.x / 64, head = blockIdx.x % 64, tid = threadIdx.x;
     const auto work = a.work(local);
@@ -364,4 +386,8 @@ __launch_bounds__(256) void mla_merge_kernel(const __grid_constant__ SparseMlaAr
     *reinterpret_cast<unsigned*>(a.mapped + (local * 64 + head) * 512 + tid * 2) =
         common::pack_bf16x2(x * inv, y * inv);
 }
+
+#undef NINFER_MLA_SEGMENT
+#undef NINFER_MLA_ARGUMENTS
+#undef NINFER_MLA_KERNEL
 } // namespace ninfer::ops::detail::kpool

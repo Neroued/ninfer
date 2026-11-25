@@ -59,17 +59,17 @@ std::size_t kpool_indexer_workspace_capacity_bytes(const KpoolIndexerProfile& pr
     return bytes;
 }
 
-void kpool_indexer(const Tensor& query, const Tensor& coefficients,
-                   const ConstKpoolIndexCacheView& cache, const KpoolMlaBatchView& batch,
-                   ContextBucket bucket, MemoryArena& workspace, KpoolBlockSelection& out,
-                   CudaExecutionView execution) {
+namespace {
+void execute(const Tensor& query, const Tensor& coefficients, const ConstKpoolIndexCacheView& cache,
+             const KpoolMlaBatchView& batch, const RaggedSequenceView* seq, ContextBucket bucket,
+             MemoryArena& workspace, KpoolBlockSelection& out, CudaExecutionView execution) {
     const int T = query.ne[2], B = query.ne[3];
     const auto device = execution.device();
     ContextBucketRange{bucket}.validate(ContextBucket::M1, "kpool_indexer");
     indexer_geometry({query.ne[1], query.ne[0]}, cache.format, B, T, T,
                      execution.multiprocessor_count());
     const int rows = T * B;
-    std::array<operand::Range, 5> inputs;
+    std::array<operand::Range, 7> inputs{};
     int n            = 0;
     const auto input = [&](const Tensor& t, DType type, std::initializer_list<int> dims,
                            int alignment, const char* name) {
@@ -79,8 +79,14 @@ void kpool_indexer(const Tensor& query, const Tensor& coefficients,
     input(query, DType::BF16, {128, 32, T, B}, 16, "index query");
     input(coefficients, DType::FP32, {32, T, B}, 16, "head coefficients");
     input(batch.positions, DType::I32, {T, B}, 4, "positions");
-    input(batch.valid_columns, DType::I32, {B}, 4, "valid columns");
-    input(batch.table_rows, DType::I32, {B}, 4, "table rows");
+    const int segments = seq ? seq->num_seqs() : B;
+    input(batch.valid_columns, DType::I32, {segments}, 4, "valid columns");
+    input(batch.table_rows, DType::I32, {segments}, 4, "table rows");
+    if (seq) {
+        inputs[n++] = operand::range(seq->cu_seqlens, kOperation);
+        inputs[n++] = operand::range(seq->token_to_seq, kOperation);
+    }
+    const auto sources = std::span(inputs).first(n);
     index_cache(cache, 128, device);
     const auto& table       = cache.keys.records.page_offsets;
     const auto table_blocks = operand::blocks(table, kOperation);
@@ -92,18 +98,21 @@ void kpool_indexer(const Tensor& query, const Tensor& coefficients,
                                           operand::range(out.selection_end, kOperation)};
     for (int i = 0; i < 3; ++i) {
         for (int j = 0; j < i; ++j) operand::disjoint(outputs[i], outputs[j], kOperation);
-        for (const auto& src : inputs) operand::disjoint(outputs[i], src, kOperation);
+        for (const auto& src : sources) operand::disjoint(outputs[i], src, kOperation);
         require(!operand::overlaps(table_blocks, outputs[i]), "output overlaps page table");
     }
     operand::device(workspace.device(), device, kOperation, "workspace");
     const bool fp8  = cache.format == KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0;
-    const auto plan = indexer_plan(T, B, bucket, fp8);
+    const bool packed = seq && segments > 1;
+    const auto plan =
+        packed ? packed_indexer_plan(T, bucket, fp8) : indexer_plan(T, B, bucket, fp8);
+    const int sms   = execution.multiprocessor_count();
     auto scope      = workspace.scope();
     MemorySpan scratch{};
     if (plan.bytes) {
         scratch          = workspace.alloc_bytes(plan.bytes, 256);
         const auto range = operand::range(scratch.data, scratch.bytes, kOperation);
-        for (const auto& src : inputs) operand::disjoint(range, src, kOperation);
+        for (const auto& src : sources) operand::disjoint(range, src, kOperation);
         for (const auto& dst : outputs) operand::disjoint(range, dst, kOperation);
         require(!operand::overlaps(table_blocks, range), "workspace overlaps page table");
     }
@@ -138,19 +147,40 @@ void kpool_indexer(const Tensor& query, const Tensor& coefficients,
             f.query        = static_cast<std::uint8_t*>(plan.query_fp8.bind(scratch).data);
             f.coefficients = static_cast<float*>(plan.weighted_coefficients.bind(scratch).data);
         }
-        launch_fp8_indexer(f, execution.multiprocessor_count(), execution.stream());
+        if (packed)
+            launch_packed_fp8_indexer(f, *seq, plan.query_width, sms, execution.stream());
+        else
+            launch_fp8_indexer(f, sms, execution.stream());
+    } else if (packed) {
+        launch_packed_indexer(a, *seq, plan.query_width, sms, execution.stream());
     } else {
-        launch_indexer(a, execution.multiprocessor_count(), execution.stream());
+        launch_indexer(a, sms, execution.stream());
     }
+}
+} // namespace
+
+void kpool_indexer(const Tensor& query, const Tensor& coefficients,
+                   const ConstKpoolIndexCacheView& cache, const KpoolMlaBatchView& batch,
+                   ContextBucket bucket, MemoryArena& workspace, KpoolBlockSelection& out,
+                   CudaExecutionView execution) {
+    execute(query, coefficients, cache, batch, nullptr, bucket, workspace, out, execution);
 }
 
 std::size_t kpool_indexer_ragged_workspace_capacity_bytes(
     const KpoolIndexerProfile& profile, KvCacheVectorFormat format, ContextBucketRange buckets,
     int min_tokens, int max_tokens, int min_segments, int max_segments, int sm_count) {
-    const auto widths = common::operand::ragged_envelope(min_tokens, max_tokens, min_segments,
-                                                         max_segments, "kpool_indexer");
-    return kpool_indexer_workspace_capacity_bytes(profile, format, buckets, 1, widths.first,
-                                                  widths.last, sm_count);
+    const int packed =
+        packed_extent_start(min_tokens, max_tokens, min_segments, max_segments, "kpool_indexer");
+    buckets.validate(ContextBucket::M1, "kpool_indexer");
+    indexer_geometry(profile, format, 1, min_tokens, max_tokens, sm_count);
+    const bool fp8   = format == KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0;
+    std::size_t peak = 0;
+    buckets.for_each([&](ContextBucket bucket) {
+        if (min_segments == 1)
+            peak = std::max(peak, indexer_capacity(min_tokens, max_tokens, 1, bucket, fp8));
+        if (packed) peak = std::max(peak, packed_indexer_plan(max_tokens, bucket, fp8).bytes);
+    });
+    return peak;
 }
 
 void kpool_indexer(const Tensor& query, const Tensor& coeff, const ConstKpoolIndexCacheView& cache,
@@ -163,31 +193,10 @@ void kpool_indexer(const Tensor& query, const Tensor& coeff, const ConstKpoolInd
     operand::ragged_batch(seq, batch.positions, batch.table_rows, op, device);
     const int n = seq.total_tokens();
     operand::tensor(query, DType::BF16, {128, 32, n}, 16, op, "query", device);
-    operand::tensor(coeff, DType::FP32, {32, n}, 4, op, "head coefficients", device);
-    operand::tensor(out.pool_ids, DType::I32, {512, n}, 4, op, "pool IDs", device);
-    operand::tensor(out.pool_counts, DType::I32, {n}, 4, op, "pool counts", device);
-    operand::tensor(out.selection_end, DType::I32, {n}, 4, op, "selection end", device);
-    const std::array outputs{operand::range(out.pool_ids, op), operand::range(out.pool_counts, op),
-                             operand::range(out.selection_end, op)};
-    operand::disjoint(outputs, op);
-    const auto table = operand::blocks(cache.keys.records.page_offsets, op);
-    for (const auto range : outputs) {
-        require(!operand::overlaps(table, range), "output overlaps page table");
-        for (const Tensor* input : {&query, &coeff, &batch.positions, &batch.table_rows,
-                                    &seq.cu_seqlens, &seq.seq_lengths, &seq.token_to_seq})
-            operand::disjoint(range, operand::range(*input, op), op);
-    }
-    for (int s = 0; s < seq.num_seqs(); ++s) {
-        const int begin = seq.segment_begin(s), len = seq.segment_length(s);
-        const KpoolMlaBatchView segment{batch.positions.slice(0, begin, len),
-                                        seq.seq_lengths.slice(0, s, 1),
-                                        batch.table_rows.slice(0, s, 1)};
-        KpoolBlockSelection result{out.pool_ids.slice(1, begin, len),
-                                   out.pool_counts.slice(0, begin, len),
-                                   out.selection_end.slice(0, begin, len)};
-        kpool_indexer(query.slice(2, begin, len), coeff.slice(1, begin, len), cache, segment,
-                      bucket, workspace, result, execution);
-    }
+    operand::tensor(coeff, DType::FP32, {32, n}, 16, op, "head coefficients", device);
+    const KpoolMlaBatchView flat{batch.positions.view({n, 1}), seq.seq_lengths, batch.table_rows};
+    execute(query.view({128, 32, n, 1}), coeff.view({32, n, 1}), cache, flat, &seq, bucket,
+            workspace, out, execution);
 }
 
 } // namespace ninfer::ops

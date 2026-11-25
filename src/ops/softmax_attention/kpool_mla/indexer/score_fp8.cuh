@@ -8,11 +8,19 @@
 
 namespace ninfer::ops::detail::kpool {
 
+#ifdef NINFER_KPOOL_PACKED
+#    define NINFER_INDEX_KERNEL    packed_indexer_score_fp8_kernel
+#    define NINFER_INDEX_ARGUMENTS PackedFp8IndexerArguments
+#else
+#    define NINFER_INDEX_KERNEL    indexer_score_fp8_kernel
+#    define NINFER_INDEX_ARGUMENTS Fp8IndexerArguments
+#endif
+
 template <int Queries, int Keys, int Stages, int MinBlocks, int WarpQueries = 1,
           bool EpiloguePrefetch = false>
 __global__ __launch_bounds__(
     (Queries / WarpQueries < 4 ? 4 : Queries / WarpQueries) * 32,
-    MinBlocks) void indexer_score_fp8_kernel(const __grid_constant__ Fp8IndexerArguments f) {
+    MinBlocks) void NINFER_INDEX_KERNEL(const __grid_constant__ NINFER_INDEX_ARGUMENTS f) {
     const auto& a           = f.index;
     constexpr int KeyGroups = Queries / WarpQueries < 4 ? 4 / (Queries / WarpQueries) : 1;
     constexpr int Threads   = Queries / WarpQueries * KeyGroups * 32;
@@ -46,14 +54,23 @@ __global__ __launch_bounds__(
     const int b = work.batch, first = work.first, start = work.start, step = work.step;
     const int live_end = min(work.live, first + Queries), visible = (work.position + live_end) / 4;
     if (start >= visible) return;
-    const int t = first + warp / KeyGroups * WarpQueries, slot = b * a.width + t;
+    const int t = first + warp / KeyGroups * WarpQueries;
+#ifdef NINFER_KPOOL_PACKED
+    const int slot = t;
+#else
+    const int slot = b * a.width + t;
+#endif
     int limit[WarpQueries];
     unsigned qf[WarpQueries][4][4][2];
     float weight[WarpQueries][4][2];
 #pragma unroll
     for (int q = 0; q < WarpQueries; ++q) {
         limit[q]           = t + q < live_end ? (work.position + t + q + 1) / 4 : 0;
+#ifdef NINFER_KPOOL_PACKED
+        const int prepared = t + q;
+#else
         const int prepared = b * f.query_width + a.begin + t + q - f.query_begin;
+#endif
 #pragma unroll
         for (int n = 0; n < 4; ++n) {
 #pragma unroll
@@ -213,4 +230,7 @@ __global__ __launch_bounds__(
         if constexpr (Stages == 1 && !EpiloguePrefetch) __syncthreads();
     }
 }
+
+#undef NINFER_INDEX_ARGUMENTS
+#undef NINFER_INDEX_KERNEL
 } // namespace ninfer::ops::detail::kpool

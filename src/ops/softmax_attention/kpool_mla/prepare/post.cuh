@@ -30,12 +30,29 @@ __device__ __forceinline__ __nv_bfloat16* carry_at(const PrepareArguments& a, in
     return a.carry + ((std::int64_t(b) * 2 + kind) * 3 + r) * 128;
 }
 
-__device__ __forceinline__ __nv_bfloat16 old_word(const PrepareArguments& a, int kind, int b,
+#ifdef NINFER_KPOOL_PACKED
+using PreparePostArguments = PackedPrepareArguments;
+
+__device__ __forceinline__ __nv_bfloat16* carry_at(const PackedPrepareArguments& a, int kind, int,
+                                                   int r) {
+    return carry_at(static_cast<const PrepareArguments&>(a), kind, a.write_slot, r);
+}
+#else
+using PreparePostArguments = PrepareArguments;
+#endif
+
+__device__ __forceinline__ __nv_bfloat16 old_word(const PreparePostArguments& a, int kind, int b,
                                                   int t0, int frontier, int position, int feature) {
+#ifdef NINFER_KPOOL_PACKED
+    const int r = position - (frontier - frontier % 4);
+    if (t0 > 0)
+        return carry_at(static_cast<const PrepareArguments&>(a), kind, a.read_slot, r)[feature];
+#else
     const int initial = a.positions[std::int64_t(b) * a.tokens];
     if (!a.update && position >= initial) return record_at(a, kind, b, position - initial)[feature];
     const int r = position - (frontier - frontier % 4);
     if (a.update && t0 > 0) return carry_at(a, kind, b, r)[feature];
+#endif
     return tail_at(a.before[kind], b, r)[feature];
 }
 
@@ -62,9 +79,15 @@ __device__ __forceinline__ float prepare_norm_sum(float value, float* reduction)
 }
 
 template <int Dimension, int Offset, bool Query, bool Subgroup = false>
-__device__ __forceinline__ void rms_job(const PrepareArguments& a, std::int64_t begin, int column,
-                                        float* reduction) {
+__device__ __forceinline__ void rms_job(const PreparePostArguments& a, std::int64_t begin,
+                                        int column, float* reduction) {
     const auto m = begin + column;
+#ifdef NINFER_KPOOL_PACKED
+    const int tid = threadIdx.x;
+    if constexpr (Query)
+        if (a.splits > 1 && a.heads && tid < 32)
+            a.coefficients[m * 32 + tid] = projection_value(a, column, 2304 + tid);
+#else
     int b, t;
     coordinate(a, column, b, t);
     const int tid = threadIdx.x;
@@ -79,6 +102,7 @@ __device__ __forceinline__ void rms_job(const PrepareArguments& a, std::int64_t 
                 a.query[m * Dimension + d] = __float2bfloat16_rn(0.F);
         return;
     }
+#endif
     float values[Dimension / 128], sum = 0.F;
 #pragma unroll
     for (int i = 0; i < Dimension / 128; ++i) {
@@ -94,6 +118,9 @@ __device__ __forceinline__ void rms_job(const PrepareArguments& a, std::int64_t 
     if constexpr (Query)
         dst = a.query + m * Dimension;
     else {
+#ifdef NINFER_KPOOL_PACKED
+        const int b = packed_segment(a, column);
+#endif
         const int p       = a.positions[m];
         const auto offset = a.page_offsets[a.table_rows[b] * a.table_stride + p / 64];
         dst               = a.latent + offset / 2 + (p % 64) * 512;
@@ -127,14 +154,22 @@ struct SharedRawToken {
 };
 
 template <class Output>
-__device__ __forceinline__ void raw_token(const PrepareArguments& a, std::int64_t begin, int b,
+__device__ __forceinline__ void raw_token(const PreparePostArguments& a, std::int64_t begin, int b,
                                           int t0, int frontier, int end, int pool, int r,
                                           bool publish_record, Output& output) {
     const int lane = threadIdx.x & 31, position = pool * 4 + r;
+#ifdef NINFER_KPOOL_PACKED
+    const int base    = packed_segment_begin(a, b);
+    const int initial = a.positions[base];
+    if (position < end && position >= frontier) {
+        const int t      = position - initial;
+        const int column = base + t - begin;
+#else
     const int initial = a.positions[std::int64_t(b) * a.tokens];
     if (position < end && position >= frontier) {
         const int t      = position - initial;
         const int column = std::int64_t(b) * a.tokens + t - begin;
+#endif
         float z[4], sum = 0.F;
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
@@ -174,7 +209,7 @@ __device__ __forceinline__ void raw_token(const PrepareArguments& a, std::int64_
     }
 }
 
-__device__ __forceinline__ void raw_pool(const PrepareArguments& a, std::int64_t begin, int b,
+__device__ __forceinline__ void raw_pool(const PreparePostArguments& a, std::int64_t begin, int b,
                                          int t0, int frontier, int end, int pool,
                                          bool publish_record, __nv_bfloat16 (&keys)[4][128],
                                          __nv_bfloat16 (&gates)[4][128]) {
@@ -184,7 +219,7 @@ __device__ __forceinline__ void raw_pool(const PrepareArguments& a, std::int64_t
     __syncthreads();
 }
 
-__device__ __forceinline__ float pooled_feature(const PrepareArguments& a, int d,
+__device__ __forceinline__ float pooled_feature(const PreparePostArguments& a, int d,
                                                 const __nv_bfloat16 (&keys)[4][128],
                                                 const __nv_bfloat16 (&gates)[4][128]) {
     float logit[4], maximum = -CUDART_INF_F;
@@ -204,12 +239,17 @@ __device__ __forceinline__ float pooled_feature(const PrepareArguments& a, int d
 }
 
 template <bool Subgroup = false>
-__device__ __forceinline__ void latent_fp8_job(const PrepareArguments& a, std::int64_t begin,
+__device__ __forceinline__ void latent_fp8_job(const PreparePostArguments& a, std::int64_t begin,
                                                int column, float* reduction) {
+#ifdef NINFER_KPOOL_PACKED
+    const auto m = begin + column;
+    const int b  = packed_segment(a, column);
+#else
     int b, t;
     coordinate(a, column, b, t);
     if (t >= a.valid[b]) return;
     const auto m   = begin + column;
+#endif
     const int lane = threadIdx.x % 32, group = threadIdx.x / 32;
     const int first = group * 128 + lane * 4;
     float values[4], sum = 0.F;
@@ -239,7 +279,7 @@ __device__ __forceinline__ void latent_fp8_job(const PrepareArguments& a, std::i
 }
 
 template <bool Fp8Index>
-__device__ __forceinline__ void publish_pool(const PrepareArguments& a, int b, int pool,
+__device__ __forceinline__ void publish_pool(const PreparePostArguments& a, int b, int pool,
                                              const __nv_bfloat16 (&keys)[4][128],
                                              const __nv_bfloat16 (&gates)[4][128]) {
     const auto offset = a.page_offsets[a.table_rows[b] * a.table_stride + pool / 16];
@@ -261,10 +301,18 @@ __device__ __forceinline__ void publish_pool(const PrepareArguments& a, int b, i
     }
 }
 
+#ifdef NINFER_KPOOL_PACKED
+template <bool Fp8Index, bool Fp8Latent, bool ParallelTail>
+__global__ __launch_bounds__(ParallelTail ? 256 : 128) void packed_prepare_post_kernel(
+    const __grid_constant__ PackedPrepareArguments a) {
+    const std::int64_t begin = a.window_begin;
+    const int columns        = a.stage_columns;
+#else
 template <bool Fp8Index, bool Fp8Latent = false, bool ParallelTail = false>
 __global__ __launch_bounds__(ParallelTail ? 256 : 128) void prepare_post_kernel(PrepareArguments a,
                                                                                 std::int64_t begin,
                                                                                 int columns) {
+#endif
     __shared__ float reduction[4];
     __shared__ __nv_bfloat16 keys[4][128], gates[4][128];
     int job = blockIdx.x;
@@ -291,7 +339,11 @@ __global__ __launch_bounds__(ParallelTail ? 256 : 128) void prepare_post_kernel(
     pool_coordinate(a, job, b, t0, t1);
     const int n = a.valid[b], stop = min(t1, n);
     if (stop <= t0) return;
+#ifdef NINFER_KPOOL_PACKED
+    const int initial = a.positions[packed_segment_begin(a, b)];
+#else
     const int initial  = a.positions[std::int64_t(b) * a.tokens];
+#endif
     const int frontier = initial + t0, end = initial + stop;
     const int first_pool = frontier / 4, pool = first_pool + job, full_end = end / 4;
     if constexpr (ParallelTail) {

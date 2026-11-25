@@ -235,26 +235,30 @@ inline std::vector<double> mla_reference_values(const std::uint16_t* query, cons
     parallel_rows(64, std::uint64_t(count) * 64 * 1024, [&](int lo, int hi) {
         for (int h = lo; h < hi; ++h) {
             std::array<double, 512> q{}, u{};
-            for (int k = 0; k < 256; ++k) {
-                const double x = kp::decode(query[h * 256 + k]);
-                for (int d = 0; d < 512; ++d)
-                    q[d] += x * factor_value(key_up[(h * 256 + k) * 512 + d]);
+            if (count == 1) {
+                std::copy_n(c.begin(), 512, u.begin());
+            } else {
+                for (int k = 0; k < 256; ++k) {
+                    const double x = kp::decode(query[h * 256 + k]);
+                    for (int d = 0; d < 512; ++d)
+                        q[d] += x * factor_value(key_up[(h * 256 + k) * 512 + d]);
+                }
+                std::vector<double> logits(count);
+                double maximum = -INFINITY;
+                for (std::size_t j = 0; j < count; ++j) {
+                    double dot = 0;
+                    for (int d = 0; d < 512; ++d) dot += q[d] * c[j * 512 + d];
+                    logits[j] = scale * dot;
+                    maximum   = std::max(maximum, logits[j]);
+                }
+                double denominator = 0;
+                for (double& x : logits) {
+                    x = std::exp(x - maximum);
+                    denominator += x;
+                }
+                for (std::size_t j = 0; j < count; ++j)
+                    for (int d = 0; d < 512; ++d) u[d] += logits[j] / denominator * c[j * 512 + d];
             }
-            std::vector<double> logits(count);
-            double maximum = -INFINITY;
-            for (std::size_t j = 0; j < count; ++j) {
-                double dot = 0;
-                for (int d = 0; d < 512; ++d) dot += q[d] * c[j * 512 + d];
-                logits[j] = scale * dot;
-                maximum   = std::max(maximum, logits[j]);
-            }
-            double denominator = 0;
-            for (double& x : logits) {
-                x = std::exp(x - maximum);
-                denominator += x;
-            }
-            for (std::size_t j = 0; j < count; ++j)
-                for (int d = 0; d < 512; ++d) u[d] += logits[j] / denominator * c[j * 512 + d];
             for (int v = 0; v < 256; ++v)
                 for (int d = 0; d < 512; ++d)
                     result[h * 256 + v] += factor_value(value_up[(h * 256 + v) * 512 + d]) * u[d];

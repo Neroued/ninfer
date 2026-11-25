@@ -7,12 +7,20 @@
 
 namespace ninfer::ops::detail::kpool {
 
+#ifdef NINFER_KPOOL_PACKED
+#    define NINFER_INDEX_KERNEL    packed_indexer_score_kernel
+#    define NINFER_INDEX_ARGUMENTS PackedIndexerArguments
+#else
+#    define NINFER_INDEX_KERNEL    indexer_score_kernel
+#    define NINFER_INDEX_ARGUMENTS IndexerArguments
+#endif
+
 // Query groups are interleaved at each key tile. A persistent worker retains its query
 // fragments while nearby groups can reuse that tile through L2.
 template <int Queries, int Keys, int Stages>
 __global__
 __launch_bounds__((Queries < 4 ? 4 : Queries) * 32,
-                  4) void indexer_score_kernel(const __grid_constant__ IndexerArguments a) {
+                  4) void NINFER_INDEX_KERNEL(const __grid_constant__ NINFER_INDEX_ARGUMENTS a) {
     constexpr int KeyGroups = Queries < 4 ? 4 / Queries : 1;
     constexpr int Threads   = Queries * KeyGroups * 32;
     constexpr int WarpKeys = Keys / KeyGroups, MT = WarpKeys / 16;
@@ -40,8 +48,14 @@ __launch_bounds__((Queries < 4 ? 4 : Queries) * 32,
     const int live_end = min(work.live, first + Queries), visible = (work.position + live_end) / 4;
     if (start >= visible) return;
     const int warp = __reduce_or_sync(0xffffffffu, unsigned(tid / 32));
-    const int t = first + (Queries == 1 ? 0 : warp / KeyGroups), slot = b * a.width + t;
+    const int t    = first + (Queries == 1 ? 0 : warp / KeyGroups);
+#ifdef NINFER_KPOOL_PACKED
+    const int slot    = t;
+    const auto column = a.column(slot);
+#else
+    const int slot    = b * a.width + t;
     const auto column = std::int64_t(b) * a.tokens + a.begin + t;
+#endif
     const int limit   = t < live_end ? (work.position + t + 1) / 4 : 0;
     // MMA rows are pools and columns are heads. Four adjacent lanes reduce the 32 heads.
     unsigned qf[4][8][2];
@@ -158,4 +172,7 @@ __launch_bounds__((Queries < 4 ? 4 : Queries) * 32,
         if constexpr (Stages == 1) __syncthreads();
     }
 }
+
+#undef NINFER_INDEX_ARGUMENTS
+#undef NINFER_INDEX_KERNEL
 } // namespace ninfer::ops::detail::kpool

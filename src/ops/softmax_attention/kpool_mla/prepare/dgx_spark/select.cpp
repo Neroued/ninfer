@@ -65,7 +65,7 @@ PrepareGeometry prepare_geometry(const KpoolMlaPrepareProfile& p, KpoolMlaStorag
     return {768 + q + heads, q, heads, p.weights};
 }
 
-int prepare_window_columns() { return 1024; }
+int prepare_window_columns() { return kPrepareWindowColumns; }
 
 struct SelectedProjection {
     ProjectionRoute route;
@@ -90,7 +90,8 @@ static SelectedProjection select_bf16_projection(int columns, int rows) {
     return {ProjectionRoute::Tma128, std::numeric_limits<int>::max()};
 }
 
-PrepareProjectionPlan prepare_projection_plan(const PrepareGeometry& geometry, int columns) {
+static PrepareProjectionPlan projection_plan(const PrepareGeometry& geometry, int columns,
+                                             bool packed) {
     const bool single_bf16 =
         !geometry.weights.second && geometry.weights.first.qtype == QType::BF16;
     const auto select = [&](const LinearProfile& weight) -> SelectedProjection {
@@ -132,6 +133,9 @@ PrepareProjectionPlan prepare_projection_plan(const PrepareGeometry& geometry, i
                  : columns <= 8 ? PairedProjectionRoute::Sliced8
                                 : PairedProjectionRoute::Sliced16;
     }
+    // A one-column carry suffix can follow a bulk projection. Keep the sliced
+    // pair's parallelism instead of restarting the serial two-parent GEMV.
+    if (packed && paired == PairedProjectionRoute::Simt1) paired = PairedProjectionRoute::Sliced8;
     const bool activation_quantization =
         paired == PairedProjectionRoute::None &&
         (projection_uses_a8(first.route) ||
@@ -150,6 +154,14 @@ PrepareProjectionPlan prepare_projection_plan(const PrepareGeometry& geometry, i
                  !(encoded_format == QType::MXFP8 && (geometry.query_rank == 0 || columns > 32 ||
                                                       (geometry.heads == 0 && columns > 16)))),
             std::min({first.last_column, second.last_column, last})};
+}
+
+PrepareProjectionPlan prepare_projection_plan(const PrepareGeometry& geometry, int columns) {
+    return projection_plan(geometry, columns, false);
+}
+
+PrepareProjectionPlan packed_prepare_projection_plan(const PrepareGeometry& geometry, int columns) {
+    return projection_plan(geometry, columns, true);
 }
 
 } // namespace ninfer::ops::detail::kpool

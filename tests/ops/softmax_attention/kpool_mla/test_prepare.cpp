@@ -295,44 +295,155 @@ int run(kp::Projection mode, int T, int B, bool update, bool graph, int phase, b
     return verify(f);
 }
 
-int ragged_prepare() {
-    RaggedFixture ragged({1, 3, 17});
-    constexpr int width = 17;
+enum class TailAlias { Disjoint, InPlace, Mixed };
+
+int ragged_prepare(std::vector<int> lengths, kp::Projection projection, kp::ProjectionFormat format,
+                   bool fp8, bool a16_only, TailAlias alias, int phase, bool replay = false) {
+    RaggedFixture ragged(std::move(lengths));
+    const int width = *std::max_element(ragged.lengths.begin(), ragged.lengths.end());
     const int n = ragged.tokens(), s = ragged.segments();
-    const auto execution = cuda_environment().default_execution;
-    kp::Weights weights(execution.device(), kp::Projection::Full);
-    kp::Fixture f(weights, execution, width, s, true, false, true, false, 2);
-    f.after_offsets.at(0) = f.before_offsets.at(0);
-    f.after_offsets.at(2) = f.before_offsets.at(2);
+    const auto execution = cuda_environment().context.execution_view();
+    kp::Weights weights(execution.device(), projection, format);
+    if (a16_only)
+        std::get<ops::PairedProjectionWeights>(weights.params.weights).first.policy =
+            ops::LinearPolicy::A16Only;
+    kp::Fixture f(
+        weights, execution, width, s, true, false, true, alias == TailAlias::InPlace, phase,
+        fp8 ? KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0 : KvCacheVectorFormat::BFloat16,
+        fp8 ? ops::KpoolMlaStorage::Fp8E4m3fnGroup128Ue8m0 : ops::KpoolMlaStorage::BFloat16);
+    if (alias == TailAlias::Mixed)
+        for (int b = 0; b < s; b += 2) f.after_offsets.at(b) = f.before_offsets.at(b);
     f.after_offsets.upload();
     f.valid.host = ragged.lengths;
     f.valid.upload();
-    for (int b = 0; b < s; ++b)
-        for (int t = 0; t < width; ++t)
-            for (int k = 0; k < 4096; ++k)
-                f.x.at(k, t, b) = kp::sample(k + 4096 * (t % 7) + 9397 * b + 317, 1.F / 256);
-    f.x.upload();
-    auto x   = to_device(ragged.pack(f.x.host, width, 4096));
-    auto pos = to_device(ragged.pack(f.positions.host, width, 1));
-    const ops::KpoolMlaRaggedBatchView batch{ragged.view, Tensor(pos.span(), DType::I32, {n}),
-                                             f.selectors.view};
     const auto bytes = ops::kpool_mla_prepare_update_ragged_workspace_capacity_bytes(
         weights.profile(), f.cache.latent.storage, f.cache.index.format, n, n, s, s,
         execution.multiprocessor_count());
-    GuardedDeviceBuffer scratch(bytes), query(1536 * n * 2ULL), coeff(32 * n * 4ULL);
-    MemoryArena arena(scratch.span());
-    ops::kpool_mla_prepare_update(
-        Tensor(x.span(), DType::BF16, {4096, n}), weights.params, batch, f.before, f.cache, f.after,
-        {Tensor(query.span(), DType::BF16, {1536, n}), Tensor(coeff.span(), DType::FP32, {32, n})},
-        arena, execution);
-    cuda_synchronize();
-    const auto q = ragged.unpack(from_device<std::uint16_t>(query.data(), 1536 * n), width, 1536);
-    const auto c = ragged.unpack(from_device<float>(coeff.data(), 32 * n), width, 32);
-    f.q.storage.copy_from_host(q.data(), q.size() * 2, 256);
-    f.coeff.storage.copy_from_host(c.data(), c.size() * 4, 256);
-    return verify(f, false) + query.verify_guards("ragged query") +
-           coeff.verify_guards("ragged coefficients") + scratch.verify_guards("ragged workspace") +
-           (arena.used() != 0 || arena.peak_used() > bytes);
+    GuardedDeviceBuffer storage(bytes + 2ULL * n * (4096 + weights.q) +
+                                4ULL * n * (1 + weights.heads) + 4 * 256);
+    MemoryArena arena(storage.span());
+    const auto x      = arena.alloc(DType::BF16, {4096, n});
+    const auto pos    = arena.alloc(DType::I32, {n});
+    const auto q      = weights.q ? arena.alloc(DType::BF16, {weights.q, n}) : Tensor{};
+    const auto coeff  = weights.heads ? arena.alloc(DType::FP32, {weights.heads, n}) : Tensor{};
+    const auto prefix = arena.used();
+    const auto aligned_prefix = (prefix + 255) / 256 * 256;
+    const ops::KpoolMlaRaggedBatchView batch{ragged.view, pos, f.selectors.view};
+    const auto fill = [&](int seed) {
+        for (int b = 0; b < s; ++b)
+            for (int t = 0; t < ragged.lengths[b]; ++t)
+                for (int k = 0; k < 4096; ++k)
+                    f.x.at(k, t, b) = kp::sample(k + 4096 * (t % 7) + 9397 * b + seed, 1.F / 256);
+        const auto x_host    = ragged.pack(f.x.host, width, 4096);
+        const auto positions = ragged.pack(f.positions.host, width, 1);
+        CUDA_CHECK(cudaMemcpy(x.data, x_host.data(), x.bytes(), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(pos.data, positions.data(), pos.bytes(), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaStreamSynchronize(nullptr));
+    };
+    const auto launch = [&](MemoryArena& scratch) {
+        ops::kpool_mla_prepare_update(x, weights.params, batch, f.before, f.cache, f.after,
+                                      {q, coeff}, scratch, execution);
+    };
+    const auto check = [&] {
+        cuda_environment().context.synchronize();
+        if (q.data) {
+            const auto padded =
+                ragged.unpack(from_device<std::uint16_t>(q.data, 1536 * n), width, 1536);
+            f.q.storage.copy_from_host(padded.data(), padded.size() * 2, 256);
+        }
+        if (coeff.data) {
+            const auto padded = ragged.unpack(from_device<float>(coeff.data, 32 * n), width, 32);
+            f.coeff.storage.copy_from_host(padded.data(), padded.size() * 4, 256);
+        }
+        return verify(f, false) + storage.verify_guards("ragged prepare arena") +
+               (arena.used() != prefix || arena.peak_used() != aligned_prefix + bytes);
+    };
+    fill(317);
+    int failures = 0;
+    if (replay) {
+        MemoryArena overlapping(storage.span());
+        bool rejected = false;
+        try {
+            launch(overlapping);
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += !rejected || overlapping.used() != 0;
+        DecodeGraphDefinition capture;
+        capture.capture(execution.stream(), [&] { launch(arena); });
+        DecodeGraphExecutable graph;
+        graph.instantiate(capture);
+        graph.launch(execution.stream());
+        failures += check();
+
+        CUDA_CHECK(cudaMemset(f.packed.storage().data, 0xa5, f.packed.storage().bytes));
+        const auto stride = std::int64_t(f.state_layout.image_bytes + 256);
+        for (int b = 0; b < s; ++b) {
+            const auto delta = s * stride;
+            f.before_offsets.at(b) += delta;
+            f.after_offsets.at(b) +=
+                f.after_offsets.at(b) == f.before_offsets.at(b) ? -delta : delta;
+            f.selectors.at(b) = b;
+            ++f.bases[b];
+            for (int t = 0; t < ragged.lengths[b]; ++t) f.positions.at(t, b) = f.bases[b] + t;
+            for (int kind = 0; kind < 2; ++kind)
+                for (int r = 0; r < 3; ++r)
+                    for (int d = 0; d < 128; ++d)
+                        f.state_host[f.state_index(false, kind, b, r, d)] =
+                            r < f.bases[b] % 4
+                                ? kp::sample(d + 128 * r + 777 * b + 99 * kind, 1.F / 512)
+                                : 0;
+        }
+        f.selectors.upload();
+        f.before_offsets.upload();
+        f.after_offsets.upload();
+        f.state.copy_from_host(f.state_host.data(), f.state.size());
+        fill(731);
+        graph.launch(execution.stream());
+        failures += check();
+    } else {
+        launch(arena);
+        failures += check();
+    }
+    return failures;
+}
+
+int ragged_prepare_capacity() {
+    const auto execution = cuda_environment().default_execution;
+    kp::Weights mx(execution.device(), kp::Projection::History, kp::ProjectionFormat::Mxfp8);
+    int failures                = 0;
+    auto mx_a16                 = mx.profile();
+    mx_a16.weights.first.policy = ops::LinearPolicy::A16Only;
+    for (const auto profile :
+         {kp::bf16_prepare_profile(kp::Projection::History),
+          kp::bf16_prepare_profile(kp::Projection::Full), mx.profile(), mx_a16}) {
+        const auto bytes = [&](int lo, int hi, int min_segments, int max_segments) {
+            return ops::kpool_mla_prepare_update_ragged_workspace_capacity_bytes(
+                profile, ops::KpoolMlaStorage::BFloat16, KvCacheVectorFormat::BFloat16, lo, hi,
+                min_segments, max_segments, execution.multiprocessor_count());
+        };
+        // A moved cut may produce any of these widths. Independently scan the
+        // rectangular per-width capacities, including the short split routes.
+        std::size_t one_window_peak = 0;
+        for (int n = 1; n <= 1024; ++n)
+            one_window_peak =
+                std::max(one_window_peak,
+                         ops::kpool_mla_prepare_update_workspace_capacity_bytes(
+                             profile, ops::KpoolMlaStorage::BFloat16, KvCacheVectorFormat::BFloat16,
+                             1, n, n, execution.multiprocessor_count()));
+        failures += bytes(1025, 1025, 1025, 1025) != one_window_peak;
+        for (const auto [lo, hi, first, last] : {std::array{1, 133, 1, 5},
+                                                 {1000, 1160, 2, 4},
+                                                 {1019, 1031, 1025, 1029},
+                                                 {2045, 2055, 1, 3},
+                                                 {2199, 3350, 2, 3}}) {
+            std::size_t peak = 0;
+            for (int n = lo; n <= hi; ++n)
+                for (int s = first; s <= std::min(last, n); ++s)
+                    peak = std::max(peak, bytes(n, n, s, s));
+            failures += peak != bytes(lo, hi, first, last);
+        }
+        failures += bytes(1025, 1025, 2, 2) != bytes(1025, 1025, 1025, 1025) + 3072;
+    }
+    return failures;
 }
 
 int inert(bool update, bool fp8 = false, bool fp8_latent = false,
@@ -429,7 +540,38 @@ int admission() {
 
 int main(int argc, char** argv) {
     OpSuite suite;
-    suite.add("kpool_prepare/ragged", ragged_prepare);
+    suite.add("kpool_prepare/ragged/bf16_carry_then_complete", [] {
+        return ragged_prepare({1025, 1024}, kp::Projection::Full, kp::ProjectionFormat::BFloat16,
+                              false, false, TailAlias::Mixed, 1);
+    });
+    suite.add("kpool_prepare/ragged/fp8_carry_then_complete", [] {
+        return ragged_prepare({1023, 1025, 1024}, kp::Projection::Full,
+                              kp::ProjectionFormat::BlockFp8, true, false, TailAlias::Mixed, 1);
+    });
+    suite.add("kpool_prepare/ragged/bf16_ping_pong", [] {
+        // A multiple of the window width forces both cuts. The middle window
+        // reads carry for segment zero and writes it for segment one.
+        return ragged_prepare({1025, 1024, 1023}, kp::Projection::Full,
+                              kp::ProjectionFormat::BFloat16, false, false, TailAlias::Mixed, 1);
+    });
+    suite.add("kpool_prepare/ragged/block_fp8_replay", [] {
+        return ragged_prepare({1023, 2, 1025}, kp::Projection::QueryAndHistory,
+                              kp::ProjectionFormat::BlockFp8, true, false, TailAlias::Mixed, 1,
+                              true);
+    });
+    suite.add("kpool_prepare/ragged/mxfp8_a16", [] {
+        return ragged_prepare({3, 62, 63}, kp::Projection::History, kp::ProjectionFormat::Mxfp8,
+                              false, true, TailAlias::Disjoint, 2);
+    });
+    suite.add("kpool_prepare/ragged/mxfp8_a8", [] {
+        return ragged_prepare({513, 512}, kp::Projection::Full, kp::ProjectionFormat::Mxfp8, true,
+                              false, TailAlias::InPlace, 3);
+    });
+    suite.add("kpool_prepare/ragged/split_history", [] {
+        return ragged_prepare({1, 126, 1}, kp::Projection::History, kp::ProjectionFormat::BFloat16,
+                              false, false, TailAlias::Disjoint, 1);
+    });
+    suite.add("kpool_prepare/ragged/capacity", ragged_prepare_capacity);
     suite.add("kpool_prepare/admission", admission);
     suite.add("kpool_prepare/large_batch/workspace_interval", workspace_interval,
               {{"suite", "concurrency"}});

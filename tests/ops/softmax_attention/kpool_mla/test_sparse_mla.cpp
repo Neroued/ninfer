@@ -108,38 +108,146 @@ int run(int T, int B, int E, int cap = 512, bool ragged = false, bool frozen = f
     return verify(f);
 }
 
-int ragged_sparse() {
-    RaggedFixture ragged({1, 3, 17});
-    constexpr int width = 17, features = 256 * 64;
+int ragged_sparse(bool boundary, bool fp8, bool mx) {
+    RaggedFixture ragged(boundary ? std::vector<int>{1025, 1024} : std::vector<int>{1, 3, 17});
+    const int width        = *std::max_element(ragged.lengths.begin(), ragged.lengths.end());
+    constexpr int features = 256 * 64;
     const int n = ragged.tokens(), s = ragged.segments();
-    const auto execution = cuda_environment().default_execution;
-    const std::array shape{kp::SparseMlaBatch{width, {67, 66, 79}, ragged.lengths}};
-    kp::SparseMlaFixture f(execution, width, s, 79, 2, 1, false, false, 1, 1,
-                           ops::KpoolMlaStorage::BFloat16, KvCacheVectorFormat::BFloat16, 0,
-                           std::nullopt, shape);
-    auto q    = to_device(ragged.pack(f.query.host, width, features));
-    auto pos  = to_device(ragged.pack(f.positions.host, width, 1));
-    auto rows = to_device(ragged.pack(f.selection_rows.host, width, 1));
-    const ops::KpoolMlaRaggedBatchView batch{ragged.view, Tensor(pos.span(), DType::I32, {n}),
-                                             f.selectors.view};
+    const auto execution = cuda_environment().context.execution_view();
+    // Sequence zero is empty with an invalid page row, sequence one begins
+    // with a singleton or a small selection, and the last sequence uses
+    // frozen selections shared across groups of four queries.
+    const auto contexts = boundary ? std::vector<int>{1025, 1029} : std::vector<int>{1, 4, 32786};
+    const std::array shape{kp::SparseMlaBatch{width, contexts, ragged.lengths}};
+    kp::SparseMlaFixture f(execution, width, s, contexts.back(), 2, 1, false, true, 1, 4,
+                           fp8 ? ops::KpoolMlaStorage::Fp8E4m3fnGroup128Ue8m0
+                               : ops::KpoolMlaStorage::BFloat16,
+                           KvCacheVectorFormat::BFloat16, 0, std::nullopt, shape);
+    if (mx) f.encode_factors(execution);
+    const auto poison = [&] {
+        for (int b = 0; b < s; ++b)
+            for (int t = 0; t < ragged.lengths[b]; ++t)
+                if (f.selected_tokens(t, b).size() <= 1)
+                    std::fill_n(f.query.host.begin() + f.query.index(0, 0, t, b), features, 0x7fc0);
+        f.query.upload();
+    };
+    if (boundary) {
+        const int singleton    = f.selection_rows.at(1023, 1);
+        f.ends.at(singleton)   = 1;
+        f.counts.at(singleton) = 0;
+    }
+    for (int b = 0; b < s; ++b)
+        if (ragged.lengths[b] > 8)
+            std::swap(f.selection_rows.at(0, b), f.selection_rows.at(ragged.lengths[b] - 1, b));
+    const int last_segment    = s - 1;
+    const auto copy_selection = [&](int dst, int src) {
+        f.ends.at(dst)   = f.ends.at(src);
+        f.counts.at(dst) = f.counts.at(src);
+        std::copy_n(&f.ids.at(0, src), f.counts.at(src), &f.ids.at(0, dst));
+    };
+    if (!boundary) {
+        // These slots belong to the empty segment's slice of the bank, but
+        // this record describes the last segment's own history.
+        copy_selection(0, f.selection_rows.at(0, last_segment));
+        f.selection_rows.at(0, last_segment) = 0;
+    }
+    f.upload_metadata();
+    poison();
     const auto factors = f.factors();
     const auto bytes   = ops::kpool_sparse_mla_ragged_workspace_capacity_bytes(
         ops::kpool_sparse_mla_profile(factors, 64), f.cache.storage, f.buckets, n, n, s, s,
         execution.multiprocessor_count());
-    GuardedDeviceBuffer scratch(std::max<std::size_t>(256, bytes)), output(n * features * 2ULL);
-    MemoryArena arena(scratch.span());
-    Tensor out(output.span(), DType::BF16, {256, 64, n});
-    ops::kpool_sparse_mla(Tensor(q.span(), DType::BF16, {256, 64, n}), factors, f.cache, batch,
-                          {f.ids.view, f.counts.view, f.ends.view},
-                          Tensor(rows.span(), DType::I32, {n}), f.scale, f.bucket, arena, out,
-                          execution);
-    cuda_synchronize();
-    const auto padded =
-        ragged.unpack(from_device<std::uint16_t>(output.data(), n * features), width, features);
-    f.output.storage.copy_from_host(padded.data(), padded.size() * 2, 256);
-    return verify(f) + output.verify_guards("ragged output") +
-           scratch.verify_guards("ragged workspace") +
-           (arena.used() != 0 || arena.peak_used() > bytes);
+    GuardedDeviceBuffer storage(bytes + n * (4ULL * features + 8) + 4 * 256);
+    MemoryArena arena(storage.span());
+    const auto q              = arena.alloc(DType::BF16, {256, 64, n});
+    const auto pos            = arena.alloc(DType::I32, {n});
+    const auto rows           = arena.alloc(DType::I32, {n});
+    auto out                  = arena.alloc(DType::BF16, {256, 64, n});
+    const auto prefix         = arena.used();
+    const auto aligned_prefix = (prefix + 255) / 256 * 256;
+    const ops::KpoolMlaRaggedBatchView batch{ragged.view, pos, f.selectors.view};
+    const auto upload = [&] {
+        const auto query      = ragged.pack(f.query.host, width, features);
+        const auto positions  = ragged.pack(f.positions.host, width, 1);
+        const auto selections = ragged.pack(f.selection_rows.host, width, 1);
+        CUDA_CHECK(cudaMemcpy(q.data, query.data(), q.bytes(), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(pos.data, positions.data(), pos.bytes(), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(rows.data, selections.data(), rows.bytes(), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaStreamSynchronize(nullptr));
+    };
+    const auto launch = [&] {
+        ops::kpool_sparse_mla(q, factors, f.cache, batch, {f.ids.view, f.counts.view, f.ends.view},
+                              rows, f.scale, f.bucket, arena, out, execution);
+    };
+    const auto check = [&] {
+        cuda_environment().context.synchronize();
+        const auto padded =
+            ragged.unpack(from_device<std::uint16_t>(out.data, n * features), width, features);
+        f.output.storage.copy_from_host(padded.data(), padded.size() * 2, 256);
+        return verify(f) + storage.verify_guards("ragged sparse MLA arena") +
+               (arena.used() != prefix || arena.peak_used() != aligned_prefix + bytes) +
+               verify_exact("sparse packed query preserved",
+                            from_device<std::uint16_t>(q.data, n * features),
+                            ragged.pack(f.query.host, width, features)) +
+               verify_exact("sparse packed selection mapping preserved",
+                            from_device<int>(rows.data, n),
+                            ragged.pack(f.selection_rows.host, width, 1));
+    };
+    upload();
+    DecodeGraphKernelSlice slice;
+    DecodeGraphCapture capture(execution.stream());
+    slice.capture(execution.stream(), launch);
+    auto definition = capture.finish();
+    DecodeGraphExecutable graph;
+    graph.instantiate(definition);
+    int failures = slice.size() != std::size_t(4 * ((n + 1023) / 1024));
+    graph.launch(execution.stream());
+    failures += check();
+    if (!boundary) {
+        // Replay using a different selection row and a remapped page-table row.
+        const int segment = last_segment;
+        copy_selection(1, f.selection_rows.at(4, segment));
+        f.selection_rows.at(0, segment)                           = 1;
+        const int empty_row                                       = segment * width + 1;
+        f.ends.at(empty_row)                                      = 0;
+        f.counts.at(empty_row)                                    = 0;
+        f.selection_rows.at(ragged.lengths[segment] - 1, segment) = empty_row;
+        for (int p = 0; p < f.P; ++p)
+            std::swap(f.tables.at(p, f.selectors.at(0)), f.tables.at(p, f.selectors.at(segment)));
+        std::swap(f.selectors.at(0), f.selectors.at(segment));
+        f.upload_metadata();
+        poison();
+        upload();
+        graph.launch(execution.stream());
+        failures += check();
+    }
+    return failures;
+}
+
+int ragged_sparse_capacity() {
+    int failures = 0;
+    for (const auto [storage, factors] :
+         {std::pair{ops::KpoolMlaStorage::BFloat16, QType::BF16},
+          {ops::KpoolMlaStorage::Fp8E4m3fnGroup128Ue8m0, QType::MXFP8}}) {
+        const auto profile =
+            ops::KpoolSparseMlaProfile{64, 256, 256, 512, 4, 512, factors, factors};
+        const auto capacity = [&](int lo, int hi, int first, int last, ContextBucketRange buckets) {
+            return ops::kpool_sparse_mla_ragged_workspace_capacity_bytes(profile, storage, buckets,
+                                                                         lo, hi, first, last, 48);
+        };
+        const ContextBucketRange buckets{ContextBucket::K8, ContextBucket::K64};
+        for (const auto [lo, hi, first, last] :
+             {std::array{1, 67, 1, 5}, {1018, 1058, 2, 7}, {2030, 2067, 1, 4}}) {
+            std::size_t peak = 0;
+            buckets.for_each([&](ContextBucket bucket) {
+                for (int n = lo; n <= hi; ++n)
+                    for (int s = first; s <= std::min(last, n); ++s)
+                        peak = std::max(peak, capacity(n, n, s, s, bucket));
+            });
+            failures += peak != capacity(lo, hi, first, last, buckets);
+        }
+    }
+    return failures;
 }
 
 int token_sweep(bool fp8, bool mx) {
@@ -579,7 +687,9 @@ int admission() {
 
 int main(int argc, char** argv) {
     OpSuite suite;
-    suite.add("kpool_sparse_mla/packed_prefill", ragged_sparse);
+    suite.add("kpool_sparse_mla/packed_replay", [] { return ragged_sparse(false, false, false); });
+    suite.add("kpool_sparse_mla/packed_window", [] { return ragged_sparse(true, true, true); });
+    suite.add("kpool_sparse_mla/packed_capacity", ragged_sparse_capacity);
     for (bool fp8 : {false, true})
         for (bool mx : {false, true})
             suite.add("kpool_sparse_mla/token_sweep/" + std::to_string(fp8) + "/" +

@@ -26,4 +26,13 @@ IndexerWindows indexer_windows(int, int, int, int) {
 int indexer_graph_slots(int, int, int, int) {
     throw std::invalid_argument("Kpool Indexer: no implementation for this target");
 }
+
+void launch_packed_indexer(IndexerArguments, const RaggedSequenceView&, int, int, cudaStream_t) {
+    throw std::invalid_argument("Kpool Indexer: no implementation for this target");
+}
+
+void launch_packed_fp8_indexer(Fp8IndexerArguments, const RaggedSequenceView&, int, int,
+                               cudaStream_t) {
+    throw std::invalid_argument("Kpool FP8 Indexer: no implementation for this target");
+}
 } // namespace ninfer::ops::detail::kpool

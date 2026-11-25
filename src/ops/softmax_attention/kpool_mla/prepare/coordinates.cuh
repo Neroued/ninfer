@@ -63,4 +63,41 @@ __device__ __forceinline__ void pool_coordinate(const PrepareArguments& a, int& 
     start = 0;
     stop  = a.last_stop;
 }
+
+// A window intersecting at most two segments encodes them directly. Larger
+// windows use packed anchors so each CTA still owns exactly one segment's pool.
+__device__ __forceinline__ int packed_segment(const PackedPrepareArguments& a, int column) {
+    if (a.first_row >= 0) return column < a.first_span ? a.first_row : a.last_row;
+    return a.token_to_seq[a.window_begin + column];
+}
+
+__device__ __forceinline__ int packed_segment_begin(const PackedPrepareArguments& a, int b) {
+    if (a.first_row >= 0)
+        return b == a.first_row ? a.window_begin - a.first_column : a.window_begin + a.first_span;
+    return a.cu_seqlens[b];
+}
+
+__device__ __forceinline__ void pool_coordinate(const PackedPrepareArguments& a, int& job, int& b,
+                                                int& start, int& stop) {
+    if (a.first_row >= 0) {
+        if (job < a.first_pool_jobs) {
+            b = a.first_row;
+            start = a.first_column;
+            stop = start + a.first_span;
+        } else {
+            b = a.last_row;
+            start = 0;
+            stop = a.last_stop;
+            job -= a.first_pool_jobs;
+        }
+        return;
+    }
+    const int local = a.pool_columns[job];
+    const int m     = a.window_begin + local;
+    b               = a.token_to_seq[m];
+    const int base  = a.cu_seqlens[b];
+    start           = max(0, a.window_begin - base);
+    stop            = min(a.window_begin + a.stage_columns, a.cu_seqlens[b + 1]) - base;
+    job             = (m - base - start) / 4;
+}
 } // namespace ninfer::ops::detail::kpool

@@ -235,4 +235,16 @@ void launch_fp8_indexer(Fp8IndexerArguments f, int sms, cudaStream_t stream) {
     }
     CUDA_CHECK(cudaGetLastError());
 }
+
+void launch_indexer_segment(IndexerArguments a, int sms, cudaStream_t stream) {
+    launch_indexer_window(a, select_indexer(a, sms), stream);
+}
+
+void launch_fp8_indexer_segment(Fp8IndexerArguments f, int sms, cudaStream_t stream) {
+    const auto& a = f.index;
+    f.query_begin = a.begin;
+    f.query_width = a.width;
+    indexer_query_fp8_kernel<<<a.width * 8, 128, 0, stream>>>(f);
+    launch_fp8_window(f, select_fp8_indexer(a, sms), stream);
+}
 } // namespace ninfer::ops::detail::kpool

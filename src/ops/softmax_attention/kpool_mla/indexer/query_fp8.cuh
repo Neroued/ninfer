@@ -5,14 +5,27 @@
 
 namespace ninfer::ops::detail::kpool {
 
-__global__ __launch_bounds__(128) void indexer_query_fp8_kernel(
-    const __grid_constant__ Fp8IndexerArguments f) {
+#ifdef NINFER_KPOOL_PACKED
+#    define NINFER_INDEX_KERNEL    packed_indexer_query_fp8_kernel
+#    define NINFER_INDEX_ARGUMENTS PackedFp8IndexerArguments
+#else
+#    define NINFER_INDEX_KERNEL    indexer_query_fp8_kernel
+#    define NINFER_INDEX_ARGUMENTS Fp8IndexerArguments
+#endif
+
+__global__
+__launch_bounds__(128) void NINFER_INDEX_KERNEL(const __grid_constant__ NINFER_INDEX_ARGUMENTS f) {
     const auto& a = f.index;
     if (a.columns <= kIndexSelected) return;
+#ifdef NINFER_KPOOL_PACKED
+    const int row     = blockIdx.x / 8;
+    const auto column = a.column(row);
+#else
     const int row = blockIdx.x / 8, b = row / f.query_width;
     const int t = row % f.query_width + f.query_begin;
     if (t >= a.valid[b]) return;
     const auto column = std::int64_t(b) * a.tokens + t;
+#endif
     if ((a.positions[column] + 1) / 4 <= kIndexSelected) return;
     const int lane = threadIdx.x & 31, head = blockIdx.x % 8 * 4 + threadIdx.x / 32;
     const auto* src   = a.query + column * 4096 + head * 128 + lane * 4;
@@ -27,4 +40,7 @@ __global__ __launch_bounds__(128) void indexer_query_fp8_kernel(
         f.coefficients[row * 32 + head] =
             a.coefficients[column * 32 + head] * common::ue8m0_to_float(encoded.scale);
 }
+
+#undef NINFER_INDEX_ARGUMENTS
+#undef NINFER_INDEX_KERNEL
 } // namespace ninfer::ops::detail::kpool

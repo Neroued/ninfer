@@ -10,6 +10,7 @@
 #include <optional>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <set>
 #include <tuple>
 #include <cuda.h>
@@ -36,7 +37,9 @@ void reserve_workspace(kp::IndexerFixture& f, std::size_t bytes, Device device) 
 
 int verify(kp::IndexerFixture& f, bool exact = false) {
     if (const int failures = verify_selection(f, exact)) return failures;
-    if (f.query.download() != f.query.host || f.coeff.download() != f.coeff.host ||
+    const auto coefficients = f.coeff.download();
+    if (f.query.download() != f.query.host ||
+        std::memcmp(coefficients.data(), f.coeff.host.data(), f.coeff.view.bytes()) != 0 ||
         f.positions.download() != f.positions.host || f.tables.download() != f.tables.host ||
         f.valid.download() != f.valid.host || f.selectors.download() != f.selectors.host)
         return 1;
@@ -259,51 +262,184 @@ int rejects(F&& call) {
     return 1;
 }
 
-int ragged_indexer() {
-    RaggedFixture ragged({1, 3, 17});
-    constexpr int width = 17;
+enum class PackedIndexerCase { Ordinary, ReplayTies, MultipleWindows, ReplayScores };
+
+int ragged_indexer(bool fp8, ContextBucket bucket,
+                   PackedIndexerCase scenario = PackedIndexerCase::Ordinary) {
+    const bool all              = bucket == ContextBucket::K2;
+    const bool replay_ties      = scenario == PackedIndexerCase::ReplayTies;
+    const bool replay_scores    = scenario == PackedIndexerCase::ReplayScores;
+    const bool multiple_windows = scenario == PackedIndexerCase::MultipleWindows;
+    const bool replay           = replay_ties || replay_scores;
+    const int window            = fp8 ? 128 : 256;
+    // Start the last segment in the final slot of the mixed window. Its next
+    // column is a contained window at a nonzero offset into the segment.
+    auto lengths = multiple_windows ? std::vector<int>{window - 2, 1, 2}
+                   : replay_scores  ? std::vector<int>{1, 4, 8, 3}
+                   : replay_ties    ? std::vector<int>{1, 3, 8, 3}
+                                    : std::vector<int>{1, 3, 9, 3};
+    RaggedFixture ragged(std::move(lengths));
+    const int width = *std::max_element(ragged.lengths.begin(), ragged.lengths.end());
     const int n = ragged.tokens(), s = ragged.segments();
-    const auto execution = cuda_environment().default_execution;
+    const auto execution = cuda_environment().context.execution_view();
     kp::IndexerCase shape;
-    shape.ends  = {67, 66, 2081};
-    shape.valid = ragged.lengths;
-    kp::IndexerFixture f(execution, width, s, 2081, 1, false, ops::KpoolMlaStorage::BFloat16,
-                         shape);
-    auto q     = to_device(ragged.pack(f.query.host, width, 128 * 32));
-    auto coeff = to_device(ragged.pack(f.coeff.host, width, 32));
-    auto pos   = to_device(ragged.pack(f.positions.host, width, 1));
-    const ops::KpoolMlaRaggedBatchView batch{ragged.view, Tensor(pos.span(), DType::I32, {n}),
-                                             f.selectors.view};
+    const int deep = bucket >= ContextBucket::K32 ? 16411 : 2073;
+    shape.ends     = multiple_windows
+                         ? std::vector<int>{deep, deep + 7, deep + 13}
+                         : std::vector<int>{67, 2048, all ? 2048 : deep, all ? 2048 : deep + 13};
+    if (replay_scores) {
+        shape.reserve_ends    = shape.ends;
+        shape.reserve_ends[1] = 2052;
+    }
+    shape.valid         = ragged.lengths;
+    shape.bucket        = bucket;
+    shape.shared_prefix = 64;
+    kp::IndexerFixture f(execution, width, s, all ? 2048 : deep + 13, 1, false,
+                         ops::KpoolMlaStorage::BFloat16, shape, true, index_format(fp8));
+    if (replay_ties) exact_inputs(f, 2);
+    if (replay_scores) {
+        std::fill(f.query.host.begin(), f.query.host.end(), 0);
+        std::fill(f.coeff.host.begin(), f.coeff.host.end(), 0);
+        std::fill(f.keys.begin(), f.keys.end(), 0);
+        f.keys[f.key(1, 512) - f.keys.data()] = kp::encode(2.F);
+        f.upload_keys();
+    }
+    auto original_query = f.query.host;
+    auto original_coeff = f.coeff.host;
+    const auto offsets  = f.tables.host;
+    const auto poison   = [&] {
+        f.tables.host = offsets;
+        f.query.host  = original_query;
+        f.coeff.host  = original_coeff;
+        for (int b = 0; b < s; ++b) {
+            if ((f.positions.at(f.valid.at(b) - 1, b) + 1) / 4 > 512) continue;
+            for (int p = 0; p < f.P; ++p) f.tables.at(p, f.selectors.at(b)) = -1;
+            for (int t = 0; t < f.valid.at(b); ++t) {
+                std::fill_n(f.query.host.begin() + f.query.index(0, 0, t, b), 4096, 0x7fc0);
+                std::fill_n(f.coeff.host.begin() + f.coeff.index(0, t, b), 32,
+                              std::numeric_limits<float>::quiet_NaN());
+            }
+        }
+        f.upload_metadata();
+        f.query.upload();
+        f.coeff.upload();
+    };
     const auto bytes = ops::kpool_indexer_ragged_workspace_capacity_bytes(
-        {32, 128}, f.cache.format, f.bucket, n, n, s, s, execution.multiprocessor_count());
-    GuardedDeviceBuffer scratch(std::max<std::size_t>(256, bytes)), ids(512 * n * 4ULL),
-        counts(n * 4ULL), ends(n * 4ULL);
-    MemoryArena arena(scratch.span());
-    ops::KpoolBlockSelection selected{Tensor(ids.span(), DType::I32, {512, n}),
-                                      Tensor(counts.span(), DType::I32, {n}),
-                                      Tensor(ends.span(), DType::I32, {n})};
-    const Tensor query(q.span(), DType::BF16, {128, 32, n});
-    const Tensor coefficients(coeff.span(), DType::FP32, {32, n});
+        {32, 128}, f.cache.format, bucket, n, n, s, s, execution.multiprocessor_count());
+    GuardedDeviceBuffer storage(bytes + n * (8192 + 128 + 2048 + 12ULL) + 6 * 256);
+    MemoryArena arena(storage.span());
+    const auto query = arena.alloc(DType::BF16, {128, 32, n});
+    const auto coeff = arena.alloc(DType::FP32, {32, n});
+    const auto pos   = arena.alloc(DType::I32, {n});
+    ops::KpoolBlockSelection selected{arena.alloc(DType::I32, {512, n}),
+                                      arena.alloc(DType::I32, {n}), arena.alloc(DType::I32, {n})};
+    const auto prefix         = arena.used();
+    const auto aligned_prefix = (prefix + 255) / 256 * 256;
+    const ops::KpoolMlaRaggedBatchView batch{ragged.view, pos, f.selectors.view};
+    const auto upload = [&] {
+        const auto q = ragged.pack(f.query.host, width, 4096);
+        const auto c = ragged.pack(f.coeff.host, width, 32);
+        const auto p = ragged.pack(f.positions.host, width, 1);
+        CUDA_CHECK(cudaMemcpy(query.data, q.data(), query.bytes(), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(coeff.data, c.data(), coeff.bytes(), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(pos.data, p.data(), pos.bytes(), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaStreamSynchronize(nullptr));
+    };
+    const auto launch = [&] {
+        ops::kpool_indexer(query, coeff, f.cache, batch, bucket, arena, selected, execution);
+    };
+    const auto check = [&] {
+        cuda_environment().context.synchronize();
+        const auto unpack = [&](auto& dst, const Tensor& data, int features) {
+            const auto padded =
+                ragged.unpack(from_device<int>(data.data, n * features), width, features);
+            dst.storage.copy_from_host(padded.data(), padded.size() * 4, 256);
+        };
+        unpack(f.ids, selected.pool_ids, 512);
+        unpack(f.counts, selected.pool_counts, 1);
+        unpack(f.ends, selected.selection_end, 1);
+        const auto actual_coeff   = from_device<float>(coeff.data, n * 32);
+        const auto expected_coeff = ragged.pack(f.coeff.host, width, 32);
+        return verify(f, replay) + storage.verify_guards("ragged indexer arena") +
+               (arena.used() != prefix ||
+                arena.peak_used() != (all ? prefix : aligned_prefix + bytes)) +
+               verify_exact("packed query preserved",
+                            from_device<std::uint16_t>(query.data, n * 4096),
+                            ragged.pack(f.query.host, width, 4096)) +
+               (std::memcmp(actual_coeff.data(), expected_coeff.data(), coeff.bytes()) != 0) +
+               verify_exact("Kpool token mapping preserved",
+                            from_device<int>(ragged.view.token_to_seq.data, n), ragged.mapping);
+    };
+
+    poison();
+    upload();
     auto alias          = selected;
     alias.selection_end = ragged.view.token_to_seq;
-    int failures        = rejects([&] {
-        ops::kpool_indexer(query, coefficients, f.cache, batch, f.bucket, arena, alias, execution);
-    });
-    ops::kpool_indexer(query, coefficients, f.cache, batch, f.bucket, arena, selected, execution);
-    cuda_synchronize();
-    const auto unpack = [&](auto& dst, const auto& buffer, int features) {
-        const auto padded =
-            ragged.unpack(from_device<int>(buffer.data(), n * features), width, features);
-        dst.storage.copy_from_host(padded.data(), padded.size() * 4, 256);
-    };
-    unpack(f.ids, ids, 512);
-    unpack(f.counts, counts, 1);
-    unpack(f.ends, ends, 1);
-    failures += verify(f) + (arena.used() != 0 || arena.peak_used() > bytes) +
-                verify_exact("Kpool token mapping preserved",
-                             from_device<int>(ragged.view.token_to_seq.data, n), ragged.mapping);
-    for (const auto* buffer : {&scratch, &ids, &counts, &ends})
-        failures += buffer->verify_guards("ragged Kpool indexer");
+    int failures        = rejects(
+        [&] { ops::kpool_indexer(query, coeff, f.cache, batch, bucket, arena, alias, execution); });
+    if (all) {
+        DecodeGraphKernelPatch capture;
+        capture.capture(execution.stream(), launch);
+        failures += capture.params().size() != 1 || bytes != 0;
+    }
+    if (replay) {
+        DecodeGraphDefinition capture;
+        capture.capture(execution.stream(), launch);
+        DecodeGraphExecutable graph;
+        graph.instantiate(capture);
+        graph.launch(execution.stream());
+        failures += check();
+        if (replay_ties) {
+            for (int t = 0; t < 3; ++t) std::swap(f.positions.at(t, 1), f.positions.at(t, 3));
+            std::swap(f.selectors.at(1), f.selectors.at(3));
+        } else {
+            // The first three lanes still have C=512. At C=513 the last
+            // lane must score pool 512 above the zero-score prefix.
+            for (int t = 0; t < 4; ++t) {
+                f.positions.at(t, 1)                      = 2048 + t;
+                original_query[f.query.index(0, 0, t, 1)] = kp::encode(8.F);
+                original_coeff[f.coeff.index(0, t, 1)]    = 0.5F;
+            }
+        }
+        poison();
+        upload();
+        graph.launch(execution.stream());
+        failures += check();
+        if (replay_scores) {
+            const auto ids   = f.ids.download();
+            const auto first = ids.begin() + (width + 3) * 512;
+            failures += std::find(first, first + 512, 512) == first + 512;
+            failures += std::find(first, first + 512, 511) != first + 512;
+        }
+    } else {
+        launch();
+        failures += check();
+    }
+    return failures;
+}
+
+int ragged_indexer_capacity() {
+    int failures = 0;
+    for (const auto format : {index_format(false), index_format(true)}) {
+        for (const auto buckets : {ContextBucketRange{ContextBucket::K2},
+                                   ContextBucketRange{ContextBucket::K8, ContextBucket::K64},
+                                   ContextBucketRange{ContextBucket::K32, ContextBucket::M1}}) {
+            const auto bytes = [&](int lo, int hi, int first, int last, ContextBucketRange range) {
+                return ops::kpool_indexer_ragged_workspace_capacity_bytes({32, 128}, format, range,
+                                                                          lo, hi, first, last, 48);
+            };
+            for (const auto [lo, hi, first, last] :
+                 {std::array{1, 36, 1, 3}, {49, 272, 2, 4}, {253, 499, 1, 3}}) {
+                std::size_t maximum = 0;
+                buckets.for_each([&](ContextBucket bucket) {
+                    for (int n = lo; n <= hi; ++n)
+                        for (int s = first; s <= std::min(n, last); ++s)
+                            maximum = std::max(maximum, bytes(n, n, s, s, bucket));
+                });
+                failures += maximum != bytes(lo, hi, first, last, buckets);
+            }
+        }
+    }
     return failures;
 }
 
@@ -504,7 +640,27 @@ int admission() {
 
 int main(int argc, char** argv) {
     OpSuite suite;
-    suite.add("kpool_indexer/ragged", ragged_indexer);
+    suite.add("kpool_indexer/ragged/k2_bf16",
+              [] { return ragged_indexer(false, ContextBucket::K2); });
+    suite.add("kpool_indexer/ragged/k2_fp8",
+              [] { return ragged_indexer(true, ContextBucket::K2); });
+    suite.add("kpool_indexer/ragged/k8_replay", [] {
+        return ragged_indexer(true, ContextBucket::K8, PackedIndexerCase::ReplayTies);
+    });
+    suite.add("kpool_indexer/ragged/k8_replay_scores", [] {
+        return ragged_indexer(true, ContextBucket::K8, PackedIndexerCase::ReplayScores);
+    });
+    suite.add("kpool_indexer/ragged/k8_windows_bf16", [] {
+        return ragged_indexer(false, ContextBucket::K8, PackedIndexerCase::MultipleWindows);
+    });
+    suite.add("kpool_indexer/ragged/k8_windows_fp8", [] {
+        return ragged_indexer(true, ContextBucket::K8, PackedIndexerCase::MultipleWindows);
+    });
+    suite.add("kpool_indexer/ragged/k32_bf16",
+              [] { return ragged_indexer(false, ContextBucket::K32); });
+    suite.add("kpool_indexer/ragged/k64_fp8",
+              [] { return ragged_indexer(true, ContextBucket::K64); });
+    suite.add("kpool_indexer/ragged/capacity", ragged_indexer_capacity);
     for (auto [T, B, E] :
          {std::tuple{1, 1, 1}, {3, 1, 3},       {1, 1, 2051},     {1, 1, 2052},     {1, 1, 8192},
           {2, 1, 16384},       {3, 1, 16388},   {4, 1, 32768},    {7, 1, 32768},    {8, 1, 32768},

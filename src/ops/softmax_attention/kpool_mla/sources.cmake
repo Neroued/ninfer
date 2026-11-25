@@ -11,8 +11,11 @@ if(NINFER_TARGET STREQUAL "dgx_spark")
     "${CMAKE_CURRENT_LIST_DIR}/sparse_mla/dgx_spark/select.cpp")
   target_sources(ninfer_ops_non_rdc PRIVATE
     "${CMAKE_CURRENT_LIST_DIR}/prepare/dgx_spark/launch.cu"
+    "${CMAKE_CURRENT_LIST_DIR}/prepare/dgx_spark/packed_launch.cu"
     "${CMAKE_CURRENT_LIST_DIR}/indexer/dgx_spark/launch.cu"
-    "${CMAKE_CURRENT_LIST_DIR}/sparse_mla/dgx_spark/launch.cu")
+    "${CMAKE_CURRENT_LIST_DIR}/indexer/dgx_spark/packed_launch.cu"
+    "${CMAKE_CURRENT_LIST_DIR}/sparse_mla/dgx_spark/launch.cu"
+    "${CMAKE_CURRENT_LIST_DIR}/sparse_mla/dgx_spark/packed_launch.cu")
 else()
   target_sources(ninfer_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/prepare/unsupported.cpp")
   target_sources(ninfer_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/indexer/unsupported.cpp")

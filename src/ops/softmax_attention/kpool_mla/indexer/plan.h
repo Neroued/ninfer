@@ -32,7 +32,6 @@ inline int indexer_window_width(int tokens, int windows, int tile = 4) {
 }
 
 inline constexpr int kIndexPreparedQueries    = 128;
-inline constexpr int kIndexMaxWindowQueries   = 256;
 inline constexpr int kIndexLongRequestQueries = 64;
 
 int indexer_group_size(int tokens, int batch);
@@ -118,6 +117,22 @@ inline IndexerPlan indexer_plan(int tokens, int batch, ContextBucket bucket, boo
     return p;
 }
 
+inline IndexerPlan packed_indexer_plan(int tokens, ContextBucket bucket, bool fp8) {
+    auto p = indexer_dimensions(bucket);
+    if (p.columns <= kIndexSelected) return p;
+    const int limit = indexer_windows(kIndexMaxWindowQueries, 1, p.columns, fp8 ? 1 : 0).row_budget;
+    p.query_width   = std::min(tokens, fp8 ? std::min(limit, kIndexPreparedQueries) : limit);
+    LayoutBuilder builder;
+    if (fp8) {
+        p.query_fp8 =
+            builder.add_tensor(DType::FP8_E4M3FN, {128, 32, p.query_width}, 256, "Kpool FP8 query");
+        p.weighted_coefficients =
+            builder.add_tensor(DType::FP32, {32, p.query_width}, 256, "Kpool scaled coefficients");
+    }
+    indexer_scratch(p, p.query_width, builder);
+    return p;
+}
+
 inline std::size_t indexer_capacity(int lo, int hi, int batch, ContextBucket bucket, bool fp8) {
     if (bucket == ContextBucket::K2) return 0;
     // BF16 reaches every group's maximum window width within one full window
@@ -172,5 +187,12 @@ struct Fp8IndexerSchedule {
 Fp8IndexerSchedule select_fp8_indexer(const IndexerArguments&, int sms);
 void launch_indexer(IndexerArguments, int sms, cudaStream_t);
 void launch_fp8_indexer(Fp8IndexerArguments, int sms, cudaStream_t);
+
+void launch_indexer_segment(IndexerArguments, int sms, cudaStream_t);
+void launch_fp8_indexer_segment(Fp8IndexerArguments, int sms, cudaStream_t);
+void launch_packed_fp8_indexer(Fp8IndexerArguments, const RaggedSequenceView&, int window, int sms,
+                               cudaStream_t);
+void launch_packed_indexer(IndexerArguments, const RaggedSequenceView&, int window, int sms,
+                           cudaStream_t);
 
 } // namespace ninfer::ops::detail::kpool

@@ -25,10 +25,19 @@ struct MlaFp8Storage {
 
 // Two warps per 16 heads divide QK's G128 groups and PV's output features.
 // FP8 codes are read once; their BF16 values stay on chip for PV.
+#ifdef NINFER_KPOOL_PACKED
+#    define NINFER_MLA_KERNEL(name)      packed_##name
+#    define NINFER_MLA_ARGUMENTS         PackedSparseMlaArguments
+#    define NINFER_MLA_SEGMENT(a, local) ((a).segment(local))
+#else
+#    define NINFER_MLA_KERNEL(name)      name
+#    define NINFER_MLA_ARGUMENTS         SparseMlaArguments
+#    define NINFER_MLA_SEGMENT(a, local) (((a).begin + (local)) / (a).tokens)
+#endif
 template <int Tokens, int HeadGroups>
-__global__
-__launch_bounds__(64 * HeadGroups, HeadGroups == 2 ? 2 : 1) void mla_attention_fp8_kernel(
-    const __grid_constant__ SparseMlaArguments a, const __grid_constant__ CUtensorMap map) {
+__global__ __launch_bounds__(64 * HeadGroups, HeadGroups == 2 ? 2 : 1) void NINFER_MLA_KERNEL(
+    mla_attention_fp8_kernel)(const __grid_constant__ NINFER_MLA_ARGUMENTS a,
+                              const __grid_constant__ CUtensorMap map) {
     constexpr int Parts = 2, Threads = 64 * HeadGroups;
     constexpr int Chunk = Tokens == 64 ? 32 : Tokens;
     const int local = blockIdx.x / (4 / HeadGroups), split = blockIdx.y;
@@ -46,18 +55,31 @@ __launch_bounds__(64 * HeadGroups, HeadGroups == 2 ? 2 : 1) void mla_attention_f
     const int start = split * tiles / splits * Tokens;
     const int stop  = min(work.size, (split + 1) * tiles / splits * Tokens);
     const auto* table =
-        a.tables + std::int64_t(a.table_rows[(a.begin + local) / a.tokens]) * a.table_stride;
+        a.tables + std::int64_t(a.table_rows[NINFER_MLA_SEGMENT(a, local)]) * a.table_stride;
     if (work.size == 1) {
+#ifdef NINFER_KPOOL_PACKED
+        // The latent is shared by every head. Publish it once for the value map.
+        if (head_base != 0) return;
+#endif
         const int token    = work.end - 1;
         const auto record  = __ldg(table + token / 64);
         const auto* codes  = a.latent_fp8 + record + (token % 64) * 512;
         const auto* scales = a.latent_scales + record + (token % 64) * 4;
+#ifdef NINFER_KPOOL_PACKED
+        for (int i = tid; i < 256; i += Threads) {
+            const int head = 0, d = i * 2;
+            *reinterpret_cast<unsigned*>(a.mapped + (local * 64 + head) * 512 + d) =
+                common::fp8_dequant_bf16x2(*reinterpret_cast<const std::uint16_t*>(codes + d),
+                                           scales[d / 128]);
+        }
+#else
         for (int i = tid; i < 16 * HeadGroups * 256; i += Threads) {
             const int head = head_base + i / 256, d = i % 256 * 2;
             *reinterpret_cast<unsigned*>(a.mapped + (local * 64 + head) * 512 + d) =
                 common::fp8_dequant_bf16x2(*reinterpret_cast<const std::uint16_t*>(codes + d),
                                            scales[d / 128]);
         }
+#endif
         return;
     }
     extern __shared__ __align__(1024) unsigned char shared[];
@@ -320,4 +342,7 @@ __launch_bounds__(64 * HeadGroups, HeadGroups == 2 ? 2 : 1) void mla_attention_f
     }
 }
 
+#undef NINFER_MLA_SEGMENT
+#undef NINFER_MLA_ARGUMENTS
+#undef NINFER_MLA_KERNEL
 } // namespace ninfer::ops::detail::kpool

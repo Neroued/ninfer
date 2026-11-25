@@ -66,6 +66,8 @@ struct PrepareProjectionPlan {
 };
 
 PrepareProjectionPlan prepare_projection_plan(const PrepareGeometry&, int columns);
+PrepareProjectionPlan packed_prepare_projection_plan(const PrepareGeometry&, int columns);
+inline constexpr int kPrepareWindowColumns = 1024;
 int prepare_window_columns();
 
 inline int projection_splits(ProjectionRoute route) {
@@ -81,15 +83,16 @@ struct PrepareWorkspace {
     int columns       = 0;
 };
 
-inline PrepareWorkspace prepare_workspace(PrepareGeometry geometry, bool update, int tokens,
-                                          int batch) {
+inline PrepareWorkspace prepare_workspace_for_total(const PrepareGeometry& geometry, bool update,
+                                                    std::int64_t total, int carry_slots,
+                                                    bool packed = false) {
     PrepareWorkspace result;
-    const auto total = std::int64_t(tokens) * batch;
-    result.columns   = static_cast<int>(std::min<std::int64_t>(total, prepare_window_columns()));
+    result.columns = static_cast<int>(std::min<std::int64_t>(total, prepare_window_columns()));
     LayoutBuilder builder;
+    const auto select           = packed ? packed_prepare_projection_plan : prepare_projection_plan;
     const int remainder         = total % result.columns;
-    const auto full             = prepare_projection_plan(geometry, result.columns);
-    const auto tail             = remainder ? prepare_projection_plan(geometry, remainder) : full;
+    const auto full             = select(geometry, result.columns);
+    const auto tail             = remainder ? select(geometry, remainder) : full;
     const auto projection_words = [&](int columns, const PrepareProjectionPlan& plan) {
         return (plan.splits == 1 ? geometry.norm_dim() : plan.splits * geometry.rows) * columns;
     };
@@ -100,8 +103,9 @@ inline PrepareWorkspace prepare_workspace(PrepareGeometry geometry, bool update,
         if (full.splits == 1 || (remainder && tail.splits == 1))
             result.gates =
                 builder.add_tensor(DType::BF16, {128, result.columns}, 256, "Kpool gates");
-        if (total > result.columns && result.columns % tokens != 0)
-            result.carry = builder.add_tensor(DType::BF16, {128, 3, 2, batch}, 256, "Kpool carry");
+        if (carry_slots)
+            result.carry =
+                builder.add_tensor(DType::BF16, {128, 3, 2, carry_slots}, 256, "Kpool carry");
     }
     if (full.quantize || (remainder && tail.quantize)) {
         result.activation_codes = builder.add_tensor(DType::FP8_E4M3FN, {4096, result.columns}, 256,
@@ -111,6 +115,24 @@ inline PrepareWorkspace prepare_workspace(PrepareGeometry geometry, bool update,
     }
     result.bytes = builder.finish(1);
     return result;
+}
+
+inline PrepareWorkspace prepare_workspace(const PrepareGeometry& geometry, bool update, int tokens,
+                                          int batch) {
+    const int window      = prepare_window_columns();
+    const auto total      = std::int64_t(tokens) * batch;
+    const int carry_slots = update && total > window && window % tokens != 0 ? batch : 0;
+    return prepare_workspace_for_total(geometry, update, total, carry_slots);
+}
+
+inline PrepareWorkspace packed_prepare_workspace(const PrepareGeometry& geometry, int tokens,
+                                                 bool may_cross) {
+    const int window      = prepare_window_columns();
+    const int carry_slots = tokens > window && may_cross ? 2 : 0;
+    // Segment-aligned cuts can produce any width up to the window. The full
+    // window covers the gate and activation buffers as well as the split FP32
+    // projection routes (which end at width 128).
+    return prepare_workspace_for_total(geometry, true, std::min(tokens, window), carry_slots, true);
 }
 
 inline std::size_t prepare_capacity(const PrepareGeometry& geometry, bool update, int lo, int hi,

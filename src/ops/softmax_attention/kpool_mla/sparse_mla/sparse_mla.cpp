@@ -63,18 +63,19 @@ std::size_t kpool_sparse_mla_workspace_capacity_bytes(const KpoolSparseMlaProfil
     return peak;
 }
 
-void kpool_sparse_mla(const Tensor& query, const KpoolMlaFactors& factors,
-                      const ConstKpoolMlaLatentCacheView& cache, const KpoolMlaBatchView& batch,
-                      const KpoolBlockSelection& selected, const Tensor& selection_rows,
-                      float attention_scale, ContextBucket bucket, MemoryArena& workspace,
-                      Tensor& out, CudaExecutionView execution) {
+namespace {
+void execute(const Tensor& query, const KpoolMlaFactors& factors,
+             const ConstKpoolMlaLatentCacheView& cache, const KpoolMlaBatchView& batch,
+             const RaggedSequenceView* seq, const KpoolBlockSelection& selected,
+             const Tensor& selection_rows, float attention_scale, ContextBucket bucket,
+             MemoryArena& workspace, Tensor& out, CudaExecutionView execution) {
     ContextBucketRange{bucket}.validate(ContextBucket::M1, "kpool_sparse_mla");
     const int T = query.ne[2], B = query.ne[3], sms = execution.multiprocessor_count();
     const auto profile = kpool_sparse_mla_profile(factors, query.ne[1]);
     sparse_mla_geometry(profile, cache.storage, B, T, T, sms);
     require(std::isfinite(attention_scale) && attention_scale > 0, "Sparse MLA scale");
     const auto device = execution.device();
-    std::array<operand::Range, 14> inputs{};
+    std::array<operand::Range, 16> inputs{};
     int n            = 0;
     const auto input = [&](const Tensor& t, DType type, std::initializer_list<int> shape,
                            int alignment, const char* name) {
@@ -86,8 +87,13 @@ void kpool_sparse_mla(const Tensor& query, const KpoolMlaFactors& factors,
         for (const auto plane : weight_operands(*factor, 16384, 512, device))
             if (plane.begin != plane.end) inputs[n++] = plane;
     input(batch.positions, DType::I32, {T, B}, 4, "positions");
-    input(batch.valid_columns, DType::I32, {B}, 4, "valid columns");
-    input(batch.table_rows, DType::I32, {B}, 4, "table rows");
+    const int segments = seq ? seq->num_seqs() : B;
+    input(batch.valid_columns, DType::I32, {segments}, 4, "valid columns");
+    input(batch.table_rows, DType::I32, {segments}, 4, "table rows");
+    if (seq) {
+        inputs[n++] = operand::range(seq->cu_seqlens, kOperation);
+        inputs[n++] = operand::range(seq->token_to_seq, kOperation);
+    }
     input(selection_rows, DType::I32, {T, B}, 4, "selection rows");
     const int selected_rows = selected.pool_ids.ne[1];
     input(selected.pool_ids, DType::I32, {512, selected_rows}, 4, "pool IDs");
@@ -138,16 +144,33 @@ void kpool_sparse_mla(const Tensor& query, const KpoolMlaFactors& factors,
         operand::disjoint(range, output, kOperation);
         require(!operand::overlaps(table_blocks, range), "workspace overlaps page table");
     }
-    launch_sparse_mla(a, scratch, profile, cache.storage, bucket, sms, execution.stream());
+    if (segments > 1 && seq)
+        launch_packed_sparse_mla({a, static_cast<const int*>(seq->token_to_seq.data)}, scratch,
+                                 profile, cache.storage, bucket, sms, execution.stream());
+    else
+        launch_sparse_mla(a, scratch, profile, cache.storage, bucket, sms, execution.stream());
+}
+} // namespace
+
+void kpool_sparse_mla(const Tensor& query, const KpoolMlaFactors& factors,
+                      const ConstKpoolMlaLatentCacheView& cache, const KpoolMlaBatchView& batch,
+                      const KpoolBlockSelection& selected, const Tensor& selection_rows,
+                      float attention_scale, ContextBucket bucket, MemoryArena& workspace,
+                      Tensor& out, CudaExecutionView execution) {
+    execute(query, factors, cache, batch, nullptr, selected, selection_rows, attention_scale,
+            bucket, workspace, out, execution);
 }
 
 std::size_t kpool_sparse_mla_ragged_workspace_capacity_bytes(
     const KpoolSparseMlaProfile& profile, KpoolMlaStorage storage, ContextBucketRange buckets,
     int min_tokens, int max_tokens, int min_segments, int max_segments, int sm_count) {
-    const auto widths = operand::ragged_envelope(min_tokens, max_tokens, min_segments, max_segments,
-                                                 "kpool_sparse_mla");
-    return kpool_sparse_mla_workspace_capacity_bytes(profile, storage, buckets, 1, widths.first,
-                                                     widths.last, sm_count);
+    const int packed =
+        packed_extent_start(min_tokens, max_tokens, min_segments, max_segments, "kpool_sparse_mla");
+    // Both layouts use the same plan for each possible window width. A packed
+    // window has no inactive columns, so it uses the single-batch split policy.
+    return kpool_sparse_mla_workspace_capacity_bytes(profile, storage, buckets, 1,
+                                                     min_segments == 1 ? min_tokens : packed,
+                                                     max_tokens, sm_count);
 }
 
 void kpool_sparse_mla(const Tensor& query, const KpoolMlaFactors& factors,
@@ -163,16 +186,10 @@ void kpool_sparse_mla(const Tensor& query, const KpoolMlaFactors& factors,
     operand::tensor(query, DType::BF16, {256, 64, n}, 16, op, "query", device);
     operand::tensor(out, DType::BF16, {256, 64, n}, 16, op, "output", device);
     operand::tensor(selection_rows, DType::I32, {n}, 4, op, "selection rows", device);
-    for (int s = 0; s < seq.num_seqs(); ++s) {
-        const int begin = seq.segment_begin(s), len = seq.segment_length(s);
-        const KpoolMlaBatchView segment{batch.positions.slice(0, begin, len),
-                                        seq.seq_lengths.slice(0, s, 1),
-                                        batch.table_rows.slice(0, s, 1)};
-        auto result = out.slice(2, begin, len);
-        kpool_sparse_mla(query.slice(2, begin, len), factors, cache, segment, selected,
-                         selection_rows.slice(0, begin, len).view({len, 1}), attention_scale,
-                         bucket, workspace, result, execution);
-    }
+    const KpoolMlaBatchView flat{batch.positions.view({n, 1}), seq.seq_lengths, batch.table_rows};
+    auto result = out.view({256, 64, n, 1});
+    execute(query.view({256, 64, n, 1}), factors, cache, flat, &seq, selected,
+            selection_rows.view({n, 1}), attention_scale, bucket, workspace, result, execution);
 }
 
 } // namespace ninfer::ops

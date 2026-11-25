@@ -52,6 +52,16 @@ struct PrepareArguments {
     bool update, fp8_index, fp8_latent;
 };
 
+struct PackedPrepareArguments : PrepareArguments {
+    const int *cu_seqlens, *token_to_seq;
+    int window_begin, read_slot, write_slot;
+    // One anchor for each possible pool, independent of the replay-time phase.
+    std::uint16_t pool_columns[kPrepareWindowColumns];
+};
+
+void launch_packed_prepare(const PackedPrepareArguments&, const PrepareGeometry&,
+                           const RaggedSequenceView&, int window_columns, cudaStream_t);
+
 void launch_prepare(const PrepareArguments& args, const PrepareGeometry& geometry,
                     int window_columns, cudaStream_t stream);
 } // namespace ninfer::ops::detail::kpool

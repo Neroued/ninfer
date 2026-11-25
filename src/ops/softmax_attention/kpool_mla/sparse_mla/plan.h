@@ -31,4 +31,7 @@ std::size_t sparse_mla_capacity(const KpoolSparseMlaProfile&, KpoolMlaStorage, i
 void launch_sparse_mla(SparseMlaArguments, MemorySpan, const KpoolSparseMlaProfile&,
                        KpoolMlaStorage, ContextBucket, int sms, cudaStream_t);
 
+void launch_packed_sparse_mla(PackedSparseMlaArguments, MemorySpan, const KpoolSparseMlaProfile&,
+                              KpoolMlaStorage, ContextBucket, int sms, cudaStream_t);
+
 } // namespace ninfer::ops::detail::kpool

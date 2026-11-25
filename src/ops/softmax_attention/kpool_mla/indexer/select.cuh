@@ -12,6 +12,50 @@ __device__ inline int candidate_count(int count, int partition) {
            min(kIndexSelected, (count - 1) % partition + 1);
 }
 
+#ifdef NINFER_KPOOL_PACKED
+template <int Items>
+__device__ __forceinline__ void select_indexer_partition(const IndexerArguments& a, int slot,
+                                                         int part, std::int64_t column,
+                                                         Top512WordStorage& radix) {
+    const int visible = a.ends[column] / 4, first = part * kIndexPartition;
+    const int count = min(kIndexPartition, visible - first);
+    const int tid   = threadIdx.x;
+    unsigned scores[Items];
+    const Top512DenseIds ids{first};
+#    pragma unroll
+    for (int j = 0; j < Items; ++j) {
+        const int i = j * 256 + tid;
+        scores[j] =
+            i < count
+                ? common::ordered_score_bits(a.scores[std::int64_t(slot) * a.columns + first + i])
+                : 0;
+    }
+    if (visible <= kIndexPartition)
+        select_top512_words(scores, ids, count, radix,
+                            Top512StoreIds{a.ids + column * kIndexSelected});
+    else
+        select_top512_words(
+            scores, ids, count, radix,
+            Top512StoreKeys{a.candidates +
+                            (std::int64_t(slot) * a.partitions + part) * kIndexSelected});
+}
+
+template <int MinBlocks, int Items>
+__global__ __launch_bounds__(256, MinBlocks) void packed_indexer_partition_words_kernel(
+    const __grid_constant__ IndexerArguments a) {
+    __shared__ Top512WordStorage radix;
+    for (int job = blockIdx.x; job < a.width * a.partitions; job += gridDim.x) {
+        const int slot = job / a.partitions, part = job % a.partitions;
+        const auto column = std::int64_t(a.begin) + slot;
+        const int visible = a.ends[column] / 4;
+        if (visible <= kIndexSelected || part * kIndexPartition >= visible) continue;
+        select_indexer_partition<Items>(a, slot, part, column, radix);
+        __syncthreads();
+    }
+}
+
+#    define NINFER_INDEX_MERGE packed_indexer_merge_kernel
+#else
 // Score windows can contain very different live histories inside one captured
 // envelope. Enumerate actual partitions so short requests share all resident CTAs.
 template <int MinBlocks, int Items>
@@ -38,7 +82,7 @@ __global__ __launch_bounds__(256, MinBlocks) void indexer_partition_words_kernel
         const int count = min(kIndexPartition, visible - first);
         unsigned scores[Items];
         const Top512DenseIds ids{first};
-#pragma unroll
+#    pragma unroll
         for (int j = 0; j < Items; ++j) {
             const int i = j * 256 + tid;
             scores[j]   = i < count ? common::ordered_score_bits(
@@ -57,9 +101,12 @@ __global__ __launch_bounds__(256, MinBlocks) void indexer_partition_words_kernel
     }
 }
 
+#    define NINFER_INDEX_MERGE indexer_merge_kernel
+#endif
+
 template <bool Final>
 __global__
-__launch_bounds__(256) void indexer_merge_kernel(const __grid_constant__ IndexerArguments a) {
+__launch_bounds__(256) void NINFER_INDEX_MERGE(const __grid_constant__ IndexerArguments a) {
     if (a.partitions <= (Final ? 1 : kIndexFanIn)) return;
     __shared__ Top512WordStorage radix;
     const int tid     = threadIdx.x;
@@ -106,4 +153,6 @@ __launch_bounds__(256) void indexer_merge_kernel(const __grid_constant__ Indexer
     }
     select_top512_words(scores, ids, count, radix, store);
 }
+
+#undef NINFER_INDEX_MERGE
 } // namespace ninfer::ops::detail::kpool

@@ -1,5 +1,6 @@
 #include "reference.h"
 #include "ops/op_tester.h"
+#include "ops/ragged_fixture.h"
 #include "cuda_fixture.h"
 #include "core/decode_graph.h"
 #include "../../../../tools/support/kpool_chain_fixture.h"
@@ -22,7 +23,7 @@ int verify_prepare(kp::ChainFixture& f, const std::vector<int>& accepted = {}) {
     const bool fp8        = i.cache.format == KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0;
     const bool fp8_latent = f.cache.latent.storage == ops::KpoolMlaStorage::Fp8E4m3fnGroup128Ue8m0;
     const auto& w         = f.weights;
-    const int patterns = std::min(i.T, 7), F = i.E - i.T;
+    const int patterns    = std::min(i.T, 7);
     std::vector<double> projected(std::size_t(patterns) * i.B * w.rows);
     parallel_rows(
         patterns * i.B * w.rows, std::uint64_t(projected.size()) * 4096, [&](int lo, int hi) {
@@ -65,7 +66,7 @@ int verify_prepare(kp::ChainFixture& f, const std::vector<int>& accepted = {}) {
     KpoolError c_error, q_error, coeff_error, pool_error, tail_error;
     int failures = 0;
     for (int b = 0; b < i.B; ++b) {
-        const int n = i.valid.at(b);
+        const int n = i.valid.at(b), F = n ? i.positions.at(0, b) : 0;
         std::vector<std::array<double, 128>> raw_k(F % 4 + n), raw_g(F % 4 + n);
         if (n)
             for (int r = 0; r < F % 4; ++r)
@@ -277,6 +278,90 @@ int run(int T, int B, int E, int layers, bool graph, bool fp8 = false, bool fp8_
     return verify(f);
 }
 
+int packed_chain() {
+    constexpr int width  = 4;
+    const auto execution = cuda_environment().context.execution_view();
+    RaggedFixture ragged({1, 3, 4});
+    const int n = ragged.tokens(), s = ragged.segments(), sms = execution.multiprocessor_count();
+    kp::IndexerCase shape;
+    shape.ends             = {68, 2056, 2063};
+    shape.valid            = ragged.lengths;
+    constexpr auto format  = KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0;
+    constexpr auto storage = ops::KpoolMlaStorage::Fp8E4m3fnGroup128Ue8m0;
+    kp::ChainFixture f(execution, width, s, 2063, 1, false, shape, true, true, format, storage);
+    auto positions = to_device(ragged.pack(f.index.positions.host, width, 1));
+    auto x         = to_device(ragged.pack(f.x.host, width, 4096));
+    std::vector<int> order(n);
+    std::iota(order.begin(), order.end(), 0);
+    auto rows = to_device(order);
+    GuardedDeviceBuffer q_rank(n * 1536 * 2ULL), coefficients(n * 32 * 4ULL),
+        query(n * 16384 * 2ULL), index_query(n * 4096 * 2ULL), output(n * 16384 * 2ULL),
+        ids(n * 512 * 4ULL), counts(n * 4ULL), ends(n * 4ULL);
+    const Tensor rank(q_rank.span(), DType::BF16, {1536, n});
+    const Tensor coeff(coefficients.span(), DType::FP32, {32, n});
+    const Tensor q(query.span(), DType::BF16, {256, 64, n});
+    const Tensor iq(index_query.span(), DType::BF16, {128, 32, n});
+    auto out = Tensor(output.span(), DType::BF16, {256, 64, n});
+    ops::KpoolBlockSelection selected{Tensor(ids.span(), DType::I32, {512, n}),
+                                      Tensor(counts.span(), DType::I32, {n}),
+                                      Tensor(ends.span(), DType::I32, {n})};
+    const ops::KpoolMlaRaggedBatchView batch{ragged.view, Tensor(positions.span(), DType::I32, {n}),
+                                             f.index.selectors.view};
+    const ops::KpoolMlaFactors factors{kp::dense_weight(f.key_up.view, 16384, 512),
+                                       kp::dense_weight(f.value_up.view, 16384, 512)};
+    const ops::ProjectionWeights weights = ops::SingleProjectionWeight{f.query_weight};
+    const std::array<std::int32_t, 2> split_rows{16384, 4096};
+    const auto bytes =
+        std::max({ops::kpool_mla_prepare_update_ragged_workspace_capacity_bytes(
+                      f.weights.profile(), storage, format, n, n, s, s, sms),
+                  ops::linear_split_workspace_capacity_bytes(weights, split_rows, 1, n),
+                  ops::kpool_indexer_ragged_workspace_capacity_bytes(
+                      {32, 128}, format, f.index.bucket, n, n, s, s, sms),
+                  ops::kpool_sparse_mla_ragged_workspace_capacity_bytes(
+                      ops::kpool_sparse_mla_profile(factors, 64), storage, f.index.bucket, n, n, s,
+                      s, sms)});
+    GuardedDeviceBuffer scratch(bytes);
+    MemoryArena arena(scratch.span());
+    DecodeGraphDefinition capture;
+    capture.capture(execution.stream(), [&] {
+        ops::kpool_mla_prepare_update(Tensor(x.span(), DType::BF16, {4096, n}), f.weights.params,
+                                      batch, f.before, f.cache, f.after, {rank, coeff}, arena,
+                                      execution);
+        const std::array outputs{q.view({16384, n}), iq.view({4096, n})};
+        ops::linear_split(rank, weights, outputs, arena, execution);
+        ops::kpool_indexer(iq, coeff, f.cache.index, batch, f.index.bucket, arena, selected,
+                           execution);
+        ops::kpool_sparse_mla(q, factors, f.cache.latent, batch, selected,
+                              Tensor(rows.span(), DType::I32, {n}), f.scale, f.index.bucket, arena,
+                              out, execution);
+    });
+    DecodeGraphExecutable graph;
+    graph.instantiate(capture);
+    graph.launch(execution.stream());
+    cuda_environment().context.synchronize();
+    const auto unpack = [&](Tensor dest, const Tensor& source) {
+        CUDA_CHECK(cudaMemset(dest.data, 0, dest.bytes()));
+        const auto bytes_per_column = source.bytes() / n;
+        for (int b = 0; b < s; ++b) {
+            auto* dst = static_cast<std::byte*>(dest.data) + b * width * bytes_per_column;
+            const auto* src = static_cast<const std::byte*>(source.data) +
+                              ragged.prefix[b] * bytes_per_column;
+            CUDA_CHECK(cudaMemcpy(dst, src, ragged.lengths[b] * bytes_per_column,
+                                  cudaMemcpyDeviceToDevice));
+        }
+    };
+    unpack(f.rank.view, rank);
+    unpack(f.index.coeff.view, coeff);
+    unpack(f.query.view, q);
+    unpack(f.index.query.view, iq);
+    unpack(f.output.view, out);
+    unpack(f.index.ids.view, selected.pool_ids);
+    unpack(f.index.counts.view, selected.pool_counts);
+    unpack(f.index.ends.view, selected.selection_end);
+    return verify(f) + scratch.verify_guards("packed chain scratch") +
+           (arena.used() != 0 || arena.peak_used() > bytes);
+}
+
 int record_chain(bool index_fp8) {
     auto& d         = cuda_environment().context;
     constexpr int T = 5, B = 3, E = 2056;
@@ -345,6 +430,7 @@ int record_chain(bool index_fp8) {
 
 int main(int argc, char** argv) {
     OpSuite suite;
+    suite.add("kpool_chain/packed_fp8_graph", packed_chain);
     for (bool fp8 : {false, true})
         suite.add(std::string("kpool_chain/fp8_latent/record_reuse/") + (fp8 ? "fp8" : "bf16"),
                   [=] { return record_chain(fp8); }, {{"format", "fp8"}, {"execution", "graph"}});

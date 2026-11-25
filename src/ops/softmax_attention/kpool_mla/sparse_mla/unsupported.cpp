@@ -21,4 +21,9 @@ void launch_sparse_mla(SparseMlaArguments, MemorySpan, const KpoolSparseMlaProfi
                        KpoolMlaStorage, ContextBucket, int, cudaStream_t) {
     throw std::invalid_argument("Kpool Sparse MLA: no implementation for this target");
 }
+
+void launch_packed_sparse_mla(PackedSparseMlaArguments, MemorySpan, const KpoolSparseMlaProfile&,
+                              KpoolMlaStorage, ContextBucket, int, cudaStream_t) {
+    throw std::invalid_argument("Kpool Sparse MLA: no implementation for this target");
+}
 } // namespace ninfer::ops::detail::kpool

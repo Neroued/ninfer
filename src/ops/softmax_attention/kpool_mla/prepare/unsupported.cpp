@@ -16,9 +16,16 @@ PrepareGeometry prepare_geometry(const KpoolMlaPrepareProfile&, KpoolMlaStorage,
 
 PrepareProjectionPlan prepare_projection_plan(const PrepareGeometry&, int) { unsupported(); }
 
+PrepareProjectionPlan packed_prepare_projection_plan(const PrepareGeometry&, int) { unsupported(); }
+
 int prepare_window_columns() { unsupported(); }
 
 void launch_prepare(const PrepareArguments&, const PrepareGeometry&, int, cudaStream_t) {
+    unsupported();
+}
+
+void launch_packed_prepare(const PackedPrepareArguments&, const PrepareGeometry&,
+                           const RaggedSequenceView&, int, cudaStream_t) {
     unsupported();
 }
 } // namespace ninfer::ops::detail::kpool

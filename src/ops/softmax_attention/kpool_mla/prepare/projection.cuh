@@ -139,6 +139,54 @@ struct UnconditionalProjectionOutput : ProjectionOutput {
     __device__ bool clear_if_empty(int, int, int, int) const { return false; }
 };
 
+// Packed projections have no padding. Window intermediates are local, while
+// coefficient columns are written directly to their global packed positions.
+struct PackedProjectionOutput {
+    float *projected, *coefficients;
+    __nv_bfloat16* gates;
+    std::int64_t begin;
+    ProjectionRowMap mapping;
+    int norm_dim;
+
+    __device__ bool clear_if_empty(int, int, int, int) const { return false; }
+
+    __device__ __forceinline__ void store(int row, int column, float value) const {
+        row = mapping(row);
+        if (row >= 2304)
+            coefficients[(begin + column) * 32 + row - 2304] = value;
+        else if (row >= 640 && row < 768)
+            gates[column * 128 + row - 640] = __float2bfloat16_rn(value);
+        else
+            projected[column * norm_dim + (row < 640 ? row : row - 128)] = value;
+    }
+
+    __device__ __forceinline__ void store4(int row, int column, float4 value) const {
+        row = mapping(row);
+        if (row >= 2304) {
+            *reinterpret_cast<float4*>(coefficients + (begin + column) * 32 + row - 2304) = value;
+        } else if (row >= 640 && row < 768) {
+            auto* dst = gates + column * 128 + row - 640;
+            dst[0]    = __float2bfloat16_rn(value.x);
+            dst[1]    = __float2bfloat16_rn(value.y);
+            dst[2]    = __float2bfloat16_rn(value.z);
+            dst[3]    = __float2bfloat16_rn(value.w);
+        } else {
+            const int feature = row < 640 ? row : row - 128;
+            *reinterpret_cast<float4*>(projected + column * norm_dim + feature) = value;
+        }
+    }
+};
+
+inline ProjectionOutput projection_output(const PrepareArguments& a, std::int64_t begin,
+                                          ProjectionRowMap mapping) {
+    return {a, begin, mapping};
+}
+
+inline PackedProjectionOutput projection_output(const PackedPrepareArguments& a, std::int64_t begin,
+                                                ProjectionRowMap mapping) {
+    return {a.projected, a.coefficients, a.gates, begin, mapping, a.norm_dim};
+}
+
 // Publish sliced-K reductions with the whole CTA while retaining FP32 norm inputs.
 struct ProjectionRowEpilogue {
     static constexpr bool kSwizzleRowStorage = true;

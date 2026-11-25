@@ -5,27 +5,13 @@
 #include "ops/linear_attention/gated_delta_net/kernels/transition.cuh"
 
 namespace ninfer::ops::detail::gated_delta_net {
-struct RecordEffects {
+struct RecordEffects : OutputEffects {
+    static constexpr bool kRecordTransition = true;
     template <class Access>
     __device__ __forceinline__ static void observe_key(const Access& access,
                                                        const RecurrentCoordinates& coord,
                                                        std::int32_t token, const RawQkLane& key) {
         access.store_key(coord, token, key);
-    }
-
-    template <class Access>
-    __device__ __forceinline__ static void
-    observe_value_gate(const Access& access, const RecurrentCoordinates& coord, std::int32_t token,
-                       const RawValueLane& value, const RawGatePair& gate) {
-        access.store_value(coord, token, value);
-        access.store_gate(coord, token, gate);
-    }
-
-    template <bool NormalizeInputs, class Access>
-    __device__ __forceinline__ static void
-    publish_output(float (&state)[kDvPerWarp][kQkPerLane], const Access& access,
-                   const RecurrentCoordinates& coord, std::int32_t token) {
-        OutputEffects::publish_output<NormalizeInputs>(state, access, coord, token);
     }
 };
 
@@ -40,8 +26,8 @@ struct RecordAccess {
     const std::int32_t* valid_columns;
     const std::int64_t* initial_offsets;
     __nv_bfloat16* key_record;
-    __nv_bfloat16* value_record;
-    uint2* gate_record;
+    float* delta_record;
+    float* alpha_record;
     __nv_bfloat16* out;
     HeadMap heads;
     std::int32_t width;
@@ -59,8 +45,8 @@ struct RecordAccess {
         initial_offsets += rows;
         if constexpr (Masked) valid_columns += rows;
         key_record += qk;
-        value_record += values;
-        gate_record += columns * heads.H_v;
+        delta_record += values;
+        alpha_record += columns * heads.H_v;
         out += values;
     }
 
@@ -127,24 +113,16 @@ struct RecordAccess {
         }
     }
 
-    __device__ __forceinline__ void store_value(const RecurrentCoordinates& coord,
-                                                std::int32_t token, const RawValueLane& raw) const {
-        if (coord.lane < kDvPerWarp) {
-            store_value_element(coord, token, coord.dv_base + coord.lane, raw.bits);
-        }
+    __device__ __forceinline__ void store_delta_element(const RecurrentCoordinates& coord,
+                                                        int token, int row, float delta) const {
+        delta_record[(column(coord, token) * heads.H_v + coord.value_head) * kStateDim + row] =
+            delta;
     }
 
-    __device__ __forceinline__ void store_value_element(const RecurrentCoordinates& coord,
-                                                        std::int32_t token, int row,
-                                                        __nv_bfloat16 bits) const {
-        value_record[(column(coord, token) * heads.H_v + coord.value_head) * kStateDim + row] =
-            bits;
-    }
-
-    __device__ __forceinline__ void store_gate(const RecurrentCoordinates& coord,
-                                               std::int32_t token, const RawGatePair& raw) const {
+    __device__ __forceinline__ void store_alpha(const RecurrentCoordinates& coord, int token,
+                                                float alpha) const {
         if (coord.state_tile == 0 && coord.warp == 0 && coord.lane == 0) {
-            gate_record[column(coord, token) * heads.H_v + coord.value_head] = raw.bits;
+            alpha_record[column(coord, token) * heads.H_v + coord.value_head] = alpha;
         }
     }
 };

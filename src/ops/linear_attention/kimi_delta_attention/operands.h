@@ -21,8 +21,9 @@ struct Arguments {
 };
 
 struct RecurrenceRecords {
-    __nv_bfloat16 *key = nullptr, *value = nullptr;
-    float *log_decay = nullptr, *beta = nullptr;
+    __nv_bfloat16* key = nullptr;
+    float* delta = nullptr;
+    float* alpha = nullptr;
 };
 
 struct Geometry {

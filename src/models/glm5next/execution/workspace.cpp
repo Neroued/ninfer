@@ -115,7 +115,7 @@ std::size_t body(const ModelProfile& p, const ExecutionShape& s, int first, int 
         if (const auto* k = std::get_if<KdaProfile>(&layer.mixer)) {
             auto scope         = a.scope();
             const bool records = !prefill && last > 1;
-            (void)workspace::kda(a, p, columns, records);
+            (void)workspace::kda(a, p, columns);
             scratch(a, records ? ops::kda_input_proj_conv_record_workspace_capacity_bytes(
                                      k->qkv, batch, first, last)
                                : ops::kda_input_proj_conv_update_workspace_capacity_bytes(

@@ -23,7 +23,8 @@ __global__ void __launch_bounds__(common::kWarpSize* kNumWarps, 2)
     const int tile      = GroupStateTiles ? blockIdx.x % tiles : blockIdx.z;
     const int batch     = Batched ? row_begin + blockIdx.y : 0;
     const int dv_base = tile * kBlockDv + warp * Rows, dqk_base = lane * kQkPerLane;
-    const int qhead = head / (args.value_heads / args.qk_heads);
+    const int group = args.value_heads / args.qk_heads;
+    const int qhead = head / group;
     int valid;
     std::int64_t first_column;
     if constexpr (Packed) {
@@ -59,17 +60,13 @@ __global__ void __launch_bounds__(common::kWarpSize* kNumWarps, 2)
         const auto qo     = (column * args.qk_heads + qhead) * kStateDim;
         const auto bo     = column * args.value_heads + head;
         if constexpr (Record) {
-            if (tile == 0 && head % (args.value_heads / args.qk_heads) == 0 &&
-                records.key != args.k)
-                records.key[qo + thread] = args.k[qo + thread];
-            if (lane < Rows && records.value != args.v)
-                records.value[vo + dv_base + lane] = args.v[vo + dv_base + lane];
+            if (tile == 0 && head % group == 0) records.key[qo + thread] = args.k[qo + thread];
         }
-        run_recurrent_token(state, args.q + qo, args.k + qo, args.v + vo, args.g + vo,
+        run_recurrent_token<Record>(state, args.q + qo, args.k + qo, args.v + vo, args.g + vo,
                             args.beta + bo, args.dt_bias + head * kStateDim, args.out + vo, lane,
                             thread, dv_base, dqk_base, a_scale, args.lower_bound, args.scale,
-                            Record && tile == 0 ? records.log_decay + vo : nullptr,
-                            Record && tile == 0 ? records.beta + bo : nullptr);
+                            Record ? records.delta + vo : nullptr,
+                            Record && tile == 0 ? records.alpha + vo : nullptr);
     }
     if constexpr (!Packed) {
         if (lane < Rows)

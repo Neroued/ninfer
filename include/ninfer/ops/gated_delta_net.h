@@ -4,6 +4,7 @@
 
 #include "core/arena.h"
 #include "core/device.h"
+#include "core/gdn_replay_records.h"
 #include "core/tensor.h"
 #include "core/record_view.h"
 
@@ -79,30 +80,24 @@ void gated_delta_net_batch_update(const Tensor& q, const Tensor& k, const Tensor
                                   StateFieldView destination_state, const Tensor& valid_columns,
                                   Tensor& out, CudaExecutionView execution);
 
-struct GdnRecurrenceRecords {
-    Tensor key;   // BF16 [128,Hq,T,B], raw represented key words.
-    Tensor value; // BF16 [128,Hv,T,B], raw represented value words.
-    Tensor gate;  // FP32 [2,Hv,T,B], raw {g,beta} words.
-};
-
 /**
- * Evaluates B independent normalized Gated DeltaNet recurrences without modifying initial state.
+ * Evaluates B independent normalized Gated DeltaNet recurrences from read-only initial_state.
  * q/k are BF16 [128,Hq,T,B], v/out BF16 [128,Hv,T,B], and g/beta FP32 [Hv,T,B].
  * initial_state selects dense FP32 [128,128,Hv] fields using device I64 [B] record byte offsets.
  * Every live selected field is 16-byte aligned and in bounds. B>0, T=2..16; (Hq,Hv) is one of
  * (16,32), (16,48), (8,24). scale is 1/sqrt(128).
  *
- * valid_columns is empty for dense rows or device I32 [B] with values in [0,T]. A zero row
- * accesses no input values, state offsets or state fields. Each valid
- * transition copies raw k, v and {g,beta} into the corresponding record fields. Invalid record
- * suffixes remain unchanged; invalid output suffixes are exact BF16 zero. Inputs, selected state
- * fields, records and output do not overlap. Valid outputs are bit-identical to normalized
- * recurrent one-token execution from the same represented inputs and initial FP32 state.
+ * valid_columns is empty for dense rows or device I32 [B] with values n[b] in [0,T]. Each row
+ * evaluates n[b] steps. Its BF16 readouts approximate the mathematical recurrence above, and
+ * private transition records bind that prefix to the initial state S0 for GdnReplayFoldPlan.
+ * A zero row reads no q/k/v/g/beta, state offsets or state. Invalid record suffixes are
+ * untouched and invalid output suffixes are exact BF16 +0. Inputs, selected state fields,
+ * records, output and metadata are disjoint.
  */
 void gated_delta_net_replay_record(const Tensor& q, const Tensor& k, const Tensor& v,
                                    const Tensor& g, const Tensor& beta, float scale,
                                    ConstStateFieldView initial_state, const Tensor& valid_columns,
-                                   GdnRecurrenceRecords records, Tensor& out,
+                                   GdnRecurrenceRecordView records, Tensor& out,
                                    CudaExecutionView execution);
 
 

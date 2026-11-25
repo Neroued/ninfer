@@ -29,12 +29,8 @@ struct RecordSchedule {
 
 RecordSchedule select_record_schedule(int value_heads, int tokens, int batch);
 
-struct FoldSchedule {
-    int warps, values;
-    int steps = 0;
-};
+int select_fold_warps(int layers, int heads, int batch, int multiprocessors);
 
-FoldSchedule select_fold_schedule(int layers, int value_heads, int width, int batch, int sms);
 std::size_t recurrence_workspace_bytes(int value_heads, int tokens);
 std::size_t recurrence_workspace_capacity(int value_heads, int first, int last);
 std::size_t ragged_workspace_capacity(int value_heads, int min_tokens, int max_tokens,

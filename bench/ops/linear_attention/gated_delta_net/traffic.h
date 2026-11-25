@@ -44,7 +44,7 @@ struct Traffic {
     // a complete Op excludes internal workspace from this implementation-independent count.
     IoBytes logical;
     IoBytes state;   // Recurrent state only; a subset of logical.
-    IoBytes records; // Raw recurrence and convolution records; a subset of logical.
+    IoBytes records; // Recurrence and convolution records; a subset of logical.
     IoBytes workspace_requests;
     // Complete global operand-request model, when the measured implementation has one.
     // Never substitute unique logical bytes for an unavailable request model.
@@ -99,7 +99,7 @@ inline Traffic record_traffic(int qk_heads, int value_heads, int width, std::spa
     Traffic result;
     result.active_rows   = std::count_if(valid.begin(), valid.end(), [](int n) { return n > 0; });
     result.state.read    = Geometry{qk_heads, value_heads, 1, result.active_rows}.state_bytes();
-    result.records.write = live.qk_bytes() + live.value_bytes() + 2 * live.gate_bytes();
+    result.records.write = live.qk_bytes() + 2 * live.value_bytes() + live.gate_bytes();
     result.logical       = {2 * live.qk_bytes() + live.value_bytes() + 2 * live.gate_bytes() +
                                 result.state.read + sizeof(std::int64_t) * result.active_rows +
                                 sizeof(std::int32_t) * batch * has_valid_tensor,
@@ -119,7 +119,7 @@ inline Traffic fold_traffic(int layers, int qk_heads, int value_heads, int conv_
         const auto conv_records = conv_column * std::min(3, count);
         const auto old_history  = conv_column * std::max(0, 3 - count);
         const auto record =
-            (live.qk_bytes() + live.value_bytes() + 2 * live.gate_bytes()) * layers + conv_records;
+            (live.qk_bytes() + 2 * live.value_bytes() + live.gate_bytes()) * layers + conv_records;
         result.state.read += state;
         result.state.write += state;
         result.records.read += record;

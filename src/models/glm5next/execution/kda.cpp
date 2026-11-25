@@ -21,21 +21,17 @@ void kda(const Tensor& input, const ModelProfile& profile, const KdaParameters& 
     const auto* record = std::get_if<RecordWindow>(&update);
     const auto* packed = std::get_if<PackedPrefillUpdate>(&update);
     auto scope         = arena.scope();
-    auto b             = workspace::kda(arena, profile, m, record != nullptr);
+    auto b             = workspace::kda(arena, profile, m);
     auto before        = states.layer_view(layer, batch.source_offsets);
     auto after         = states.layer_view(layer, batch.destination_offsets);
     auto q             = b.query.view({d, heads, t, rows});
-    Tensor key, value;
+    auto key           = b.key.view({d, heads, t, rows});
+    auto value         = b.value.view({d, heads, t, rows});
     std::optional<KdaReplayRecordLayer> records;
     if (record) {
         if (record->kda.spec.width != t)
             throw std::logic_error("KDA record width differs from physical forward");
         records = record->kda.layer(layer, rows);
-        key     = records->key.view({d, heads, t, rows});
-        value   = records->value.view({d, heads, t, rows});
-    } else {
-        key   = b.key.view({d, heads, t, rows});
-        value = b.value.view({d, heads, t, rows});
     }
     const ops::KdaConvOutputs outputs{q.view({width, t, rows}), key.view({width, t, rows}),
                                       value.view({width, t, rows})};
@@ -74,10 +70,7 @@ void kda(const Tensor& input, const ModelProfile& profile, const KdaParameters& 
     } else if (records) {
         ops::kimi_delta_attention_replay_record(
             q, key, value, forget, beta, p.a_log, p.dt_bias, c.gate_lower_bound, scale,
-            before.recurrent, batch.valid_columns,
-            {key, value, records->log_decay.view({d, heads, t, rows}),
-             records->beta.view({heads, t, rows})},
-            recurrent, cuda);
+            before.recurrent, batch.valid_columns, records->recurrence, recurrent, cuda);
     } else {
         ops::kimi_delta_attention_batch_update(
             q, key, value, forget, beta, p.a_log, p.dt_bias, c.gate_lower_bound, scale,

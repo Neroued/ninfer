@@ -29,8 +29,8 @@ template <bool Masked>
 void launch_recurrent_record_fixed(const Tensor& q, const Tensor& k, const Tensor& v,
                                    const Tensor& g, const Tensor& beta, float scale,
                                    ConstStateFieldView initial_state, const Tensor& valid_columns,
-                                   Tensor& key_record, Tensor& value_record, Tensor& gate_record,
-                                   Tensor& out, cudaStream_t stream) {
+                                   const Tensor& key_record, const Tensor& delta_record,
+                                   const Tensor& alpha_record, Tensor& out, cudaStream_t stream) {
     const auto heads       = HeadMap::of(q.ne[1], v.ne[1]);
     const bool group_tiles = q.ne[3] >= 16;
     dim3 grid(v.ne[1] * (group_tiles ? kStateDim / kBlockDv : 1), 1,
@@ -46,8 +46,8 @@ void launch_recurrent_record_fixed(const Tensor& q, const Tensor& k, const Tenso
         Masked ? static_cast<const std::int32_t*>(valid_columns.data) : nullptr,
         static_cast<const std::int64_t*>(initial_state.records.byte_offsets.data),
         static_cast<__nv_bfloat16*>(key_record.data),
-        static_cast<__nv_bfloat16*>(value_record.data),
-        reinterpret_cast<uint2*>(gate_record.data),
+        static_cast<float*>(delta_record.data),
+        static_cast<float*>(alpha_record.data),
         static_cast<__nv_bfloat16*>(out.data),
         heads,
         q.ne[2],
@@ -78,14 +78,15 @@ void launch_recurrent_record_fixed(const Tensor& q, const Tensor& k, const Tenso
 
 void launch_recurrent_record(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
                              const Tensor& beta, float scale, ConstStateFieldView initial_state,
-                             const Tensor& valid_columns, Tensor& key_record, Tensor& value_record,
-                             Tensor& gate_record, Tensor& out, cudaStream_t stream) {
+                             const Tensor& valid_columns, const Tensor& key_record,
+                             const Tensor& delta_record, const Tensor& alpha_record, Tensor& out,
+                             cudaStream_t stream) {
     if (valid_columns.data == nullptr) {
         launch_recurrent_record_fixed<false>(q, k, v, g, beta, scale, initial_state, valid_columns,
-                                             key_record, value_record, gate_record, out, stream);
+                                             key_record, delta_record, alpha_record, out, stream);
     } else {
         launch_recurrent_record_fixed<true>(q, k, v, g, beta, scale, initial_state, valid_columns,
-                                            key_record, value_record, gate_record, out, stream);
+                                            key_record, delta_record, alpha_record, out, stream);
     }
 }
 

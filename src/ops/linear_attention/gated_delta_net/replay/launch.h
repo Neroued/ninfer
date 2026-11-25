@@ -45,8 +45,9 @@ struct GdnReplayFoldDeviceRows {
 
 void launch_recurrent_record(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
                              const Tensor& beta, float scale, ConstStateFieldView initial_state,
-                             const Tensor& valid_columns, Tensor& key_record, Tensor& value_record,
-                             Tensor& gate_record, Tensor& out, cudaStream_t stream);
+                             const Tensor& valid_columns, const Tensor& key_record,
+                             const Tensor& delta_record, const Tensor& alpha_record, Tensor& out,
+                             cudaStream_t stream);
 
 void launch_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states,
                         const GdnReplayFoldKernelRows& rows, std::int32_t active_rows,

@@ -1,22 +1,12 @@
 #include "support.h"
-#include "ops/state_fixture.h"
-#include "core/weight.h"
+
 #include "cuda_fixture.h"
-#include "core/buffer.h"
-#include "core/device.h"
-#include "ninfer/ops/gdn_input_proj.h"
+#include "ops/state_fixture.h"
 
-#include "ops/input_projection_test_common.h"
-
-#include <cuda_runtime.h>
-
-#include <algorithm>
 #include <cmath>
-#include <cstddef>
 #include <cstdint>
 #include <iostream>
 #include <string>
-#include <string_view>
 #include <vector>
 
 using namespace ninfer;
@@ -25,175 +15,154 @@ using namespace ninfer::test::input_projection;
 
 namespace {
 
-constexpr std::int32_t kQueryRows = 2048;
-constexpr std::int32_t kKeyRows   = 2048;
-
-std::vector<std::uint16_t> make_bf16_bits(std::size_t elements, std::uint32_t seed, float low,
-                                          float high) {
-    std::vector<float> values(elements);
-    fill_uniform(values, seed, low, high);
-    round_to_bf16(values);
-    return bf16_bits(values);
-}
-
-int verify_equal(std::string_view label, const std::vector<std::uint16_t>& lhs,
-                 const std::vector<std::uint16_t>& rhs) {
-    if (lhs.size() == rhs.size() && std::equal(lhs.begin(), lhs.end(), rhs.begin())) { return 0; }
-    std::cerr << label << ": BF16 bits differ\n";
-    return 1;
-}
-
-int verify_zero_tail(std::string_view label, const std::vector<std::uint16_t>& values,
-                     std::int32_t rows, std::int32_t width, std::int32_t batch,
-                     const std::vector<std::int32_t>& valid_columns) {
-    for (std::int32_t batch_row = 0; batch_row < batch; ++batch_row) {
-        for (std::int32_t token = valid_columns[static_cast<std::size_t>(batch_row)]; token < width;
-             ++token) {
-            const std::size_t base = static_cast<std::size_t>(batch_row * width + token) * rows;
-            for (std::int32_t row = 0; row < rows; ++row) {
-                if (values[base + row] != 0) {
-                    std::cerr << label << ": invalid tail is not exact zero\n";
-                    return 1;
+int verify_projection(const gdn_input_conv::Weights& weights, const gdn_input_conv::RecordCase& c,
+                      const std::vector<float>& x, const std::vector<std::uint16_t>& conv_weight,
+                      const std::vector<std::uint16_t>& history, const std::vector<int>& slots,
+                      const std::vector<int>& valid, const GuardedBf16Tensor& record,
+                      const GuardedBf16Tensor& query, const GuardedBf16Tensor& key,
+                      const GuardedBf16Tensor& value, const GuardedBf16Tensor& z) {
+    const auto p         = weights.profile;
+    const int value_rows = p.value_rows(), channels = 2 * p.qk_rows + value_rows;
+    // Keep the original 7- and 32-point samples within a denser A4 grid
+    // so normwise quantization error is measured across more channels.
+    const int sample_count  = c.policy == ops::LinearPolicy::AllowA4 ? 187 : c.width <= 4 ? 32 : 7;
+    const std::string label = std::string(p.name) + " T=" + std::to_string(c.width) +
+                              " B=" + std::to_string(c.batch) + " " +
+                              gdn_input_conv::policy_name(c.policy);
+    const auto& criterion = gdn_input_conv::projection_conv_criterion(p, c.policy);
+    const auto projected  = record.bits();
+    const auto z_bits     = z.bits();
+    std::vector<double> record_actual, record_expected, z_actual, z_expected;
+    int failures     = 0;
+    int channel_base = 0;
+    for (const auto* part : {&query, &key, &value}) {
+        const int rows    = part == &value ? value_rows : p.qk_rows;
+        const auto actual = part->bits();
+        std::vector<double> expected_values, actual_values;
+        for (int b = 0; b < c.batch; ++b) {
+            const auto column = std::size_t(b) * c.width;
+            for (const int row : sampled_rows(rows, sample_count)) {
+                const int channel = channel_base + row;
+                const auto start  = std::size_t(slots[b]) * 3 * channels + channel;
+                double h0         = bf16_to_f32(history[start]);
+                double h1         = bf16_to_f32(history[start + channels]);
+                double h2         = bf16_to_f32(history[start + 2 * channels]);
+                for (int t = 0; t < valid[b]; ++t) {
+                    const auto physical = column + t;
+                    const double latest = weights.project(channel, x.data() + physical * p.hidden);
+                    const double convolution =
+                        bf16_to_f32(conv_weight[channel]) * h0 +
+                        bf16_to_f32(conv_weight[channel + channels]) * h1 +
+                        bf16_to_f32(conv_weight[channel + 2 * channels]) * h2 +
+                        bf16_to_f32(conv_weight[channel + 3 * channels]) * latest;
+                    expected_values.push_back(convolution / (1.0 + std::exp(-convolution)));
+                    actual_values.push_back(bf16_to_f32(actual[physical * rows + row]));
+                    record_expected.push_back(latest);
+                    record_actual.push_back(bf16_to_f32(projected[physical * channels + channel]));
+                    h0 = h1;
+                    h1 = h2;
+                    h2 = latest;
+                }
+            }
+            for (int t = valid[b]; t < c.width; ++t) {
+                const auto first = actual.begin() + (column + t) * rows;
+                if (!std::all_of(first, first + rows, [](auto word) { return word == 0; })) {
+                    std::cerr << p.name << " invalid Q/K/V tail differs from BF16 +0\n";
+                    return failures + 1;
+                }
+            }
+        }
+        if (!expected_values.empty())
+            failures += verify_reduction(label + (part == &query ? " query"
+                                                  : part == &key ? " key"
+                                                                 : " value"),
+                                         actual_values, expected_values, criterion);
+        channel_base += rows;
+    }
+    for (int b = 0; b < c.batch; ++b) {
+        for (int t = 0; t < c.width; ++t) {
+            const auto column = std::size_t(b) * c.width + t;
+            for (const auto row : sampled_rows(value_rows, sample_count)) {
+                z_expected.push_back(weights.project(channels + row, x.data() + column * p.hidden));
+                z_actual.push_back(bf16_to_f32(z_bits[column * value_rows + row]));
+            }
+            if (t < valid[b]) {
+                const auto first = projected.begin() + column * channels;
+                if (!std::all_of(first, first + channels, [](std::uint16_t word) {
+                        return std::isfinite(bf16_to_f32(word));
+                    })) {
+                    std::cerr << p.name << " non-finite valid convolution record\n";
+                    return failures + 1;
                 }
             }
         }
     }
-    return 0;
+    if (!record_expected.empty())
+        failures += verify_reduction(label + " projected history", record_actual, record_expected,
+                                     criterion);
+    failures += verify_reduction(label + " z", z_actual, z_expected, criterion);
+    return failures;
 }
 
-int verify_conv_record(std::string_view label, const std::vector<std::uint16_t>& snapshot_state,
-                       const std::vector<std::uint16_t>& record, std::int32_t channels,
-                       std::int32_t width, std::int32_t batch,
-                       const std::vector<std::int32_t>& valid_columns,
-                       const std::vector<std::int32_t>& snapshot_bases) {
-    const std::size_t slot_stride = static_cast<std::size_t>(channels) * 3;
-    for (std::int32_t batch_row = 0; batch_row < batch; ++batch_row) {
-        for (std::int32_t token = 0; token < valid_columns[static_cast<std::size_t>(batch_row)];
-             ++token) {
-            const std::size_t snapshot =
-                static_cast<std::size_t>(snapshot_bases[static_cast<std::size_t>(batch_row)] +
-                                         token) *
-                    slot_stride +
-                2ULL * channels;
-            const std::size_t record_column =
-                static_cast<std::size_t>(batch_row * width + token) * channels;
-            if (!std::equal(snapshot_state.begin() + static_cast<std::ptrdiff_t>(snapshot),
-                            snapshot_state.begin() +
-                                static_cast<std::ptrdiff_t>(snapshot + channels),
-                            record.begin() + static_cast<std::ptrdiff_t>(record_column))) {
-                std::cerr << label << ": conv record differs from snapshot newest column\n";
-                return 1;
-            }
-        }
-    }
-    return 0;
-}
+} // namespace
 
-template <class SnapshotLaunch, class RecordLaunch>
-int run_case(std::string_view label, std::int32_t hidden, std::int32_t value_rows,
-             std::int32_t z_rows, std::int32_t width, std::int32_t batch,
-             std::vector<std::int32_t> valid_columns, std::size_t snapshot_workspace_bytes,
-             std::size_t record_workspace_bytes, SnapshotLaunch&& snapshot_launch,
-             RecordLaunch&& record_launch, std::uint32_t seed, int qk_rows = kQueryRows) {
-    const std::int32_t channels          = qk_rows + qk_rows + value_rows;
-    const std::int32_t aggregate_columns = width * batch;
-    const std::int32_t source_slots      = 8;
-    const std::int32_t slots             = aggregate_columns + source_slots;
-    const bool dense                     = valid_columns.empty();
-    if (valid_columns.empty()) { valid_columns.assign(static_cast<std::size_t>(batch), width); }
+namespace ninfer::test::gdn_input_conv {
 
-    const std::vector<float> activation = make_bf16_activation(hidden, aggregate_columns, seed);
-    const std::vector<std::uint16_t> conv_weight_bits =
-        make_bf16_bits(static_cast<std::size_t>(channels) * 4, seed + 1, -0.02F, 0.02F);
-    const std::vector<std::uint16_t> state_before = make_bf16_bits(
-        static_cast<std::size_t>(channels) * 3 * source_slots, seed + 2, -0.05F, 0.05F);
-
-    std::vector<std::uint16_t> snapshot_before(static_cast<std::size_t>(channels) * 3 * slots);
-    std::copy(state_before.begin(), state_before.end(),
-              snapshot_before.begin() + static_cast<std::size_t>(channels) * 3 * aggregate_columns);
-    std::vector<std::int32_t> snapshot_initial_slots(static_cast<std::size_t>(batch));
-    std::vector<std::int32_t> initial_slots(static_cast<std::size_t>(batch));
-    std::vector<std::int32_t> snapshot_bases(static_cast<std::size_t>(batch));
-    for (std::int32_t batch_row = 0; batch_row < batch; ++batch_row) {
-        snapshot_bases[static_cast<std::size_t>(batch_row)] = batch_row * width;
-        // Read-only selectors may repeat; source capacity does not depend on W.
-        initial_slots[static_cast<std::size_t>(batch_row)] =
-            batch_row == 7 ? 7 : (batch_row * 3 + 7) % source_slots;
-        snapshot_initial_slots[static_cast<std::size_t>(batch_row)] =
-            aggregate_columns + initial_slots[static_cast<std::size_t>(batch_row)];
-    }
-
-    DeviceBuffer device_x           = to_device_bf16(activation);
-    DeviceBuffer device_conv_weight = to_device(conv_weight_bits);
-    DeviceBuffer snapshot_state     = to_device(snapshot_before);
-    DeviceBuffer record_state       = to_device(state_before);
-    DeviceBuffer device_valid;
-    if (!dense) { device_valid = to_device(valid_columns); }
-
-    GuardedBf16Tensor snapshot_query(qk_rows, aggregate_columns);
-    GuardedBf16Tensor snapshot_key(qk_rows, aggregate_columns);
-    GuardedBf16Tensor snapshot_value(value_rows, aggregate_columns);
-    GuardedBf16Tensor snapshot_z(z_rows, aggregate_columns);
-    GuardedBf16Tensor record_query(qk_rows, aggregate_columns);
-    GuardedBf16Tensor record_key(qk_rows, aggregate_columns);
-    GuardedBf16Tensor record_value(value_rows, aggregate_columns);
-    GuardedBf16Tensor record_z(z_rows, aggregate_columns);
-    GuardedBf16Tensor conv_record(channels, aggregate_columns);
-
-    Tensor x(device_x.span(), DType::BF16, {hidden, width, batch});
-    Tensor conv_weight(device_conv_weight.span(), DType::BF16, {channels, 4});
-    Tensor snapshot_state_view(snapshot_state.span(), DType::BF16, {channels, 3, slots});
-    RecordStateFixture snapshot_history(snapshot_state_view, 2);
-    auto snapshot_offsets = snapshot_history.record_offsets(snapshot_initial_slots);
-    Tensor record_state_view(record_state.span(), DType::BF16, {channels, 3, source_slots});
-    RecordStateFixture record_history(record_state_view, 2);
-    auto initial_offsets          = record_history.record_offsets(initial_slots);
-    const auto inactive_selectors = [&] {
-        for (int row = 0; row < batch; ++row)
-            if (!valid_columns[row]) {
-                snapshot_offsets[row] = initial_offsets[row] = -1;
-                snapshot_bases[row]                          = -1;
-            }
+int run_record(Weights& weights, const RecordCase& c) {
+    const auto p          = weights.profile;
+    const auto projection = weights.projection(c.policy);
+    const int width = c.width, batch = c.batch, columns = width * batch;
+    const int value_rows = p.value_rows(), channels = 2 * p.qk_rows + value_rows;
+    const bool dense           = c.valid.empty();
+    auto valid_columns         = dense ? std::vector<int>(batch, width) : c.valid;
+    constexpr int source_slots = 8;
+    auto activation            = make_bf16_activation(p.hidden, columns, c.seed);
+    auto conv_values           = std::vector<float>(4 * channels);
+    fill_uniform(conv_values, c.seed + 1, -.02F, .02F);
+    auto state_values = std::vector<float>(std::size_t(channels) * 3 * source_slots);
+    fill_uniform(state_values, c.seed + 2, -.05F, .05F);
+    const auto conv_weight_bits = bf16_bits(conv_values);
+    const auto state_before     = bf16_bits(state_values);
+    auto device_x               = to_device_bf16(activation);
+    auto device_conv_weight     = to_device(conv_weight_bits);
+    auto state                  = to_device(state_before);
+    auto device_valid           = dense ? DeviceBuffer{} : to_device(valid_columns);
+    const Tensor x(device_x.span(), DType::BF16, {p.hidden, width, batch});
+    const Tensor conv_weight(device_conv_weight.span(), DType::BF16, {channels, 4});
+    const Tensor history_tensor(state.span(), DType::BF16, {channels, 3, source_slots});
+    RecordStateFixture history(history_tensor, 2);
+    const Tensor valid = dense ? Tensor{} : Tensor(device_valid.span(), DType::I32, {batch});
+    std::vector<int> slots(batch);
+    for (int b = 0; b < batch; ++b) slots[b] = (3 * b + 7) % source_slots;
+    const auto selectors = [&] {
+        auto offsets = history.record_offsets(slots);
+        for (int b = 0; b < batch; ++b)
+            if (!valid_columns[b]) offsets[b] = -1;
+        return offsets;
     };
-    inactive_selectors();
-    DeviceBuffer device_snapshot         = to_device(snapshot_bases);
-    DeviceBuffer device_snapshot_initial = to_device(snapshot_offsets);
-    DeviceBuffer device_initial          = to_device(initial_offsets);
-    Tensor valid;
-    if (!dense) { valid = Tensor(device_valid.span(), DType::I32, {batch}); }
-    Tensor initial(device_initial.span(), DType::I64, {batch});
-    Tensor snapshot_initial(device_snapshot_initial.span(), DType::I64, {batch});
-    Tensor snapshot_base(device_snapshot.span(), DType::I32, {batch});
-    Tensor snapshot_q(snapshot_query.span(), DType::BF16, {qk_rows, width, batch});
-    Tensor snapshot_k(snapshot_key.span(), DType::BF16, {qk_rows, width, batch});
-    Tensor snapshot_v(snapshot_value.span(), DType::BF16, {value_rows, width, batch});
-    Tensor snapshot_z_view(snapshot_z.span(), DType::BF16, {z_rows, width, batch});
-    Tensor record_q(record_query.span(), DType::BF16, {qk_rows, width, batch});
-    Tensor record_k(record_key.span(), DType::BF16, {qk_rows, width, batch});
-    Tensor record_v(record_value.span(), DType::BF16, {value_rows, width, batch});
-    Tensor record_z_view(record_z.span(), DType::BF16, {z_rows, width, batch});
-    Tensor conv_record_view(conv_record.span(), DType::BF16, {channels, width, batch});
+    auto initial_offsets = selectors();
+    auto device_initial  = to_device(initial_offsets);
+    const Tensor initial(device_initial.span(), DType::I64, {batch});
 
-    ninfer::DeviceBuffer snapshot_workspace_storage(
-        ninfer::test::cuda_environment().context.device(),
-        std::max<std::size_t>(256, snapshot_workspace_bytes));
-
-    MemoryArena snapshot_workspace(snapshot_workspace_storage.span());
-    ninfer::DeviceBuffer record_workspace_storage(
-        ninfer::test::cuda_environment().context.device(),
-        std::max<std::size_t>(256, record_workspace_bytes));
-    MemoryArena record_workspace(record_workspace_storage.span());
+    GuardedBf16Tensor query(p.qk_rows, columns), key(p.qk_rows, columns);
+    GuardedBf16Tensor value(value_rows, columns), z(value_rows, columns), record(channels, columns);
+    auto conv_record = record.tensor().view({channels, width, batch});
+    const ops::GdnConvOutputs outputs{query.tensor().view({p.qk_rows, width, batch}),
+                                      key.tensor().view({p.qk_rows, width, batch}),
+                                      value.tensor().view({value_rows, width, batch}),
+                                      z.tensor().view({value_rows, width, batch})};
+    const auto capacity =
+        ops::gdn_input_proj_conv_record_workspace_capacity_bytes(projection, batch, width, width);
+    auto& context = cuda_environment().context;
+    DeviceBuffer scratch(context.device(), std::max<std::size_t>(256, capacity));
+    MemoryArena workspace(scratch.span());
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-    const auto stream_execution = ninfer::test::cuda_environment().context.execution_view(stream);
+    const auto execution = context.execution_view(stream);
     cuda_synchronize();
     const auto launch = [&] {
-        snapshot_launch(x, conv_weight, snapshot_history.view(snapshot_initial),
-                        snapshot_state_view, valid, snapshot_base, snapshot_q, snapshot_k,
-                        snapshot_v, snapshot_z_view, snapshot_workspace, stream_execution);
-        record_launch(x, conv_weight, record_history.view(initial), valid, conv_record_view,
-                      record_q, record_k, record_v, record_z_view, record_workspace,
-                      stream_execution);
+        ops::gdn_input_proj_conv_record(x, projection, conv_weight, history.view(initial), valid,
+                                        outputs, conv_record, workspace, execution);
     };
     launch();
     CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -207,27 +176,20 @@ int run_case(std::string_view label, std::int32_t hidden, std::int32_t value_row
         CUDA_CHECK(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
         CUDA_CHECK(cudaGraphLaunch(executable, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
-        // The same graph must consume changed inputs at the captured addresses.
-        activation_bits = bf16_bits(make_bf16_activation(hidden, aggregate_columns, seed + 19));
-        CUDA_CHECK(cudaMemcpyAsync(device_x.data(), activation_bits.data(),
-                                   activation_bits.size() * sizeof(std::uint16_t),
+        activation      = make_bf16_activation(p.hidden, columns, c.seed + 19);
+        activation_bits = bf16_bits(activation);
+        CUDA_CHECK(cudaMemcpyAsync(device_x.data(), activation_bits.data(), x.bytes(),
                                    cudaMemcpyHostToDevice, stream));
         if (!dense) {
             if (valid_columns[0]) valid_columns[0] = 1;
-            CUDA_CHECK(cudaMemcpyAsync(device_valid.data(), valid_columns.data(),
-                                       device_valid.size(), cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(device_valid.data(), valid_columns.data(), valid.bytes(),
+                                       cudaMemcpyHostToDevice, stream));
         }
-        for (int row = 0; row < batch; ++row) {
-            initial_slots[row]          = (initial_slots[row] + 1) % source_slots;
-            snapshot_initial_slots[row] = aggregate_columns + initial_slots[row];
-        }
-        initial_offsets  = record_history.record_offsets(initial_slots);
-        snapshot_offsets = snapshot_history.record_offsets(snapshot_initial_slots);
-        inactive_selectors();
-        CUDA_CHECK(cudaMemcpyAsync(device_initial.data(), initial_offsets.data(),
-                                   device_initial.size(), cudaMemcpyHostToDevice, stream));
-        CUDA_CHECK(cudaMemcpyAsync(device_snapshot_initial.data(), snapshot_offsets.data(),
-                                   device_snapshot_initial.size(), cudaMemcpyHostToDevice, stream));
+        for (auto& slot : slots) slot = (slot + 1) % source_slots;
+        initial_offsets = selectors();
+        CUDA_CHECK(cudaMemcpyAsync(device_initial.data(), initial_offsets.data(), initial.bytes(),
+                                   cudaMemcpyHostToDevice, stream));
+        for (auto* tensor : {&query, &key, &value, &z, &record}) tensor->repaint(stream);
         CUDA_CHECK(cudaGraphLaunch(executable, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
         CUDA_CHECK(cudaGraphExecDestroy(executable));
@@ -235,85 +197,22 @@ int run_case(std::string_view label, std::int32_t hidden, std::int32_t value_row
     }
     CUDA_CHECK(cudaStreamDestroy(stream));
 
-    int failures = 0;
-    failures +=
-        verify_equal(std::string(label) + " query", snapshot_query.bits(), record_query.bits());
-    failures += verify_equal(std::string(label) + " key", snapshot_key.bits(), record_key.bits());
-    failures +=
-        verify_equal(std::string(label) + " value", snapshot_value.bits(), record_value.bits());
-    failures += verify_equal(std::string(label) + " z", snapshot_z.bits(), record_z.bits());
-    failures += verify_zero_tail(std::string(label) + " query", record_query.bits(), qk_rows, width,
-                                 batch, valid_columns);
-    failures += verify_zero_tail(std::string(label) + " key", record_key.bits(), qk_rows, width,
-                                 batch, valid_columns);
-    failures += verify_zero_tail(std::string(label) + " value", record_value.bits(), value_rows,
-                                 width, batch, valid_columns);
-
-    record_history.copy_back();
-    failures += snapshot_history.verify_guards("snapshot history");
-    failures += record_history.verify_guards("record history");
-    const std::vector<std::uint16_t> snapshot_state_after =
-        from_device<std::uint16_t>(snapshot_state, snapshot_before.size());
-    const std::vector<std::uint16_t> record_state_after =
-        from_device<std::uint16_t>(record_state, state_before.size());
-    failures += verify_conv_record(label, snapshot_state_after, conv_record.bits(), channels, width,
-                                   batch, valid_columns, snapshot_bases);
-    failures +=
-        verify_equal(std::string(label) + " source state", state_before, record_state_after);
-
-    failures += verify_preserved(std::string(label) + " x", device_x, activation_bits);
-    failures +=
-        verify_preserved(std::string(label) + " conv weight", device_conv_weight, conv_weight_bits);
-    failures += verify_preserved(std::string(label) + " initial", device_initial, initial_offsets);
-    if (!dense) {
-        failures += verify_preserved(std::string(label) + " valid", device_valid, valid_columns);
-    }
-    failures += snapshot_query.verify_guards(std::string(label) + " snapshot query");
-    failures += snapshot_key.verify_guards(std::string(label) + " snapshot key");
-    failures += snapshot_value.verify_guards(std::string(label) + " snapshot value");
-    failures += snapshot_z.verify_guards(std::string(label) + " snapshot z");
-    failures += record_query.verify_guards(std::string(label) + " record query");
-    failures += record_key.verify_guards(std::string(label) + " record key");
-    failures += record_value.verify_guards(std::string(label) + " record value");
-    failures += record_z.verify_guards(std::string(label) + " record z");
-    failures += conv_record.verify_guards(std::string(label) + " conv record");
-    if (snapshot_workspace.used() != 0 ||
-        snapshot_workspace.peak_used() != snapshot_workspace_bytes) {
-        std::cerr << label << ": snapshot workspace query/execution mismatch\n";
-        ++failures;
-    }
-    if (record_workspace.used() != 0 || record_workspace.peak_used() != record_workspace_bytes) {
-        std::cerr << label << ": record workspace query/execution mismatch\n";
+    int failures = verify_projection(weights, c, activation, conv_weight_bits, state_before, slots,
+                                     valid_columns, record, query, key, value, z);
+    history.copy_back();
+    failures += history.verify_guards("record history");
+    failures += verify_preserved("record source history", state, state_before);
+    failures += verify_preserved("record x", device_x, activation_bits);
+    failures += verify_preserved("record conv weight", device_conv_weight, conv_weight_bits);
+    failures += verify_preserved("record initial offsets", device_initial, initial_offsets);
+    if (!dense) failures += verify_preserved("record valid columns", device_valid, valid_columns);
+    for (const auto* tensor : {&query, &key, &value, &z, &record})
+        failures += tensor->verify_guards("projection record");
+    if (workspace.used() != 0 || workspace.peak_used() > capacity) {
+        std::cerr << p.name << " record workspace query/execution mismatch\n";
         ++failures;
     }
     return failures;
 }
 
-} // namespace
-
-namespace ninfer::test::gdn_input_conv {
-int run_record(Weights& weights, const RecordCase& c) {
-    const auto p              = weights.profile;
-    const auto projection     = weights.projection(c.policy);
-    const auto snapshot_bytes = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-        projection, c.batch, c.width, c.width);
-    const auto record_bytes = ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
-        projection, c.batch, c.width, c.width);
-    return run_case(
-        p.name, p.hidden, p.value_rows(), p.value_rows(), c.width, c.batch, c.valid, snapshot_bytes,
-        record_bytes,
-        [&](const Tensor& x, const Tensor& conv, StateFieldView source, Tensor& state,
-            const Tensor& valid, const Tensor& bases, Tensor& q, Tensor& k, Tensor& v, Tensor& z,
-            MemoryArena& arena, CudaExecutionView execution) {
-            ops::gdn_input_proj_conv_snapshot(x, projection, conv, {source, state, bases}, valid,
-                                              {q, k, v, z}, arena, execution);
-        },
-        [&](const Tensor& x, const Tensor& conv, StateFieldView state, const Tensor& valid,
-            Tensor& record, Tensor& q, Tensor& k, Tensor& v, Tensor& z, MemoryArena& arena,
-            CudaExecutionView execution) {
-            ops::gdn_input_proj_conv_record(x, projection, conv, state, valid, {q, k, v, z}, record,
-                                            arena, execution);
-        },
-        c.seed, p.qk_rows);
-}
 } // namespace ninfer::test::gdn_input_conv

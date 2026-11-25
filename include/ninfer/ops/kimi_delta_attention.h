@@ -2,6 +2,7 @@
 
 #include "core/arena.h"
 #include "core/device.h"
+#include "core/kda_replay_records.h"
 #include "core/tensor.h"
 #include "core/record_view.h"
 #include "ninfer/ops/ragged.h"
@@ -98,22 +99,15 @@ void kimi_delta_attention_batch_update(const Tensor& q, const Tensor& k, const T
                                        const Tensor& valid_columns, Tensor& out,
                                        CudaExecutionView execution);
 
-struct KdaRecurrenceRecords {
-    Tensor key;       // BF16 [128,Hq,T,B], before normalization.
-    Tensor value;     // BF16 [128,Hv,T,B].
-    Tensor log_decay; // FP32 [128,Hv,T,B].
-    Tensor beta;      // FP32 [Hv,T,B], after sigmoid.
-};
-
 /**
- * Evaluate n[b] KDA steps from each read-only source field, publishing BF16 readouts and
- * transition records, without writing persistent state. Inputs are the batch-update shapes
- * with positive T and B; valid_columns is empty (n=T) or Device I32 [B], 0<=n<=T.
- * Zero-length rows read neither State selectors nor fields and write no records.
- * Records preserve represented K/V and the actual FP32 log-decay/beta words. Outputs match
- * ordinary one-token updates of the same inputs bit for bit. Invalid output tails are +0;
- * record tails and source fields are unchanged. K/key-record and V/value-record may exactly
- * alias; other tensor writes are disjoint from inputs, records, metadata and selected fields.
+ * Evaluate n[b] KDA steps from each read-only initial state S0, publishing BF16 readouts
+ * that approximate the mathematical recurrence above. The opaque transition records bind
+ * the valid prefix to that same S0 for KdaReplayFoldPlan.
+ *
+ * Inputs use the batch-update shapes with T>=1 and B>=1. valid_columns is empty (n=T) or
+ * Device I32 [B], 0<=n<=T. Invalid output tails are exact BF16 +0. Invalid record suffixes
+ * and initial state are unchanged. Zero-length rows access neither State selectors nor fields.
+ * Record planes are disjoint from one another, all inputs, output, state and metadata.
  * Device selectors/lengths are caller promises. Zero scratch; capture/replay reads current
  * I64 source offsets and valid lengths at stable metadata addresses.
  */
@@ -121,7 +115,7 @@ void kimi_delta_attention_replay_record(const Tensor& q, const Tensor& k, const 
                                         const Tensor& g, const Tensor& beta, const Tensor& A_log,
                                         const Tensor& dt_bias, float lower_bound, float scale,
                                         ConstStateFieldView initial_state,
-                                        const Tensor& valid_columns, KdaRecurrenceRecords records,
+                                        const Tensor& valid_columns, KdaRecurrenceRecordView records,
                                         Tensor& out, CudaExecutionView execution);
 
 } // namespace ninfer::ops

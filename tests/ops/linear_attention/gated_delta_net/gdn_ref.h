@@ -1,13 +1,26 @@
 #pragma once
 
 #include "ops/suite.h"
+#include "ops/op_tester.h"
 
 #include <cmath>
 #include <cstdint>
+#include <span>
 #include <stdexcept>
 #include <vector>
 
 namespace ninfer::test::gdn_ref {
+
+inline constexpr ReductionCriterion kOutputCriterion{6.0e-3, 5.0e-6, 8.0e-3};
+inline constexpr ReductionCriterion kStateCriterion{4.5e-3, 1.0e-5, 9.0e-3};
+
+// Decode only the represented prefix belonging to this physical batch row.
+inline std::vector<float> represented_bf16(std::span<const std::uint16_t> bits) {
+    std::vector<float> represented;
+    represented.reserve(bits.size());
+    for (auto word : bits) represented.push_back(bf16_to_f32(word));
+    return represented;
+}
 
 struct Inputs {
     std::int64_t head_dim    = 0;
@@ -38,7 +51,8 @@ inline std::int64_t qk_head(std::int64_t value_head, std::int64_t qk_heads,
 }
 
 inline Result evaluate(const Inputs& in, double scale, bool normalize_qk,
-                       bool record_snapshots = false) {
+                       bool record_snapshots                    = false,
+                       std::span<const double> trajectory_state = {}) {
     const std::int64_t S    = in.head_dim;
     const std::int64_t H_qk = in.qk_heads;
     const std::int64_t H_v  = in.value_heads;
@@ -52,7 +66,8 @@ inline Result evaluate(const Inputs& in, double scale, bool normalize_qk,
     const std::size_t state_size = static_cast<std::size_t>(S * S * H_v);
     if (in.q.size() != qk_size || in.k.size() != qk_size || in.v.size() != value_size ||
         in.g.size() != static_cast<std::size_t>(H_v * T) ||
-        in.beta.size() != static_cast<std::size_t>(H_v * T) || in.state.size() != state_size) {
+        in.beta.size() != static_cast<std::size_t>(H_v * T) ||
+        (trajectory_state.empty() ? in.state.size() : trajectory_state.size()) != state_size) {
         throw std::invalid_argument("gdn_ref: input size does not match geometry");
     }
 
@@ -96,7 +111,9 @@ inline Result evaluate(const Inputs& in, double scale, bool normalize_qk,
             const std::size_t state_base = static_cast<std::size_t>(h * S * S);
             for (std::int64_t i = 0; i < S * S; ++i) {
                 state[static_cast<std::size_t>(i)] =
-                    static_cast<double>(in.state[state_base + static_cast<std::size_t>(i)]);
+                    trajectory_state.empty()
+                        ? in.state[state_base + static_cast<std::size_t>(i)]
+                        : trajectory_state[state_base + static_cast<std::size_t>(i)];
             }
 
             const std::int64_t qh = qk_head(h, H_qk, H_v);

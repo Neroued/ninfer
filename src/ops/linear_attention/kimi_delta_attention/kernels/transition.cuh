@@ -54,10 +54,11 @@ __device__ __forceinline__ void store_state(const float (&state)[Rows][kQkPerLan
     }
 }
 
-template <int Rows>
-__device__ __forceinline__ void
+template <bool Record, int Rows>
+__device__ __forceinline__ float
 apply_transition(float (&state)[Rows][kQkPerLane], const float (&key)[kQkPerLane],
-                 const float (&alpha)[kQkPerLane], float value_local, float beta) {
+                 const float (&alpha)[kQkPerLane], float value_local, float beta, int lane) {
+    float delta_lane = 0.0F;
 #pragma unroll
     for (int row = 0; row < Rows; ++row) {
         float prediction = 0.0F;
@@ -68,11 +69,15 @@ apply_transition(float (&state)[Rows][kQkPerLane], const float (&key)[kQkPerLane
         prediction        = common::warp_sum<common::kWarpSize>(prediction);
         const float value = __shfl_sync(common::kFullWarpMask, value_local, row);
         const float delta = beta * (value - prediction);
+        if constexpr (Record) {
+            if (lane == row) delta_lane = delta;
+        }
 #pragma unroll
         for (int column = 0; column < kQkPerLane; ++column) {
             state[row][column] = fmaf(delta, key[column], alpha[column] * state[row][column]);
         }
     }
+    return delta_lane;
 }
 
 template <int Rows>
@@ -93,14 +98,14 @@ store_readout(const float (&state)[Rows][kQkPerLane], const float (&query)[kQkPe
     if (lane < Rows) { output[dv_base + lane] = __float2bfloat16(result * scale); }
 }
 
-template <int Rows>
+template <bool Record, int Rows>
 __device__ __forceinline__ void
 run_recurrent_token(float (&state)[Rows][kQkPerLane], const __nv_bfloat16* query_source,
                     const __nv_bfloat16* key_source, const __nv_bfloat16* value_source,
                     const __nv_bfloat16* gate_source, const __nv_bfloat16* beta_source,
                     const float* dt_bias_source, __nv_bfloat16* output, int lane, int thread,
                     int dv_base, int dqk_base, float a_scale, float lower_bound, float scale,
-                    float* log_record, float* beta_record) {
+                    float* delta_record, float* alpha_record) {
     float key[kQkPerLane];
     float query[kQkPerLane];
     common::load_bf16x4(key, key_source + dqk_base);
@@ -108,24 +113,28 @@ run_recurrent_token(float (&state)[Rows][kQkPerLane], const __nv_bfloat16* query
     normalize_qk(key, lane);
     normalize_qk(query, lane);
 
-    float raw[kQkPerLane], bias[kQkPerLane], decay[kQkPerLane], alpha[kQkPerLane];
+    float raw[kQkPerLane], bias[kQkPerLane], alpha[kQkPerLane];
     common::load_bf16x4(raw, gate_source + dqk_base);
 #pragma unroll
     for (int c = 0; c < kQkPerLane; ++c) bias[c] = dt_bias_source[dqk_base + c];
 #pragma unroll
     for (int c = 0; c < kQkPerLane; ++c) {
-        decay[c] = lower_bound * common::sigmoid_approx(a_scale * (raw[c] + bias[c]));
-        alpha[c] = common::exp_approx_ftz(decay[c]);
+        const float log_alpha = lower_bound * common::sigmoid_approx(a_scale * (raw[c] + bias[c]));
+        alpha[c] = common::exp_approx_ftz(log_alpha);
     }
     float beta = lane == 0 ? common::sigmoid_approx(__bfloat162float(*beta_source)) : 0.0F;
     beta       = __shfl_sync(common::kFullWarpMask, beta, 0);
-    if (thread < 32 && log_record)
-        common::store_vec(log_record + dqk_base, common::load_vec<float4>(decay));
-    if (thread == 0 && beta_record) *beta_record = beta;
+    if constexpr (Record) {
+        if (thread < common::kWarpSize && alpha_record)
+            common::store_vec(alpha_record + dqk_base, common::load_vec<float4>(alpha));
+    }
 
     float value_local = 0.0F;
     if (lane < Rows) { value_local = __bfloat162float(value_source[dv_base + lane]); }
-    apply_transition(state, key, alpha, value_local, beta);
+    const float delta_lane = apply_transition<Record>(state, key, alpha, value_local, beta, lane);
+    if constexpr (Record) {
+        if (lane < Rows) delta_record[dv_base + lane] = delta_lane;
+    }
     store_readout(state, query, output, dv_base, lane, scale);
 }
 

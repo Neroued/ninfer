@@ -26,7 +26,7 @@ __device__ __forceinline__ RecurrentCoordinates coordinates(HeadMap heads, int b
 }
 
 
-enum class Mode { Update, Record, Fold };
+enum class Mode { Update, Record };
 
 template <int Capacity>
 struct alignas(16) Window {
@@ -36,15 +36,14 @@ struct alignas(16) Window {
     float gate[Capacity], beta[Capacity];
 };
 
-template <bool Readout, int Capacity, class Access>
+template <int Capacity, class Access>
 __device__ __forceinline__ void prefetch(Window<Capacity>& sm, const Access& a,
                                          const RecurrentCoordinates& c, int valid) {
     const int tid = c.warp * 32 + c.lane;
     for (int i = tid; i < valid * 16; i += common::kWarpSize * kNumWarps) {
         const int t = i / 16, col = (i % 16) * 8;
         common::cp_async<16, Cache::cg>(&sm.key[t][col], a.key_ptr(c, t) + col);
-        if constexpr (Readout)
-            common::cp_async<16, Cache::cg>(&sm.query[t][col], a.query_ptr(c, t) + col);
+        common::cp_async<16, Cache::cg>(&sm.query[t][col], a.query_ptr(c, t) + col);
     }
     for (int i = tid; i < valid * (kBlockDv / 8); i += common::kWarpSize * kNumWarps) {
         const int t = i / (kBlockDv / 8), col = i % (kBlockDv / 8) * 8;
@@ -72,13 +71,11 @@ __device__ __forceinline__ void normalize(float (&x)[kStateDim / Lanes]) {
     }
 }
 
-// A subgroup owns consecutive state rows and coalesced four-key segments. Keep its transition
-// arithmetic aligned with replay fold's exact snapshot contract.
+// A subgroup owns consecutive state rows and coalesced four-key segments.
 template <int Lanes, bool Normalize, Mode Behavior, bool Prefetch, int Capacity, class Access>
 __device__ __forceinline__ void run(const Access& a, RecurrentCoordinates original, int valid,
                                     Window<Capacity>* sm) {
     static_assert(Lanes == 8 || Lanes == 16);
-    constexpr bool Readout    = Behavior != Mode::Fold;
     constexpr bool Record     = Behavior == Mode::Record;
     constexpr bool WriteState = Behavior != Mode::Record;
     constexpr int Rows        = Lanes / 8;
@@ -88,7 +85,7 @@ __device__ __forceinline__ void run(const Access& a, RecurrentCoordinates origin
     const int group = original.lane / Lanes;
     auto c          = original;
     c.dv_base += group * Rows;
-    if constexpr (Prefetch) prefetch<Readout>(*sm, a, original, valid);
+    if constexpr (Prefetch) prefetch(*sm, a, original, valid);
     __align__(16) float state[Rows][Cols];
     const float* source = a.state_read_base(c);
 #pragma unroll
@@ -125,11 +122,11 @@ __device__ __forceinline__ void run(const Access& a, RecurrentCoordinates origin
         RawGatePair gate;
         if constexpr (Prefetch) {
             const float g = sm->gate[t], beta = sm->beta[t];
-            gate = {make_uint2(__float_as_uint(g), __float_as_uint(beta)), g, beta};
+            gate = {g, beta};
         } else
             gate = a.load_gate(c, t);
         const float alpha = expf(gate.g);
-        if constexpr (Record) a.store_gate(original, t, gate);
+        if constexpr (Record) a.store_alpha(original, t, alpha);
 #pragma unroll
         for (int r = 0; r < Rows; ++r) {
             __nv_bfloat16 vb;
@@ -138,40 +135,37 @@ __device__ __forceinline__ void run(const Access& a, RecurrentCoordinates origin
             else
                 vb = a.value_ptr(c, t)[c.dv_base + r];
             const float value = __bfloat162float(vb);
-            if constexpr (Record) {
-                if (lane == r) a.store_value_element(c, t, c.dv_base + r, vb);
-            }
             float dot = 0;
 #pragma unroll
             for (int j = 0; j < Cols; ++j) dot += state[r][j] * key[j];
             dot               = common::warp_sum<Lanes>(dot);
             const float delta = gate.beta * (value - alpha * dot);
+            if constexpr (Record) {
+                if (lane == r) a.store_delta_element(c, t, c.dv_base + r, delta);
+            }
 #pragma unroll
             for (int j = 0; j < Cols; ++j) state[r][j] = alpha * state[r][j] + delta * key[j];
         }
-        if constexpr (Readout) {
-            float query[Cols];
-            const __nv_bfloat16* query_ptr;
-            if constexpr (Prefetch)
-                query_ptr = sm->query[t];
-            else
-                query_ptr = a.query_ptr(c, t);
+        float query[Cols];
+        const __nv_bfloat16* query_ptr;
+        if constexpr (Prefetch)
+            query_ptr = sm->query[t];
+        else
+            query_ptr = a.query_ptr(c, t);
 #pragma unroll
-            for (int p = 0; p < Cols / 4; ++p) {
-                const auto raw = load_raw_qk_lane(query_ptr, lane * 4 + p * Lanes * 4);
+        for (int p = 0; p < Cols / 4; ++p) {
+            const auto raw = load_raw_qk_lane(query_ptr, lane * 4 + p * Lanes * 4);
 #pragma unroll
-                for (int j = 0; j < 4; ++j) query[p * 4 + j] = raw.value[j];
-            }
-            normalize<Lanes, Normalize>(query);
+            for (int j = 0; j < 4; ++j) query[p * 4 + j] = raw.value[j];
+        }
+        normalize<Lanes, Normalize>(query);
 #pragma unroll
-            for (int r = 0; r < Rows; ++r) {
-                float dot = 0;
+        for (int r = 0; r < Rows; ++r) {
+            float dot = 0;
 #pragma unroll
-                for (int j = 0; j < Cols; ++j) dot += state[r][j] * query[j];
-                dot = common::warp_sum<Lanes>(dot);
-                if (lane == r)
-                    a.output_ptr(c, t)[c.dv_base + r] = __float2bfloat16_rn(dot * a.scale);
-            }
+            for (int j = 0; j < Cols; ++j) dot += state[r][j] * query[j];
+            dot = common::warp_sum<Lanes>(dot);
+            if (lane == r) a.output_ptr(c, t)[c.dv_base + r] = __float2bfloat16_rn(dot * a.scale);
         }
     }
     if constexpr (WriteState) {

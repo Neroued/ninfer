@@ -12,7 +12,7 @@ using detail::gated_delta_net::kStateDim;
 void validate_replay_record(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
                             const Tensor& beta, float scale, ConstStateFieldView initial_state,
                             const Tensor& valid_columns, const Tensor& key_record,
-                            const Tensor& value_record, const Tensor& gate_record,
+                            const Tensor& delta_record, const Tensor& alpha_record,
                             const Tensor& out, Device device) {
     constexpr const char* kOp      = "gated_delta_net_replay_record";
     const std::int32_t qk_heads    = q.ne[1];
@@ -45,10 +45,10 @@ void validate_replay_record(const Tensor& q, const Tensor& k, const Tensor& v, c
     }
     common::operand::tensor(key_record, DType::BF16, {kStateDim, qk_heads, width, rows}, 8, kOp,
                             "key record", device);
-    common::operand::tensor(value_record, DType::BF16, {kStateDim, value_heads, width, rows}, 2,
-                            kOp, "value record", device);
-    common::operand::tensor(gate_record, DType::FP32, {2, value_heads, width, rows}, 8, kOp,
-                            "gate record", device);
+    common::operand::tensor(delta_record, DType::FP32, {kStateDim, value_heads, width, rows}, 4,
+                            kOp, "delta record", device);
+    common::operand::tensor(alpha_record, DType::FP32, {value_heads, width, rows}, 4, kOp,
+                            "alpha record", device);
     common::operand::tensor(out, DType::BF16, {kStateDim, value_heads, width, rows}, 2, kOp, "out",
                             device);
     detail::gated_delta_net::require_scale(scale, kOp);
@@ -61,8 +61,8 @@ void validate_replay_record(const Tensor& q, const Tensor& k, const Tensor& v, c
                                                 &valid_columns,
                                                 &initial_state.records.byte_offsets,
                                                 &key_record,
-                                                &value_record,
-                                                &gate_record,
+                                                &delta_record,
+                                                &alpha_record,
                                                 &out};
     std::array<common::operand::Blocks, 11> ranges{};
     std::size_t count = 0;
@@ -80,14 +80,14 @@ void validate_replay_record(const Tensor& q, const Tensor& k, const Tensor& v, c
 void gated_delta_net_replay_record(const Tensor& q, const Tensor& k, const Tensor& v,
                                    const Tensor& g, const Tensor& beta, float scale,
                                    ConstStateFieldView initial_state, const Tensor& valid_columns,
-                                   GdnRecurrenceRecords records, Tensor& out,
+                                   GdnRecurrenceRecordView records, Tensor& out,
                                    CudaExecutionView execution) {
-    const auto stream = execution.stream();
-    validate_replay_record(q, k, v, g, beta, scale, initial_state, valid_columns, records.key,
-                           records.value, records.gate, out, execution.device());
+    const auto [key, delta, alpha] = ninfer::detail::GdnReplayRecordAccess::planes(records);
+    validate_replay_record(q, k, v, g, beta, scale, initial_state, valid_columns, key, delta, alpha,
+                           out, execution.device());
     detail::gated_delta_net::launch_recurrent_record(q, k, v, g, beta, scale, initial_state,
-                                                     valid_columns, records.key, records.value,
-                                                     records.gate, out, stream);
+                                                     valid_columns, key, delta, alpha, out,
+                                                     execution.stream());
 }
 
 } // namespace ninfer::ops

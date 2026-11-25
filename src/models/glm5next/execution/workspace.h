@@ -59,13 +59,13 @@ struct KdaBuffers {
 };
 
 template <class Arena>
-KdaBuffers kda(Arena& a, const ModelProfile& p, int columns, bool records) {
+KdaBuffers kda(Arena& a, const ModelProfile& p, int columns) {
     const auto& c   = p.config.text.kda;
     const int width = dimension(std::uint64_t(p.local.kda_heads.size) * c.head_dim);
     const int low   = dimension(c.gate_lowrank);
     return {a.alloc(DType::BF16, {width, columns}),
-            records ? Tensor{} : a.alloc(DType::BF16, {width, columns}),
-            records ? Tensor{} : a.alloc(DType::BF16, {width, columns}),
+            a.alloc(DType::BF16, {width, columns}),
+            a.alloc(DType::BF16, {width, columns}),
             a.alloc(DType::BF16, {dimension(p.local.kda_heads.size), columns}),
             a.alloc(DType::BF16, {low, columns}),
             a.alloc(DType::BF16, {low, columns}),

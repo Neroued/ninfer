@@ -16,8 +16,7 @@ struct KdaReplayFoldDeviceRows {
 
 void launch_replay_fold(const KdaReplayRecords&, LinearAttentionStateAllLayersView,
                         const KdaReplayFoldKernelRows&, int row_begin, int batch,
-                        int multiprocessors, cudaStream_t);
+                        CudaExecutionView);
 void launch_replay_fold(const KdaReplayRecords&, LinearAttentionStateAllLayersView,
-                        const KdaReplayFoldDeviceRows&, int batch, int multiprocessors,
-                        cudaStream_t);
+                        const KdaReplayFoldDeviceRows&, int batch, CudaExecutionView);
 } // namespace ninfer::ops::detail::kimi_delta_attention

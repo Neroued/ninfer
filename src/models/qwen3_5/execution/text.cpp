@@ -316,9 +316,8 @@ void TextRun::gdn(const BlockParameters& block, std::uint32_t compact_layer) {
         Tensor ob = o.view({dv, vh, width, batch});
         if (replay) {
             const auto records = replay->records.layer(compact_layer, batch);
-            ops::gated_delta_net_replay_record(
-                qb, kb, vb, gb, bb, scale, source, inputs_.valid_columns,
-                {records.key, records.value, records.gate}, ob, cuda);
+            ops::gated_delta_net_replay_record(qb, kb, vb, gb, bb, scale, source,
+                                               inputs_.valid_columns, records.recurrence, ob, cuda);
         } else {
             ops::gated_delta_net_batch_update(
                 qb, kb, vb, gb, bb, scale, true, source,

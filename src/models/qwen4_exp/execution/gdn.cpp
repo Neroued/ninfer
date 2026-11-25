@@ -75,8 +75,7 @@ void gdn(const Tensor& input, const GdnConfig& c, const GdnParameters& p, const 
         auto recurrent = b.recurrent.view({vd, vh, t, batch.batch});
         ops::gated_delta_net_replay_record(
             q, k, v, b.g.view({vh, t, batch.batch}), b.beta.view({vh, t, batch.batch}), scale,
-            state.recurrent, batch.valid_columns, {records.key, records.value, records.gate},
-            recurrent, cuda);
+            state.recurrent, batch.valid_columns, records.recurrence, recurrent, cuda);
     } else {
         auto before = states.layer_view(layer, batch.source_offsets);
         auto after  = states.layer_view(layer, batch.destination_offsets);

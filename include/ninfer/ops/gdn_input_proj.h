@@ -95,12 +95,12 @@ gdn_input_proj_conv_snapshot_workspace_capacity_bytes(const ProjectionProfile& w
  * Supported weights, tensor layouts, valid prefixes and output effects match snapshot above;
  * the record domain is B>=1, T=2..16, T*B fitting I32. conv_record is contiguous,
  * 16-byte-aligned BF16 [C,T,B].
- * Only its valid prefix is defined. It receives each newest projected history column.
- *
- * Query/key/value/z and valid record columns are bit-identical to snapshot from the same
- * initial history, represented inputs, physical T/B and activation permission. Records equal
- * the newest column of each corresponding snapshot. Source history is never modified.
- * The record's BF16 publication does not require rounding private convolution intermediates.
+ * Projection, four-tap causal depthwise convolution and SiLU approximate the mathematical
+ * computation specified above from the read-only source history and represented inputs.
+ * Only its valid prefix is defined. It receives each newest BF16 projected history column.
+ * Invalid query/key/value suffixes are exact BF16 +0.
+ * A zero-length row reads no history or selectors. The record's BF16 publication does not
+ * require rounding private convolution intermediates.
  *
  * All tensor operands are disjoint from one another, the weight parents and call-local scratch.
  * Materialized computation may write projection directly to conv_record. Workspace queries

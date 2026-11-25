@@ -35,8 +35,8 @@ constexpr int kStateDim = 128;
 
 // One error budget for the complete recurrence over represented public inputs, including
 // continuation. FP32 state storage does not prescribe the precision of private arithmetic.
-constexpr ReductionCriterion kOutputCriterion{6.0e-3, 5.0e-6, 8.0e-3};
-constexpr ReductionCriterion kStateCriterion{4.5e-3, 1.0e-5, 9.0e-3};
+using gdn_ref::kOutputCriterion;
+using gdn_ref::kStateCriterion;
 
 enum class InputPattern {
     Ordinary,

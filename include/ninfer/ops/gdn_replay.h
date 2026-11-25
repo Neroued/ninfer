@@ -23,11 +23,12 @@ struct GdnReplayFoldRow {
  * complete StateImage records. Each selected field is dense, aligned and in bounds. A row may
  * update in place; active destinations are distinct and cannot overwrite another active source.
  *
- * commit_columns is in [0,T]. Zero is a strict no-op: no record or state is accessed. A positive
- * row writes final FP32 recurrent state and tail_3(old_history || conv_record[0:commit_columns]).
- * Both regions are bit-identical to the corresponding snapshot of the same full physical
- * record-producing block from the same initial state and represented inputs. Projection is
- * not re-evaluated at the commit width.
+ * commit_columns is in [0,n[b]], the valid recorded extent. Zero is a strict no-op and
+ * accesses no state offsets, records or state, and its offsets may be -1. Records bind to the
+ * initial recurrent state S0 observed by gated_delta_net_replay_record. A positive row must read
+ * that same S0 from source_offset. It writes an FP32 approximation to the mathematical prefix state
+ * S_m for m = commit_columns, and the exact BF16 words of
+ * tail_3(source.conv || conv_record[0:m]).
  *
  * Construction validates fixed state/record geometry. The bound arena, field geometry and
  * record addresses stay stable for the plan lifetime; record byte offsets may change. Host row

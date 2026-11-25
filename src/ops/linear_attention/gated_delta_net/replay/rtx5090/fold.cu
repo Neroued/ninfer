@@ -1,80 +1,164 @@
-#include "ops/linear_attention/gated_delta_net/replay/launch.h"
-#include "ops/common/cuda/reduce.cuh"
 #include "ops/linear_attention/gated_delta_net/replay/fold_io.cuh"
-#include <type_traits>
-#include "core/device.h"
-#include "ops/common/host/operands.h"
-#include <cuda_bf16.h>
-#include <cstdint>
-#include <stdexcept>
 
 namespace ninfer::ops::detail::gated_delta_net {
 namespace {
-static_assert(sizeof(GdnReplayFoldKernelRow) == 32);
-static_assert(alignof(GdnReplayFoldKernelRow) == 16);
-static_assert(sizeof(GdnReplayFoldKernelRows) == 256);
-static_assert(alignof(GdnReplayFoldKernelRows) == 16);
-static_assert(std::is_trivially_copyable_v<GdnReplayFoldKernelRows>);
+constexpr int kFoldWarps = 8;
 
-template <class Geometry, class Rows>
-void launch_replay_fold_fixed(const GdnReplayRecords& records,
-                              LinearAttentionStateAllLayersView states, const Rows& rows,
-                              std::int32_t active_rows, std::int32_t record_begin,
-                              cudaStream_t stream) {
-    const FoldAccess<Geometry, Rows> access{
-        static_cast<const __nv_bfloat16*>(records.key.data),
-        static_cast<const __nv_bfloat16*>(records.value.data),
-        reinterpret_cast<const uint2*>(records.gate.data),
-        static_cast<const __nv_bfloat16*>(records.conv.data),
-        common::operand::state_field_base<float>(states.recurrent),
-        common::operand::state_field_base<__nv_bfloat16>(states.conv),
-        static_cast<std::int64_t>(states.recurrent.field.layer_stride / sizeof(float)),
-        static_cast<std::int64_t>(states.conv.field.layer_stride / sizeof(__nv_bfloat16)),
-        records.spec.record_capacity,
-        records.spec.width,
-        rows,
-        record_begin,
-    };
-    const dim3 grid(static_cast<unsigned>(Geometry::kValueHeads),
-                    static_cast<unsigned>(active_rows),
-                    static_cast<unsigned>(Geometry::kLayers * (kStateDim / kBlockDv)));
-    const dim3 block(common::kWarpSize, kNumWarps, 1);
-    recurrent_fold_kernel<Geometry, Rows><<<grid, block, 0, stream>>>(access);
-    CUDA_CHECK(cudaGetLastError());
+__device__ __forceinline__ float4 load_state_row(const float* state, int row, int col) {
+    // Keep prefetched rows resident through the compute pass and possible in-place store.
+    const auto policy = common::l2_retained_policy();
+    float4 value;
+    asm volatile("ld.global.cg.L2::cache_hint.v4.f32 {%0,%1,%2,%3}, [%4], %5;"
+                 : "=f"(value.x), "=f"(value.y), "=f"(value.z), "=f"(value.w)
+                 : "l"(state + row * kStateDim + col), "l"(policy));
+    return value;
 }
 
-template <class Rows>
-void dispatch_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states,
-                          const Rows& rows, std::int32_t active_rows, std::int32_t record_begin,
-                          cudaStream_t stream) {
-    switch (select_fold_geometry(records.spec)) {
-    case FoldGeometryId::Layers48Heads48:
-        return launch_replay_fold_fixed<FoldGeometry48x48>(records, states, rows, active_rows,
-                                                           record_begin, stream);
-    case FoldGeometryId::Layers30Heads32:
-        return launch_replay_fold_fixed<FoldGeometry30x32>(records, states, rows, active_rows,
-                                                           record_begin, stream);
-    case FoldGeometryId::Layers36Heads48:
-        return launch_replay_fold_fixed<FoldGeometry36x48>(records, states, rows, active_rows,
-                                                           record_begin, stream);
-    case FoldGeometryId::Layers36Heads24:
-        return launch_replay_fold_fixed<FoldGeometry36x24>(records, states, rows, active_rows,
-                                                           record_begin, stream);
+__device__ __forceinline__ void store_state_row(float* state, int row, int col, float4 value) {
+    // A fold streams the state once. Prefer early eviction of completed state rows.
+    asm volatile("st.global.cs.v4.f32 [%0], {%1,%2,%3,%4};" ::"l"(state + row * kStateDim + col),
+                 "f"(value.x), "f"(value.y), "f"(value.z), "f"(value.w)
+                 : "memory");
+}
+
+template <int RowsPerPass, bool Sequential>
+__device__ __forceinline__ void fold_window(float4 (&initial)[RowsPerPass],
+                                            const FoldWindow<kStateDim>& sm, const float* source,
+                                            float* destination, int warp, int col, int commit) {
+#pragma unroll 1
+    for (int base = warp; base < kStateDim; base += kFoldWarps * RowsPerPass) {
+        float4 acc[RowsPerPass];
+        // Issue the next pass's loads before the correction loop.
+        float4 next[RowsPerPass];
+        if (base + kFoldWarps * RowsPerPass < kStateDim) {
+#pragma unroll
+            for (int r = 0; r < RowsPerPass; ++r)
+                next[r] = load_state_row(source, base + (RowsPerPass + r) * kFoldWarps, col);
+        }
+#pragma unroll
+        for (int r = 0; r < RowsPerPass; ++r)
+            acc[r] = Sequential ? initial[r] : scale_state(initial[r], sm.total_decay);
+        for (int t = 0; t < commit; ++t) {
+            const auto key = common::load_vec<float4>(sm.scaled_key[t] + col);
+#pragma unroll
+            for (int r = 0; r < RowsPerPass; ++r) {
+                const float delta = sm.delta[t][base + r * kFoldWarps];
+                if constexpr (Sequential)
+                    acc[r] = apply_transition(acc[r], sm.alpha[t], delta, key);
+                else
+                    acc[r] = add_outer(acc[r], delta, key);
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < RowsPerPass; ++r) {
+            store_state_row(destination, base + r * kFoldWarps, col, acc[r]);
+            if (base + kFoldWarps * RowsPerPass < kStateDim) initial[r] = next[r];
+        }
     }
 }
 
+template <int RowsPerPass, class Geometry, class Rows>
+__global__ __launch_bounds__(common::kWarpSize* kFoldWarps, 4) void linear_fold_kernel(
+    const __grid_constant__ FoldAccess<Geometry, Rows> access) {
+    static_assert(kStateDim % (kFoldWarps * RowsPerPass) == 0);
+    const int tid = threadIdx.x, lane = tid % common::kWarpSize, warp = tid / common::kWarpSize;
+    const int head = blockIdx.x, batch = blockIdx.z, layer = blockIdx.y;
+    const int commit = fold_columns(access.rows, batch);
+    if (commit == 0) return;
+    const auto row = fold_row(access.rows, batch, commit);
+    const auto column =
+        (std::int64_t(layer) * access.record_capacity + access.record_begin + batch) * access.width;
+    const auto* layer_state = access.recurrent_layer0 + layer * access.recurrent_layer_stride;
+    const float* source =
+        layer_state + row.source_offset / sizeof(float) + head * kStateDim * kStateDim;
+    float* destination = access.recurrent_layer0 + layer * access.recurrent_layer_stride +
+                         row.destination_offset / sizeof(float) + head * kStateDim * kStateDim;
+    const int col = lane * 4;
+    __shared__ FoldWindow<kStateDim> sm;
+
+    if (commit == 1) {
+        if (warp == 0) {
+            auto key = load_raw_qk_lane(access.key_ptr(column, head), col);
+            normalize_qk_lane<true>(key.value, lane);
+            common::store_vec(sm.scaled_key[0] + col,
+                              make_float4(key.value[0], key.value[1], key.value[2], key.value[3]));
+            common::cp_async<16, Cache::cg>(sm.delta[0] + col,
+                                            access.delta_ptr(column, head) + col);
+            common::cp_commit();
+            if (lane == 0) sm.total_decay = access.alpha(column, head);
+            common::cp_wait<0>();
+        }
+        float4 initial[RowsPerPass];
+#pragma unroll
+        for (int r = 0; r < RowsPerPass; ++r)
+            initial[r] = load_state_row(source, warp + r * kFoldWarps, col);
+        __syncthreads();
+        const auto key    = common::load_vec<float4>(sm.scaled_key[0] + col);
+        const float decay = sm.total_decay;
+#pragma unroll 1
+        for (int base = warp; base < kStateDim; base += kFoldWarps * RowsPerPass) {
+#pragma unroll
+            for (int r = 0; r < RowsPerPass; ++r) {
+                const int dv      = base + r * kFoldWarps;
+                const auto result = add_outer(scale_state(initial[r], decay), sm.delta[0][dv], key);
+                if (dv + kFoldWarps * RowsPerPass < kStateDim)
+                    initial[r] = load_state_row(source, dv + kFoldWarps * RowsPerPass, col);
+                store_state_row(destination, dv, col, result);
+            }
+        }
+    } else {
+        for (int t = warp; t < commit; t += kFoldWarps)
+            common::cp_async<16, Cache::cg>(sm.delta[t] + col,
+                                            access.delta_ptr(column + t, head) + col);
+        common::cp_commit();
+        if (warp == 0) stage_decays(sm, access, column, head, lane, commit);
+        float4 initial[RowsPerPass];
+#pragma unroll
+        for (int r = 0; r < RowsPerPass; ++r)
+            initial[r] = load_state_row(source, warp + r * kFoldWarps, col);
+        __syncthreads();
+        const bool fallback = sm.fallback;
+        for (int t = warp; t < commit; t += kFoldWarps) {
+            auto key = load_raw_qk_lane(access.key_ptr(column + t, head), col);
+            normalize_qk_lane<true>(key.value, lane);
+            const float suffix = fallback ? 1.f : sm.suffix[t];
+            common::store_vec(sm.scaled_key[t] + col,
+                              make_float4(key.value[0] * suffix, key.value[1] * suffix,
+                                          key.value[2] * suffix, key.value[3] * suffix));
+        }
+        common::cp_wait<0>();
+        __syncthreads();
+        if (fallback)
+            fold_window<RowsPerPass, true>(initial, sm, source, destination, warp, col, commit);
+        else
+            fold_window<RowsPerPass, false>(initial, sm, source, destination, warp, col, commit);
+    }
+    if (warp == 0) access.publish_conv(layer, head, lane, commit, column, row);
+}
+
+struct FoldLauncher {
+    template <class Geometry, class Rows>
+    static void launch(const FoldAccess<Geometry, Rows>& access, int active_rows,
+                       cudaStream_t stream) {
+        // Two rows per pass improve the 36-layer, 24-head working set.
+        constexpr int RowsPerPass = Geometry::kValueHeads == 24 ? 2 : 4;
+        const dim3 grid(Geometry::kValueHeads, Geometry::kLayers, active_rows);
+        linear_fold_kernel<RowsPerPass>
+            <<<grid, common::kWarpSize * kFoldWarps, 0, stream>>>(access);
+    }
+};
 } // namespace
 
 void launch_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states,
                         const GdnReplayFoldKernelRows& rows, std::int32_t active_rows,
                         std::int32_t record_begin, cudaStream_t stream) {
-    dispatch_replay_fold(records, states, rows, active_rows, record_begin, stream);
+    dispatch_replay_fold<FoldLauncher>(records, states, rows, active_rows, record_begin, stream);
 }
 
 void launch_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states,
                         const GdnReplayFoldDeviceRows& rows, std::int32_t active_rows,
                         std::int32_t record_begin, cudaStream_t stream) {
-    dispatch_replay_fold(records, states, rows, active_rows, record_begin, stream);
+    dispatch_replay_fold<FoldLauncher>(records, states, rows, active_rows, record_begin, stream);
 }
 
 } // namespace ninfer::ops::detail::gated_delta_net

@@ -13,7 +13,6 @@ struct Options {
     std::vector<ragged::SegmentSpec> ragged_specs;
     ragged::StateOffsetForm state_form = ragged::StateOffsetForm::Distinct;
     int heads = 32, qk_heads = 32, batch = 1, layers = 34;
-    bool alias_records = true;
 };
 
 inline Options parse(int argc, char** argv) {
@@ -32,7 +31,6 @@ inline Options parse(int argc, char** argv) {
                    "  --valid dense|N[,N...] --commits dense|N[,N...]\n"
                    "  --ragged-segments SPEC (core or input-update)\n"
                    "  --state-form distinct|alias|mixed|permuted|shared-source (ragged)\n"
-                   "  --kv-records alias|copy (record only; default alias)\n"
                    "  --format q8|mxfp8 --policy a16|a8 (input projection; default follows "
                    "format)\n"
                    "core is single sequence; update is T=1; fold measures all layers.\n"
@@ -74,10 +72,6 @@ inline Options parse(int argc, char** argv) {
         } else if (flag == "--policy") {
             if (value != "a16" && value != "a8") throw std::invalid_argument("policy: a16|a8");
             o.policy = value;
-        } else if (flag == "--kv-records") {
-            if (value != "alias" && value != "copy")
-                throw std::invalid_argument("kv-records: alias|copy");
-            o.alias_records = value == "alias";
         } else if (!measurement::parse(o.timing, flag, value))
             throw std::invalid_argument("unknown option");
     }

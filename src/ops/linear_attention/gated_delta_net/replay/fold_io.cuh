@@ -1,25 +1,14 @@
 #pragma once
 
-#include "ops/common/cuda/reduce.cuh"
+#include <cfloat>
+
+#include "ops/common/cuda/pipeline.cuh"
+#include "ops/common/host/operands.h"
 #include "ops/linear_attention/gated_delta_net/kernels/transition.cuh"
 #include "ops/linear_attention/gated_delta_net/replay/launch.h"
 
 namespace ninfer::ops::detail::gated_delta_net {
-struct FoldEffects {
-    template <class Access>
-    __device__ __forceinline__ static void observe_key(const Access&, const RecurrentCoordinates&,
-                                                       std::int32_t, const RawQkLane&) {}
-
-    template <class Access>
-    __device__ __forceinline__ static void
-    observe_value_gate(const Access&, const RecurrentCoordinates&, std::int32_t,
-                       const RawValueLane&, const RawGatePair&) {}
-
-    template <bool NormalizeInputs, class Access>
-    __device__ __forceinline__ static void
-    publish_output(float (&)[kDvPerWarp][kQkPerLane], const Access&, const RecurrentCoordinates&,
-                   std::int32_t) {}
-};
+inline constexpr int kFoldWidth = 16;
 
 template <int Layers, int QkHeads, int ValueHeads, int ConvChannels>
 struct FoldGeometry {
@@ -27,23 +16,16 @@ struct FoldGeometry {
     static constexpr int kQkHeads      = QkHeads;
     static constexpr int kValueHeads   = ValueHeads;
     static constexpr int kConvChannels = ConvChannels;
-    static_assert(ValueHeads % QkHeads == 0);
-    static_assert(ConvChannels % 128 == 0);
 };
 
-using FoldGeometry48x48 = FoldGeometry<48, 16, 48, 10240>;
-using FoldGeometry30x32 = FoldGeometry<30, 16, 32, 8192>;
-using FoldGeometry36x48 = FoldGeometry<36, 16, 48, 10240>;
-using FoldGeometry36x24 = FoldGeometry<36, 8, 24, 5120>;
-
 __device__ __forceinline__ GdnReplayFoldKernelRow fold_row(const GdnReplayFoldKernelRows& rows,
-                                                           int b) {
+                                                           int b, int) {
     return rows.row[b];
 }
 
 __device__ __forceinline__ GdnReplayFoldKernelRow fold_row(const GdnReplayFoldDeviceRows& rows,
-                                                           int b) {
-    return {rows.sources[b], rows.destinations[b], rows.columns[b], 0};
+                                                           int b, int commit) {
+    return {rows.sources[b], rows.destinations[b], commit, 0};
 }
 
 __device__ __forceinline__ int fold_columns(const GdnReplayFoldKernelRows& rows, int b) {
@@ -54,146 +36,150 @@ __device__ __forceinline__ int fold_columns(const GdnReplayFoldDeviceRows& rows,
     return rows.columns[b];
 }
 
-template <class Geometry, class Rows = GdnReplayFoldKernelRows>
+template <class Geometry, class Rows>
 struct FoldAccess {
     const __nv_bfloat16* key_record;
-    const __nv_bfloat16* value_record;
-    const uint2* gate_record;
+    const float* delta_record;
+    const float* alpha_record;
     const __nv_bfloat16* conv_record;
     float* recurrent_layer0;
     __nv_bfloat16* conv_layer0;
     std::int64_t recurrent_layer_stride;
     std::int64_t conv_layer_stride;
-    std::int32_t record_capacity;
-    std::int32_t width;
+    int record_capacity;
+    int width;
     Rows rows;
-    std::int32_t record_begin;
+    int record_begin;
 
-    __device__ __forceinline__ RecurrentCoordinates coordinates() const {
-        const std::int32_t batch       = static_cast<std::int32_t>(blockIdx.y);
-        const std::int32_t layer_tile  = static_cast<std::int32_t>(blockIdx.z);
-        const int lane                 = threadIdx.x;
-        const int warp                 = threadIdx.y;
-        const std::int32_t state_tile  = layer_tile & 7;
-        const std::uint32_t value_head = static_cast<std::uint32_t>(blockIdx.x);
-        constexpr std::uint32_t kGroup = Geometry::kValueHeads / Geometry::kQkHeads;
-        const std::uint32_t qk_head    = value_head / kGroup;
-        const std::uint32_t dv_base =
-            static_cast<std::uint32_t>(state_tile * kBlockDv + warp * kDvPerWarp);
-        return {lane,
-                warp,
-                batch,
-                layer_tile >> 3,
-                state_tile,
-                value_head,
-                qk_head,
-                dv_base,
-                static_cast<std::uint32_t>(lane * kQkPerLane)};
+    __device__ __forceinline__ const __nv_bfloat16* key_ptr(std::int64_t column, int head) const {
+        constexpr int group = Geometry::kValueHeads / Geometry::kQkHeads;
+        return key_record + (column * Geometry::kQkHeads + head / group) * kStateDim;
     }
 
-    __device__ __forceinline__ std::int32_t
-    active_columns(const RecurrentCoordinates& coord) const {
-        return fold_columns(rows, coord.batch);
+    __device__ __forceinline__ const float* delta_ptr(std::int64_t column, int head) const {
+        return delta_record + (column * Geometry::kValueHeads + head) * kStateDim;
     }
 
-    __device__ __forceinline__ std::int64_t record_outer(const RecurrentCoordinates& coord) const {
-        return static_cast<std::int64_t>(coord.layer) * record_capacity + record_begin +
-               coord.batch;
+    __device__ __forceinline__ float alpha(std::int64_t column, int head) const {
+        return alpha_record[column * Geometry::kValueHeads + head];
     }
 
-    __device__ __forceinline__ const float*
-    state_read_base(const RecurrentCoordinates& coord) const {
-        return recurrent_layer0 + static_cast<std::int64_t>(coord.layer) * recurrent_layer_stride +
-               fold_row(rows, coord.batch).source_offset / sizeof(float) +
-               static_cast<std::int64_t>(coord.value_head) * kStateDim * kStateDim;
-    }
-
-    __device__ __forceinline__ float* state_write_base(const RecurrentCoordinates& coord) const {
-        return recurrent_layer0 + static_cast<std::int64_t>(coord.layer) * recurrent_layer_stride +
-               fold_row(rows, coord.batch).destination_offset / sizeof(float) +
-               static_cast<std::int64_t>(coord.value_head) * kStateDim * kStateDim;
-    }
-
-    __device__ __forceinline__ const __nv_bfloat16* key_ptr(const RecurrentCoordinates& coord,
-                                                            std::int32_t token) const {
-        const std::int64_t column = record_outer(coord) * width + token;
-        return key_record + (column * Geometry::kQkHeads + coord.qk_head) * kStateDim;
-    }
-
-    __device__ __forceinline__ const __nv_bfloat16* value_ptr(const RecurrentCoordinates& coord,
-                                                              std::int32_t token) const {
-        const std::int64_t column = record_outer(coord) * width + token;
-        return value_record + (column * Geometry::kValueHeads + coord.value_head) * kStateDim;
-    }
-
-    __device__ __forceinline__ RawGatePair load_gate(const RecurrentCoordinates& coord,
-                                                     std::int32_t token) const {
-        const std::int64_t column = record_outer(coord) * width + token;
-        return load_record_gate(gate_record, column * Geometry::kValueHeads + coord.value_head);
-    }
-
-    __device__ __forceinline__ void
-    store_final_state(const RecurrentCoordinates& coord,
-                      const float (&state)[kDvPerWarp][kQkPerLane]) const {
-        float* destination = state_write_base(coord);
+    __device__ __forceinline__ void publish_conv(int layer, int head, int lane, int commit,
+                                                 std::int64_t column,
+                                                 GdnReplayFoldKernelRow row) const {
+        constexpr int channels         = Geometry::kConvChannels;
+        constexpr int vector_channels  = sizeof(uint4) / sizeof(__nv_bfloat16);
+        constexpr int channels_per_cta = common::kWarpSize * vector_channels;
+        static_assert(channels % vector_channels == 0);
+        const auto* conv = conv_layer0 + layer * conv_layer_stride;
+        for (int c = head * channels_per_cta + lane * vector_channels; c < channels;
+             c += Geometry::kValueHeads * channels_per_cta) {
+            auto* destination = conv_layer0 + layer * conv_layer_stride +
+                                row.destination_offset / sizeof(__nv_bfloat16) + c;
+            const auto* source = conv + row.source_offset / sizeof(__nv_bfloat16) + c;
+            const auto* record = conv_record + column * channels + c;
+            // Copy the tail of the concatenated history. Each channel has one writer and
+            // the left shift reads a source word before that word can be overwritten in place.
 #pragma unroll
-        for (int r = 0; r < kDvPerWarp; ++r) {
-            store_qk_lane(state[r],
-                          destination + static_cast<std::int64_t>(coord.dv_base + r) * kStateDim,
-                          coord.dqk_base);
+            for (int i = 0; i < 3; ++i) {
+                const int index = commit + i;
+                const auto* from =
+                    index < 3 ? source + index * channels : record + (index - 3) * channels;
+                common::store_vec(destination + i * channels, common::load_vec<uint4>(from));
+            }
         }
-    }
-
-    __device__ __forceinline__ void publish_final_conv_history(const RecurrentCoordinates& coord,
-                                                               std::int32_t commit) const {
-        const std::int32_t tile_block =
-            static_cast<std::int32_t>(coord.value_head) * 8 + coord.state_tile;
-        if (tile_block >= Geometry::kConvChannels / 128) { return; }
-
-        const std::int32_t tid     = coord.warp * common::kWarpSize + coord.lane;
-        const std::int32_t channel = tile_block * 128 + tid;
-        const __nv_bfloat16* source_history =
-            conv_layer0 + static_cast<std::int64_t>(coord.layer) * conv_layer_stride +
-            fold_row(rows, coord.batch).source_offset / sizeof(__nv_bfloat16) + channel;
-        __nv_bfloat16* destination_history =
-            conv_layer0 + static_cast<std::int64_t>(coord.layer) * conv_layer_stride +
-            fold_row(rows, coord.batch).destination_offset / sizeof(__nv_bfloat16) + channel;
-        const __nv_bfloat16* record =
-            conv_record + record_outer(coord) * width * Geometry::kConvChannels + channel;
-
-        __nv_bfloat16 h0;
-        __nv_bfloat16 h1;
-        __nv_bfloat16 h2;
-        if (commit == 1) {
-            h0 = source_history[Geometry::kConvChannels];
-            h1 = source_history[2LL * Geometry::kConvChannels];
-            h2 = record[0];
-        } else if (commit == 2) {
-            h0 = source_history[2LL * Geometry::kConvChannels];
-            h1 = record[0];
-            h2 = record[Geometry::kConvChannels];
-        } else {
-            h0 = record[static_cast<std::int64_t>(commit - 3) * Geometry::kConvChannels];
-            h1 = record[static_cast<std::int64_t>(commit - 2) * Geometry::kConvChannels];
-            h2 = record[static_cast<std::int64_t>(commit - 1) * Geometry::kConvChannels];
-        }
-        destination_history[0]                             = h0;
-        destination_history[Geometry::kConvChannels]       = h1;
-        destination_history[2LL * Geometry::kConvChannels] = h2;
     }
 };
 
-template <class Geometry, class Rows = GdnReplayFoldKernelRows>
-__global__ void __launch_bounds__(common::kWarpSize* kNumWarps, 2)
-    recurrent_fold_kernel(const __grid_constant__ FoldAccess<Geometry, Rows> access) {
-    const RecurrentCoordinates coord = access.coordinates();
-    const std::int32_t valid         = access.active_columns(coord);
-    if (valid == 0) { return; }
-    __align__(16) float state[kDvPerWarp][kQkPerLane];
-    load_state_tile(state, access.state_read_base(coord), coord);
-    run_recurrent_sequence<true, FoldEffects>(state, access, coord, valid);
-    access.store_final_state(coord, state);
-    access.publish_final_conv_history(coord, valid);
+template <int TileRows>
+struct alignas(16) FoldWindow {
+    float delta[kFoldWidth][TileRows];
+    float scaled_key[kFoldWidth][kStateDim];
+    float suffix[kFoldWidth];
+    float alpha[kFoldWidth];
+    float total_decay;
+    bool fallback;
+};
+
+__device__ __forceinline__ float4 add_outer(float4 acc, float delta, float4 key) {
+    return {fmaf(delta, key.x, acc.x), fmaf(delta, key.y, acc.y), fmaf(delta, key.z, acc.z),
+            fmaf(delta, key.w, acc.w)};
+}
+
+__device__ __forceinline__ float4 scale_state(float4 state, float decay) {
+    return {state.x * decay, state.y * decay, state.z * decay, state.w * decay};
+}
+
+__device__ __forceinline__ float4 apply_transition(float4 state, float alpha, float delta,
+                                                   float4 key) {
+    return {fmaf(alpha, state.x, delta * key.x), fmaf(alpha, state.y, delta * key.y),
+            fmaf(alpha, state.z, delta * key.z), fmaf(alpha, state.w, delta * key.w)};
+}
+
+// Form suffix products of the represented decays. A represented zero still resets
+// state directly. If a product leaves the normal FP32 range, retain the unscaled
+// keys and apply the individual transitions instead.
+template <int TileRows, class Access>
+__device__ __forceinline__ void stage_decays(FoldWindow<TileRows>& sm, const Access& access,
+                                             std::int64_t column, int head, int lane, int commit) {
+    const float alpha = lane < commit ? access.alpha(column + lane, head) : 1.f;
+    if (lane < commit) sm.alpha[lane] = alpha;
+    float decay   = 1.f;
+    bool fallback = false;
+    for (int t = commit - 1; t >= 0; --t) {
+        if (lane == t) sm.suffix[t] = decay;
+        const float a       = __shfl_sync(common::kFullWarpMask, alpha, t);
+        const float product = decay * a;
+        fallback |= !isfinite(product) || (product < FLT_MIN && decay > 0.f && a > 0.f);
+        decay = product;
+    }
+    if (lane == 0) {
+        sm.total_decay = decay;
+        sm.fallback    = fallback;
+    }
+}
+
+template <class Launcher, class Geometry, class Rows>
+void launch_replay_fold_fixed(const GdnReplayRecords& records,
+                              LinearAttentionStateAllLayersView states, const Rows& rows,
+                              int active_rows, int record_begin, cudaStream_t stream) {
+    const auto [key, delta, alpha] = ninfer::detail::GdnReplayRecordAccess::planes(records);
+    const FoldAccess<Geometry, Rows> access{
+        static_cast<const __nv_bfloat16*>(key.data),
+        static_cast<const float*>(delta.data),
+        static_cast<const float*>(alpha.data),
+        static_cast<const __nv_bfloat16*>(records.conv.data),
+        common::operand::state_field_base<float>(states.recurrent),
+        common::operand::state_field_base<__nv_bfloat16>(states.conv),
+        static_cast<std::int64_t>(states.recurrent.field.layer_stride / sizeof(float)),
+        static_cast<std::int64_t>(states.conv.field.layer_stride / sizeof(__nv_bfloat16)),
+        records.spec.record_capacity,
+        records.spec.width,
+        rows,
+        record_begin,
+    };
+    Launcher::launch(access, active_rows, stream);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+template <class Launcher, class Rows>
+void dispatch_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states,
+                          const Rows& rows, int active_rows, int record_begin,
+                          cudaStream_t stream) {
+    switch (select_fold_geometry(records.spec)) {
+    case FoldGeometryId::Layers48Heads48:
+        return launch_replay_fold_fixed<Launcher, FoldGeometry<48, 16, 48, 10240>>(
+            records, states, rows, active_rows, record_begin, stream);
+    case FoldGeometryId::Layers30Heads32:
+        return launch_replay_fold_fixed<Launcher, FoldGeometry<30, 16, 32, 8192>>(
+            records, states, rows, active_rows, record_begin, stream);
+    case FoldGeometryId::Layers36Heads48:
+        return launch_replay_fold_fixed<Launcher, FoldGeometry<36, 16, 48, 10240>>(
+            records, states, rows, active_rows, record_begin, stream);
+    case FoldGeometryId::Layers36Heads24:
+        return launch_replay_fold_fixed<Launcher, FoldGeometry<36, 8, 24, 5120>>(
+            records, states, rows, active_rows, record_begin, stream);
+    }
 }
 
 } // namespace ninfer::ops::detail::gated_delta_net

@@ -7,9 +7,9 @@ using namespace ninfer::bench;
 namespace {
 void run_ragged(const kda::Options& options, L2FlushBuffer& flush, CudaExecutionView cuda) {
     kda::RaggedWeights weights(options);
-    measurement::Csv csv(options.timing.csv_out, std::string(kda::Traffic::columns) +
-                                                     ",kv_records,record_origin,state_form");
-    const auto extra = ",,none," + std::string(ragged::state_form_name(options.state_form));
+    measurement::Csv csv(options.timing.csv_out,
+                         std::string(kda::Traffic::columns) + ",record_origin,state_form");
+    const auto extra = ",none," + std::string(ragged::state_form_name(options.state_form));
     for (const auto& lengths : options.ragged_specs) {
         kda::RaggedFixture fixture(options, lengths, weights);
         const auto bytes = kda::traffic(fixture);
@@ -57,7 +57,7 @@ int main(int argc, char** argv) {
             return 0;
         }
         measurement::Csv csv(o.timing.csv_out,
-                             std::string(kda::Traffic::columns) + ",kv_records,record_origin");
+                             std::string(kda::Traffic::columns) + ",record_origin");
         for (int t : o.tokens) {
             kda::Fixture f(o, t);
             const auto bytes = kda::traffic(f, o.op);
@@ -90,8 +90,6 @@ int main(int argc, char** argv) {
                     row.workspace_peak = o.op == "fold" ? 0 : f.workspace->peak_used();
                     csv.write(row, r, execution, cache,
                               bytes.csv(r.gpu.median_us) + "," +
-                                  (o.op == "record" ? (o.alias_records ? "alias" : "copy") : "") +
-                                  "," +
                                   (f.projects_fold() || f.recorded_layer() || o.op == "chain" ||
                                            o.op == "input-record"
                                        ? "projection"

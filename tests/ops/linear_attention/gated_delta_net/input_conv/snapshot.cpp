@@ -25,18 +25,7 @@ using namespace ninfer::test::input_projection;
 
 namespace {
 
-// The complete A16 Op includes BF16 output rounding, whose unit roundoff is 1/256.
-constexpr ReductionCriterion kGdnInputProjConvSnapshotA16Tolerance{3.15e-3, 4.0e-3, 1.0 / 256.0};
-// Q8 A16 includes BF16 weight reconstruction and, in the composed arithmetic
-// profile, BF16 projection storage before convolution. The FP64 oracle keeps
-// both intermediates ideal. Allow two BF16 unit roundoffs in L2 for the projection
-// and nonlinear output, with a finite gross cap; fused routes avoid the inner cast.
-constexpr ReductionCriterion kQ8GdnInputProjConvSnapshotA16Tolerance{2.0 / 256.0, 1.0 / 256.0,
-                                                                     2.0 / 256.0};
-constexpr ReductionCriterion kGdnInputProjConvSnapshotA4Tolerance{0.16, 4.0e-3, 0.16};
-constexpr ReductionCriterion kFp8GdnInputProjConvSnapshotA16Tolerance{1.0 / 256.0, 1.0 / 256.0,
-                                                                      2.0 / 256.0};
-constexpr ReductionCriterion kFp8GdnInputProjConvSnapshotA8Tolerance{0.04, 1.0 / 256.0, 0.06};
+using namespace ninfer::test::gdn_input_conv;
 
 constexpr std::int32_t kQueryRows = 2048;
 constexpr std::int32_t kKeyRows   = 2048;

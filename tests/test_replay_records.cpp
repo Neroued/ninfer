@@ -78,16 +78,63 @@ int compact_widths(const Layout& maximum,
     return failures;
 }
 
+using GdnAccess = ninfer::detail::GdnReplayRecordAccess;
+
+int compact_gdn_widths(const ninfer::GdnReplayRecordLayout& maximum) {
+    int failures = compact_widths(maximum, {{&ninfer::GdnReplayRecordLayout::conv, 1}});
+    const auto [key, delta, alpha] = GdnAccess::planes(maximum);
+    for (int width = 1; width <= maximum.spec.width; ++width) {
+        const auto child                                 = maximum.with_width(width);
+        const auto [child_key, child_delta, child_alpha] = GdnAccess::planes(child);
+        failures +=
+            expect_size(child.payload_bytes(), maximum.payload_bytes() / maximum.spec.width * width,
+                        "compact GDN payload");
+        const auto check = [&](const auto& parent, const auto& plane, int axis) {
+            auto shape  = parent.shape;
+            shape[axis] = width;
+            return expect(
+                plane.region.offset == parent.region.offset && plane.region.alignment == 256 &&
+                    plane.region.bytes == parent.region.bytes / maximum.spec.width * width &&
+                    plane.shape == shape && plane.dtype == parent.dtype,
+                "compact GDN recurrence plane");
+        };
+        failures +=
+            check(key, child_key, 2) + check(delta, child_delta, 2) + check(alpha, child_alpha, 1);
+    }
+    return failures;
+}
+
+using KdaAccess = ninfer::detail::KdaReplayRecordAccess;
+
+int compact_kda_widths(const ninfer::KdaReplayRecordLayout& maximum) {
+    int failures = compact_widths(maximum, {{&ninfer::KdaReplayRecordLayout::conv, 1}});
+    const auto [key, delta, alpha] = KdaAccess::planes(maximum);
+    for (int width = 1; width <= maximum.spec.width; ++width) {
+        const auto child = maximum.with_width(width);
+        const auto [child_key, child_delta, child_alpha] = KdaAccess::planes(child);
+        failures +=
+            expect_size(child.payload_bytes(), maximum.payload_bytes() / maximum.spec.width * width,
+                        "compact KDA payload");
+        const auto check = [&](const auto& parent, const auto& plane) {
+            auto shape = parent.shape;
+            shape[2] = width;
+            return expect(
+                plane.region.offset == parent.region.offset && plane.region.alignment == 256 &&
+                    plane.region.bytes == parent.region.bytes / maximum.spec.width * width &&
+                    plane.shape == shape && plane.dtype == parent.dtype,
+                "compact KDA recurrence plane");
+        };
+        failures += check(key, child_key) + check(delta, child_delta) + check(alpha, child_alpha);
+    }
+    return failures;
+}
+
 int derived_record_layouts() {
     ninfer::LayoutBuilder builder;
     (void)builder.add(73, 1, "preceding field");
-    using G      = ninfer::GdnReplayRecordLayout;
-    using K      = ninfer::KdaReplayRecordLayout;
     const auto g = ninfer::plan_gdn_replay_records(builder, {3, 5, 8, 64, 2, 4, 16, 16});
     const auto k = ninfer::plan_kda_replay_records(builder, {3, 5, 8, 64, 2, 4, 16, 16});
-    return compact_widths(g, {{&G::conv, 1}, {&G::key, 2}, {&G::value, 2}, {&G::gate, 2}}) +
-           compact_widths(
-               k, {{&K::conv, 1}, {&K::key, 2}, {&K::value, 2}, {&K::log_decay, 2}, {&K::beta, 1}});
+    return compact_gdn_widths(g) + compact_kda_widths(k);
 }
 
 std::size_t record_bytes(const ninfer::GdnReplayRecordSpec& spec) {
@@ -112,19 +159,36 @@ int large_record_capacity() {
         const auto kda_layout = ninfer::plan_kda_replay_records(kda_builder, kda);
         ninfer::HostBuffer kda_memory(kda_builder.finish(256));
         const ninfer::KdaReplayRecords kda_records(kda_memory.span(), kda_layout);
+        const auto gdn_base = GdnAccess::planes(gdn_records);
+        const auto kda_base = KdaAccess::planes(kda_records);
+        failures += expect(kda_base.key.dtype == ninfer::DType::BF16, "KDA key dtype");
+        for (const auto* plane : {&kda_records.conv, &kda_base.key, &kda_base.delta,
+                                  &kda_base.alpha})
+            failures += expect(reinterpret_cast<std::uintptr_t>(plane->data) % 256 == 0,
+                               "KDA record plane alignment");
         for (const int active : {1, 8, capacity}) {
-            const auto g                 = gdn_records.layer(2, active);
-            const auto k                 = kda_records.layer(2, active);
+            const auto gdn_layer         = gdn_records.layer(2, active);
+            const auto g                 = GdnAccess::planes(gdn_layer.recurrence);
+            const auto kda_layer = kda_records.layer(2, active);
+            const auto k = KdaAccess::planes(kda_layer.recurrence);
             const std::size_t key_offset = 2ULL * capacity * dim * heads * width * 2;
             failures += expect_size(static_cast<const std::byte*>(g.key.data) -
-                                        static_cast<const std::byte*>(gdn_records.key.data),
+                                        static_cast<const std::byte*>(gdn_base.key.data),
                                     key_offset, "GDN layer offset depends on active rows");
             failures += expect_size(static_cast<const std::byte*>(k.key.data) -
-                                        static_cast<const std::byte*>(kda_records.key.data),
+                                        static_cast<const std::byte*>(kda_base.key.data),
                                     key_offset, "KDA layer offset depends on active rows");
             failures += expect_shape(g.key, dim, heads, width, active, "large GDN layer");
             failures += expect_shape(k.key, dim, heads, width, active, "large KDA layer");
-            failures += expect_shape(k.log_decay, dim, heads, width, active, "large KDA decay");
+            failures += expect_shape(k.delta, dim, heads, width, active, "large KDA delta");
+            failures += expect_shape(k.alpha, dim, heads, width, active, "large KDA alpha");
+            for (const auto [plane, base] : {std::pair{&k.delta, &kda_base.delta},
+                                             std::pair{&k.alpha, &kda_base.alpha}}) {
+                failures += expect(plane->dtype == ninfer::DType::FP32, "KDA transition dtype");
+                failures += expect_size(static_cast<const std::byte*>(plane->data) -
+                                            static_cast<const std::byte*>(base->data),
+                                        2 * key_offset, "KDA transition offset");
+            }
         }
         failures += expect_throw([&] { (void)gdn_records.layer(0, capacity + 1); },
                                  "GDN row outside allocated capacity");
@@ -156,40 +220,47 @@ int main() {
     ninfer::HostBuffer backing(bytes);
     const ninfer::GdnReplayRecords records(backing.span(), layout);
 
+    const auto [key, delta, alpha] = GdnAccess::planes(records);
     failures += expect_shape(records.conv, 256, 4, 15, 1, "conv plane");
-    failures += expect_shape(records.key, 128, 2, 4, 15, "key plane");
-    failures += expect_shape(records.value, 128, 6, 4, 15, "value plane");
-    failures += expect_shape(records.gate, 2, 6, 4, 15, "gate plane");
+    failures += expect_shape(key, 128, 2, 4, 15, "key plane");
+    failures += expect_shape(delta, 128, 6, 4, 15, "delta plane");
+    failures += expect_shape(alpha, 6, 4, 15, 1, "alpha plane");
     failures += expect(records.conv.dtype == ninfer::DType::BF16, "conv dtype differs");
-    failures += expect(records.key.dtype == ninfer::DType::BF16, "key dtype differs");
-    failures += expect(records.value.dtype == ninfer::DType::BF16, "value dtype differs");
-    failures += expect(records.gate.dtype == ninfer::DType::FP32, "gate dtype differs");
+    failures += expect(key.dtype == ninfer::DType::BF16, "key dtype differs");
+    failures += expect(delta.dtype == ninfer::DType::FP32, "delta dtype differs");
+    failures += expect(alpha.dtype == ninfer::DType::FP32, "alpha dtype differs");
     failures += expect(reinterpret_cast<std::uintptr_t>(records.conv.data) % 256 == 0,
                        "conv plane is not aligned");
-    failures += expect(reinterpret_cast<std::uintptr_t>(records.key.data) % 256 == 0,
-                       "key plane is not aligned");
-    failures += expect(reinterpret_cast<std::uintptr_t>(records.value.data) % 256 == 0,
-                       "value plane is not aligned");
-    failures += expect(reinterpret_cast<std::uintptr_t>(records.gate.data) % 256 == 0,
-                       "gate plane is not aligned");
+    failures +=
+        expect(reinterpret_cast<std::uintptr_t>(key.data) % 256 == 0, "key plane is not aligned");
+    failures += expect(reinterpret_cast<std::uintptr_t>(delta.data) % 256 == 0,
+                       "delta plane is not aligned");
+    failures += expect(reinterpret_cast<std::uintptr_t>(alpha.data) % 256 == 0,
+                       "alpha plane is not aligned");
     failures += expect_size(layout.payload_bytes(),
-                            records.conv.bytes() + records.key.bytes() + records.value.bytes() +
-                                records.gate.bytes(),
+                            records.conv.bytes() + key.bytes() + delta.bytes() + alpha.bytes(),
                             "record payload bytes");
 
     const auto layer2 = records.layer(2, 3);
+    const auto layer  = GdnAccess::planes(layer2.recurrence);
     failures += expect_shape(layer2.conv, 256, 4, 3, 1, "layer conv slice");
-    failures += expect_shape(layer2.key, 128, 2, 4, 3, "layer key slice");
-    failures += expect_shape(layer2.value, 128, 6, 4, 3, "layer value slice");
-    failures += expect_shape(layer2.gate, 2, 6, 4, 3, "layer gate slice");
+    failures += expect_shape(layer.key, 128, 2, 4, 3, "layer key slice");
+    failures += expect_shape(layer.delta, 128, 6, 4, 3, "layer delta slice");
+    failures += expect_shape(layer.alpha, 6, 4, 3, 1, "layer alpha slice");
     failures += expect(
         static_cast<std::byte*>(layer2.conv.data) - static_cast<std::byte*>(records.conv.data) ==
             static_cast<std::ptrdiff_t>(2 * spec.record_capacity * records.conv.nb[2]),
         "layer conv slice offset differs");
-    failures += expect(
-        static_cast<std::byte*>(layer2.key.data) - static_cast<std::byte*>(records.key.data) ==
-            static_cast<std::ptrdiff_t>(2 * spec.record_capacity * records.key.nb[3]),
-        "layer key slice offset differs");
+    failures +=
+        expect(static_cast<std::byte*>(layer.key.data) - static_cast<std::byte*>(key.data) ==
+                   static_cast<std::ptrdiff_t>(2 * spec.record_capacity * key.nb[3]),
+               "layer key slice offset differs");
+    failures +=
+        expect_size(static_cast<std::byte*>(layer.delta.data) - static_cast<std::byte*>(delta.data),
+                    2 * spec.record_capacity * delta.nb[3], "layer delta slice offset");
+    failures +=
+        expect_size(static_cast<std::byte*>(layer.alpha.data) - static_cast<std::byte*>(alpha.data),
+                    2 * spec.record_capacity * alpha.nb[2], "layer alpha slice offset");
     failures += expect_throw([&] { (void)records.layer(-1, 1); }, "negative layer");
     failures += expect_throw([&] { (void)records.layer(3, 1); }, "past-end layer");
     failures += expect_throw([&] { (void)records.layer(0, 0); }, "zero active rows");
@@ -203,7 +274,7 @@ int main() {
                                           .value_heads     = 48,
                                           .key_dim         = 128,
                                           .value_dim       = 128}),
-                            85819392, "48-layer T6 capacity");
+                            113688576, "48-layer T6 capacity");
     failures += expect_size(record_bytes({.layers          = 30,
                                           .record_capacity = 8,
                                           .width           = 6,
@@ -212,7 +283,7 @@ int main() {
                                           .value_heads     = 32,
                                           .key_dim         = 128,
                                           .value_dim       = 128}),
-                            41656320, "30-layer T6 capacity");
+                            53268480, "30-layer T6 capacity");
     failures += expect_size(record_bytes({.layers          = 30,
                                           .record_capacity = 8,
                                           .width           = 16,
@@ -221,7 +292,7 @@ int main() {
                                           .value_heads     = 32,
                                           .key_dim         = 128,
                                           .value_dim       = 128}),
-                            111083520, "30-layer T16 capacity");
+                            142049280, "30-layer T16 capacity");
 
     failures += expect_throw(
         [&] {

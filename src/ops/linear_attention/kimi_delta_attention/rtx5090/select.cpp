@@ -49,9 +49,11 @@ RecordSchedule select_record_schedule(int heads, int tokens, int batch) {
     return {4};
 }
 
-FoldSchedule select_fold_schedule(int layers, int heads, int width, int batch, int sms) {
-    if (std::int64_t(layers) * heads * batch < 2LL * sms) return {4, 4};
-    return width <= 8 ? FoldSchedule{16, 4} : FoldSchedule{8, 4};
+int select_fold_warps(int layers, int heads, int batch, int multiprocessors) {
+    const auto groups = std::int64_t(layers) * heads * batch;
+    // 16-row tiles fill short one-layer grids and give large streaming grids more CTAs
+    // per SM. The middle range benefits from amortizing record stages over 32 rows.
+    return 2 * groups >= multiprocessors && groups <= 16LL * multiprocessors ? 8 : 4;
 }
 } // namespace ninfer::ops::detail::kimi_delta_attention
 

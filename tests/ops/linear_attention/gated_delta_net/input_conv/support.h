@@ -20,6 +20,31 @@ struct Profile {
     int value_rows() const { return qk_rows == 1024 ? 3072 : (hidden == 2048 ? 4096 : 6144); }
 };
 
+// The complete A16 Op includes BF16 output rounding, whose unit roundoff is 1/256.
+inline constexpr ReductionCriterion kGdnInputProjConvSnapshotA16Tolerance{3.15e-3, 4.0e-3,
+                                                                          1.0 / 256.0};
+// Q8 A16 includes BF16 weight reconstruction and, in the composed arithmetic
+// profile, BF16 projection storage before convolution. The FP64 oracle keeps
+// both intermediates ideal. Allow two BF16 unit roundoffs in L2 for the projection
+// and nonlinear output, with a finite gross cap; fused routes avoid the inner cast.
+inline constexpr ReductionCriterion kQ8GdnInputProjConvSnapshotA16Tolerance{
+    2.0 / 256.0, 1.0 / 256.0, 2.0 / 256.0};
+inline constexpr ReductionCriterion kGdnInputProjConvSnapshotA4Tolerance{0.16, 4.0e-3, 0.16};
+inline constexpr ReductionCriterion kFp8GdnInputProjConvSnapshotA16Tolerance{
+    1.0 / 256.0, 1.0 / 256.0, 2.0 / 256.0};
+inline constexpr ReductionCriterion kFp8GdnInputProjConvSnapshotA8Tolerance{0.04, 1.0 / 256.0,
+                                                                            0.06};
+
+inline const ReductionCriterion& projection_conv_criterion(Profile profile,
+                                                           ops::LinearPolicy policy) {
+    if (profile.format == QType::Q8_G32_FP16) return kQ8GdnInputProjConvSnapshotA16Tolerance;
+    if (profile.format == QType::FP8_E4M3FN_ROW_BF16)
+        return policy == ops::LinearPolicy::A16Only ? kFp8GdnInputProjConvSnapshotA16Tolerance
+                                                    : kFp8GdnInputProjConvSnapshotA8Tolerance;
+    return policy == ops::LinearPolicy::AllowA4 ? kGdnInputProjConvSnapshotA4Tolerance
+                                                : kGdnInputProjConvSnapshotA16Tolerance;
+}
+
 inline constexpr Profile profiles[]{{QType::Q4_G64_FP16, 5120, "q4_q5"},
                                     {QType::Q8_G32_FP16, 2048, "q8"},
                                     {QType::Q8_G32_FP16, 2560, "q8"},

@@ -1,34 +1,21 @@
-#include "core/platform.h"
-#include "fold_compare.h"
-#include "ops/suite.h"
-#include "ninfer/ops/gated_delta_net.h"
+#include "gdn_ref.h"
+
 #include "cuda_fixture.h"
-#include "core/buffer.h"
-#include "ninfer/ops/gdn_input_proj.h"
+#include "ninfer/ops/gated_delta_net.h"
 #include "ninfer/ops/gdn_replay.h"
-
-#include "core/decode_graph.h"
-#include "core/device.h"
-#include "core/gdn_replay_records.h"
-#include "core/layout.h"
-#include "core/linear_attention_state.h"
-#include "core/weight.h"
-#include "ops/input_projection_test_common.h"
 #include "ops/op_tester.h"
-#include "ops/state_fixture.h"
-
-#include <cuda_runtime.h>
+#include "ops/suite.h"
 
 #include <algorithm>
-#include <bit>
+#include <array>
 #include <cmath>
-#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <numeric>
 #include <optional>
-#include <string>
+#include <span>
 #include <vector>
 
 using namespace ninfer;
@@ -36,853 +23,533 @@ using namespace ninfer::test;
 
 namespace {
 
-constexpr std::int32_t kStateDim       = 128;
-constexpr std::int32_t kRecordCapacity = 8;
-constexpr std::size_t kGuardBytes      = 256;
+constexpr int kDim      = 128;
+constexpr double kScale = 1.0 / std::sqrt(double(kDim));
 
-std::uint32_t mix(std::uint32_t value) {
-    value ^= value >> 16;
-    value *= 0x7feb352dU;
-    value ^= value >> 15;
-    value *= 0x846ca68bU;
-    return value ^ (value >> 16);
-}
-
-float signed_pattern(std::uint32_t key, float magnitude = 0.06F) {
-    const std::int32_t centered = static_cast<std::int32_t>(mix(key) % 2001U) - 1000;
-    return static_cast<float>(centered) * (magnitude / 1000.0F);
-}
-
-std::uint16_t bf16_pattern(std::uint32_t key, float magnitude = 0.06F) {
-    return f32_to_bf16(signed_pattern(key, magnitude));
-}
-
-void* offset_pointer(void* pointer, std::size_t bytes) {
-    return static_cast<void*>(static_cast<std::byte*>(pointer) + bytes);
-}
-
-const void* offset_pointer(const void* pointer, std::size_t bytes) {
-    return static_cast<const void*>(static_cast<const std::byte*>(pointer) + bytes);
-}
-
-struct FoldProfile {
-    std::int32_t layers;
-    std::int32_t value_heads;
-    std::int32_t conv_channels;
+struct Geometry {
+    int layers, qk_heads, heads, channels;
 };
 
-std::vector<float> initial_recurrent_values(std::size_t elements, std::uint32_t seed, int layer,
-                                            int row) {
-    std::vector<float> values(elements,
-                              signed_pattern(seed + 500009U + layer * 227U + row * 43U, 0.01F));
-    values[0] = std::bit_cast<float>(0x80000000U);
+constexpr Geometry k48x48{48, 16, 48, 10240};
+constexpr Geometry k30x32{30, 16, 32, 8192};
+constexpr Geometry k36x48{36, 16, 48, 10240};
+constexpr Geometry k36x24{36, 8, 24, 5120};
+
+enum class Execution { Host, HostGraph, Device, DeviceGraph };
+
+bool device_rows(Execution execution) {
+    return execution == Execution::Device || execution == Execution::DeviceGraph;
+}
+
+struct Stream {
+    cudaStream_t handle{};
+
+    Stream() { CUDA_CHECK(cudaStreamCreateWithFlags(&handle, cudaStreamNonBlocking)); }
+
+    ~Stream() { cudaStreamDestroy(handle); }
+};
+
+template <class Launch, class Prepare>
+void run_graph(cudaStream_t stream, Launch launch, Prepare prepare) {
+    cudaGraph_t graph;
+    cudaGraphExec_t executable;
+    CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+    launch();
+    CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
+    CUDA_CHECK(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
+    CUDA_CHECK(cudaGraphLaunch(executable, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    prepare();
+    CUDA_CHECK(cudaGraphLaunch(executable, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaGraphExecDestroy(executable));
+    CUDA_CHECK(cudaGraphDestroy(graph));
+}
+
+template <class Fn>
+int must_reject(const char* label, Fn fn) {
+    try {
+        fn();
+    } catch (const std::out_of_range&) { return 0; } catch (const std::invalid_argument&) {
+        return 0;
+    }
+    std::cerr << "fold accepted " << label << '\n';
+    return 1;
+}
+
+std::vector<float> random_floats(std::size_t count, unsigned seed, float low, float high) {
+    std::vector<float> values(count);
+    fill_uniform(values, seed, low, high);
     return values;
 }
 
-std::vector<std::int32_t> selected_slots(std::int32_t rows) {
-    if (rows == 1) { return {2}; }
-    std::vector<std::int32_t> slots{10, 2, 8, 0, 6, 4, 9, 1};
-    slots.resize(static_cast<std::size_t>(rows));
-    return slots;
+std::vector<std::uint16_t> random_words(std::size_t count, unsigned seed) {
+    const auto values = random_floats(count, seed, -.08f, .08f);
+    std::vector<std::uint16_t> words(count);
+    std::transform(values.begin(), values.end(), words.begin(), f32_to_bf16);
+    words[0] = 0x8000U;
+    words[1] = 0x7fc1U; // Check preservation of payload words as well as finite values.
+    return words;
 }
 
-int check_fold(const GdnReplayRecordLayout& record_layout, DeviceBuffer& record_storage, int rows,
-               const std::vector<std::int32_t>& commits, std::uint32_t seed,
-               bool distinct_destination, bool captured, bool device_rows) {
-    const auto& spec = record_layout.spec;
-    const FoldProfile profile{spec.layers, spec.value_heads, spec.conv_channels};
-    const int width = spec.width, record_capacity = spec.record_capacity, kQkHeads = spec.qk_heads;
-    const bool compact = rows > 8;
-    std::vector<int> reference_indices(rows);
-    std::iota(reference_indices.begin(), reference_indices.end(), 0);
-    int reference_capacity = rows;
-    int first_inactive     = -1;
-    if (compact) {
-        int active = 0;
-        for (int row = 0; row < rows; ++row)
-            if (commits[row]) reference_indices[row] = active++;
-        for (int row = 0; row < rows; ++row)
-            if (!commits[row]) {
-                reference_indices[row] = active;
-                if (first_inactive < 0) first_inactive = row;
-            }
-        reference_capacity = active + (first_inactive >= 0);
-    }
-    const auto repeated_inactive = [&](int row) {
-        return compact && !commits[row] && row != first_inactive;
-    };
-    const auto source_slots   = compact ? reference_indices : selected_slots(rows);
-    auto destination_slots    = source_slots;
-    const int source_capacity = compact ? reference_capacity : rows == 1 ? 3 : 11;
-    if (distinct_destination)
-        for (int row = 0; row < rows; ++row)
-            destination_slots[row] = rows == 1 ? 1 : source_capacity + reference_indices[row];
-    const int slot_count =
-        source_capacity + (distinct_destination && rows != 1 ? reference_capacity : 0);
-    const std::size_t recurrent_slot_elements =
-        static_cast<std::size_t>(kStateDim) * kStateDim * profile.value_heads;
-    const std::size_t recurrent_slot_bytes = recurrent_slot_elements * sizeof(float);
-    const std::size_t conv_slot_elements   = static_cast<std::size_t>(profile.conv_channels) * 3;
-    const std::size_t conv_slot_bytes      = conv_slot_elements * sizeof(std::uint16_t);
+constexpr int kLayerScales = 16;
 
-    const auto record_bytes = record_storage.size() - 2 * kGuardBytes;
-    record_storage.fill(0xa5);
-    void* record_base = offset_pointer(record_storage.data(), kGuardBytes);
-    cuda_check(cudaMemset(record_base, 0xff, record_bytes), "initialize replay records");
-    const GdnReplayRecords records(record_storage.span().subspan(kGuardBytes, record_bytes),
-                                   record_layout);
+float layer_scale(int layer) {
+    const int index = layer % kLayerScales;
+    return std::ldexp(index < 8 ? 1.0f : -1.0f, -(index % 8));
+}
 
-    std::vector<std::uint16_t> conv_records(records.conv.numel(), 0xffffU);
-    std::vector<std::uint16_t> key_records(records.key.numel(), 0xffffU);
-    std::vector<std::uint16_t> value_records(records.value.numel(), 0xffffU);
-    std::vector<std::uint32_t> gate_records(records.gate.numel(), 0xffffffffU);
-    parallel_rows(
-        profile.layers * rows, records.conv.numel() + records.key.numel() + records.value.numel(),
-        [&](int first, int last) {
-            for (int index = first; index < last; ++index) {
-                const int layer = index / rows, row = index % rows;
-                const std::int32_t commit = commits[static_cast<std::size_t>(row)];
-                const std::int64_t record_outer =
-                    static_cast<std::int64_t>(layer) * record_capacity + row;
-                for (std::int32_t token = 0; token < (commit == 0 ? 0 : width); ++token) {
-                    const std::int64_t column = record_outer * width + token;
-                    for (std::int32_t channel = 0; channel < profile.conv_channels; ++channel) {
-                        conv_records[static_cast<std::size_t>(column) * profile.conv_channels +
-                                     channel] =
-                            bf16_pattern(seed + layer * 131U + row * 17U + token * 7U + channel);
-                    }
-                    for (std::int32_t head = 0; head < kQkHeads; ++head) {
-                        const std::size_t base =
-                            static_cast<std::size_t>((column * kQkHeads + head) * kStateDim);
-                        for (std::int32_t dim = 0; dim < kStateDim; ++dim) {
-                            key_records[base + dim] =
-                                bf16_pattern(seed + 100003U + layer * 197U + row * 23U +
-                                                 token * 11U + head * 5U + dim,
-                                             0.08F);
-                        }
-                    }
-                    for (std::int32_t head = 0; head < profile.value_heads; ++head) {
-                        const std::size_t vector_base = static_cast<std::size_t>(
-                            (column * profile.value_heads + head) * kStateDim);
-                        for (std::int32_t dim = 0; dim < kStateDim; ++dim) {
-                            value_records[vector_base + dim] =
-                                bf16_pattern(seed + 200003U + layer * 211U + row * 29U +
-                                                 token * 13U + head * 7U + dim,
-                                             0.08F);
-                        }
-                        const std::size_t gate_base =
-                            static_cast<std::size_t>((column * profile.value_heads + head) * 2);
-                        const float g =
-                            -0.03F -
-                            static_cast<float>(
-                                mix(seed + layer * 31U + row * 17U + token * 7U + head) % 900U) /
-                                1000.0F;
-                        const float beta =
-                            0.05F + static_cast<float>(mix(seed + 300007U + layer * 37U +
-                                                           row * 19U + token * 11U + head) %
-                                                       900U) /
-                                        1000.0F;
-                        gate_records[gate_base]     = std::bit_cast<std::uint32_t>(g);
-                        gate_records[gate_base + 1] = std::bit_cast<std::uint32_t>(beta);
-                    }
-                }
-            }
-        });
-    cuda_check(cudaMemcpy(records.conv.data, conv_records.data(), records.conv.bytes(),
-                          cudaMemcpyHostToDevice),
-               "upload conv records");
-    cuda_check(cudaMemcpy(records.key.data, key_records.data(), records.key.bytes(),
-                          cudaMemcpyHostToDevice),
-               "upload key records");
-    cuda_check(cudaMemcpy(records.value.data, value_records.data(), records.value.bytes(),
-                          cudaMemcpyHostToDevice),
-               "upload value records");
-    cuda_check(cudaMemcpy(records.gate.data, gate_records.data(), records.gate.bytes(),
-                          cudaMemcpyHostToDevice),
-               "upload gate records");
+std::vector<std::uint16_t> represented_words(const std::vector<float>& values, float scale = 1.0f) {
+    std::vector<std::uint16_t> bits(values.size());
+    std::transform(values.begin(), values.end(), bits.begin(),
+                   [scale](float v) { return f32_to_bf16(v * scale); });
+    return bits;
+}
 
-    StateImageBuilder state_builder;
-    const LinearAttentionStateLayout state_layout = plan_linear_attention_state(
-        state_builder, {.layers         = static_cast<std::uint32_t>(profile.layers),
-                        .conv_channels  = profile.conv_channels,
-                        .conv_width     = 3,
-                        .value_heads    = profile.value_heads,
-                        .value_head_dim = kStateDim,
-                        .key_head_dim   = kStateDim,
-                        .conv_dtype     = DType::BF16});
-    const auto image_layout = state_builder.finish();
-    const auto state_offset = [&](int record) {
-        return static_cast<std::int64_t>((image_layout.image_bytes + 256) * record);
-    };
-    const std::size_t state_bytes = static_cast<std::size_t>(state_offset(slot_count));
-    DeviceBuffer state_storage(ninfer::test::cuda_environment().context.device(),
-                               state_bytes + 2 * kGuardBytes);
-    state_storage.fill(0xa5);
-    void* state_base = offset_pointer(state_storage.data(), kGuardBytes);
-    cuda_check(cudaMemset(state_base, 0, state_bytes), "initialize all-layer state");
-    StateImageStorage images(state_storage.span().subspan(kGuardBytes, state_bytes), image_layout);
-    LinearAttentionStateView state_pool(images, state_layout);
-
-    DeviceBuffer expected_conv(ninfer::test::cuda_environment().context.device(),
-                               static_cast<std::size_t>(profile.layers) * reference_capacity *
-                                   conv_slot_bytes);
-    expected_conv.fill(0);
-    for (std::int32_t layer = 0; layer < profile.layers; ++layer) {
-        for (std::int32_t row = 0; row < rows; ++row) {
-            if (repeated_inactive(row)) continue;
-            std::vector<std::uint16_t> initial(conv_slot_elements);
-            for (std::int32_t history = 0; history < 3; ++history) {
-                for (std::int32_t channel = 0; channel < profile.conv_channels; ++channel) {
-                    initial[static_cast<std::size_t>(history) * profile.conv_channels + channel] =
-                        bf16_pattern(seed + 400009U + layer * 223U + row * 41U + history * 13U +
-                                         channel,
-                                     0.05F);
-                }
-            }
-            const Tensor destination =
-                state_pool.conv_tensor(static_cast<std::uint32_t>(layer),
-                                       state_offset(source_slots[static_cast<std::size_t>(row)]));
-            cuda_check(cudaMemcpy(destination.data, initial.data(), conv_slot_bytes,
-                                  cudaMemcpyHostToDevice),
-                       "upload initial conv state");
-
-            std::vector<std::uint16_t> expected = initial;
-            const std::int32_t commit           = commits[static_cast<std::size_t>(row)];
-            if (commit == 0 && destination_slots[row] != source_slots[row])
-                std::fill(expected.begin(), expected.end(), 0);
-            if (commit > 0) {
-                const std::int64_t record_outer =
-                    static_cast<std::int64_t>(layer) * record_capacity + row;
-                for (std::int32_t channel = 0; channel < profile.conv_channels; ++channel) {
-                    const auto record_value = [&](std::int32_t token) {
-                        return conv_records[static_cast<std::size_t>(
-                                                (record_outer * width + token) *
-                                                profile.conv_channels) +
-                                            channel];
-                    };
-                    if (commit == 1) {
-                        expected[channel] = initial[profile.conv_channels + channel];
-                        expected[profile.conv_channels + channel] =
-                            initial[2LL * profile.conv_channels + channel];
-                        expected[2LL * profile.conv_channels + channel] = record_value(0);
-                    } else if (commit == 2) {
-                        expected[channel] = initial[2LL * profile.conv_channels + channel];
-                        expected[profile.conv_channels + channel]       = record_value(0);
-                        expected[2LL * profile.conv_channels + channel] = record_value(1);
-                    } else {
-                        expected[channel]                               = record_value(commit - 3);
-                        expected[profile.conv_channels + channel]       = record_value(commit - 2);
-                        expected[2LL * profile.conv_channels + channel] = record_value(commit - 1);
-                    }
-                }
-            }
-            void* expected_destination = offset_pointer(
-                expected_conv.data(),
-                static_cast<std::size_t>(layer * reference_capacity + reference_indices[row]) *
-                    conv_slot_bytes);
-            cuda_check(cudaMemcpy(expected_destination, expected.data(), conv_slot_bytes,
-                                  cudaMemcpyHostToDevice),
-                       "upload expected conv state");
+struct Inputs {
+    Inputs(Geometry geometry, int width, int batch, unsigned seed)
+        : p(geometry), width(width), batch(batch), q(rounded(geometry.qk_heads * kDim, seed)),
+          k(rounded(geometry.qk_heads * kDim, seed + 1)),
+          v(rounded(geometry.heads * kDim, seed + 2)),
+          g(random_floats(gate_count(), seed + 3, -.55f, -.003f)),
+          beta(random_floats(gate_count(), seed + 4, .02f, .98f)) {
+        for (int b = 0; b < batch; ++b) {
+            std::fill_n(k.data() + std::size_t(b * width) * p.qk_heads * kDim, kDim, 0.0f);
+            for (const int t : {0, 2, 3})
+                if (t < width)
+                    g[(b * width + t) * p.heads] = -std::numeric_limits<float>::infinity();
         }
     }
 
-    const std::size_t expected_recurrent_bytes =
-        static_cast<std::size_t>(profile.layers) * reference_capacity * recurrent_slot_bytes;
-    DeviceBuffer expected_recurrent(ninfer::test::cuda_environment().context.device(),
-                                    expected_recurrent_bytes);
-    expected_recurrent.fill(0);
-    DeviceBuffer local_state(ninfer::test::cuda_environment().context.device(),
-                             recurrent_slot_bytes);
-    local_state.fill(0);
-    const std::size_t q_elements = static_cast<std::size_t>(kStateDim) * kQkHeads * width;
-    const std::size_t out_elements =
-        static_cast<std::size_t>(kStateDim) * profile.value_heads * width;
-    DeviceBuffer q(ninfer::test::cuda_environment().context.device(),
-                   q_elements * sizeof(std::uint16_t));
-    DeviceBuffer out(ninfer::test::cuda_environment().context.device(),
-                     out_elements * sizeof(std::uint16_t));
-    q.fill(0);
-    DeviceBuffer g_row(ninfer::test::cuda_environment().context.device(),
-                       static_cast<std::size_t>(profile.value_heads) * width * sizeof(float));
-    DeviceBuffer beta_row(ninfer::test::cuda_environment().context.device(),
-                          static_cast<std::size_t>(profile.value_heads) * width * sizeof(float));
-    const Tensor q_tensor(q.span(), DType::BF16, {kStateDim, kQkHeads, width, 1});
-    Tensor local_state_tensor(local_state.span(), DType::FP32,
-                              {kStateDim, kStateDim, profile.value_heads});
-    DeviceBuffer reference_slot = to_device(std::vector<std::int64_t>{0});
-    Tensor selected_reference_slot(reference_slot.span(), DType::I64, {1});
-    Tensor output(out.span(), DType::BF16, {kStateDim, profile.value_heads, width, 1});
-    constexpr float kScale = 1.0F / std::sqrt(128.0F);
+    std::size_t gate_count() const { return std::size_t(width) * batch * p.heads; }
 
-    for (std::int32_t layer = 0; layer < profile.layers; ++layer) {
-        const GdnReplayRecordLayer layer_records = records.layer(layer, rows);
-        for (std::int32_t row = 0; row < rows; ++row) {
-            if (repeated_inactive(row)) continue;
-            const auto initial_recurrent =
-                initial_recurrent_values(recurrent_slot_elements, seed, layer, row);
-            const Tensor actual_initial = state_pool.recurrent_tensor(
-                static_cast<std::uint32_t>(layer),
-                state_offset(source_slots[static_cast<std::size_t>(row)]));
-            cuda_check(cudaMemcpy(actual_initial.data, initial_recurrent.data(),
-                                  recurrent_slot_bytes, cudaMemcpyHostToDevice),
-                       "upload initial recurrent state");
-            cuda_check(cudaMemcpy(local_state.data(), initial_recurrent.data(),
-                                  recurrent_slot_bytes, cudaMemcpyHostToDevice),
-                       "upload local reference initial state");
+    std::vector<float> rounded(int rows, unsigned seed) const {
+        auto result = random_floats(std::size_t(width) * batch * rows, seed, -.11f, .11f);
+        round_to_bf16(result);
+        return result;
+    }
 
-            const std::int32_t commit = commits[static_cast<std::size_t>(row)];
-            void* expected            = offset_pointer(
-                expected_recurrent.data(),
-                static_cast<std::size_t>(layer * reference_capacity + reference_indices[row]) *
-                    recurrent_slot_bytes);
-            if (commit == 0) {
-                const Tensor untouched = state_pool.recurrent_tensor(
-                    static_cast<std::uint32_t>(layer), state_offset(destination_slots[row]));
-                cuda_check(cudaMemcpy(expected, untouched.data, recurrent_slot_bytes,
-                                      cudaMemcpyDeviceToDevice),
-                           "save untouched destination recurrent state");
-                continue;
+    gdn_ref::Inputs reference(int b, int tokens, std::span<const float> initial) const {
+        const auto prefix = [&](const auto& in, int rows) {
+            const auto first = in.begin() + std::size_t(b * width) * rows;
+            return std::vector<float>(first, first + std::size_t(tokens) * rows);
+        };
+        return {kDim,
+                p.qk_heads,
+                p.heads,
+                tokens,
+                prefix(q, p.qk_heads * kDim),
+                prefix(k, p.qk_heads * kDim),
+                prefix(v, p.heads * kDim),
+                prefix(g, p.heads),
+                prefix(beta, p.heads),
+                {initial.begin(), initial.end()}};
+    }
+
+    Geometry p;
+    int width, batch;
+    std::vector<float> q, k, v, g, beta;
+};
+
+class FoldFixture {
+public:
+    FoldFixture(Geometry profile, int slots, int batch, int max_width,
+                std::optional<float> first_state = std::nullopt)
+        : p(profile), slots(slots), batch(batch),
+          state_layout(plan_linear_attention_state(
+              state_builder, {static_cast<std::uint32_t>(p.layers), p.channels, 3, p.heads, kDim,
+                              kDim, DType::BF16})),
+          image_layout(state_builder.finish()), state_storage(image_layout.image_bytes * slots),
+          images(state_storage.span(), image_layout), states(images, state_layout),
+          maximum(
+              plan_gdn_replay_records(record_builder, {p.layers, batch + 1, max_width, p.channels,
+                                                       p.qk_heads, p.heads, kDim, kDim})),
+          record_storage(record_builder.finish(256)) {
+        recurrent.resize(slots);
+        histories.resize(slots);
+        std::vector<float> scaled(state_elements());
+        for (int slot = 0; slot < slots; ++slot) {
+            recurrent[slot] = random_floats(state_elements(), 8021U + slot, -.025f, .025f);
+            if (first_state) {
+                std::fill(recurrent[slot].begin(), recurrent[slot].end(), 0.f);
+                recurrent[slot][0] = *first_state;
+            } else {
+                recurrent[slot][0] = -0.0f;
             }
-            std::vector<float> g_host(static_cast<std::size_t>(profile.value_heads) * width);
-            std::vector<float> beta_host(static_cast<std::size_t>(profile.value_heads) * width);
-            const std::int64_t record_outer =
-                static_cast<std::int64_t>(layer) * record_capacity + row;
-            for (std::int32_t token = 0; token < width; ++token) {
-                for (std::int32_t head = 0; head < profile.value_heads; ++head) {
-                    const std::size_t source = static_cast<std::size_t>(
-                        ((record_outer * width + token) * profile.value_heads + head) * 2);
-                    const std::size_t destination =
-                        static_cast<std::size_t>(token) * profile.value_heads + head;
-                    g_host[destination]    = std::bit_cast<float>(gate_records[source]);
-                    beta_host[destination] = std::bit_cast<float>(gate_records[source + 1]);
-                }
-            }
-            g_row.copy_from_host(g_host.data(), g_row.size());
-            beta_row.copy_from_host(beta_host.data(), beta_row.size());
-            // Snapshot each transition of the same full W record block. Saving N must not
-            // change the input width or regenerate any projection at N.
-            for (int token = 0; token < width; ++token) {
-                Tensor query = q_tensor.slice(2, token, 1).view({kStateDim, kQkHeads, 1});
-                Tensor key   = layer_records.key.slice(3, row, 1)
-                                 .slice(2, token, 1)
-                                 .view({kStateDim, kQkHeads, 1});
-                Tensor value = layer_records.value.slice(3, row, 1)
-                                   .slice(2, token, 1)
-                                   .view({kStateDim, profile.value_heads, 1});
-                Tensor g_tensor(g_row.span().subspan(std::size_t(token) * profile.value_heads * 4),
-                                DType::FP32, {profile.value_heads, 1});
-                Tensor beta_tensor(
-                    beta_row.span().subspan(std::size_t(token) * profile.value_heads * 4),
-                    DType::FP32, {profile.value_heads, 1});
-                Tensor output_token =
-                    output.slice(2, token, 1).view({kStateDim, profile.value_heads, 1});
-                ops::gated_delta_net_batch_update(
-                    query, key, value, g_tensor, beta_tensor, kScale, true,
-                    dense_record_field(local_state_tensor, 3, selected_reference_slot),
-                    dense_record_field(local_state_tensor, 3, selected_reference_slot), {},
-                    output_token, ninfer::test::cuda_environment().default_execution);
-                if (token + 1 == commit)
-                    cuda_check(cudaMemcpyAsync(expected, local_state.data(), recurrent_slot_bytes,
-                                               cudaMemcpyDeviceToDevice, nullptr),
-                               "save Nth snapshot");
+            histories[slot].resize(p.layers);
+            for (int layer = 0; layer < p.layers; ++layer) {
+                auto& history = histories[slot][layer];
+                history       = random_words(3 * p.channels, 2017U + 121U * slot + layer);
+                CUDA_CHECK(cudaMemcpy(states.conv_tensor(layer, offset(slot)).data, history.data(),
+                                      history.size() * sizeof(std::uint16_t),
+                                      cudaMemcpyHostToDevice));
+                const float scale = layer_scale(layer);
+                std::transform(recurrent[slot].begin(), recurrent[slot].end(), scaled.begin(),
+                               [scale](float f) { return f * scale; });
+                CUDA_CHECK(cudaMemcpy(states.recurrent_tensor(layer, offset(slot)).data,
+                                      scaled.data(), scaled.size() * sizeof(float),
+                                      cudaMemcpyHostToDevice));
             }
         }
     }
 
-    DeviceBuffer records_before(record_storage.device(), record_storage.size());
-    CUDA_CHECK(cudaMemcpyAsync(records_before.data(), record_storage.data(), record_storage.size(),
-                               cudaMemcpyDeviceToDevice, nullptr));
-    CUDA_CHECK(cudaStreamSynchronize(nullptr));
-    std::vector<ops::GdnReplayFoldRow> fold_rows(static_cast<std::size_t>(rows));
-    for (std::int32_t row = 0; row < rows; ++row) {
-        fold_rows[static_cast<std::size_t>(row)] = {
-            commits[row] ? state_offset(source_slots[row]) : -1,
-            commits[row] ? state_offset(destination_slots[row]) : -1,
-            commits[static_cast<std::size_t>(row)]};
+    std::int64_t offset(int slot) const { return slot < 0 ? -1 : slot * image_layout.image_bytes; }
+
+    std::size_t state_elements() const { return std::size_t(p.heads) * kDim * kDim; }
+
+    float leading_state() const {
+        return from_device<float>(states.recurrent_tensor(0, 0).data, 1).front();
     }
-    const ops::GdnReplayFoldPlan fold_plan(records, state_pool.all_layers_view());
-    std::vector<std::int64_t> source_offsets(rows), destination_offsets(rows);
-    for (int row = 0; row < rows; ++row) {
-        source_offsets[row]      = commits[row] ? state_offset(source_slots[row]) : -1;
-        destination_offsets[row] = commits[row] ? state_offset(destination_slots[row]) : -1;
-    }
-    auto device_sources      = to_device(source_offsets);
-    auto device_destinations = to_device(destination_offsets);
-    auto device_commits      = to_device(commits);
-    const Tensor source_metadata(device_sources.span(), DType::I64, {rows});
-    const Tensor destination_metadata(device_destinations.span(), DType::I64, {rows});
-    const Tensor commit_metadata(device_commits.span(), DType::I32, {rows});
-    const auto execute = [&](CudaExecutionView cuda) {
-        if (device_rows)
-            fold_plan.execute(source_metadata, destination_metadata, commit_metadata, cuda);
-        else
-            fold_plan.execute(fold_rows, cuda);
-    };
-    if (captured || (width == 16 && rows == 8)) {
+
+    int round(const Inputs& inputs, const std::vector<int>& source_slots,
+              const std::vector<int>& dest_slots, const std::vector<int>& commits,
+              Execution execution, bool checks = false, std::vector<double>* trajectory = nullptr) {
+        const int width = inputs.width;
+        auto& context   = cuda_environment().context;
+        Stream stream;
+        const auto cuda = context.execution_view(stream.handle);
+        const GdnReplayRecords records(record_storage.span(), maximum.with_width(width));
+        const ops::GdnReplayFoldPlan plan(records, states.all_layers_view());
+        record_storage.fill(0xff);
+
+        std::vector<int> valid(batch);
+        std::vector<std::int64_t> record_offsets(batch), sources(batch), destinations(batch);
+        std::vector<ops::GdnReplayFoldRow> rows(batch);
+        for (int b = 0; b < batch; ++b) {
+            valid[b] = commits[b] == 0 && b % 2 == 0 ? 0 : std::max(commits[b], width - b % 3);
+            record_offsets[b] = valid[b] ? offset(source_slots[b]) : -1;
+            sources[b]        = commits[b] ? offset(source_slots[b]) : -1;
+            destinations[b]   = commits[b] ? offset(dest_slots[b]) : -1;
+            rows[b]           = {sources[b], destinations[b], commits[b]};
+        }
+        auto q_buffer              = to_device(represented_words(inputs.q));
+        auto k_buffer              = to_device(represented_words(inputs.k));
+        auto gate_buffer           = to_device(inputs.g);
+        auto beta_buffer           = to_device(inputs.beta);
+        auto record_offsets_buffer = to_device(record_offsets);
+        auto valid_buffer          = to_device(valid);
+        const Tensor q(q_buffer.span(), DType::BF16, {kDim, p.qk_heads, width, batch});
+        const Tensor k(k_buffer.span(), DType::BF16, {kDim, p.qk_heads, width, batch});
+        const Tensor g(gate_buffer.span(), DType::FP32, {p.heads, width, batch});
+        const Tensor beta(beta_buffer.span(), DType::FP32, {p.heads, width, batch});
+        const Tensor select(record_offsets_buffer.span(), DType::I64, {batch});
+        const Tensor valid_tensor(valid_buffer.span(), DType::I32, {batch});
+        std::vector<DeviceBuffer> values;
+        for (int i = 0; i < kLayerScales; ++i)
+            values.push_back(to_device(represented_words(inputs.v, layer_scale(i))));
+        const auto output_elements = std::size_t(kDim) * p.heads * width * batch;
+        DeviceBuffer out_buffer(context.device(), output_elements * sizeof(std::uint16_t) *
+                                                      (trajectory ? p.layers : 1));
+        std::vector<std::vector<std::uint16_t>> conv_records(p.layers);
+        for (int layer = 0; layer < p.layers; ++layer) {
+            const auto record = records.layer(layer, batch);
+            auto& conv        = conv_records[layer];
+            conv              = random_words(record.conv.numel(), 1709U + layer * 17 + width);
+            for (int b = 0; b < batch; ++b)
+                std::fill_n(conv.data() + (std::size_t(b) * width + valid[b]) * p.channels,
+                            (width - valid[b]) * p.channels, 0xffffU);
+            CUDA_CHECK(cudaMemcpy(record.conv.data, conv.data(), record.conv.bytes(),
+                                  cudaMemcpyHostToDevice));
+        }
         cuda_synchronize();
-        DeviceBuffer original(ninfer::test::cuda_environment().context.device(), state_bytes);
-        DeviceContext context;
-        cuda_check(cudaMemcpyAsync(original.data(), state_base, state_bytes,
-                                   cudaMemcpyDeviceToDevice, context.stream()),
-                   "save graph initial state");
-        DecodeGraphDefinition definition;
-        DecodeGraphExecutable graph;
-        if (device_rows) device_commits.fill(0);
-        definition.capture(context.stream(), [&] { execute(context.execution_view()); });
-        graph.instantiate(definition);
-        if (device_rows)
-            device_commits.copy_from_host(commits.data(), commits.size() * sizeof(int));
-        // Host row descriptors are captured by value. Mutating them after capture must
-        // not alter the graph's accepted prefixes. GPU state remains a live operand.
-        for (auto& row : fold_rows) row.commit_columns = 0;
-        // Restore GPU state between replays.
-        for (int replay = 0; replay < 2; ++replay) {
-            cuda_check(cudaMemcpyAsync(state_base, original.data(), state_bytes,
-                                       cudaMemcpyDeviceToDevice, context.stream()),
-                       "restore graph state");
-            graph.launch(context.stream());
-            context.synchronize();
+        for (int layer = 0; layer < p.layers; ++layer) {
+            auto buffer = out_buffer.span();
+            if (trajectory)
+                buffer = buffer.subspan(layer * output_elements * sizeof(std::uint16_t));
+            Tensor out(buffer, DType::BF16, {kDim, p.heads, width, batch});
+            const Tensor v(values[layer % kLayerScales].span(), DType::BF16,
+                           {kDim, p.heads, width, batch});
+            ops::gated_delta_net_replay_record(
+                q, k, v, g, beta, float(kScale), states.layer_view(layer, select).recurrent,
+                valid_tensor, records.layer(layer, batch).recurrence, out, cuda);
         }
-    } else {
-        execute(ninfer::test::cuda_environment().default_execution);
-        cuda_synchronize();
-    }
-
-    int failures             = 0;
-    const std::string suffix = " L=" + std::to_string(profile.layers) +
-                               " Hv=" + std::to_string(profile.value_heads) +
-                               " T=" + std::to_string(width) + " B=" + std::to_string(rows);
-    std::vector<FoldComparison> comparisons;
-    std::vector<std::string> labels;
-    const auto add = [&](const void* actual, const void* expected, std::size_t bytes,
-                         std::string label, std::uint32_t fill = 0, std::uint32_t first = 0) {
-        if (bytes % sizeof(std::uint32_t))
-            throw std::logic_error("fold comparison is not a whole number of words");
-        comparisons.push_back({actual, expected, bytes / sizeof(std::uint32_t), fill, first});
-        labels.push_back(std::move(label));
-    };
-
-    // Prepare the independent expected source histories in a single host/device transfer.
-    const auto source_histories = distinct_destination ? profile.layers * reference_capacity : 0;
-    std::vector<std::uint16_t> initial_conv(std::size_t(source_histories) * conv_slot_elements);
-    if (distinct_destination) {
-        parallel_rows(profile.layers * rows, initial_conv.size(), [&](int first, int last) {
-            for (int index = first; index < last; ++index) {
-                const int layer = index / rows, row = index % rows;
-                if (repeated_inactive(row) || destination_slots[row] == source_slots[row]) continue;
-                const auto reference =
-                    std::size_t(layer * reference_capacity + reference_indices[row]);
-                auto* output = initial_conv.data() + reference * conv_slot_elements;
-                for (int history = 0; history < 3; ++history)
-                    for (int channel = 0; channel < profile.conv_channels; ++channel)
-                        output[history * profile.conv_channels + channel] = bf16_pattern(
-                            seed + 400009U + layer * 223U + row * 41U + history * 13U + channel,
-                            0.05F);
-            }
-        });
-    }
-    const auto source_conv = to_device(initial_conv);
-
-    for (int layer = 0; layer < profile.layers; ++layer) {
-        for (int row = 0; row < rows; ++row) {
-            if (repeated_inactive(row)) continue;
-            const auto coordinate =
-                " layer=" + std::to_string(layer) + " row=" + std::to_string(row);
-            const auto reference = std::size_t(layer * reference_capacity + reference_indices[row]);
-            const auto destination = state_offset(destination_slots[row]);
-            add(state_pool.recurrent_tensor(layer, destination).data,
-                offset_pointer(expected_recurrent.data(), reference * recurrent_slot_bytes),
-                recurrent_slot_bytes,
-                "fold recurrent state differs from Nth snapshot" + coordinate);
-            add(state_pool.conv_tensor(layer, destination).data,
-                offset_pointer(expected_conv.data(), reference * conv_slot_bytes), conv_slot_bytes,
-                "fold conv history differs" + coordinate);
-            if (destination_slots[row] != source_slots[row]) {
-                const auto source = state_offset(source_slots[row]);
-                const auto initial =
-                    signed_pattern(seed + 500009U + layer * 227U + row * 43U, 0.01F);
-                add(state_pool.recurrent_tensor(layer, source).data, nullptr, recurrent_slot_bytes,
-                    "fold modified recurrent source" + coordinate,
-                    std::bit_cast<std::uint32_t>(initial), 0x80000000U);
-                add(state_pool.conv_tensor(layer, source).data,
-                    offset_pointer(source_conv.data(), reference * conv_slot_bytes),
-                    conv_slot_bytes, "fold modified convolution source" + coordinate);
-            }
+        CUDA_CHECK(cudaStreamSynchronize(stream.handle));
+        const auto record_before =
+            from_device<std::byte>(record_storage.data(), record_storage.bytes());
+        if (execution == Execution::DeviceGraph || execution == Execution::HostGraph) {
+            // Both graph modes execute twice. Out-of-place state is stable across launches.
+            // The device form first exercises dynamic all-zero metadata with invalid offsets.
+            if (execution == Execution::HostGraph && source_slots == dest_slots)
+                throw std::logic_error("host Graph replay requires an unchanged source");
         }
-        for (int slot = 0; slot < slot_count; ++slot) {
-            if (std::find(source_slots.begin(), source_slots.end(), slot) != source_slots.end() ||
-                std::find(destination_slots.begin(), destination_slots.end(), slot) !=
-                    destination_slots.end())
-                continue;
-            const auto coordinate =
-                " layer=" + std::to_string(layer) + " slot=" + std::to_string(slot);
-            add(state_pool.recurrent_tensor(layer, state_offset(slot)).data, nullptr,
-                recurrent_slot_bytes, "fold modified inactive recurrent slot" + coordinate);
-            add(state_pool.conv_tensor(layer, state_offset(slot)).data, nullptr, conv_slot_bytes,
-                "fold modified inactive conv slot" + coordinate);
+        auto source_buffer      = to_device(sources);
+        auto destination_buffer = to_device(destinations);
+        auto commit_buffer      = to_device(commits);
+        const Tensor source(source_buffer.span(), DType::I64, {batch});
+        const Tensor destination(destination_buffer.span(), DType::I64, {batch});
+        const Tensor columns(commit_buffer.span(), DType::I32, {batch});
+        int failures = checks ? validate(plan, records, source, destination, columns, cuda) : 0;
+        const auto launch = [&] {
+            if (device_rows(execution))
+                plan.execute(source, destination, columns, cuda);
+            else
+                plan.execute(rows, cuda);
+        };
+        if (execution == Execution::DeviceGraph) {
+            source_buffer.fill(0xff);
+            destination_buffer.fill(0xff);
+            commit_buffer.fill(0);
+            run_graph(stream.handle, launch, [&] {
+                failures += verify_state(inputs, source_slots, dest_slots, std::vector<int>(batch),
+                                         conv_records, {}, nullptr);
+                source_buffer.copy_from_host(sources.data(), source.bytes());
+                destination_buffer.copy_from_host(destinations.data(), destination.bytes());
+                commit_buffer.copy_from_host(commits.data(), columns.bytes());
+            });
+        } else if (execution == Execution::HostGraph) {
+            run_graph(stream.handle, launch, [&] {
+                for (int b = 0; b < batch; ++b) {
+                    if (!rows[b].commit_columns) continue;
+                    for (int layer = 0; layer < p.layers; ++layer) {
+                        const auto state   = states.recurrent_tensor(layer, destinations[b]);
+                        const auto history = states.conv_tensor(layer, destinations[b]);
+                        CUDA_CHECK(cudaMemsetAsync(state.data, 0xff, state.bytes(), stream.handle));
+                        CUDA_CHECK(
+                            cudaMemsetAsync(history.data, 0xff, history.bytes(), stream.handle));
+                    }
+                    rows[b] = {-1, -1, 0};
+                }
+            });
+        } else {
+            launch();
+            CUDA_CHECK(cudaStreamSynchronize(stream.handle));
         }
-    }
-    add(record_storage.data(), records_before.data(), record_storage.size(),
-        "fold modified record storage");
-    add(state_storage.data(), nullptr, kGuardBytes, "fold modified state prefix guard", 0xa5a5a5a5U,
-        0xa5a5a5a5U);
-    add(offset_pointer(state_storage.data(), kGuardBytes + state_bytes), nullptr, kGuardBytes,
-        "fold modified state suffix guard", 0xa5a5a5a5U, 0xa5a5a5a5U);
-
-    // Every state word is compared. Read the verdicts together instead of transferring
-    // the full replay arenas and each individually addressed snapshot.
-    const auto device_comparisons = to_device(comparisons);
-    DeviceBuffer mismatches(state_storage.device(), comparisons.size() * sizeof(unsigned));
-    mismatches.fill(0);
-    CUDA_CHECK(compare_fold_words(static_cast<const FoldComparison*>(device_comparisons.data()),
-                                  comparisons.size(), static_cast<unsigned*>(mismatches.data()),
-                                  nullptr));
-    const auto changed = from_device<unsigned>(mismatches, comparisons.size());
-    for (std::size_t i = 0; i < changed.size(); ++i) {
-        if (changed[i]) {
-            std::cerr << labels[i] << suffix << '\n';
+        failures += verify_state(inputs, source_slots, dest_slots, commits, conv_records,
+                                 trajectory ? out_buffer.span() : MemorySpan{}, trajectory);
+        failures += record_storage.verify_guards("fold records");
+        failures += state_storage.verify_guards("fold states");
+        if (from_device<std::byte>(record_storage.data(), record_storage.bytes()) !=
+                record_before ||
+            from_device<std::int64_t>(source_buffer, batch) != sources ||
+            from_device<std::int64_t>(destination_buffer, batch) != destinations ||
+            from_device<int>(commit_buffer, batch) != commits) {
+            std::cerr << "fold modified records or metadata\n";
             ++failures;
         }
+        return failures;
     }
-    return failures;
-}
 
-GdnReplayRecordLayout fold_layout(LayoutBuilder& builder, FoldProfile profile, int width,
-                                  int capacity) {
-    return plan_gdn_replay_records(builder, {profile.layers, capacity, width, profile.conv_channels,
-                                             profile.value_heads == 24 ? 8 : 16,
-                                             profile.value_heads, kStateDim, kStateDim});
-}
-
-int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
-             const std::vector<std::int32_t>& commits, std::uint32_t seed,
-             bool distinct_destination = false, bool captured = false, bool device_rows = false,
-             std::int32_t record_capacity = kRecordCapacity) {
-    LayoutBuilder builder;
-    const auto layout = fold_layout(builder, profile, width, record_capacity);
-    DeviceBuffer storage(cuda_environment().context.device(),
-                         builder.finish(256) + 2 * kGuardBytes);
-    return check_fold(layout, storage, rows, commits, seed, distinct_destination, captured,
-                      device_rows);
-}
-
-int switching_widths() {
-    LayoutBuilder builder;
-    const auto maximum = fold_layout(builder, {36, 24, 5120}, 8, 4);
-    DeviceBuffer storage(cuda_environment().context.device(),
-                         builder.finish(256) + 2 * kGuardBytes);
-    int failures  = 0;
-    unsigned seed = 191;
-    for (int width : {8, 5, 2, 8}) {
-        const auto layout = maximum.with_width(width);
+private:
+    int validate(const ops::GdnReplayFoldPlan& plan, const GdnReplayRecords& records,
+                 const Tensor& sources, const Tensor& destinations, const Tensor& commits,
+                 CudaExecutionView cuda) {
+        int failures   = 0;
+        auto malformed = records;
+        --malformed.spec.value_dim;
+        failures += must_reject("record geometry", [&] {
+            (void)ops::GdnReplayFoldPlan(malformed, states.all_layers_view());
+        });
+        malformed                 = records;
+        const auto private_planes = ninfer::detail::GdnReplayRecordAccess::planes(records);
+        malformed.conv.data       = private_planes.delta.data;
+        failures += must_reject("overlapping record planes", [&] {
+            (void)ops::GdnReplayFoldPlan(malformed, states.all_layers_view());
+        });
+        failures += must_reject("empty rows", [&] { plan.execute({}, cuda); });
+        for (const auto row : {ops::GdnReplayFoldRow{0, 0, -1},
+                               {0, 0, records.spec.width + 1},
+                               {-1, 0, 1},
+                               {0, -1, 1},
+                               {2, 0, 1}}) {
+            failures +=
+                must_reject("invalid active row", [&] { plan.execute(std::span(&row, 1), cuda); });
+        }
+        const ops::GdnReplayFoldRow duplicates[]{{offset(0), offset(1), 1},
+                                                 {offset(0), offset(1), 1}};
+        const ops::GdnReplayFoldRow cross_sources[]{{offset(0), offset(1), 1},
+                                                    {offset(1), offset(1), 1}};
+        failures += must_reject("shared destination", [&] { plan.execute(duplicates, cuda); });
         failures +=
-            check_fold(layout, storage, 3, {1, 0, layout.spec.width}, seed++, false, false, true);
+            must_reject("another active source", [&] { plan.execute(cross_sources, cuda); });
+        malformed           = records;
+        malformed.conv.data = states.conv_tensor(0, offset(0)).data;
+        const ops::GdnReplayFoldPlan overlapping(malformed, states.all_layers_view());
+        failures += must_reject("record plane overlapping a selected state",
+                                [&] { overlapping.execute(std::span(duplicates, 1), cuda); });
+        failures += must_reject("device commit dtype",
+                                [&] { plan.execute(sources, destinations, sources, cuda); });
+        auto overlap = commits;
+        overlap.data = records.conv.data;
+        failures += must_reject("device metadata overlapping records",
+                                [&] { plan.execute(sources, destinations, overlap, cuda); });
+        overlap.data = states.conv_tensor(0, 0).data;
+        failures += must_reject("device metadata overlapping state storage",
+                                [&] { plan.execute(sources, destinations, overlap, cuda); });
+        return failures;
+    }
+
+    int verify_state(const Inputs& inputs, const std::vector<int>& sources,
+                     const std::vector<int>& destinations, const std::vector<int>& commits,
+                     const std::vector<std::vector<std::uint16_t>>& conv_records, MemorySpan output,
+                     std::vector<double>* trajectory) {
+        std::vector<std::vector<double>> reference(batch), out_reference(batch);
+        std::vector<int> target_row(slots, -1);
+        for (int b = 0; b < batch; ++b) {
+            const auto m = commits[b];
+            if (m == 0) continue;
+            target_row[destinations[b]] = b;
+            auto represented =
+                inputs.reference(b, trajectory ? inputs.width : m, recurrent[sources[b]]);
+            auto expected = gdn_ref::evaluate(represented, kScale, true, trajectory != nullptr,
+                                              trajectory ? std::span<const double>(*trajectory)
+                                                         : std::span<const double>{});
+            if (trajectory) {
+                const auto first = expected.snapshots.begin() + (m - 1) * state_elements();
+                reference[b].assign(first, first + state_elements());
+                out_reference[b] = std::move(expected.out);
+            } else {
+                reference[b] = std::move(expected.final_state);
+            }
+        }
+        int failures   = 0;
+        double max_abs = 0.0, max_relative_l2 = 0.0;
+        std::vector<float> actual(state_elements()), before(state_elements());
+        std::vector<double> actual_fp64(kDim * kDim), expected_fp64(kDim * kDim);
+        for (int layer = 0; layer < p.layers; ++layer) {
+            const float scale = layer_scale(layer);
+            for (int slot = 0; slot < slots; ++slot) {
+                const int b      = target_row[slot];
+                const int m      = b < 0 ? 0 : commits[b];
+                const auto state = states.recurrent_tensor(layer, offset(slot));
+                CUDA_CHECK(
+                    cudaMemcpy(actual.data(), state.data, state.bytes(), cudaMemcpyDeviceToHost));
+                const auto conv     = states.conv_tensor(layer, offset(slot));
+                const auto observed = from_device<std::uint16_t>(conv.data, conv.numel());
+                if (m == 0) {
+                    std::transform(recurrent[slot].begin(), recurrent[slot].end(), before.begin(),
+                                   [scale](float f) { return f * scale; });
+                    if (std::memcmp(actual.data(), before.data(), state.bytes()) != 0 ||
+                        observed != histories[slot][layer]) {
+                        std::cerr << "fold modified inactive layer " << layer << " slot " << slot
+                                  << '\n';
+                        ++failures;
+                    }
+                    continue;
+                }
+                auto expected_history = histories[sources[b]][layer];
+                const auto conv_first =
+                    conv_records[layer].begin() + std::size_t(b) * inputs.width * p.channels;
+                expected_history.insert(expected_history.end(), conv_first,
+                                        conv_first + m * p.channels);
+                expected_history.erase(expected_history.begin(),
+                                       expected_history.begin() + m * p.channels);
+                if (observed != expected_history) {
+                    std::cerr << "fold conv tail differs at layer " << layer << " row " << b
+                              << '\n';
+                    ++failures;
+                }
+                histories[slot][layer] = std::move(expected_history);
+                for (int head = 0; head < p.heads; ++head) {
+                    const auto head_offset = std::size_t(head) * kDim * kDim;
+                    std::copy_n(actual.begin() + head_offset, actual_fp64.size(),
+                                actual_fp64.begin());
+                    std::transform(reference[b].begin() + head_offset,
+                                   reference[b].begin() + head_offset + expected_fp64.size(),
+                                   expected_fp64.begin(), [scale](double f) { return f * scale; });
+                    const auto stats = compute_reduction_stats(
+                        actual_fp64.data(), expected_fp64.data(), expected_fp64.size());
+                    max_abs         = std::max(max_abs, stats.maximum_absolute_error);
+                    max_relative_l2 = std::max(max_relative_l2, stats.relative_l2);
+                    if (!reduction_passes(stats, expected_fp64.size(), gdn_ref::kStateCriterion)) {
+                        std::cerr << "fold state error at layer " << layer << " row " << b
+                                  << " head " << head << " max_abs=" << stats.maximum_absolute_error
+                                  << " rel_l2=" << stats.relative_l2 << '\n';
+                        ++failures;
+                    }
+                }
+                if (trajectory) {
+                    const auto count = out_reference[b].size();
+                    const auto words = from_device<std::uint16_t>(
+                        static_cast<const std::uint16_t*>(output.data) + layer * count, count);
+                    const auto unpacked = gdn_ref::represented_bf16(words);
+                    std::vector<double> expected(count);
+                    std::transform(out_reference[b].begin(), out_reference[b].end(),
+                                   expected.begin(), [scale](double f) { return f * scale; });
+                    failures +=
+                        verify_reduction("chained record readout",
+                                         std::vector<double>(unpacked.begin(), unpacked.end()),
+                                         expected, gdn_ref::kOutputCriterion);
+                }
+            }
+        }
+        if (trajectory) *trajectory = std::move(reference[0]);
+        std::cout << "Fold " << p.layers << 'x' << p.heads << " T=" << inputs.width
+                  << " max_abs=" << max_abs << " max_rel_l2=" << max_relative_l2 << '\n';
+        return failures;
+    }
+
+    Geometry p;
+    int slots, batch;
+    StateImageBuilder state_builder;
+    LinearAttentionStateLayout state_layout;
+    StateImageLayout image_layout;
+    GuardedDeviceBuffer state_storage;
+    StateImageStorage images;
+    LinearAttentionStateView states;
+    LayoutBuilder record_builder;
+    GdnReplayRecordLayout maximum;
+    GuardedDeviceBuffer record_storage;
+    std::vector<std::vector<float>> recurrent;
+    std::vector<std::vector<std::vector<std::uint16_t>>> histories;
+};
+
+int run_case(Geometry p, int width, const std::vector<int>& commits, Execution execution,
+             bool out_of_place = false, bool validate = false) {
+    const int batch = commits.size();
+    std::vector<int> source(batch, 0), dest(batch, 0);
+    int count = 0;
+    for (int b = 0; b < batch; ++b) {
+        if (!commits[b]) continue;
+        source[b] = ++count;
+        dest[b]   = out_of_place ? ++count : count;
+    }
+    FoldFixture fixture(p, std::max(count + 1, 3), batch, width);
+    return fixture.round(Inputs(p, width, batch, 1007U + width), source, dest, commits, execution,
+                         validate);
+}
+
+int cancellation() {
+    FoldFixture fixture(k36x24, 1, 1, 2, 0x1p20f);
+    Inputs inputs(k36x24, 2, 1, 729U);
+    std::fill(inputs.k.begin(), inputs.k.end(), 0.f);
+    std::fill(inputs.v.begin(), inputs.v.end(), 0.f);
+    std::fill(inputs.g.begin(), inputs.g.end(), 0.f);
+    std::fill(inputs.beta.begin(), inputs.beta.end(), 1.f);
+    inputs.k[0] = inputs.k[k36x24.qk_heads * kDim] = 32.f;
+    inputs.v[k36x24.heads * kDim]                  = 0x1p-6f;
+    return fixture.round(inputs, {0}, {0}, {2}, Execution::Host);
+}
+
+int extreme_decay(float gate, float initial) {
+    FoldFixture fixture(k36x24, 1, 1, 2, initial);
+    Inputs inputs(k36x24, 2, 1, 911U);
+    std::fill(inputs.k.begin(), inputs.k.end(), 0.f);
+    std::fill(inputs.v.begin(), inputs.v.end(), 0.f);
+    std::fill(inputs.g.begin(), inputs.g.end(), gate);
+    std::fill(inputs.beta.begin(), inputs.beta.end(), 1.f);
+    int failures = fixture.round(inputs, {0}, {0}, {2}, Execution::Host);
+    const std::array initial_state{initial};
+    auto reference = inputs.reference(0, 2, initial_state);
+    reference.state.resize(fixture.state_elements());
+    const double expected = gdn_ref::evaluate(reference, kScale, true).final_state.front();
+    const double actual   = fixture.leading_state();
+    if (!std::isfinite(actual) || std::abs(actual - expected) > 1e-5 * std::abs(expected)) {
+        std::cerr << "finite extreme-decay result: expected " << expected << ", got " << actual
+                  << '\n';
+        ++failures;
     }
     return failures;
 }
 
-int run_record_fold_rounds(bool q8 = false, bool local = false) {
-    using ninfer::test::input_projection::DevicePackedWeight;
-    using ninfer::test::input_projection::make_bf16_activation;
-
-    const FoldProfile kProfile{q8 ? 36 : 48, local ? 24 : 48, local ? 5120 : 10240};
-    const int kQkHeads                   = local ? 8 : 16;
-    const int kQueryRows                 = 128 * kQkHeads;
-    const std::int32_t kHidden           = q8 ? 2560 : 5120;
-    const std::int32_t kValueRows        = local ? 3072 : 6144;
-    const std::int32_t kZRows            = local ? 3072 : 6144;
-    constexpr std::int32_t kWidth        = 16;
-    constexpr std::int32_t kStateSlots   = kWidth + 1;
-    constexpr std::int32_t kInitialSlot  = kWidth;
-    constexpr std::int32_t kSnapshotBase = 0;
-    constexpr float kScale               = 1.0F / std::sqrt(128.0F);
-
-    DevicePackedWeight qk_parent(quantized_weight::make_patterned_weight(
-        q8 ? QType::Q8_G32_FP16 : QType::Q4_G64_FP16, q8 ? (local ? 8192 : 16384) : 4096, kHidden,
-        1901U));
-    std::optional<DevicePackedWeight> vz_parent;
-    if (!q8)
-        vz_parent.emplace(
-            quantized_weight::make_patterned_weight(QType::Q5_G64_FP16, 12288, kHidden, 1902U));
-    const std::vector<float> activation = make_bf16_activation(kHidden, kWidth, 1903U);
-    DeviceBuffer device_x               = to_device_bf16(activation);
-    std::vector<std::uint16_t> conv_weight_bits(static_cast<std::size_t>(kProfile.conv_channels) *
-                                                4);
-    for (std::size_t index = 0; index < conv_weight_bits.size(); ++index) {
-        conv_weight_bits[index] = bf16_pattern(1907U + static_cast<std::uint32_t>(index), 0.02F);
-    }
-    DeviceBuffer device_conv_weight = to_device(conv_weight_bits);
-    DeviceBuffer device_snapshot    = to_device(std::vector<std::int32_t>{kSnapshotBase});
-
-    LayoutBuilder record_builder;
-    const GdnReplayRecordLayout record_layout =
-        plan_gdn_replay_records(record_builder, {.layers          = kProfile.layers,
-                                                 .record_capacity = 1,
-                                                 .width           = kWidth,
-                                                 .conv_channels   = kProfile.conv_channels,
-                                                 .qk_heads        = kQkHeads,
-                                                 .value_heads     = kProfile.value_heads,
-                                                 .key_dim         = kStateDim,
-                                                 .value_dim       = kStateDim});
-    DeviceBuffer record_storage(ninfer::test::cuda_environment().context.device(),
-                                record_builder.finish(256));
-    record_storage.fill(0xff);
-    GdnReplayRecords records(record_storage.span(), record_layout);
-
-    StateImageBuilder state_builder;
-    const LinearAttentionStateLayout state_layout = plan_linear_attention_state(
-        state_builder, {.layers         = static_cast<std::uint32_t>(kProfile.layers),
-                        .conv_channels  = kProfile.conv_channels,
-                        .conv_width     = 3,
-                        .value_heads    = kProfile.value_heads,
-                        .value_head_dim = kStateDim,
-                        .key_head_dim   = kStateDim,
-                        .conv_dtype     = DType::BF16});
-    const auto image_layout = state_builder.finish();
-    const auto state_offset = [&](int record) {
-        return static_cast<std::int64_t>((image_layout.image_bytes + 256) * record);
-    };
-    DeviceBuffer state_storage(ninfer::test::cuda_environment().context.device(),
-                               state_offset(kStateSlots));
-    state_storage.fill(0);
-    StateImageStorage images(state_storage.span(), image_layout);
-    LinearAttentionStateView state_pool(images, state_layout);
-    const ops::GdnReplayFoldPlan fold_plan(records, state_pool.all_layers_view());
-
-    const std::size_t recurrent_slot_elements =
-        static_cast<std::size_t>(kStateDim) * kStateDim * kProfile.value_heads;
-    const std::size_t conv_slot_elements = static_cast<std::size_t>(kProfile.conv_channels) * 3;
-    for (std::int32_t layer = 0; layer < kProfile.layers; ++layer) {
-        const float initial_value = signed_pattern(1911U + layer * 47U, 0.01F);
-        const std::vector<float> recurrent(recurrent_slot_elements, initial_value);
-        const Tensor recurrent_slot = state_pool.recurrent_tensor(static_cast<std::uint32_t>(layer),
-                                                                  state_offset(kInitialSlot));
-        cuda_check(cudaMemcpy(recurrent_slot.data, recurrent.data(), recurrent_slot.bytes(),
-                              cudaMemcpyHostToDevice),
-                   "upload pair initial recurrent state");
-
-        std::vector<std::uint16_t> conv(conv_slot_elements);
-        for (std::int32_t history = 0; history < 3; ++history) {
-            for (std::int32_t channel = 0; channel < kProfile.conv_channels; ++channel) {
-                conv[static_cast<std::size_t>(history) * kProfile.conv_channels + channel] =
-                    bf16_pattern(1913U + layer * 53U + history * 11U + channel, 0.04F);
-            }
-        }
-        const Tensor conv_slot =
-            state_pool.conv_tensor(static_cast<std::uint32_t>(layer), state_offset(kInitialSlot));
-        cuda_check(
-            cudaMemcpy(conv_slot.data, conv.data(), conv_slot.bytes(), cudaMemcpyHostToDevice),
-            "upload pair initial conv state");
-    }
-
-    DeviceBuffer snapshot_q(ninfer::test::cuda_environment().context.device(),
-                            static_cast<std::size_t>(kQueryRows) * kWidth * sizeof(std::uint16_t));
-    DeviceBuffer snapshot_k(ninfer::test::cuda_environment().context.device(),
-                            static_cast<std::size_t>(kQueryRows) * kWidth * sizeof(std::uint16_t));
-    DeviceBuffer snapshot_v(ninfer::test::cuda_environment().context.device(),
-                            static_cast<std::size_t>(kValueRows) * kWidth * sizeof(std::uint16_t));
-    DeviceBuffer snapshot_z(ninfer::test::cuda_environment().context.device(),
-                            static_cast<std::size_t>(kZRows) * kWidth * sizeof(std::uint16_t));
-    DeviceBuffer record_q(ninfer::test::cuda_environment().context.device(), snapshot_q.size());
-    DeviceBuffer record_k(ninfer::test::cuda_environment().context.device(), snapshot_k.size());
-    DeviceBuffer record_v(ninfer::test::cuda_environment().context.device(), snapshot_v.size());
-    DeviceBuffer record_z(ninfer::test::cuda_environment().context.device(), snapshot_z.size());
-    DeviceBuffer snapshot_out(ninfer::test::cuda_environment().context.device(), snapshot_v.size());
-    DeviceBuffer record_out(ninfer::test::cuda_environment().context.device(), snapshot_v.size());
-    DeviceBuffer device_g(ninfer::test::cuda_environment().context.device(),
-                          static_cast<std::size_t>(kProfile.value_heads) * kWidth * sizeof(float));
-    DeviceBuffer device_beta(ninfer::test::cuda_environment().context.device(), device_g.size());
-
-    Tensor x(device_x.span(), DType::BF16, {kHidden, kWidth, 1});
-    Tensor conv_weight(device_conv_weight.span(), DType::BF16, {kProfile.conv_channels, 4});
-    DeviceBuffer device_initial = to_device(std::vector<std::int64_t>{state_offset(kInitialSlot)});
-    Tensor initial_selector(device_initial.span(), DType::I64, {1});
-    DeviceBuffer conv_snapshots_storage(cuda_environment().context.device(),
-                                        std::size_t(kProfile.conv_channels) * 3 * kWidth *
-                                            kProfile.layers * 2);
-    Tensor conv_snapshots(conv_snapshots_storage.span(), DType::BF16,
-                          {kProfile.conv_channels, 3, kWidth, kProfile.layers});
-    Tensor snapshot_selector(device_snapshot.span(), DType::I32, {1});
-    Tensor valid;
-    Tensor snapshot_query(snapshot_q.span(), DType::BF16, {kQueryRows, kWidth, 1});
-    Tensor snapshot_key(snapshot_k.span(), DType::BF16, {kQueryRows, kWidth, 1});
-    Tensor snapshot_value(snapshot_v.span(), DType::BF16, {kValueRows, kWidth, 1});
-    Tensor snapshot_z_tensor(snapshot_z.span(), DType::BF16, {kZRows, kWidth, 1});
-    Tensor record_query(record_q.span(), DType::BF16, {kQueryRows, kWidth, 1});
-    Tensor record_key(record_k.span(), DType::BF16, {kQueryRows, kWidth, 1});
-    Tensor record_value(record_v.span(), DType::BF16, {kValueRows, kWidth, 1});
-    Tensor record_z_tensor(record_z.span(), DType::BF16, {kZRows, kWidth, 1});
-    Tensor snapshot_output(snapshot_out.span(), DType::BF16,
-                           {kStateDim, kProfile.value_heads, kWidth, 1});
-    Tensor record_output(record_out.span(), DType::BF16,
-                         {kStateDim, kProfile.value_heads, kWidth, 1});
-    Tensor g(device_g.span(), DType::FP32, {kProfile.value_heads, kWidth, 1});
-    Tensor beta(device_beta.span(), DType::FP32, {kProfile.value_heads, kWidth, 1});
-
-    const std::size_t snapshot_workspace_bytes =
-        q8 ? ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-                 ops::SingleProjectionWeight{qk_parent.view(), ops::LinearPolicy::A16Only}, 1,
-                 kWidth, kWidth)
-           : ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-                 ops::PairedProjectionWeights{{qk_parent.view()}, {vz_parent->view()}}, 1, kWidth,
-                 kWidth);
-    const std::size_t record_workspace_bytes =
-        q8 ? ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
-                 ops::SingleProjectionWeight{qk_parent.view(), ops::LinearPolicy::A16Only}, 1,
-                 kWidth, kWidth)
-           : ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
-                 ops::PairedProjectionWeights{{qk_parent.view()}, {vz_parent->view()}}, 1, kWidth,
-                 kWidth);
-    ninfer::DeviceBuffer snapshot_workspace_storage(
-        ninfer::test::cuda_environment().context.device(),
-        std::max<std::size_t>(256, snapshot_workspace_bytes));
-    MemoryArena snapshot_workspace(snapshot_workspace_storage.span());
-    ninfer::DeviceBuffer record_workspace_storage(
-        ninfer::test::cuda_environment().context.device(),
-        std::max<std::size_t>(256, record_workspace_bytes));
-    MemoryArena record_workspace(record_workspace_storage.span());
-
-    std::vector<std::int64_t> source_steps(kWidth), destination_steps(kWidth);
-    for (int token = 0; token < kWidth; ++token) {
-        source_steps[token]      = state_offset(token == 0 ? kInitialSlot : token - 1);
-        destination_steps[token] = state_offset(token);
-    }
-    DeviceBuffer device_sources      = to_device(source_steps);
-    DeviceBuffer device_destinations = to_device(destination_steps);
-
+int chain() {
+    FoldFixture fixture(k36x24, 2, 1, 16);
     int failures = 0;
-    for (std::int32_t round = 0; round < 3; ++round) {
-        const std::int32_t commit = round == 0 ? 1 : round == 1 ? kWidth - 1 : kWidth;
-        std::vector<float> g_host(static_cast<std::size_t>(kProfile.value_heads) * kWidth);
-        std::vector<float> beta_host(g_host.size());
-        for (std::size_t index = 0; index < g_host.size(); ++index) {
-            g_host[index]    = -0.04F - static_cast<float>((index + round * 17) % 80) / 100.0F;
-            beta_host[index] = 0.08F + static_cast<float>((index * 7 + round * 13) % 80) / 100.0F;
-        }
-        device_g.copy_from_host(g_host.data(), device_g.size());
-        device_beta.copy_from_host(beta_host.data(), device_beta.size());
-
-        for (std::int32_t layer = 0; layer < kProfile.layers; ++layer) {
-            GdnReplayRecordLayer layer_records = records.layer(layer, 1);
-            auto conv_states =
-                state_pool.layer_view(static_cast<std::uint32_t>(layer), initial_selector).conv;
-            auto snapshots =
-                conv_snapshots.slice(3, layer, 1).view({kProfile.conv_channels, 3, kWidth});
-            if (q8) {
-                ops::gdn_input_proj_conv_snapshot(
-                    x, ops::SingleProjectionWeight{qk_parent.view(), ops::LinearPolicy::A16Only},
-                    conv_weight, {conv_states, snapshots, snapshot_selector}, valid,
-                    {snapshot_query, snapshot_key, snapshot_value, snapshot_z_tensor},
-                    snapshot_workspace, ninfer::test::cuda_environment().default_execution);
-                ops::gdn_input_proj_conv_record(
-                    x, ops::SingleProjectionWeight{qk_parent.view(), ops::LinearPolicy::A16Only},
-                    conv_weight, conv_states, valid,
-                    {record_query, record_key, record_value, record_z_tensor}, layer_records.conv,
-                    record_workspace, ninfer::test::cuda_environment().default_execution);
-            } else {
-                ops::gdn_input_proj_conv_snapshot(
-                    x, ops::PairedProjectionWeights{{qk_parent.view()}, {vz_parent->view()}},
-                    conv_weight, {conv_states, snapshots, snapshot_selector}, valid,
-                    {snapshot_query, snapshot_key, snapshot_value, snapshot_z_tensor},
-                    snapshot_workspace, ninfer::test::cuda_environment().default_execution);
-                ops::gdn_input_proj_conv_record(
-                    x, ops::PairedProjectionWeights{{qk_parent.view()}, {vz_parent->view()}},
-                    conv_weight, conv_states, valid,
-                    {record_query, record_key, record_value, record_z_tensor}, layer_records.conv,
-                    record_workspace, ninfer::test::cuda_environment().default_execution);
-            }
-
-            Tensor snapshot_q_view = snapshot_query.view({kStateDim, kQkHeads, kWidth, 1});
-            Tensor snapshot_k_view = snapshot_key.view({kStateDim, kQkHeads, kWidth, 1});
-            Tensor snapshot_v_view =
-                snapshot_value.view({kStateDim, kProfile.value_heads, kWidth, 1});
-            Tensor record_q_view = record_query.view({kStateDim, kQkHeads, kWidth, 1});
-            Tensor record_k_view = record_key.view({kStateDim, kQkHeads, kWidth, 1});
-            Tensor record_v_view = record_value.view({kStateDim, kProfile.value_heads, kWidth, 1});
-            auto recurrent_states =
-                state_pool.layer_view(static_cast<std::uint32_t>(layer), initial_selector)
-                    .recurrent;
-            // The projection is computed at W once above. Materialize all W recurrent
-            // snapshots from those exact q/k/v columns, then select N-1 after folding.
-            for (int token = 0; token < kWidth; ++token) {
-                Tensor q_step = snapshot_q_view.slice(2, token, 1);
-                Tensor k_step = snapshot_k_view.slice(2, token, 1);
-                Tensor v_step = snapshot_v_view.slice(2, token, 1);
-                Tensor g_step = g.slice(1, token, 1), beta_step = beta.slice(1, token, 1);
-                Tensor out_step = snapshot_output.slice(2, token, 1);
-                Tensor source(device_sources.span().subspan(std::size_t(token) * 8), DType::I64,
-                              {1});
-                Tensor destination(device_destinations.span().subspan(std::size_t(token) * 8),
-                                   DType::I64, {1});
-                auto source_state = recurrent_states, destination_state = recurrent_states;
-                source_state.records.byte_offsets      = source;
-                destination_state.records.byte_offsets = destination;
-                ops::gated_delta_net_batch_update(
-                    q_step, k_step, v_step, g_step, beta_step, kScale, true, source_state,
-                    destination_state, {}, out_step,
-                    ninfer::test::cuda_environment().default_execution);
-            }
-            ops::gated_delta_net_replay_record(
-                record_q_view, record_k_view, record_v_view, g, beta, kScale, recurrent_states,
-                valid, {layer_records.key, layer_records.value, layer_records.gate}, record_output,
-                ninfer::test::cuda_environment().default_execution);
-            cuda_synchronize();
-
-            const std::string label = "record-fold pair round=" + std::to_string(round) +
-                                      " layer=" + std::to_string(layer);
-            const auto compare_bf16 = [&](const DeviceBuffer& lhs, const DeviceBuffer& rhs,
-                                          std::size_t elements, const char* field) {
-                if (from_device<std::uint16_t>(lhs, elements) !=
-                    from_device<std::uint16_t>(rhs, elements)) {
-                    std::cerr << label << " " << field << " differs\n";
-                    return 1;
-                }
-                return 0;
-            };
-            failures += compare_bf16(snapshot_q, record_q,
-                                     static_cast<std::size_t>(kQueryRows) * kWidth, "query");
-            failures += compare_bf16(snapshot_k, record_k,
-                                     static_cast<std::size_t>(kQueryRows) * kWidth, "key");
-            failures += compare_bf16(snapshot_v, record_v,
-                                     static_cast<std::size_t>(kValueRows) * kWidth, "value");
-            failures +=
-                compare_bf16(snapshot_z, record_z, static_cast<std::size_t>(kZRows) * kWidth, "z");
-            failures +=
-                compare_bf16(snapshot_out, record_out,
-                             static_cast<std::size_t>(kValueRows) * kWidth, "recurrent output");
-            if (failures != 0) { return failures; }
-        }
-
-        const std::array fold_rows{
-            ops::GdnReplayFoldRow{state_offset(kInitialSlot), state_offset(kInitialSlot), commit}};
-        fold_plan.execute(fold_rows, ninfer::test::cuda_environment().default_execution);
-        cuda_synchronize();
-        for (std::int32_t layer = 0; layer < kProfile.layers; ++layer) {
-            const Tensor folded_recurrent = state_pool.recurrent_tensor(
-                static_cast<std::uint32_t>(layer), state_offset(kInitialSlot));
-            const Tensor snapshot_recurrent = state_pool.recurrent_tensor(
-                static_cast<std::uint32_t>(layer), state_offset(commit - 1));
-            if (from_device<std::uint32_t>(folded_recurrent.data, recurrent_slot_elements) !=
-                from_device<std::uint32_t>(snapshot_recurrent.data, recurrent_slot_elements)) {
-                std::cerr << "record-fold recurrent mismatch round=" << round << " layer=" << layer
-                          << "\n";
-                return failures + 1;
-            }
-            const Tensor folded_conv   = state_pool.conv_tensor(static_cast<std::uint32_t>(layer),
-                                                                state_offset(kInitialSlot));
-            const Tensor snapshot_conv = conv_snapshots.slice(3, layer, 1)
-                                             .slice(2, commit - 1, 1)
-                                             .view({kProfile.conv_channels, 3});
-            if (from_device<std::uint16_t>(folded_conv.data, conv_slot_elements) !=
-                from_device<std::uint16_t>(snapshot_conv.data, conv_slot_elements)) {
-                std::cerr << "record-fold conv mismatch round=" << round << " layer=" << layer
-                          << "\n";
-                return failures + 1;
-            }
-        }
+    std::vector<double> trajectory;
+    int round = 0;
+    for (const auto [width, commit] : {std::pair{16, 1}, {4, 4}, {9, 2}, {16, 11}, {3, 3}}) {
+        failures += fixture.round(Inputs(k36x24, width, 1, 8191U + round++), {0}, {0}, {commit},
+                                  Execution::Device, false, &trajectory);
     }
-    failures += qk_parent.verify_preserved(q8 ? "record-fold Q8 parent" : "record-fold Q4 parent");
-    if (vz_parent) failures += vz_parent->verify_preserved("record-fold Q5 parent");
     return failures;
 }
 
@@ -890,106 +557,39 @@ int run_record_fold_rounds(bool q8 = false, bool local = false) {
 
 int main(int argc, char** argv) {
     OpSuite suite;
-    suite.add("gdn/fold/switch_widths", switching_widths);
-    for (int prefix : {3, 11})
-        suite.add("gdn_fold/device/l36/h24/w16/a" + std::to_string(prefix), [=] {
-            return run_case({36, 24, 5120}, 16, 1, {prefix}, 5101U, true, true, true);
+    constexpr Geometry geometries[]{k48x48, k30x32, k36x48, k36x24};
+    for (int i = 0; i < 4; ++i) {
+        const auto p     = geometries[i];
+        const auto label = "gdn_fold/" + std::to_string(p.layers) + "x" + std::to_string(p.heads);
+        suite.add(label + "/host_graph_mixed",
+                  [=] { return run_case(p, 6, {0, 1, 2, 6}, Execution::HostGraph, true, i == 0); },
+                  {{"execution", "graph"}});
+        suite.add(label + "/device_graph_mixed",
+                  [=] { return run_case(p, 16, {0, 3, 16}, Execution::DeviceGraph, false); },
+                  {{"execution", "graph"}});
+    }
+    for (int width = 2; width <= 16; ++width) {
+        suite.add("gdn_fold/width_" + std::to_string(width), [=] {
+            return run_case(geometries[width % 4], width, {width - 1}, Execution::Host);
         });
-    for (const FoldProfile profile :
-         {FoldProfile{48, 48, 10240}, {30, 32, 8192}, {36, 48, 10240}, {36, 24, 5120}})
-        for (bool captured : {false, true}) {
-            const auto id = "gdn_fold/device/l" + std::to_string(profile.layers) + "/h" +
-                            std::to_string(profile.value_heads) + (captured ? "/graph" : "/eager");
-            suite.add(id, [=] {
-                return run_case(profile, 6, 4, {0, 1, 3, 6}, 5100U, captured, captured, true);
-            });
-        }
-    for (const auto [batch, device] : {std::pair{9, false}, std::pair{17, true}}) {
-        std::vector<int> commits(batch, 0);
-        commits[0]     = 1;
-        commits[8]     = 2;
-        commits.back() = 3;
-        suite.add("gdn_fold/expanded/b" + std::to_string(batch),
+    }
+    suite.add("gdn_fold/device_zero",
+              [] { return run_case(k36x48, 2, {0, 0}, Execution::Device); });
+    suite.add("gdn_fold/host_zero", [] { return run_case(k36x24, 2, {0}, Execution::Host); });
+    for (const int batch : {9, 17}) {
+        suite.add("gdn_fold/expanded_" + std::to_string(batch),
                   [=] {
-                      return run_case({36, 24, 5120}, 4, batch, commits, 5300U + batch, false,
-                                      device, device, batch + 3);
+                      std::vector<int> commits(batch, 0);
+                      commits.front() = 1;
+                      commits.back()  = 4;
+                      return run_case(k36x24, 4, commits,
+                                      batch == 9 ? Execution::Host : Execution::Device);
                   },
                   {{"suite", "concurrency"}});
     }
-    const auto add = [&](FoldProfile p, int width, int batch, std::vector<int> commits,
-                         unsigned seed, bool distinct = false, bool captured = false,
-                         int capacity = kRecordCapacity) {
-        std::string id = std::string(p.value_heads == 24 ? "gdn_fold_local/l" : "gdn_fold/l") +
-                         std::to_string(p.layers) + "/h" + std::to_string(p.value_heads) + "/w" +
-                         std::to_string(width) + "/b" + std::to_string(batch) +
-                         (distinct ? "/disjoint" : "/alias") + "/commits";
-        for (int c : commits) id += "_" + std::to_string(c);
-        if (captured) id += "/graph";
-        if (capacity != kRecordCapacity) id += "/capacity_" + std::to_string(capacity);
-        suite.add(id,
-                  [=] {
-                      return run_case(p, width, batch, commits, seed, distinct, captured, false,
-                                      capacity);
-                  },
-                  {{"execution", captured || (width == 16 && batch == 8) ? "graph" : "eager"}});
-    };
-    add({48, 48, 10240}, 2, 1, {2}, 1801U, true);
-    add({48, 48, 10240}, 3, 4, {0, 1, 2, 3}, 1811U);
-    add({48, 48, 10240}, 6, 8, {0, 1, 2, 3, 6, 4, 1, 5}, 1821U);
-    add({48, 48, 10240}, 7, 8, {7, 0, 1, 2, 3, 4, 5, 6}, 1823U, true);
-    add({48, 48, 10240}, 16, 8, {0, 1, 2, 3, 7, 13, 15, 16}, 1825U, true);
-    add({48, 48, 10240}, 16, 1, {16}, 1827U, true);
-    add({48, 48, 10240}, 16, 1, {0}, 1829U, true);
-    add({30, 32, 8192}, 2, 1, {2}, 1831U);
-    add({30, 32, 8192}, 6, 1, {6}, 1841U);
-    add({30, 32, 8192}, 6, 2, {2, 5}, 1851U);
-    add({30, 32, 8192}, 16, 8, {0, 1, 2, 3, 16, 7, 12, 5}, 1861U);
-    add({36, 48, 10240}, 2, 1, {2}, 1871U, true);
-    add({36, 48, 10240}, 5, 4, {0, 1, 3, 5}, 1873U);
-    add({36, 48, 10240}, 16, 8, {0, 1, 2, 3, 4, 5, 6, 7}, 1875U, true);
-    add({36, 48, 10240}, 16, 8, {8, 9, 10, 11, 12, 13, 14, 15}, 1877U);
-    add({36, 48, 10240}, 16, 1, {16}, 1879U, true);
-    add({36, 48, 10240}, 16, 1, {0}, 1881U, true);
-    add({36, 48, 10240}, 16, 8, {0, 0, 0, 0, 0, 0, 0, 0}, 1883U, true);
-    add({36, 48, 10240}, 16, 8, {0, 0, 0, 0, 0, 0, 0, 1}, 1885U, true);
-    add({36, 48, 10240}, 16, 8, {0, 0, 0, 0, 0, 0, 0, 16}, 1887U, true);
-    add({30, 32, 8192}, 2, 3, {0, 1, 2}, 1889U);
-    add({30, 32, 8192}, 2, 1, {1}, 1891U, false, false, 1);
-    add({36, 48, 10240}, 5, 3, {0, 1, 5}, 1893U, false, false, 3);
-    for (const FoldProfile profile : {FoldProfile{36, 48, 10240}, {36, 24, 5120}})
-        suite.add("gdn_fold/device/l36/h" + std::to_string(profile.value_heads) + "/sparse/graph",
-                  [=] { return run_case(profile, 16, 4, {0, 0, 0, 16}, 5200U, true, true, true); });
-    suite.add("gdn_fold/device/l36/h48/zero/graph", [] {
-        return run_case({36, 48, 10240}, 4, 4, {0, 0, 0, 0}, 5201U, true, true, true);
-    });
-    suite.add("gdn_fold/record_rounds/q4_q5", [] { return run_record_fold_rounds(); },
-              {{"format", "q4_q5"}});
-    suite.add("gdn_fold/record_rounds/q8", [] { return run_record_fold_rounds(true); },
-              {{"format", "q8"}});
-
-    for (int b = 1; b <= 8; ++b) {
-        for (int t : {2, 4, 6, 8, 16}) {
-            add({36, 24, 5120}, t, b, std::vector<int>(b, t), 2200U + 100 * b + t, true);
-            std::vector<int> mixed(b);
-            for (int row = 0; row < b; ++row) mixed[row] = (3 * row + 1) % (t + 1);
-            add({36, 24, 5120}, t, b, mixed, 3200U + 100 * b + t);
-        }
-        add({36, 24, 5120}, 16, b, std::vector<int>(b, 0), 4200U + b, true);
-        add({36, 24, 5120}, 16, b, std::vector<int>(b, 1), 4300U + b, true);
-    }
-    for (int first = 0; first < 16; first += 8) {
-        std::vector<int> commits(8);
-        for (int b = 0; b < 8; ++b) commits[b] = first + b;
-        add({36, 24, 5120}, 16, 8, commits, 4400U + first, true);
-    }
-    for (bool distinct : {false, true}) {
-        for (int commit : {8, 9, 10})
-            add({36, 24, 5120}, 16, 1, {commit}, 4500U + commit, distinct, commit == 9);
-        for (int width : {9, 10}) add({36, 24, 5120}, width, 1, {width}, 4600U + width, distinct);
-    }
-#if NINFER_TARGET_SPARK
-    suite.add("gdn_fold_local/record_rounds/q8", [] { return run_record_fold_rounds(true, true); },
-              {{"format", "q8"}});
-#endif
+    suite.add("gdn_fold/cancellation", cancellation);
+    suite.add("gdn_fold/decay_product_overflow", [] { return extreme_decay(50.f, 0.f); });
+    suite.add("gdn_fold/decay_product_underflow", [] { return extreme_decay(-50.f, 0x1p126f); });
+    suite.add("gdn_fold/chained_trajectory", chain);
     return suite.main(argc, argv);
 }

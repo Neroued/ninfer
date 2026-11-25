@@ -1,3 +1,4 @@
+#include "gdn_ref.h"
 #include "ops/suite.h"
 #include "ops/state_fixture.h"
 #include "ninfer/ops/gated_delta_net.h"
@@ -36,13 +37,6 @@ std::vector<std::uint16_t> make_bf16(std::size_t count, std::uint32_t seed) {
         bits[index] = f32_to_bf16(values[index]);
     }
     return bits;
-}
-
-int verify_equal(const std::string& label, const std::vector<std::uint16_t>& lhs,
-                 const std::vector<std::uint16_t>& rhs) {
-    if (lhs == rhs) { return 0; }
-    std::cerr << label << ": BF16 bits differ\n";
-    return 1;
 }
 
 int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
@@ -95,29 +89,21 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
     DeviceBuffer device_v        = upload(v_bits, v_offset);
     DeviceBuffer device_g        = to_device(g);
     DeviceBuffer device_beta     = to_device(beta);
-    DeviceBuffer reference_state = to_device(state);
-    DeviceBuffer reference_final(ninfer::test::cuda_environment().context.device(),
-                                 static_cast<std::size_t>(kStateDim) * kStateDim * value_heads *
-                                     batch * sizeof(float));
     DeviceBuffer record_state = to_device(state);
     DeviceBuffer device_valid;
     if (!dense) { device_valid = to_device(valid_columns); }
 
-    DeviceBuffer reference_out(ninfer::test::cuda_environment().context.device(),
-                               value_elements * sizeof(std::uint16_t));
-    DeviceBuffer record_out(ninfer::test::cuda_environment().context.device(),
+    DeviceBuffer record_out(cuda_environment().context.device(),
                             value_elements * sizeof(std::uint16_t));
-    DeviceBuffer key_record(ninfer::test::cuda_environment().context.device(),
-                            qk_elements * sizeof(std::uint16_t));
-    DeviceBuffer value_record(ninfer::test::cuda_environment().context.device(),
-                              value_elements * sizeof(std::uint16_t));
-    DeviceBuffer gate_record(ninfer::test::cuda_environment().context.device(),
-                             gate_elements * 2 * sizeof(std::uint32_t));
-    reference_out.fill(0);
+    LayoutBuilder record_builder;
+    const auto record_layout = plan_gdn_replay_records(
+        record_builder, {1, batch, width, (2 * kQkHeads + value_heads) * kStateDim, kQkHeads,
+                         value_heads, kStateDim, kStateDim});
+    DeviceBuffer storage(cuda_environment().context.device(), record_builder.finish(256));
+    const GdnReplayRecords records(storage.span(), record_layout);
+    const auto layer = records.layer(0, batch);
     record_out.fill(0xff);
-    key_record.fill(0xff);
-    value_record.fill(0xff);
-    gate_record.fill(0xff);
+    storage.fill(0xff);
 
     Tensor q(device_q.span().subspan(qk_offset, qk_elements * 2), DType::BF16,
              {kStateDim, kQkHeads, width, batch});
@@ -127,15 +113,9 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
              {kStateDim, value_heads, width, batch});
     Tensor g_tensor(device_g.span(), DType::FP32, {value_heads, width, batch});
     Tensor beta_tensor(device_beta.span(), DType::FP32, {value_heads, width, batch});
-    Tensor reference_states(reference_state.span(), DType::FP32,
-                            {kStateDim, kStateDim, value_heads, slots});
     Tensor record_states(record_state.span(), DType::FP32,
                          {kStateDim, kStateDim, value_heads, slots});
     RecordStateFixture history(record_states, 3);
-    Tensor reference_final_states(reference_final.span(), DType::FP32,
-                                  {kStateDim, kStateDim, value_heads, batch});
-    DeviceBuffer reference_slot = to_device(std::vector<std::int64_t>{0});
-    Tensor selected_reference_slot(reference_slot.span(), DType::I64, {1});
     Tensor valid;
     if (!dense) { valid = Tensor(device_valid.span(), DType::I32, {batch}); }
     auto initial_offsets = history.record_offsets(initial_slots);
@@ -143,72 +123,18 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
         if (!valid_columns[row]) initial_offsets[row] = -1;
     DeviceBuffer device_initial = to_device(initial_offsets);
     Tensor initial(device_initial.span(), DType::I64, {batch});
-    Tensor reference_output(reference_out.span(), DType::BF16,
-                            {kStateDim, value_heads, width, batch});
     Tensor record_output(record_out.span(), DType::BF16, {kStateDim, value_heads, width, batch});
-    Tensor key_record_tensor(key_record.span(), DType::BF16, {kStateDim, kQkHeads, width, batch});
-    Tensor value_record_tensor(value_record.span(), DType::BF16,
-                               {kStateDim, value_heads, width, batch});
-    Tensor gate_record_tensor(gate_record.span(), DType::FP32, {2, value_heads, width, batch});
 
     constexpr float kScale = 1.0F / std::sqrt(128.0F);
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
     const auto stream_execution = ninfer::test::cuda_environment().context.execution_view(stream);
     cuda_synchronize();
-    // The contract names public one-token state-pool execution as the exact reference.
-    const auto launch_reference = [&] {
-        CUDA_CHECK(cudaMemsetAsync(reference_out.data(), 0, reference_out.size(), stream));
-        for (std::int32_t row = 0; row < batch; ++row) {
-            const std::int32_t valid_extent = valid_columns[static_cast<std::size_t>(row)];
-            if (!valid_extent) continue;
-            Tensor q_row = q.slice(3, row, 1)
-                               .slice(2, 0, valid_extent)
-                               .view({kStateDim, kQkHeads, valid_extent});
-            Tensor k_row = k.slice(3, row, 1)
-                               .slice(2, 0, valid_extent)
-                               .view({kStateDim, kQkHeads, valid_extent});
-            Tensor v_row = v.slice(3, row, 1)
-                               .slice(2, 0, valid_extent)
-                               .view({kStateDim, value_heads, valid_extent});
-            Tensor g_row = g_tensor.slice(2, row, 1)
-                               .slice(1, 0, valid_extent)
-                               .view({value_heads, valid_extent});
-            Tensor beta_row = beta_tensor.slice(2, row, 1)
-                                  .slice(1, 0, valid_extent)
-                                  .view({value_heads, valid_extent});
-            Tensor state_row =
-                reference_states.slice(3, initial_slots[static_cast<std::size_t>(row)], 1)
-                    .view({kStateDim, kStateDim, value_heads});
-            Tensor out_row = reference_output.slice(3, row, 1)
-                                 .slice(2, 0, valid_extent)
-                                 .view({kStateDim, value_heads, valid_extent});
-            Tensor final_row =
-                reference_final_states.slice(3, row, 1).view({kStateDim, kStateDim, value_heads});
-            CUDA_CHECK(cudaMemcpyAsync(final_row.data, state_row.data, state_row.bytes(),
-                                       cudaMemcpyDeviceToDevice, stream));
-            for (int token = 0; token < valid_extent; ++token) {
-                auto qt = q_row.slice(2, token, 1);
-                auto kt = k_row.slice(2, token, 1);
-                auto vt = v_row.slice(2, token, 1);
-                auto gt = g_row.slice(1, token, 1);
-                auto bt = beta_row.slice(1, token, 1);
-                auto ot = out_row.slice(2, token, 1);
-                ops::gated_delta_net_batch_update(
-                    qt, kt, vt, gt, bt, kScale, true,
-                    dense_record_field(final_row, 3, selected_reference_slot),
-                    dense_record_field(final_row, 3, selected_reference_slot), {}, ot,
-                    stream_execution);
-            }
-        }
-    };
     const auto launch_record = [&] {
-        ops::gated_delta_net_replay_record(
-            q, k, v, g_tensor, beta_tensor, kScale, history.view(initial), valid,
-            {key_record_tensor, value_record_tensor, gate_record_tensor}, record_output,
-            stream_execution);
+        ops::gated_delta_net_replay_record(q, k, v, g_tensor, beta_tensor, kScale,
+                                           history.view(initial), valid, layer.recurrence,
+                                           record_output, stream_execution);
     };
-    launch_reference();
     launch_record();
     CUDA_CHECK(cudaStreamSynchronize(stream));
     if (width == 2 || width == 9 || width == 16) {
@@ -234,11 +160,9 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
             if (!valid_columns[row]) initial_offsets[row] = -1;
         CUDA_CHECK(cudaMemcpyAsync(device_initial.data(), initial_offsets.data(),
                                    device_initial.size(), cudaMemcpyHostToDevice, stream));
-        CUDA_CHECK(cudaMemsetAsync(key_record.data(), 0xff, key_record.size(), stream));
-        CUDA_CHECK(cudaMemsetAsync(value_record.data(), 0xff, value_record.size(), stream));
-        CUDA_CHECK(cudaMemsetAsync(gate_record.data(), 0xff, gate_record.size(), stream));
+        CUDA_CHECK(cudaMemsetAsync(storage.data(), 0xff, storage.size(), stream));
+        CUDA_CHECK(cudaMemsetAsync(record_out.data(), 0xff, record_out.size(), stream));
         CUDA_CHECK(cudaGraphLaunch(executable, stream));
-        launch_reference();
         CUDA_CHECK(cudaStreamSynchronize(stream));
         CUDA_CHECK(cudaGraphExecDestroy(executable));
         CUDA_CHECK(cudaGraphDestroy(graph));
@@ -248,70 +172,84 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
     int failures             = 0;
     const std::string suffix = " Hv=" + std::to_string(value_heads) +
                                " T=" + std::to_string(width) + " B=" + std::to_string(batch);
-    const std::vector<std::uint16_t> reference_output_bits =
-        from_device<std::uint16_t>(reference_out, value_elements);
-    const std::vector<std::uint16_t> record_output_bits =
-        from_device<std::uint16_t>(record_out, value_elements);
-    failures +=
-        verify_equal("replay record output" + suffix, reference_output_bits, record_output_bits);
-
-    const std::vector<std::uint16_t> key_bits_after =
-        from_device<std::uint16_t>(key_record, qk_elements);
-    const std::vector<std::uint16_t> value_bits_after =
-        from_device<std::uint16_t>(value_record, value_elements);
-    const std::vector<std::uint32_t> gate_bits_after =
-        from_device<std::uint32_t>(gate_record, gate_elements * 2);
-    for (std::int32_t row = 0; row < batch; ++row) {
-        const std::int32_t valid_extent = valid_columns[static_cast<std::size_t>(row)];
-        for (std::int32_t token = 0; token < width; ++token) {
-            const std::int64_t column = static_cast<std::int64_t>(row) * width + token;
-            const bool active         = token < valid_extent;
-            for (std::int32_t head = 0; head < kQkHeads; ++head) {
-                const std::size_t base =
-                    static_cast<std::size_t>((column * kQkHeads + head) * kStateDim);
-                for (std::int32_t dim = 0; dim < kStateDim; ++dim) {
-                    const std::uint16_t expected = active ? k_bits[base + dim] : kBf16Poison;
-                    if (key_bits_after[base + dim] != expected) {
-                        std::cerr << "key record mismatch" << suffix << "\n";
-                        return failures + 1;
-                    }
-                }
-            }
-            for (std::int32_t head = 0; head < value_heads; ++head) {
-                const std::size_t vector_base =
-                    static_cast<std::size_t>((column * value_heads + head) * kStateDim);
-                for (std::int32_t dim = 0; dim < kStateDim; ++dim) {
-                    const std::uint16_t expected = active ? v_bits[vector_base + dim] : kBf16Poison;
-                    if (value_bits_after[vector_base + dim] != expected) {
-                        std::cerr << "value record mismatch" << suffix << "\n";
-                        return failures + 1;
-                    }
-                }
-                const std::size_t gate_offset =
-                    static_cast<std::size_t>((column * value_heads + head) * 2);
-                const std::size_t source_offset =
-                    static_cast<std::size_t>(column * value_heads + head);
-                const std::uint32_t expected_g =
-                    active ? std::bit_cast<std::uint32_t>(g[source_offset]) : kFp32Poison;
-                const std::uint32_t expected_beta =
-                    active ? std::bit_cast<std::uint32_t>(beta[source_offset]) : kFp32Poison;
-                if (gate_bits_after[gate_offset] != expected_g ||
-                    gate_bits_after[gate_offset + 1] != expected_beta) {
-                    std::cerr << "gate record mismatch" << suffix << "\n";
-                    return failures + 1;
-                }
-            }
-            if (!active) {
-                const std::size_t output_base =
-                    static_cast<std::size_t>(column) * value_heads * kStateDim;
-                for (std::int32_t index = 0; index < value_heads * kStateDim; ++index) {
-                    if (record_output_bits[output_base + index] != 0) {
-                        std::cerr << "record invalid output is not zero" << suffix << "\n";
-                        return failures + 1;
-                    }
-                }
+    const auto record_output_bits = from_device<std::uint16_t>(record_out, value_elements);
+    const auto [key_record, delta_record, alpha_record] =
+        ninfer::detail::GdnReplayRecordAccess::planes(layer.recurrence);
+    const auto key_after   = from_device<std::uint16_t>(key_record.data, qk_elements);
+    const auto delta_after = from_device<std::uint32_t>(delta_record.data, value_elements);
+    const auto alpha_after = from_device<std::uint32_t>(alpha_record.data, gate_elements);
+    const auto conv_after  = from_device<std::uint16_t>(layer.conv.data, layer.conv.numel());
+    const auto all_equal = [](const auto& values, std::size_t first, std::size_t count, auto word) {
+        return std::all_of(values.begin() + first, values.begin() + first + count,
+                           [word](auto value) { return value == word; });
+    };
+    if (!all_equal(conv_after, 0, conv_after.size(), kBf16Poison)) {
+        std::cerr << "recurrent record modified convolution plane" << suffix << '\n';
+        ++failures;
+    }
+    for (int row = 0; row < batch; ++row) {
+        const int tokens     = valid_columns[row];
+        const auto qk_base   = std::size_t(row * width) * kQkHeads * kStateDim;
+        const auto v_base    = std::size_t(row * width) * value_heads * kStateDim;
+        const auto gate_base = std::size_t(row * width) * value_heads;
+        const auto qk_count  = std::size_t(tokens) * kQkHeads * kStateDim;
+        const auto v_count   = std::size_t(tokens) * value_heads * kStateDim;
+        const auto g_count   = std::size_t(tokens) * value_heads;
+        if (tokens) {
+            const auto state_begin = state.begin() + initial_slots[row] * (state_elements / slots);
+            const auto expected    = gdn_ref::evaluate(
+                {kStateDim,
+                    kQkHeads,
+                    value_heads,
+                    tokens,
+                    gdn_ref::represented_bf16(std::span(q_bits).subspan(qk_base, qk_count)),
+                    gdn_ref::represented_bf16(std::span(k_bits).subspan(qk_base, qk_count)),
+                    gdn_ref::represented_bf16(std::span(v_bits).subspan(v_base, v_count)),
+                    {g.begin() + gate_base, g.begin() + gate_base + g_count},
+                    {beta.begin() + gate_base, beta.begin() + gate_base + g_count},
+                    {state_begin, state_begin + state_elements / slots}},
+                1.0 / std::sqrt(128.0), true);
+            const auto output =
+                gdn_ref::represented_bf16(std::span(record_output_bits).subspan(v_base, v_count));
+            failures += verify_reduction("replay record output" + suffix,
+                                         std::vector<double>(output.begin(), output.end()),
+                                         expected.out, gdn_ref::kOutputCriterion);
+            if (!std::equal(key_after.begin() + qk_base, key_after.begin() + qk_base + qk_count,
+                            k_bits.begin() + qk_base)) {
+                std::cerr << "represented record key differs" << suffix << '\n';
+                ++failures;
             }
         }
+        const auto tail = width - tokens;
+        if (!all_equal(record_output_bits, v_base + v_count, tail * value_heads * kStateDim, 0) ||
+            !all_equal(key_after, qk_base + qk_count, tail * kQkHeads * kStateDim, kBf16Poison) ||
+            !all_equal(delta_after, v_base + v_count, tail * value_heads * kStateDim,
+                       kFp32Poison) ||
+            !all_equal(alpha_after, gate_base + g_count, tail * value_heads, kFp32Poison)) {
+            std::cerr << "invalid output or record suffix differs" << suffix << '\n';
+            ++failures;
+        }
+    }
+
+    if (width == 2 && batch == 1) {
+        const auto rejects = [&](const Tensor& query, const Tensor& key, const Tensor& gate,
+                                 const Tensor& mask, Tensor output) {
+            try {
+                ops::gated_delta_net_replay_record(
+                    query, key, v, gate, beta_tensor, kScale, history.view(initial), mask,
+                    layer.recurrence, output, cuda_environment().context.execution_view());
+            } catch (const std::invalid_argument&) { return 0; }
+            std::cerr << "record accepted invalid operands" << suffix << '\n';
+            return 1;
+        };
+        failures += rejects(q, q, g_tensor, valid, record_output);
+        failures += rejects(q, k, beta_tensor, valid, record_output);
+        failures += rejects(q, k, g_tensor, valid, v);
+        failures +=
+            rejects(q, k, g_tensor, valid,
+                    Tensor(MemorySpan{delta_record.data, delta_record.bytes(), delta_record.device},
+                           DType::BF16, {kStateDim, value_heads, width, batch}));
+        failures += rejects(q, k, g_tensor, valid, q);
     }
 
     history.copy_back();
@@ -321,7 +259,11 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
         std::cerr << "replay record modified source state" << suffix << "\n";
         ++failures;
     }
-    if (from_device<std::uint16_t>(q.data, qk_elements) != q_bits ||
+    if (from_device<std::int64_t>(device_initial, batch) != initial_offsets ||
+        (!dense && from_device<int>(device_valid, batch) != valid_columns) ||
+        from_device<float>(device_g, gate_elements) != g ||
+        from_device<float>(device_beta, gate_elements) != beta ||
+        from_device<std::uint16_t>(q.data, qk_elements) != q_bits ||
         from_device<std::uint16_t>(k.data, qk_elements) != k_bits ||
         from_device<std::uint16_t>(v.data, value_elements) != v_bits) {
         std::cerr << "replay record modified inputs" << suffix << "\n";
@@ -361,12 +303,10 @@ int main(int argc, char** argv) {
     suite.add("gdn_record/h48/minimum-alignment/graph",
               [] { return run_case(48, 9, 2, {9, 3}, 1793U, true); }, {{"execution", "graph"}});
 
-    for (int b = 1; b <= 8; ++b)
-        for (int t = 2; t <= 16; ++t) {
-            add(24, t, b, {}, 2000U + 100 * b + t);
-            std::vector<int> valid(b);
-            for (int row = 0; row < b; ++row) valid[row] = 1 + (3 * row + t - 1) % t;
-            add(24, t, b, valid, 3000U + 100 * b + t);
-        }
+    for (int t : {2, 4, 8, 9, 16}) {
+        add(24, t, 1, {}, 2000U + t);
+        add(24, t, 4, {t, 0, 1, t - 1}, 3000U + t);
+    }
+    add(32, 5, 1, {0}, 1715U);
     return suite.main(argc, argv);
 }

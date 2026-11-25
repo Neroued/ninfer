@@ -2,10 +2,12 @@
 #include "ops/ragged_fixture.h"
 #include "core/decode_graph.h"
 #include "core/platform.h"
+#include "core/transfer.h"
 #include "ops/input_projection_test_common.h"
 #include "ops/state_fixture.h"
 #include "ninfer/ops/kda_input_proj.h"
 #include "ninfer/ops/kda_replay.h"
+#include "ninfer/ops/kimi_delta_attention.h"
 
 #include <array>
 #include <tuple>
@@ -35,9 +37,9 @@ int fold_records(const Tensor& conv, const std::vector<std::uint16_t>& words,
     const auto record_layout =
         plan_kda_replay_records(records_builder, {1, batch, width, C, 32, 32, 128, 128});
     DeviceBuffer frame(cuda.device(), records_builder.finish(256));
-    CUDA_CHECK(cudaMemsetAsync(frame.data(), 0, frame.size(), cuda.stream()));
     KdaReplayRecords records(frame.span(), record_layout);
-    records.conv = conv;
+    copy_bytes_async({records.conv.data, records.conv.bytes(), cuda.device()},
+                     {conv.data, conv.bytes(), cuda.device()}, cuda);
     ops::KdaReplayFoldPlan plan(records, states.all_layers_view());
     std::vector<ops::KdaReplayFoldRow> rows(batch);
     std::vector<std::uint16_t> initial(std::size_t(batch) * C * 3);
@@ -51,6 +53,23 @@ int fold_records(const Tensor& conv, const std::vector<std::uint16_t>& words,
         CUDA_CHECK(cudaMemcpyAsync(target.data, row, target.bytes(), cudaMemcpyHostToDevice,
                                    cuda.stream()));
     }
+    // Populate the opaque recurrence records from the same zero S0 used by fold.
+    std::vector<std::int64_t> sources;
+    for (const auto& row : rows) sources.push_back(row.source_offset);
+    auto source_buffer = to_device(sources), lengths = to_device(valid);
+    Tensor offsets(source_buffer.span(), DType::I64, {batch});
+    Tensor counts(lengths.span(), DType::I32, {batch});
+    auto zeros = to_device_bf16(std::vector<float>(std::size_t(H) * width * batch));
+    const Tensor input(zeros.span(), DType::BF16, {128, 32, width, batch});
+    const Tensor beta(zeros.span(), DType::BF16, {32, width, batch});
+    auto gates = to_device_f32(std::vector<float>(H));
+    const Tensor a(gates.span(), DType::FP32, {32}), bias(gates.span(), DType::FP32, {128, 32});
+    DeviceBuffer output(cuda.device(), input.bytes());
+    Tensor out(output.span(), DType::BF16, {128, 32, width, batch});
+    ops::kimi_delta_attention_replay_record(
+        input, input, input, input, beta, a, bias, 0.0F, 0.08838834764831845F,
+        states.layer_view(0, offsets).recurrent, counts, records.layer(0, batch).recurrence, out,
+        cuda);
     int failures = 0;
     for (int accepted = 0; accepted <= width; ++accepted) {
         for (int b = 0; b < batch; ++b) {
@@ -213,45 +232,43 @@ int run_case(int width, int batch, bool in_place, bool graph, int capacity_last 
         outputs(update_outputs), workspace, ex);
     cuda_synchronize();
     const auto raw_bits = from_device<std::uint16_t>(raw.data(), raw.bytes() / 2);
-    std::array<std::vector<double>, 3> got;
+    std::array<std::vector<std::uint16_t>, 3> got, updated;
     for (int i = 0; i < 3; ++i) {
-        got[i] = from_device_bf16(record_outputs[i].data(), record_outputs[i].bytes() / 2);
-        failures += verify_exact(
-            "input update/record",
-            from_device<std::uint16_t>(record_outputs[i].data(), record_outputs[i].bytes() / 2),
-            from_device<std::uint16_t>(update_outputs[i].data(), update_outputs[i].bytes() / 2));
+        got[i] = from_device<std::uint16_t>(record_outputs[i].data(), record_outputs[i].bytes() / 2);
+        updated[i] =
+            from_device<std::uint16_t>(update_outputs[i].data(), update_outputs[i].bytes() / 2);
         failures += record_outputs[i].verify_guards("record QKV") +
                     update_outputs[i].verify_guards("update QKV");
     }
+    std::vector<std::vector<std::uint16_t>> updated_history(batch);
     const auto& final_history = in_place ? source : destination;
     for (int b = 0; b < batch; ++b) {
-        const auto t      = final_history.tensor(in_place ? selected[b] : b);
-        const auto actual = from_device<std::uint16_t>(t.data, C * 3);
-        std::vector<std::uint16_t> expected(C * 3);
-        for (int j = 0; j < 3; ++j)
-            for (int c = 0; c < C; ++c) {
-                if (!valid[b]) {
-                    const int original  = in_place ? selected[b] : b;
-                    expected[j * C + c] = f32_to_bf16(historyh[(original * 3 + j) * C + c]);
-                    continue;
-                }
-                const int pos = valid[b] - 3 + j;
-                expected[j * C + c] =
-                    pos < 0 ? f32_to_bf16(historyh[(selected[b] * 3 + pos + 3) * C + c])
-                            : raw_bits[(std::size_t(b) * width + pos) * C + c];
-            }
-        failures += verify_exact("update history from actual records", actual, expected);
+        const int original = in_place ? selected[b] : b;
+        const auto t = final_history.tensor(original);
+        updated_history[b] = from_device<std::uint16_t>(t.data, C * 3);
+        for (int j = 0; j < 3; ++j) {
+            const int pos = valid[b] - 3 + j;
+            if (pos >= 0) continue;
+            const int slot = valid[b] ? selected[b] : original;
+            for (int c = 0; c < C; ++c)
+                if (updated_history[b][j * C + c] !=
+                        f32_to_bf16(historyh[(slot * 3 + pos + 3) * C + c]))
+                    throw std::runtime_error("update changed untouched history words");
+        }
         for (int t = valid[b]; t < width; ++t) {
             for (int c = 0; c < C; ++c)
                 if (raw_bits[(std::size_t(b) * width + t) * C + c] != 0x3535)
                     throw std::runtime_error("input record overwrote invalid suffix");
-            for (const auto& plane : got)
-                for (int c = 0; c < H; ++c)
-                    if (plane[(std::size_t(b) * width + t) * H + c] != 0)
-                        throw std::runtime_error("input output invalid suffix is nonzero");
+            for (int i = 0; i < 3; ++i)
+                for (int c = 0; c < H; ++c) {
+                    const auto index = (std::size_t(b) * width + t) * H + c;
+                    if (got[i][index] != 0 || updated[i][index] != 0)
+                        throw std::runtime_error("input output invalid suffix is not BF16 +0");
+                }
         }
     }
-    std::vector<double> reference, actual, projected_reference, projected_actual;
+    std::vector<double> reference, actual, actual_update, projected_reference, projected_actual,
+        update_history_reference, update_history_actual;
     const auto sampled = input_projection::sampled_rows(C, 31);
     for (int b = 0; b < batch; ++b)
         for (const int c : sampled) {
@@ -268,19 +285,31 @@ int run_case(int width, int batch, bool in_place, bool graph, int capacity_last 
                     sum += double(wh[tap * C + c]) * value;
                 }
                 reference.push_back(sum / (1 + std::exp(-sum)));
-                actual.push_back(got[c / H][(std::size_t(b) * width + t) * H + c % H]);
+                const auto index = (std::size_t(b) * width + t) * H + c % H;
+                actual.push_back(bf16_to_f32(got[c / H][index]));
+                actual_update.push_back(bf16_to_f32(updated[c / H][index]));
+                if (t >= valid[b] - 3) {
+                    update_history_reference.push_back(p[t]);
+                    update_history_actual.push_back(
+                        bf16_to_f32(updated_history[b][(t + 3 - valid[b]) * C + c]));
+                }
                 projected_reference.push_back(p[t]);
                 projected_actual.push_back(
                     bf16_to_f32(raw_bits[(std::size_t(b) * width + t) * C + c]));
             }
         }
-    if (!reference.empty())
-        failures += verify_reduction("fused projection/conv/SiLU", actual, reference, criterion);
+    if (!reference.empty()) {
+        failures += verify_reduction("record projection/conv/SiLU", actual, reference, criterion);
+        failures += verify_reduction("update projection/conv/SiLU", actual_update, reference,
+                                     criterion);
+        failures += verify_reduction("updated projected history", update_history_actual,
+                                     update_history_reference, criterion);
+    }
     if (precision_boundary) {
         const double p        = 1.0 / 256;
         const double expected = bf16_to_f32(f32_to_bf16(p / (1 + std::exp(-p))));
         for (const auto& plane : got)
-            if (plane[0] != expected)
+            if (bf16_to_f32(plane[0]) != expected)
                 throw std::runtime_error("projection was rounded before convolution");
     }
     if (!projected_reference.empty())

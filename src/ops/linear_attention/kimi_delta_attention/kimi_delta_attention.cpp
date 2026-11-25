@@ -288,7 +288,7 @@ void kimi_delta_attention_replay_record(const Tensor& q, const Tensor& k, const 
                                         const Tensor& g, const Tensor& beta, const Tensor& a_log,
                                         const Tensor& dt_bias, float lower_bound, float scale,
                                         ConstStateFieldView source, const Tensor& valid,
-                                        KdaRecurrenceRecords records, Tensor& out,
+                                        KdaRecurrenceRecordView records, Tensor& out,
                                         CudaExecutionView execution) {
     const auto p = kda::validate_inputs(q, k, v, g, beta, a_log, dt_bias, lower_bound, scale, out,
                                         execution.device());
@@ -296,16 +296,14 @@ void kimi_delta_attention_replay_record(const Tensor& q, const Tensor& k, const 
     if (valid.data)
         common::operand::tensor(valid, DType::I32, {p.batch}, 4, op, "valid columns",
                                 execution.device());
-    common::operand::tensor(records.key, DType::BF16, {128, p.qk_heads, p.tokens, p.batch}, 16, op,
+    const auto [key, delta, alpha] = ninfer::detail::KdaReplayRecordAccess::planes(records);
+    common::operand::tensor(key, DType::BF16, {128, p.qk_heads, p.tokens, p.batch}, 16, op,
                             "key record", execution.device());
-    common::operand::tensor(records.value, DType::BF16, {128, p.value_heads, p.tokens, p.batch}, 16,
-                            op, "value record", execution.device());
-    common::operand::tensor(records.log_decay, DType::FP32, {128, p.value_heads, p.tokens, p.batch},
-                            16, op, "decay record", execution.device());
-    common::operand::tensor(records.beta, DType::FP32, {p.value_heads, p.tokens, p.batch}, 4, op,
-                            "beta record", execution.device());
-    const Tensor* outputs[] = {&records.key, &records.value, &records.log_decay, &records.beta,
-                               &out};
+    common::operand::tensor(delta, DType::FP32, {128, p.value_heads, p.tokens, p.batch}, 16, op,
+                            "delta record", execution.device());
+    common::operand::tensor(alpha, DType::FP32, {128, p.value_heads, p.tokens, p.batch}, 16, op,
+                            "alpha record", execution.device());
+    const Tensor* outputs[] = {&key, &delta, &alpha, &out};
     for (std::size_t i = 0; i < std::size(outputs); ++i) {
         for (std::size_t j = 0; j < i; ++j)
             common::operand::disjoint(common::operand::range(*outputs[i], op),
@@ -313,10 +311,7 @@ void kimi_delta_attention_replay_record(const Tensor& q, const Tensor& k, const 
         for (const auto* input :
              {&q, &k, &v, &g, &beta, &a_log, &dt_bias,
               static_cast<const Tensor*>(&source.records.byte_offsets), &valid}) {
-            if (!input->data ||
-                (outputs[i] == &records.key && input == &k && records.key.data == k.data) ||
-                (outputs[i] == &records.value && input == &v && records.value.data == v.data))
-                continue;
+            if (!input->data) continue;
             common::operand::disjoint(common::operand::range(*outputs[i], op),
                                       common::operand::range(*input, op), op);
         }
@@ -326,9 +321,8 @@ void kimi_delta_attention_replay_record(const Tensor& q, const Tensor& k, const 
                   common::operand::state_field_base<const float>(source), nullptr, out),
         static_cast<const std::int64_t*>(source.records.byte_offsets.data),
         static_cast<const std::int32_t*>(valid.data),
-        {static_cast<__nv_bfloat16*>(records.key.data),
-         static_cast<__nv_bfloat16*>(records.value.data),
-         static_cast<float*>(records.log_decay.data), static_cast<float*>(records.beta.data)},
+        {static_cast<__nv_bfloat16*>(key.data), static_cast<float*>(delta.data),
+         static_cast<float*>(alpha.data)},
         p.batch, execution.stream());
 }
 } // namespace ninfer::ops

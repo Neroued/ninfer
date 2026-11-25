@@ -128,13 +128,6 @@ struct Fixture {
                 CUDA_CHECK(cudaMemcpyAsync(records.conv.data, conv_records.data(),
                                            records.conv.bytes(), cudaMemcpyDeviceToDevice, stream));
             }
-            if (o.op == "record" && o.alias_records) {
-                auto layer = records.layer(0, b);
-                CUDA_CHECK(cudaMemcpyAsync(layer.key.data, k.data(), k.size(),
-                                           cudaMemcpyDeviceToDevice, stream));
-                CUDA_CHECK(cudaMemcpyAsync(layer.value.data, v.data(), v.size(),
-                                           cudaMemcpyDeviceToDevice, stream));
-            }
         }
         if (o.op == "core" || o.op == "layer-prefill")
             capacity = ops::kimi_delta_attention_workspace_capacity_bytes(qh, h, t, t);
@@ -198,32 +191,24 @@ struct Fixture {
         return Tensor(x.span(), DType::BF16, {128, heads, t, b});
     }
 
-    bool aliases_kv_records() const {
-        return o.op == "chain" || recorded_layer() || projects_fold() ||
-               (o.op == "record" && o.alias_records);
-    }
-
     void record(int layer, CudaExecutionView cuda) {
-        auto rr          = records.layer(layer, b);
-        auto y           = vector(out, h);
-        const bool alias = aliases_kv_records();
+        const auto rr = records.layer(layer, b);
+        auto y        = vector(out, h);
         ops::kimi_delta_attention_replay_record(
-            vector(q, qh), alias ? rr.key : vector(k, qh), alias ? rr.value : vector(v, h),
+            vector(q, qh), vector(k, qh), vector(v, h),
             vector(g, h), Tensor(beta.span(), DType::BF16, {h, t, b}),
             Tensor(a_log.span(), DType::FP32, {h}), Tensor(bias.span(), DType::FP32, {128, h}), -5,
             0.08838834764831845F, states->layer_view(layer, st()).recurrent, vt(),
-            {rr.key, rr.value, rr.log_decay, rr.beta}, y, cuda);
+            rr.recurrence, y, cuda);
     }
 
     void input_call(bool record_mode, CudaExecutionView cuda, int layer = 0) {
         auto x = Tensor(input.span(), DType::BF16, {4096, t, b}),
              w = Tensor(conv_weight.span(), o.format == "mxfp8" ? DType::BF16 : DType::FP32,
                         {12288, 4});
-        const bool alias = o.op == "chain" || recorded_layer() || projects_fold();
-        const auto key   = alias ? records.layer(layer, b).key : vector(k, qh);
-        const auto value = alias ? records.layer(layer, b).value : vector(v, h);
-        const ops::KdaConvOutputs outputs{vector(q, qh).view({4096, t, b}), key.view({4096, t, b}),
-                                          value.view({4096, t, b})};
+        const ops::KdaConvOutputs outputs{vector(q, qh).view({4096, t, b}),
+                                          vector(k, qh).view({4096, t, b}),
+                                          vector(v, h).view({4096, t, b})};
         const ops::SingleProjectionWeight qw{weight.weight, input_policy()};
         if (record_mode) {
             auto rr = records.layer(layer, b);

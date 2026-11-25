@@ -56,10 +56,11 @@ void kda_input_proj_conv_update(const Tensor& x, const SingleProjectionWeight& q
                                 MemoryArena& workspace, CudaExecutionView execution);
 
 /**
- * Same physical computation and readouts as update, but source stays read-only and each
- * valid newest BF16 projected column is stored in conv_record [N,T,B]. Record suffixes remain
- * unchanged. These words define tail restoration for accepted prefixes of this physical call;
- * recomputing a shorter projection is not the reference. Outputs and records are disjoint.
+ * Approximate the projection, four-tap causal channelwise convolution and SiLU defined
+ * above, with read-only source history. Each valid newest projected column is stored as BF16
+ * in conv_record [N,T,B]. These words define tail restoration for accepted prefixes.
+ * Invalid output tails are exact BF16 +0 and invalid record suffixes are unchanged.
+ * Zero-length rows access neither State selectors nor history. Outputs and records are disjoint.
  */
 void kda_input_proj_conv_record(const Tensor& x, const SingleProjectionWeight& qkv,
                                 const Tensor& conv_weight, KdaConvSourceState state,

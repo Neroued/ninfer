@@ -26,20 +26,16 @@ void validate_fold_records(const KdaReplayRecords& records) {
     const std::int32_t outer = spec.layers * spec.record_capacity;
     common::operand::tensor(records.conv, DType::BF16, {spec.conv_channels, spec.width, outer}, 256,
                             kOp, "conv records", records.conv.device);
-    common::operand::tensor(records.key, DType::BF16, {kStateDim, spec.qk_heads, spec.width, outer},
+    const auto [key, delta, alpha] = ninfer::detail::KdaReplayRecordAccess::planes(records);
+    common::operand::tensor(key, DType::BF16, {kStateDim, spec.qk_heads, spec.width, outer},
                             256, kOp, "key records", records.conv.device);
-    common::operand::tensor(records.value, DType::BF16,
-                            {kStateDim, spec.value_heads, spec.width, outer}, 256, kOp,
-                            "value records", records.conv.device);
-    common::operand::tensor(records.log_decay, DType::FP32,
-                            {kStateDim, spec.value_heads, spec.width, outer}, 256, kOp,
-                            "log decay records", records.conv.device);
-    common::operand::tensor(records.beta, DType::FP32, {spec.value_heads, spec.width, outer}, 256,
-                            kOp, "beta records", records.conv.device);
+    common::operand::tensor(delta, DType::FP32, {kStateDim, spec.value_heads, spec.width, outer},
+                            256, kOp, "delta records", records.conv.device);
+    common::operand::tensor(alpha, DType::FP32, {kStateDim, spec.value_heads, spec.width, outer},
+                            256, kOp, "alpha records", records.conv.device);
     const std::array record_ranges{
-        common::operand::range(records.conv, kOp), common::operand::range(records.key, kOp),
-        common::operand::range(records.value, kOp), common::operand::range(records.log_decay, kOp),
-        common::operand::range(records.beta, kOp)};
+        common::operand::range(records.conv, kOp), common::operand::range(key, kOp),
+        common::operand::range(delta, kOp), common::operand::range(alpha, kOp)};
     common::operand::disjoint(record_ranges, kOp);
 }
 
@@ -83,6 +79,7 @@ void validate_fold_rows(const KdaReplayRecords& records, LinearAttentionStateAll
                         std::span<const KdaReplayFoldRow> rows) {
     if (rows.empty() || rows.size() > static_cast<std::size_t>(records.spec.record_capacity))
         throw std::invalid_argument("kda_replay_fold: active row count is out of range");
+    const auto [key, delta, alpha] = ninfer::detail::KdaReplayRecordAccess::planes(records);
     using Fields = std::array<common::operand::Blocks, 2>;
     std::vector<Fields> sources(rows.size()), destinations(rows.size());
     for (std::size_t row = 0; row < rows.size(); ++row) {
@@ -96,8 +93,7 @@ void validate_fold_rows(const KdaReplayRecords& records, LinearAttentionStateAll
                              selected_field(states.recurrent, selected.destination_offset)};
         for (const auto& fields : {sources[row], destinations[row]})
             for (const auto& field : fields)
-                for (const auto* record : {&records.conv, &records.key, &records.value,
-                                           &records.log_decay, &records.beta})
+                for (const auto* record : {&records.conv, &key, &delta, &alpha})
                     if (common::operand::overlaps(
                             field, common::operand::range(*record, "kda_replay_fold")))
                         throw std::invalid_argument(
@@ -153,7 +149,7 @@ void KdaReplayFoldPlan::execute(std::span<const KdaReplayFoldRow> rows,
         std::copy(group.begin(), group.end(), packed.row);
         detail::kimi_delta_attention::launch_replay_fold(
             records_, states_, packed, static_cast<int>(begin), static_cast<int>(count),
-            execution.multiprocessor_count(), execution.stream());
+            execution);
     }
 }
 
@@ -169,9 +165,9 @@ void KdaReplayFoldPlan::execute(const Tensor& source_offsets, const Tensor& dest
                                 execution.device());
     common::operand::tensor(commit_columns, DType::I32, {batch}, 4, op, "commit columns",
                             execution.device());
+    const auto [key, delta, alpha] = ninfer::detail::KdaReplayRecordAccess::planes(records_);
     for (const auto* metadata : {&source_offsets, &destination_offsets, &commit_columns})
-        for (const auto* record :
-             {&records_.conv, &records_.key, &records_.value, &records_.log_decay, &records_.beta})
+        for (const auto* record : {&records_.conv, &key, &delta, &alpha})
             common::operand::disjoint(common::operand::range(*metadata, op),
                                       common::operand::range(*record, op), op);
     detail::kimi_delta_attention::launch_replay_fold(
@@ -180,7 +176,7 @@ void KdaReplayFoldPlan::execute(const Tensor& source_offsets, const Tensor& dest
             static_cast<const std::int64_t*>(source_offsets.data),
             static_cast<const std::int64_t*>(destination_offsets.data),
             static_cast<const std::int32_t*>(commit_columns.data)},
-        batch, execution.multiprocessor_count(), execution.stream());
+        batch, execution);
 }
 
 } // namespace ninfer::ops

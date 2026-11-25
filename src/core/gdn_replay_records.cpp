@@ -71,18 +71,19 @@ void require_disjoint(const TensorRegion& a, const TensorRegion& b) {
 
 void validate_layout(const GdnReplayRecordLayout& layout) {
     validate_spec(layout.spec);
-    const std::int32_t outer = checked_outer_extent(layout.spec);
+    const auto [key, delta, alpha] = detail::GdnReplayRecordAccess::planes(layout);
+    const std::int32_t outer       = checked_outer_extent(layout.spec);
     require_region(layout.conv, DType::BF16,
                    {layout.spec.conv_channels, layout.spec.width, outer, 1}, "conv");
-    require_region(layout.key, DType::BF16,
+    require_region(key, DType::BF16,
                    {layout.spec.key_dim, layout.spec.qk_heads, layout.spec.width, outer}, "key");
-    require_region(layout.value, DType::BF16,
+    require_region(delta, DType::FP32,
                    {layout.spec.value_dim, layout.spec.value_heads, layout.spec.width, outer},
-                   "value");
-    require_region(layout.gate, DType::FP32, {2, layout.spec.value_heads, layout.spec.width, outer},
-                   "gate");
+                   "delta");
+    require_region(alpha, DType::FP32, {layout.spec.value_heads, layout.spec.width, outer, 1},
+                   "alpha");
 
-    const TensorRegion* regions[] = {&layout.conv, &layout.key, &layout.value, &layout.gate};
+    const TensorRegion* regions[] = {&layout.conv, &key, &delta, &alpha};
     for (std::size_t i = 0; i < std::size(regions); ++i) {
         for (std::size_t j = 0; j < i; ++j) { require_disjoint(*regions[i], *regions[j]); }
     }
@@ -99,18 +100,18 @@ GdnReplayRecordLayout plan_gdn_replay_records(LayoutBuilder& builder,
     layout.spec = spec;
     layout.conv = builder.add_tensor(DType::BF16, {spec.conv_channels, spec.width, outer},
                                      kRecordAlignment, "GDN replay conv records");
-    layout.key  = builder.add_tensor(DType::BF16, {spec.key_dim, spec.qk_heads, spec.width, outer},
+    layout.key_ = builder.add_tensor(DType::BF16, {spec.key_dim, spec.qk_heads, spec.width, outer},
                                      kRecordAlignment, "GDN replay key records");
-    layout.value =
-        builder.add_tensor(DType::BF16, {spec.value_dim, spec.value_heads, spec.width, outer},
-                           kRecordAlignment, "GDN replay value records");
-    layout.gate = builder.add_tensor(DType::FP32, {2, spec.value_heads, spec.width, outer},
-                                     kRecordAlignment, "GDN replay gate records");
+    layout.delta_ =
+        builder.add_tensor(DType::FP32, {spec.value_dim, spec.value_heads, spec.width, outer},
+                           kRecordAlignment, "GDN replay delta records");
+    layout.alpha_ = builder.add_tensor(DType::FP32, {spec.value_heads, spec.width, outer},
+                                       kRecordAlignment, "GDN replay alpha records");
     return layout;
 }
 
 std::size_t GdnReplayRecordLayout::payload_bytes() const noexcept {
-    return conv.region.bytes + key.region.bytes + value.region.bytes + gate.region.bytes;
+    return conv.region.bytes + key_.region.bytes + delta_.region.bytes + alpha_.region.bytes;
 }
 
 GdnReplayRecordLayout GdnReplayRecordLayout::with_width(std::int32_t width) const {
@@ -120,18 +121,20 @@ GdnReplayRecordLayout GdnReplayRecordLayout::with_width(std::int32_t width) cons
     auto narrowed  = spec;
     narrowed.width = width;
     LayoutBuilder builder;
-    auto result                = plan_gdn_replay_records(builder, narrowed);
-    result.conv.region.offset  = conv.region.offset;
-    result.key.region.offset   = key.region.offset;
-    result.value.region.offset = value.region.offset;
-    result.gate.region.offset  = gate.region.offset;
+    auto result                 = plan_gdn_replay_records(builder, narrowed);
+    result.conv.region.offset   = conv.region.offset;
+    result.key_.region.offset   = key_.region.offset;
+    result.delta_.region.offset = delta_.region.offset;
+    result.alpha_.region.offset = alpha_.region.offset;
     return result;
 }
 
 GdnReplayRecords::GdnReplayRecords(MemorySpan backing, const GdnReplayRecordLayout& layout)
-    : conv(layout.conv.bind(backing)), key(layout.key.bind(backing)),
-      value(layout.value.bind(backing)), gate(layout.gate.bind(backing)), spec(layout.spec) {
+    : spec(layout.spec) {
     validate_layout(layout);
+    const auto [key, delta, alpha] = detail::GdnReplayRecordAccess::planes(layout);
+    conv                           = layout.conv.bind(backing);
+    recurrence_                    = {key.bind(backing), delta.bind(backing), alpha.bind(backing)};
 }
 
 GdnReplayRecordLayer GdnReplayRecords::layer(std::int32_t layer_index, std::int32_t rows) const {
@@ -144,10 +147,10 @@ GdnReplayRecordLayer GdnReplayRecords::layer(std::int32_t layer_index, std::int3
     }
     const std::int32_t outer_begin = layer_index * spec.record_capacity;
     return GdnReplayRecordLayer{
-        .conv  = conv.slice(2, outer_begin, rows).view({spec.conv_channels, spec.width, rows}),
-        .key   = key.slice(3, outer_begin, rows),
-        .value = value.slice(3, outer_begin, rows),
-        .gate  = gate.slice(3, outer_begin, rows),
+        .conv       = conv.slice(2, outer_begin, rows).view({spec.conv_channels, spec.width, rows}),
+        .recurrence = {recurrence_.key_.slice(3, outer_begin, rows),
+                       recurrence_.delta_.slice(3, outer_begin, rows),
+                       recurrence_.alpha_.slice(2, outer_begin, rows)},
     };
 }
 

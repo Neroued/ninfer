@@ -9,8 +9,8 @@ struct RaggedRecurrent {
     int recurrent_before;
 };
 
-template <bool Batched, bool Record, int Rows = kDvPerWarp, bool GroupStateTiles = false,
-          class... Metadata>
+template <bool Batched, bool Record, class StateT, int Rows = kDvPerWarp,
+          bool GroupStateTiles = false, class... Metadata>
 __global__ void __launch_bounds__(common::kWarpSize* kNumWarps, 2)
     recurrent_kernel(Arguments args, const std::int64_t* source_offsets,
                      const std::int64_t* destination_offsets, const std::int32_t* valid_columns,
@@ -49,9 +49,9 @@ __global__ void __launch_bounds__(common::kWarpSize* kNumWarps, 2)
     const auto state_head = static_cast<std::int64_t>(head) * kStateDim * kStateDim;
     const auto src_bytes =
         Batched ? source_offsets[batch] : (args.source_offset ? *args.source_offset : 0);
-    const auto source = state_head + src_bytes / static_cast<std::int64_t>(sizeof(float));
+    const auto source = state_head + src_bytes / static_cast<std::int64_t>(sizeof(StateT));
     __align__(16) float state[Rows][kQkPerLane];
-    load_state(state, args.state_in + source, dv_base, dqk_base);
+    load_state(state, static_cast<const StateT*>(args.state_in) + source, dv_base, dqk_base);
     float a_scale = lane == 0 ? expf(args.a_log[head]) : 0.0F;
     a_scale       = __shfl_sync(common::kFullWarpMask, a_scale, 0);
     for (int t = 0; t < valid; ++t) {
@@ -77,10 +77,11 @@ __global__ void __launch_bounds__(common::kWarpSize* kNumWarps, 2)
             }
     }
     if constexpr (!Record) {
-        const auto dst_bytes   = Batched ? destination_offsets[batch]
-                                         : (args.destination_offset ? *args.destination_offset : 0);
-        const auto destination = state_head + dst_bytes / static_cast<std::int64_t>(sizeof(float));
-        store_state(state, args.state_out + destination, dv_base, dqk_base);
+        const auto dst_bytes = Batched ? destination_offsets[batch]
+                                       : (args.destination_offset ? *args.destination_offset : 0);
+        const auto destination =
+            state_head + dst_bytes / static_cast<std::int64_t>(sizeof(StateT));
+        store_state(state, static_cast<StateT*>(args.state_out) + destination, dv_base, dqk_base);
     }
 }
 

@@ -29,9 +29,9 @@ __device__ __forceinline__ void fold_subgroup(float4 (&state)[32 / kFoldLanes],
     }
 }
 
-template <class Geometry, class Rows>
+template <class Geometry, class Rows, class StateT>
 __global__ __launch_bounds__(common::kWarpSize* kFoldWarps, 2) void subgroup_fold_kernel(
-    const __grid_constant__ FoldAccess<Geometry, Rows> access) {
+    const __grid_constant__ FoldAccess<Geometry, Rows, StateT> access) {
     constexpr int Threads  = common::kWarpSize * kFoldWarps;
     constexpr int TileRows = kStateDim / kFoldTiles;
     constexpr int Vectors  = 32 / kFoldLanes;
@@ -44,10 +44,13 @@ __global__ __launch_bounds__(common::kWarpSize* kFoldWarps, 2) void subgroup_fol
     const auto row = fold_row(access.rows, batch, commit);
     const auto column =
         (std::int64_t(layer) * access.record_capacity + access.record_begin + batch) * access.width;
-    auto* layer_state   = access.recurrent_layer0 + layer * access.recurrent_layer_stride;
-    const int offset    = (head * kStateDim + tile * TileRows + subgroup) * kStateDim;
-    const float* source = layer_state + row.source_offset / sizeof(float) + offset;
-    float* destination  = layer_state + row.destination_offset / sizeof(float) + offset;
+    auto* layer_state    = access.recurrent_layer0 + layer * access.recurrent_layer_stride;
+    const int offset     = (head * kStateDim + tile * TileRows + subgroup) * kStateDim;
+    const StateT* source = layer_state +
+                           row.source_offset / static_cast<std::int64_t>(sizeof(StateT)) + offset;
+    StateT* destination = layer_state +
+                          row.destination_offset / static_cast<std::int64_t>(sizeof(StateT)) +
+                          offset;
     __shared__ FoldWindow<TileRows> sm;
     // With at most 16 columns, one 16-byte copy per participating thread stages the tile.
     if (tid < commit * (TileRows / 4)) {
@@ -59,7 +62,7 @@ __global__ __launch_bounds__(common::kWarpSize* kFoldWarps, 2) void subgroup_fol
     float4 state[Vectors];
 #pragma unroll
     for (int p = 0; p < Vectors; ++p)
-        state[p] = common::load_vec<float4>(source + (p * kFoldLanes + lane) * 4);
+        state[p] = common::load_state_float4(source + (p * kFoldLanes + lane) * 4);
 
     if (tid < 32) stage_decays(sm, access, column, head, tid, commit);
     if (subgroup < commit) {
@@ -103,13 +106,13 @@ __global__ __launch_bounds__(common::kWarpSize* kFoldWarps, 2) void subgroup_fol
         fold_subgroup<false>(state, sm, subgroup, lane, commit);
 #pragma unroll
     for (int p = 0; p < Vectors; ++p)
-        common::store_vec(destination + (p * kFoldLanes + lane) * 4, state[p]);
+        common::store_state_float4(destination + (p * kFoldLanes + lane) * 4, state[p]);
     if (tid < 32 && tile == 0) access.publish_conv(layer, head, tid, commit, column, row);
 }
 
 struct FoldLauncher {
-    template <class Geometry, class Rows>
-    static void launch(const FoldAccess<Geometry, Rows>& access, int active_rows,
+    template <class Geometry, class Rows, class StateT>
+    static void launch(const FoldAccess<Geometry, Rows, StateT>& access, int active_rows,
                        cudaStream_t stream) {
         // Use four independently streamed tiles per head with ordinary vector state I/O.
         const dim3 grid(Geometry::kValueHeads * kFoldTiles, active_rows, Geometry::kLayers);

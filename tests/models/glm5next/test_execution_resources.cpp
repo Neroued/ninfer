@@ -19,7 +19,8 @@ void require(bool value, const char* message) {
 // contract qualified by Op tests and the real startup check.
 glm::ExecutionPlan storage_plan(unsigned rank, bool mtp, KvCacheStorage storage,
                                 KvCacheVectorFormat index_format, bool dflash = false,
-                                unsigned concurrency = 3) {
+                                unsigned concurrency = 3,
+                                LinearStateDType linear_state_dtype = LinearStateDType::Float32) {
     auto profile           = std::make_shared<glm::execution::ModelProfile>();
     auto& c                = profile->config.text;
     c.hidden               = 4096;
@@ -47,14 +48,15 @@ glm::ExecutionPlan storage_plan(unsigned rank, bool mtp, KvCacheStorage storage,
     p.shape   = {
         129,  concurrency, 128, mtp ? 3U : 0U, storage, index_format, EnginePurpose::Generation,
         true, false};
-    p.shape.speculative = mtp ? SpeculativeBackend::Mtp : SpeculativeBackend::None;
+    p.shape.speculative        = mtp ? SpeculativeBackend::Mtp : SpeculativeBackend::None;
+    p.shape.linear_state_dtype = linear_state_dtype;
     if (dflash) {
         p.shape.speculative  = SpeculativeBackend::DFlash2;
         p.shape.draft_tokens = 7;
     }
     p.batches = std::make_shared<const models::BatchExecutionPlan>(
         models::make_batch_execution_spec(concurrency, 2, true));
-    p.state = glm::plan_state(*p.profile);
+    p.state = glm::plan_state(*p.profile, linear_state_dtype);
     LayoutBuilder b;
     p.main =
         glm::plan_cache(b, c.mla, 11, 129, concurrency, glm::latent_storage(storage), index_format);
@@ -77,9 +79,10 @@ struct Fixture {
     std::vector<glm::RankResourceDescription> descriptions;
 
     explicit Fixture(bool mtp, KvCacheStorage storage = KvCacheStorage::BFloat16,
-                     KvCacheVectorFormat index_format = KvCacheVectorFormat::BFloat16)
-        : plans{storage_plan(0, mtp, storage, index_format),
-                storage_plan(1, mtp, storage, index_format)} {
+                     KvCacheVectorFormat index_format    = KvCacheVectorFormat::BFloat16,
+                     LinearStateDType linear_state_dtype = LinearStateDType::Float32)
+        : plans{storage_plan(0, mtp, storage, index_format, false, 3, linear_state_dtype),
+                storage_plan(1, mtp, storage, index_format, false, 3, linear_state_dtype)} {
         parallel.ranks.resize(2);
         parallel.ranks[1].rank = 1;
         const std::array offers{
@@ -110,19 +113,25 @@ struct Fixture {
 };
 
 void host() {
-    for (const bool mtp : {false, true})
-        for (const auto storage :
-             {KvCacheStorage::BFloat16, KvCacheStorage::Fp8E4m3fnGroup128Ue8m0})
-            for (const auto index_format :
-                 {KvCacheVectorFormat::BFloat16, KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0}) {
-                Fixture f(mtp, storage, index_format);
-                const auto& p              = f.plans[0];
-                const auto recurrent_bytes = 34ULL * 32 * 128 * 128 * 4;
-                const auto conv_bytes      = 34ULL * 3 * 32 * 128 * 3 * 2;
-                const auto tails           = (11ULL + mtp) * 128 * 3 * 2 * 2;
-                require(p.state.common.image_bytes == recurrent_bytes + conv_bytes + 4096 * 2 &&
-                            p.state.owner.image_bytes == p.state.common.image_bytes + tails,
-                        "GLM State does not contain the required KDA/hidden/owner-tail payload");
+    for (const auto linear_state_dtype :
+         {LinearStateDType::Float32, LinearStateDType::BFloat16})
+        for (const bool mtp : {false, true})
+            for (const auto storage :
+                 {KvCacheStorage::BFloat16, KvCacheStorage::Fp8E4m3fnGroup128Ue8m0})
+                for (const auto index_format :
+                     {KvCacheVectorFormat::BFloat16, KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0}) {
+                    Fixture f(mtp, storage, index_format, linear_state_dtype);
+                    const auto& p = f.plans[0];
+                    const std::size_t state_elem =
+                        linear_state_dtype == LinearStateDType::BFloat16 ? 2ULL : 4ULL;
+                    const auto recurrent_bytes = 34ULL * 32 * 128 * 128 * state_elem;
+                    const auto conv_bytes      = 34ULL * 3 * 32 * 128 * 3 * 2;
+                    const auto tails           = (11ULL + mtp) * 128 * 3 * 2 * 2;
+                    require(p.state.kda.spec.recurrent_dtype == to_dtype(linear_state_dtype) &&
+                                p.state.common.image_bytes ==
+                                    recurrent_bytes + conv_bytes + 4096 * 2 &&
+                                p.state.owner.image_bytes == p.state.common.image_bytes + tails,
+                            "GLM State does not contain the required KDA/hidden/owner-tail payload");
                 for (const auto& plan : f.plans) {
                     const auto& reference = plan.capacity.reference;
                     require(reference.tokens_per_request == 129 && reference.request_count == 2 &&

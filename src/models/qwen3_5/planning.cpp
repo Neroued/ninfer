@@ -196,6 +196,7 @@ SessionPlan plan_session(const SequencePlan& sequence) {
         out.hybrid_max_tokens = source.moe->description().layers.front().hybrid_max_tokens;
     out.context_cache       = source.context_cache;
     out.kv_storage          = source.kv_storage;
+    out.linear_state_dtype  = source.linear_state_dtype;
     out.proposal_head       = source.proposal_head;
     out.causal_scoring      = source.causal_scoring;
     out.vision_max_features = source.workspace.vision ? source.workspace.vision->max_features : 0;

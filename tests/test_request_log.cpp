@@ -52,6 +52,7 @@ int main() {
     options.launch.engine.prefill_chunk            = 1024;
     options.launch.logging.stats_interval_ms       = 2500;
     options.launch.engine.kv_cache                 = ninfer::KvCacheStorage::Fp8E4m3fnGroup128Ue8m0;
+    options.launch.engine.linear_state_dtype       = ninfer::LinearStateDType::BFloat16;
     options.launch.engine.speculative.backend      = ninfer::SpeculativeBackend::Mtp;
     options.launch.engine.speculative.draft_tokens = 3;
     options.launch.engine.speculative.proposal_head = ninfer::ProposalHead::Optimized;
@@ -66,6 +67,7 @@ int main() {
     const Json startup = Json::parse(format_startup_config_json("test-startup", 1000, options));
     failures += check(startup.at("event") == "startup_config" &&
                           startup.at("schema_version") == kRequestLogSchemaVersion &&
+                          startup.at("configuration").at("engine.linear_state_dtype") == "bf16" &&
                           startup.at("configuration").at("generation.sampling.temperature") ==
                               static_cast<double>(0.6F) &&
                           startup.at("configuration").at("server.api_key") == "configured" &&
@@ -81,6 +83,7 @@ int main() {
     engine_options.pending_timeout_ms                = options.launch.engine.pending_timeout_ms;
     engine_options.prefill_chunk                     = options.launch.engine.prefill_chunk;
     engine_options.kv_cache                          = options.launch.engine.kv_cache;
+    engine_options.linear_state_dtype                = options.launch.engine.linear_state_dtype;
     engine_options.speculative                       = options.launch.engine.speculative;
     engine_options.enable_vision                     = options.launch.engine.enable_vision;
     engine_options.use_cuda_graph                    = options.launch.engine.use_cuda_graph;
@@ -209,6 +212,8 @@ int main() {
     failures += check(server.at("server").at("default_thinking_budget") == 512,
                       "server thinking budget missing");
     failures += check(server.at("engine").at("kv_cache") == "fp8", "KV type missing");
+    failures += check(server.at("engine").at("linear_state_dtype") == "bf16",
+                      "linear state dtype missing");
     options.launch.engine.kv_cache = ninfer::KvCacheStorage::Nvfp4Group16;
     engine_options.kv_cache        = options.launch.engine.kv_cache;
     description.kv_cache           = options.launch.engine.kv_cache;

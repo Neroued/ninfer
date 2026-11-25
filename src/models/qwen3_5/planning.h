@@ -81,8 +81,9 @@ struct SessionPlan {
     SpeculativeLengthPolicy length_policy  = SpeculativeLengthPolicy::Adaptive;
     std::uint32_t hybrid_max_tokens        = 0;
     ContextCacheOptions context_cache;
-    KvCacheStorage kv_storage  = KvCacheStorage::BFloat16;
-    ProposalHead proposal_head = ProposalHead::Full;
+    KvCacheStorage kv_storage           = KvCacheStorage::BFloat16;
+    LinearStateDType linear_state_dtype = LinearStateDType::Float32;
+    ProposalHead proposal_head          = ProposalHead::Full;
     TransferWork state_transfer;
     std::optional<LayoutRegion> dflash_local_group;
     std::optional<TransferWork> dflash_local_transfer;

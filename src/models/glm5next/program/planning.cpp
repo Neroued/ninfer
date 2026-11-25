@@ -39,7 +39,8 @@ ExecutionShape shape(const execution::ModelProfile& p, const EngineOptions& o,
             o.observability.gpu_timing,
             o.speculative.backend,
             false,
-            o.speculative.length_policy};
+            o.speculative.length_policy,
+            o.linear_state_dtype};
 }
 
 context::ContextDirectorySpec schema(const ExecutionPlan& p, std::size_t capacity, bool global) {
@@ -110,7 +111,7 @@ ExecutionPlan plan_execution(std::shared_ptr<const execution::ModelProfile> prof
         throw std::invalid_argument("GLM batch plan differs from its execution resources");
     out.decode_routes             = make_decode_routes(out.shape, *out.batches);
     out.use_cuda_graph = !out.batches->graph_rows().empty();
-    out.state          = plan_state(*out.profile);
+    out.state          = plan_state(*out.profile, out.shape.linear_state_dtype);
     out.workspace =
         execution::plan_workspace(*out.profile, out.shape, sm_count, o.vision_memory_budget_bytes);
     const auto& c = out.profile->config.text;

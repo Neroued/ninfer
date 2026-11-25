@@ -64,6 +64,7 @@ void test_arguments() {
     const auto defaults = parse({"ninfer", "--prompt", "hello", "model.ninfer"});
     const auto& engine  = defaults.launch.engine;
     require(engine.max_context == 8192 &&
+                engine.linear_state_dtype == ninfer::LinearStateDType::Float32 &&
                 engine.context_capacity.mode == ninfer::ContextCapacityMode::Automatic &&
                 engine.memory_headroom_bytes == (512ULL << 20),
             "shared context defaults differ");
@@ -75,10 +76,11 @@ void test_arguments() {
     const auto resources =
         parse({"ninfer", "model.ninfer", "--prompt", "hello", "--max-concurrency", "4",
                "--context-capacity", "2GiB", "--host-cache-capacity", "64MiB", "--prefix-reuse",
-               "--preserve-thinking", "--cuda-graph=false"});
+               "--preserve-thinking", "--cuda-graph=false", "--linear-state-dtype", "bf16"});
     require(resources.launch.engine.context_capacity.explicit_bytes == (2ULL << 30) &&
                 resources.launch.engine.context_cache.host_capacity_bytes == (64ULL << 20) &&
                 resources.launch.engine.context_cache.enabled &&
+                resources.launch.engine.linear_state_dtype == ninfer::LinearStateDType::BFloat16 &&
                 !resources.launch.engine.use_cuda_graph &&
                 resources.launch.generation.preserve_thinking == true,
             "explicit resources were overwritten");
@@ -100,6 +102,7 @@ void test_arguments() {
                                                {"--prompt", "other", "--messages", "messages.json"},
                                                {"--seed", "18446744073709551616"},
                                                {"--temperature", "nan"},
+                                               {"--linear-state-dtype", "fp16"},
                                                {"--spec", "dflash2", "--draft-tokens", "16"}}) {
         std::vector<std::string> args{"ninfer", "model.ninfer", "--prompt", "hello"};
         args.insert(args.end(), suffix.begin(), suffix.end());
@@ -245,6 +248,7 @@ vision = true
 memory_budget = "512MiB"
 [engine]
 max_context = 16384
+linear_state_dtype = "bf16"
 context_capacity = "1.5GiB"
 prefill_chunk = 4096
 cuda_graph = true
@@ -273,6 +277,7 @@ regex = "file"
     require(base.launch.engine.artifact_path == files.root / "weights/model.ninfer",
             "file-relative model path changed");
     require(base.launch.engine.context_capacity.explicit_bytes == (1536ULL << 20) &&
+                base.launch.engine.linear_state_dtype == ninfer::LinearStateDType::BFloat16 &&
                 base.launch.engine.context_cache.host_capacity_bytes == 65536 &&
                 base.launch.engine.vision_memory_budget_bytes == (512ULL << 20),
             "file values or exact capacity conversion failed");
@@ -287,6 +292,8 @@ regex = "file"
             "uint64 seed string lost precision");
     const auto replaced = parse({"ninfer",
                                  "--max-context=32768",
+                                 "--linear-state-dtype",
+                                 "fp32",
                                  "--config",
                                  path.string(),
                                  "--messages",
@@ -311,6 +318,7 @@ regex = "file"
                                  "--reasoning-stop",
                                  "FIN"});
     require(replaced.launch.engine.max_context == 32768 &&
+                replaced.launch.engine.linear_state_dtype == ninfer::LinearStateDType::Float32 &&
                 replaced.launch.engine.context_capacity.mode ==
                     ninfer::ContextCapacityMode::Automatic &&
                 !replaced.launch.engine.enable_vision &&
@@ -375,6 +383,8 @@ void test_file_errors_and_example(const Files& files) {
             "root example path is not relative to its file");
     require(
         cli.launch.generation.max_tokens == 128 && server.launch.generation.max_tokens == 8192 &&
+            cli.launch.engine.linear_state_dtype == ninfer::LinearStateDType::Float32 &&
+            server.launch.engine.linear_state_dtype == ninfer::LinearStateDType::Float32 &&
             !cli.launch.engine.context_cache.enabled && server.launch.engine.context_cache.enabled,
         "shared example did not select entry-specific defaults");
 }

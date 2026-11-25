@@ -1,8 +1,19 @@
 #pragma once
 
 #include "core/state_image.h"
+#include "ninfer/linear_state_format.h"
 
 namespace ninfer {
+
+[[nodiscard]] constexpr DType to_dtype(LinearStateDType dtype) {
+    switch (dtype) {
+    case LinearStateDType::Float32:
+        return DType::FP32;
+    case LinearStateDType::BFloat16:
+        return DType::BF16;
+    }
+    throw std::invalid_argument("unknown linear-state dtype");
+}
 
 struct LinearAttentionStateSpec {
     std::uint32_t layers        = 0;
@@ -12,6 +23,7 @@ struct LinearAttentionStateSpec {
     std::int32_t value_head_dim = 0;
     std::int32_t key_head_dim   = 0;
     DType conv_dtype            = DType::BF16;
+    DType recurrent_dtype       = DType::FP32;
 };
 
 struct LinearAttentionStateLayout {

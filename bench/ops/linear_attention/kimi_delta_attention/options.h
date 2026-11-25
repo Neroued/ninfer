@@ -1,10 +1,13 @@
 #pragma once
+#include "core/dtype.h"
 #include "op_measurement.cuh"
 #include "ragged_workload.h"
 
 #include <optional>
 
 namespace ninfer::bench::kda {
+inline const char* state_dtype_name(DType dtype) { return dtype == DType::BF16 ? "bf16" : "fp32"; }
+
 struct Options {
     measurement::Options timing;
     std::string op = "record", valid = "dense", commits = "dense";
@@ -12,6 +15,7 @@ struct Options {
     std::vector<int> tokens{4};
     std::vector<ragged::SegmentSpec> ragged_specs;
     ragged::StateOffsetForm state_form = ragged::StateOffsetForm::Distinct;
+    DType state_dtype                  = DType::FP32;
     int heads = 32, qk_heads = 32, batch = 1, layers = 34;
 };
 
@@ -31,6 +35,7 @@ inline Options parse(int argc, char** argv) {
                    "  --valid dense|N[,N...] --commits dense|N[,N...]\n"
                    "  --ragged-segments SPEC (core or input-update)\n"
                    "  --state-form distinct|alias|mixed|permuted|shared-source (ragged)\n"
+                   "  --state-dtype fp32|bf16 (default fp32)\n"
                    "  --format q8|mxfp8 --policy a16|a8 (input projection; default follows "
                    "format)\n"
                    "core is single sequence; update is T=1; fold measures all layers.\n"
@@ -54,6 +59,13 @@ inline Options parse(int argc, char** argv) {
         else if (flag == "--state-form") {
             o.state_form   = ragged::parse_state_form(value);
             explicit_state = true;
+        } else if (flag == "--state-dtype") {
+            if (value == "fp32")
+                o.state_dtype = DType::FP32;
+            else if (value == "bf16")
+                o.state_dtype = DType::BF16;
+            else
+                throw std::invalid_argument("state-dtype: fp32|bf16");
         } else if (flag == "--batch")
             o.batch = measurement::integer(value);
         else if (flag == "--layers")

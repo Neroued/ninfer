@@ -66,7 +66,8 @@ RequestBasePlan Session::plan_request(PreparedPrompt&& prompt,
                           : FinishReason::ContextCapacity,
                       plan->reuse};
     plan->sampling = options.sampling;
-    plan->domain   = static_cast<std::uint32_t>(p.shape.kv_storage);
+    plan->domain   = static_cast<std::uint32_t>(p.shape.kv_storage) |
+                     (static_cast<std::uint32_t>(p.shape.linear_state_dtype) << 24U);
     for (const auto& media : input.identity.media)
         plan->media.push_back({&media.item, &media.preparation_digest});
     plan->query = context::PrefixQuery(p.prefixes, plan->domain, plan->identity_view());

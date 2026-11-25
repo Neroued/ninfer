@@ -152,7 +152,7 @@ __device__ __forceinline__ void store_output(const Arguments& args, float (&acc)
     }
 }
 
-template <int DV, class... Metadata>
+template <int DV, class StateT, class... Metadata>
 __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurrence_kernel(
     Arguments args, const Chunk* __restrict__ workspace,
     const __grid_constant__ Metadata... metadata) {
@@ -202,13 +202,15 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
             args.source_offset += s;
         }
     }
+    const auto* state_in  = static_cast<const StateT*>(args.state_in);
+    auto* state_out       = static_cast<StateT*>(args.state_out);
     const auto state_base = static_cast<std::int64_t>(head) * kStateDim * kStateDim;
     const auto src_base =
         state_base +
-        (args.source_offset ? *args.source_offset / static_cast<std::int64_t>(sizeof(float)) : 0);
+        (args.source_offset ? *args.source_offset / static_cast<std::int64_t>(sizeof(StateT)) : 0);
     const auto dst_base =
         state_base + (args.destination_offset
-                          ? *args.destination_offset / static_cast<std::int64_t>(sizeof(float))
+                          ? *args.destination_offset / static_cast<std::int64_t>(sizeof(StateT))
                           : 0);
 
     // MMA accumulators describe S^T[key,value]. External state remains [value,key].
@@ -220,10 +222,13 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
         for (int mi = 0; mi < MPW; ++mi) {
             const int key    = (m_start + mi * MW) * 16 + g;
             const int value  = value_start + n * 8 + t * 2;
-            state[ni][mi][0] = args.state_in[src_base + value * kStateDim + key];
-            state[ni][mi][1] = args.state_in[src_base + (value + 1) * kStateDim + key];
-            state[ni][mi][2] = args.state_in[src_base + value * kStateDim + key + 8];
-            state[ni][mi][3] = args.state_in[src_base + (value + 1) * kStateDim + key + 8];
+            state[ni][mi][0] = common::load_state_scalar(state_in + src_base + value * kStateDim + key);
+            state[ni][mi][1] =
+                common::load_state_scalar(state_in + src_base + (value + 1) * kStateDim + key);
+            state[ni][mi][2] =
+                common::load_state_scalar(state_in + src_base + value * kStateDim + key + 8);
+            state[ni][mi][3] =
+                common::load_state_scalar(state_in + src_base + (value + 1) * kStateDim + key + 8);
         }
     }
     if constexpr (Packed) {
@@ -390,17 +395,21 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
         const int n = n_start + ni * kWarps;
 #pragma unroll
         for (int mi = 0; mi < MPW; ++mi) {
-            const int key                                            = (m_start + mi * MW) * 16 + g;
-            const int value                                          = value_start + n * 8 + t * 2;
-            args.state_out[dst_base + value * kStateDim + key]       = state[ni][mi][0];
-            args.state_out[dst_base + (value + 1) * kStateDim + key] = state[ni][mi][1];
-            args.state_out[dst_base + value * kStateDim + key + 8]   = state[ni][mi][2];
-            args.state_out[dst_base + (value + 1) * kStateDim + key + 8] = state[ni][mi][3];
+            const int key   = (m_start + mi * MW) * 16 + g;
+            const int value = value_start + n * 8 + t * 2;
+            common::store_state_scalar(state_out + dst_base + value * kStateDim + key,
+                                       state[ni][mi][0]);
+            common::store_state_scalar(state_out + dst_base + (value + 1) * kStateDim + key,
+                                       state[ni][mi][1]);
+            common::store_state_scalar(state_out + dst_base + value * kStateDim + key + 8,
+                                       state[ni][mi][2]);
+            common::store_state_scalar(state_out + dst_base + (value + 1) * kStateDim + key + 8,
+                                       state[ni][mi][3]);
         }
     }
 }
 
-template <int DV, class... Metadata>
+template <int DV, class StateT, class... Metadata>
 void launch(const Arguments& args, const Chunk* workspace, CudaExecutionView execution,
             const Metadata&... metadata) {
     constexpr int shared_bytes = sizeof(RecurrenceShared<DV>);
@@ -410,7 +419,7 @@ void launch(const Arguments& args, const Chunk* workspace, CudaExecutionView exe
         const auto bit   = device < 64 ? std::uint64_t{1} << device : 0;
         if ((configured.load(std::memory_order_acquire) & bit) == 0) {
             CUDA_CHECK(cudaFuncSetAttribute(
-                reinterpret_cast<const void*>(chunk_recurrence_kernel<DV, Metadata...>),
+                reinterpret_cast<const void*>(chunk_recurrence_kernel<DV, StateT, Metadata...>),
                 cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes));
             if (bit) configured.fetch_or(bit, std::memory_order_release);
         }
@@ -421,25 +430,38 @@ void launch(const Arguments& args, const Chunk* workspace, CudaExecutionView exe
         grid.y            = std::min(window.segments, common::kCudaGridYLimit);
         grid.z            = common::div_up(static_cast<unsigned>(window.segments), grid.y);
     }
-    chunk_recurrence_kernel<DV, Metadata...>
+    chunk_recurrence_kernel<DV, StateT, Metadata...>
         <<<grid, kThreads<DV>, shared_bytes, execution.stream()>>>(args, workspace, metadata...);
     CUDA_CHECK(cudaGetLastError());
+}
+
+template <class StateT, class... Metadata>
+void dispatch_tile(const Arguments& args, const Chunk* workspace, int value_tile,
+                   CudaExecutionView execution, const Metadata&... metadata) {
+    switch (value_tile) {
+    case 64:
+        return launch<64, StateT>(args, workspace, execution, metadata...);
+    case 32:
+        return launch<32, StateT>(args, workspace, execution, metadata...);
+    case 16:
+        return launch<16, StateT>(args, workspace, execution, metadata...);
+    case 8:
+        return launch<8, StateT>(args, workspace, execution, metadata...);
+    }
+    throw std::logic_error("linear attention: invalid recurrence value tile");
 }
 
 template <class... Metadata>
 void dispatch(const Arguments& args, const Chunk* workspace, int value_tile,
               CudaExecutionView execution, const Metadata&... metadata) {
-    switch (value_tile) {
-    case 64:
-        return launch<64>(args, workspace, execution, metadata...);
-    case 32:
-        return launch<32>(args, workspace, execution, metadata...);
-    case 16:
-        return launch<16>(args, workspace, execution, metadata...);
-    case 8:
-        return launch<8>(args, workspace, execution, metadata...);
+    switch (args.state_dtype) {
+    case DType::FP32:
+        return dispatch_tile<float>(args, workspace, value_tile, execution, metadata...);
+    case DType::BF16:
+        return dispatch_tile<__nv_bfloat16>(args, workspace, value_tile, execution, metadata...);
+    default:
+        throw std::logic_error("linear attention: unsupported recurrent state dtype");
     }
-    throw std::logic_error("linear attention: invalid recurrence value tile");
 }
 
 } // namespace

@@ -30,12 +30,16 @@ Geometry validate_inputs(const Tensor& q, const Tensor& k, const Tensor& v, cons
     return p;
 }
 
-void validate_state(ConstStateFieldView state, const Geometry& p, Device device) {
+DType validate_state(ConstStateFieldView state, const Geometry& p, Device device) {
     constexpr const char* op = "kimi_delta_attention";
     if (state.field.layers != 1)
         throw std::invalid_argument("kimi_delta_attention: select one State layer");
-    common::operand::state_field(state, DType::FP32, {128, 128, p.value_heads}, 16, op,
+    const DType state_dtype = state.field.tensor.dtype;
+    if (!is_supported_state_dtype(state_dtype))
+        throw std::invalid_argument("kimi_delta_attention: recurrent state must be FP32 or BF16");
+    common::operand::state_field(state, state_dtype, {128, 128, p.value_heads}, 16, op,
                                  "recurrent state", device);
     common::operand::shape(state.records.byte_offsets, {p.batch, 1, 1, 1}, op, "State offsets");
+    return state_dtype;
 }
 } // namespace ninfer::ops::detail::kimi_delta_attention

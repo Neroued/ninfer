@@ -4,14 +4,14 @@
 
 namespace ninfer::models::glm5next {
 
-StateLayout plan_state(const execution::ModelProfile& p) {
+StateLayout plan_state(const execution::ModelProfile& p, LinearStateDType linear_state_dtype) {
     StateImageBuilder b;
     const auto& c    = p.config.text;
     const auto heads = dimension(p.local.kda_heads.size), d = dimension(c.kda.head_dim);
     StateLayout out;
     out.kda    = plan_linear_attention_state(b, {c.kda_layers, dimension(3ULL * heads * d),
                                                  dimension(c.kda.conv_width - 1ULL), heads, d, d,
-                                                 DType::BF16});
+                                                 DType::BF16, to_dtype(linear_state_dtype)});
     out.hidden = b.add(DType::BF16, {dimension(c.hidden)}, 1, "Main final hidden");
     if (p.draft) {
         const auto& d = p.draft->context;

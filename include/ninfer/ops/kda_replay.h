@@ -16,8 +16,8 @@ struct KdaReplayFoldRow {
 /**
  * For each positive commit m, fold records [0,m) across all layers. The source recurrent
  * field must contain the same initial S0 observed by kimi_delta_attention_replay_record
- * when it produced those records. The destination FP32 recurrent field approximates the
- * mathematical state Sm. Its convolution history is exactly
+ * when it produced those records. The destination recurrent field (FP32 or BF16, matching the
+ * planned state dtype) approximates the mathematical state Sm. Its convolution history is exactly
  * tail_3(source.conv || records.conv[0:m]) at the BF16 word level.
  * Record row b is fixed throughout the call; width>=1, 1<=B<=record_capacity, 0<=m<=width.
  *

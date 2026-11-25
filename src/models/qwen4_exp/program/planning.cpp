@@ -13,7 +13,7 @@ namespace {
 PersistentLayout persistent(const execution::ModelProfile& p, const EngineOptions& o) {
     LayoutBuilder b;
     PersistentLayout out;
-    out.state = plan_state_image(p.config, p.local.gdn);
+    out.state = plan_state_image(p.config, p.local.gdn, o.linear_state_dtype);
     out.main  = plan_qsa_cache(b, p.local.qsa, p.config.text.qsa_layers, o.max_context,
                                o.max_concurrency, o.kv_cache);
     if (p.mtp)
@@ -140,7 +140,8 @@ ExecutionShape describe_execution_shape(const execution::ModelProfile& profile,
             o.context_cache.enabled,
             o.use_cuda_graph,
             o.observability.gpu_timing,
-            o.speculative.length_policy};
+            o.speculative.length_policy,
+            o.linear_state_dtype};
 }
 
 std::size_t ExecutionPlan::device_bytes() const {

@@ -19,15 +19,17 @@ struct PlannedState {
 
 PlannedState plan_state(std::uint32_t layers, std::int32_t conv_channels, std::int32_t conv_width,
                         std::int32_t value_heads, std::int32_t value_head_dim,
-                        std::int32_t key_head_dim, ninfer::DType conv_dtype = ninfer::DType::BF16) {
+                        std::int32_t key_head_dim, ninfer::DType conv_dtype = ninfer::DType::BF16,
+                        ninfer::DType recurrent_dtype = ninfer::DType::FP32) {
     ninfer::StateImageBuilder images;
-    auto layout = ninfer::plan_linear_attention_state(images, {.layers         = layers,
-                                                               .conv_channels  = conv_channels,
-                                                               .conv_width     = conv_width,
-                                                               .value_heads    = value_heads,
-                                                               .value_head_dim = value_head_dim,
-                                                               .key_head_dim   = key_head_dim,
-                                                               .conv_dtype     = conv_dtype});
+    auto layout = ninfer::plan_linear_attention_state(images, {.layers          = layers,
+                                                               .conv_channels   = conv_channels,
+                                                               .conv_width      = conv_width,
+                                                               .value_heads     = value_heads,
+                                                               .value_head_dim  = value_head_dim,
+                                                               .key_head_dim    = key_head_dim,
+                                                               .conv_dtype      = conv_dtype,
+                                                               .recurrent_dtype = recurrent_dtype});
     return {std::move(layout), images.finish()};
 }
 
@@ -191,6 +193,71 @@ int scattered_records(ninfer::DeviceContext& device) {
     failures += check_shape(fp32_state.recurrent_tensor(0, 0), {4, 3, 2, 1}, "FP32 recurrent");
     return failures;
 }
+
+int bf16_recurrent_case(ninfer::DeviceContext& device) {
+    int failures = 0;
+    if (std::string_view(ninfer::linear_state_dtype_name(ninfer::LinearStateDType::Float32)) !=
+            "fp32" ||
+        std::string_view(ninfer::linear_state_dtype_name(ninfer::LinearStateDType::BFloat16)) !=
+            "bf16" ||
+        ninfer::linear_state_dtype_from_option("fp32") != ninfer::LinearStateDType::Float32 ||
+        ninfer::linear_state_dtype_from_option("bf16") != ninfer::LinearStateDType::BFloat16 ||
+        ninfer::to_dtype(ninfer::LinearStateDType::Float32) != ninfer::DType::FP32 ||
+        ninfer::to_dtype(ninfer::LinearStateDType::BFloat16) != ninfer::DType::BF16) {
+        failures += fail("linear state dtype helpers mismatch");
+    }
+    bool rejected = false;
+    try {
+        (void)ninfer::linear_state_dtype_from_option("fp16");
+    } catch (const std::exception&) { rejected = true; }
+    if (!rejected) failures += fail("invalid linear state dtype option was accepted");
+
+    rejected = false;
+    try {
+        (void)plan_state(2, 128, 3, 4, 128, 128, ninfer::DType::BF16, ninfer::DType::FP16);
+    } catch (const std::exception&) { rejected = true; }
+    if (!rejected) failures += fail("FP16 recurrent state dtype was accepted");
+
+    auto fp32 = plan_state(3, 1024, 3, 8, 128, 128, ninfer::DType::BF16, ninfer::DType::FP32);
+    auto bf16 = plan_state(3, 1024, 3, 8, 128, 128, ninfer::DType::BF16, ninfer::DType::BF16);
+
+    ninfer::DeviceBuffer fp32_backing(device.device(), fp32.images.image_bytes);
+    ninfer::StateImageStorage fp32_images(fp32_backing.span(), fp32.images);
+    ninfer::LinearAttentionStateView fp32_state(fp32_images, fp32.layout);
+
+    ninfer::DeviceBuffer backing(device.device(), 2 * bf16.images.image_bytes);
+    ninfer::StateImageStorage images(backing.span(), bf16.images);
+    ninfer::LinearAttentionStateView state(images, bf16.layout);
+
+    const auto fp32_all = fp32_state.all_layers_view();
+    const auto bf16_all = state.all_layers_view();
+    failures += expect_size(bf16_all.recurrent.field.tensor.region.bytes,
+                            fp32_all.recurrent.field.tensor.region.bytes / 2,
+                            "bf16 recurrent layer bytes");
+    failures += expect_size(bf16_all.conv.field.tensor.region.bytes,
+                            fp32_all.conv.field.tensor.region.bytes, "conv layer bytes unchanged");
+    if (bf16_all.recurrent.field.layer_stride % 256 != 0)
+        failures += fail("bf16 recurrent layer stride not 256-byte aligned");
+    if (bf16_all.spec.recurrent_dtype != ninfer::DType::BF16)
+        failures += fail("all_layers_view lost BF16 recurrent_dtype");
+    const std::int64_t dst_offset = static_cast<std::int64_t>(bf16.images.image_bytes);
+    images.clear(0, device.execution_view());
+    images.clear(dst_offset, device.execution_view());
+    for (std::uint32_t layer = 0; layer < 3; ++layer) {
+        const auto rec = state.recurrent_tensor(layer, 0);
+        if (rec.dtype != ninfer::DType::BF16) failures += fail("expected BF16 recurrent tensor");
+        failures += expect_size(rec.bytes(), 128ULL * 128 * 8 * 2, "bf16 recurrent tensor bytes");
+        CUDA_CHECK(cudaMemsetAsync(rec.data, int(0x31 + layer), rec.bytes(), device.stream()));
+    }
+    images.copy(0, dst_offset, device.execution_view());
+    device.synchronize();
+    for (std::uint32_t layer = 0; layer < 3; ++layer) {
+        failures += expect_device_byte(state.recurrent_tensor(layer, dst_offset),
+                                       static_cast<unsigned char>(0x31 + layer),
+                                       "copied bf16 recurrent");
+    }
+    return failures;
+}
 } // namespace
 
 int main() {
@@ -201,8 +268,8 @@ int main() {
             return 77;
         CUDA_CHECK(error);
         ninfer::DeviceContext device(0);
-        const auto failures =
-            mixed_image_case(device) + recurrent_image_case(device) + scattered_records(device);
+        const auto failures = mixed_image_case(device) + recurrent_image_case(device) +
+                              scattered_records(device) + bf16_recurrent_case(device);
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

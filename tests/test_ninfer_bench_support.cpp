@@ -36,14 +36,16 @@ void rejects(std::vector<std::string> args) {
 void options_test() {
     expect(parse({"bench", "--help"}).help_requested, "help without model");
     const auto mixed = parse({"bench", "model.ninfer", "--messages", "first.json", "--prompt",
-                              "--messages", "--kv-dtype", "k8v4", "--spec", "mtp", "--draft-tokens",
-                              "3", "--max-tokens", "64", "--no-cuda-graph", "--gpu-timing"});
+                              "--messages", "--kv-dtype", "k8v4", "--linear-state-dtype", "bf16",
+                              "--spec", "mtp", "--draft-tokens", "3", "--max-tokens", "64",
+                              "--no-cuda-graph", "--gpu-timing"});
     expect(mixed.inputs.size() == 2 && mixed.inputs[0].kind == bench::InputKind::Messages &&
                mixed.inputs[1].value == "--messages",
            "ordered inputs and literal flag-like values");
     expect(mixed.concurrency == 2 && mixed.launch.engine.max_concurrency == 2,
            "inferred concurrency");
     expect(mixed.launch.engine.kv_cache == KvCacheStorage::Fp8KeyNvfp4Value &&
+               mixed.launch.engine.linear_state_dtype == LinearStateDType::BFloat16 &&
                mixed.launch.engine.speculative.backend == SpeculativeBackend::Mtp &&
                mixed.launch.engine.speculative.draft_tokens == 3 &&
                !mixed.launch.engine.use_cuda_graph &&
@@ -67,8 +69,11 @@ void options_test() {
     const auto defaults =
         parse({"bench", "model.ninfer", "--prompt", "x", "--prefix-reuse=default"});
     expect(defaults.launch.engine.context_cache.enabled, "explicit default uses decode defaults");
-    expect(bench::usage_text("bench").find("--kv-dtype") != std::string::npos, "shared help");
+    expect(bench::usage_text("bench").find("--kv-dtype") != std::string::npos &&
+               bench::usage_text("bench").find("--linear-state-dtype") != std::string::npos,
+           "shared help");
     rejects({"bench", "model.ninfer"});
+    rejects({"bench", "model.ninfer", "--prompt", "a", "--linear-state-dtype", "fp16"});
     rejects({"bench", "model.ninfer", "--prompt", "a", "--prompt", "b", "--concurrency", "3"});
     rejects({"bench", "model.ninfer", "--prompt", "a", "--repetitions", "0"});
     rejects({"bench", "model.ninfer", "--prompt", "a", "--profile-measured"});
@@ -84,14 +89,17 @@ void config_test() {
     {
         std::ofstream file(path);
         file << "[model]\npath = 'model.ninfer'\n[engine]\nmax_context = 2048\n"
-                "kv_dtype = 'int8'\nmax_concurrency = 2\n[speculative]\nbackend = 'mtp'\n"
+                "kv_dtype = 'int8'\nlinear_state_dtype = 'bf16'\nmax_concurrency = 2\n"
+                "[speculative]\nbackend = 'mtp'\n"
                 "draft_tokens = 3\n[generation]\nmax_tokens = 32\n[cli]\nprompt = 'ignored'\n";
     }
-    const auto options = parse({"bench", "--config", path.string(), "--prompt", "input",
-                                "--kv-dtype", "bf16", "--max-tokens", "48", "--concurrency", "3"});
+    const auto options =
+        parse({"bench", "--config", path.string(), "--prompt", "input", "--kv-dtype", "bf16",
+               "--linear-state-dtype", "fp32", "--max-tokens", "48", "--concurrency", "3"});
     expect(options.launch.engine.artifact_path == directory / "model.ninfer",
            "config-relative artifact");
     expect(options.launch.engine.kv_cache == KvCacheStorage::BFloat16 &&
+               options.launch.engine.linear_state_dtype == LinearStateDType::Float32 &&
                options.launch.engine.max_context == 2048 &&
                options.launch.engine.max_concurrency == 2 &&
                options.launch.generation.max_tokens == 48,

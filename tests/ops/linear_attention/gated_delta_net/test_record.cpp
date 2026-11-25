@@ -41,7 +41,7 @@ std::vector<std::uint16_t> make_bf16(std::size_t count, std::uint32_t seed) {
 
 int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
              std::vector<std::int32_t> valid_columns, std::uint32_t seed,
-             bool minimum_alignment = false) {
+             bool minimum_alignment = false, DType state_dtype = DType::FP32) {
     const std::int32_t kQkHeads = value_heads == 24 ? 8 : 16;
     const bool dense            = valid_columns.empty();
     if (dense) { valid_columns.assign(static_cast<std::size_t>(batch), width); }
@@ -68,6 +68,7 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
     beta[0]   = std::bit_cast<float>(0x00000001U);
     std::vector<float> state(state_elements);
     fill_uniform(state, seed + 5, -0.03F, 0.03F);
+    if (state_dtype == DType::BF16) round_to_bf16(state);
     state[0] = std::bit_cast<float>(0x80000000U);
 
     std::vector<std::int32_t> initial_slots(static_cast<std::size_t>(batch));
@@ -84,12 +85,18 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
                                         bits.size() * sizeof(std::uint16_t), cudaMemcpyHostToDevice));
         return buffer;
     };
-    DeviceBuffer device_q        = upload(q_bits, qk_offset);
-    DeviceBuffer device_k        = upload(k_bits, qk_offset);
-    DeviceBuffer device_v        = upload(v_bits, v_offset);
-    DeviceBuffer device_g        = to_device(g);
-    DeviceBuffer device_beta     = to_device(beta);
-    DeviceBuffer record_state = to_device(state);
+    DeviceBuffer device_q    = upload(q_bits, qk_offset);
+    DeviceBuffer device_k    = upload(k_bits, qk_offset);
+    DeviceBuffer device_v    = upload(v_bits, v_offset);
+    DeviceBuffer device_g    = to_device(g);
+    DeviceBuffer device_beta = to_device(beta);
+    std::vector<std::uint16_t> state_bf16;
+    if (state_dtype == DType::BF16) {
+        state_bf16.resize(state_elements);
+        std::transform(state.begin(), state.end(), state_bf16.begin(), f32_to_bf16);
+    }
+    DeviceBuffer record_state =
+        state_dtype == DType::BF16 ? to_device(state_bf16) : to_device(state);
     DeviceBuffer device_valid;
     if (!dense) { device_valid = to_device(valid_columns); }
 
@@ -113,7 +120,7 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
              {kStateDim, value_heads, width, batch});
     Tensor g_tensor(device_g.span(), DType::FP32, {value_heads, width, batch});
     Tensor beta_tensor(device_beta.span(), DType::FP32, {value_heads, width, batch});
-    Tensor record_states(record_state.span(), DType::FP32,
+    Tensor record_states(record_state.span(), state_dtype,
                          {kStateDim, kStateDim, value_heads, slots});
     RecordStateFixture history(record_states, 3);
     Tensor valid;
@@ -250,12 +257,30 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
                     Tensor(MemorySpan{delta_record.data, delta_record.bytes(), delta_record.device},
                            DType::BF16, {kStateDim, value_heads, width, batch}));
         failures += rejects(q, k, g_tensor, valid, q);
+        if (state_dtype == DType::FP32) {
+            auto bad_source                = history.view(initial);
+            bad_source.field.tensor.dtype = DType::FP16;
+            bool rejected           = false;
+            try {
+                ops::gated_delta_net_replay_record(
+                    q, k, v, g_tensor, beta_tensor, kScale, bad_source, valid, layer.recurrence,
+                    record_output, cuda_environment().context.execution_view());
+            } catch (const std::invalid_argument&) { rejected = true; }
+            if (!rejected) {
+                std::cerr << "record accepted FP16 source state" << suffix << '\n';
+                ++failures;
+            }
+        }
     }
 
     history.copy_back();
     failures += history.verify_guards("record source");
-    const std::vector<float> state_after = from_device<float>(record_state, state_elements);
-    if (std::memcmp(state_after.data(), state.data(), state_elements * sizeof(float)) != 0) {
+    const bool state_unchanged =
+        state_dtype == DType::BF16
+            ? from_device<std::uint16_t>(record_state, state_elements) == state_bf16
+            : std::memcmp(from_device<float>(record_state, state_elements).data(), state.data(),
+                          state_elements * sizeof(float)) == 0;
+    if (!state_unchanged) {
         std::cerr << "replay record modified source state" << suffix << "\n";
         ++failures;
     }
@@ -308,5 +333,25 @@ int main(int argc, char** argv) {
         add(24, t, 4, {t, 0, 1, t - 1}, 3000U + t);
     }
     add(32, 5, 1, {0}, 1715U);
+
+    // BF16 recurrent state storage cases
+    const auto add_bf16 = [&](int heads, int width, int batch, std::vector<int> valid,
+                              unsigned seed, bool min_align = false) {
+        suite.add("gdn_record_bf16/h" + std::to_string(heads) + "/w" + std::to_string(width) +
+                      "/b" + std::to_string(batch) + (valid.empty() ? "/dense" : "/ragged") +
+                      (min_align ? "/min-align" : ""),
+                  [=] {
+                      return run_case(heads, width, batch, valid, seed, min_align, DType::BF16);
+                  },
+                  {{"execution", width == 2 || width == 9 || width == 16 ? "graph" : "eager"}});
+    };
+    add_bf16(24, 2, 1, {}, 4001U);
+    add_bf16(24, 9, 4, {9, 0, 1, 8}, 4002U);
+    add_bf16(32, 6, 8, {6, 5, 4, 3, 2, 1, 6, 2}, 4003U);
+    add_bf16(32, 5, 1, {0}, 4004U);
+    add_bf16(48, 2, 1, {}, 4005U);
+    add_bf16(48, 16, 1, {}, 4006U);
+    add_bf16(48, 16, 8, {16, 1, 4, 7, 10, 13, 0, 15}, 4007U);
+    add_bf16(48, 9, 2, {9, 3}, 4008U, true);
     return suite.main(argc, argv);
 }

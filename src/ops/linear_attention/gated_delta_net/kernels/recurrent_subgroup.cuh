@@ -87,13 +87,13 @@ __device__ __forceinline__ void run(const Access& a, RecurrentCoordinates origin
     c.dv_base += group * Rows;
     if constexpr (Prefetch) prefetch(*sm, a, original, valid);
     __align__(16) float state[Rows][Cols];
-    const float* source = a.state_read_base(c);
+    const auto* source = a.state_read_base(c);
 #pragma unroll
     for (int r = 0; r < Rows; ++r) {
 #pragma unroll
         for (int p = 0; p < Cols / 4; ++p) {
             const int col  = lane * 4 + p * Lanes * 4;
-            const float4 x = common::load_vec<float4>(source + (c.dv_base + r) * kStateDim + col);
+            const float4 x = common::load_state_float4(source + (c.dv_base + r) * kStateDim + col);
             common::store_vec(state[r] + p * 4, x);
         }
     }
@@ -169,14 +169,14 @@ __device__ __forceinline__ void run(const Access& a, RecurrentCoordinates origin
         }
     }
     if constexpr (WriteState) {
-        float* destination = a.state_write_base(c);
+        auto* destination = a.state_write_base(c);
 #pragma unroll
         for (int r = 0; r < Rows; ++r) {
 #pragma unroll
             for (int p = 0; p < Cols / 4; ++p) {
                 const int col = lane * 4 + p * Lanes * 4;
-                common::store_vec(destination + (c.dv_base + r) * kStateDim + col,
-                                  common::load_vec<float4>(state[r] + p * 4));
+                common::store_state_float4(destination + (c.dv_base + r) * kStateDim + col,
+                                           common::load_vec<float4>(state[r] + p * 4));
             }
         }
     }

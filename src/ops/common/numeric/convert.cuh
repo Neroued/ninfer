@@ -6,6 +6,7 @@
 #include <cuda_fp16.h>
 
 #include <cstdint>
+#include <type_traits>
 
 namespace ninfer::ops::common {
 
@@ -120,6 +121,106 @@ __device__ __forceinline__ void load_bf16x4(float (&values)[4], const __nv_bfloa
     values[1]          = low.y;
     values[2]          = high.x;
     values[3]          = high.y;
+}
+
+__device__ __forceinline__ void store_bf16x4(__nv_bfloat16* destination, const float (&values)[4]) {
+    const uint2 packed{pack_bf16x2(values[0], values[1]), pack_bf16x2(values[2], values[3])};
+    store_vec(destination, packed);
+}
+
+template <class StateT>
+__device__ __forceinline__ void load_state_vec4(float (&values)[4], const StateT* source) {
+    static_assert(std::is_same_v<StateT, float> || std::is_same_v<StateT, __nv_bfloat16>);
+    if constexpr (std::is_same_v<StateT, float>) {
+        store_vec(values, load_vec<float4>(source));
+    } else {
+        load_bf16x4(values, source);
+    }
+}
+
+template <class StateT>
+__device__ __forceinline__ void store_state_vec4(StateT* destination, const float (&values)[4]) {
+    static_assert(std::is_same_v<StateT, float> || std::is_same_v<StateT, __nv_bfloat16>);
+    if constexpr (std::is_same_v<StateT, float>) {
+        store_vec(destination, load_vec<float4>(values));
+    } else {
+        store_bf16x4(destination, values);
+    }
+}
+
+template <class StateT>
+__device__ __forceinline__ float4 load_state_float4(const StateT* source) {
+    static_assert(std::is_same_v<StateT, float> || std::is_same_v<StateT, __nv_bfloat16>);
+    if constexpr (std::is_same_v<StateT, float>) {
+        return load_vec<float4>(source);
+    } else {
+        float values[4];
+        load_bf16x4(values, source);
+        return make_float4(values[0], values[1], values[2], values[3]);
+    }
+}
+
+template <class StateT>
+__device__ __forceinline__ void store_state_float4(StateT* destination, float4 value) {
+    static_assert(std::is_same_v<StateT, float> || std::is_same_v<StateT, __nv_bfloat16>);
+    if constexpr (std::is_same_v<StateT, float>) {
+        store_vec(destination, value);
+    } else {
+        const uint2 packed{pack_bf16x2(value.x, value.y), pack_bf16x2(value.z, value.w)};
+        store_vec(destination, packed);
+    }
+}
+
+template <class StateT>
+__device__ __forceinline__ float4 load_state_float4_l2_retained(const StateT* source) {
+    static_assert(std::is_same_v<StateT, float> || std::is_same_v<StateT, __nv_bfloat16>);
+    const auto policy = l2_retained_policy();
+    if constexpr (std::is_same_v<StateT, float>) {
+        float4 value;
+        asm volatile("ld.global.cg.L2::cache_hint.v4.f32 {%0,%1,%2,%3}, [%4], %5;"
+                     : "=f"(value.x), "=f"(value.y), "=f"(value.z), "=f"(value.w)
+                     : "l"(source), "l"(policy));
+        return value;
+    } else {
+        uint2 packed;
+        asm volatile("ld.global.cg.L2::cache_hint.v2.u32 {%0,%1}, [%2], %3;"
+                     : "=r"(packed.x), "=r"(packed.y)
+                     : "l"(source), "l"(policy));
+        const float2 low  = bf16x2_bits_to_float2(packed.x);
+        const float2 high = bf16x2_bits_to_float2(packed.y);
+        return make_float4(low.x, low.y, high.x, high.y);
+    }
+}
+
+template <class StateT>
+__device__ __forceinline__ void store_state_float4_streaming(StateT* destination, float4 value) {
+    static_assert(std::is_same_v<StateT, float> || std::is_same_v<StateT, __nv_bfloat16>);
+    if constexpr (std::is_same_v<StateT, float>) {
+        asm volatile("st.global.cs.v4.f32 [%0], {%1,%2,%3,%4};" ::"l"(destination), "f"(value.x),
+                     "f"(value.y), "f"(value.z), "f"(value.w)
+                     : "memory");
+    } else {
+        const std::uint32_t low  = pack_bf16x2(value.x, value.y);
+        const std::uint32_t high = pack_bf16x2(value.z, value.w);
+        asm volatile("st.global.cs.v2.u32 [%0], {%1,%2};" ::"l"(destination), "r"(low), "r"(high)
+                     : "memory");
+    }
+}
+
+template <class StateT>
+__device__ __forceinline__ float load_state_scalar(const StateT* source) {
+    static_assert(std::is_same_v<StateT, float> || std::is_same_v<StateT, __nv_bfloat16>);
+    if constexpr (std::is_same_v<StateT, float>) return *source;
+    return __bfloat162float(*source);
+}
+
+template <class StateT>
+__device__ __forceinline__ void store_state_scalar(StateT* destination, float value) {
+    static_assert(std::is_same_v<StateT, float> || std::is_same_v<StateT, __nv_bfloat16>);
+    if constexpr (std::is_same_v<StateT, float>)
+        *destination = value;
+    else
+        *destination = __float2bfloat16_rn(value);
 }
 
 __device__ __forceinline__ __half2 half2_from_bits(std::uint32_t bits) {

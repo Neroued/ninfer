@@ -159,7 +159,7 @@ __device__ __forceinline__ void store_output(const RecurrenceOperands& args, flo
     }
 }
 
-template <int DV, class... Metadata>
+template <int DV, class StateT, class... Metadata>
 __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurrence_kernel(
     RecurrenceOperands base_args, const QkChunk* __restrict__ qk_workspace,
     const ControlChunk* __restrict__ control_workspace,
@@ -213,10 +213,12 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
         const auto state_base = static_cast<std::int64_t>(head) * kStateDim * kStateDim;
         const auto source_base =
             state_base +
-            (args.source_offset ? *args.source_offset / std::int64_t(sizeof(float)) : 0);
+            (args.source_offset ? *args.source_offset / std::int64_t(sizeof(StateT)) : 0);
         const auto destination_base =
             state_base +
-            (args.destination_offset ? *args.destination_offset / std::int64_t(sizeof(float)) : 0);
+            (args.destination_offset ? *args.destination_offset / std::int64_t(sizeof(StateT)) : 0);
+        const auto* state_in = static_cast<const StateT*>(args.state_in);
+        auto* state_out      = static_cast<StateT*>(args.state_out);
 
         // MMA accumulators describe S^T[key,value]. External state remains [value,key].
         float state[NPW][MPW][4];
@@ -225,12 +227,16 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
             const int n = n_start + ni * kWarps;
 #pragma unroll
             for (int mi = 0; mi < MPW; ++mi) {
-                const int key    = (m_start + mi * MW) * 16 + g;
-                const int value  = value_start + n * 8 + t * 2;
-                state[ni][mi][0] = args.state_in[source_base + value * kStateDim + key];
-                state[ni][mi][1] = args.state_in[source_base + (value + 1) * kStateDim + key];
-                state[ni][mi][2] = args.state_in[source_base + value * kStateDim + key + 8];
-                state[ni][mi][3] = args.state_in[source_base + (value + 1) * kStateDim + key + 8];
+                const int key   = (m_start + mi * MW) * 16 + g;
+                const int value = value_start + n * 8 + t * 2;
+                state[ni][mi][0] =
+                    common::load_state_scalar(state_in + source_base + value * kStateDim + key);
+                state[ni][mi][1] = common::load_state_scalar(
+                    state_in + source_base + (value + 1) * kStateDim + key);
+                state[ni][mi][2] = common::load_state_scalar(
+                    state_in + source_base + value * kStateDim + key + 8);
+                state[ni][mi][3] = common::load_state_scalar(
+                    state_in + source_base + (value + 1) * kStateDim + key + 8);
             }
         }
         load_stage<DV, Packed>(sm.stage[0], args, qk_workspace, control_workspace, head,
@@ -409,18 +415,22 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
             for (int mi = 0; mi < MPW; ++mi) {
                 const int key   = (m_start + mi * MW) * 16 + g;
                 const int value = value_start + n * 8 + t * 2;
-                args.state_out[destination_base + value * kStateDim + key]       = state[ni][mi][0];
-                args.state_out[destination_base + (value + 1) * kStateDim + key] = state[ni][mi][1];
-                args.state_out[destination_base + value * kStateDim + key + 8]   = state[ni][mi][2];
-                args.state_out[destination_base + (value + 1) * kStateDim + key + 8] =
-                    state[ni][mi][3];
+                common::store_state_scalar(state_out + destination_base + value * kStateDim + key,
+                                           state[ni][mi][0]);
+                common::store_state_scalar(
+                    state_out + destination_base + (value + 1) * kStateDim + key, state[ni][mi][1]);
+                common::store_state_scalar(
+                    state_out + destination_base + value * kStateDim + key + 8, state[ni][mi][2]);
+                common::store_state_scalar(
+                    state_out + destination_base + (value + 1) * kStateDim + key + 8,
+                    state[ni][mi][3]);
             }
         }
         if constexpr (Packed) i += gridDim.y;
     } while (Packed && i < packed->chunked_segments);
 }
 
-template <int DV, class... Metadata>
+template <int DV, class StateT, class... Metadata>
 void opt_in_shared_memory() {
     constexpr int shared_bytes = sizeof(RecurrenceShared<DV>);
     if constexpr (shared_bytes > 48 * 1024) {
@@ -433,34 +443,34 @@ void opt_in_shared_memory() {
         if ((configured.load(std::memory_order_acquire) & bit) == 0) {
             // NVCC's host stub retains the const qualification on the argument pack.
             CUDA_CHECK(cudaFuncSetAttribute(
-                reinterpret_cast<const void*>(chunk_recurrence_kernel<DV, Metadata...>),
+                reinterpret_cast<const void*>(chunk_recurrence_kernel<DV, StateT, Metadata...>),
                 cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes));
             if (bit) configured.fetch_or(bit, std::memory_order_release);
         }
     }
 }
 
-template <int DV>
+template <int DV, class StateT>
 void launch_ragged(const RecurrenceOperands& args, const PackedChunks& packed, const QkChunk* qk,
                    const ControlChunk* control, cudaStream_t stream) {
     constexpr int stripes      = kStateDim / DV;
     constexpr int shared_bytes = sizeof(RecurrenceShared<DV>);
-    opt_in_shared_memory<DV, PackedChunks>();
+    opt_in_shared_memory<DV, StateT, PackedChunks>();
     const int segment_grid = std::min(packed.chunked_segments, common::kCudaGridYLimit);
     const dim3 grid        = args.value_heads <= INT_MAX / stripes
                                  ? dim3(args.value_heads * stripes, segment_grid)
                                  : dim3(args.value_heads, segment_grid, stripes);
-    chunk_recurrence_kernel<DV, PackedChunks>
+    chunk_recurrence_kernel<DV, StateT, PackedChunks>
         <<<grid, kThreads<DV>, shared_bytes, stream>>>(args, qk, control, packed);
     CUDA_CHECK(cudaGetLastError());
 }
 
-template <int DV>
+template <int DV, class StateT>
 void launch(const RecurrenceOperands& args, const QkChunk* qk, const ControlChunk* control,
             cudaStream_t stream) {
     constexpr int shared_bytes = sizeof(RecurrenceShared<DV>);
-    opt_in_shared_memory<DV>();
-    chunk_recurrence_kernel<DV>
+    opt_in_shared_memory<DV, StateT>();
+    chunk_recurrence_kernel<DV, StateT>
         <<<args.value_heads*(kStateDim / DV), kThreads<DV>, shared_bytes, stream>>>(args, qk,
                                                                                     control);
     CUDA_CHECK(cudaGetLastError());
@@ -471,32 +481,44 @@ void launch(const RecurrenceOperands& args, const QkChunk* qk, const ControlChun
 void launch_recurrence_ragged(const RecurrenceOperands& args, const PackedChunks& packed,
                               const QkChunk* qk, const ControlChunk* control, int value_tile,
                               cudaStream_t stream) {
-    switch (value_tile) {
-    case 64:
-        return launch_ragged<64>(args, packed, qk, control, stream);
-    case 32:
-        return launch_ragged<32>(args, packed, qk, control, stream);
-    case 16:
-        return launch_ragged<16>(args, packed, qk, control, stream);
-    case 8:
-        return launch_ragged<8>(args, packed, qk, control, stream);
-    }
-    throw std::logic_error("linear attention: invalid recurrence value tile");
+    const auto dispatch = [&]<class StateT>() {
+        switch (value_tile) {
+        case 64:
+            return launch_ragged<64, StateT>(args, packed, qk, control, stream);
+        case 32:
+            return launch_ragged<32, StateT>(args, packed, qk, control, stream);
+        case 16:
+            return launch_ragged<16, StateT>(args, packed, qk, control, stream);
+        case 8:
+            return launch_ragged<8, StateT>(args, packed, qk, control, stream);
+        }
+        throw std::logic_error("linear attention: invalid recurrence value tile");
+    };
+    if (args.state_dtype == DType::BF16)
+        dispatch.template operator()<__nv_bfloat16>();
+    else
+        dispatch.template operator()<float>();
 }
 
 void launch_recurrence(const RecurrenceOperands& args, const QkChunk* qk,
                        const ControlChunk* control, int value_tile, cudaStream_t stream) {
-    switch (value_tile) {
-    case 64:
-        return launch<64>(args, qk, control, stream);
-    case 32:
-        return launch<32>(args, qk, control, stream);
-    case 16:
-        return launch<16>(args, qk, control, stream);
-    case 8:
-        return launch<8>(args, qk, control, stream);
-    }
-    throw std::logic_error("linear attention: invalid recurrence value tile");
+    const auto dispatch = [&]<class StateT>() {
+        switch (value_tile) {
+        case 64:
+            return launch<64, StateT>(args, qk, control, stream);
+        case 32:
+            return launch<32, StateT>(args, qk, control, stream);
+        case 16:
+            return launch<16, StateT>(args, qk, control, stream);
+        case 8:
+            return launch<8, StateT>(args, qk, control, stream);
+        }
+        throw std::logic_error("linear attention: invalid recurrence value tile");
+    };
+    if (args.state_dtype == DType::BF16)
+        dispatch.template operator()<__nv_bfloat16>();
+    else
+        dispatch.template operator()<float>();
 }
 
 } // namespace ninfer::ops::detail::gated_delta_net::chunked

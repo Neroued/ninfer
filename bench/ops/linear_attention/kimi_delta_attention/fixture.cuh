@@ -85,7 +85,8 @@ struct Fixture {
         StateImageBuilder builder;
         (void)builder.add(DType::I32, {64}, 1, "unrelated field");
         fields = plan_linear_attention_state(
-            builder, {static_cast<unsigned>(layers), channels, 3, h, 128, 128, DType::BF16});
+            builder,
+            {static_cast<unsigned>(layers), channels, 3, h, 128, 128, DType::BF16, o.state_dtype});
         state_layout       = builder.finish();
         std::size_t cursor = 256;
         for (int i = 0; i < b; ++i) {
@@ -99,9 +100,11 @@ struct Fixture {
         sources.copy_from_host(so.data(), sources.size());
         destinations = make_buffer(b * sizeof(std::int64_t));
         destinations.copy_from_host(ds.data(), destinations.size());
-        storage           = std::make_unique<StateImageStorage>(state.span(), state_layout);
-        states            = std::make_unique<LinearAttentionStateView>(*storage, fields);
-        auto recurrent    = make_f32(std::size_t(128) * 128 * h * layers * b, 19, -0.1F, 0.1F);
+        storage        = std::make_unique<StateImageStorage>(state.span(), state_layout);
+        states         = std::make_unique<LinearAttentionStateView>(*storage, fields);
+        const auto n_r = std::size_t(128) * 128 * h * layers * b;
+        auto recurrent = o.state_dtype == DType::BF16 ? make_bf16(n_r, 19, -0.1F, 0.1F)
+                                                      : make_f32(n_r, 19, -0.1F, 0.1F);
         auto conv         = make_bf16(std::size_t(channels) * 3 * layers * b, 23, -0.1F, 0.1F);
         const auto stream = device_context().execution_view().stream();
         for (int i = 0; i < b; ++i)
@@ -340,7 +343,8 @@ struct RaggedFixture {
         : weights(w), input_update(o.op == "input-update"), h(o.heads), qh(o.qk_heads),
           channels((2 * qh + h) * 128), workload(lengths, device_context().device()),
           n(workload.view().total_tokens()), s(workload.view().num_seqs()),
-          state_bytes(input_update ? 6ULL * channels : 4ULL * 128 * 128 * h),
+          state_bytes(input_update ? 6ULL * channels
+                                   : dtype_size(o.state_dtype) * 128ULL * 128 * h),
           offsets(ragged::make_state_offsets(s, o.state_form, state_bytes, 16, 16)),
           sources(ragged::upload_offsets(device_context().device(), offsets.source_offsets_host)),
           destinations(
@@ -357,8 +361,10 @@ struct RaggedFixture {
             capacity = ops::kda_input_proj_conv_update_ragged_workspace_capacity_bytes(
                 ops::linear_profile(weights.projection_view()), n, n, s, s);
         } else {
-            state    = make_f32(offsets.backing_bytes() / 4, 19, -0.1F, 0.1F);
-            layout   = {{{0, state_bytes, 16}, DType::FP32, {128, 128, h, 1}}, 1, 0};
+            state = o.state_dtype == DType::BF16
+                        ? make_bf16(offsets.backing_bytes() / 2, 19, -0.1F, 0.1F)
+                        : make_f32(offsets.backing_bytes() / 4, 19, -0.1F, 0.1F);
+            layout = {{{0, state_bytes, 16}, o.state_dtype, {128, 128, h, 1}}, 1, 0};
             q        = make_bf16(qk_elements, 11);
             k        = make_bf16(qk_elements, 12);
             v        = make_bf16(value_elements, 13);

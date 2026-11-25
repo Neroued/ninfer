@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/dtype.h"
 #include "op_measurement.cuh"
 #include "ragged_workload.h"
 
@@ -8,10 +9,13 @@
 namespace ninfer::bench::gdn_recurrence {
 enum class Mode { Running, BatchUpdate, ChunkedRaw, ChunkedNormalized, Recurrent };
 
+inline const char* state_dtype_name(DType dtype) { return dtype == DType::BF16 ? "bf16" : "fp32"; }
+
 struct Options {
     measurement::Options timing;
     Mode mode    = Mode::Running;
     int qk_heads = 16, value_heads = 48, batch = 1;
+    DType state_dtype                  = DType::FP32;
     ragged::StateOffsetForm state_form = ragged::StateOffsetForm::Distinct;
     std::vector<int> tokens{1024};
     std::vector<ragged::SegmentSpec> ragged_specs;
@@ -32,6 +36,7 @@ inline Options parse_options(int argc, char** argv) {
                    "  --tokens T[,T...] or --sweep START:END[:STEP] --qk-heads H "
                    "--value-heads H --batch B\n"
                    "  --qk-norm fused|composed (composed requires B=1)\n"
+                   "  --state-dtype fp32|bf16 (default fp32)\n"
                    "  --breakdown (chunked stages)\n"
                    "  --ragged-segments SPEC (running only)\n"
                    "  --state-form distinct|alias|mixed|permuted|shared-source\n"
@@ -82,7 +87,14 @@ inline Options parse_options(int argc, char** argv) {
             explicit_state = true;
         } else if (flag == "--qk-norm")
             o.qk_norm = value;
-        else if (!measurement::parse(o.timing, flag, value))
+        else if (flag == "--state-dtype") {
+            if (value == "fp32")
+                o.state_dtype = DType::FP32;
+            else if (value == "bf16")
+                o.state_dtype = DType::BF16;
+            else
+                throw std::invalid_argument("state-dtype: fp32|bf16");
+        } else if (!measurement::parse(o.timing, flag, value))
             throw std::invalid_argument("unknown option: " + std::string(flag));
     }
     if (ragged_text) {

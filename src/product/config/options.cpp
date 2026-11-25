@@ -382,6 +382,9 @@ ParsedOptions parse(int argc, char** argv, EntryPoint entry,
         case Field::KvDtype:
             engine.kv_cache = kv_storage(string());
             break;
+        case Field::LinearStateDtype:
+            engine.linear_state_dtype = linear_state_dtype_from_option(string());
+            break;
         case Field::ContextCapacity:
             if (const auto* capacity = std::get_if<std::uint64_t>(&value)) {
                 engine.context_capacity = ContextCapacityPolicy::explicit_capacity(*capacity);

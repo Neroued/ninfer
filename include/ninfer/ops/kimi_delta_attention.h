@@ -42,13 +42,15 @@ namespace ninfer::ops {
  *   ideal[:,h,t] = scale * S_h * q[:,qh,t].
  *
  * Contiguous represented inputs are q/k BF16 [128,Hqk,T], v/g/out BF16 [128,Hv,T],
- * beta BF16 [Hv,T], A_log FP32 [Hv], dt_bias FP32 [128,Hv], state FP32 [128,128,Hv].
+ * beta BF16 [Hv,T], A_log FP32 [Hv], dt_bias FP32 [128,Hv], state FP32 or BF16 [128,128,Hv].
  * Physical state index is ((h*128+value)*128+key). Hqk>=1, Hv>=Hqk, Hv%Hqk==0, T>=1.
  * lower_bound is finite in [-5,0]; scale is 1/sqrt(128). Inputs/out are non-overlapping.
- * State input/output may be disjoint or exactly alias; no other operand overlaps state.
+ * State input/output must share the same supported dtype (FP32 or BF16) and may be disjoint
+ * or exactly alias; no other operand overlaps state.
  *
- * Running and published state remain FP32; output storage is BF16. Results approximate the
- * complete recurrence over the represented inputs.
+ * Internal running state stays FP32; published state uses the state tensor's storage dtype
+ * (FP32 or BF16, rounded to nearest-even on write-back when BF16); output storage is BF16.
+ * Results approximate the complete recurrence over the represented inputs.
  *
  * workspace supplies the capacity query above and is scoped to the call; the Op allocates no
  * device storage. execution supplies the stream and physical SM count for launch decomposition.
@@ -69,9 +71,9 @@ void kimi_delta_attention(const Tensor& q, const Tensor& k, const Tensor& v, con
 /**
  * Packed ragged form over S = ragged.num_seqs() non-empty segments and N = ragged.total_tokens()
  * columns. q/k are BF16 [128,Hqk,N], v/g/out are BF16 [128,Hv,N], beta is BF16 [Hv,N], and
- * source_state/destination_state select S independent FP32 [128,128,Hv] state records by Device
- * I64 [S] byte offsets. Alignment, bounds, and selected-state alias relationships are
- * caller guarantees, with the same rules as batch update. Same-segment exact in-place alias
+ * source_state/destination_state select S independent FP32 or BF16 (matching) [128,128,Hv] state
+ * records by Device I64 [S] byte offsets. Alignment, bounds, and selected-state alias relationships
+ * are caller guarantees, with the same rules as batch update. Same-segment exact in-place alias
  * is allowed, and workspace may be reused between segments on the execution stream.
  */
 void kimi_delta_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
@@ -84,8 +86,9 @@ void kimi_delta_attention(const Tensor& q, const Tensor& k, const Tensor& v, con
 /**
  * Scratch-free one-token update for B independent state records, using the same head mapping.
  * q/k BF16 [128,Hqk,1,B], v/g/out BF16 [128,Hv,1,B], beta BF16 [Hv,1,B],
- * A_log FP32 [Hv], dt_bias FP32 [128,Hv], and source/destination select FP32 [128,128,Hv] fields
- * using device I64 [B] arena-relative byte offsets. Each field is 16-byte aligned and in bounds;
+ * A_log FP32 [Hv], dt_bias FP32 [128,Hv], and source/destination select matching FP32 or BF16
+ * [128,128,Hv] fields using device I64 [B] arena-relative byte offsets. Each field is 16-byte
+ * aligned and in bounds;
  * other operands are contiguous. B is positive. valid_columns is empty for all active rows,
  * or Device I32 [B] with values in {0,1}. An inactive row writes exact BF16 +0 to output and
  * accesses neither its State offsets nor selected fields. Source/destination may exactly alias or

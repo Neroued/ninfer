@@ -1,9 +1,12 @@
 #pragma once
 
+#include "core/dtype.h"
 #include "op_measurement.cuh"
 #include "ninfer/ops/gdn_replay.h"
 
 namespace ninfer::bench::gdn_replay {
+inline const char* state_dtype_name(DType dtype) { return dtype == DType::BF16 ? "bf16" : "fp32"; }
+
 struct Profile {
     int layers = 36, qk_heads = 16, value_heads = 48, conv_channels = 10240;
 };
@@ -13,6 +16,7 @@ struct Options {
     Profile profile;
     std::string op = "fold", commits = "dense", valid = "dense";
     std::string row_metadata = "host";
+    DType state_dtype        = DType::FP32;
     std::vector<int> tokens{16};
     int batch = 1;
 };
@@ -28,6 +32,7 @@ inline Options parse_options(int argc, char** argv) {
                    "  --op fold|record --layers L --qk-heads Q --value-heads H --conv-channels C\n"
                    "  --tokens T[,T...] or --sweep START:END[:STEP] --batch B\n"
                    "  --commits dense|one|mixed|N[,N...] --valid dense|mixed|N[,N...]\n"
+                   "  --state-dtype fp32|bf16 (default fp32)\n"
                    "  --row-metadata host|device (fold only, default host)\n"
                    "Head dimension=128, T=2..16, B>0.\n"
                    "Fold times all specified layers; record times one recurrence layer.\n";
@@ -59,7 +64,14 @@ inline Options parse_options(int argc, char** argv) {
             o.commits = value;
         else if (flag == "--valid")
             o.valid = value;
-        else if (flag == "--row-metadata") {
+        else if (flag == "--state-dtype") {
+            if (value == "fp32")
+                o.state_dtype = DType::FP32;
+            else if (value == "bf16")
+                o.state_dtype = DType::BF16;
+            else
+                throw std::invalid_argument("state-dtype: fp32|bf16");
+        } else if (flag == "--row-metadata") {
             if (value != "host" && value != "device")
                 throw std::invalid_argument("row-metadata: host|device");
             o.row_metadata = value;

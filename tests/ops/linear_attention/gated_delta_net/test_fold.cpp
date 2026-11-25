@@ -154,11 +154,11 @@ struct Inputs {
 class FoldFixture {
 public:
     FoldFixture(Geometry profile, int slots, int batch, int max_width,
-                std::optional<float> first_state = std::nullopt)
-        : p(profile), slots(slots), batch(batch),
+                std::optional<float> first_state = std::nullopt, DType state_dtype = DType::FP32)
+        : p(profile), slots(slots), batch(batch), state_dtype_(state_dtype),
           state_layout(plan_linear_attention_state(
               state_builder, {static_cast<std::uint32_t>(p.layers), p.channels, 3, p.heads, kDim,
-                              kDim, DType::BF16})),
+                              kDim, DType::BF16, state_dtype})),
           image_layout(state_builder.finish()), state_storage(image_layout.image_bytes * slots),
           images(state_storage.span(), image_layout), states(images, state_layout),
           maximum(
@@ -170,9 +170,11 @@ public:
         std::vector<float> scaled(state_elements());
         for (int slot = 0; slot < slots; ++slot) {
             recurrent[slot] = random_floats(state_elements(), 8021U + slot, -.025f, .025f);
+            if (state_dtype_ == DType::BF16) round_to_bf16(recurrent[slot]);
             if (first_state) {
                 std::fill(recurrent[slot].begin(), recurrent[slot].end(), 0.f);
-                recurrent[slot][0] = *first_state;
+                recurrent[slot][0] =
+                    state_dtype_ == DType::BF16 ? bf16_to_f32(f32_to_bf16(*first_state)) : *first_state;
             } else {
                 recurrent[slot][0] = -0.0f;
             }
@@ -184,11 +186,18 @@ public:
                                       history.size() * sizeof(std::uint16_t),
                                       cudaMemcpyHostToDevice));
                 const float scale = layer_scale(layer);
-                std::transform(recurrent[slot].begin(), recurrent[slot].end(), scaled.begin(),
-                               [scale](float f) { return f * scale; });
-                CUDA_CHECK(cudaMemcpy(states.recurrent_tensor(layer, offset(slot)).data,
-                                      scaled.data(), scaled.size() * sizeof(float),
-                                      cudaMemcpyHostToDevice));
+                if (state_dtype_ == DType::BF16) {
+                    const auto bits = represented_words(recurrent[slot], scale);
+                    CUDA_CHECK(cudaMemcpy(states.recurrent_tensor(layer, offset(slot)).data,
+                                          bits.data(), bits.size() * sizeof(std::uint16_t),
+                                          cudaMemcpyHostToDevice));
+                } else {
+                    std::transform(recurrent[slot].begin(), recurrent[slot].end(), scaled.begin(),
+                                   [scale](float f) { return f * scale; });
+                    CUDA_CHECK(cudaMemcpy(states.recurrent_tensor(layer, offset(slot)).data,
+                                          scaled.data(), scaled.size() * sizeof(float),
+                                          cudaMemcpyHostToDevice));
+                }
             }
         }
     }
@@ -198,6 +207,9 @@ public:
     std::size_t state_elements() const { return std::size_t(p.heads) * kDim * kDim; }
 
     float leading_state() const {
+        if (state_dtype_ == DType::BF16)
+            return bf16_to_f32(
+                from_device<std::uint16_t>(states.recurrent_tensor(0, 0).data, 1).front());
         return from_device<float>(states.recurrent_tensor(0, 0).data, 1).front();
     }
 
@@ -375,6 +387,11 @@ private:
         overlap.data = states.conv_tensor(0, 0).data;
         failures += must_reject("device metadata overlapping state storage",
                                 [&] { plan.execute(sources, destinations, overlap, cuda); });
+        auto bad_states                               = states.all_layers_view();
+        bad_states.spec.recurrent_dtype               = DType::FP16;
+        bad_states.recurrent.field.tensor.dtype       = DType::FP16;
+        failures += must_reject("unsupported recurrent state dtype",
+                                [&] { (void)ops::GdnReplayFoldPlan(records, bad_states); });
         return failures;
     }
 
@@ -403,7 +420,9 @@ private:
         }
         int failures   = 0;
         double max_abs = 0.0, max_relative_l2 = 0.0;
+        const auto& criterion = gdn_ref::state_criterion(state_dtype_);
         std::vector<float> actual(state_elements()), before(state_elements());
+        std::vector<std::uint16_t> actual_bf16(state_dtype_ == DType::BF16 ? state_elements() : 0);
         std::vector<double> actual_fp64(kDim * kDim), expected_fp64(kDim * kDim);
         for (int layer = 0; layer < p.layers; ++layer) {
             const float scale = layer_scale(layer);
@@ -411,15 +430,29 @@ private:
                 const int b      = target_row[slot];
                 const int m      = b < 0 ? 0 : commits[b];
                 const auto state = states.recurrent_tensor(layer, offset(slot));
-                CUDA_CHECK(
-                    cudaMemcpy(actual.data(), state.data, state.bytes(), cudaMemcpyDeviceToHost));
+                if (state_dtype_ == DType::BF16) {
+                    CUDA_CHECK(cudaMemcpy(actual_bf16.data(), state.data, state.bytes(),
+                                          cudaMemcpyDeviceToHost));
+                    std::transform(actual_bf16.begin(), actual_bf16.end(), actual.begin(),
+                                   bf16_to_f32);
+                } else {
+                    CUDA_CHECK(cudaMemcpy(actual.data(), state.data, state.bytes(),
+                                          cudaMemcpyDeviceToHost));
+                }
                 const auto conv     = states.conv_tensor(layer, offset(slot));
                 const auto observed = from_device<std::uint16_t>(conv.data, conv.numel());
                 if (m == 0) {
-                    std::transform(recurrent[slot].begin(), recurrent[slot].end(), before.begin(),
-                                   [scale](float f) { return f * scale; });
-                    if (std::memcmp(actual.data(), before.data(), state.bytes()) != 0 ||
-                        observed != histories[slot][layer]) {
+                    bool recurrent_same = false;
+                    if (state_dtype_ == DType::BF16) {
+                        const auto before_bits = represented_words(recurrent[slot], scale);
+                        recurrent_same         = actual_bf16 == before_bits;
+                    } else {
+                        std::transform(recurrent[slot].begin(), recurrent[slot].end(),
+                                       before.begin(), [scale](float f) { return f * scale; });
+                        recurrent_same =
+                            std::memcmp(actual.data(), before.data(), state.bytes()) == 0;
+                    }
+                    if (!recurrent_same || observed != histories[slot][layer]) {
                         std::cerr << "fold modified inactive layer " << layer << " slot " << slot
                                   << '\n';
                         ++failures;
@@ -450,7 +483,7 @@ private:
                         actual_fp64.data(), expected_fp64.data(), expected_fp64.size());
                     max_abs         = std::max(max_abs, stats.maximum_absolute_error);
                     max_relative_l2 = std::max(max_relative_l2, stats.relative_l2);
-                    if (!reduction_passes(stats, expected_fp64.size(), gdn_ref::kStateCriterion)) {
+                    if (!reduction_passes(stats, expected_fp64.size(), criterion)) {
                         std::cerr << "fold state error at layer " << layer << " row " << b
                                   << " head " << head << " max_abs=" << stats.maximum_absolute_error
                                   << " rel_l2=" << stats.relative_l2 << '\n';
@@ -474,12 +507,14 @@ private:
         }
         if (trajectory) *trajectory = std::move(reference[0]);
         std::cout << "Fold " << p.layers << 'x' << p.heads << " T=" << inputs.width
-                  << " max_abs=" << max_abs << " max_rel_l2=" << max_relative_l2 << '\n';
+                  << (state_dtype_ == DType::BF16 ? " bf16" : " fp32") << " max_abs=" << max_abs
+                  << " max_rel_l2=" << max_relative_l2 << '\n';
         return failures;
     }
 
     Geometry p;
     int slots, batch;
+    DType state_dtype_;
     StateImageBuilder state_builder;
     LinearAttentionStateLayout state_layout;
     StateImageLayout image_layout;
@@ -494,7 +529,7 @@ private:
 };
 
 int run_case(Geometry p, int width, const std::vector<int>& commits, Execution execution,
-             bool out_of_place = false, bool validate = false) {
+             bool out_of_place = false, bool validate = false, DType state_dtype = DType::FP32) {
     const int batch = commits.size();
     std::vector<int> source(batch, 0), dest(batch, 0);
     int count = 0;
@@ -503,13 +538,13 @@ int run_case(Geometry p, int width, const std::vector<int>& commits, Execution e
         source[b] = ++count;
         dest[b]   = out_of_place ? ++count : count;
     }
-    FoldFixture fixture(p, std::max(count + 1, 3), batch, width);
+    FoldFixture fixture(p, std::max(count + 1, 3), batch, width, std::nullopt, state_dtype);
     return fixture.round(Inputs(p, width, batch, 1007U + width), source, dest, commits, execution,
                          validate);
 }
 
-int cancellation() {
-    FoldFixture fixture(k36x24, 1, 1, 2, 0x1p20f);
+int cancellation(DType state_dtype = DType::FP32) {
+    FoldFixture fixture(k36x24, 1, 1, 2, 0x1p20f, state_dtype);
     Inputs inputs(k36x24, 2, 1, 729U);
     std::fill(inputs.k.begin(), inputs.k.end(), 0.f);
     std::fill(inputs.v.begin(), inputs.v.end(), 0.f);
@@ -520,8 +555,8 @@ int cancellation() {
     return fixture.round(inputs, {0}, {0}, {2}, Execution::Host);
 }
 
-int extreme_decay(float gate, float initial) {
-    FoldFixture fixture(k36x24, 1, 1, 2, initial);
+int extreme_decay(float gate, float initial, DType state_dtype = DType::FP32) {
+    FoldFixture fixture(k36x24, 1, 1, 2, initial, state_dtype);
     Inputs inputs(k36x24, 2, 1, 911U);
     std::fill(inputs.k.begin(), inputs.k.end(), 0.f);
     std::fill(inputs.v.begin(), inputs.v.end(), 0.f);
@@ -533,7 +568,8 @@ int extreme_decay(float gate, float initial) {
     reference.state.resize(fixture.state_elements());
     const double expected = gdn_ref::evaluate(reference, kScale, true).final_state.front();
     const double actual   = fixture.leading_state();
-    if (!std::isfinite(actual) || std::abs(actual - expected) > 1e-5 * std::abs(expected)) {
+    const double rel_tol  = state_dtype == DType::BF16 ? 1e-2 : 1e-5;
+    if (!std::isfinite(actual) || std::abs(actual - expected) > rel_tol * std::abs(expected)) {
         std::cerr << "finite extreme-decay result: expected " << expected << ", got " << actual
                   << '\n';
         ++failures;
@@ -541,8 +577,8 @@ int extreme_decay(float gate, float initial) {
     return failures;
 }
 
-int chain() {
-    FoldFixture fixture(k36x24, 2, 1, 16);
+int chain(DType state_dtype = DType::FP32) {
+    FoldFixture fixture(k36x24, 2, 1, 16, std::nullopt, state_dtype);
     int failures = 0;
     std::vector<double> trajectory;
     int round = 0;
@@ -587,9 +623,52 @@ int main(int argc, char** argv) {
                   },
                   {{"suite", "concurrency"}});
     }
-    suite.add("gdn_fold/cancellation", cancellation);
+    suite.add("gdn_fold/cancellation", [] { return cancellation(); });
     suite.add("gdn_fold/decay_product_overflow", [] { return extreme_decay(50.f, 0.f); });
     suite.add("gdn_fold/decay_product_underflow", [] { return extreme_decay(-50.f, 0x1p126f); });
-    suite.add("gdn_fold/chained_trajectory", chain);
+    suite.add("gdn_fold/chained_trajectory", [] { return chain(); });
+
+    // BF16 recurrent state storage cases
+    for (int i = 0; i < 4; ++i) {
+        const auto p = geometries[i];
+        const auto label =
+            "gdn_fold_bf16/" + std::to_string(p.layers) + "x" + std::to_string(p.heads);
+        suite.add(label + "/host_graph_mixed",
+                  [=] {
+                      return run_case(p, 6, {0, 1, 2, 6}, Execution::HostGraph, true, false,
+                                      DType::BF16);
+                  },
+                  {{"execution", "graph"}});
+        suite.add(label + "/device_graph_mixed",
+                  [=] {
+                      return run_case(p, 16, {0, 3, 16}, Execution::DeviceGraph, false, false,
+                                      DType::BF16);
+                  },
+                  {{"execution", "graph"}});
+    }
+    for (int width : {2, 4, 8, 9, 16}) {
+        suite.add("gdn_fold_bf16/width_" + std::to_string(width), [=] {
+            return run_case(geometries[width % 4], width, {width - 1}, Execution::Host, false,
+                            false, DType::BF16);
+        });
+    }
+    suite.add("gdn_fold_bf16/device_zero",
+              [] { return run_case(k36x48, 2, {0, 0}, Execution::Device, false, false, DType::BF16); });
+    suite.add("gdn_fold_bf16/host_zero",
+              [] { return run_case(k36x24, 2, {0}, Execution::Host, false, false, DType::BF16); });
+    suite.add("gdn_fold_bf16/expanded_17",
+              [] {
+                  std::vector<int> commits(17, 0);
+                  commits.front() = 1;
+                  commits.back()  = 4;
+                  return run_case(k36x24, 4, commits, Execution::Device, false, false, DType::BF16);
+              },
+              {{"suite", "concurrency"}});
+    suite.add("gdn_fold_bf16/cancellation", [] { return cancellation(DType::BF16); });
+    suite.add("gdn_fold_bf16/decay_product_overflow",
+              [] { return extreme_decay(50.f, 0.f, DType::BF16); });
+    suite.add("gdn_fold_bf16/decay_product_underflow",
+              [] { return extreme_decay(-50.f, 0x1p126f, DType::BF16); });
+    suite.add("gdn_fold_bf16/chained_trajectory", [] { return chain(DType::BF16); });
     return suite.main(argc, argv);
 }

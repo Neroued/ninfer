@@ -75,7 +75,8 @@ RequestBasePlan Session::plan_request(qwen::PreparedPrompt&& prompt,
                           : FinishReason::ContextCapacity,
                       plan->reuse};
     plan->sampling = options.sampling;
-    plan->domain   = static_cast<std::uint32_t>(p.shape.kv_storage) << 16;
+    plan->domain   = (static_cast<std::uint32_t>(p.shape.kv_storage) << 16U) |
+                     (static_cast<std::uint32_t>(p.shape.linear_state_dtype) << 24U);
     for (const auto& item : input.vision_items) plan->media.push_back({&item});
     plan->query = context::PrefixQuery(p.prefixes, plan->domain, plan->identity_view());
     if (plan->reuse) {

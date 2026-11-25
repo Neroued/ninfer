@@ -252,8 +252,9 @@ private:
         description.model_name      = startup.load.model_name;
         description.max_context     = options.max_context;
         description.max_concurrency = options.max_concurrency;
-        description.prefill_chunk   = options.prefill_chunk;
-        description.kv_cache        = options.kv_cache;
+        description.prefill_chunk      = options.prefill_chunk;
+        description.kv_cache           = options.kv_cache;
+        description.linear_state_dtype = options.linear_state_dtype;
         std::visit(
             [&](const auto& instance) {
                 description.context_token_capacity_estimate =

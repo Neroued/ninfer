@@ -103,8 +103,11 @@ void controls() {
     }
 }
 
-void image(DeviceContext& device, bool mtp) {
-    const auto layout         = q4::plan_state_image(config(mtp), config(mtp).text.gdn);
+void image(DeviceContext& device, bool mtp,
+           LinearStateDType linear_state_dtype = LinearStateDType::Float32) {
+    const auto layout = q4::plan_state_image(config(mtp), config(mtp).text.gdn, linear_state_dtype);
+    require(layout.gdn.spec.recurrent_dtype == to_dtype(linear_state_dtype),
+            "Qwen4Exp state image lost linear_state_dtype");
     const std::int64_t source = 256, destination = layout.images.image_bytes + 768;
     DeviceBuffer backing(device.device(), destination + layout.images.image_bytes);
     q4::StateViews state(backing.span(), layout);
@@ -237,6 +240,15 @@ int main(int argc, char** argv) {
     try {
         controls();
         binding_contract();
+        {
+            const auto c    = config(false);
+            const auto fp32 = q4::plan_state_image(c, c.text.gdn, LinearStateDType::Float32);
+            const auto bf16 = q4::plan_state_image(c, c.text.gdn, LinearStateDType::BFloat16);
+            const std::size_t expected_delta = 36ULL * 48 * 128 * 128 * 2;
+            require(fp32.images.image_bytes - bf16.images.image_bytes == expected_delta &&
+                        bf16.images.image_bytes % bf16.images.alignment == 0,
+                    "Qwen4Exp BF16 linear state did not shrink image by exact recurrent delta");
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--host") {
             std::cout << "Qwen4Exp control layouts passed\n";
             return 0;
@@ -246,6 +258,8 @@ int main(int argc, char** argv) {
         DeviceContext device;
         image(device, false);
         image(device, true);
+        image(device, false, LinearStateDType::BFloat16);
+        image(device, true, LinearStateDType::BFloat16);
         const std::array formats{KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64,
                                  KvCacheStorage::Fp8E4m3fnGroup128Ue8m0,
                                  KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value};

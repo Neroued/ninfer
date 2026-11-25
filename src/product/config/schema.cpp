@@ -23,6 +23,8 @@ constexpr FieldSpec kFields[] = {
      "Per-request context limit (8192; perplexity defaults to its scoring window).", Scope::Common},
     {Field::KvDtype, "engine.kv_dtype", "--kv-dtype", "", "bf16|int8|fp8|nvfp4|k8v4",
      "KV representation.", Scope::Common},
+    {Field::LinearStateDtype, "engine.linear_state_dtype", "--linear-state-dtype", "", "fp32|bf16",
+     "Linear attention recurrent state representation (fp32).", Scope::Common},
     {Field::ContextCapacity, "engine.context_capacity", "--context-capacity", "", "SIZE|auto",
      "Per-rank Device capacity shared by KV and State; auto uses the startup budget.",
      Scope::Common, ConfigurationUnit::Bytes},
@@ -380,6 +382,8 @@ FieldValue parse_field_value(Field field, const RawValue& value, bool command_li
         return real(value, command_line, -2, 2);
     case Field::KvDtype:
         return enumeration(value, {"bf16", "int8", "fp8", "nvfp4", "k8v4"});
+    case Field::LinearStateDtype:
+        return enumeration(value, {"fp32", "bf16"});
     case Field::SpecBackend:
         return enumeration(value, {"none", "mtp", "dflash", "dflash2"});
     case Field::ProposalHead:

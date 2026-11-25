@@ -59,13 +59,15 @@ void test_resources_and_units() {
         parse({"ninfer-serve", "--pending-timeout", "1.25s", "model.ninfer", "--stats-interval",
                "0ms", "--media-cache-capacity", "0B", "--max-request-size", "1.5MiB",
                "--max-concurrency", "128", "--media-preprocess-threads", "auto",
-               "--context-capacity", "auto", "--checkpoint-interval", "16384"});
+               "--context-capacity", "auto", "--checkpoint-interval", "16384",
+               "--linear-state-dtype", "bf16"});
     require(controls.launch.engine.pending_timeout_ms == 1250 &&
                 controls.launch.logging.stats_interval_ms == 0 &&
                 controls.max_request_bytes == 1572864 &&
                 controls.launch.engine.max_concurrency == 128 &&
                 controls.launch.engine.context_cache.checkpoint_interval == 16384 &&
                 controls.launch.engine.media_cache_bytes == 0 &&
+                controls.launch.engine.linear_state_dtype == ninfer::LinearStateDType::BFloat16 &&
                 controls.launch.engine.context_capacity.mode ==
                     ninfer::ContextCapacityMode::Automatic,
             "unit, zero or automatic controls changed");
@@ -84,6 +86,7 @@ void test_resources_and_units() {
                                                {"--checkpoint-interval", "0"},
                                                {"--port", "65536"},
                                                {"--top-k", "21"},
+                                               {"--linear-state-dtype", "fp16"},
                                                {"--media-preprocess-threads", "0"}}) {
         std::vector<std::string> args{"ninfer-serve", "model.ninfer"};
         args.insert(args.end(), suffix.begin(), suffix.end());

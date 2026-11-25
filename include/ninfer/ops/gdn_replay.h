@@ -26,8 +26,9 @@ struct GdnReplayFoldRow {
  * commit_columns is in [0,n[b]], the valid recorded extent. Zero is a strict no-op and
  * accesses no state offsets, records or state, and its offsets may be -1. Records bind to the
  * initial recurrent state S0 observed by gated_delta_net_replay_record. A positive row must read
- * that same S0 from source_offset. It writes an FP32 approximation to the mathematical prefix state
- * S_m for m = commit_columns, and the exact BF16 words of
+ * that same S0 from source_offset. It writes an FP32 or BF16 (matching states.spec.recurrent_dtype)
+ * approximation to the mathematical prefix state S_m for m = commit_columns (accumulated in FP32,
+ * rounded once on BF16 publication), and the exact BF16 words of
  * tail_3(source.conv || conv_record[0:m]).
  *
  * Construction validates fixed state/record geometry. The bound arena, field geometry and

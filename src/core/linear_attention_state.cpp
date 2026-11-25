@@ -8,15 +8,17 @@ LinearAttentionStateLayout plan_linear_attention_state(StateImageBuilder& builde
                                                        const LinearAttentionStateSpec& spec) {
     if (spec.layers == 0 || spec.conv_channels <= 0 || spec.conv_width <= 0 ||
         spec.value_heads <= 0 || spec.value_head_dim <= 0 || spec.key_head_dim <= 0 ||
-        (spec.conv_dtype != DType::BF16 && spec.conv_dtype != DType::FP32)) {
+        (spec.conv_dtype != DType::BF16 && spec.conv_dtype != DType::FP32) ||
+        (spec.recurrent_dtype != DType::FP32 && spec.recurrent_dtype != DType::BF16)) {
         throw std::invalid_argument("Linear Attention state geometry is invalid");
     }
     return {
         spec,
         builder.add(spec.conv_dtype, {spec.conv_channels, spec.conv_width}, spec.layers,
                     "Linear Attention convolution"),
-        builder.add(DType::FP32, {spec.key_head_dim, spec.value_head_dim, spec.value_heads},
-                    spec.layers, "Linear Attention recurrence"),
+        builder.add(spec.recurrent_dtype,
+                    {spec.key_head_dim, spec.value_head_dim, spec.value_heads}, spec.layers,
+                    "Linear Attention recurrence"),
     };
 }
 
@@ -29,7 +31,8 @@ LinearAttentionStateView::LinearAttentionStateView(const StateImageStorage& stor
     if (conv.tensor.dtype != spec.conv_dtype ||
         conv.tensor.shape !=
             std::array<std::int32_t, 4>{spec.conv_channels, spec.conv_width, 1, 1} ||
-        recurrent.tensor.dtype != DType::FP32 ||
+        (spec.recurrent_dtype != DType::FP32 && spec.recurrent_dtype != DType::BF16) ||
+        recurrent.tensor.dtype != spec.recurrent_dtype ||
         recurrent.tensor.shape != std::array<std::int32_t, 4>{spec.key_head_dim,
                                                               spec.value_head_dim, spec.value_heads,
                                                               1} ||

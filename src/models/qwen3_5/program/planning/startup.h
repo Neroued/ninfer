@@ -35,6 +35,7 @@ struct SequencePlanningInputs {
     SpeculativeBackend speculative_backend = SpeculativeBackend::None;
     SpeculativeLengthPolicy length_policy  = SpeculativeLengthPolicy::Adaptive;
     KvCacheStorage kv_storage              = KvCacheStorage::BFloat16;
+    LinearStateDType linear_state_dtype    = LinearStateDType::Float32;
     ProposalHead proposal_head             = ProposalHead::Full;
     models::LoadOptions features;
     bool gpu_timing                   = false;
@@ -59,6 +60,7 @@ struct SequencePlanImpl {
     SpeculativeBackend speculative_backend = SpeculativeBackend::None;
     SpeculativeLengthPolicy length_policy  = SpeculativeLengthPolicy::Adaptive;
     KvCacheStorage kv_storage              = KvCacheStorage::BFloat16;
+    LinearStateDType linear_state_dtype    = LinearStateDType::Float32;
     ProposalHead proposal_head             = ProposalHead::Full;
     models::LoadOptions features;
     bool gpu_timing                   = false;

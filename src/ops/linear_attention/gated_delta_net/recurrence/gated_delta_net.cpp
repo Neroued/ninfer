@@ -41,7 +41,9 @@ RecurrenceGeometry validate_recurrent(const Tensor& q, const Tensor& k, const Te
     common::operand::dtype(out, DType::BF16, "gated_delta_net", "out must be BF16");
     common::operand::dtype(g, DType::FP32, "gated_delta_net", "g must be FP32");
     common::operand::dtype(beta, DType::FP32, "gated_delta_net", "beta must be FP32");
-    common::operand::dtype(ssm_state, DType::FP32, "gated_delta_net", "ssm_state must be FP32");
+    if (!detail::gated_delta_net::is_supported_state_dtype(ssm_state.dtype)) {
+        throw std::invalid_argument("gated_delta_net: ssm_state must be FP32 or BF16");
+    }
 
     const RecurrenceGeometry geometry = require_geometry(q, v);
     common::operand::shape(
@@ -110,10 +112,17 @@ validate_recurrent_batch_update(const Tensor& q, const Tensor& k, const Tensor& 
                            "g");
     common::operand::shape(beta, {geometry.value_heads, geometry.tokens, batch, 1},
                            "gated_delta_net", "beta");
+    const DType state_dtype = source_state.field.tensor.dtype;
+    if (!detail::gated_delta_net::is_supported_state_dtype(state_dtype) ||
+        destination_state.field.tensor.dtype != state_dtype) {
+        throw std::invalid_argument(
+            "gated_delta_net: source and destination recurrent states must be matching FP32 or "
+            "BF16");
+    }
     for (const auto& state : std::array<ConstStateFieldView, 2>{source_state, destination_state}) {
         if (state.field.layers != 1)
             throw std::invalid_argument("gated_delta_net: select one recurrent state layer");
-        common::operand::state_field(state, DType::FP32, {128, 128, geometry.value_heads}, 16,
+        common::operand::state_field(state, state_dtype, {128, 128, geometry.value_heads}, 16,
                                      "gated_delta_net", "recurrent state", device);
         common::operand::shape(state.records.byte_offsets, {batch, 1, 1, 1}, "gated_delta_net",
                                "state byte offsets");
@@ -141,8 +150,8 @@ void validate_recurrence(const Tensor& q, const Tensor& k, const Tensor& v, cons
     // ssm_state_in is an equally-shaped read view (may alias ssm_state_out for in-place).
     const RecurrenceGeometry geometry =
         validate_recurrent(q, k, v, g, beta, scale, ssm_state_out, out, device);
-    common::operand::dtype(ssm_state_in, DType::FP32, "gated_delta_net",
-                           "ssm_state_in must be FP32");
+    common::operand::dtype(ssm_state_in, ssm_state_out.dtype, "gated_delta_net",
+                           "ssm_state_in dtype must match ssm_state_out");
     common::operand::shape(ssm_state_in,
                            {detail::gated_delta_net::kStateDim, detail::gated_delta_net::kStateDim,
                             geometry.value_heads, 1},
@@ -160,8 +169,9 @@ gdn::RecurrenceOperands make_operands(const Tensor& q, const Tensor& k, const Te
             static_cast<const __nv_bfloat16*>(v.data),
             static_cast<const float*>(g.data),
             static_cast<const float*>(beta.data),
-            static_cast<const float*>(ssm_state_in.data),
-            static_cast<float*>(ssm_state_out.data),
+            ssm_state_in.data,
+            ssm_state_out.data,
+            ssm_state_out.dtype,
             static_cast<__nv_bfloat16*>(out.data),
             q.ne[1],
             v.ne[1],
@@ -325,16 +335,23 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
     const auto device        = execution.device();
     operand::ragged_sequence(seq, op, device);
     operand::device(ws.device(), device, op, "workspace");
-    const int n = seq.total_tokens(), h = v.ne[1];
+    const int n            = seq.total_tokens(), h = v.ne[1];
+    const DType state_type = source.field.tensor.dtype;
+    if (!gdn::is_supported_state_dtype(state_type) ||
+        destination.field.tensor.dtype != state_type) {
+        throw std::invalid_argument(
+            "gated_delta_net: source and destination recurrent states must be matching FP32 or "
+            "BF16");
+    }
     for (const auto& state : std::array<ConstStateFieldView, 2>{source, destination}) {
-        operand::state_field(state, DType::FP32, {128, 128, h}, 16, op, "state", device);
+        operand::state_field(state, state_type, {128, 128, h}, 16, op, "state", device);
         operand::shape(state.records.byte_offsets, {seq.num_seqs(), 1, 1, 1}, op, "state offsets");
         if (state.field.layers != 1)
             throw std::invalid_argument("gated_delta_net: select one recurrent state layer");
     }
     auto src = source.field.metadata(), dst = destination.field.metadata();
-    src.data   = const_cast<float*>(operand::state_field_base<const float>(source));
-    dst.data   = operand::state_field_base<float>(destination);
+    src.data   = const_cast<void*>(operand::state_field_base<const void>(source));
+    dst.data   = operand::state_field_base<void>(destination);
     src.device = dst.device = device;
     const auto geometry     = validate_recurrent(q, k, v, g, beta, scale, dst, out, device);
     if (n != geometry.tokens) throw std::invalid_argument("gated_delta_net: ragged token count");

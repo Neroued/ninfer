@@ -76,8 +76,9 @@ ResourceLayout persistent_layout(const SequencePlanImpl& plan) {
                 .conv_width    = config.gdn ? dimension(config.gdn->linear_conv_kernel_dim - 1) : 0,
                 .value_heads   = config.gdn ? dimension(config.gdn->linear_num_value_heads) : 0,
                 .value_head_dim = config.gdn ? dimension(config.gdn->linear_value_head_dim) : 0,
-                .key_head_dim   = config.gdn ? dimension(config.gdn->linear_key_head_dim) : 0,
-                .conv_dtype     = DType::BF16,
+                .key_head_dim    = config.gdn ? dimension(config.gdn->linear_key_head_dim) : 0,
+                .conv_dtype      = DType::BF16,
+                .recurrent_dtype = to_dtype(plan.linear_state_dtype),
             },
         .hidden = dimension(config.hidden_size),
     };
@@ -667,6 +668,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->context_cache                     = inputs.context_cache;
     impl->vision_memory_budget_bytes        = inputs.vision_memory_budget_bytes;
     impl->kv_storage                        = inputs.kv_storage;
+    impl->linear_state_dtype                = inputs.linear_state_dtype;
     impl->persistent                        = persistent_layout(*impl);
     impl->context_cache.host_capacity_bytes = context::host_context_capacity(
         impl->context_cache.host_capacity_bytes, impl->persistent.state_images.images.image_bytes);
@@ -715,6 +717,7 @@ make_sequence_planner_impl(std::shared_ptr<const execution::ModelProfile> profil
         .speculative_backend        = options.speculative.backend,
         .length_policy              = options.speculative.length_policy,
         .kv_storage                 = options.kv_cache,
+        .linear_state_dtype         = options.linear_state_dtype,
         .proposal_head              = options.speculative.proposal_head,
         .features                   = models::load_options(options),
         .gpu_timing                 = options.observability.gpu_timing,

@@ -73,7 +73,8 @@ inline Traffic traffic(Fixture& f, const std::string& op) {
     const auto n = std::accumulate(f.valid_counts.begin(), f.valid_counts.end(), std::uint64_t(0));
     const auto active =
         std::count_if(f.valid_counts.begin(), f.valid_counts.end(), [](int n) { return n != 0; });
-    const std::uint64_t state         = 4ULL * 128 * 128 * f.h * active;
+    const std::uint64_t state_elem_bytes = dtype_size(f.o.state_dtype);
+    const std::uint64_t state            = state_elem_bytes * 128ULL * 128 * f.h * active;
     const std::uint64_t record_column = 2ULL * 128 * f.qh + 8ULL * 128 * f.h;
     Traffic out;
     const std::uint64_t m = std::uint64_t(f.t) * f.b;
@@ -115,7 +116,7 @@ inline Traffic traffic(Fixture& f, const std::string& op) {
     if (op == "fold") {
         for (int m : f.commit_counts)
             if (m) {
-                const auto bytes = 4ULL * 128 * 128 * f.h * f.layers;
+                const auto bytes = state_elem_bytes * 128ULL * 128 * f.h * f.layers;
                 out.state_read += bytes + 2ULL * f.channels * f.layers * std::max(0, 3 - m);
                 out.state_write += bytes + 6ULL * f.channels * f.layers;
                 out.record_read +=

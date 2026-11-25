@@ -5,14 +5,15 @@
 #include "ops/linear_attention/gated_delta_net/kernels/transition.cuh"
 
 namespace ninfer::ops::detail::gated_delta_net {
+template <class StateT>
 struct DirectAccess {
     const __nv_bfloat16* q;
     const __nv_bfloat16* k;
     const __nv_bfloat16* v;
     const float* g;
     const float* beta;
-    const float* state_read;
-    float* state_write;
+    const StateT* state_read;
+    StateT* state_write;
     __nv_bfloat16* out;
     HeadMap heads;
     std::int32_t width;
@@ -30,16 +31,16 @@ struct DirectAccess {
         return token;
     }
 
-    __device__ __forceinline__ const float*
+    __device__ __forceinline__ const StateT*
     state_read_base(const RecurrentCoordinates& coord) const {
-        const auto offset = source_offset ? *source_offset / std::int64_t(sizeof(float)) : 0;
+        const auto offset = source_offset ? *source_offset / std::int64_t(sizeof(StateT)) : 0;
         return state_read + offset +
                static_cast<std::int64_t>(coord.value_head) * kStateDim * kStateDim;
     }
 
-    __device__ __forceinline__ float* state_write_base(const RecurrentCoordinates& coord) const {
+    __device__ __forceinline__ StateT* state_write_base(const RecurrentCoordinates& coord) const {
         const auto offset =
-            destination_offset ? *destination_offset / std::int64_t(sizeof(float)) : 0;
+            destination_offset ? *destination_offset / std::int64_t(sizeof(StateT)) : 0;
         return state_write + offset +
                static_cast<std::int64_t>(coord.value_head) * kStateDim * kStateDim;
     }
@@ -70,8 +71,10 @@ struct DirectAccess {
     }
 };
 
-__device__ __forceinline__ DirectAccess ragged_access(const RecurrenceOperands& args, HeadMap heads,
-                                                      int segment, int begin, int length) {
+template <class StateT>
+__device__ __forceinline__ DirectAccess<StateT> ragged_access(const RecurrenceOperands& args,
+                                                              HeadMap heads, int segment, int begin,
+                                                              int length) {
     const auto qk = static_cast<std::int64_t>(begin) * args.qk_heads * kStateDim;
     const auto gb = static_cast<std::int64_t>(begin) * args.value_heads;
     const auto v  = gb * kStateDim;
@@ -80,8 +83,8 @@ __device__ __forceinline__ DirectAccess ragged_access(const RecurrenceOperands& 
             args.v + v,
             args.g + gb,
             args.beta + gb,
-            args.state_in,
-            args.state_out,
+            static_cast<const StateT*>(args.state_in),
+            static_cast<StateT*>(args.state_out),
             args.out + v,
             heads,
             length,
@@ -90,14 +93,15 @@ __device__ __forceinline__ DirectAccess ragged_access(const RecurrenceOperands& 
             args.destination_offset + segment};
 }
 
+template <class StateT>
 struct BatchUpdateAccess {
     const __nv_bfloat16* q;
     const __nv_bfloat16* k;
     const __nv_bfloat16* v;
     const float* g;
     const float* beta;
-    const float* states_read;
-    float* states_write;
+    const StateT* states_read;
+    StateT* states_write;
     const std::int64_t* source_offsets;
     const std::int64_t* destination_offsets;
     const std::int32_t* valid_columns;
@@ -117,14 +121,15 @@ struct BatchUpdateAccess {
         return coord.batch;
     }
 
-    __device__ __forceinline__ const float*
+    __device__ __forceinline__ const StateT*
     state_read_base(const RecurrentCoordinates& coord) const {
-        return states_read + source_offsets[coord.batch] / sizeof(float) +
+        return states_read + source_offsets[coord.batch] / static_cast<std::int64_t>(sizeof(StateT)) +
                static_cast<std::int64_t>(coord.value_head) * kStateDim * kStateDim;
     }
 
-    __device__ __forceinline__ float* state_write_base(const RecurrentCoordinates& coord) const {
-        return states_write + destination_offsets[coord.batch] / sizeof(float) +
+    __device__ __forceinline__ StateT* state_write_base(const RecurrentCoordinates& coord) const {
+        return states_write +
+               destination_offsets[coord.batch] / static_cast<std::int64_t>(sizeof(StateT)) +
                static_cast<std::int64_t>(coord.value_head) * kStateDim * kStateDim;
     }
 
@@ -154,17 +159,17 @@ struct BatchUpdateAccess {
     }
 };
 
-template <bool NormalizeInputs>
+template <bool NormalizeInputs, class StateT>
 __global__ void __launch_bounds__(common::kWarpSize* kNumWarps, 2)
     recurrent_bf16_direct_kernel(const __nv_bfloat16* __restrict__ q,
                                  const __nv_bfloat16* __restrict__ k,
                                  const __nv_bfloat16* __restrict__ v, const float* __restrict__ g,
-                                 const float* __restrict__ beta, const float* state_read,
-                                 float* state_write, __nv_bfloat16* __restrict__ out,
+                                 const float* __restrict__ beta, const StateT* state_read,
+                                 StateT* state_write, __nv_bfloat16* __restrict__ out,
                                  std::int32_t width, HeadMap heads, float scale,
                                  const std::int64_t* source_offset,
                                  const std::int64_t* destination_offset) {
-    const DirectAccess access{
+    const DirectAccess<StateT> access{
         q,   k,     v,     g,     beta,          state_read,        state_write,
         out, heads, width, scale, source_offset, destination_offset};
     const RecurrentCoordinates coord = access.coordinates();
@@ -174,9 +179,9 @@ __global__ void __launch_bounds__(common::kWarpSize* kNumWarps, 2)
     store_state_tile(state, access.state_write_base(coord), coord);
 }
 
-template <bool NormalizeInputs>
+template <bool NormalizeInputs, class StateT>
 __global__ void __launch_bounds__(common::kWarpSize* kNumWarps, 2)
-    recurrent_batch_update_kernel(BatchUpdateAccess access) {
+    recurrent_batch_update_kernel(BatchUpdateAccess<StateT> access) {
     const RecurrentCoordinates coord = access.coordinates();
     if (access.valid_columns && !access.valid_columns[coord.batch]) {
         zero_output_suffix(access, coord, 0, 1);

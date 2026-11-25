@@ -12,6 +12,7 @@ struct ExecutionShape {
     bool cuda_graph    = false;
     bool gpu_timing    = false;
     SpeculativeLengthPolicy length_policy = SpeculativeLengthPolicy::Adaptive;
+    LinearStateDType linear_state_dtype   = LinearStateDType::Float32;
 
     bool operator==(const ExecutionShape&) const = default;
 };

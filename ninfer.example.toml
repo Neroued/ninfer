@@ -14,6 +14,7 @@ vision = false
 device = 0
 max_context = 8192
 kv_dtype = "bf16" # bf16 / int8 / fp8 / nvfp4 / k8v4
+linear_state_dtype = "fp32" # fp32 / bf16
 context_capacity = "auto" # Per-rank shared Device KV/State capacity; auto, "8GiB", or positive integer bytes.
 memory_headroom = "512MiB" # Per-rank planning allowance; startup may consume it. 0B adds no headroom.
 prefill_chunk = "default" # default or a positive multiple of 128; no hardware performance estimation.

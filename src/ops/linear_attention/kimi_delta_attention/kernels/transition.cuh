@@ -32,25 +32,23 @@ __device__ __forceinline__ void normalize_qk(float (&values)[kQkPerLane], int la
     for (int index = 0; index < kQkPerLane; ++index) { values[index] *= inv; }
 }
 
-template <int Rows>
-__device__ __forceinline__ void load_state(float (&state)[Rows][kQkPerLane], const float* base,
+template <int Rows, class StateT>
+__device__ __forceinline__ void load_state(float (&state)[Rows][kQkPerLane], const StateT* base,
                                            int dv_base, int dqk_base) {
 #pragma unroll
     for (int row = 0; row < Rows; ++row) {
-        common::store_vec(
-            state[row],
-            common::load_vec<float4>(base + static_cast<std::int64_t>(dv_base + row) * kStateDim +
-                                     dqk_base));
+        common::load_state_vec4(
+            state[row], base + static_cast<std::int64_t>(dv_base + row) * kStateDim + dqk_base);
     }
 }
 
-template <int Rows>
-__device__ __forceinline__ void store_state(const float (&state)[Rows][kQkPerLane], float* base,
+template <int Rows, class StateT>
+__device__ __forceinline__ void store_state(const float (&state)[Rows][kQkPerLane], StateT* base,
                                             int dv_base, int dqk_base) {
 #pragma unroll
     for (int row = 0; row < Rows; ++row) {
-        common::store_vec(base + static_cast<std::int64_t>(dv_base + row) * kStateDim + dqk_base,
-                          common::load_vec<float4>(state[row]));
+        common::store_state_vec4(
+            base + static_cast<std::int64_t>(dv_base + row) * kStateDim + dqk_base, state[row]);
     }
 }
 

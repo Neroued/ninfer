@@ -12,6 +12,7 @@ struct GraphPreparationPlan {
     bool enabled = false, offload = false;
     std::uint32_t max_context = 0, max_concurrency = 0, draft_tokens = 0, prefill_chunk = 0;
     KvCacheStorage kv_cache{};
+    LinearStateDType linear_state_dtype{};
     BatchExecutionSpec batches;
     bool vision = false;
     std::vector<moe::GraphPlan> ordinary, verify;

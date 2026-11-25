@@ -116,7 +116,8 @@ RequestBasePlan SessionImpl::plan_request(qwen::PreparedPromptData&& prompt,
 
     base->prefix_identity_tag = static_cast<std::uint32_t>(speculative_backend) |
                                 (static_cast<std::uint32_t>(plan.proposal_head) << 8U) |
-                                (static_cast<std::uint32_t>(plan.kv_storage) << 16U);
+                                (static_cast<std::uint32_t>(plan.kv_storage) << 16U) |
+                                (static_cast<std::uint32_t>(plan.linear_state_dtype) << 24U);
     base->prompt = std::make_shared<const qwen::PreparedPromptData>(std::move(prompt));
     for (const auto& item : base->prompt->vision_items) base->media.push_back({&item});
     base->query = context::PrefixQuery(prefixes, base->prefix_identity_tag, base->identity_view());

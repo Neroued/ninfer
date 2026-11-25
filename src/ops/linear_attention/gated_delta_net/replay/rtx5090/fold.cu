@@ -4,27 +4,22 @@ namespace ninfer::ops::detail::gated_delta_net {
 namespace {
 constexpr int kFoldWarps = 8;
 
-__device__ __forceinline__ float4 load_state_row(const float* state, int row, int col) {
+template <class StateT>
+__device__ __forceinline__ float4 load_state_row(const StateT* state, int row, int col) {
     // Keep prefetched rows resident through the compute pass and possible in-place store.
-    const auto policy = common::l2_retained_policy();
-    float4 value;
-    asm volatile("ld.global.cg.L2::cache_hint.v4.f32 {%0,%1,%2,%3}, [%4], %5;"
-                 : "=f"(value.x), "=f"(value.y), "=f"(value.z), "=f"(value.w)
-                 : "l"(state + row * kStateDim + col), "l"(policy));
-    return value;
+    return common::load_state_float4_l2_retained(state + row * kStateDim + col);
 }
 
-__device__ __forceinline__ void store_state_row(float* state, int row, int col, float4 value) {
+template <class StateT>
+__device__ __forceinline__ void store_state_row(StateT* state, int row, int col, float4 value) {
     // A fold streams the state once. Prefer early eviction of completed state rows.
-    asm volatile("st.global.cs.v4.f32 [%0], {%1,%2,%3,%4};" ::"l"(state + row * kStateDim + col),
-                 "f"(value.x), "f"(value.y), "f"(value.z), "f"(value.w)
-                 : "memory");
+    common::store_state_float4_streaming(state + row * kStateDim + col, value);
 }
 
-template <int RowsPerPass, bool Sequential>
+template <int RowsPerPass, bool Sequential, class StateT>
 __device__ __forceinline__ void fold_window(float4 (&initial)[RowsPerPass],
-                                            const FoldWindow<kStateDim>& sm, const float* source,
-                                            float* destination, int warp, int col, int commit) {
+                                            const FoldWindow<kStateDim>& sm, const StateT* source,
+                                            StateT* destination, int warp, int col, int commit) {
 #pragma unroll 1
     for (int base = warp; base < kStateDim; base += kFoldWarps * RowsPerPass) {
         float4 acc[RowsPerPass];
@@ -57,9 +52,9 @@ __device__ __forceinline__ void fold_window(float4 (&initial)[RowsPerPass],
     }
 }
 
-template <int RowsPerPass, class Geometry, class Rows>
+template <int RowsPerPass, class Geometry, class Rows, class StateT>
 __global__ __launch_bounds__(common::kWarpSize* kFoldWarps, 4) void linear_fold_kernel(
-    const __grid_constant__ FoldAccess<Geometry, Rows> access) {
+    const __grid_constant__ FoldAccess<Geometry, Rows, StateT> access) {
     static_assert(kStateDim % (kFoldWarps * RowsPerPass) == 0);
     const int tid = threadIdx.x, lane = tid % common::kWarpSize, warp = tid / common::kWarpSize;
     const int head = blockIdx.x, batch = blockIdx.z, layer = blockIdx.y;
@@ -69,10 +64,12 @@ __global__ __launch_bounds__(common::kWarpSize* kFoldWarps, 4) void linear_fold_
     const auto column =
         (std::int64_t(layer) * access.record_capacity + access.record_begin + batch) * access.width;
     const auto* layer_state = access.recurrent_layer0 + layer * access.recurrent_layer_stride;
-    const float* source =
-        layer_state + row.source_offset / sizeof(float) + head * kStateDim * kStateDim;
-    float* destination = access.recurrent_layer0 + layer * access.recurrent_layer_stride +
-                         row.destination_offset / sizeof(float) + head * kStateDim * kStateDim;
+    const StateT* source    = layer_state +
+                           row.source_offset / static_cast<std::int64_t>(sizeof(StateT)) +
+                           head * kStateDim * kStateDim;
+    StateT* destination = access.recurrent_layer0 + layer * access.recurrent_layer_stride +
+                          row.destination_offset / static_cast<std::int64_t>(sizeof(StateT)) +
+                          head * kStateDim * kStateDim;
     const int col = lane * 4;
     __shared__ FoldWindow<kStateDim> sm;
 
@@ -137,8 +134,8 @@ __global__ __launch_bounds__(common::kWarpSize* kFoldWarps, 4) void linear_fold_
 }
 
 struct FoldLauncher {
-    template <class Geometry, class Rows>
-    static void launch(const FoldAccess<Geometry, Rows>& access, int active_rows,
+    template <class Geometry, class Rows, class StateT>
+    static void launch(const FoldAccess<Geometry, Rows, StateT>& access, int active_rows,
                        cudaStream_t stream) {
         // Two rows per pass improve the 36-layer, 24-head working set.
         constexpr int RowsPerPass = Geometry::kValueHeads == 24 ? 2 : 4;

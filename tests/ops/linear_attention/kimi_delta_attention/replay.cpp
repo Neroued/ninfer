@@ -22,7 +22,10 @@ namespace {
 constexpr float scale = 0.08838834764831845F;
 
 constexpr ReductionCriterion output_criterion{6.0e-3, 1.0e-5, 1.5e-2};
-constexpr ReductionCriterion state_criterion{4.0e-3, 1.0e-5, 1.2e-2};
+constexpr ReductionCriterion state_criterion_for(DType state_dtype = DType::FP32) {
+    return state_dtype == DType::BF16 ? ReductionCriterion{7.5e-3, 2.0e-5, 1.6e-2}
+                                      : ReductionCriterion{4.0e-3, 1.0e-5, 1.2e-2};
+}
 using RecordAccess = ninfer::detail::KdaReplayRecordAccess;
 
 template <class T>
@@ -32,7 +35,34 @@ void require_words(const void* device, const std::vector<T>& expected, const cha
         throw std::runtime_error(label);
 }
 
+std::vector<std::uint16_t> bf16_words(const std::vector<float>& values) {
+    std::vector<std::uint16_t> out(values.size());
+    std::transform(values.begin(), values.end(), out.begin(), f32_to_bf16);
+    return out;
+}
+
+void upload_state(const Tensor& field, const std::vector<float>& values, CudaExecutionView cuda) {
+    if (field.dtype == DType::BF16) {
+        const auto words = bf16_words(values);
+        copy_bytes({field.data, field.bytes(), cuda.device()},
+                   {words.data(), field.bytes(), Device::cpu()}, cuda);
+        return;
+    }
+    copy_bytes({field.data, field.bytes(), cuda.device()},
+               {values.data(), field.bytes(), Device::cpu()}, cuda);
+}
+
+void require_state_words(const Tensor& field, const std::vector<float>& expected,
+                         const char* label) {
+    if (field.dtype == DType::BF16) {
+        require_words(field.data, bf16_words(expected), label);
+        return;
+    }
+    require_words(field.data, expected, label);
+}
+
 std::vector<double> read_state(const Tensor& tensor) {
+    if (tensor.dtype == DType::BF16) return from_device_bf16(tensor.data, tensor.numel());
     const auto fp32 = from_device<float>(tensor.data, tensor.numel());
     return {fp32.begin(), fp32.end()};
 }
@@ -43,6 +73,14 @@ void require_fill(const void* device, std::size_t n, T expected, const char* lab
     const auto actual = from_device<T>(device, n);
     if (std::any_of(actual.begin(), actual.end(), [=](T x) { return x != expected; }))
         throw std::runtime_error(label);
+}
+
+void require_state_poison(const Tensor& field, const char* label) {
+    if (field.dtype == DType::BF16) {
+        require_fill(field.data, field.numel(), std::uint16_t{0x5a5a}, label);
+        return;
+    }
+    require_fill(field.data, field.numel(), 0x5a5a5a5au, label);
 }
 
 template <class Fn>
@@ -88,14 +126,14 @@ void append_prefix(kda_ref::Inputs& sequence, const kda_ref::Inputs& next, int c
     sequence.tokens += count;
 }
 
-kda_ref::Result evaluate_prefix(kda_ref::Inputs input, int count) {
+kda_ref::Result evaluate_prefix(kda_ref::Inputs input, int count, double lower_bound = -5.0) {
     input.tokens = count;
     input.q.resize(std::size_t(count) * 128 * input.qk_heads);
     input.k.resize(input.q.size());
     input.v.resize(std::size_t(count) * 128 * input.value_heads);
     input.g.resize(input.v.size());
     input.beta.resize(std::size_t(count) * input.value_heads);
-    return kda_ref::evaluate(input, -5.0, scale);
+    return kda_ref::evaluate(input, lower_bound, scale);
 }
 
 std::vector<float> values(std::size_t n, unsigned seed, float amplitude = 1) {
@@ -107,7 +145,8 @@ std::vector<float> values(std::size_t n, unsigned seed, float amplitude = 1) {
 }
 
 int check_replay(const KdaReplayRecordLayout& rl, DeviceBuffer& record_buffer, int batch,
-                 bool in_place, bool graph, bool projected, bool inactive) {
+                 bool in_place, bool graph, bool projected, bool inactive,
+                 DType state_dtype = DType::FP32) {
     auto& context = cuda_environment().context;
     CudaStream stream(context);
     const auto cuda  = context.execution_view(stream.stream());
@@ -117,7 +156,7 @@ int check_replay(const KdaReplayRecordLayout& rl, DeviceBuffer& record_buffer, i
     StateImageBuilder sb;
     const auto guard        = sb.add(DType::I32, {64}, 1, "unrelated field");
     const auto state_layout = plan_linear_attention_state(
-        sb, {static_cast<unsigned>(layers), channels, 3, heads, 128, 128, DType::BF16});
+        sb, {static_cast<unsigned>(layers), channels, 3, heads, 128, 128, DType::BF16, state_dtype});
     const auto layout = sb.finish();
     std::vector<std::int64_t> sources(batch), destinations(batch);
     std::size_t cursor = 256;
@@ -182,11 +221,11 @@ int check_replay(const KdaReplayRecordLayout& rl, DeviceBuffer& record_buffer, i
         auto convbuf           = to_device_bf16(conv_values);
         copy_bytes_async({rec.conv.data, rec.conv.bytes(), cuda.device()}, convbuf.span(), cuda);
         for (int b = 0; b < batch; ++b) {
-            auto& s0         = initial[l * batch + b];
-            s0               = values(128 * 128 * heads, 901 + l * 11 + b, 0.02F);
+            auto& s0 = initial[l * batch + b];
+            s0       = values(128 * 128 * heads, 901 + l * 11 + b, 0.02F);
+            if (state_dtype == DType::BF16) round_to_bf16(s0);
             const auto field = states.recurrent_tensor(l, sources[b]);
-            copy_bytes({field.data, field.bytes(), cuda.device()},
-                       {s0.data(), field.bytes(), Device::cpu()}, cuda);
+            upload_state(field, s0, cuda);
             const auto old = values(channels * 3, 1001 + l * 11 + b);
             auto& old_bits = initial_conv[l * batch + b];
             old_bits.resize(old.size());
@@ -293,8 +332,8 @@ int check_replay(const KdaReplayRecordLayout& rl, DeviceBuffer& record_buffer, i
                 failures +=
                     verify_reduction("record readout", actual, expected.out, output_criterion);
             }
-            require_words(states.recurrent_tensor(l, sources[b]).data, initial[l * batch + b],
-                          "record changed source recurrent state");
+            require_state_words(states.recurrent_tensor(l, sources[b]), initial[l * batch + b],
+                                "record changed source recurrent state");
             require_words(states.conv_tensor(l, sources[b]).data, initial_conv[l * batch + b],
                           "record changed source convolution history");
         }
@@ -333,14 +372,13 @@ int check_replay(const KdaReplayRecordLayout& rl, DeviceBuffer& record_buffer, i
             CUDA_CHECK(cudaStreamSynchronize(cuda.stream()));
             for (int l = 0; l < layers; ++l)
                 for (int b = 0; b < batch; ++b) {
-                    require_words(states.recurrent_tensor(l, sources[b]).data,
-                                  initial[l * batch + b], "zero fold changed source");
+                    require_state_words(states.recurrent_tensor(l, sources[b]),
+                                        initial[l * batch + b], "zero fold changed source");
                     require_words(states.conv_tensor(l, sources[b]).data,
                                   initial_conv[l * batch + b], "zero fold changed source history");
                     if (!in_place) {
-                        require_fill(states.recurrent_tensor(l, destinations[b]).data,
-                                     128 * 128 * heads, 0x5a5a5a5au,
-                                     "zero fold changed destination");
+                        require_state_poison(states.recurrent_tensor(l, destinations[b]),
+                                             "zero fold changed destination");
                         require_fill(states.conv_tensor(l, destinations[b]).data, channels * 3,
                                      std::uint16_t{0x5a5a},
                                      "zero fold changed destination history");
@@ -391,8 +429,9 @@ int check_replay(const KdaReplayRecordLayout& rl, DeviceBuffer& record_buffer, i
                 const auto& old      = initial_conv[l * batch + slot];
                 if (const int count = counts[b]) {
                     const auto expected = evaluate_prefix(inputs[l * batch + b], count);
-                    failures += verify_reduction("fold prefix state", read_state(recurrent),
-                                                 expected.final_state, state_criterion);
+                    failures +=
+                        verify_reduction("fold prefix state", read_state(recurrent),
+                                         expected.final_state, state_criterion_for(state_dtype));
                     std::vector<std::uint16_t> tail(3 * channels);
                     for (int j = 0; j < 3; ++j) {
                         const int t      = count - 3 + j;
@@ -403,14 +442,13 @@ int check_replay(const KdaReplayRecordLayout& rl, DeviceBuffer& record_buffer, i
                     }
                     require_words(conv.data, tail, "fold convolution tail differs");
                 } else if (!in_place) {
-                    require_fill(recurrent.data, recurrent.numel(), 0x5a5a5a5au,
-                                 "zero commit changed recurrent destination");
+                    require_state_poison(recurrent, "zero commit changed recurrent destination");
                     require_fill(conv.data, conv.numel(), std::uint16_t{0x5a5a},
                                  "zero commit changed convolution destination");
                 }
                 if (!counts[b] || !in_place) {
-                    require_words(states.recurrent_tensor(l, sources[slot]).data,
-                                  initial[l * batch + slot], "fold changed untouched source");
+                    require_state_words(states.recurrent_tensor(l, sources[slot]),
+                                        initial[l * batch + slot], "fold changed untouched source");
                     require_words(states.conv_tensor(l, sources[slot]).data, old,
                                   "fold changed untouched source history");
                 }
@@ -431,10 +469,7 @@ int check_replay(const KdaReplayRecordLayout& rl, DeviceBuffer& record_buffer, i
                     const auto recurrent = states.recurrent_tensor(l, dest);
                     const auto conv      = states.conv_tensor(l, dest);
                     if (in_place) {
-                        copy_bytes(
-                            {recurrent.data, recurrent.bytes(), cuda.device()},
-                            {initial[l * batch + slot].data(), recurrent.bytes(), Device::cpu()},
-                            cuda);
+                        upload_state(recurrent, initial[l * batch + slot], cuda);
                         copy_bytes(
                             {conv.data, conv.bytes(), cuda.device()},
                             {initial_conv[l * batch + slot].data(), conv.bytes(), Device::cpu()},
@@ -456,36 +491,37 @@ int check_replay(const KdaReplayRecordLayout& rl, DeviceBuffer& record_buffer, i
 }
 
 int replay_case(int layers, int heads, int width, int batch, bool in_place, bool graph,
-                int qheads = 0, bool projected = false, bool inactive = false) {
+                int qheads = 0, bool projected = false, bool inactive = false,
+                DType state_dtype = DType::FP32) {
     if (!qheads) qheads = heads;
     LayoutBuilder builder;
     const auto layout =
         plan_kda_replay_records(builder, {layers, batch > 8 ? batch + 3 : 8, width,
                                           (2 * qheads + heads) * 128, qheads, heads, 128, 128});
     DeviceBuffer storage(cuda_environment().context.device(), builder.finish(256));
-    return check_replay(layout, storage, batch, in_place, graph, projected, inactive);
+    return check_replay(layout, storage, batch, in_place, graph, projected, inactive, state_dtype);
 }
 
-int switching_widths() {
+int switching_widths(DType state_dtype = DType::FP32) {
     LayoutBuilder builder;
     const auto maximum = plan_kda_replay_records(builder, {3, 8, 8, 5 * 128, 1, 3, 128, 128});
     DeviceBuffer storage(cuda_environment().context.device(), builder.finish(256));
     int failures = 0;
     for (int width : {8, 5, 2, 8}) {
         const auto layout = maximum.with_width(width);
-        failures += check_replay(layout, storage, 5, false, false, false, true);
+        failures += check_replay(layout, storage, 5, false, false, false, true, state_dtype);
     }
     return failures;
 }
 
-int cancellation(int width) {
+int cancellation(int width, DType state_dtype = DType::FP32) {
     constexpr int dim = 128, channels = 3 * dim;
     auto& context = cuda_environment().context;
     CudaStream stream(context);
     const auto cuda = context.execution_view(stream.stream());
     StateImageBuilder state_builder;
-    const auto fields =
-        plan_linear_attention_state(state_builder, {1, channels, 3, 1, dim, dim, DType::BF16});
+    const auto fields = plan_linear_attention_state(
+        state_builder, {1, channels, 3, 1, dim, dim, DType::BF16, state_dtype});
     const auto layout = state_builder.finish();
     DeviceBuffer memory(cuda.device(), layout.image_bytes);
     StateImageStorage storage(memory.span(), layout);
@@ -507,8 +543,7 @@ int cancellation(int width) {
     inputs.k[0] = inputs.k[dim] = 32.f;
     inputs.v[dim]               = 0x1p-6f;
     const auto state            = states.recurrent_tensor(0, 0);
-    copy_bytes({state.data, state.bytes(), cuda.device()},
-               {inputs.state.data(), state.bytes(), Device::cpu()}, cuda);
+    upload_state(state, inputs.state, cuda);
     auto offsets_buffer = to_device(std::vector<std::int64_t>{0});
     const Tensor offsets(offsets_buffer.span(), DType::I64, {1});
 
@@ -543,26 +578,26 @@ int cancellation(int width) {
 
     const auto expected = kda_ref::evaluate(inputs, lower_bound, scale);
     return verify_reduction("fold preserves small correction", read_state(state),
-                            expected.final_state, state_criterion);
+                            expected.final_state, state_criterion_for(state_dtype));
 }
 
-int chained() {
+int chained(DType state_dtype = DType::FP32) {
     constexpr float lower_bound = -0.25F;
     constexpr int heads = 2, qheads = 1, channels = (heads + 2 * qheads) * 128;
     auto& context = cuda_environment().context;
     CudaStream stream(context);
     const auto cuda = context.execution_view(stream.stream());
     StateImageBuilder state_builder;
-    const auto fields =
-        plan_linear_attention_state(state_builder, {1, channels, 3, heads, 128, 128, DType::BF16});
+    const auto fields = plan_linear_attention_state(
+        state_builder, {1, channels, 3, heads, 128, 128, DType::BF16, state_dtype});
     const auto state_layout = state_builder.finish();
     DeviceBuffer memory(cuda.device(), state_layout.image_bytes);
     StateImageStorage storage(memory.span(), state_layout);
     LinearAttentionStateView states(storage, fields);
-    const auto state   = states.recurrent_tensor(0, 0);
-    const auto initial = values(state.numel(), 19, 0.1F);
-    copy_bytes({state.data, state.bytes(), cuda.device()},
-               {initial.data(), state.bytes(), Device::cpu()}, cuda);
+    const auto state = states.recurrent_tensor(0, 0);
+    auto initial     = values(state.numel(), 19, 0.1F);
+    if (state_dtype == DType::BF16) round_to_bf16(initial);
+    upload_state(state, initial, cuda);
     CUDA_CHECK(cudaMemsetAsync(states.conv_tensor(0, 0).data, 0, channels * 3 * 2, cuda.stream()));
     auto sb = to_device(std::vector<std::int64_t>{0});
     Tensor offsets(sb.span(), DType::I64, {1});
@@ -578,6 +613,7 @@ int chained() {
                                .a_log       = a_log,
                                .dt_bias     = bias,
                                .state       = initial};
+    std::vector<float> committed_state = initial;
     int failures = 0, seed = 100;
     for (const auto [width, count] :
          {std::pair{1, 1}, {8, 4}, {20, 17}, {35, 34}, {4, 0}, {8, 8}}) {
@@ -596,6 +632,9 @@ int chained() {
         const Tensor beta(bb.span(), DType::BF16, {heads, width, 1});
         Tensor out(output.span(), DType::BF16, {128, heads, width, 1});
         CUDA_CHECK(cudaMemsetAsync(rec.conv.data, 0, rec.conv.bytes(), cuda.stream()));
+        const auto state_before =
+            count == 0 ? from_device<std::uint8_t>(state.data, state.bytes())
+                       : std::vector<std::uint8_t>{};
         ops::kimi_delta_attention_replay_record(q, k, v, g, beta, a, dt, lower_bound, scale,
                                                 states.layer_view(0, offsets).recurrent, {},
                                                 rec.recurrence, out, cuda);
@@ -604,26 +643,92 @@ int chained() {
         fold.execute({&row, 1}, cuda);
         CUDA_CHECK(cudaStreamSynchronize(cuda.stream()));
 
-        const auto round = reference_input(q, k, v, g, beta, a, dt, 0, width, {});
-        auto candidates  = trajectory;
-        append_prefix(candidates, round, width);
-        const auto verify = kda_ref::evaluate(candidates, lower_bound, scale);
-        failures += verify_reduction(
-            "chained readouts", from_device_bf16(output.data(), out.numel()),
-            std::span(verify.out).subspan(std::size_t(trajectory.tokens) * 128 * heads),
-            output_criterion);
-        append_prefix(trajectory, round, count);
-        const auto committed = kda_ref::evaluate(trajectory, lower_bound, scale);
-        failures += verify_reduction("chained prefix state", read_state(state),
-                                     committed.final_state, state_criterion);
+        const auto round = reference_input(q, k, v, g, beta, a, dt, 0, width, committed_state);
+        if (state_dtype == DType::BF16) {
+            const auto verify = kda_ref::evaluate(round, lower_bound, scale);
+            failures += verify_reduction("chained readouts", from_device_bf16(output.data(), out.numel()),
+                                         verify.out, output_criterion);
+            if (count > 0) {
+                const auto committed = evaluate_prefix(round, count, lower_bound);
+                failures += verify_reduction("chained prefix state", read_state(state),
+                                             committed.final_state,
+                                             state_criterion_for(state_dtype));
+                committed_state.resize(committed.final_state.size());
+                for (std::size_t i = 0; i < committed_state.size(); ++i)
+                    committed_state[i] = static_cast<float>(committed.final_state[i]);
+                round_to_bf16(committed_state);
+            } else {
+                require_words(state.data, state_before, "zero chained fold changed state");
+            }
+        } else {
+            auto candidates = trajectory;
+            append_prefix(candidates, round, width);
+            const auto verify = kda_ref::evaluate(candidates, lower_bound, scale);
+            failures += verify_reduction(
+                "chained readouts", from_device_bf16(output.data(), out.numel()),
+                std::span(verify.out).subspan(std::size_t(trajectory.tokens) * 128 * heads),
+                output_criterion);
+            append_prefix(trajectory, round, count);
+            const auto committed = kda_ref::evaluate(trajectory, lower_bound, scale);
+            failures += verify_reduction("chained prefix state", read_state(state),
+                                         committed.final_state, state_criterion_for(state_dtype));
+        }
     }
     return failures;
+}
+
+int contract_state_dtype_rejection() {
+    constexpr int dim = 128, heads = 2, channels = 3 * heads * dim, width = 2;
+    auto& context = cuda_environment().context;
+    CudaStream stream(context);
+    const auto cuda = context.execution_view(stream.stream());
+    StateImageBuilder sb;
+    const auto fields =
+        plan_linear_attention_state(sb, {1, channels, 3, heads, dim, dim, DType::BF16, DType::FP32});
+    const auto state_layout = sb.finish();
+    DeviceBuffer memory(cuda.device(), state_layout.image_bytes);
+    StateImageStorage storage(memory.span(), state_layout);
+    LinearAttentionStateView states(storage, fields);
+    auto offsets_buf = to_device(std::vector<std::int64_t>{0});
+    Tensor offsets(offsets_buf.span(), DType::I64, {1});
+
+    LayoutBuilder builder;
+    const auto rl = plan_kda_replay_records(builder, {1, 1, width, channels, heads, heads, dim, dim});
+    DeviceBuffer frame(cuda.device(), builder.finish(256));
+    const KdaReplayRecords records(frame.span(), rl);
+    const auto rec = records.layer(0, 1);
+
+    DeviceBuffer qkv(cuda.device(), std::size_t(dim) * heads * width * sizeof(std::uint16_t));
+    DeviceBuffer beta_b(cuda.device(), std::size_t(heads) * width * sizeof(std::uint16_t));
+    DeviceBuffer a_b(cuda.device(), std::size_t(heads) * sizeof(float));
+    DeviceBuffer dt_b(cuda.device(), std::size_t(dim) * heads * sizeof(float));
+    DeviceBuffer out_b(cuda.device(), std::size_t(dim) * heads * width * sizeof(std::uint16_t));
+    Tensor q(qkv.span(), DType::BF16, {dim, heads, width, 1});
+    Tensor beta(beta_b.span(), DType::BF16, {heads, width, 1});
+    Tensor a(a_b.span(), DType::FP32, {heads});
+    Tensor dt(dt_b.span(), DType::FP32, {dim, heads});
+    Tensor out(out_b.span(), DType::BF16, {dim, heads, width, 1});
+
+    auto bad_src                    = states.layer_view(0, offsets).recurrent;
+    bad_src.field.tensor.dtype      = DType::FP16;
+    reject([&] {
+        ops::kimi_delta_attention_replay_record(q, q, q, q, beta, a, dt, -5, scale, bad_src, {},
+                                                rec.recurrence, out, cuda);
+    }, "kda replay record accepts FP16 source state");
+
+    auto bad_all                        = states.all_layers_view();
+    bad_all.spec.recurrent_dtype        = DType::FP16;
+    bad_all.recurrent.field.tensor.dtype = DType::FP16;
+    reject([&] { (void)ops::KdaReplayFoldPlan(records, bad_all); },
+           "kda replay fold accepts FP16 state");
+    return 0;
 }
 } // namespace
 
 int main(int argc, char** argv) {
     OpSuite suite;
-    suite.add("kda/replay/switch_widths", switching_widths);
+    suite.add("kda/replay/contract_state_dtype", contract_state_dtype_rejection);
+    suite.add("kda/replay/switch_widths", [] { return switching_widths(); });
     suite.add("kda/replay/mixed", [] { return replay_case(2, 3, 7, 8, false, false, 1); });
     suite.add("kda/replay/inplace", [] { return replay_case(8, 32, 4, 2, true, false); });
     suite.add("kda/replay/graph",
@@ -653,7 +758,7 @@ int main(int argc, char** argv) {
               [] { return replay_case(2, 32, 8, 4, false, true); });
     suite.add("kda/replay/inplace_multilayer_t16",
               [] { return replay_case(2, 32, 16, 8, true, true); });
-    suite.add("kda/replay/chained", chained);
+    suite.add("kda/replay/chained", [] { return chained(); });
     suite.add("kda/replay/expanded_host",
               [] { return replay_case(2, 1, 4, 17, false, false, 1, false, true); },
               {{"suite", "concurrency"}});
@@ -665,6 +770,39 @@ int main(int argc, char** argv) {
               {{"suite", "concurrency"}});
     suite.add("kda/replay/grouped_long_window",
               [] { return replay_case(1, 32, 16, 64, false, true, 32, false, true); },
+              {{"suite", "concurrency"}});
+    suite.add("kda/replay_bf16/switch_widths", [] { return switching_widths(DType::BF16); });
+    suite.add("kda/replay_bf16/mixed",
+              [] { return replay_case(2, 3, 7, 8, false, false, 1, false, false, DType::BF16); });
+    suite.add("kda/replay_bf16/inplace",
+              [] { return replay_case(8, 32, 4, 2, true, false, 0, false, false, DType::BF16); });
+    suite.add("kda/replay_bf16/graph",
+              [] { return replay_case(2, 8, 20, 8, false, true, 4, false, true, DType::BF16); });
+    suite.add("kda/replay_bf16/t20_inplace",
+              [] { return replay_case(2, 4, 20, 4, true, false, 2, false, false, DType::BF16); });
+    suite.add("kda/replay_bf16/t35_out_of_place",
+              [] { return replay_case(2, 4, 35, 2, false, false, 2, false, false, DType::BF16); });
+    suite.add("kda/replay_bf16/cancellation_short",
+              [] { return cancellation(2, DType::BF16); });
+    suite.add("kda/replay_bf16/cancellation_chunk",
+              [] { return cancellation(5, DType::BF16); });
+    suite.add("kda/replay_bf16/full_layers",
+              [] { return replay_case(34, 32, 4, 1, false, true, 0, false, false, DType::BF16); });
+    suite.add("kda/replay_bf16/single",
+              [] { return replay_case(1, 1, 1, 1, false, false, 0, false, false, DType::BF16); });
+    suite.add("kda/replay_bf16/projected_t8b8",
+              [] { return replay_case(1, 32, 8, 8, false, true, 32, true, false, DType::BF16); });
+    suite.add("kda/replay_bf16/projected_t4b8",
+              [] { return replay_case(1, 32, 4, 8, true, true, 32, true, false, DType::BF16); });
+    suite.add("kda/replay_bf16/chained", [] { return chained(DType::BF16); });
+    suite.add("kda/replay_bf16/expanded_device",
+              [] { return replay_case(2, 1, 3, 64, false, true, 1, false, true, DType::BF16); },
+              {{"suite", "concurrency"}});
+    suite.add("kda/replay_bf16/grouped_state_tiles",
+              [] { return replay_case(1, 32, 4, 17, false, true, 32, false, true, DType::BF16); },
+              {{"suite", "concurrency"}});
+    suite.add("kda/replay_bf16/grouped_long_window",
+              [] { return replay_case(1, 32, 16, 64, false, true, 32, false, true, DType::BF16); },
               {{"suite", "concurrency"}});
     return suite.main(argc, argv);
 }

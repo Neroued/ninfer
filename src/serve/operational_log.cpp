@@ -467,7 +467,9 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
     const auto& engine       = service.engine_options();
     const auto& cache        = engine.context_cache;
     const auto& context_cost = startup.load.context_cost;
-    logger_->info("capacity | {} | {} ranks | {} active lanes", kv_cache_name(description.kv_cache),
+    logger_->info("capacity | kv {} | linear state {} | {} ranks | {} active lanes",
+                  kv_cache_name(description.kv_cache),
+                  ninfer::linear_state_dtype_name(description.linear_state_dtype),
                   description.ranks.size(), engine.max_concurrency);
     product::log_context_capacity(*logger_, description);
     if (startup.speculative) {

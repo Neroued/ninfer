@@ -36,13 +36,13 @@ __device__ __forceinline__ int fold_columns(const GdnReplayFoldDeviceRows& rows,
     return rows.columns[b];
 }
 
-template <class Geometry, class Rows>
+template <class Geometry, class Rows, class StateT>
 struct FoldAccess {
     const __nv_bfloat16* key_record;
     const float* delta_record;
     const float* alpha_record;
     const __nv_bfloat16* conv_record;
-    float* recurrent_layer0;
+    StateT* recurrent_layer0;
     __nv_bfloat16* conv_layer0;
     std::int64_t recurrent_layer_stride;
     std::int64_t conv_layer_stride;
@@ -139,19 +139,19 @@ __device__ __forceinline__ void stage_decays(FoldWindow<TileRows>& sm, const Acc
     }
 }
 
-template <class Launcher, class Geometry, class Rows>
+template <class Launcher, class Geometry, class Rows, class StateT>
 void launch_replay_fold_fixed(const GdnReplayRecords& records,
                               LinearAttentionStateAllLayersView states, const Rows& rows,
                               int active_rows, int record_begin, cudaStream_t stream) {
     const auto [key, delta, alpha] = ninfer::detail::GdnReplayRecordAccess::planes(records);
-    const FoldAccess<Geometry, Rows> access{
+    const FoldAccess<Geometry, Rows, StateT> access{
         static_cast<const __nv_bfloat16*>(key.data),
         static_cast<const float*>(delta.data),
         static_cast<const float*>(alpha.data),
         static_cast<const __nv_bfloat16*>(records.conv.data),
-        common::operand::state_field_base<float>(states.recurrent),
+        common::operand::state_field_base<StateT>(states.recurrent),
         common::operand::state_field_base<__nv_bfloat16>(states.conv),
-        static_cast<std::int64_t>(states.recurrent.field.layer_stride / sizeof(float)),
+        static_cast<std::int64_t>(states.recurrent.field.layer_stride / sizeof(StateT)),
         static_cast<std::int64_t>(states.conv.field.layer_stride / sizeof(__nv_bfloat16)),
         records.spec.record_capacity,
         records.spec.width,
@@ -166,20 +166,28 @@ template <class Launcher, class Rows>
 void dispatch_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states,
                           const Rows& rows, int active_rows, int record_begin,
                           cudaStream_t stream) {
-    switch (select_fold_geometry(records.spec)) {
-    case FoldGeometryId::Layers48Heads48:
-        return launch_replay_fold_fixed<Launcher, FoldGeometry<48, 16, 48, 10240>>(
-            records, states, rows, active_rows, record_begin, stream);
-    case FoldGeometryId::Layers30Heads32:
-        return launch_replay_fold_fixed<Launcher, FoldGeometry<30, 16, 32, 8192>>(
-            records, states, rows, active_rows, record_begin, stream);
-    case FoldGeometryId::Layers36Heads48:
-        return launch_replay_fold_fixed<Launcher, FoldGeometry<36, 16, 48, 10240>>(
-            records, states, rows, active_rows, record_begin, stream);
-    case FoldGeometryId::Layers36Heads24:
-        return launch_replay_fold_fixed<Launcher, FoldGeometry<36, 8, 24, 5120>>(
-            records, states, rows, active_rows, record_begin, stream);
-    }
+    const auto dispatch = [&]<class StateT>() {
+        switch (select_fold_geometry(records.spec)) {
+        case FoldGeometryId::Layers48Heads48:
+            return launch_replay_fold_fixed<Launcher, FoldGeometry<48, 16, 48, 10240>, Rows,
+                                            StateT>(records, states, rows, active_rows,
+                                                    record_begin, stream);
+        case FoldGeometryId::Layers30Heads32:
+            return launch_replay_fold_fixed<Launcher, FoldGeometry<30, 16, 32, 8192>, Rows, StateT>(
+                records, states, rows, active_rows, record_begin, stream);
+        case FoldGeometryId::Layers36Heads48:
+            return launch_replay_fold_fixed<Launcher, FoldGeometry<36, 16, 48, 10240>, Rows,
+                                            StateT>(records, states, rows, active_rows,
+                                                    record_begin, stream);
+        case FoldGeometryId::Layers36Heads24:
+            return launch_replay_fold_fixed<Launcher, FoldGeometry<36, 8, 24, 5120>, Rows, StateT>(
+                records, states, rows, active_rows, record_begin, stream);
+        }
+    };
+    if (states.recurrent.field.tensor.dtype == DType::BF16)
+        dispatch.template operator()<__nv_bfloat16>();
+    else
+        dispatch.template operator()<float>();
 }
 
 } // namespace ninfer::ops::detail::gated_delta_net

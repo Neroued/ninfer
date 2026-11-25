@@ -32,7 +32,8 @@ struct StatePlacement {
     bool operator==(const StatePlacement&) const = default;
 };
 
-[[nodiscard]] StateLayout plan_state(const execution::ModelProfile&);
+[[nodiscard]] StateLayout plan_state(const execution::ModelProfile&,
+                                     LinearStateDType = LinearStateDType::Float32);
 [[nodiscard]] StatePlacement describe_state(const StateLayout&);
 [[nodiscard]] ops::KpoolMlaStorage latent_storage(KvCacheStorage);
 

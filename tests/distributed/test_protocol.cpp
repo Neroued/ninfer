@@ -218,6 +218,7 @@ void cache_profiles_roundtrip() {
                          KvCacheStorage::Fp8KeyNvfp4Value}) {
         q::RankLoadRequest request{};
         request.options.kv_cache                  = storage;
+        request.options.linear_state_dtype        = LinearStateDType::BFloat16;
         request.options.speculative.length_policy = SpeculativeLengthPolicy::Fixed;
         request.batches = models::make_batch_execution_spec(request.options.max_concurrency, 1,
                                                             request.options.use_cuda_graph);
@@ -228,12 +229,14 @@ void cache_profiles_roundtrip() {
         const auto loaded = q::decode_rank_load(load_in);
         load_in.finish();
         require(loaded.options.kv_cache == storage &&
+                    loaded.options.linear_state_dtype == LinearStateDType::BFloat16 &&
                     loaded.options.speculative.length_policy == SpeculativeLengthPolicy::Fixed,
-                "rank load changed the KV profile or length policy");
+                "rank load changed the KV profile, linear state dtype, or length policy");
 
         q::RankExecutionDescription execution{};
-        execution.session.shape.kv_storage      = storage;
-        execution.session.shape.max_concurrency = request.options.max_concurrency;
+        execution.session.shape.kv_storage         = storage;
+        execution.session.shape.linear_state_dtype = LinearStateDType::BFloat16;
+        execution.session.shape.max_concurrency    = request.options.max_concurrency;
         execution.session.shape.cuda_graph      = request.options.use_cuda_graph;
         execution.session.shape.length_policy   = request.options.speculative.length_policy;
         execution.session.batches =
@@ -321,6 +324,7 @@ void model_preparation() {
     o.max_concurrency                   = 8;
     o.max_context                       = 1048576;
     o.prefill_chunk                     = 4096;
+    o.linear_state_dtype                = LinearStateDType::BFloat16;
     o.use_cuda_graph                    = false;
     o.enable_vision                     = true;
     o.vision_memory_budget_bytes        = 256ULL << 20;
@@ -352,6 +356,7 @@ void model_preparation() {
     wire::Encoder roundtrip;
     glm::encode_rank_load(roundtrip, decoded);
     require(std::move(roundtrip).take() == bytes && decoded.rank.kda_heads.begin == 32 &&
+                decoded.options.linear_state_dtype == LinearStateDType::BFloat16 &&
                 decoded.options.speculative.proposal_head == ProposalHead::Optimized &&
                 decoded.options.speculative.length_policy == SpeculativeLengthPolicy::Fixed &&
                 decoded.index_format == request.index_format &&
@@ -403,6 +408,7 @@ void model_preparation() {
                                        true,
                                        false};
     r.shape.length_policy           = SpeculativeLengthPolicy::Fixed;
+    r.shape.linear_state_dtype      = LinearStateDType::BFloat16;
     r.state                         = {{1024, 256}, {1536, 256}, {1024, 512, 256}};
     r.batches                       = request.batches;
     r.context.ranks                 = {{1, 2ULL << 30, 0}};

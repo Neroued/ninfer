@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common/roofline.h"
+#include "core/dtype.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -15,6 +16,7 @@ namespace ninfer::bench::gdn {
 struct Geometry {
     static constexpr std::uint64_t head_dim = 128;
     int qk_heads, value_heads, tokens, batch = 1;
+    DType state_dtype = DType::FP32;
 
     std::uint64_t qk_bytes() const {
         return head_dim * qk_heads * tokens * batch * sizeof(std::uint16_t);
@@ -29,7 +31,7 @@ struct Geometry {
     }
 
     std::uint64_t state_bytes() const {
-        return head_dim * head_dim * value_heads * batch * sizeof(float);
+        return head_dim * head_dim * value_heads * batch * dtype_size(state_dtype);
     }
 };
 
@@ -91,14 +93,15 @@ inline Traffic running_traffic(const Geometry& p) {
 }
 
 inline Traffic record_traffic(int qk_heads, int value_heads, int width, std::span<const int> valid,
-                              bool has_valid_tensor) {
+                              bool has_valid_tensor, DType state_dtype = DType::FP32) {
     const int batch  = static_cast<int>(valid.size());
     const int tokens = std::accumulate(valid.begin(), valid.end(), 0);
-    const Geometry live{qk_heads, value_heads, tokens};
-    const Geometry physical{qk_heads, value_heads, width, batch};
+    const Geometry live{qk_heads, value_heads, tokens, 1, state_dtype};
+    const Geometry physical{qk_heads, value_heads, width, batch, state_dtype};
     Traffic result;
-    result.active_rows   = std::count_if(valid.begin(), valid.end(), [](int n) { return n > 0; });
-    result.state.read    = Geometry{qk_heads, value_heads, 1, result.active_rows}.state_bytes();
+    result.active_rows = std::count_if(valid.begin(), valid.end(), [](int n) { return n > 0; });
+    result.state.read =
+        Geometry{qk_heads, value_heads, 1, result.active_rows, state_dtype}.state_bytes();
     result.records.write = live.qk_bytes() + 2 * live.value_bytes() + live.gate_bytes();
     result.logical       = {2 * live.qk_bytes() + live.value_bytes() + 2 * live.gate_bytes() +
                                 result.state.read + sizeof(std::int64_t) * result.active_rows +
@@ -109,11 +112,11 @@ inline Traffic record_traffic(int qk_heads, int value_heads, int width, std::spa
 }
 
 inline Traffic fold_traffic(int layers, int qk_heads, int value_heads, int conv_channels,
-                            std::span<const int> commits) {
+                            std::span<const int> commits, DType state_dtype = DType::FP32) {
     Traffic result;
     for (int count : commits) {
         if (!count) continue;
-        const Geometry live{qk_heads, value_heads, count};
+        const Geometry live{qk_heads, value_heads, count, 1, state_dtype};
         const auto state        = live.state_bytes() * layers;
         const auto conv_column  = 2ULL * conv_channels * layers;
         const auto conv_records = conv_column * std::min(3, count);

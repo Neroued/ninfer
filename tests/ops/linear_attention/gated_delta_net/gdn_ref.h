@@ -13,6 +13,11 @@ namespace ninfer::test::gdn_ref {
 
 inline constexpr ReductionCriterion kOutputCriterion{6.0e-3, 5.0e-6, 8.0e-3};
 inline constexpr ReductionCriterion kStateCriterion{4.5e-3, 1.0e-5, 9.0e-3};
+inline constexpr ReductionCriterion kBf16StateCriterion{7.5e-3, 2.0e-5, 1.6e-2};
+
+inline constexpr ReductionCriterion state_criterion(DType state_dtype) {
+    return state_dtype == DType::BF16 ? kBf16StateCriterion : kStateCriterion;
+}
 
 // Decode only the represented prefix belonging to this physical batch row.
 inline std::vector<float> represented_bf16(std::span<const std::uint16_t> bits) {

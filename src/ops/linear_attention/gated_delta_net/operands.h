@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/dtype.h"
 #include <cuda_bf16.h>
 #include <cstdint>
 #include <cmath>
@@ -9,6 +10,10 @@
 namespace ninfer::ops::detail::gated_delta_net {
 
 inline constexpr std::int32_t kStateDim = 128;
+
+[[nodiscard]] constexpr bool is_supported_state_dtype(DType dtype) noexcept {
+    return dtype == DType::FP32 || dtype == DType::BF16;
+}
 
 [[nodiscard]] constexpr bool are_head_counts_valid(std::int64_t qk_heads,
                                                    std::int64_t value_heads) noexcept {
@@ -21,8 +26,10 @@ struct RecurrenceGeometry {
 
 struct RecurrenceOperands {
     const __nv_bfloat16 *q, *k, *v;
-    const float *g, *beta, *state_in;
-    float* state_out;
+    const float *g, *beta;
+    const void* state_in;
+    void* state_out;
+    DType state_dtype;
     __nv_bfloat16* out;
     int qk_heads, value_heads, tokens;
     float scale;

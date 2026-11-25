@@ -175,7 +175,8 @@ struct EngineOptions {
     // Zero uses 4096 for Qwen4Exp, GLM5Next, or CPU expert offload, otherwise 1024.
     std::uint32_t prefill_chunk = 0;
     MoeOptions moe;
-    KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
+    KvCacheStorage kv_cache             = KvCacheStorage::BFloat16;
+    LinearStateDType linear_state_dtype = LinearStateDType::Float32;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes  = kDefaultMediaLiveBytes;

@@ -10,8 +10,8 @@
 
 namespace ninfer::ops::detail::gated_delta_net {
 namespace {
-template <bool Masked, bool GroupStateTiles, bool Prefetch>
-__global__ __launch_bounds__(128, 2) void record_kernel(RecordAccess<Masked> access) {
+template <bool Masked, bool GroupStateTiles, bool Prefetch, class StateT>
+__global__ __launch_bounds__(128, 2) void record_kernel(RecordAccess<Masked, StateT> access) {
     extern __shared__ __align__(16) char backing[];
     const auto coord = subgroup::coordinates<GroupStateTiles>(access.heads, blockIdx.y);
     const int valid  = access.active_columns(coord);
@@ -25,7 +25,7 @@ __global__ __launch_bounds__(128, 2) void record_kernel(RecordAccess<Masked> acc
         access, coord, valid, reinterpret_cast<subgroup::Window<subgroup::kWindowSize>*>(backing));
 }
 
-template <bool Masked>
+template <bool Masked, class StateT>
 void launch_recurrent_record_fixed(const Tensor& q, const Tensor& k, const Tensor& v,
                                    const Tensor& g, const Tensor& beta, float scale,
                                    ConstStateFieldView initial_state, const Tensor& valid_columns,
@@ -36,13 +36,13 @@ void launch_recurrent_record_fixed(const Tensor& q, const Tensor& k, const Tenso
     dim3 grid(v.ne[1] * (group_tiles ? kStateDim / kBlockDv : 1), 1,
               group_tiles ? 1 : kStateDim / kBlockDv);
     const dim3 block(common::kWarpSize, kNumWarps, 1);
-    RecordAccess<Masked> access{
+    RecordAccess<Masked, StateT> access{
         static_cast<const __nv_bfloat16*>(q.data),
         static_cast<const __nv_bfloat16*>(k.data),
         static_cast<const __nv_bfloat16*>(v.data),
         static_cast<const float*>(g.data),
         static_cast<const float*>(beta.data),
-        common::operand::state_field_base<const float>(initial_state),
+        common::operand::state_field_base<const StateT>(initial_state),
         Masked ? static_cast<const std::int32_t*>(valid_columns.data) : nullptr,
         static_cast<const std::int64_t*>(initial_state.records.byte_offsets.data),
         static_cast<__nv_bfloat16*>(key_record.data),
@@ -61,9 +61,11 @@ void launch_recurrent_record_fixed(const Tensor& q, const Tensor& k, const Tenso
         const auto submit = [&]<bool Prefetch>() {
             constexpr auto bytes = Prefetch ? sizeof(subgroup::Window<subgroup::kWindowSize>) : 0;
             if (group_tiles)
-                record_kernel<Masked, true, Prefetch><<<grid, block, bytes, stream>>>(access);
+                record_kernel<Masked, true, Prefetch, StateT>
+                    <<<grid, block, bytes, stream>>>(access);
             else
-                record_kernel<Masked, false, Prefetch><<<grid, block, bytes, stream>>>(access);
+                record_kernel<Masked, false, Prefetch, StateT>
+                    <<<grid, block, bytes, stream>>>(access);
         };
         if ((alignment & 15) == 0)
             submit.template operator()<true>();
@@ -81,13 +83,21 @@ void launch_recurrent_record(const Tensor& q, const Tensor& k, const Tensor& v, 
                              const Tensor& valid_columns, const Tensor& key_record,
                              const Tensor& delta_record, const Tensor& alpha_record, Tensor& out,
                              cudaStream_t stream) {
-    if (valid_columns.data == nullptr) {
-        launch_recurrent_record_fixed<false>(q, k, v, g, beta, scale, initial_state, valid_columns,
-                                             key_record, delta_record, alpha_record, out, stream);
-    } else {
-        launch_recurrent_record_fixed<true>(q, k, v, g, beta, scale, initial_state, valid_columns,
-                                            key_record, delta_record, alpha_record, out, stream);
-    }
+    const auto dispatch = [&]<class StateT>() {
+        if (valid_columns.data == nullptr) {
+            launch_recurrent_record_fixed<false, StateT>(q, k, v, g, beta, scale, initial_state,
+                                                         valid_columns, key_record, delta_record,
+                                                         alpha_record, out, stream);
+        } else {
+            launch_recurrent_record_fixed<true, StateT>(q, k, v, g, beta, scale, initial_state,
+                                                        valid_columns, key_record, delta_record,
+                                                        alpha_record, out, stream);
+        }
+    };
+    if (initial_state.field.tensor.dtype == DType::BF16)
+        dispatch.template operator()<__nv_bfloat16>();
+    else
+        dispatch.template operator()<float>();
 }
 
 } // namespace ninfer::ops::detail::gated_delta_net

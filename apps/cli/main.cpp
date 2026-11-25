@@ -187,6 +187,8 @@ void print_generation_summary(const ninfer::GenerationResult& result,
     print_metric("max context", std::to_string(description.max_context));
     print_metric("prefill chunk", std::to_string(description.prefill_chunk));
     print_metric("kv cache dtype", format_kv_cache(description.kv_cache));
+    print_metric("linear state dtype",
+                 ninfer::linear_state_dtype_name(description.linear_state_dtype));
     for (std::size_t i = 0; i < description.ranks.size(); ++i) {
         const auto& rank   = description.ranks[i];
         const auto& budget = startup.ranks.at(i);

@@ -44,11 +44,16 @@ Json aggregate_json(const ScoreAggregate& value) {
 
 std::filesystem::path prepare_output_directory(const Options& options, const RunDescription& run,
                                                const CorpusSelection& corpus) {
-    const auto& load = run.startup.load;
-    auto output      = options.output.value_or(
+    const auto& load       = run.startup.load;
+    std::string kv_segment = kv_cache_profile_info(run.engine.kv_cache).name;
+    if (run.engine.linear_state_dtype != LinearStateDType::Float32) {
+        kv_segment += "-ls_";
+        kv_segment += linear_state_dtype_name(run.engine.linear_state_dtype);
+    }
+    auto output = options.output.value_or(
         std::filesystem::path("profiles/perplexity") / safe_component(load.model_name) /
-        safe_component(load.prefill_signature) / kv_cache_profile_info(run.engine.kv_cache).name /
-        safe_component(corpus.corpus_id) / safe_component(corpus.mode) / timestamp());
+        safe_component(load.prefill_signature) / kv_segment / safe_component(corpus.corpus_id) /
+        safe_component(corpus.mode) / timestamp());
     if (std::filesystem::exists(output)) {
         if (!std::filesystem::is_directory(output) || !std::filesystem::is_empty(output))
             throw std::runtime_error("output directory exists and is not empty: " +
@@ -121,6 +126,7 @@ Json make_report(const Options& options, const RunDescription& run, const Corpus
           {"max_context_tokens", run.engine.max_context},
           {"prefill_chunk_tokens", run.engine.prefill_chunk},
           {"kv_dtype", kv_cache_profile_info(run.engine.kv_cache).name},
+          {"linear_state_dtype", linear_state_dtype_name(run.engine.linear_state_dtype)},
           {"context_pools", product::context_capacity_json(run.engine.context_pools)},
           {"context_token_capacity_estimate", run.engine.context_token_capacity_estimate}}},
         {"timing",
@@ -153,6 +159,7 @@ void write_report(const std::filesystem::path& directory, const Json& report,
     summary << "Perplexity result\nartifact: "
             << report.at("artifact").at("name").get<std::string>()
             << "\nkv: " << execution.at("kv_dtype").get<std::string>()
+            << ", linear_state: " << execution.at("linear_state_dtype").get<std::string>()
             << ", corpus: " << report.at("corpus").at("id").get<std::string>() << " / "
             << report.at("corpus").at("mode").get<std::string>()
             << ", context/stride: " << execution.at("context_tokens") << '/'

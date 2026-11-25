@@ -15,9 +15,10 @@ GraphPreparationPlan describe_graph_preparation(const EngineOptions& options,
     out.max_context     = options.max_context;
     out.max_concurrency = options.max_concurrency;
     out.draft_tokens    = options.speculative.draft_tokens;
-    out.prefill_chunk   = options.prefill_chunk;
-    out.kv_cache        = options.kv_cache;
-    out.vision          = options.enable_vision;
+    out.prefill_chunk      = options.prefill_chunk;
+    out.kv_cache           = options.kv_cache;
+    out.linear_state_dtype = options.linear_state_dtype;
+    out.vision             = options.enable_vision;
     if (!plan) return out;
     for (const auto batch : batches.graph_rows())
         for (const auto& layer : plan->description().layers) {

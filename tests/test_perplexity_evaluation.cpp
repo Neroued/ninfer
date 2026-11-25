@@ -66,7 +66,8 @@ int check_options(const Files& files) {
         require(defaults.context == 4096 && defaults.stride == 2048 &&
                     defaults.launch.engine.max_context == 4096 &&
                     defaults.launch.engine.purpose == EnginePurpose::CausalScoring &&
-                    defaults.launch.engine.kv_cache == KvCacheStorage::Fp8E4m3fnGroup128Ue8m0,
+                    defaults.launch.engine.kv_cache == KvCacheStorage::Fp8E4m3fnGroup128Ue8m0 &&
+                    defaults.launch.engine.linear_state_dtype == LinearStateDType::Float32,
                 "PPL defaults changed");
     const auto window = parse({"ninfer-perplexity", "model.ninfer", "--text", "text.txt",
                                "--context", "6144", "--stride", "1024"});
@@ -137,10 +138,13 @@ device = 0
                         "generation-only configuration reached PPL");
     const auto overridden =
         parse({"ninfer-perplexity", "--config", config.string(), "--text", "text.txt",
-               "--max-context", "16384", "--kv-dtype", "fp8", "--prefill-chunk", "128"});
+               "--max-context", "16384", "--kv-dtype", "fp8", "--linear-state-dtype", "bf16",
+               "--prefill-chunk", "128"});
     failures += require(overridden.launch.engine.max_context == 16384 &&
                             overridden.launch.engine.prefill_chunk == 128 &&
-                            overridden.launch.engine.kv_cache == defaults.launch.engine.kv_cache,
+                            overridden.launch.engine.kv_cache == defaults.launch.engine.kv_cache &&
+                            overridden.launch.engine.linear_state_dtype ==
+                                LinearStateDType::BFloat16,
                         "CLI did not override PPL startup config");
     const auto display = product::format_configuration(
         product::configuration_view(configured.launch, EntryPoint::Perplexity));
@@ -215,6 +219,7 @@ int check_report(const Files& files) {
                         "PPL report lost actual rank resources");
     failures +=
         require(report["execution"]["prefill_chunk_tokens"] == 256 &&
+                    report["execution"]["linear_state_dtype"] == "fp32" &&
                     report["overall"]["scored_tokens"] == 3 &&
                     report["overall"]["total_nll"] == 6.0 && report["overall"]["mean_nll"] == 2.0 &&
                     report["streams"][0]["windows"][0]["target_end"] == 3 &&
@@ -226,8 +231,42 @@ int check_report(const Files& files) {
     std::ifstream file(directory / "report.json");
     failures += require(nlohmann::json::parse(file) == report &&
                             !std::filesystem::exists(directory / "report.json.tmp") &&
+                            summary.str().find("linear_state: fp32") != std::string::npos &&
                             summary.str().find("ranks: 2") != std::string::npos,
                         "PPL report publication differs from the result");
+
+    // Verify default output directory segment: unchanged for fp32, -ls_bf16 suffix for bf16.
+    const auto saved_cwd = std::filesystem::current_path();
+    std::filesystem::current_path(files.root);
+    try {
+        auto fp32_opts = parse({"ninfer-perplexity", "model.ninfer", "--text", "text.txt"});
+        run.startup.load.model_name        = "m";
+        run.startup.load.prefill_signature = "sig";
+        run.engine.linear_state_dtype      = LinearStateDType::Float32;
+        const auto fp32_dir                = prepare_output_directory(fp32_opts, run, corpus);
+        failures += require(
+            fp32_dir.parent_path().parent_path().parent_path().filename() == "fp8",
+            "default fp32 PPL output directory changed its kv_dtype segment");
+
+        auto bf16_opts = parse({"ninfer-perplexity", "model.ninfer", "--text", "text.txt",
+                                "--linear-state-dtype", "bf16"});
+        run.engine.linear_state_dtype = bf16_opts.launch.engine.linear_state_dtype;
+        const auto bf16_report        = make_report(bf16_opts, run, corpus, result);
+        failures += require(bf16_report["execution"]["linear_state_dtype"] == "bf16",
+                            "bf16 PPL report lost linear_state_dtype");
+        const auto bf16_dir = prepare_output_directory(bf16_opts, run, corpus);
+        failures += require(
+            bf16_dir.parent_path().parent_path().parent_path().filename() == "fp8-ls_bf16",
+            "bf16 PPL output directory did not append -ls_bf16 to the kv_dtype segment");
+        std::ostringstream bf16_summary;
+        write_report(bf16_dir, bf16_report, bf16_summary);
+        failures += require(bf16_summary.str().find("linear_state: bf16") != std::string::npos,
+                            "bf16 PPL summary lost linear_state");
+    } catch (...) {
+        std::filesystem::current_path(saved_cwd);
+        throw;
+    }
+    std::filesystem::current_path(saved_cwd);
     return failures;
 }
 

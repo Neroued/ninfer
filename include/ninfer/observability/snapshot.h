@@ -4,6 +4,7 @@
 #include "ninfer/observability/execution.h"
 #include "ninfer/observability/request.h"
 #include "ninfer/deployment.h"
+#include "ninfer/linear_state_format.h"
 
 #include <filesystem>
 
@@ -170,6 +171,7 @@ struct EngineDescription {
     std::vector<ContextPoolCapacity> context_pools;
     std::uint64_t context_token_capacity_estimate = 0;
     KvCacheStorage kv_cache                       = KvCacheStorage::BFloat16;
+    LinearStateDType linear_state_dtype           = LinearStateDType::Float32;
     std::vector<ContextKvPoolUsage> kv_pools;
 };
 

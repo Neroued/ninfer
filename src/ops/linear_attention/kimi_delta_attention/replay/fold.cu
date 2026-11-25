@@ -23,10 +23,11 @@ __device__ __forceinline__ KdaReplayFoldRow select_row(const KdaReplayFoldDevice
     return {rows.sources[b], rows.destinations[b], count};
 }
 
+template <class StateT>
 struct FoldArguments {
     const __nv_bfloat16 *key, *conv;
     const float *delta, *alpha;
-    float* recurrent;
+    StateT* recurrent;
     __nv_bfloat16* history;
     std::int64_t recurrent_stride, history_stride;
     int qk_heads, value_heads, group, conv_channels, width, capacity, row_begin, layer_begin;
@@ -40,22 +41,16 @@ struct FoldArguments {
     }
 };
 
-template <int Warps>
-__device__ __forceinline__ float4 load_state_row(const float* state, int row, int col) {
+template <int Warps, class StateT>
+__device__ __forceinline__ float4 load_state_row(const StateT* state, int row, int col) {
     if constexpr (NINFER_TARGET_SPARK && Warps < 16)
-        return common::load_vec<float4>(state + row * kStateDim + col);
-    const auto policy = common::l2_retained_policy();
-    float4 value;
-    asm volatile("ld.global.cg.L2::cache_hint.v4.f32 {%0,%1,%2,%3}, [%4], %5;"
-                 : "=f"(value.x), "=f"(value.y), "=f"(value.z), "=f"(value.w)
-                 : "l"(state + row * kStateDim + col), "l"(policy));
-    return value;
+        return common::load_state_float4(state + row * kStateDim + col);
+    return common::load_state_float4_l2_retained(state + row * kStateDim + col);
 }
 
-__device__ __forceinline__ void store_state_row(float* state, int row, int col, float4 value) {
-    asm volatile("st.global.cs.v4.f32 [%0], {%1,%2,%3,%4};" ::"l"(state + row * kStateDim + col),
-                 "f"(value.x), "f"(value.y), "f"(value.z), "f"(value.w)
-                 : "memory");
+template <class StateT>
+__device__ __forceinline__ void store_state_row(StateT* state, int row, int col, float4 value) {
+    common::store_state_float4_streaming(state + row * kStateDim + col, value);
 }
 
 __device__ __forceinline__ float4 add_outer(float4 acc, float delta, float4 key) {
@@ -70,7 +65,8 @@ struct alignas(16) FoldWindow {
     float total_decay[kStateDim];
 };
 
-__device__ __forceinline__ void publish_conv(const FoldArguments& a, KdaReplayFoldRow row,
+template <class StateT>
+__device__ __forceinline__ void publish_conv(const FoldArguments<StateT>& a, KdaReplayFoldRow row,
                                              std::int64_t column, int layer, int stripe,
                                              int stripes, int lane) {
     constexpr int kVectorChannels = sizeof(uint4) / sizeof(__nv_bfloat16);
@@ -98,9 +94,9 @@ __device__ __forceinline__ float4 scaled(float4 a, float4 b) {
     return {a.x * b.x, a.y * b.y, a.z * b.z, a.w * b.w};
 }
 
-template <int Warps>
-__device__ __forceinline__ void fold_one(const FoldArguments& a, const float* source,
-                                         float* destination, std::int64_t column, int head,
+template <int Warps, class StateT>
+__device__ __forceinline__ void fold_one(const FoldArguments<StateT>& a, const StateT* source,
+                                         StateT* destination, std::int64_t column, int head,
                                          int qhead, int row, int lane, int col) {
     float4 initial[kRowsPerWarp];
 #pragma unroll
@@ -122,9 +118,9 @@ __device__ __forceinline__ void fold_one(const FoldArguments& a, const float* so
     }
 }
 
-template <int Warps>
+template <int Warps, class StateT>
 __device__ __forceinline__ void
-fold_chunk(const FoldArguments& a, FoldWindow<Warps * kRowsPerWarp>& sm,
+fold_chunk(const FoldArguments<StateT>& a, FoldWindow<Warps * kRowsPerWarp>& sm,
            float4 (&state)[kRowsPerWarp], std::int64_t column, int width, int head, int qhead,
            int tile, int warp, int lane, int col) {
     constexpr int TileRows = Warps * kRowsPerWarp;
@@ -193,9 +189,9 @@ fold_chunk(const FoldArguments& a, FoldWindow<Warps * kRowsPerWarp>& sm,
     }
 }
 
-template <int Warps>
+template <int Warps, class StateT>
 __device__ __forceinline__ void
-fold_short(const FoldArguments& a, FoldWindow<Warps * kRowsPerWarp>& sm,
+fold_short(const FoldArguments<StateT>& a, FoldWindow<Warps * kRowsPerWarp>& sm,
            float4 (&state)[kRowsPerWarp], std::int64_t column, int width, int head, int qhead,
            int tile, int warp, int lane, int col) {
     constexpr int TileRows = Warps * kRowsPerWarp;
@@ -237,10 +233,9 @@ fold_short(const FoldArguments& a, FoldWindow<Warps * kRowsPerWarp>& sm,
         }
 }
 
-template <class Rows, int Warps>
-__global__ __launch_bounds__(32 * Warps,
-                             2) void linear_fold_kernel(const __grid_constant__ FoldArguments a,
-                                                        const __grid_constant__ Rows rows) {
+template <class Rows, int Warps, class StateT>
+__global__ __launch_bounds__(32 * Warps, 2) void linear_fold_kernel(
+    const __grid_constant__ FoldArguments<StateT> a, const __grid_constant__ Rows rows) {
     constexpr int TileRows = Warps * kRowsPerWarp;
     constexpr int Tiles    = kStateDim / TileRows;
     static_assert(kStateDim % TileRows == 0 && Warps <= 16);
@@ -255,8 +250,8 @@ __global__ __launch_bounds__(32 * Warps,
     const auto column = (std::int64_t(layer) * a.capacity + a.row_begin + batch) * a.width;
     auto* head_state =
         a.recurrent + layer * a.recurrent_stride + std::int64_t(head) * kStateDim * kStateDim;
-    auto* destination   = head_state + row.destination_offset / sizeof(float);
-    const auto* source  = head_state + row.source_offset / sizeof(float);
+    auto* destination = head_state + row.destination_offset / static_cast<std::int64_t>(sizeof(StateT));
+    const auto* source = head_state + row.source_offset / static_cast<std::int64_t>(sizeof(StateT));
     const int first_row = tile * TileRows;
     __shared__ FoldWindow<TileRows> sm;
     if (commit == 1) {
@@ -289,33 +284,34 @@ __global__ __launch_bounds__(32 * Warps,
                      lane);
 }
 
-template <class Rows>
-void launch(const KdaReplayRecords& r, LinearAttentionStateAllLayersView s, const Rows& rows,
-            int row_begin, int batch, CudaExecutionView execution) {
+template <class Rows, class StateT>
+void launch_typed(const KdaReplayRecords& r, LinearAttentionStateAllLayersView s, const Rows& rows,
+                  int row_begin, int batch, CudaExecutionView execution) {
     const auto [key, delta, alpha] = ninfer::detail::KdaReplayRecordAccess::planes(r);
-    FoldArguments a{static_cast<const __nv_bfloat16*>(key.data),
-                    static_cast<const __nv_bfloat16*>(r.conv.data),
-                    static_cast<const float*>(delta.data),
-                    static_cast<const float*>(alpha.data),
-                    common::operand::state_field_base<float>(s.recurrent),
-                    common::operand::state_field_base<__nv_bfloat16>(s.conv),
-                    static_cast<std::int64_t>(s.recurrent.field.layer_stride / sizeof(float)),
-                    static_cast<std::int64_t>(s.conv.field.layer_stride / sizeof(__nv_bfloat16)),
-                    r.spec.qk_heads,
-                    r.spec.value_heads,
-                    r.spec.value_heads / r.spec.qk_heads,
-                    r.spec.conv_channels,
-                    r.spec.width,
-                    r.spec.record_capacity,
-                    row_begin,
-                    0};
+    FoldArguments<StateT> a{
+        static_cast<const __nv_bfloat16*>(key.data),
+        static_cast<const __nv_bfloat16*>(r.conv.data),
+        static_cast<const float*>(delta.data),
+        static_cast<const float*>(alpha.data),
+        common::operand::state_field_base<StateT>(s.recurrent),
+        common::operand::state_field_base<__nv_bfloat16>(s.conv),
+        static_cast<std::int64_t>(s.recurrent.field.layer_stride / sizeof(StateT)),
+        static_cast<std::int64_t>(s.conv.field.layer_stride / sizeof(__nv_bfloat16)),
+        r.spec.qk_heads,
+        r.spec.value_heads,
+        r.spec.value_heads / r.spec.qk_heads,
+        r.spec.conv_channels,
+        r.spec.width,
+        r.spec.record_capacity,
+        row_begin,
+        0};
     for (std::int64_t begin = 0; begin < r.spec.layers; begin += kGridExtent) {
         a.layer_begin     = static_cast<int>(begin);
         const auto layers = std::min<std::int64_t>(kGridExtent, r.spec.layers - begin);
         const auto submit = [&]<int Warps>() {
             constexpr int tiles = kStateDim / (Warps * kRowsPerWarp);
             const dim3 grid(unsigned(r.spec.value_heads) * tiles, layers, batch);
-            linear_fold_kernel<Rows, Warps>
+            linear_fold_kernel<Rows, Warps, StateT>
                 <<<grid, common::kWarpSize * Warps, 0, execution.stream()>>>(a, rows);
         };
         const int warps =
@@ -327,6 +323,21 @@ void launch(const KdaReplayRecords& r, LinearAttentionStateAllLayersView s, cons
         else
             submit.template operator()<4>();
         CUDA_CHECK(cudaGetLastError());
+    }
+}
+
+template <class Rows>
+void launch(const KdaReplayRecords& r, LinearAttentionStateAllLayersView s, const Rows& rows,
+            int row_begin, int batch, CudaExecutionView execution) {
+    switch (s.recurrent.field.tensor.dtype) {
+    case DType::FP32:
+        launch_typed<Rows, float>(r, s, rows, row_begin, batch, execution);
+        return;
+    case DType::BF16:
+        launch_typed<Rows, __nv_bfloat16>(r, s, rows, row_begin, batch, execution);
+        return;
+    default:
+        throw std::logic_error("kda_replay_fold: unsupported recurrent state dtype");
     }
 }
 } // namespace

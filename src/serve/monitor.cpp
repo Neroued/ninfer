@@ -38,6 +38,7 @@ void HttpServer::register_monitor_routes() {
             {"max_concurrency", description.max_concurrency},
             {"prefill_chunk", description.prefill_chunk},
             {"kv_cache", kv_cache_profile_info(description.kv_cache).name},
+            {"linear_state_dtype", linear_state_dtype_name(description.linear_state_dtype)},
             {"context_token_capacity_estimate", description.context_token_capacity_estimate}};
         out["ranks"] = Json::array();
         for (const auto& r : description.ranks)

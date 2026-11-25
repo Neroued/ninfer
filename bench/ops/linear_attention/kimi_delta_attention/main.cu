@@ -8,8 +8,10 @@ namespace {
 void run_ragged(const kda::Options& options, L2FlushBuffer& flush, CudaExecutionView cuda) {
     kda::RaggedWeights weights(options);
     measurement::Csv csv(options.timing.csv_out,
-                         std::string(kda::Traffic::columns) + ",record_origin,state_form");
-    const auto extra = ",none," + std::string(ragged::state_form_name(options.state_form));
+                         std::string(kda::Traffic::columns) +
+                             ",record_origin,state_form,state_dtype");
+    const auto extra = ",none," + std::string(ragged::state_form_name(options.state_form)) + "," +
+                       kda::state_dtype_name(options.state_dtype);
     for (const auto& lengths : options.ragged_specs) {
         kda::RaggedFixture fixture(options, lengths, weights);
         const auto bytes = kda::traffic(fixture);
@@ -57,7 +59,7 @@ int main(int argc, char** argv) {
             return 0;
         }
         measurement::Csv csv(o.timing.csv_out,
-                             std::string(kda::Traffic::columns) + ",record_origin");
+                             std::string(kda::Traffic::columns) + ",record_origin,state_dtype");
         for (int t : o.tokens) {
             kda::Fixture f(o, t);
             const auto bytes = kda::traffic(f, o.op);
@@ -94,7 +96,8 @@ int main(int argc, char** argv) {
                                            o.op == "input-record"
                                        ? "projection"
                                    : o.op == "fold" || o.op == "record" ? "provided"
-                                                                        : "none"));
+                                                                        : "none") +
+                                  "," + kda::state_dtype_name(o.state_dtype));
                 }
         }
     } catch (const std::exception& e) {

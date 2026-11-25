@@ -70,6 +70,7 @@ void encode(Encoder& out, const RankExecutionDescription& r) {
     out.boolean(s.cuda_graph);
     out.boolean(s.gpu_timing);
     out.u8(static_cast<std::uint8_t>(s.length_policy));
+    out.u8(static_cast<std::uint8_t>(s.linear_state_dtype));
     out.u8(static_cast<std::uint8_t>(p.decode_path));
     encode_batch_execution_spec(out, p.batches->spec());
     context::encode_directory(out, p.context);
@@ -93,7 +94,8 @@ RankExecutionDescription decode_rank_execution(Decoder& in) {
                      in.boolean(),
                      in.boolean(),
                      in.boolean(),
-                     static_cast<SpeculativeLengthPolicy>(in.u8())};
+                     static_cast<SpeculativeLengthPolicy>(in.u8()),
+                     static_cast<LinearStateDType>(in.u8())};
     p.decode_path = static_cast<ExecutionPath>(in.u8());
     p.batches = std::make_shared<const BatchExecutionPlan>(decode_batch_execution_spec(in));
     if (p.shape.cuda_graph)

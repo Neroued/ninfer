@@ -20,7 +20,8 @@ struct StateLayout {
     std::optional<QsaTailLayout> mtp_qsa;
 };
 
-[[nodiscard]] StateLayout plan_state_image(const Config&, const GdnConfig&);
+[[nodiscard]] StateLayout plan_state_image(const Config&, const GdnConfig&,
+                                           LinearStateDType = LinearStateDType::Float32);
 
 class StateViews {
 public:

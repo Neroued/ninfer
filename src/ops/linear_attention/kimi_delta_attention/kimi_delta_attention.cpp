@@ -10,8 +10,8 @@ constexpr const char* op = "kimi_delta_attention";
 
 kda::Arguments arguments(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
                          const Tensor& beta, const Tensor& a_log, const Tensor& dt_bias,
-                         float lower_bound, float scale, const float* state_in, float* state_out,
-                         Tensor& out) {
+                         float lower_bound, float scale, const void* state_in, void* state_out,
+                         DType state_dtype, Tensor& out) {
     return {static_cast<const __nv_bfloat16*>(q.data),
             static_cast<const __nv_bfloat16*>(k.data),
             static_cast<const __nv_bfloat16*>(v.data),
@@ -21,6 +21,7 @@ kda::Arguments arguments(const Tensor& q, const Tensor& k, const Tensor& v, cons
             static_cast<const float*>(dt_bias.data),
             state_in,
             state_out,
+            state_dtype,
             static_cast<__nv_bfloat16*>(out.data),
             q.ne[1],
             v.ne[1],
@@ -89,8 +90,12 @@ void kimi_delta_attention(const Tensor& q, const Tensor& k, const Tensor& v, con
     const auto p = kda::validate_inputs(q, k, v, g, beta, a_log, dt_bias, lower_bound, scale, out,
                                         execution.device());
     if (p.batch != 1) throw std::invalid_argument("kimi_delta_attention: full window requires B=1");
+    if (!kda::is_supported_state_dtype(state_in.dtype) || state_in.dtype != state_out.dtype)
+        throw std::invalid_argument(
+            "kimi_delta_attention: recurrent state must be matching FP32 or BF16");
+    const DType state_dtype = state_in.dtype;
     for (const auto* state : {&state_in, static_cast<const Tensor*>(&state_out)}) {
-        common::operand::tensor(*state, DType::FP32, {128, 128, p.value_heads}, 16, op, "State",
+        common::operand::tensor(*state, state_dtype, {128, 128, p.value_heads}, 16, op, "State",
                                 execution.device());
         for (const auto* t :
              {&q, &k, &v, &g, &beta, &a_log, &dt_bias, static_cast<const Tensor*>(&out)})
@@ -100,9 +105,8 @@ void kimi_delta_attention(const Tensor& q, const Tensor& k, const Tensor& v, con
     if (state_in.data != state_out.data)
         common::operand::disjoint(common::operand::range(state_in, op),
                                   common::operand::range(state_out, op), op);
-    const auto args = arguments(q, k, v, g, beta, a_log, dt_bias, lower_bound, scale,
-                                static_cast<const float*>(state_in.data),
-                                static_cast<float*>(state_out.data), out);
+    const auto args = arguments(q, k, v, g, beta, a_log, dt_bias, lower_bound, scale, state_in.data,
+                                state_out.data, state_dtype, out);
     const auto plan =
         kda::select_recurrence_plan(p.value_heads, p.tokens, execution.multiprocessor_count());
     if (plan.route == kda::RecurrenceRoute::Recurrent) {
@@ -131,8 +135,10 @@ void kimi_delta_attention(const Tensor& q, const Tensor& k, const Tensor& v, con
     if (p.batch != 1 || p.tokens != ragged.total_tokens())
         throw std::invalid_argument("kimi_delta_attention: ragged shape mismatch");
     const kda::Geometry state_geometry{p.qk_heads, p.value_heads, 1, ragged.num_seqs()};
-    kda::validate_state(source, state_geometry, execution.device());
-    kda::validate_state(destination, state_geometry, execution.device());
+    const DType state_dtype = kda::validate_state(source, state_geometry, execution.device());
+    if (kda::validate_state(destination, state_geometry, execution.device()) != state_dtype)
+        throw std::invalid_argument(
+            "kimi_delta_attention: source and destination state dtypes must match");
     const Tensor* metadata[] = {&ragged.cu_seqlens, &ragged.seq_lengths, &ragged.token_to_seq,
                                 &source.records.byte_offsets, &destination.records.byte_offsets};
     for (const auto* meta : metadata)
@@ -140,8 +146,9 @@ void kimi_delta_attention(const Tensor& q, const Tensor& k, const Tensor& v, con
                                   common::operand::range(*meta, op), op);
 
     auto args          = arguments(q, k, v, g, beta, a_log, dt_bias, lower_bound, scale,
-                                   common::operand::state_field_base<const float>(source),
-                                   common::operand::state_field_base<float>(destination), out);
+                                   common::operand::state_field_base<const void>(source),
+                                   common::operand::state_field_base<void>(destination), state_dtype,
+                                   out);
     args.source_offset = static_cast<const std::int64_t*>(source.records.byte_offsets.data);
     args.destination_offset =
         static_cast<const std::int64_t*>(destination.records.byte_offsets.data);
@@ -264,8 +271,10 @@ void kimi_delta_attention_batch_update(const Tensor& q, const Tensor& k, const T
                                         execution.device());
     if (p.tokens != 1)
         throw std::invalid_argument("kimi_delta_attention: batch update requires T=1");
-    kda::validate_state(source, p, execution.device());
-    kda::validate_state(destination, p, execution.device());
+    const DType state_dtype = kda::validate_state(source, p, execution.device());
+    if (kda::validate_state(destination, p, execution.device()) != state_dtype)
+        throw std::invalid_argument(
+            "kimi_delta_attention: source and destination state dtypes must match");
     if (valid.data) {
         common::operand::tensor(valid, DType::I32, {p.batch}, 4, op, "valid columns",
                                 execution.device());
@@ -277,8 +286,8 @@ void kimi_delta_attention_batch_update(const Tensor& q, const Tensor& k, const T
                                   common::operand::range(*metadata, op), op);
     kda::launch_batch_update(
         arguments(q, k, v, g, beta, a_log, dt_bias, lower_bound, scale,
-                  common::operand::state_field_base<const float>(source),
-                  common::operand::state_field_base<float>(destination), out),
+                  common::operand::state_field_base<const void>(source),
+                  common::operand::state_field_base<void>(destination), state_dtype, out),
         static_cast<const std::int64_t*>(source.records.byte_offsets.data),
         static_cast<const std::int64_t*>(destination.records.byte_offsets.data),
         static_cast<const std::int32_t*>(valid.data), p.batch, execution.stream());
@@ -292,7 +301,7 @@ void kimi_delta_attention_replay_record(const Tensor& q, const Tensor& k, const 
                                         CudaExecutionView execution) {
     const auto p = kda::validate_inputs(q, k, v, g, beta, a_log, dt_bias, lower_bound, scale, out,
                                         execution.device());
-    kda::validate_state(source, p, execution.device());
+    const DType state_dtype = kda::validate_state(source, p, execution.device());
     if (valid.data)
         common::operand::tensor(valid, DType::I32, {p.batch}, 4, op, "valid columns",
                                 execution.device());
@@ -318,7 +327,7 @@ void kimi_delta_attention_replay_record(const Tensor& q, const Tensor& k, const 
     }
     kda::launch_record(
         arguments(q, k, v, g, beta, a_log, dt_bias, lower_bound, scale,
-                  common::operand::state_field_base<const float>(source), nullptr, out),
+                  common::operand::state_field_base<const void>(source), nullptr, state_dtype, out),
         static_cast<const std::int64_t*>(source.records.byte_offsets.data),
         static_cast<const std::int32_t*>(valid.data),
         {static_cast<__nv_bfloat16*>(key.data), static_cast<float*>(delta.data),

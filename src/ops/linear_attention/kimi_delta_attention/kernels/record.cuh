@@ -2,7 +2,7 @@
 #include "ops/linear_attention/kimi_delta_attention/kernels/transition.cuh"
 
 namespace ninfer::ops::detail::kimi_delta_attention {
-template <int Steps, int Rows, bool GroupStateTiles = false, int TokenUnroll = Steps,
+template <int Steps, int Rows, class StateT, bool GroupStateTiles = false, int TokenUnroll = Steps,
           bool PackedTransition = false>
 __global__
 __launch_bounds__(128, 2) void staged_record_kernel(Arguments a, const std::int64_t* sources,
@@ -25,9 +25,10 @@ __launch_bounds__(128, 2) void staged_record_kernel(Arguments a, const std::int6
         return;
     }
     const auto state_base =
-        sources[batch] / sizeof(float) + static_cast<std::int64_t>(head) * 128 * 128;
+        sources[batch] / static_cast<std::int64_t>(sizeof(StateT)) +
+        static_cast<std::int64_t>(head) * 128 * 128;
     __align__(16) float state[Rows][4];
-    load_state(state, a.state_in + state_base, dv, dk);
+    load_state(state, static_cast<const StateT*>(a.state_in) + state_base, dv, dk);
 
     __shared__ struct {
         float key[Steps][128], query[Steps][128], alpha[Steps][128], value[Steps][128], beta[Steps];

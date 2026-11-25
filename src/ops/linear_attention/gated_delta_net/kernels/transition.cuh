@@ -33,14 +33,16 @@ static_assert(kStateDim % common::kWarpSize == 0);
 static_assert(kQkPerLane == 4);
 static_assert(kStateDim % kBlockDv == 0);
 
-__device__ __forceinline__ void load_qk_lane(float (&reg)[kQkPerLane], const float* base,
+template <class StateT>
+__device__ __forceinline__ void load_qk_lane(float (&reg)[kQkPerLane], const StateT* base,
                                              std::uint32_t dqk_base) {
-    common::store_vec(reg, common::load_vec<float4>(base + dqk_base));
+    common::load_state_vec4(reg, base + dqk_base);
 }
 
-__device__ __forceinline__ void store_qk_lane(const float (&reg)[kQkPerLane], float* base,
+template <class StateT>
+__device__ __forceinline__ void store_qk_lane(const float (&reg)[kQkPerLane], StateT* base,
                                               std::uint32_t dqk_base) {
-    common::store_vec(base + dqk_base, common::load_vec<float4>(reg));
+    common::store_state_vec4(base + dqk_base, reg);
 }
 
 inline constexpr float kQkL2NormEps = 1.0e-6f;
@@ -187,8 +189,9 @@ struct OutputEffects {
     }
 };
 
+template <class StateT>
 __device__ __forceinline__ void load_state_tile(float (&state)[kDvPerWarp][kQkPerLane],
-                                                const float* base,
+                                                const StateT* base,
                                                 const RecurrentCoordinates& coord) {
 #pragma unroll
     for (int r = 0; r < kDvPerWarp; ++r) {
@@ -197,8 +200,9 @@ __device__ __forceinline__ void load_state_tile(float (&state)[kDvPerWarp][kQkPe
     }
 }
 
+template <class StateT>
 __device__ __forceinline__ void store_state_tile(const float (&state)[kDvPerWarp][kQkPerLane],
-                                                 float* base, const RecurrentCoordinates& coord) {
+                                                 StateT* base, const RecurrentCoordinates& coord) {
 #pragma unroll
     for (int r = 0; r < kDvPerWarp; ++r) {
         store_qk_lane(state[r], base + static_cast<std::int64_t>(coord.dv_base + r) * kStateDim,

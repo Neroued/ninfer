@@ -82,8 +82,10 @@ private:
 
 class FoldFixture {
 public:
-    FoldFixture(const Profile& profile, std::int32_t width, std::int32_t batch)
+    FoldFixture(const Profile& profile, std::int32_t width, std::int32_t batch,
+                DType state_dtype = DType::FP32)
         : profile_(profile), width_(width), batch_(batch), state_records_(std::max(11, batch + 3)),
+          state_dtype_(state_dtype),
           record_storage_(ninfer::bench::device_context().device(),
                           record_bytes(profile, width, batch)),
           records_(record_storage_.span(), record_layout_),
@@ -103,9 +105,15 @@ public:
             CUDA_CHECK(bench::fixture::fill_values(static_cast<__nv_bfloat16*>(initial_conv.data()),
                                                    initial_conv.size() / 2, 401U + layer, -.5F,
                                                    .5F));
-            CUDA_CHECK(bench::fixture::fill_values(static_cast<float*>(initial_recurrent.data()),
-                                                   initial_recurrent.size() / 4, 501U + layer,
-                                                   -.02F, .02F));
+            if (state_dtype_ == DType::BF16) {
+                CUDA_CHECK(bench::fixture::fill_values(
+                    static_cast<__nv_bfloat16*>(initial_recurrent.data()),
+                    initial_recurrent.size() / 2, 501U + layer, -.02F, .02F));
+            } else {
+                CUDA_CHECK(bench::fixture::fill_values(
+                    static_cast<float*>(initial_recurrent.data()), initial_recurrent.size() / 4,
+                    501U + layer, -.02F, .02F));
+            }
             for (int record = 0; record < state_records_; ++record) {
                 auto conv      = states_.conv_tensor(layer, byte_offset(record));
                 auto recurrent = states_.recurrent_tensor(layer, byte_offset(record));
@@ -161,16 +169,17 @@ private:
                                                  .value_dim       = kStateDim});
     }
 
-    static LinearAttentionStateLayout make_state_layout(const Profile& profile,
+    static LinearAttentionStateLayout make_state_layout(const Profile& profile, DType state_dtype,
                                                         StateImageBuilder& builder) {
         return plan_linear_attention_state(builder,
                                            {.layers = static_cast<std::uint32_t>(profile.layers),
-                                            .conv_channels  = profile.conv_channels,
-                                            .conv_width     = 3,
-                                            .value_heads    = profile.value_heads,
-                                            .value_head_dim = kStateDim,
-                                            .key_head_dim   = kStateDim,
-                                            .conv_dtype     = DType::BF16});
+                                            .conv_channels   = profile.conv_channels,
+                                            .conv_width      = 3,
+                                            .value_heads     = profile.value_heads,
+                                            .value_head_dim  = kStateDim,
+                                            .key_head_dim    = kStateDim,
+                                            .conv_dtype      = DType::BF16,
+                                            .recurrent_dtype = state_dtype});
     }
 
     static std::size_t record_bytes(const Profile& profile, std::int32_t width,
@@ -182,12 +191,14 @@ private:
 
     Profile profile_;
     std::int32_t width_, batch_, state_records_;
+    DType state_dtype_;
     LayoutBuilder record_builder_;
     GdnReplayRecordLayout record_layout_ =
         make_record_layout(profile_, width_, batch_, record_builder_);
     StateImageBuilder state_builder_;
-    LinearAttentionStateLayout state_layout_ = make_state_layout(profile_, state_builder_);
-    StateImageLayout image_layout_           = state_builder_.finish();
+    LinearAttentionStateLayout state_layout_ =
+        make_state_layout(profile_, state_dtype_, state_builder_);
+    StateImageLayout image_layout_ = state_builder_.finish();
     DeviceBuffer record_storage_;
     GdnReplayRecords records_;
     DeviceBuffer state_storage_;
@@ -199,9 +210,13 @@ private:
 
 class RecordFixture {
 public:
-    RecordFixture(const Profile& profile, int width, int batch, const std::vector<int>& valid)
-        : value_heads_(profile.value_heads), batch_(batch), inputs_(profile, width, batch),
-          state_(bench::make_f32(state_elements() * batch_, 217U, -.02F, .02F)),
+    RecordFixture(const Profile& profile, int width, int batch, const std::vector<int>& valid,
+                  DType state_dtype = DType::FP32)
+        : value_heads_(profile.value_heads), batch_(batch), state_dtype_(state_dtype),
+          inputs_(profile, width, batch),
+          state_(state_dtype == DType::BF16
+                     ? bench::make_bf16(state_elements() * batch_, 217U, -.02F, .02F)
+                     : bench::make_f32(state_elements() * batch_, 217U, -.02F, .02F)),
           initial_(make_offsets(initial_offsets())),
           valid_(valid.empty() ? DeviceBuffer{} : make_i32(valid)),
           layout_(plan_gdn_replay_records(builder_,
@@ -215,8 +230,8 @@ public:
     void launch_record(CudaExecutionView cuda) {
         Tensor initial(initial_.span(), DType::I64, {batch_});
         Tensor valid = valid_.data() ? Tensor(valid_.span(), DType::I32, {batch_}) : Tensor{};
-        TensorRegion region{{0, state_elements() * sizeof(float), 16},
-                            DType::FP32,
+        TensorRegion region{{0, state_elements() * dtype_size(state_dtype_), 16},
+                            state_dtype_,
                             {kStateDim, kStateDim, value_heads_, 1}};
         const ConstStateFieldView source{{state_.span(), initial}, StateFieldLayout{region, 1, 0}};
         inputs_.record(source, valid, records_.layer(0, batch_).recurrence, cuda);
@@ -230,11 +245,12 @@ private:
     std::vector<std::int64_t> initial_offsets() const {
         std::vector<std::int64_t> offsets(batch_);
         for (int row = 0; row < batch_; ++row)
-            offsets[row] = row * state_elements() * sizeof(float);
+            offsets[row] = row * state_elements() * dtype_size(state_dtype_);
         return offsets;
     }
 
     int value_heads_, batch_;
+    DType state_dtype_;
     RecordInputs inputs_;
     DeviceBuffer state_, initial_, valid_;
     LayoutBuilder builder_;

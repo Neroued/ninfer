@@ -176,9 +176,9 @@ private:
 };
 
 template <class Readout>
-auto capture_readout(DeviceContext& device, const Readout& call) {
-    return [&device, call](ops::ContextBucket bucket, cudaStream_t stream) {
-        call.execute(bucket, device.execution_view(stream));
+auto capture_readout(const Readout& call) {
+    return [call](ops::ContextBucket bucket, CudaExecutionView cuda) {
+        call.execute(bucket, cuda);
     };
 }
 
@@ -192,7 +192,7 @@ ContextBucketBinding bind_readout(DeviceContext& device, ops::ContextBucketRange
         };
     else
         profile = [call](auto bucket) { return call.profile(bucket); };
-    return {buckets, std::move(profile), capture_readout(device, call), offset};
+    return {buckets, std::move(profile), capture_readout(call), offset};
 }
 
 template <class Cache>
@@ -218,7 +218,7 @@ auto readout_operands(const Readout& call) {
 }
 
 template <class Readout>
-void record_readout(DeviceContext& device, const ReadoutRecorder& record, const Readout& expected,
+void record_readout(const ReadoutRecorder& record, const Readout& expected,
                     const Readout& actual) {
     if (expected.query.data != actual.query.data || expected.key.data != actual.key.data ||
         expected.value.data != actual.value.data || expected.output.data != actual.output.data ||
@@ -228,7 +228,7 @@ void record_readout(DeviceContext& device, const ReadoutRecorder& record, const 
         readout_operands(expected) != readout_operands(actual))
         throw std::logic_error(
             "Qwen3.5 graph readout differs from its bound workspace or operands");
-    record(capture_readout(device, actual));
+    record(capture_readout(actual));
 }
 
 ReadoutCapture bind_mtp_step(RankProgramImpl& p, ops::ContextBucketRange buckets,
@@ -239,7 +239,7 @@ ReadoutCapture bind_mtp_step(RankProgramImpl& p, ops::ContextBucketRange buckets
         capture.body = [&p, batch, step, call,
                         bucket = buckets.first](const ReadoutRecorder& record) {
             p.run_mtp_draft_step(batch, step, bucket, [&](const auto& actual) {
-                record_readout(p.device, record, call, actual);
+                record_readout(record, call, actual);
             });
         };
     });
@@ -267,10 +267,10 @@ ReadoutCapture bind_dflash(RankProgramImpl& p, ops::ContextBucketRange buckets,
         p.run_dflash_draft(route, std::span(&buckets.first, 1),
                            {buckets,
                             [&](const auto& actual) {
-                                record_readout(p.device, record, local.at(next_local++), actual);
+                                record_readout(record, local.at(next_local++), actual);
                             },
                             [&](const auto& actual) {
-                                record_readout(p.device, record, full.at(next_full++), actual);
+                                record_readout(record, full.at(next_full++), actual);
                             }});
     };
     return capture;
@@ -371,7 +371,7 @@ ResidentTargetCapture bind_resident(RankProgramImpl& p, ops::ContextBucketRange 
         std::size_t next = 0;
         for (std::uint32_t layer = 0; layer < p.parameters.text.layers.size(); ++layer) {
             run->mixer(layer, [&](const auto& actual) {
-                record_readout(p.device, record, expected.at(next++), actual);
+                record_readout(record, expected.at(next++), actual);
             });
             run->post_mixer(layer);
             run->capture_features(layer);
@@ -405,13 +405,10 @@ OffloadedTargetCapture bind_offloaded(RankProgramImpl& p, ops::ContextBucketRang
                 expected = call;
                 mixer.readouts.push_back(bind_readout(p.device, buckets, call));
             });
-        mixer.body = [&p, run, layer, routed = bool(routed),
-                      expected](const ReadoutRecorder& record) {
+        mixer.body = [run, layer, routed = bool(routed), expected](const ReadoutRecorder& record) {
             execution::CausalAttentionSubmit readout;
             if (expected)
-                readout = [&](const auto& actual) {
-                    record_readout(p.device, record, *expected, actual);
-                };
+                readout = [&](const auto& actual) { record_readout(record, *expected, actual); };
             run->mixer(layer, readout);
             if (!routed) {
                 run->post_mixer(layer);

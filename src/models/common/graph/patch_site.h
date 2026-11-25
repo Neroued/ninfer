@@ -11,13 +11,13 @@ namespace ninfer::models {
 class ContextBucketSite {
 public:
     using Profile = std::function<ops::OpGraphProfile(ops::ContextBucket)>;
-    using Capture = std::function<void(ops::ContextBucket, cudaStream_t)>;
+    using Capture = std::function<void(ops::ContextBucket, CudaExecutionView)>;
 
-    ContextBucketSite(ops::ContextBucketRange, cudaStream_t, const Profile&, const Capture&);
+    ContextBucketSite(ops::ContextBucketRange, CudaExecutionView, const Profile&, const Capture&);
 
     // The inline body uses the same operand bindings as the standalone patch captures.
-    void record(cudaStream_t, const Capture&);
-    void record(cudaStream_t, const Capture&, const moe::MixerSliceRecorder&) const;
+    void record(CudaExecutionView, const Capture&);
+    void record(CudaExecutionView, const Capture&, const moe::MixerSliceRecorder&) const;
 
     void select(DecodeGraphExecutable&, ops::ContextBucket);
     void select(moe::LayerGraphExecutable&, std::size_t slice, ops::ContextBucket);
@@ -39,9 +39,9 @@ private:
 
 class SlotPatchSite {
 public:
-    using Capture = std::function<void(std::uint32_t, cudaStream_t)>;
+    using Capture = std::function<void(std::uint32_t, CudaExecutionView)>;
 
-    SlotPatchSite(cudaStream_t, const Capture&);
+    SlotPatchSite(CudaExecutionView, const Capture&);
     void append(cudaStream_t);
     void select(DecodeGraphExecutable&, std::uint32_t);
 
@@ -83,9 +83,9 @@ using ReadoutRecorder = std::function<void(const ContextBucketSite::Capture&)>;
 using ReadoutBody     = std::function<void(const ReadoutRecorder&)>;
 
 [[nodiscard]] std::vector<ContextBucketSite>
-    prepare_readouts(cudaStream_t, std::span<const ContextBucketBinding>);
+    prepare_readouts(CudaExecutionView, std::span<const ContextBucketBinding>);
 
-void record_readouts(cudaStream_t, std::span<ContextBucketSite>, const ReadoutBody&,
+void record_readouts(CudaExecutionView, std::span<ContextBucketSite>, const ReadoutBody&,
                      const moe::MixerSliceRecorder* = nullptr);
 
 } // namespace ninfer::models

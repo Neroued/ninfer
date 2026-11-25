@@ -10,31 +10,30 @@ namespace ninfer::models::qwen4_exp::detail {
 
 namespace {
 
-auto capture_readout(DeviceContext& device, execution::QsaReadout call,
+auto capture_readout(execution::QsaReadout call,
                      void (execution::QsaReadout::*execute)(ops::ContextBucket, CudaExecutionView)
                          const) {
-    return
-        [&device, call = std::move(call), execute](ops::ContextBucket bucket, cudaStream_t stream) {
-            (call.*execute)(bucket, device.execution_view(stream));
-        };
+    return [call = std::move(call), execute](ops::ContextBucket bucket, CudaExecutionView cuda) {
+        (call.*execute)(bucket, cuda);
+    };
 }
 
 void bind_qsa(std::vector<ContextBucketBinding>& bindings, DeviceContext& device,
               ops::ContextBucketRange buckets, const execution::QsaReadout& call) {
     const int sms = device.multiprocessor_count();
     bindings.push_back({buckets, [call](auto b) { return call.index_profile(b); },
-                        capture_readout(device, call, &execution::QsaReadout::indexer)});
+                        capture_readout(call, &execution::QsaReadout::indexer)});
     bindings.push_back({buckets, [call, sms](auto b) { return call.attention_profile(b, sms); },
-                        capture_readout(device, call, &execution::QsaReadout::attention)});
+                        capture_readout(call, &execution::QsaReadout::attention)});
 }
 
-void record_qsa(DeviceContext& device, const ReadoutRecorder& record,
-                const execution::QsaReadout& expected, const execution::QsaReadout& actual) {
+void record_qsa(const ReadoutRecorder& record, const execution::QsaReadout& expected,
+                const execution::QsaReadout& actual) {
     if (expected.query.data != actual.query.data || expected.output.data != actual.output.data ||
         expected.scratch.data != actual.scratch.data)
         throw std::logic_error("Qwen4Exp Graph readout binding differs from execution layout");
-    record(capture_readout(device, actual, &execution::QsaReadout::indexer));
-    record(capture_readout(device, actual, &execution::QsaReadout::attention));
+    record(capture_readout(actual, &execution::QsaReadout::indexer));
+    record(capture_readout(actual, &execution::QsaReadout::attention));
 }
 
 ReadoutCapture bind_mtp_step(RankProgramImpl& p, ops::ContextBucketRange buckets,
@@ -45,7 +44,7 @@ ReadoutCapture bind_mtp_step(RankProgramImpl& p, ops::ContextBucketRange buckets
     bind_qsa(capture.readouts, p.device, buckets, call);
     capture.body = [&p, step, batch, call](const ReadoutRecorder& record) {
         p.draft_forward(step, batch, p.shape.max_context, [&](const execution::QsaReadout& actual) {
-            record_qsa(p.device, record, call, actual);
+            record_qsa(record, call, actual);
         });
     };
     return capture;
@@ -77,8 +76,8 @@ ProposalCapture bind_proposal(RankProgramImpl& p, ops::ContextBucketRange bucket
         binding.forward = bind_mtp_step(p, buckets, step, batch);
         if (p.host_ple)
             binding.handoff = [&p, ids = p.draft_output_ids(step, batch),
-                               step](std::uint32_t slot, cudaStream_t stream) {
-                p.host_ple->capture_append(slot, ids, step, p.device.execution_view(stream));
+                               step](std::uint32_t slot, CudaExecutionView cuda) {
+                p.host_ple->capture_append(slot, ids, step, cuda);
             };
     }
     capture.verify_ids = [&p, batch, width] { prepare_verify_ids(p, batch, width); };
@@ -166,9 +165,9 @@ ResidentTargetCapture bind_resident(RankProgramImpl& p, ops::ContextBucketRange 
         }
     }
     if (p.host_ple)
-        capture.handoff = [&p, batch](std::uint32_t slot, cudaStream_t stream) {
-            auto run = main_run(p, batch, p.device.execution_view(stream));
-            consume_host_ple(p, run, batch, slot, stream);
+        capture.handoff = [&p, batch](std::uint32_t slot, CudaExecutionView cuda) {
+            auto run = main_run(p, batch, cuda);
+            consume_host_ple(p, run, batch, slot, cuda.stream());
         };
     const auto output = main_outputs(p, batch);
     capture.head      = bind_head(p, batch, output.sample);
@@ -186,7 +185,7 @@ ResidentTargetCapture bind_resident(RankProgramImpl& p, ops::ContextBucketRange 
         forward_resident(
             p, run, output,
             [&](const execution::QsaReadout& actual) {
-                record_qsa(p.device, record, expected.at(next++), actual);
+                record_qsa(record, expected.at(next++), actual);
             },
             [&] {
                 if (p.host_ple) {
@@ -222,9 +221,9 @@ OffloadedTargetCapture bind_offloaded(RankProgramImpl& p, ops::ContextBucketRang
         if (std::holds_alternative<execution::QsaParameters>(layer.mixer)) {
             const auto call = run->local_qsa(i).readout(buckets);
             bind_qsa(mixer.readouts, p.device, buckets, call);
-            mixer.body = [&p, run, i, call](const ReadoutRecorder& record) {
+            mixer.body = [run, i, call](const ReadoutRecorder& record) {
                 run->mixer(i, [&](const execution::QsaReadout& actual) {
-                    record_qsa(p.device, record, call, actual);
+                    record_qsa(record, call, actual);
                 });
             };
         } else {
@@ -235,10 +234,11 @@ OffloadedTargetCapture bind_offloaded(RankProgramImpl& p, ops::ContextBucketRang
                                   [run](const moe::GpuCall& call) { run->gpu_moe(call); },
                                   [run, i] { run->combine(i); }});
     }
-    capture.hook   = InterLayerHookCapture{p.parameters.profile->config.text.ple.layer,
-                                         [&p, run, batch](std::uint32_t slot, cudaStream_t stream) {
-                                             consume_host_ple(p, *run, batch, slot, stream);
-                                         }};
+    capture.hook = InterLayerHookCapture{
+        p.parameters.profile->config.text.ple.layer,
+        [&p, run, batch](std::uint32_t slot, CudaExecutionView cuda) {
+            consume_host_ple(p, *run, batch, slot, cuda.stream());
+        }};
     capture.suffix = [run, output] { run->finish(output); };
     capture.head   = bind_head(p, batch, output.sample);
     return capture;

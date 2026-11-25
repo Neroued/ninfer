@@ -933,8 +933,9 @@ int ragged_recurrence(const std::string& label, std::vector<int> lengths, int qk
     cudaGraphExec_t executable = nullptr;
     if (graph) {
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        const auto stream_execution = cuda_environment().context.execution_view(stream);
         CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
-        launch(cuda_environment().context.execution_view(stream));
+        launch(stream_execution);
         CUDA_CHECK(cudaStreamEndCapture(stream, &captured));
         CUDA_CHECK(cudaGraphInstantiate(&executable, captured, 0));
     }

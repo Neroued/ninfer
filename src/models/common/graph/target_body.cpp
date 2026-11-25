@@ -15,17 +15,18 @@ void select_readouts(DecodeGraphExecutable& executable, std::span<ContextBucketS
 } // namespace
 
 ProposalBody::ProposalBody(DeviceContext& device, const ProposalCapture& capture) {
+    const auto cuda = device.execution_view();
     steps_.reserve(capture.steps.size());
     for (const auto& source : capture.steps) {
         auto& step = steps_.emplace_back();
-        step.sites = prepare_readouts(device.stream(), source.forward.readouts);
+        step.sites = prepare_readouts(cuda, source.forward.readouts);
         step.bucket_offsets.reserve(step.sites.size());
         for (const auto& binding : source.forward.readouts)
             step.bucket_offsets.push_back(binding.bucket_offset);
         if (source.handoff) {
             if (!capture.handoff_stream || capture.handoff_stream == device.stream())
                 throw std::logic_error("proposal handoff requires a secondary stream");
-            step.handoff.emplace(device.stream(), source.handoff);
+            step.handoff.emplace(cuda, source.handoff);
         }
     }
     for (const auto& step : steps_) {
@@ -36,14 +37,15 @@ ProposalBody::ProposalBody(DeviceContext& device, const ProposalCapture& capture
     }
 }
 
-void ProposalBody::record(cudaStream_t stream, ParallelExecution* parallel,
+void ProposalBody::record(CudaExecutionView cuda, ParallelExecution* parallel,
                           const ProposalCapture& capture, bool gate_steps) {
+    const auto stream = cuda.stream();
     if (gate_steps && fork_) throw std::logic_error("gated proposal has a secondary handoff");
     if (capture.prefix) capture.prefix();
     for (std::size_t i = 0; i < steps_.size(); ++i) {
         auto& step         = steps_[i];
         const auto forward = [&] {
-            record_readouts(stream, step.sites, capture.steps[i].forward.body);
+            record_readouts(cuda, step.sites, capture.steps[i].forward.body);
         };
         if (gate_steps)
             gates_.capture_step(stream, parallel, forward);
@@ -106,13 +108,13 @@ void ResidentBody::prepare(DeviceContext& device, ParallelExecution* parallel,
     const auto stream = cuda.stream();
     parallel_         = parallel;
     if (proposal) proposal_.emplace(device, *proposal);
-    main_sites_ = prepare_readouts(stream, capture.readouts);
-    if (capture.handoff) handoff_.emplace(stream, capture.handoff);
+    main_sites_ = prepare_readouts(cuda, capture.readouts);
+    if (capture.handoff) handoff_.emplace(cuda, capture.handoff);
     graph_.prepare(
         cuda,
         [&] {
-            if (proposal_) proposal_->record(stream, parallel, *proposal, gate_steps);
-            record_readouts(stream, main_sites_, [&](const ReadoutRecorder& readout) {
+            if (proposal_) proposal_->record(cuda, parallel, *proposal, gate_steps);
+            record_readouts(cuda, main_sites_, [&](const ReadoutRecorder& readout) {
                 capture.body(
                     readout,
                     [&] {
@@ -162,7 +164,7 @@ void OffloadedLayeredBody::prepare(CudaExecutionView cuda, ParallelExecution* pa
         hook_layer_ = capture.hook->layer;
         if (*hook_layer_ > capture.layers.size())
             throw std::logic_error("invalid graph hook layer");
-        hook_slot_.emplace(cuda.stream(), capture.hook->body);
+        hook_slot_.emplace(cuda, capture.hook->body);
         hook_.prepare(cuda, [&] { hook_slot_->append(cuda.stream()); }, parallel);
         GraphPatchCalibration calibration;
         calibration.add(hook_.executable, *hook_slot_);
@@ -174,20 +176,19 @@ void OffloadedLayeredBody::prepare(CudaExecutionView cuda, ParallelExecution* pa
         GraphPatchCalibration calibration;
         if (const auto* resident = std::get_if<ReadoutCapture>(&source)) {
             auto& segment = std::get<GraphSegment>(layer.body);
-            layer.sites   = prepare_readouts(cuda.stream(), resident->readouts);
+            layer.sites   = prepare_readouts(cuda, resident->readouts);
             segment.prepare(
-                cuda, [&] { record_readouts(cuda.stream(), layer.sites, resident->body); },
-                parallel);
+                cuda, [&] { record_readouts(cuda, layer.sites, resident->body); }, parallel);
             calibration.add(segment.executable, layer.sites);
             calibration.run(preparation, [&] { segment.executable.upload(cuda.stream()); });
         } else {
             const auto& offloaded = std::get<OffloadedLayerCapture>(source);
             auto& graph           = layer.body.emplace<OffloadedLayer>();
-            layer.sites           = prepare_readouts(cuda.stream(), offloaded.mixer.readouts);
+            layer.sites           = prepare_readouts(cuda, offloaded.mixer.readouts);
             graph.definition      = schedule.capture_layer(
                 offloaded.bank, cuda, offloaded.geometry,
                 [&](const moe::MixerSliceRecorder& mixer) {
-                    record_readouts(cuda.stream(), layer.sites, offloaded.mixer.body, &mixer);
+                    record_readouts(cuda, layer.sites, offloaded.mixer.body, &mixer);
                 },
                 offloaded.gpu, offloaded.feature);
             if (graph.definition->mixer_slice_count() != layer.sites.size())

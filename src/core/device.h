@@ -85,7 +85,7 @@ struct DeviceContext {
 
     CudaExecutionView execution_view() const noexcept;
     CudaExecutionView transfer_view() const noexcept;
-    // Admit borrowed streams at their owner, before entering the execution chain.
+    // Admit non-capturing borrowed streams at their owner, before entering execution or capture.
     // nullptr denotes this device's legacy default stream; callers still bind the device.
     CudaExecutionView execution_view(cudaStream_t borrowed_stream) const;
     std::size_t total_vram() const noexcept;

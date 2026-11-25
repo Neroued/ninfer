@@ -141,7 +141,7 @@ void DecodeGraphSuite::prepare_proposal(const speculative::RoundRoute& route,
     const auto capture = bind_proposal(bindings, route);
     entry.body.emplace(device_, capture);
     entry.graph.prepare(
-        cuda, [&] { entry.body->record(cuda.stream(), parallel_, capture, false); }, parallel_);
+        cuda, [&] { entry.body->record(cuda, parallel_, capture, false); }, parallel_);
     GraphPatchCalibration calibration;
     entry.body->add_calibration(entry.graph.executable, calibration);
     calibration.run(preparation, [&] { entry.graph.executable.upload(cuda.stream()); });

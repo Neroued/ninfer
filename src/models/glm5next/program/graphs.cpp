@@ -6,13 +6,12 @@ namespace ninfer::models::glm5next::detail {
 namespace {
 
 // Standalone patches use the bound operands. Inline recording uses the operands from the
-// same forward path that executes eagerly, with the capture stream supplied by the suite.
+// same forward path that executes eagerly, with the execution view supplied by the suite.
 template <class Readout>
-auto capture_readout(DeviceContext& device, Readout call, auto execute) {
-    return
-        [&device, call = std::move(call), execute](ops::ContextBucket bucket, cudaStream_t stream) {
-            (call.*execute)(bucket, device.execution_view(stream));
-        };
+auto capture_readout(Readout call, auto execute) {
+    return [call = std::move(call), execute](ops::ContextBucket bucket, CudaExecutionView cuda) {
+        (call.*execute)(bucket, cuda);
+    };
 }
 
 void bind_mla(std::vector<ContextBucketBinding>& bindings, DeviceContext& device,
@@ -20,18 +19,18 @@ void bind_mla(std::vector<ContextBucketBinding>& bindings, DeviceContext& device
     const auto sms = device.execution_view().multiprocessor_count();
     if (call.index)
         bindings.push_back({buckets, [call, sms](auto b) { return call.index_profile(b, sms); },
-                            capture_readout(device, call, &execution::MlaReadout::indexer)});
+                            capture_readout(call, &execution::MlaReadout::indexer)});
     bindings.push_back({buckets, [call, sms](auto b) { return call.attention_profile(b, sms); },
-                        capture_readout(device, call, &execution::MlaReadout::attention)});
+                        capture_readout(call, &execution::MlaReadout::attention)});
 }
 
-void record_mla(DeviceContext& device, const ReadoutRecorder& record,
-                const execution::MlaReadout& expected, const execution::MlaReadout& actual) {
+void record_mla(const ReadoutRecorder& record, const execution::MlaReadout& expected,
+                const execution::MlaReadout& actual) {
     if (expected.query.data != actual.query.data || expected.scratch.data != actual.scratch.data ||
         expected.index != actual.index)
         throw std::logic_error("GLM Graph readout binding differs from execution layout");
-    if (actual.index) record(capture_readout(device, actual, &execution::MlaReadout::indexer));
-    record(capture_readout(device, actual, &execution::MlaReadout::attention));
+    if (actual.index) record(capture_readout(actual, &execution::MlaReadout::indexer));
+    record(capture_readout(actual, &execution::MlaReadout::attention));
 }
 
 ReadoutCapture bind_mtp_step(RankProgramImpl& p, ops::ContextBucketRange buckets,
@@ -43,7 +42,7 @@ ReadoutCapture bind_mtp_step(RankProgramImpl& p, ops::ContextBucketRange buckets
     bind_mla(capture.readouts, p.device, buckets, call);
     capture.body = [&p, step, batch, call](const ReadoutRecorder& record) {
         p.mtp_forward(step, batch, [&](const execution::MlaReadout& actual) {
-            record_mla(p.device, record, call, actual);
+            record_mla(record, call, actual);
         });
     };
     return capture;
@@ -57,9 +56,8 @@ ReadoutCapture bind_dflash(RankProgramImpl& p, ops::ContextBucketRange buckets, 
     for (std::uint32_t layer = 0; layer < p.parameters.draft->layers.size(); ++layer) {
         const auto call = run.attention(layer).readout();
         expected.push_back(call);
-        capture.readouts.push_back(
-            {buckets, [call](auto b) { return call.profile(b); },
-             capture_readout(p.device, call, &execution::DraftReadout::execute)});
+        capture.readouts.push_back({buckets, [call](auto b) { return call.profile(b); },
+                                    capture_readout(call, &execution::DraftReadout::execute)});
     }
     capture.body = [&p, rows, head_columns, bucket = buckets.first,
                     expected = std::move(expected)](const ReadoutRecorder& record) {
@@ -69,7 +67,7 @@ ReadoutCapture bind_dflash(RankProgramImpl& p, ops::ContextBucketRange buckets, 
             if (call.query.data != actual.query.data || call.scratch.data != actual.scratch.data)
                 throw std::logic_error(
                     "DFlash Graph readout binding differs from execution layout");
-            record(capture_readout(p.device, actual, &execution::DraftReadout::execute));
+            record(capture_readout(actual, &execution::DraftReadout::execute));
         });
     };
     return capture;
@@ -123,7 +121,7 @@ ResidentTargetCapture bind_target(RankProgramImpl& p, ops::ContextBucketRange bu
         }
         std::size_t next = 0;
         p.target_forward(main, hidden, false, [&](const execution::MlaReadout& actual) {
-            record_mla(p.device, record, expected.at(next++), actual);
+            record_mla(record, expected.at(next++), actual);
         });
         head();
         p.timer.end_target(true);

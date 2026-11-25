@@ -165,6 +165,15 @@ CudaExecutionView DeviceContext::transfer_view() const noexcept {
 
 CudaExecutionView DeviceContext::execution_view(cudaStream_t borrowed_stream) const {
     CudaDeviceScope scope(device());
+    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+    const auto capture_error               = cudaStreamIsCapturing(borrowed_stream, &capture_status);
+    if (capture_error == cudaErrorStreamCaptureImplicit ||
+        (capture_error == cudaSuccess && capture_status != cudaStreamCaptureStatusNone)) {
+        throw std::logic_error("cannot admit a borrowed stream while it is capturing");
+    }
+    if (capture_error != cudaSuccess) {
+        throw std::runtime_error(cuda_error_message("cudaStreamIsCapturing failed", capture_error));
+    }
     int ordinal      = -1;
     const auto error = cudaStreamGetDevice(borrowed_stream, &ordinal);
     if (error != cudaSuccess) {

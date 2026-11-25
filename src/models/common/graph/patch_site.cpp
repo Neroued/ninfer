@@ -12,7 +12,7 @@ static_assert(ops::kContextBucketCount < missing_patch);
 
 } // namespace
 
-ContextBucketSite::ContextBucketSite(ops::ContextBucketRange buckets, cudaStream_t stream,
+ContextBucketSite::ContextBucketSite(ops::ContextBucketRange buckets, CudaExecutionView cuda,
                                      const Profile& profile, const Capture& capture)
     : first_(buckets.first) {
     bucket_to_patch_.fill(missing_patch);
@@ -22,7 +22,7 @@ ContextBucketSite::ContextBucketSite(ops::ContextBucketRange buckets, cudaStream
         const auto next = std::ranges::find(profiles, key) - profiles.begin();
         if (static_cast<std::size_t>(next) == profiles.size()) {
             auto& patch = patches_.emplace_back();
-            patch.capture(stream, [&] { capture(bucket, stream); });
+            patch.capture(cuda.stream(), [&] { capture(bucket, cuda); });
             if (patch.params().size() != patches_.front().params().size())
                 throw std::logic_error("context bucket changed the kernel slice length");
             profiles.push_back(key);
@@ -31,16 +31,16 @@ ContextBucketSite::ContextBucketSite(ops::ContextBucketRange buckets, cudaStream
     });
 }
 
-void ContextBucketSite::record(cudaStream_t stream, const Capture& capture) {
-    slice_.capture(stream, [&] { capture(first_, stream); });
+void ContextBucketSite::record(CudaExecutionView cuda, const Capture& capture) {
+    slice_.capture(cuda.stream(), [&] { capture(first_, cuda); });
     if (slice_.size() != patches_.front().params().size())
         throw std::logic_error("inline context bucket slice differs from its patch");
     installed_ = 0;
 }
 
-void ContextBucketSite::record(cudaStream_t stream, const Capture& capture,
+void ContextBucketSite::record(CudaExecutionView cuda, const Capture& capture,
                                const moe::MixerSliceRecorder& recorder) const {
-    if (recorder([&] { capture(first_, stream); }) != patches_.front().params().size())
+    if (recorder([&] { capture(first_, cuda); }) != patches_.front().params().size())
         throw std::logic_error("MoE context bucket slice differs from its patch");
 }
 
@@ -72,9 +72,9 @@ void ContextBucketSite::select(moe::LayerGraphExecutable& executable, std::size_
     install(executable, slice, lookup(bucket));
 }
 
-SlotPatchSite::SlotPatchSite(cudaStream_t stream, const Capture& capture) {
+SlotPatchSite::SlotPatchSite(CudaExecutionView cuda, const Capture& capture) {
     for (std::uint32_t slot = 0; slot < definitions_.size(); ++slot)
-        definitions_[slot].capture(stream, [&] { capture(slot, stream); });
+        definitions_[slot].capture(cuda.stream(), [&] { capture(slot, cuda); });
 }
 
 void SlotPatchSite::append(cudaStream_t stream) {
@@ -125,25 +125,25 @@ void GraphPatchCalibration::run(GraphPreparation& preparation,
     preparation.checkpoint();
 }
 
-std::vector<ContextBucketSite> prepare_readouts(cudaStream_t stream,
+std::vector<ContextBucketSite> prepare_readouts(CudaExecutionView cuda,
                                                 std::span<const ContextBucketBinding> bindings) {
     std::vector<ContextBucketSite> sites;
     sites.reserve(bindings.size());
     for (const auto& binding : bindings)
-        sites.emplace_back(binding.buckets, stream, binding.profile, binding.capture);
+        sites.emplace_back(binding.buckets, cuda, binding.profile, binding.capture);
     return sites;
 }
 
-void record_readouts(cudaStream_t stream, std::span<ContextBucketSite> sites,
+void record_readouts(CudaExecutionView cuda, std::span<ContextBucketSite> sites,
                      const ReadoutBody& body, const moe::MixerSliceRecorder* mixer) {
     std::size_t next = 0;
     body([&](const ContextBucketSite::Capture& capture) {
         if (next == sites.size()) throw std::logic_error("unbound graph readout");
         auto& site = sites[next++];
         if (mixer)
-            site.record(stream, capture, *mixer);
+            site.record(cuda, capture, *mixer);
         else
-            site.record(stream, capture);
+            site.record(cuda, capture);
     });
     if (next != sites.size()) throw std::logic_error("graph readouts were not consumed");
 }

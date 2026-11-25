@@ -53,10 +53,10 @@ ContextBucketBinding readout(Fixture& fixture, std::size_t index, unsigned* capt
                 const std::array<std::uint64_t, 1> words{constant ? 0U : variant(bucket)};
                 return ops::detail::make_op_graph_profile(words);
             },
-            [=, &fixture](ContextBucket bucket, cudaStream_t stream) {
+            [=, &fixture](ContextBucket bucket, CudaExecutionView cuda) {
                 if (captures) ++*captures;
-                add<<<1, 1, 0, stream>>>(fixture.values + index,
-                                         1 + (constant ? 0 : variant(bucket)));
+                add<<<1, 1, 0, cuda.stream()>>>(fixture.values + index,
+                                                1 + (constant ? 0 : variant(bucket)));
             }};
 }
 
@@ -78,17 +78,18 @@ void require_flat(cudaStream_t stream) {
 
 void check_profile_deduplication(Fixture& f) {
     unsigned captures = 0;
-    const auto stream = f.device.stream();
+    const auto cuda   = f.device.execution_view();
+    const auto stream = cuda.stream();
     const auto many   = readout(f, 0, &captures);
     const auto one    = readout(f, 1, &captures, true);
-    ContextBucketSite site(buckets, stream, many.profile, many.capture);
-    ContextBucketSite constant(buckets, stream, one.profile, one.capture);
+    ContextBucketSite site(buckets, cuda, many.profile, many.capture);
+    ContextBucketSite constant(buckets, cuda, one.profile, one.capture);
     require(site.variant_count() == 3 && constant.variant_count() == 1 && captures == 4,
             "seven buckets were not deduplicated before capture");
     GraphSegment segment;
-    segment.prepare(f.device.execution_view(), [&] {
-        site.record(stream, many.capture);
-        constant.record(stream, one.capture);
+    segment.prepare(cuda, [&] {
+        site.record(cuda, many.capture);
+        constant.record(cuda, one.capture);
         require_flat(stream);
     });
     GraphPreparation preparation(f.device, GraphPreparationMode::Capture);
@@ -174,10 +175,10 @@ void check_suite(Fixture& f, SpeculativeBackend backend, ProposalTopology topolo
             };
             if (split) {
                 out.handoff_stream = f.device.transfer_stream();
-                step.handoff       = [&, i](std::uint32_t slot, cudaStream_t stream) {
+                step.handoff       = [&, i](std::uint32_t slot, CudaExecutionView cuda) {
                     CUDA_CHECK(cudaMemcpyAsync(copied + slot, f.values + i, sizeof(unsigned),
-                                                     cudaMemcpyDeviceToHost, stream));
-                    (slot ? copied_one : copied_zero).record_external(stream);
+                                                     cudaMemcpyDeviceToHost, cuda.stream()));
+                    (slot ? copied_one : copied_zero).record_external(cuda.stream());
                 };
             }
         }
@@ -211,8 +212,8 @@ void check_suite(Fixture& f, SpeculativeBackend backend, ProposalTopology topolo
                 },
             .head = f.increment(7)};
         if (split)
-            target.handoff = [&](std::uint32_t slot, cudaStream_t stream) {
-                add<<<1, 1, 0, stream>>>(f.values + 11, slot + 1);
+            target.handoff = [&](std::uint32_t slot, CudaExecutionView cuda) {
+                add<<<1, 1, 0, cuda.stream()>>>(f.values + 11, slot + 1);
             };
         return target;
     };
@@ -514,8 +515,8 @@ void check_layered(Fixture& f) {
     capture.layers = {
         ReadoutCapture{{binding}, [emit = binding.capture](const auto& record) { record(emit); }},
         OffloadedLayerCapture{}, ReadoutCapture{{}, [&](const auto&) { f.increment(3)(); }}};
-    capture.hook       = InterLayerHookCapture{1, [&](std::uint32_t slot, cudaStream_t stream) {
-                                             add<<<1, 1, 0, stream>>>(f.values + 2, 1 + slot);
+    capture.hook       = InterLayerHookCapture{1, [&](std::uint32_t slot, CudaExecutionView cuda) {
+                                             add<<<1, 1, 0, cuda.stream()>>>(f.values + 2, 1 + slot);
                                          }};
     capture.suffix     = f.increment(4);
     capture.head       = f.increment(5);

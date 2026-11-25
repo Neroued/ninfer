@@ -359,8 +359,9 @@ int run_batched_case(std::string_view label, std::int32_t hidden, std::int32_t v
         cudaGraphExec_t executable;
         cuda_synchronize();
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        const auto stream_execution = cuda_environment().context.execution_view(stream);
         CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
-        invoke(cuda_environment().context.execution_view(stream));
+        invoke(stream_execution);
         CUDA_CHECK(cudaStreamEndCapture(stream, &captured));
         CUDA_CHECK(cudaGraphInstantiate(&executable, captured, nullptr, nullptr, 0));
         CUDA_CHECK(cudaGraphLaunch(executable, stream));

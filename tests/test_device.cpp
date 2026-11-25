@@ -174,7 +174,22 @@ int main(int argc, char** argv) {
     ninfer::DeviceBuffer timed_work(moved.device(), 1 << 20);
     cudaGraph_t graph          = nullptr;
     cudaGraphExec_t executable = nullptr;
+    ninfer::CudaStream borrowed(moved);
+    const auto borrowed_view = moved.execution_view(borrowed.stream());
+    if (borrowed_view.stream() != borrowed.stream())
+        return fail("admitted borrowed stream lost its handle");
     CUDA_CHECK(cudaStreamBeginCapture(moved.stream(), cudaStreamCaptureModeThreadLocal));
+    // Already-owned execution views remain usable during capture; admitting a capturing stream
+    // is rejected without invalidating the active capture.
+    if (moved.execution_view().stream() != moved.stream() ||
+        moved.transfer_view().stream() != moved.transfer_stream())
+        return fail("owned execution views changed during stream capture");
+    bool rejected_capturing_stream = false;
+    try {
+        (void)moved.execution_view(moved.stream());
+    } catch (const std::logic_error&) { rejected_capturing_stream = true; }
+    if (!rejected_capturing_stream)
+        return fail("execution_view(stream) admitted a stream while it was capturing");
     timer.start_external();
     CUDA_CHECK(cudaMemsetAsync(timed_work.data(), 0, timed_work.size(), moved.stream()));
     timer.record_stop_external();

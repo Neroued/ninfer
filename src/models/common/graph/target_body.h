@@ -38,7 +38,7 @@ class ProposalBody {
 public:
     ProposalBody(DeviceContext&, const ProposalCapture&);
 
-    void record(cudaStream_t, ParallelExecution*, const ProposalCapture&, bool gate_steps);
+    void record(CudaExecutionView, ParallelExecution*, const ProposalCapture&, bool gate_steps);
     void finish(const CommunicationGraphWork&);
     void add_calibration(DecodeGraphExecutable&, GraphPatchCalibration&);
 

@@ -83,6 +83,10 @@ Linear 示例：
 ```
 
 一次精确点可以使用 `--t`；profile 只采必要的公开调用。长期工具不强制私有 kernel。
+支持多请求打包 Prefill 的算子基准（CausalConv、KDA 输入投影、PLE、GDN/KDA 递推、Causal Softmax
+Attention、QSA、Kpool MLA）复用 [ragged_workload.h](ops/ragged_workload.h)，可通过 `--ragged`
+传入段长分布（`len1,len2` 或 `countxlen`，分号分隔多组扫描）及 `--state-form`
+（`distinct|alias|mixed|permuted|shared-source`）评估原生 varlen 性能。
 GDN 的 stage/crossover 诊断保留其明确例外，prepare、recurrence 或预归一化输入的结果
 不能代替完整 Op。其他 family 的语义、模式和默认样本直接查所属入口：
 

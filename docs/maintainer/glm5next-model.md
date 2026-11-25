@@ -97,7 +97,10 @@ DFlash2 使用自己的 GQA 与滑动窗口 context；context KV 按 heads TP �
 Checkpoint 同时覆盖 Main 和当前启用 backend 的续算状态。
 
 MLA 边界按 owner-local 行 pack，输出汇集回全局顺序，再进入复制的 mHC 或 MTP residual。
-零有效行也遵守通信次序。放置与压力转换使用[共享 Context 策略](context-management.md#attention-dp)，
+纯文本多请求 Prefill 同样按 owner 分组构造全局与本地 `RaggedSequenceView`：KDA（`kda_input_proj_conv_update` /
+`kimi_delta_attention`）与 FFN 消费全局打包 token 流，各 rank 的 Kpool MLA（`prepare_update` / `indexer` /
+`sparse_mla`）和 MTP 历史补齐并行执行本地 owner 段，末尾经 `scatter_ragged_last_columns` 与 `ops::gather`
+写回状态并汇集待采样行。零有效行也遵守通信次序。放置与压力转换使用[共享 Context 策略](context-management.md#attention-dp)，
 字段转换和切片由 [ParallelPlan](../../src/models/glm5next/parallel/plan.cpp)及 Session 解释。
 
 ## MTP
@@ -117,8 +120,9 @@ DFlash2 从配置指定 Main 层的特征建立 conditioning，经 feature proje
 context K/V。草拟输入为 anchor 与 masked block，经过 GQA、动态卷积和 FFN，再用词表候选及
 条件 selector 生成 draft 路径和实际 proposal 分布。Target 的 KDA/MLA 与接受过程保持原语义。
 
-每层的 K/V/Q 使用合并 parent，context-only 路径借用 K/V 前缀。特征、候选分布及 provisional
-计算属于执行帧；正式 context 只采用已提交输入。草拟窗口与验证有效长度分别管理，
+每层的 K/V/Q 使用合并 parent，context-only 路径借用 K/V 前缀。打包 Prefill 下，各 rank 按滑动窗口截断索引
+单次收集并广播特征分片，通过原生 ragged `context_kv_materialize` 一次性物化所有段的局部上下文 KV。
+特征、候选分布及 provisional 计算属于执行帧；正式 context 只采用已提交输入。草拟窗口与验证有效长度分别管理，
 记录和状态采用遵循[Speculative 执行](speculative-decoding.md)。
 
 MTP 与 DFlash2 是互斥的启动选择，只加载所选 backend、head 和执行资源。

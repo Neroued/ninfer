@@ -24,7 +24,8 @@ ContextWork 只描述存储动作，不携带计算批次。其绑定合同为�
 共享 [BatchExecutionPlan](../../src/models/common/batch.h)负责桶、取整和可行几何，
 各模型保留自己的数学组合与 Graph 组织。小批次采用精确桶，大容量使用稀疏桶并覆盖最终 C；
 具体分桶策略由[实现](../../src/models/common/batch.cpp)维护。
-关闭 Graph 时 Decode 使用精确几何；Prefill、Replay、Score 和 Control 保持各自的精确几何。
+关闭 Graph 时 Decode 使用精确几何；Packed Prefill 保持 Eager 并按有效段长动态打包，
+Replay、Score 和 Control 保持各自的精确几何。
 
 Qwen Decode 使用 P；GLM 的 ADP Decode 使用 `(P,L)`。P 对 B 向上取整，L 对实际最大 owner
 成员数向上取整。Graph catalog 只保留可由合法真实分布选中的 pair，不枚举 owner 向量。
@@ -34,6 +35,20 @@ Graph 变体表达物理几何与必要计算主体。采样参数、请求身�
 不增加变体轴。上下文变化按 `ContextBucket` 在扁平图内更新 Attention/Indexer 的 kernel 参数切片，
 外层通信次序保持不变。自适应验证可选择不同的物理 target 宽度。
 需要 Host grammar、CPU expert 或接受结果的边界保留显式交接。
+
+## Packed Prefill
+
+多请求文本 Prefill 在 Eager 路径上将多个并发请求的输入后缀沿一维 token 轴连续打包，
+通过 [RaggedSequenceView](../../include/ninfer/ops/ragged.h) 描述 `S >= 1` 个非空段（每段 `L_s >= 1`）与总列数 `N`：
+
+- 调度依据模型声明的 `PrefillBudgetPolicy`（全局 token 上限、单 placement 上限、块对齐与单步最大序列数）
+  在各 placement 间以水位线公平分配预算；Vision Prefill、Replay 与压力 turn 期间的受阻推进保持独占单请求执行。
+- 精确前缀缓存命中的零 token 行不进入 Main 打包段，跳过前向计算，直接以源 State 的 `continuation_hidden`
+  与其他完成 prompt 的行共同参与本步末尾的批量采样。
+- 主请求使用硬预留，搭车请求仅使用即时可用余量，不因打包触发抢占或迁移；同一步内可混合采样行与中间续算行，
+  并共享同一冻结成员和提交事务。
+- GLM 的 ADP 打包 Prefill 先按 attention owner 稳定分组再压紧全局 token 轴：TP/KDA 层消费统一全局 `ragged` 流，
+  各 rank 的 MLA/Indexer 层各自并行执行本 rank 拥有的连续局部段（`local_mla_ragged`）。
 
 ## 逻辑成员与物理行
 

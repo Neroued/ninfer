@@ -194,7 +194,7 @@ def configure(model, recipe, sources):
     recipe.assign(
         "text/layers/0/mlp/down",
         format="q6_g64_fp16",
-        method="grouped_absmax",
+        method="grouped_mse",
     )
 ```
 
@@ -251,7 +251,7 @@ The converter currently writes these formats:
 | Format | Built-in method for floating-point input | Import of already encoded input |
 |---|---|---|
 | `bf16`, `fp32`, `int32` | `cast_direct` | Direct words through the source reader |
-| `q4_g64_fp16`, `q5_g64_fp16`, `q6_g64_fp16`, `q8_g32_fp16` | `grouped_absmax` | Supply a custom method/source if needed |
+| `q4_g64_fp16`, `q5_g64_fp16`, `q6_g64_fp16`, `q8_g32_fp16` | `grouped_mse` | Supply a custom method/source if needed |
 | `fp8_e4m3fn_row_bf16` | `fp8_row_maxabs` | `import_encoded` |
 | `fp8_e4m3fn_block128x128_bf16`, `fp8_e4m3fn_block128x128_fp32` | None | `import_encoded` |
 | `nvfp4` | `stored_scale_mse` | `import_encoded` |
@@ -259,7 +259,10 @@ The converter currently writes these formats:
 | `mxfp8` | None | `import_encoded` |
 | `nf4_g16_e4m3fn` | `stored_scale_mse` | Supply encoded words through `TensorOutput` |
 
-`grouped_absmax` stores one FP16 scale per group and signed integer codes. `fp8_row_maxabs` first
+`grouped_mse` stores one signed finite FP16 scale per group and signed integer codes (including
+full two's-complement `[-128, 127]` codes for `q8_g32_fp16`), selecting the globally optimal
+discrete FP16 scale per group under exact FP64 pairwise SSE with deterministic tie-breaking across
+both CPU and CUDA extension paths. `fp8_row_maxabs` first
 rounds input values to BF16, then produces E4M3FN codes and one BF16 multiplier per row.
 `import_encoded` preserves compatible code and scale words. `nvfp4` uses a matrix divisor;
 `nvfp4_mul` preserves a multiplier. MXFP8 has one UE8M0 multiplier per K32 group; block-FP8 preserves
@@ -354,7 +357,7 @@ recipe.assign(
     name,
     source=model.source(name, sources["alternate"]),
     format="q6_g64_fp16",
-    method="grouped_absmax",
+    method="grouped_mse",
 )
 ```
 
@@ -386,7 +389,7 @@ def configure(model, recipe, sources):
         return torch.from_numpy(values)
 
     source = LogicalSource(tuple(data.shape), str(path), read_values)
-    recipe.assign(name, source=source, format="q6_g64_fp16", method="grouped_absmax")
+    recipe.assign(name, source=source, format="q6_g64_fp16", method="grouped_mse")
 ```
 
 Use this as an override. The NumPy file must already follow the logical row/column order. For an

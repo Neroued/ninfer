@@ -39,18 +39,23 @@ Main GQA、MTP 和需要 full context 的 DFlash 层分别有自己的 history�
 DFlash local cyclic KV 属于 State；临时 query KV、verify records 与候选分布属于 frame。
 
 Checkpoint 保留同一次真实执行的 State、history coverage 与位置身份。
-Prefill/Replay 可在一个 Work 内推进多个数学或媒体段，保存与调度边界由 Session 统一决定。
+纯文本多请求 Prefill 通过 [RaggedSequenceView](../../include/ninfer/ops/ragged.h) 将多个并发请求打入同一执行步，
+沿 GDN、因果卷积与 Causal Softmax Attention 原生 varlen 路线单趟执行，末尾以
+`scatter_ragged_last_columns` 写出各段 `continuation_hidden`，再通过 `ops::gather` 一次性汇集全部待采样行（含零 token 精确缓存命中行）的隐藏状态。
+Vision Prefill 与 Replay 仍保持单请求独占推进，保存与调度边界由 Session 统一决定。
 存储、引用、Host 恢复与抢占复用[Context 管理](context-management.md)，不按模型另建缓存策略。
 
 ## Speculative backend
 
 MTP 是一个私有 attention＋FFN block，conditioning 使用 Main 最终归一化 hidden，
 输入为分别归一化后的 embedding 与 hidden 拼接。Main/MTP 稳定前沿为
-`F / max(F-1,0)`；token、hidden 和位置按真实配对解释。媒体占位使用对应的 composed embedding。
+`F / max(F-1,0)`；token、hidden 和位置按真实配对解释。打包 Prefill 下通过 ragged
+`prepare_causal_pairs` 与 ragged `kv_cache_append` 单趟完成跨段历史对齐与 KV 写入；媒体占位使用对应的 composed embedding。
 
 DFlash/DFlash2 从指定 Main 层的 residual 捕获 conditioning，一次 masked block 提出多个 token。
-DFlash2 还有动态卷积与条件候选路径。它们的 context append、proposal 分布与状态恢复和 MTP
-不同，详见[Speculative 执行](speculative-decoding.md)。
+DFlash2 还有动态卷积与条件候选路径；打包 Prefill 下，DFlash1（local cyclic + full paged）与 DFlash2
+（5 层融合 `context_kv_materialize`）均按每段滑动窗口截断索引单趟物化全部段的上下文 KV。
+它们的 context append、proposal 分布与状态恢复和 MTP 不同，详见[Speculative 执行](speculative-decoding.md)。
 
 Indexed proposal head 是独立可选表示，通过 row map 回到真实 token ID；target 仍使用完整
 Main head。不同 proposal 只改变接受行为和成本，不改变 target 验证职责。

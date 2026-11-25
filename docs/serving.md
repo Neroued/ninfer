@@ -1184,10 +1184,12 @@ raw counters and seconds over rounded stderr rates.
 ## Execution behavior
 
 The server owns one Engine with `max_concurrency` resident request lanes fixed at startup, locally
-or across its configured ranks. Decode-ready requests are batched at execution boundaries. A request becomes
-decode-ready after prefill; completed or cancelled requests leave subsequent work. CUDA Graph
-execution follows the model's compute and commit boundaries, including owner-local attention for
-GLM attention DP.
+or across its configured ranks. Decode-ready requests are batched at execution boundaries, and
+concurrent text prefill requests can likewise be packed into one eager prefill step within the
+configured `prefill_chunk` budget (Vision prefill and Replay remain single-request steps). A request
+becomes decode-ready after prefill; completed or cancelled requests leave subsequent work. CUDA
+Graph execution follows the model's compute and commit boundaries, including owner-local attention
+for GLM attention DP.
 
 `--max-pending-requests` bounds the requests waiting behind the active set. The total generation
 request lifetime capacity is `max_concurrency + max_pending_requests`, including requests still in

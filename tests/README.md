@@ -40,6 +40,9 @@ Op runner 支持元数据列举与交集筛选，例如：
 ```
 
 用 `--help` 查当前 filters，`--case` 选择稳定 case ID；一个 Graph/state 序列整体执行。
+多格式 Op suite 通过 `ninfer_add_op_test(... FORMATS ...)` 拆分为按格式独立的 CTest 条目，
+并带有 `PROCESSORS` 与 `COST` 属性供 `ctest -j` 并行调度；重量级 fixture 构造与 CPU 独立 oracle
+在单测试内部并行执行。
 测试默认集合覆盖实际生产风险，不把每次调优扫描变成长驻 case。增加检查应对应可能改变
 结果或破坏状态的边界；不为覆盖计数穷举所有配置组合。
 

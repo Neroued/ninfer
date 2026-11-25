@@ -78,7 +78,9 @@ final HC mixer 前的四流 residual。媒体 embedding 的配对规则也归模
 Token 被接受不意味着递归 hidden 等于真实 hidden，因此不能只截短 draft cache 完成提交。
 
 Prefill、Replay 与 Control 同样建立 backward-aligned history：根块跳过首 token 的配对，
-后续块用上个块保存的 conditioning 衔接。History-only 路径只做建立 K/V 或 latent/index 所需的
+后续块用上个块保存的 conditioning 衔接。多请求打包 Prefill 通过 ragged `prepare_causal_pairs`
+在单次调用内跨异长段构造对齐配对（仅对 `main_frontier == 0` 的段跳过首列，对续算段衔接源 State 保存的 conditioning），
+再通过原生 ragged KV/prepare 入口一次性写入历史。History-only 路径只做建立 K/V 或 latent/index 所需的
 stem、投影和状态更新，不执行无用的 query、attention、FFN 或 head。
 
 临时 draft tail、selection 和 records 属于 frame；canonical history 与定长 tail 属于 Context。
@@ -111,7 +113,8 @@ projection 充当参考。Chunked Prefill 则按自身数学精度验收，其�
 
 DFlash 从指定 target blocks 的完整 residual 特征形成 conditioning，再建立各 draft 层的 context
 K/V。一轮输入为 anchor 加 masked columns，用非因果 masked-block attention 一次生成 proposals；
-它不是逐步运行 MTP。Context prefill 只物化 conditioning K/V，不运行整套 draft FFN。
+它不是逐步运行 MTP。Context prefill 只物化 conditioning K/V，不运行整套 draft FFN；多请求打包 Prefill
+按各段窗口尾部截断后，通过原生 ragged 路径一次性物化所有段的局部 cyclic 与全长 paged 上下文。
 
 Local draft layers 使用 cyclic KV，full layers 使用 paged history。
 Query block、候选路径和 proposal 概率属于本轮 scratch。DFlash2 增加动态卷积与条件候选选择，

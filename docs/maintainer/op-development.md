@@ -63,6 +63,20 @@ Workspace 由调用者提供，Op 仅在 scope 中借用，不隐藏设备分配
 必须覆盖非单调 route 的高水位；不能只测区间上界。固定零 scratch 的入口省去 arena 和查询。
 Host scope 退出不结束 GPU 使用，复用仍遵循 stream 与消费者寿命。
 
+### Ragged / Varlen 合同
+
+支持多请求打包 Prefill 的有状态算子通过公共 [RaggedSequenceView](../../include/ninfer/ops/ragged.h) 接入，
+沿一维紧凑 token 轴处理 `S = num_seqs() >= 1` 个非空段（每段长度 `L_s >= 1`），总列数为 `N = total_tokens()`：
+
+- `host_cu_seqlens` 长度为 `S + 1`，从 `0` 严格递增至 `N`；调用方保证设备侧连续 `I32` 元数据
+  `cu_seqlens`、`seq_lengths`、`token_to_seq` 与 Host 布局一致，算子在执行流上直接消费，不做 D2H 回读。
+- 带 workspace 的 Ragged 入口提供 `*_ragged_workspace_capacity_bytes(..., min_tokens, max_tokens, min_segments, max_segments)`
+  容量查询，覆盖区间内任意合法分段组合（含短段/长段混合路由）的峰值需求。
+- Ragged Prefill 入口运行于 Eager 路径，不并入 Decode CUDA Graph；原生多段 kernel 须保持单段（`S = 1`）
+  与既有密集单请求实现等价的性能基线，且避免逐段宿主循环启动。
+- 独立数学验证复现完整公式并覆盖 `S = 1`、均长/异长多段、跨页与 tile 边界及 `distinct/alias/permuted/shared-source`
+  状态偏移，公共构造见 [ragged_fixture.h](../../tests/ops/ragged_fixture.h)。
+
 ## 数值验证
 
 验证公开合同和实际生产入口。数学 Op 使用独立 FP32/FP64 参考，按 public represented inputs

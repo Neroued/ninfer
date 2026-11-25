@@ -26,7 +26,9 @@ Engine 记录请求生命周期、调度工作和协调侧执行边界；模型/
 | Host 工作时间 | 协调线程各互斥调用阶段的墙钟，包含 executor flush，另计 scheduler yield/relock |
 
 分布式执行的组耗时来自完整完成边界；各 rank 的设备时间分别展示，不相加当作组延迟。
-Prefill chunk 和 decode step 使用执行样本。Decode 按实际 batch 分组，不能用平均 batch
+Prefill chunk 和 decode step 使用执行样本。多请求打包 Prefill 的单个执行单元可同时推进多个请求，
+因此 `ExecutionCounters[Prefill].rows` 可大于 `units`，单请求的 `prefill_seconds` 与 Decode 相同，
+均为共享延迟暴露，不可跨并发请求直接相加。Decode 按实际 batch 分组，不能用平均 batch
 解释目标并发的延迟。Spec 的实际接受量与执行时间分开，token/s 不能代替每步计算成本。
 
 启用 speculation 的 Decode 行步按[验证长度与授予](speculative-decoding.md#逐轮验证长度与容量授予)

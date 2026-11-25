@@ -61,7 +61,7 @@ inline DeviceLayers make_device_layers(
 
 __device__ __forceinline__ void store_key_head(const float* input, DeviceLayerView layer,
                                                const int* positions, const std::int64_t* offsets,
-                                               int column, int width, int head, float epsilon,
+                                               int column, int request, int head, float epsilon,
                                                const RopeD128Frequencies& frequencies) {
     const int lane = threadIdx.x & 31;
     const int j    = lane * 2;
@@ -75,7 +75,7 @@ __device__ __forceinline__ void store_key_head(const float* input, DeviceLayerVi
     float sin0, cos0, sin1, cos1;
     rope_d128_sincos(frequencies, positions[column], j, &sin0, &cos0);
     rope_d128_sincos(frequencies, positions[column], j + 1, &sin1, &cos1);
-    const auto dst = offsets[column / width] / sizeof(__nv_bfloat16) +
+    const auto dst = offsets[request] / sizeof(__nv_bfloat16) +
                      kv::cyclic_offset<128, 2048>(positions[column], head, layer.padded_capacity);
     auto* out      = reinterpret_cast<__nv_bfloat162*>(layer.cache_k + dst);
     out[lane]      = __floats2bfloat162_rn(x0 * cos0 - y0 * sin0, x1 * cos1 - y1 * sin1);
@@ -95,6 +95,7 @@ struct MaterializeProjectionEpilogue {
     DeviceLayerView layer;
     const int* positions;
     const int* counts;
+    const int* token_to_seq;
     const std::int64_t* offsets;
     float* scratch;
     int layer_index, width, batch, min_count, max_count;
@@ -102,11 +103,16 @@ struct MaterializeProjectionEpilogue {
 
     __device__ void store(int row, int packed_column, float result) const {
         if (packed_column >= max_count * batch) return;
-        const int column  = context_column(packed_column, width, max_count);
-        const int request = column / width, count = counts[request];
-        if (count < min_count || count > max_count || column % width >= count) return;
+        const int column =
+            token_to_seq ? packed_column : context_column(packed_column, width, max_count);
+        const int request = token_to_seq ? token_to_seq[column] : (column / width);
+        if (!token_to_seq) {
+            const int count = counts[request];
+            if (count < min_count || count > max_count || column % width >= count) return;
+        }
         if (!value)
-            scratch[row + 1024LL * (packed_column + max_count * batch * layer_index)] = result;
+            scratch[row + 1024LL * (packed_column + std::int64_t(max_count) * batch * layer_index)] =
+                result;
         else { store_value(row, column, offsets[request], positions, layer, result); }
     }
 

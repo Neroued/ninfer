@@ -5,6 +5,7 @@
 #include "core/arena.h"
 #include "core/cyclic_kv_cache.h"
 #include "core/tensor.h"
+#include "ninfer/ops/ragged.h"
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -86,5 +87,27 @@ void context_kv_materialize(
 context_kv_materialize_workspace_capacity_bytes(const ContextKVMaterializeProfile& profile,
                                                 std::int32_t batch_size, std::int32_t min_width,
                                                 std::int32_t max_width);
+
+/**
+ * Project packed ragged normalized context into five layer-local cyclic K/V caches.
+ *
+ * context is contiguous 16-byte-aligned BF16 [H,N] for N=ragged.total_tokens(), positions is
+ * contiguous Device I32 [N], and each layer supplies Device I64 [S] record byte offsets for
+ * S=ragged.num_seqs(). Every packed token t in [0,N) belongs to segment
+ * s=ragged.token_to_seq[t] and is written to cyclic slot positions[t] mod capacity of record s
+ * with the exact math and rounding rules of batched context_kv_materialize. Every segment has
+ * length <= capacity (2048); total tokens N may exceed 2048 across multiple segments.
+ */
+void context_kv_materialize(
+    const Tensor& context, const RaggedSequenceView& ragged, const Tensor& positions,
+    const std::array<ContextKVMaterializeLayerView, kContextKVMaterializeLayers>& layers,
+    const ContextKVMaterializeProfile& profile, MemoryArena& workspace, CudaExecutionView execution);
+
+/** Capacity over every ragged (T,S) batch in the inclusive envelope. */
+[[nodiscard]] std::size_t
+context_kv_materialize_workspace_capacity_bytes(const ContextKVMaterializeProfile& profile,
+                                                std::int32_t min_tokens, std::int32_t max_tokens,
+                                                std::int32_t min_segments,
+                                                std::int32_t max_segments);
 
 } // namespace ninfer::ops

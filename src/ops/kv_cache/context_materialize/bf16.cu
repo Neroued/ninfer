@@ -11,7 +11,7 @@ struct Epilogue {
     static constexpr int kSharedBytes = (S::kBlockRows < 128 ? S::kBlockRows : 128) *
                                         (S::kBlockTokens < 128 ? S::kBlockTokens : 128) * 4;
     const DeviceLayers* layers;
-    const int *positions, *counts;
+    const int *positions, *counts, *token_to_seq;
     float* scratch;
     int width, batch, min_count, prefix;
     const int* cached_columns  = nullptr;
@@ -21,17 +21,19 @@ struct Epilogue {
     __device__ __forceinline__ bool live(int token) const {
         if (cached_columns) return cached_columns[token - first_token] >= 0;
         if (token >= prefix * batch) return false;
+        if (token_to_seq) return true;
         const int count = counts[token / prefix];
         return count >= min_count && count <= prefix && token % prefix < count;
     }
 
     __device__ __forceinline__ int physical_column(int token) const {
-        return cached_columns ? cached_columns[token - first_token]
-                              : context_column(token, width, prefix);
+        if (cached_columns) return cached_columns[token - first_token];
+        return token_to_seq ? token : context_column(token, width, prefix);
     }
 
     __device__ __forceinline__ int request_row(int token) const {
-        return cached_requests ? cached_requests[token - first_token] : token / prefix;
+        if (cached_requests) return cached_requests[token - first_token];
+        return token_to_seq ? token_to_seq[token] : (token / prefix);
     }
 
     template <class S, bool Full, class Output>
@@ -82,8 +84,8 @@ struct Epilogue {
                             if (!live(token)) continue;
                             const int physical = physical_column(token);
                             store_key_head(scores + local * 128, layer, positions, layer.offsets,
-                                           physical, width, first_row / 128, layers->epsilon,
-                                           layers->frequencies);
+                                           physical, request_row(token), first_row / 128,
+                                           layers->epsilon, layers->frequencies);
                         }
                     } else {
                         for (int item = threadIdx.x; item < R * T; item += S::kThreads) {
@@ -101,7 +103,8 @@ struct Epilogue {
                         if (!live(token)) continue;
                         const int row = first_row + item % R;
                         if (row < 512)
-                            scratch[row + 512LL * (token + prefix * batch * l)] = scores[item];
+                            scratch[row + 512LL * (token + std::int64_t(prefix) * batch * l)] =
+                                scores[item];
                         else {
                             const int physical = physical_column(token);
                             store_value(row - 512, physical, layer.offsets[request_row(token)],
@@ -119,10 +122,11 @@ struct Epilogue {
 // schedules are shared with Linear; represented inputs and accumulators are unchanged.
 template <class S>
 __global__ __launch_bounds__(S::kThreads, S::kMinBlocksPerSm) void projection_kernel(
-    const __nv_bfloat16* x, const int* positions, const int* counts,
+    const __nv_bfloat16* x, const int* positions, const int* counts, const int* token_to_seq,
     const __grid_constant__ DeviceLayers layers, float* scratch, int width, int batch,
     int min_count, int prefix) {
-    const Epilogue metadata{&layers, positions, counts, scratch, width, batch, min_count, prefix};
+    const Epilogue metadata{&layers, positions, counts, token_to_seq, scratch,
+                            width,   batch,     min_count, prefix};
     constexpr int BR = S::kBlockRows, BT = S::kBlockTokens, BK = S::kBlockK, Stages = S::kStages;
     int tile_r, tile_t;
     bf16_mma_tile_coordinates<S>(blockIdx.x, 1024 / BR, (prefix * batch + BT - 1) / BT, tile_r,
@@ -133,13 +137,14 @@ __global__ __launch_bounds__(S::kThreads, S::kMinBlocksPerSm) void projection_ke
     for (int t = threadIdx.x; t < BT; t += S::kThreads) {
         const int token    = token_begin + t;
         const bool valid   = metadata.live(token);
-        mapped_columns[t]  = valid ? context_column(token, width, prefix) : -1;
-        mapped_requests[t] = valid ? token / prefix : 0;
+        mapped_columns[t]  = valid ? metadata.physical_column(token) : -1;
+        mapped_requests[t] = valid ? metadata.request_row(token) : 0;
         active |= valid;
     }
     if (!__syncthreads_or(active)) return;
-    const Epilogue ep{&layers,   positions, counts,         scratch,         width,      batch,
-                      min_count, prefix,    mapped_columns, mapped_requests, token_begin};
+    const Epilogue ep{&layers,      positions,      counts,          token_to_seq, scratch,
+                      width,        batch,          min_count,       prefix,       mapped_columns,
+                      mapped_requests, token_begin};
     extern __shared__ __align__(128) unsigned char shared[];
     auto* as           = reinterpret_cast<__nv_bfloat16*>(shared);
     auto* bs           = as + Stages * BR * BK;
@@ -195,25 +200,27 @@ struct alignas(128) Descriptors {
 template <class S>
 __global__ __launch_bounds__(S::kThreads, S::kMinBlocksPerSm) void tma_projection_kernel(
     const __grid_constant__ Descriptors descriptors, const __grid_constant__ DeviceLayers layers,
-    const int* positions, const int* counts, float* scratch, int width, int batch, int min_count,
-    int prefix) {
+    const int* positions, const int* counts, const int* token_to_seq, float* scratch, int width,
+    int batch, int min_count, int prefix) {
     int r, t;
     bf16_mma_tile_coordinates<S>(blockIdx.x, 1024 / S::kBlockRows,
                                  (prefix * batch + S::kBlockTokens - 1) / S::kBlockTokens, r, t);
-    const Epilogue metadata{&layers, positions, counts, scratch, width, batch, min_count, prefix};
+    const Epilogue metadata{&layers, positions, counts, token_to_seq, scratch,
+                            width,   batch,     min_count, prefix};
     __shared__ int mapped_columns[S::kBlockTokens], mapped_requests[S::kBlockTokens];
     bool active = false;
     for (int i = threadIdx.x; i < S::kBlockTokens; i += S::kThreads) {
         const int token    = t * S::kBlockTokens + i;
         const bool valid   = metadata.live(token);
-        mapped_columns[i]  = valid ? context_column(token, width, prefix) : -1;
-        mapped_requests[i] = valid ? token / prefix : 0;
+        mapped_columns[i]  = valid ? metadata.physical_column(token) : -1;
+        mapped_requests[i] = valid ? metadata.request_row(token) : 0;
         active |= valid;
     }
     if (!__syncthreads_or(active)) return;
     const Epilogue ep{&layers,
                       positions,
                       counts,
+                      token_to_seq,
                       scratch,
                       width,
                       batch,
@@ -228,14 +235,17 @@ __global__ __launch_bounds__(S::kThreads, S::kMinBlocksPerSm) void tma_projectio
 
 // All five layers share phases; no BF16 K projection intermediate is introduced.
 __global__ __launch_bounds__(640) void key_post_kernel(const float* input, const int* positions,
-                                                       const int* counts,
+                                                       const int* counts, const int* token_to_seq,
                                                        const __grid_constant__ DeviceLayers layers,
                                                        int width, int batch, int min_count,
                                                        int prefix) {
-    const int token = blockIdx.x, request = token / prefix;
-    const int count = counts[request];
-    if (count < min_count || count > prefix || token % prefix >= count) return;
-    const int physical = context_column(token, width, prefix);
+    const int token   = blockIdx.x;
+    const int request = token_to_seq ? token_to_seq[token] : (token / prefix);
+    if (!token_to_seq) {
+        const int count = counts[request];
+        if (count < min_count || count > prefix || token % prefix >= count) return;
+    }
+    const int physical = token_to_seq ? token : context_column(token, width, prefix);
     __shared__ float sine[64], cosine[64];
     if (threadIdx.x < 64)
         rope_d128_sincos(layers.frequencies, positions[physical], threadIdx.x, sine + threadIdx.x,
@@ -243,7 +253,8 @@ __global__ __launch_bounds__(640) void key_post_kernel(const float* input, const
     const int h = threadIdx.x / 32, lane = threadIdx.x % 32, j = lane * 2;
     const auto layer   = layers.layer[h / 4];
     const int head     = h % 4;
-    const auto* source = input + (h / 4 * batch * prefix + token) * 512LL + head * 128;
+    const auto* source =
+        input + (std::int64_t(h / 4) * batch * prefix + token) * 512LL + head * 128;
     float x = source[j], y = source[j + 1], u = source[j + 64], v = source[j + 65];
     float square        = common::warp_reduce_sum(x * x + y * y + u * u + v * v);
     const float inverse = rsqrtf(__shfl_sync(0xffffffffU, square, 0) / 128.F + layers.epsilon);
@@ -263,12 +274,14 @@ __global__ __launch_bounds__(640) void key_post_kernel(const float* input, const
 
 template <class S, bool Tma = false>
 void launch(const Tensor& x, const Tensor& positions, const Tensor& counts,
+            const Tensor* token_to_seq,
             const std::array<ContextKVMaterializeLayerView, kContextKVMaterializeLayers>& layers,
             const ContextKVMaterializeProfile& profile,
             ContextKVMaterializeExecutionEnvelope envelope, const Tensor& scratch,
             cudaStream_t stream) {
-    const auto device = make_device_layers(layers, profile);
-    const int columns = envelope.max_count * x.ne[2];
+    const auto device   = make_device_layers(layers, profile);
+    const auto* seq_ptr = token_to_seq ? static_cast<const int*>(token_to_seq->data) : nullptr;
+    const int columns   = envelope.max_count * x.ne[2];
     const dim3 grid(1024 / S::kBlockRows * ((columns + S::kBlockTokens - 1) / S::kBlockTokens), 1,
                     kLayers);
     const auto cp = [&]<class C>() {
@@ -276,11 +289,12 @@ void launch(const Tensor& x, const Tensor& positions, const Tensor& counts,
         common::prepare_shared<bytes, projection_kernel<C>, true>();
         projection_kernel<C><<<grid, C::kThreads, bytes, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data), static_cast<const int*>(positions.data),
-            static_cast<const int*>(counts.data), device, static_cast<float*>(scratch.data),
-            x.ne[1], x.ne[2], envelope.min_count, envelope.max_count);
+            static_cast<const int*>(counts.data), seq_ptr, device,
+            static_cast<float*>(scratch.data), x.ne[1], x.ne[2], envelope.min_count,
+            envelope.max_count);
     };
     if constexpr (Tma) {
-        if (x.ne[2] == 1 || x.ne[1] == int(envelope.max_count)) {
+        if (seq_ptr || x.ne[2] == 1 || x.ne[1] == int(envelope.max_count)) {
             Descriptors descriptors{};
             for (int l = 0; l < kLayers; ++l)
                 descriptors.layer[l] = make_bf16_tma_descriptors<S>(
@@ -291,8 +305,8 @@ void launch(const Tensor& x, const Tensor& positions, const Tensor& counts,
             common::prepare_shared<bytes, tma_projection_kernel<S>, true>();
             tma_projection_kernel<S><<<grid, S::kThreads, bytes, stream>>>(
                 descriptors, device, static_cast<const int*>(positions.data),
-                static_cast<const int*>(counts.data), static_cast<float*>(scratch.data), x.ne[1],
-                x.ne[2], envelope.min_count, envelope.max_count);
+                static_cast<const int*>(counts.data), seq_ptr, static_cast<float*>(scratch.data),
+                x.ne[1], x.ne[2], envelope.min_count, envelope.max_count);
         } else {
             using C = Bf16ScheduleInstance<
                 Bf16A16MmaSchedule<S::kBlockRows, S::kBlockTokens, S::kBlockK, S::kWarpRows,
@@ -308,8 +322,8 @@ void launch(const Tensor& x, const Tensor& positions, const Tensor& counts,
     if constexpr (S::kBlockRows < 128) {
         key_post_kernel<<<columns, 640, 0, stream>>>(
             static_cast<const float*>(scratch.data), static_cast<const int*>(positions.data),
-            static_cast<const int*>(counts.data), device, x.ne[1], x.ne[2], envelope.min_count,
-            envelope.max_count);
+            static_cast<const int*>(counts.data), seq_ptr, device, x.ne[1], x.ne[2],
+            envelope.min_count, envelope.max_count);
         CUDA_CHECK(cudaGetLastError());
     }
 }

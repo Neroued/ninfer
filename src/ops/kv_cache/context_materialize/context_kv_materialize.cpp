@@ -198,7 +198,7 @@ void context_kv_materialize(
         if (selected.key_scratch)
             key_scratch =
                 allocate_key_scratch(workspace, profile.head_dim * profile.kv_heads, columns);
-        selected.launch(x, p, c, selected_layers, profile, envelope, key_scratch, stream);
+        selected.launch(x, p, c, nullptr, selected_layers, profile, envelope, key_scratch, stream);
     };
     const int rows = launch_rows(batch, envelope.max_count);
     if (rows == batch) {
@@ -216,6 +216,130 @@ void context_kv_materialize(
         }
         launch(context.slice(2, begin, size), positions.slice(1, begin, size),
                counts.slice(0, begin, size), selected_layers);
+    }
+}
+
+std::size_t
+context_kv_materialize_workspace_capacity_bytes(const ContextKVMaterializeProfile& profile,
+                                                std::int32_t min_tokens, std::int32_t max_tokens,
+                                                std::int32_t min_segments,
+                                                std::int32_t max_segments) {
+    require_math_profile(profile);
+    (void)common::operand::ragged_envelope(min_tokens, max_tokens, min_segments, max_segments, kOp);
+    const std::int64_t max_feasible =
+        std::min<std::int64_t>(max_tokens, static_cast<std::int64_t>(max_segments) * kCapacity);
+    if (min_tokens > max_feasible) {
+        throw std::invalid_argument(
+            "context_kv_materialize workspace: min_tokens exceeds max_segments * capacity");
+    }
+    constexpr std::int32_t kMaxLaunchColumns = 65535 * 16;
+    const auto rows                          = profile.head_dim * profile.kv_heads;
+    std::size_t capacity                     = 0;
+    const auto include                       = [&](std::int32_t columns) {
+        if (columns <= 0) return;
+        if (detail::select_context_kv_materialize(profile, columns).key_scratch) {
+            capacity = std::max(capacity, key_scratch_capacity(rows, columns));
+        }
+    };
+    const std::int32_t hi = static_cast<std::int32_t>(
+        std::min<std::int64_t>(max_feasible, kMaxLaunchColumns));
+    if (max_feasible > kMaxLaunchColumns) {
+        include(kMaxLaunchColumns);
+        for (std::int32_t c = 1; c <= 512; ++c) include(c);
+    }
+    // Check all schedule transition points and boundaries without scanning millions of sizes.
+    for (std::int32_t c : {16, 24, 32, 64, 80, 96, 128, 256, 512}) {
+        if (c >= min_tokens && c <= hi) include(c);
+    }
+    include(min_tokens);
+    include(hi);
+    return capacity;
+}
+
+void context_kv_materialize(
+    const Tensor& context, const RaggedSequenceView& ragged, const Tensor& positions,
+    const std::array<ContextKVMaterializeLayerView, kContextKVMaterializeLayers>& layers,
+    const ContextKVMaterializeProfile& profile, MemoryArena& workspace,
+    CudaExecutionView execution) {
+    const auto device = execution.device();
+    if (workspace.device() != device) {
+        throw std::invalid_argument("context_kv_materialize: workspace belongs to another device");
+    }
+    const auto stream = execution.stream();
+    require_math_profile(profile);
+    common::operand::ragged_sequence(ragged, kOp, device);
+    const std::int32_t tokens   = ragged.total_tokens();
+    const std::int32_t segments = ragged.num_seqs();
+    for (std::int32_t s = 0; s < segments; ++s) {
+        if (ragged.segment_length(s) > kCapacity) {
+            throw std::invalid_argument("context_kv_materialize: segment exceeds cyclic capacity");
+        }
+    }
+    require_tensor(context, DType::BF16, profile.hidden_size, tokens, 1, 1, 16, "context", device);
+    require_tensor(positions, DType::I32, tokens, 1, 1, 1, alignof(std::int32_t), "positions",
+                   device);
+    const std::array inputs{
+        common::operand::range(context, kOp),
+        common::operand::range(positions, kOp),
+        common::operand::range(ragged.cu_seqlens, kOp),
+        common::operand::range(ragged.seq_lengths, kOp),
+        common::operand::range(ragged.token_to_seq, kOp),
+    };
+    for (const auto& layer : layers) {
+        require_weight(layer.key_weight, profile, "key weight", device);
+        require_weight(layer.value_weight, profile, "value weight", device);
+        if (profile.weight_type == QType::BF16 &&
+            static_cast<const std::byte*>(layer.value_weight.qdata) !=
+                static_cast<const std::byte*>(layer.key_weight.qdata) +
+                    std::size_t(profile.head_dim * profile.kv_heads) * profile.hidden_size * 2)
+            throw std::invalid_argument(
+                "context_kv_materialize: BF16 K/V must borrow a consecutive parent prefix");
+        require_tensor(layer.key_norm_weight, DType::BF16, kHeadDim, 1, 1, 1, 4, "key norm weight",
+                       device);
+        validate_cache(layer.cache, segments, profile, device);
+        const auto storage = common::operand::range(layer.cache.k.records.storage.data,
+                                                    layer.cache.k.records.storage.bytes, kOp);
+        for (const auto input : inputs) common::operand::disjoint(storage, input, kOp);
+        common::operand::disjoint(storage,
+                                  common::operand::range(layer.cache.k.records.byte_offsets, kOp),
+                                  kOp);
+        const auto k_region = common::operand::range(
+            static_cast<const std::byte*>(layer.cache.k.records.storage.data) +
+                layer.cache.k.field.tensor.region.offset,
+            layer.cache.k.field.tensor.region.bytes, kOp);
+        const auto v_region = common::operand::range(
+            static_cast<const std::byte*>(layer.cache.v.records.storage.data) +
+                layer.cache.v.field.tensor.region.offset,
+            layer.cache.v.field.tensor.region.bytes, kOp);
+        common::operand::disjoint(k_region, v_region, kOp);
+    }
+
+    constexpr std::int32_t kMaxLaunchColumns = 65535 * 16;
+    const Tensor empty_counts;
+    for (std::int32_t begin = 0; begin < tokens; begin += kMaxLaunchColumns) {
+        const std::int32_t size = std::min(kMaxLaunchColumns, tokens - begin);
+        const auto x            = context.slice(1, begin, size);
+        const auto p            = positions.slice(0, begin, size);
+        const auto seq          = ragged.token_to_seq.slice(0, begin, size);
+        const auto selected     = detail::select_context_kv_materialize(profile, size);
+        auto scope              = workspace.scope();
+        Tensor key_scratch;
+        if (selected.key_scratch) {
+            key_scratch =
+                allocate_key_scratch(workspace, profile.head_dim * profile.kv_heads, size);
+            const auto scratch_range = common::operand::range(key_scratch, kOp);
+            for (const auto input : inputs) common::operand::disjoint(scratch_range, input, kOp);
+            for (const auto& layer : layers) {
+                common::operand::disjoint(
+                    scratch_range,
+                    common::operand::range(layer.cache.k.records.storage.data,
+                                           layer.cache.k.records.storage.bytes, kOp),
+                    kOp);
+            }
+        }
+        const auto count = static_cast<std::uint32_t>(size);
+        selected.launch(x, p, empty_counts, &seq, layers, profile, {count, count}, key_scratch,
+                        stream);
     }
 }
 

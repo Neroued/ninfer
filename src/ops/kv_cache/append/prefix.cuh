@@ -129,4 +129,63 @@ __global__ void prefix_paged_kernel(
     }
 }
 
+template <int Capacity>
+__global__ void ragged_cyclic_kernel(
+    const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
+    const std::int32_t* __restrict__ positions, const std::int32_t* __restrict__ token_to_seq,
+    const std::int64_t* __restrict__ state_offsets, __nv_bfloat16* __restrict__ cache_k,
+    __half* __restrict__ cache_v, int tokens, int padded_capacity) {
+    static_assert(Capacity == 2048 || Capacity == 4096);
+    static_assert((Capacity & (Capacity - 1)) == 0);
+    constexpr int UnitsPerToken = kKVCacheAppendPrefixHeads * kKVCacheAppendPrefixHeadDim / 8;
+    static_assert(UnitsPerToken == 128);
+    const int token = static_cast<int>(blockIdx.x);
+    if (token >= tokens) return;
+    const int lane      = static_cast<int>(threadIdx.x) & 31;
+    int position        = 0;
+    std::int64_t offset = 0;
+    if (lane == 0) {
+        const int segment = token_to_seq[token];
+        position          = positions[token];
+        offset            = state_offsets[segment];
+    }
+    position = __shfl_sync(0xffffffffu, position, 0);
+    offset   = __shfl_sync(0xffffffffu, offset, 0);
+    prefix_copy_cyclic_unit<Capacity>(
+        k, v, cache_k + offset / static_cast<std::int64_t>(sizeof(__nv_bfloat16)),
+        cache_v + offset / static_cast<std::int64_t>(sizeof(__half)), token,
+        static_cast<int>(threadIdx.x), position & (Capacity - 1), padded_capacity);
+}
+
+__global__ void ragged_paged_kernel(
+    const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
+    const std::int32_t* __restrict__ positions, const std::int32_t* __restrict__ token_to_seq,
+    const std::int32_t* __restrict__ table_rows, __nv_bfloat16* __restrict__ cache_k,
+    __half* __restrict__ cache_v, const std::int64_t* __restrict__ block_tables, int logical_pages,
+    int tokens) {
+    constexpr int UnitsPerToken  = kKVCacheAppendPrefixHeads * 8;
+    constexpr int TokensPerBlock = 256 / UnitsPerToken;
+    static_assert(TokensPerBlock * UnitsPerToken == 256);
+    const int local            = static_cast<int>(threadIdx.x);
+    const int local_token      = local / UnitsPerToken;
+    const int unit_in_token    = local - local_token * UnitsPerToken;
+    const int lane             = local & 31;
+    const int token            = static_cast<int>(blockIdx.x) * TokensPerBlock + local_token;
+    int position               = 0;
+    std::int64_t record_offset = 0;
+    if (lane == 0 && token < tokens) {
+        const int segment = token_to_seq[token];
+        position          = positions[token];
+        const auto* table =
+            block_tables + static_cast<std::int64_t>(logical_pages) * table_rows[segment];
+        record_offset = table[position >> 6];
+    }
+    position      = __shfl_sync(0xffffffffu, position, 0);
+    record_offset = __shfl_sync(0xffffffffu, record_offset, 0);
+    if (token < tokens) {
+        prefix_copy_paged_unit(k, v, cache_k, cache_v, token, unit_in_token,
+                               position & (kKVCacheAppendPrefixPage - 1), record_offset);
+    }
+}
+
 } // namespace ninfer::ops::detail

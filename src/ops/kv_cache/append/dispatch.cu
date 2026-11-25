@@ -47,8 +47,42 @@ void kv_cache_append_dispatch(const Tensor& k, const Tensor& v, const Tensor& po
 void kv_cache_append_dispatch(const Tensor& k, const Tensor& v, const RaggedSequenceView& ragged,
                               const Tensor& positions, const Tensor& table_rows,
                               PagedKVBatchLayerView cache, cudaStream_t stream) {
-    kv::launch_paged_write_ragged(k, v, positions, ragged.token_to_seq, ragged.seq_lengths,
-                                  table_rows, cache, 0, stream);
+    if (cache.head_dim == 256) {
+        kv::launch_paged_write_ragged(k, v, positions, ragged.token_to_seq, ragged.seq_lengths,
+                                      table_rows, cache, 0, stream);
+        return;
+    }
+    const int tokens = k.ne[2];
+    ragged_paged_kernel<<<1 + (tokens - 1) / 4, 256, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(k.data), static_cast<const __nv_bfloat16*>(v.data),
+        static_cast<const std::int32_t*>(positions.data),
+        static_cast<const std::int32_t*>(ragged.token_to_seq.data),
+        static_cast<const std::int32_t*>(table_rows.data),
+        static_cast<__nv_bfloat16*>(cache.k_pages.data()),
+        static_cast<__half*>(cache.v_pages.data()),
+        static_cast<const std::int64_t*>(cache.k_pages.records.page_offsets.data),
+        cache.k_pages.records.page_offsets.ne[0], tokens);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void kv_cache_append_dispatch(const Tensor& k, const Tensor& v, const RaggedSequenceView& ragged,
+                              const Tensor& positions, CyclicKVCacheLayerView cache,
+                              cudaStream_t stream) {
+    const int tokens  = k.ne[2];
+    const auto launch = [&]<int Capacity>() {
+        ragged_cyclic_kernel<Capacity><<<tokens, 128, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(k.data), static_cast<const __nv_bfloat16*>(v.data),
+            static_cast<const std::int32_t*>(positions.data),
+            static_cast<const std::int32_t*>(ragged.token_to_seq.data),
+            static_cast<const std::int64_t*>(cache.k.records.byte_offsets.data),
+            common::operand::state_field_base<__nv_bfloat16>(cache.k),
+            common::operand::state_field_base<__half>(cache.v), tokens, cache.padded_capacity);
+    };
+    if (cache.capacity == 2048)
+        launch.template operator()<2048>();
+    else
+        launch.template operator()<4096>();
+    CUDA_CHECK(cudaGetLastError());
 }
 
 void kv_cache_append_prefix_dispatch(const Tensor& k, const Tensor& v, const Tensor& positions,

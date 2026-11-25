@@ -1,5 +1,6 @@
 #include "ops/suite.h"
 #include "ops/op_tester.h"
+#include "ops/ragged_fixture.h"
 #include "ops/quantized_weight.h"
 #include "cuda_fixture.h"
 #include "core/decode_graph.h"
@@ -179,6 +180,130 @@ int run(F& f, int width, int batch, bool graph, bool narrow = false,
     return failures;
 }
 
+int run_ragged(F& f, std::vector<int> lengths, bool graph) {
+    const auto e = cuda_environment().context.execution_view();
+    RaggedFixture ragged(std::move(lengths));
+    const int tokens = ragged.tokens(), segments = ragged.segments();
+    std::vector<float> input(std::size_t(4096) * tokens);
+    fill_uniform(input, 61501U + tokens, -.5F, .5F);
+    round_to_bf16(input);
+    auto dx = to_device_bf16(input), dp = DeviceBuffer(e.device(), tokens * 4);
+    std::array<DeviceBuffer, 5> offsets;
+    for (int l = 0; l < 5; ++l) {
+        offsets[l] = DeviceBuffer(e.device(), segments * 8);
+        f.bind(l, Tensor(offsets[l].span(), DType::I64, {segments}));
+    }
+    const auto bytes = ops::context_kv_materialize_workspace_capacity_bytes(
+        F::Profile, tokens, tokens, segments, segments);
+    GuardedDeviceBuffer backing(std::max<std::size_t>(bytes, 1));
+    MemoryArena arena(backing.span());
+    Tensor x(dx.span(), DType::BF16, {4096, tokens}), p(dp.span(), DType::I32, {tokens});
+    auto launch = [&] {
+        ops::context_kv_materialize(x, ragged.view, p, f.layers, F::Profile, arena, e);
+    };
+    DecodeGraphDefinition definition;
+    DecodeGraphExecutable executable;
+    int failures = 0;
+    for (int replay = 0; replay < (graph ? 3 : 1); ++replay) {
+        std::vector<int> positions(tokens);
+        std::array<std::vector<int>, 5> slots;
+        for (int s = 0; s < segments; ++s)
+            for (int t = 0; t < ragged.lengths[s]; ++t)
+                positions[ragged.prefix[s] + t] = 1'048'570 + s * 4096 + t + replay * 137;
+        for (int l = 0; l < 5; ++l) {
+            slots[l].resize(segments);
+            for (int s = 0; s < segments; ++s) slots[l][s] = (s * 3 + l + replay) % F::Records;
+            const auto off = f.records->record_offsets(slots[l]);
+            offsets[l].copy_from_host(off.data(), off.size() * 8);
+        }
+        dp.copy_from_host(positions.data(), positions.size() * 4);
+        f.reset();
+        cuda_synchronize();
+        if (graph && replay == 0) {
+            definition.capture(e.stream(), launch);
+            executable.instantiate(definition);
+        }
+        if (graph)
+            executable.launch(e.stream());
+        else
+            launch();
+        cuda_synchronize(e.stream());
+        f.records->copy_back();
+        for (int l = 0; l < 5; ++l) {
+            const auto kb = from_device<std::uint16_t>(f.keys[l], F::CacheElements);
+            const auto vb = from_device<std::uint16_t>(f.values[l], F::CacheElements);
+            std::array<std::set<int>, 8> written;
+            for (int s = 0; s < segments; ++s)
+                for (int t = 0; t < ragged.lengths[s]; ++t)
+                    written[slots[l][s]].insert(positions[ragged.prefix[s] + t] % 2048);
+            bool footprint = true;
+            for (int r = 0; r < 8; ++r)
+                for (int h = 0; h < 4; ++h)
+                    for (int slot = 0; slot < F::Padded; ++slot)
+                        if (!written[r].contains(slot))
+                            for (int d = 0; d < 128; ++d) {
+                                const auto i = F::index(r, h, slot, d);
+                                if (kb[i] != 0xa5a5U || vb[i] != 0xa5a5U) footprint = false;
+                            }
+            if (!footprint) {
+                std::cerr << "BF16 ragged untouched footprint layer=" << l << '\n';
+                ++failures;
+            }
+            std::vector<double> got_k, want_k, got_v, want_v;
+            for (int s = 0; s < segments; ++s) {
+                std::set<int> locals{0, ragged.lengths[s] - 1};
+                if (ragged.lengths[s] > 128) locals.insert(128);
+                for (int local : locals) {
+                    const int col = ragged.prefix[s] + local, pos = positions[col],
+                              slot = pos % 2048;
+                    std::array<double, 1024> raw{};
+                    parallel_rows(1024, 1024ULL * 4096, [&](int first, int last) {
+                        for (int row = first; row < last; ++row) {
+                            double sum = 0;
+                            for (int k = 0; k < 4096; ++k)
+                                sum +=
+                                    double(F::value(f.parent_bits[l][std::size_t(row) * 4096 + k])) *
+                                    input[std::size_t(col) * 4096 + k];
+                            raw[row] = sum;
+                        }
+                    });
+                    for (int h = 0; h < 4; ++h) {
+                        double sq = 0;
+                        for (int d = 0; d < 128; ++d) sq += raw[h * 128 + d] * raw[h * 128 + d];
+                        const double inv = 1 / std::sqrt(sq / 128 + F::Profile.epsilon);
+                        for (int d = 0; d < 64; ++d) {
+                            const double a = raw[h * 128 + d] * inv * F::value(f.norm_bits[l][d]);
+                            const double z =
+                                raw[h * 128 + d + 64] * inv * F::value(f.norm_bits[l][d + 64]);
+                            const double ang =
+                                pos * std::pow(double(F::Profile.theta), -double(d) / 64);
+                            got_k.push_back(bf16_to_f32(kb[F::index(slots[l][s], h, slot, d)]));
+                            got_k.push_back(bf16_to_f32(kb[F::index(slots[l][s], h, slot, d + 64)]));
+                            want_k.push_back(a * std::cos(ang) - z * std::sin(ang));
+                            want_k.push_back(z * std::cos(ang) + a * std::sin(ang));
+                        }
+                    }
+                    for (int row = 0; row < 512; ++row) {
+                        const float v = represented_value(raw[512 + row]);
+                        want_v.push_back(quantized_weight::detail::f16_to_f32(
+                            quantized_weight::detail::f32_to_f16(v)));
+                        got_v.push_back(quantized_weight::detail::f16_to_f32(
+                            vb[F::index(slots[l][s], row / 128, slot, row % 128)]));
+                    }
+                }
+            }
+            failures +=
+                verify_reduction("BF16 ragged K layer=" + std::to_string(l), got_k, want_k, kKeys);
+            failures += verify_reduction("BF16 ragged V layer=" + std::to_string(l), got_v, want_v,
+                                         kValues);
+        }
+        failures += !f.records->guards_intact();
+    }
+    if (arena.used() != 0 || arena.peak_used() > bytes) ++failures;
+    failures += backing.verify_guards("BF16 ragged workspace");
+    return failures;
+}
+
 int reject_invalid_prefix(F& f) {
     const auto e = cuda_environment().context.execution_view();
     DeviceBuffer input(e.device(), 4096 * 2), metadata(e.device(), 16), workspace(e.device(), 16);
@@ -279,4 +404,27 @@ void add_bf16_context_materialize_cases(OpSuite& suite) {
             return failures;
         },
         {{"format", "bf16"}, {"suite", "concurrency"}});
+    suite.add(
+        "context_materialize_bf16/ragged/all_regimes",
+        [] {
+            F fixture(cuda_environment().context.device());
+            int failures = 0;
+            failures += run_ragged(fixture, {1, 3, 5, 2}, true);         // Small (11)
+            failures += run_ragged(fixture, {5, 11, 9}, true);           // Narrow+TMA (25)
+            failures += run_ragged(fixture, {7, 19, 23}, false);         // Medium (49)
+            failures += run_ragged(fixture, {17, 45, 31}, false);        // Block (93)
+            failures += run_ragged(fixture, {33, 97, 65, 19}, true);     // Transition+TMA (214)
+            failures += run_ragged(fixture, {65, 193, 129, 31}, false);  // Wide+TMA (418)
+            failures += run_ragged(fixture, {129, 257, 193, 65}, true);  // Long+TMA (644, 0-scratch)
+            failures += run_ragged(fixture, {1025, 1025, 17}, false);    // Long+TMA > 2048 (2067)
+            const auto envelope = ops::context_kv_materialize_workspace_capacity_bytes(
+                F::Profile, 1, 4096, 1, 8);
+            for (int t : {1, 16, 32, 64, 128, 256, 512, 513, 2048, 4096}) {
+                if (ops::context_kv_materialize_workspace_capacity_bytes(F::Profile, t, t, 1, 8) >
+                    envelope)
+                    ++failures;
+            }
+            return failures;
+        },
+        {{"format", "bf16"}, {"execution", "graph"}});
 }

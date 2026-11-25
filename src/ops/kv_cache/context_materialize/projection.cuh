@@ -27,6 +27,7 @@ __launch_bounds__(Rows / 16 * ColumnWarps * 32,
                       ? 2
                       : 1) void context_kv_mma_kernel(const __nv_bfloat16* hidden,
                                                       const int* positions, const int* counts,
+                                                      const int* token_to_seq,
                                                       const __grid_constant__ DeviceLayers layers,
                                                       float* key_scratch, int width, int batch,
                                                       int min_count, int max_count) {
@@ -225,14 +226,17 @@ __launch_bounds__(Rows / 16 * ColumnWarps * 32,
     __syncthreads();
     for (int local = warp; local < live_columns; local += kWarps) {
         const int packed_column = column_begin + local;
-        const int column        = context_column(packed_column, width, max_count);
-        const int request       = column / width;
-        const int count         = counts[request];
-        if (count < min_count || count > max_count || column % width >= count) continue;
+        const int column =
+            token_to_seq ? packed_column : context_column(packed_column, width, max_count);
+        const int request = token_to_seq ? token_to_seq[column] : (column / width);
+        if (!token_to_seq) {
+            const int count = counts[request];
+            if (count < min_count || count > max_count || column % width >= count) continue;
+        }
         if constexpr (Rows == 128) {
             if (!value) {
                 store_key_head(storage.scores[local], layer, positions, layer.offsets, column,
-                               width, row_begin / 128, layers.epsilon, layers.frequencies);
+                               request, row_begin / 128, layers.epsilon, layers.frequencies);
                 continue;
             }
         }
@@ -240,7 +244,8 @@ __launch_bounds__(Rows / 16 * ColumnWarps * 32,
             const int row      = row_begin + r;
             const float result = storage.scores[local][r];
             if (!value) {
-                key_scratch[row + 1024LL * (packed_column + max_count * batch * layer_index)] =
+                key_scratch[row +
+                            1024LL * (packed_column + std::int64_t(max_count) * batch * layer_index)] =
                     result;
             } else {
                 store_value(row, column, layer.offsets[request], positions, layer, result);
@@ -256,7 +261,7 @@ using GroupedSchedule =
 
 template <int Columns, int KWarps = 8>
 __global__ __launch_bounds__(KWarps * 32, 1) void context_kv_grouped_kernel(
-    const __nv_bfloat16* x, const int* positions, const int* counts,
+    const __nv_bfloat16* x, const int* positions, const int* counts, const int* token_to_seq,
     const __grid_constant__ DeviceLayers layers, float* scratch, int width, int batch,
     int min_count, int max_count) {
     const int l        = blockIdx.z >> 1;
@@ -264,9 +269,10 @@ __global__ __launch_bounds__(KWarps * 32, 1) void context_kv_grouped_kernel(
     const auto layer   = layers.layer[l];
     const auto* codes  = value ? layer.value_codes : layer.key_codes;
     const auto* scales = value ? layer.value_scales : layer.key_scales;
-    const MaterializeProjectionEpilogue epilogue{layer,     positions, counts, layer.offsets,
-                                                 scratch,   l,         width,  batch,
-                                                 min_count, max_count, value};
+    const MaterializeProjectionEpilogue epilogue{layer,   positions, counts,    token_to_seq,
+                                                 layer.offsets,      scratch,   l,
+                                                 width,   batch,     min_count, max_count,
+                                                 value};
     q8_a16_sliced_k_mma<GroupedSchedule<Columns, KWarps>, true>(
         Q8LinearOperands{x, codes, scales, 1024, 5120, max_count * batch, 5120},
         LinearBf16Output{nullptr, 0}, epilogue, Q8SlicedKIdentityRows{}, 0,
@@ -275,21 +281,26 @@ __global__ __launch_bounds__(KWarps * 32, 1) void context_kv_grouped_kernel(
 
 __global__ __launch_bounds__(256) void context_kv_key_post_kernel(
     const float* __restrict__ key_scratch, const std::int32_t* __restrict__ positions,
-    const std::int32_t* __restrict__ counts, const __grid_constant__ DeviceLayers layers,
-    std::int32_t batch_size, std::int32_t width, std::int32_t min_count, std::int32_t max_count) {
-    const int packed_column   = static_cast<int>(blockIdx.x);
-    const int physical_column = context_column(packed_column, width, max_count);
-    const int layer_index     = static_cast<int>(blockIdx.y);
-    const int batch           = physical_column / width;
-    const int local           = physical_column % width;
-    const int count           = counts[batch];
-    if (count < min_count || count > max_count || local >= count) return;
+    const std::int32_t* __restrict__ counts, const std::int32_t* __restrict__ token_to_seq,
+    const __grid_constant__ DeviceLayers layers, std::int32_t batch_size, std::int32_t width,
+    std::int32_t min_count, std::int32_t max_count) {
+    const int packed_column = static_cast<int>(blockIdx.x);
+    const int physical_column =
+        token_to_seq ? packed_column : context_column(packed_column, width, max_count);
+    const int layer_index = static_cast<int>(blockIdx.y);
+    const int request     = token_to_seq ? token_to_seq[physical_column] : (physical_column / width);
+    if (!token_to_seq) {
+        const int local = physical_column % width;
+        const int count = counts[request];
+        if (count < min_count || count > max_count || local >= count) return;
+    }
     const auto layer = layers.layer[layer_index];
     const int head   = threadIdx.x >> 5;
     const float* input =
-        key_scratch + std::int64_t(kRows) * (packed_column + max_count * batch_size * layer_index) +
+        key_scratch +
+        std::int64_t(kRows) * (packed_column + std::int64_t(max_count) * batch_size * layer_index) +
         head * kHeadDim;
-    store_key_head(input, layer, positions, layer.offsets, physical_column, width, head,
+    store_key_head(input, layer, positions, layer.offsets, physical_column, request, head,
                    layers.epsilon, layers.frequencies);
 }
 

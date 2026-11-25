@@ -47,19 +47,33 @@ void kv_cache_append(const Tensor& k, const Tensor& v, const Tensor& positions,
 /**
  * Append every packed K/V row of a ragged batch to batched paged growing-cache storage.
  *
- * k/v are contiguous 16-byte-aligned BF16 [256,4|2,N] for N=ragged.total_tokens(), positions is
+ * k/v are contiguous 16-byte-aligned BF16 [D,Hkv,N] for N=ragged.total_tokens(), positions is
  * contiguous device I32 [N], and table_rows is contiguous device I32 [S] for S=ragged.num_seqs().
  * Each packed token t in [0,N) belongs to segment s=ragged.token_to_seq[t] and is encoded at
- * logical position positions[t] through page table row table_rows[s] using the exact codec and
- * layout rules of single-sequence kv_cache_append. Every addressed code/value and scale is
- * overwritten, no unrelated cache row is read or written, inputs are unchanged, and cache storage
- * does not overlap any input, metadata tensor, or page offset table. The caller guarantees
- * nonnegative materialized logical positions within cache capacity and distinct destination slots
- * across packed tokens.
+ * logical position positions[t] through page table row table_rows[s]. Supports D=256/Hkv=2|4 with
+ * any storage codec defined by single-sequence kv_cache_append, and D=128/Hkv=8 with BF16 K and
+ * FP16 V record-local planes [128,64,8]. Every addressed code/value and scale is overwritten, no
+ * unrelated cache row is read or written, inputs are unchanged, and cache storage does not overlap
+ * any input, metadata tensor, or page offset table. The caller guarantees nonnegative materialized
+ * logical positions within cache capacity and distinct destination slots across packed tokens.
  */
 void kv_cache_append(const Tensor& k, const Tensor& v, const RaggedSequenceView& ragged,
                      const Tensor& positions, const Tensor& table_rows,
                      PagedKVBatchLayerView cache, CudaExecutionView execution);
+
+/**
+ * Append every packed K/V row of a ragged batch to StateImage cyclic storage.
+ *
+ * k/v are contiguous 16-byte-aligned BF16 [128,8,N] for N=ragged.total_tokens() and positions is
+ * contiguous device I32 [N]. Each packed token t in [0,N) belongs to segment
+ * s=ragged.token_to_seq[t] and is written to cyclic slot positions[t] mod capacity of record
+ * cache.k.records.byte_offsets[s] (D=128, Hkv=8, capacity 2048 or 4096), storing K bit-for-bit and
+ * V as FP16_RNE(BF16 input). Each segment appends at most capacity tokens, cache storage does not
+ * overlap inputs or record offsets, inputs are unchanged, and unaddressed slots are preserved.
+ */
+void kv_cache_append(const Tensor& k, const Tensor& v, const RaggedSequenceView& ragged,
+                     const Tensor& positions, CyclicKVCacheLayerView cache,
+                     CudaExecutionView execution);
 
 /**
  * Append device-selected BF16 prefixes to batched paged growing-cache storage.

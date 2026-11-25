@@ -7,6 +7,7 @@
 #include "ninfer/ops/context_kv_materialize.h"
 
 #include "ops/op_tester.h"
+#include "ops/ragged_fixture.h"
 #include "core/decode_graph.h"
 #include "ops/quantized_weight.h"
 
@@ -463,6 +464,138 @@ int run_case(Fixture& fixture, const std::string& label, int width, int batch,
     return failures;
 }
 
+int run_ragged_case(Fixture& fixture, const std::string& label, std::vector<int> lengths,
+                    bool graph) {
+    RaggedFixture ragged(std::move(lengths));
+    const int tokens = ragged.tokens(), segments = ragged.segments();
+    std::vector<float> context = make_context(tokens, 0x901U + tokens);
+    std::vector<int> positions(tokens), slots(segments);
+    const auto fill_inputs = [&](int pass) {
+        for (int s = 0; s < segments; ++s) {
+            slots[s]       = (s * 3 + 1 + pass) % 8;
+            const int base = 262140 + s * 4096 + pass * 17;
+            for (int t = 0; t < ragged.lengths[s]; ++t) positions[ragged.prefix[s] + t] = base + t;
+        }
+    };
+    fill_inputs(0);
+    DeviceBuffer context_device   = to_device_bf16(context);
+    DeviceBuffer positions_device = to_device_i32(positions);
+    auto state_offsets            = fixture.records->record_offsets(slots);
+    DeviceBuffer offsets_device   = to_device(state_offsets);
+    const std::size_t workspace_bytes = ops::context_kv_materialize_workspace_capacity_bytes(
+        kProfile, tokens, tokens, segments, segments);
+    GuardedDeviceBuffer scratch(std::max<std::size_t>(workspace_bytes, 1));
+    MemoryArena workspace(scratch.span());
+    Tensor context_tensor(context_device.span(), DType::BF16, {kHidden, tokens});
+    Tensor positions_tensor(positions_device.span(), DType::I32, {tokens});
+    Tensor offsets_tensor(offsets_device.span(), DType::I64, {segments});
+    fixture.bind(offsets_tensor);
+    const auto launch = [&](CudaExecutionView cuda) {
+        ops::context_kv_materialize(context_tensor, ragged.view, positions_tensor, fixture.views,
+                                    kProfile, workspace, cuda);
+    };
+    const auto check_pass = [&](const std::string& pass_label) {
+        const Snapshot snapshot(fixture);
+        int pass_failures = 0;
+        std::array<std::set<int>, 8> written;
+        for (int s = 0; s < segments; ++s)
+            for (int t = 0; t < ragged.lengths[s]; ++t)
+                written[slots[s]].insert(positions[ragged.prefix[s] + t] & (kCapacity - 1));
+        for (int layer = 0; layer < kLayers; ++layer) {
+            bool intact = true;
+            for (int r = 0; r < 8; ++r)
+                for (int h = 0; h < kHeads; ++h)
+                    for (int slot = 0; slot < kPaddedCapacity; ++slot)
+                        if (!written[r].contains(slot))
+                            for (int d = 0; d < kHeadDim; ++d) {
+                                const auto idx = cache_index(r, h, slot, d);
+                                if (snapshot.keys[layer][idx] != 0xa5a5U ||
+                                    snapshot.values[layer][idx] != 0xa5a5U)
+                                    intact = false;
+                            }
+            if (!intact) {
+                std::cerr << pass_label << " untouched cache modified layer=" << layer << '\n';
+                ++pass_failures;
+            }
+            const LayerStorage& source = fixture.storage[layer];
+            std::vector<double> key_got, key_expected, value_got, value_expected;
+            const std::array<int, 3> heads{0, 3, 7};
+            const std::array<int, 4> value_rows{0, 127, 511, 1023};
+            for (int s = 0; s < segments; ++s) {
+                std::set<int> locals{0, ragged.lengths[s] - 1};
+                if (ragged.lengths[s] > 64) locals.insert(64);
+                for (int local : locals) {
+                    const int col      = ragged.prefix[s] + local;
+                    const int position = positions[col];
+                    const int slot     = position & (kCapacity - 1);
+                    const int lane     = slots[s];
+                    const float* input = context.data() + static_cast<std::size_t>(col) * kHidden;
+                    for (int head : heads) {
+                        std::vector<double> head_expected;
+                        append_key_oracle(source, input, head, position, head_expected);
+                        for (int pair = 0; pair < kHeadDim / 2; ++pair) {
+                            key_got.push_back(bf16_to_f32(
+                                snapshot.keys[layer][cache_index(lane, head, slot, pair)]));
+                            key_expected.push_back(head_expected[2 * pair]);
+                            key_got.push_back(bf16_to_f32(snapshot.keys[layer][cache_index(
+                                lane, head, slot, pair + kHeadDim / 2)]));
+                            key_expected.push_back(head_expected[2 * pair + 1]);
+                        }
+                    }
+                    for (int i = 0; i < int(value_rows.size()); ++i) {
+                        const int row           = value_rows[i];
+                        const float represented = represented_projection(
+                            source.decoded_value_samples.data() + i * kHidden, input);
+                        const auto expected_bits =
+                            quantized_weight::detail::f32_to_f16(represented);
+                        value_expected.push_back(
+                            quantized_weight::detail::f16_to_f32(expected_bits));
+                        value_got.push_back(quantized_weight::detail::f16_to_f32(
+                            snapshot.values[layer][cache_index(lane, row / kHeadDim, slot,
+                                                               row % kHeadDim)]));
+                    }
+                }
+            }
+            pass_failures += verify_reduction(pass_label + " K layer=" + std::to_string(layer),
+                                              key_got, key_expected, kKeyCriterion);
+            pass_failures += verify_reduction(pass_label + " V layer=" + std::to_string(layer),
+                                              value_got, value_expected, kValueCriterion);
+        }
+        return pass_failures;
+    };
+    fixture.reset_cache();
+    launch(ninfer::test::cuda_environment().default_execution);
+    cuda_synchronize();
+    int failures = check_pass(label);
+    if (workspace.used() != 0 || workspace.peak_used() > workspace_bytes) ++failures;
+    failures += scratch.verify_guards(label + " workspace");
+    if (graph) {
+        cudaStream_t stream = nullptr;
+        cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "graph stream");
+        const auto stream_exec = ninfer::test::cuda_environment().context.execution_view(stream);
+        {
+            DecodeGraphDefinition definition;
+            DecodeGraphExecutable executable;
+            definition.capture(stream, [&] { launch(stream_exec); });
+            executable.instantiate(definition);
+            for (int replay = 1; replay <= 2; ++replay) {
+                fill_inputs(replay);
+                fixture.reset_cache();
+                cuda_synchronize();
+                state_offsets = fixture.records->record_offsets(slots);
+                offsets_device.copy_from_host(state_offsets.data(),
+                                              segments * sizeof(std::int64_t));
+                positions_device.copy_from_host(positions.data(), tokens * 4);
+                executable.launch(stream);
+                cuda_synchronize(stream);
+                failures += check_pass(label + " replay=" + std::to_string(replay));
+            }
+        }
+        cuda_check(cudaStreamDestroy(stream), "destroy graph stream");
+    }
+    return failures;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -596,6 +729,27 @@ int main(int argc, char** argv) {
                 failures +=
                     run_case(fixture, "capacity witness B=" + std::to_string(batch), witness, batch,
                              counts, slots, positions, 0x702U, false, false, interval);
+            }
+            return failures;
+        },
+        {{"format", "q8"}, {"execution", "graph"}});
+    suite.add(
+        "context_materialize/ragged/all_regimes",
+        [] {
+            Fixture fixture;
+            int failures = 0;
+            failures += run_ragged_case(fixture, "ragged grouped16", {1, 3, 5, 2}, true);
+            failures += run_ragged_case(fixture, "ragged grouped24", {3, 7, 11}, false);
+            failures += run_ragged_case(fixture, "ragged mma64x32", {1, 13, 29, 7}, true);
+            failures += run_ragged_case(fixture, "ragged mma128x64", {17, 65, 31, 19}, true);
+            failures += run_ragged_case(fixture, "ragged wide324", {65, 129, 97, 33}, false);
+            failures += run_ragged_case(fixture, "ragged over2048", {1025, 1025, 17}, false);
+            const auto envelope = ops::context_kv_materialize_workspace_capacity_bytes(
+                kProfile, 1, 4096, 1, 8);
+            for (int t : {1, 16, 24, 32, 64, 80, 96, 128, 256, 257, 2048, 4096}) {
+                if (ops::context_kv_materialize_workspace_capacity_bytes(kProfile, t, t, 1, 8) >
+                    envelope)
+                    ++failures;
             }
             return failures;
         },

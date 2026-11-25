@@ -9,6 +9,9 @@ void kv_cache_append_dispatch(const Tensor& k, const Tensor& v, const Tensor& po
 void kv_cache_append_dispatch(const Tensor& k, const Tensor& v, const RaggedSequenceView& ragged,
                               const Tensor& positions, const Tensor& table_rows,
                               PagedKVBatchLayerView cache, cudaStream_t stream);
+void kv_cache_append_dispatch(const Tensor& k, const Tensor& v, const RaggedSequenceView& ragged,
+                              const Tensor& positions, CyclicKVCacheLayerView cache,
+                              cudaStream_t stream);
 void kv_cache_append_prefix_dispatch(const Tensor& k, const Tensor& v, const Tensor& positions,
                                      const Tensor& counts, const Tensor& table_rows,
                                      PagedKVBatchLayerView cache,

@@ -26,7 +26,7 @@ enum class ComputePhase {
 
 struct PackedPrefill {
     execution::PackedPrefillUpdate update;
-    ops::RaggedSequenceView mtp_ragged;
+    ops::RaggedSequenceView mtp_ragged, dflash_ragged;
     std::vector<std::uint32_t> sampled_members;
 };
 

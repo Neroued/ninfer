@@ -583,6 +583,131 @@ void draft_append_context(DraftExecutionView execution, const Tensor& features,
     append_context_impl(execution, features, positions, counts, offsets, table_rows, envelope);
 }
 
+void draft_append_context(DraftExecutionView execution, const Tensor& features,
+                          const Tensor& positions, const ops::RaggedSequenceView& ragged,
+                          const ops::RaggedSequenceView& local_ragged, const Tensor& local_indices,
+                          const Tensor& offsets, const Tensor& table_rows) {
+    if (!execution.parameters.draft) throw std::logic_error("draft parameters are unavailable");
+    const auto& target      = execution.parameters.profile->config.text;
+    const auto& config      = *execution.parameters.profile->config.draft;
+    const int n             = ragged.total_tokens();
+    const int segments      = ragged.num_seqs();
+    const int n_local       = local_ragged.total_tokens();
+    const int feature_dim   = dimension(target.hidden_size *
+                                        std::uint64_t(config.target_layer_ids.size()));
+    const int hidden        = dimension(target.hidden_size);
+    const int window        = dimension(config.sliding_window.value_or(0));
+    nvtx::ScopedRange append_range(nvtx::Name::DFlashContextAppend, nvtx::Category::DFlash,
+                                   static_cast<std::uint64_t>(n));
+    if (n <= 0 || segments <= 0 || local_ragged.num_seqs() != segments || n_local <= 0 ||
+        n_local > n || features.dtype != DType::BF16 || features.ne[0] != feature_dim ||
+        features.ne[1] != n || features.ne[2] != 1 || features.ne[3] != 1 ||
+        positions.dtype != DType::I32 || positions.ne[0] != n || positions.ne[1] != 1 ||
+        offsets.dtype != DType::I64 || offsets.ne[0] != segments ||
+        table_rows.dtype != DType::I32 || table_rows.ne[0] != segments) {
+        throw std::invalid_argument("DFlash packed context append inputs are invalid");
+    }
+    for (int s = 0; s < segments; ++s) {
+        if (local_ragged.segment_length(s) != std::min(ragged.segment_length(s), window)) {
+            throw std::invalid_argument("DFlash packed local window mismatch");
+        }
+    }
+    const bool truncated = n_local < n;
+    if (truncated && (local_indices.dtype != DType::I32 || local_indices.ne[0] != n_local ||
+                      local_indices.ne[1] != 1)) {
+        throw std::invalid_argument("DFlash packed local indices are invalid");
+    }
+    auto scope = execution.work.scope();
+    if (config.dflash2) {
+        Tensor input           = features;
+        Tensor local_positions = positions;
+        if (truncated) {
+            input           = execution.work.alloc(DType::BF16, {feature_dim, n_local});
+            local_positions = execution.work.alloc(DType::I32, {n_local});
+            Tensor in_view  = input.view({feature_dim, 1, n_local});
+            Tensor pos_view = local_positions.view({1, 1, n_local});
+            ops::gather_batch_rows(features.view({feature_dim, 1, n}), local_indices, in_view,
+                                   execution.cuda);
+            ops::gather_batch_rows(positions.view({1, 1, n}), local_indices, pos_view,
+                                   execution.cuda);
+        }
+        const auto roots = workspace::dflash_context(execution.work, target, config, n_local);
+        Tensor projected = roots.projected;
+        Tensor context   = roots.normalized;
+        project(input, execution.parameters.draft->feature_projection, projected, execution.work,
+                execution.cuda);
+        ops::rmsnorm(projected, execution.parameters.draft->context_norm, config.rms_norm_eps,
+                     false, context, execution.cuda);
+        std::array<ops::ContextKVMaterializeLayerView, ops::kContextKVMaterializeLayers> layers;
+        if (config.num_hidden_layers != layers.size() ||
+            config.local_layer_count() != layers.size()) {
+            throw std::invalid_argument(
+                "masked draft context: config is outside the fused materialization contract");
+        }
+        for (int layer = 0; layer < dimension(config.num_hidden_layers); ++layer) {
+            const auto& weights = execution.parameters.draft->layers[layer];
+            layers[layer]       = {weights.context_key.weight, weights.context_value.weight,
+                                   weights.key_norm, execution.local_layer(layer, offsets)};
+        }
+        ops::context_kv_materialize(context, local_ragged, local_positions, layers,
+                                    *execution.parameters.profile->draft->context_materialization,
+                                    execution.work, execution.cuda);
+        return;
+    }
+
+    const auto roots = workspace::dflash_context(execution.work, target, config, n);
+    Tensor projected = roots.projected;
+    Tensor context   = roots.normalized;
+    project(features, execution.parameters.draft->feature_projection, projected, execution.work,
+            execution.cuda);
+    ops::rmsnorm(projected, execution.parameters.draft->context_norm, config.rms_norm_eps, false,
+                 context, execution.cuda);
+    Tensor local_context   = context;
+    Tensor local_positions = positions;
+    if (truncated) {
+        local_context   = execution.work.alloc(DType::BF16, {hidden, n_local});
+        local_positions = execution.work.alloc(DType::I32, {n_local});
+        Tensor lc_view  = local_context.view({hidden, 1, n_local});
+        Tensor lp_view  = local_positions.view({1, 1, n_local});
+        ops::gather_batch_rows(context.view({hidden, 1, n}), local_indices, lc_view,
+                               execution.cuda);
+        ops::gather_batch_rows(positions.view({1, 1, n}), local_indices, lp_view, execution.cuda);
+    }
+    const auto head_dim  = dimension(config.attention.head_dim);
+    const auto kv_heads  = dimension(config.attention.num_key_value_heads);
+    const auto key_width = dimension(config.attention.key_width());
+    for (int layer = 0; layer < dimension(config.num_hidden_layers); ++layer) {
+        auto layer_scope = execution.work.scope();
+        const auto& weight =
+            execution.parameters.draft->layers.at(static_cast<std::size_t>(layer));
+        const bool local_layer =
+            config.layer_types[layer] == dflash::AttentionKind::SlidingAttention;
+        const int layer_columns = local_layer ? n_local : n;
+        Tensor layer_context    = local_layer ? local_context : context;
+        Tensor layer_positions  = local_layer ? local_positions : positions;
+        auto layer_roots =
+            workspace::dflash_context_layer(execution.work, target, config, layer_columns);
+        Tensor key_raw    = layer_roots.key_raw.view({head_dim, kv_heads, layer_columns});
+        Tensor value      = layer_roots.value.view({head_dim, kv_heads, layer_columns});
+        Tensor key_flat   = key_raw.view({key_width, layer_columns});
+        Tensor value_flat = value.view({key_width, layer_columns});
+        ops::linear_pair(layer_context, layer_context, weight.context_key.weight,
+                         weight.context_value.weight, key_flat, value_flat, execution.cuda);
+        Tensor key = layer_roots.key.view({head_dim, kv_heads, layer_columns});
+        ops::rmsnorm(key_raw, weight.key_norm, config.rms_norm_eps, false, key, execution.cuda);
+        ops::rope(layer_positions, head_dim, config.rope_theta, key, execution.cuda);
+        if (local_layer) {
+            ops::kv_cache_append(key, value, local_ragged, layer_positions,
+                                 execution.local_layer(config.compact_layer_index(layer), offsets),
+                                 execution.cuda);
+        } else {
+            ops::kv_cache_append(key, value, ragged, layer_positions, table_rows,
+                                 execution.full_layer(config.compact_layer_index(layer)),
+                                 execution.cuda);
+        }
+    }
+}
+
 void draft_propose(DraftExecutionView execution, const DraftInputs& inputs, DraftOutputs& outputs,
                    DraftBuckets buckets, const DraftReadoutSubmit& submit) {
     if (!execution.parameters.draft) throw std::logic_error("draft parameters are unavailable");

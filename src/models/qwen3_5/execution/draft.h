@@ -5,6 +5,7 @@
 #include "models/qwen3_5/execution/parameters.h"
 #include "models/qwen3_5/state/decoder_state.h"
 #include "ninfer/ops/kv_cache_append.h"
+#include "ninfer/ops/ragged.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/sliding_window_attention.h"
 #include "ninfer/ops/softmax_attention.h"
@@ -89,6 +90,15 @@ struct DraftReadoutSubmit {
 void draft_append_context(DraftExecutionView, const Tensor& features, const Tensor& positions,
                           const Tensor& counts, const Tensor& offsets, const Tensor& table_rows,
                           ops::KVCacheAppendPrefixExecutionEnvelope);
+
+// Appends packed ragged target features to cyclic State records and (for DFlash1) paged
+// full-attention history in a single pass. local_ragged holds each segment truncated to the
+// cyclic sliding window; when local_ragged.total_tokens() < ragged.total_tokens(), local_indices
+// selects the retained columns from features/positions.
+void draft_append_context(DraftExecutionView, const Tensor& features, const Tensor& positions,
+                          const ops::RaggedSequenceView& ragged,
+                          const ops::RaggedSequenceView& local_ragged, const Tensor& local_indices,
+                          const Tensor& offsets, const Tensor& table_rows);
 
 // Produces this round's proposal for each row. ids/positions are [K+1,B], drafts [g,B] for the
 // first 1 <= g <= K mask columns. DFlash2 additionally writes its sparse proposal distribution;

@@ -1,6 +1,9 @@
 #include "models/glm5next/program/internal.h"
 
 #include "core/nvtx.h"
+#include "ninfer/ops/indexing.h"
+
+#include <algorithm>
 
 namespace ninfer::models::glm5next::detail {
 namespace {
@@ -99,31 +102,65 @@ void RankProgramImpl::append_dflash_context(const execution::BatchView& call, co
 
 void RankProgramImpl::append_packed_dflash_context(const execution::BatchView& call,
                                                    const ops::RaggedSequenceView& ragged) {
-    const auto& p = *parameters.profile;
-    const auto columns =
-        execution::sequence_parallel_policy(p.local.size).partition(call.tokens, p.local.rank);
-    const auto features = draft_features(call, true);
-    const auto capacity = p.draft->context.capacity;
-    // Draft context is TP-sharded, so both ranks materialize every segment in the same order.
-    for (int s = 0; s < ragged.num_seqs(); ++s) {
-        const auto len      = std::uint32_t(ragged.segment_length(s));
-        const auto retained = std::min(len, capacity);
-        const int count     = extent(retained);
-        if (!count) continue;
-        auto scope           = resources.workspace.scope();
-        const int end        = ragged.host_cu_seqlens[s + 1];
-        const int begin      = end - count;
-        const auto tail      = columns.split()
-                                   ? gather_feature_range(features, columns, begin, end,
-                                                          resources.workspace, *parallel, cuda)
-                                   : features.slice(1, begin, count);
-        const auto positions = call.positions.slice(0, begin, count).view({count, 1});
-        const auto counts    = len > capacity ? resources.tensor(frame.dflash->window_count)
-                                              : ragged.seq_lengths.slice(0, s, 1);
-        execution::draft_append_context(
-            parameters, {resources.workspace, resources.states, *parallel}, tail, positions, counts,
-            call.destination_offsets.slice(0, s, 1), {retained, retained}, cuda);
+    const auto& p            = *parameters.profile;
+    const auto& local_ragged = compute->packed->dflash_ragged;
+    const int n              = ragged.total_tokens();
+    const int n_local        = local_ragged.total_tokens();
+    if (!n_local) return;
+    const auto& df       = *frame.packed_prefill->dflash;
+    const auto columns   = execution::sequence_parallel_policy(p.local.size)
+                               .partition(call.tokens, p.local.rank);
+    const auto features  = draft_features(call, true);
+    const bool truncated = n_local < n;
+    auto scope           = resources.workspace.scope();
+    const auto src_idx   = row(df.source_indices, n_local);
+    const auto local_idx = row(df.local_indices, n_local);
+
+    Tensor packed_features;
+    if (columns.split()) {
+        auto gathered = resources.workspace.alloc(DType::BF16, {features.ne[0], n_local});
+        const auto* host_src = static_cast<const std::int32_t*>(host(df.source_indices).data);
+        for (std::uint32_t r = 0; r < columns.ranks; ++r) {
+            const TokenPartition part(columns.columns, columns.ranks, r);
+            const auto* first = std::lower_bound(host_src, host_src + n_local, part.begin);
+            const auto* last =
+                std::lower_bound(first, host_src + n_local, part.begin + part.count);
+            const int lo = static_cast<int>(first - host_src);
+            const int hi = static_cast<int>(last - host_src);
+            if (lo >= hi) continue;
+            auto destination = gathered.slice(1, lo, hi - lo);
+            if (r == columns.rank) {
+                const int count = hi - lo;
+                if (host_src[hi - 1] - host_src[lo] == count - 1) {
+                    const auto source = features.slice(1, host_src[lo] - part.begin, count);
+                    copy_bytes_async({destination.data, destination.bytes(), cuda.device()},
+                                     {source.data, source.bytes(), cuda.device()}, cuda);
+                } else {
+                    Tensor dst_view = destination.view({features.ne[0], 1, count});
+                    ops::gather_batch_rows(features.view({features.ne[0], 1, columns.count}),
+                                           local_idx.slice(0, lo, count), dst_view, cuda);
+                }
+            }
+            parallel->broadcast(destination, r, cuda);
+        }
+        packed_features = gathered;
+    } else if (truncated) {
+        packed_features = resources.workspace.alloc(DType::BF16, {features.ne[0], n_local});
+        Tensor dst_view = packed_features.view({features.ne[0], 1, n_local});
+        ops::gather_batch_rows(features.view({features.ne[0], 1, n}), src_idx, dst_view, cuda);
+    } else {
+        packed_features = features.view({features.ne[0], n});
     }
+
+    Tensor packed_positions = call.positions;
+    if (truncated) {
+        packed_positions = resources.workspace.alloc(DType::I32, {n_local});
+        Tensor pos_view  = packed_positions.view({1, 1, n_local});
+        ops::gather_batch_rows(call.positions.view({1, 1, n}), src_idx, pos_view, cuda);
+    }
+    execution::draft_append_context(parameters, {resources.workspace, resources.states, *parallel},
+                                    packed_features, packed_positions, local_ragged,
+                                    call.destination_offsets, cuda);
 }
 
 void RankProgramImpl::accept_dflash(int b, int w, int steps) {

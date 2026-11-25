@@ -150,11 +150,18 @@ struct PackedMtpMetadata {
 };
 
 template <class T>
+struct PackedDFlashMetadata {
+    RaggedPrefillMetadata<T> ragged;
+    T source_indices;
+};
+
+template <class T>
 struct PackedPrefillMetadata {
     RaggedPrefillMetadata<T> ragged;
     T main_tables, backend_tables, source_offsets, destination_offsets;
     T sampling_positions, live_rows, residency_slots;
     std::optional<PackedMtpMetadata<T>> mtp;
+    std::optional<PackedDFlashMetadata<T>> dflash;
 };
 
 struct PackedPrefillLayout {

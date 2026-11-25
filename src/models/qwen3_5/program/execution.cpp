@@ -54,20 +54,19 @@ void RankProgramImpl::finish_packed_prefill(ComputeOperation& operation) {
     const auto hidden   = frame.input_view(ragged.total_tokens(), 1).hidden;
     if (backend == SpeculativeBackend::Mtp) align_packed_mtp_history(operation);
     if (resources.dflash) {
-        auto& draft = *resources.dflash;
-        for (int s = 0; s < ragged.num_seqs(); ++s) {
-            const int begin = ragged.segment_begin(s), len = ragged.segment_length(s);
-            const auto count = static_cast<std::uint32_t>(len);
-            execution::draft_append_context(
-                {parameters, resources.work, device.execution_view(), draft.local,
-                 draft.full ? &*draft.full : nullptr, proposal_head},
-                draft.prefill_features.slice(1, begin, len)
-                    .view({draft.prefill_features.ne[0], len, 1}),
-                draft.prefill_positions.slice(0, begin, len).view({len, 1}),
-                ragged.seq_lengths.slice(0, s, 1),
-                storage.device.destination_offsets.slice(0, s, 1),
-                storage.device.backend_tables.slice(0, s, 1), {count, count});
-        }
+        auto& draft        = *resources.dflash;
+        const int tokens   = ragged.total_tokens();
+        const int segments = ragged.num_seqs();
+        const auto& local  = operation.packed_prefill->dflash_local_ragged;
+        const auto indices =
+            storage.device.dflash->source_indices.slice(0, 0, local.total_tokens());
+        execution::draft_append_context(
+            {parameters, resources.work, device.execution_view(), draft.local,
+             draft.full ? &*draft.full : nullptr, proposal_head},
+            draft.prefill_features.slice(1, 0, tokens),
+            draft.prefill_positions.slice(0, 0, tokens), ragged, local, indices,
+            storage.device.destination_offsets.slice(0, 0, segments),
+            storage.device.backend_tables.slice(0, 0, segments));
     }
     ops::scatter_ragged_last_columns(
         hidden, ragged,

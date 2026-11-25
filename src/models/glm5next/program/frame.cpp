@@ -192,6 +192,10 @@ FrameLayout plan_frame(LayoutBuilder& b, const execution::ModelProfile& p,
         if (p.mtp)
             packed.mtp =
                 PackedMtpLayout{ragged(), rows(), rows(), rows(), rows(), offsets(), offsets()};
+        if (p.draft)
+            packed.dflash = PackedDFlashLayout{
+                ragged(), tensor(DType::I32, {chunk}, "DFlash source indices"),
+                tensor(DType::I32, {chunk}, "DFlash local rank indices")};
     }
     if (p.vision) out.visual_indices = tensor(DType::I32, {columns}, "visual embedding indices");
     const auto host_end = b.finish(256);

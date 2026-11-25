@@ -46,7 +46,7 @@ enum class ComputeStage : std::uint8_t {
 };
 
 struct PackedPrefill {
-    ops::RaggedSequenceView ragged, mtp_ragged;
+    ops::RaggedSequenceView ragged, mtp_ragged, dflash_local_ragged;
     std::int32_t sampled_count = 0;
 };
 

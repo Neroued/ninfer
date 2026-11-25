@@ -230,7 +230,10 @@ void RankProgramImpl::initialize_packed_prefill(ComputeOperation& operation,
     const auto sampling_positions = host_values<std::int32_t>(meta.sampling_positions);
     const auto sample_live        = host_values<std::int32_t>(meta.live_rows);
     const auto sample_residencies = host_values<std::int32_t>(meta.residency_slots);
-    int col = 0, segments = 0, mtp_segments = 0;
+    int col = 0, segments = 0, mtp_segments = 0, dflash_col = 0;
+    const int dflash_window =
+        meta.dflash ? execution::dimension(parameters.profile->config.draft->sliding_window.value_or(0))
+                    : 0;
     frame.bind_rows(operation.batch);
     frame.clear_ingress();
     for (std::uint32_t b = 0; b < operation.batch; ++b) {
@@ -257,6 +260,14 @@ void RankProgramImpl::initialize_packed_prefill(ComputeOperation& operation,
                             rope + axis * tokens + col);
             if (meta.mtp && (row.main_frontier || len > 1))
                 bind_mtp_segment(*meta.mtp, mtp_segments++, segments, len, row);
+            if (meta.dflash) {
+                const int retained = std::min(len, dflash_window);
+                host_values<std::int32_t>(meta.dflash->ragged.seq_lengths)[segments] = retained;
+                auto indices = host_values<std::int32_t>(meta.dflash->source_indices);
+                for (int t = 0; t < retained; ++t)
+                    indices[dflash_col + t] = col + len - retained + t;
+                dflash_col += retained;
+            }
             ++segments;
             col += len;
             storage.last_columns[b] = col - 1;
@@ -275,6 +286,9 @@ void RankProgramImpl::initialize_packed_prefill(ComputeOperation& operation,
     packed.ragged = bind_ragged(meta.ragged, storage.device.ragged, segments);
     if (mtp_segments)
         packed.mtp_ragged = bind_ragged(meta.mtp->ragged, storage.device.mtp->ragged, mtp_segments);
+    if (meta.dflash && segments)
+        packed.dflash_local_ragged =
+            bind_ragged(meta.dflash->ragged, storage.device.dflash->ragged, segments);
     if (resources.dflash) upload_ingress();
     if (tokens) upload_input(operation.width, 1);
     CUDA_CHECK(cudaMemcpyAsync(storage.device_storage.data, storage.host_storage.data,

@@ -4,6 +4,7 @@
 #include "models/glm5next/execution/parameters.h"
 #include "models/glm5next/execution/workspace.h"
 #include "models/glm5next/state/context.h"
+#include "ninfer/ops/ragged.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/sliding_window_attention.h"
 
@@ -76,6 +77,9 @@ private:
 void draft_append_context(const Parameters&, DraftExecution, const Tensor& features,
                           const Tensor& positions, const Tensor& counts, const Tensor& offsets,
                           ops::ContextKVMaterializeExecutionEnvelope, CudaExecutionView);
+void draft_append_context(const Parameters&, DraftExecution, const Tensor& features,
+                          const Tensor& positions, const ops::RaggedSequenceView& ragged,
+                          const Tensor& offsets, CudaExecutionView);
 
 [[nodiscard]] std::size_t draft_workspace_capacity(const ModelProfile&, int width, int max_batch);
 [[nodiscard]] std::size_t draft_context_workspace_capacity(const ModelProfile&,

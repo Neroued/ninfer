@@ -198,6 +198,31 @@ void draft_append_context(const Parameters& p, DraftExecution e, const Tensor& f
                                 layers, profile.draft->context, envelope, e.workspace, cuda);
 }
 
+void draft_append_context(const Parameters& p, DraftExecution e, const Tensor& features,
+                          const Tensor& positions, const ops::RaggedSequenceView& ragged,
+                          const Tensor& offsets, CudaExecutionView cuda) {
+    const auto& profile = *p.profile;
+    const auto& draft   = *p.draft;
+    auto scope          = e.workspace.scope();
+    const int tokens    = ragged.total_tokens();
+    auto v              = workspace::draft_context(e.workspace, profile, tokens);
+    ops::linear(features.view({features.ne[0], tokens}), draft.feature_projection.weight,
+                v.projected, draft.feature_projection.policy, e.workspace, cuda);
+    e.parallel.gather(v.projected, v.gathered, cuda);
+    ops::rmsnorm_gathered_features(v.gathered, draft.context_norm,
+                                   profile.config.draft->rms_norm_eps, v.normalized, cuda);
+    std::array<ops::ContextKVMaterializeLayerView, ops::kContextKVMaterializeLayers> layers;
+    if (draft.layers.size() != layers.size())
+        throw std::invalid_argument("DFlash context layer group differs from materialization");
+    for (std::size_t i = 0; i < layers.size(); ++i) {
+        const auto& layer = draft.layers[i];
+        layers[i]         = {layer.context_key, layer.context_value, layer.key_norm,
+                             e.states.draft_layer(i, offsets)};
+    }
+    ops::context_kv_materialize(v.normalized, ragged, positions, layers, profile.draft->context,
+                                e.workspace, cuda);
+}
+
 std::size_t draft_workspace_capacity(const ModelProfile& p, int width, int max_batch) {
     WorkspaceLayoutBuilder a;
     const auto& c      = *p.config.draft;
@@ -267,6 +292,26 @@ std::size_t draft_context_workspace_capacity(const ModelProfile& p, const Execut
             DType::BF16,
             {dimension(p.config.text.hidden * p.config.draft->target_layer_ids.size()), retained});
         append(retained, 1);
+    }
+    {
+        auto scope         = a.scope();
+        const int max_cols = dimension(std::min<std::uint64_t>(
+            s.prefill_chunk,
+            std::uint64_t(s.max_concurrency) * std::uint64_t(p.draft->context.capacity)));
+        const bool split =
+            sequence_parallel_policy(p.local.size).partition(dimension(s.prefill_chunk), 0).split();
+        const bool may_truncate = s.prefill_chunk > p.draft->context.capacity;
+        if (split || may_truncate) {
+            (void)a.alloc(
+                DType::BF16,
+                {dimension(p.config.text.hidden * p.config.draft->target_layer_ids.size()),
+                 max_cols});
+        }
+        if (may_truncate) (void)a.alloc(DType::I32, {max_cols});
+        (void)workspace::draft_context(a, p, max_cols);
+        scratch(a, linear(p.draft->feature_projection, 1, max_cols));
+        scratch(a, ops::context_kv_materialize_workspace_capacity_bytes(
+                       p.draft->context, 1, max_cols, 1, dimension(s.max_concurrency)));
     }
     return a.peak_bytes();
 }

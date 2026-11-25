@@ -319,6 +319,34 @@ void RankProgramImpl::prepare_packed_inputs(const ForwardWork& work) {
                               &mtp.table_rows, &mtp.source_offsets, &mtp.destination_offsets})
             upload(*r, mtp_segments);
     }
+    if (layout.dflash) {
+        const auto& df      = *layout.dflash;
+        const int capacity  = extent(parameters.profile->draft->context.capacity);
+        const auto own_part = execution::sequence_parallel_policy(parameters.profile->local.size)
+                                  .partition(tokens, rank);
+        auto* src_idx   = i32(df.source_indices);
+        auto* local_idx = i32(df.local_indices);
+        auto* df_lens   = i32(df.ragged.seq_lengths);
+        int out_col     = 0;
+        for (int s = 0; s < segments; ++s) {
+            const int len      = packed.update.ragged.segment_length(s);
+            const int retained = std::min(len, capacity);
+            const int end      = packed.update.ragged.host_cu_seqlens[s + 1];
+            df_lens[s]         = retained;
+            for (int t = 0; t < retained; ++t) {
+                const int orig   = end - retained + t;
+                src_idx[out_col] = orig;
+                local_idx[out_col] =
+                    (orig >= own_part.begin && orig < own_part.begin + own_part.count)
+                        ? (orig - own_part.begin)
+                        : 0;
+                ++out_col;
+            }
+        }
+        packed.dflash_ragged = upload_ragged(df.ragged, segments);
+        upload(df.source_indices, out_col);
+        upload(df.local_indices, out_col);
+    }
 }
 
 execution::BatchView RankProgramImpl::batch(const BatchLayout& io, int t, int g, int c,

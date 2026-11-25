@@ -65,10 +65,16 @@ struct PackedMtpLayout {
     TensorRegion source_offsets, destination_offsets;
 };
 
+struct PackedDFlashLayout {
+    RaggedLayout ragged;
+    TensorRegion source_indices, local_indices;
+};
+
 struct PackedPrefillLayout {
     RaggedLayout global, local;
     TensorRegion source_offsets, destination_offsets, local_tables, sampled_offsets;
     std::optional<PackedMtpLayout> mtp;
+    std::optional<PackedDFlashLayout> dflash;
 };
 
 struct FrameLayout {

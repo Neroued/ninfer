@@ -85,6 +85,10 @@ PackedPrefillLayout plan_packed_prefill(LayoutBuilder& device, LayoutBuilder& ho
             rows(DType::I64, "MTP source State offsets"),
             rows(DType::I32, "MTP backend tables")};
     }
+    if (is_masked_draft_backend(spec.backend)) {
+        m.dflash = PackedDFlashMetadata<TensorRegion>{
+            ragged(), metadata.add_tensor(DType::I32, {chunk}, 4, "DFlash local source indices")};
+    }
     const auto bytes   = metadata.finish(kAlignment);
     out.device         = device.add(bytes, kAlignment, "packed prefill metadata");
     out.host           = host.add(bytes, kAlignment, "Host packed prefill metadata");
@@ -105,13 +109,18 @@ PackedPrefillMetadata<Tensor> bind_packed_metadata(const PackedPrefillMetadata<T
     PackedPrefillMetadata<Tensor> out{
         ragged(m.ragged),       bind(m.main_tables),         bind(m.backend_tables),
         bind(m.source_offsets), bind(m.destination_offsets), bind(m.sampling_positions),
-        bind(m.live_rows),      bind(m.residency_slots),     {}};
+        bind(m.live_rows),      bind(m.residency_slots),     {},
+        {}};
     if (m.mtp) {
         const auto& p = *m.mtp;
         out.mtp       = PackedMtpMetadata<Tensor>{ragged(p.ragged),      bind(p.input_segments),
                                                   bind(p.previous_rows), bind(p.skip_first),
                                                   bind(p.previous_rope), bind(p.source_offsets),
                                                   bind(p.backend_tables)};
+    }
+    if (m.dflash) {
+        out.dflash = PackedDFlashMetadata<Tensor>{ragged(m.dflash->ragged),
+                                                  bind(m.dflash->source_indices)};
     }
     return out;
 }

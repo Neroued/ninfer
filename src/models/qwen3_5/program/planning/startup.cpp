@@ -519,7 +519,41 @@ WorkspaceSpec build_workspace_plan(const SequencePlanImpl& plan) {
                 return finish(layout);
             };
 
-            out.dflash_context = dflash_context_capacity(chunk, 1, false);
+            const auto dflash_packed_context_capacity = [&] {
+                WorkspaceLayoutBuilder layout;
+                const auto window    = dimension(draft->sliding_window.value_or(0));
+                const auto max_local = dimension(std::min<std::uint64_t>(
+                    chunk, std::uint64_t(plan.max_concurrency) * std::uint64_t(window)));
+                const bool may_truncate = chunk > window;
+                if (draft->dflash2.has_value()) {
+                    if (may_truncate) {
+                        matrix(layout, DType::BF16,
+                               dimension(config.hidden_size *
+                                         std::uint64_t(draft->target_layer_ids.size())),
+                               max_local);
+                        matrix(layout, DType::I32, max_local, 1);
+                    }
+                    (void)workspace::dflash_context(layout, config, *draft, max_local);
+                    linear_scratch(layout, profile.draft->feature_projection, 1, max_local);
+                    scratch(layout, ops::context_kv_materialize_workspace_capacity_bytes(
+                                        *profile.draft->context_materialization, 1, max_local, 1,
+                                        dimension(plan.max_concurrency)));
+                    return finish(layout);
+                }
+                (void)workspace::dflash_context(layout, config, *draft, chunk);
+                linear_scratch(layout, profile.draft->feature_projection, 1, chunk);
+                if (may_truncate) {
+                    matrix(layout, DType::BF16, dimension(config.hidden_size), max_local);
+                    matrix(layout, DType::I32, max_local, 1);
+                }
+                {
+                    auto layer = layout.scope();
+                    (void)workspace::dflash_context_layer(layout, config, *draft, chunk);
+                }
+                return finish(layout);
+            };
+            out.dflash_context =
+                std::max(dflash_context_capacity(chunk, 1, false), dflash_packed_context_capacity());
             for (std::int32_t batch = 1; batch <= dimension(plan.max_concurrency); ++batch) {
                 const std::size_t accept =
                     draft->dflash2.has_value()

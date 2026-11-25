@@ -52,6 +52,7 @@ enum class Field {
     ModelId,
     Cors,
     MaxRequestSize,
+    AdminCache,
     ResponseRecords,
     ResponseSize,
     LogLevel,

@@ -37,4 +37,21 @@ void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& q, Tenso
 void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& x,
           CudaExecutionView execution);
 
+/**
+ * Applies full-head pairwise-interleaved Vision 2-D RoPE in place. Device I32 positions [N,2]
+ * stores contiguous height and width axes. Adjacent feature pairs p=0..15 use width and
+ * p=16..31 use height, with angle coordinate * theta^(-(p % 16)/16). The transform is
+ * (even*cos - odd*sin, odd*cos + even*sin) in FP32, rounded once to BF16.
+ *
+ * Each operand is Device BF16 [64,H,N] with positive H, strides 2 and 128 bytes across
+ * features and heads, and an even token stride of at least 128*H bytes. Operands and positions
+ * must occupy disjoint storage, including inter-token padding. Positions, padding, and (0,0)
+ * tokens are bit-exact. Theta must be positive and finite. Empty extents submit no device work.
+ * The Op uses no workspace or persistent state and supports CUDA Graph replay.
+ */
+void rope_2d_interleaved(const Tensor& positions, float theta, Tensor& q, Tensor& k,
+                         CudaExecutionView execution);
+void rope_2d_interleaved(const Tensor& positions, float theta, Tensor& x,
+                         CudaExecutionView execution);
+
 } // namespace ninfer::ops

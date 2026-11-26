@@ -18,7 +18,7 @@ constexpr int kShortSplits    = 8;
 constexpr int kLongSplits     = 4;
 constexpr int kShortRankTile  = 32;
 
-enum class Route { DecodeSeparate, DecodeLast, Medium, PrefillShort, Cluster4, Cluster8, Vector };
+enum class Route { Decode, Medium, PrefillShort, Cluster4, Cluster8, ClusterWide, Vector };
 
 struct Schedule {
     Route route;
@@ -57,11 +57,11 @@ struct Chunk {
     float* projection;
     float2* inv;
     float* blended;
-    float* sums;
+    float2* sums;
     unsigned* done;
 };
 
-void launch_decode(Chunk a, Route route, cudaStream_t stream);
+void launch_decode(Chunk a, cudaStream_t stream);
 void launch_normalize(Chunk a, cudaStream_t stream);
 void launch_prefill(Chunk a, Route route, cudaStream_t stream);
 void launch_generic(Arguments a, cudaStream_t stream);

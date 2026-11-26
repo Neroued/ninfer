@@ -41,12 +41,9 @@ operand::Range checked_tensor(const Tensor& value, DType dtype, std::initializer
     return operand::range(value, kOp);
 }
 
-// Decode uses a short PDL chain. Dense RTX 5090 sweeps favor a separate
-// finish for the first few rows, a last-CTA reduction for the next wave,
-// and token-tiled MMA once per-row weight replication starts to dominate.
-constexpr int kSeparateRows = 4;
-constexpr int kDecodeRows   = 6;
-constexpr int kMediumRows   = 144;
+// A separate PDL finish avoids putting normalization on the last blend CTA.
+constexpr int kDecodeRows = 6;
+constexpr int kMediumRows = 144;
 
 constexpr std::size_t kChunkBudget      = 42ULL << 20;
 constexpr std::size_t kWeightsPerStream = std::size_t(8) * kHidden * kRank;
@@ -54,7 +51,7 @@ constexpr std::size_t kWeightsPerStream = std::size_t(8) * kHidden * kRank;
 // inverse RMS and tile sums/counters. Destination broadcasting can only
 // reduce this conservative estimate.
 constexpr std::size_t kBytesPerRow = 14ULL * kHidden + 4 * kRank * kShortSplits + 2 * kRank +
-                                     sizeof(float) * kUpTiles + sizeof(float2) +
+                                     sizeof(float2) * kUpTiles + sizeof(float2) +
                                      (kRank / kShortRankTile) * sizeof(unsigned);
 constexpr int kChunkGranularity = 64;
 
@@ -71,18 +68,18 @@ int chunk_limit(int streams) {
 // A wave is the measured resident cluster count times the 16-token tile.
 // Cluster8 serves the first wave without workspace (including the rows=145..256 band
 // where multi-kernel Medium/PrefillShort incur extra launch and scratch overhead);
-// PrefillShort and Cluster4 cover wave-two transitions and large-M residency.
-constexpr int kTileTokens        = 16;
-constexpr int kCluster8Wave      = 40;
-constexpr int kShortSecondWave   = 56;
-constexpr int kCluster4Wave      = 84;
-constexpr std::int64_t kL2Bytes  = 96LL << 20;
+// PrefillShort and Cluster4 cover wave-two transitions. Larger working sets
+// reuse more weights per CTA in the 32-token cluster.
+constexpr int kTileTokens       = 16;
+constexpr int kCluster8Wave     = 40;
+constexpr int kShortSecondWave  = 56;
+constexpr int kCluster4Wave     = 84;
+constexpr std::int64_t kL2Bytes = 96LL << 20;
 
 Schedule select(int hidden, int rank, int tokens, int streams) {
     if (hidden != kHidden || rank != kRank) return {Route::Vector, tokens, streams};
     const auto rows = std::int64_t(tokens) * streams;
-    if (rows <= kSeparateRows) return {Route::DecodeSeparate, tokens, streams};
-    if (rows <= kDecodeRows) return {Route::DecodeLast, tokens, streams};
+    if (rows <= kDecodeRows) return {Route::Decode, tokens, streams};
     if (rows <= kMediumRows) return {Route::Medium, tokens, chunk_streams(streams)};
 
     const auto tiles     = std::int64_t((tokens - 1) / kTileTokens + 1) * streams;
@@ -91,19 +88,24 @@ Schedule select(int hidden, int rank, int tokens, int streams) {
         return {Route::PrefillShort, std::min(tokens, chunk_limit(streams)),
                 chunk_streams(streams)};
     const bool outside_l2 = rows > kL2Bytes / (2 * std::int64_t(sizeof(float)) * kHidden);
-    const bool narrow     = outside_l2 || (next_wave && tiles <= kCluster4Wave);
+    if (outside_l2) return {Route::ClusterWide, tokens, streams};
+    const bool narrow = next_wave && tiles <= kCluster4Wave;
     return {narrow ? Route::Cluster4 : Route::Cluster8, tokens, streams};
+}
+
+bool is_cluster(Route route) {
+    return route == Route::Cluster4 || route == Route::Cluster8 || route == Route::ClusterWide;
 }
 
 ScratchLayout scratch_layout(Schedule plan, int rank) {
     const auto rows = std::int64_t(plan.tokens) * plan.streams;
     ScratchLayout layout;
-    if (plan.route == Route::Cluster4 || plan.route == Route::Cluster8) return layout;
+    if (is_cluster(plan.route)) return layout;
     if (plan.route == Route::Vector) {
         layout.bytes = operand::bytes(rows, std::size_t(rank) * 2, kOp);
         return layout;
     }
-    const bool decode  = plan.route == Route::DecodeSeparate || plan.route == Route::DecodeLast;
+    const bool decode  = plan.route == Route::Decode;
     const bool prefill = plan.route == Route::PrefillShort;
     const int splits   = decode                        ? kDecodeSplits
                          : plan.route == Route::Medium ? kMediumSplits
@@ -117,18 +119,20 @@ ScratchLayout scratch_layout(Schedule plan, int rank) {
         layout.bytes += size;
         return offset;
     };
-    layout.sum_tiles  = decode ? kDecodeTiles : kUpTiles;
-    layout.projection = append(kRank * splits * sizeof(float));
-    layout.blended    = append(kHidden * sizeof(float));
-    layout.sums       = append(layout.sum_tiles * sizeof(float));
+    layout.sum_tiles = decode ? kDecodeTiles : kUpTiles;
+    if (!prefill) layout.projection = append(kRank * splits * sizeof(float));
+    layout.blended = append(kHidden * sizeof(float));
+    layout.sums    = append(layout.sum_tiles * sizeof(float2));
     if (prefill) {
+        // Down finishes consuming the split partials before up writes the
+        // blend. Up waits on down and reads only the rounded latent.
+        static_assert(kRank * kShortSplits <= kHidden);
+        layout.projection = layout.blended;
         // Vector loads from latent are 16-byte aligned. Scalar counters go last.
         layout.latent        = append(kRank * sizeof(__nv_bfloat16));
         layout.inv           = append(sizeof(float2));
         constexpr int planes = kRank / kShortRankTile;
         layout.done          = append(planes * sizeof(unsigned));
-    } else if (plan.route == Route::DecodeLast) {
-        layout.done = append(sizeof(unsigned));
     }
     return layout;
 }
@@ -153,8 +157,8 @@ std::size_t loop_message_blend_rmsnorm_workspace_capacity_bytes(std::int32_t hid
     if (hidden == kHidden && rank == kRank) {
         // Each schedule segment has a monotone or capped layout. Include the
         // last extent of each segment whose layout can shrink at the boundary.
-        for (const int last : {kSeparateRows / streams, kDecodeRows / streams,
-                               kMediumRows / streams, kShortSecondWave / streams * kTileTokens}) {
+        for (const int last : {kDecodeRows / streams, kMediumRows / streams,
+                               kShortSecondWave / streams * kTileTokens}) {
             if (last >= min_tokens && last < max_tokens) peak = std::max(peak, size_at(last));
         }
     }
@@ -219,7 +223,7 @@ void loop_message_blend_rmsnorm(const Tensor& dest, const Tensor& message,
                       sn == 1,
                       pair_eps,
                       norm_eps};
-    if (plan.route == Route::Cluster4 || plan.route == Route::Cluster8) {
+    if (is_cluster(plan.route)) {
         launch_cluster_prefill(a, plan.route, execution.stream());
         return;
     }
@@ -240,10 +244,10 @@ void loop_message_blend_rmsnorm(const Tensor& dest, const Tensor& message,
                               reinterpret_cast<float*>(base + layout.projection),
                               reinterpret_cast<float2*>(base + layout.inv),
                               reinterpret_cast<float*>(base + layout.blended),
-                              reinterpret_cast<float*>(base + layout.sums),
+                              reinterpret_cast<float2*>(base + layout.sums),
                               reinterpret_cast<unsigned*>(base + layout.done)};
-            if (plan.route == Route::DecodeSeparate || plan.route == Route::DecodeLast)
-                launch_decode(chunk, plan.route, execution.stream());
+            if (plan.route == Route::Decode)
+                launch_decode(chunk, execution.stream());
             else
                 launch_prefill(chunk, plan.route, execution.stream());
             first_m += mm;

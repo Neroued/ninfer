@@ -8,6 +8,9 @@
 namespace ninfer::ops::detail::loop_message {
 namespace {
 constexpr int kPrefillThreads   = 256;
+// One warp per row performs the medium tile's RMS scan. Only the first
+// eight warps issue MMA, while the full block stages its input and weights.
+constexpr int kMediumDownThreads = 512;
 constexpr int kPrefillWarps     = kPrefillThreads / 32;
 constexpr int kNormalizeThreads = 256;
 constexpr int kDownK            = 128;
@@ -16,21 +19,13 @@ template <int CounterPlanes>
 __global__ void pair_inverses(Chunk a) {
     constexpr int Threads = 128;
     const Token token(a, blockIdx.x);
-    const auto* d = reinterpret_cast<const float4*>(token.dest);
-    const auto* m = reinterpret_cast<const float4*>(token.message);
     pdl::trigger_dependents();
-    float ds = 0, ms = 0;
-    for (int i = threadIdx.x; i < kHidden / 4; i += Threads) {
-        ds = square_sum(d[i], ds);
-        ms = square_sum(m[i], ms);
-    }
-    __shared__ float sums[2][Threads / 32];
-    ds = common::block_reduce_sum<Threads>(ds, sums[0]);
-    ms = common::block_reduce_sum<Threads>(ms, sums[1]);
+    __shared__ RmsStats stats[2][Threads / 32];
+    __shared__ float retry[2][Threads / 32];
+    const auto inverse = input_scales<Threads>(token, kHidden, a.args.pair_eps, stats, retry);
     pdl::wait_for_dependencies();
     if (threadIdx.x == 0) {
-        a.inv[blockIdx.x] = {row_inverse_rms(ds, token.dest, kHidden, a.args.pair_eps),
-                             row_inverse_rms(ms, token.message, kHidden, a.args.pair_eps)};
+        a.inv[blockIdx.x] = inverse;
 #pragma unroll
         for (int plane = 0; plane < CounterPlanes; ++plane)
             a.done[plane * a.tokens * a.streams + blockIdx.x] = 0;
@@ -38,7 +33,10 @@ __global__ void pair_inverses(Chunk a) {
 }
 
 template <int Tokens, int Splits, bool Stats, int Ranks>
-__global__ void tiled_down(Chunk a) {
+__global__ __launch_bounds__(Stats ? kPrefillThreads
+                                   : kMediumDownThreads) void tiled_down(Chunk a) {
+    constexpr int Threads  = Stats ? kPrefillThreads : kMediumDownThreads;
+    constexpr int RowWarps = Threads / 32;
     constexpr int K    = kDownK;
     constexpr int Half = kHidden / K, HalfSplits = Splits > 1 ? Splits / 2 : 1;
     static_assert(kHidden % K == 0 && Tokens % 16 == 0 && (Stats || Splits % 2 == 0));
@@ -68,7 +66,7 @@ __global__ void tiled_down(Chunk a) {
 
     const auto stage_weights = [&](int slot, int kk) {
 #pragma unroll
-        for (int i = tid; i < Ranks * K / 8; i += kPrefillThreads) {
+        for (int i = tid; i < Ranks * K / 8; i += Threads) {
             const int r = i / (K / 8), c = (i % (K / 8)) * 8;
             common::cp_async<16>(w[slot] + swizzle<K>(r, c), down + r * (2 * kHidden) + kk + c);
         }
@@ -83,22 +81,22 @@ __global__ void tiled_down(Chunk a) {
         const bool dest    = begin < kHidden;
         const auto* source = dest ? token.dest : token.message;
 #pragma unroll
-        for (int t = warp; t < Tokens; t += kPrefillWarps) {
-            float first = 0, second = 0;
+        for (int t = warp; t < Tokens; t += RowWarps) {
+            RmsStats first{}, second{};
             const auto* row_source = t < count ? source + t * kHidden : nullptr;
             if (row_source) {
                 const auto* v = reinterpret_cast<const float4*>(row_source);
 #pragma unroll 3
                 for (int i = lane; i < kHidden / 4; i += 64) {
-                    first  = square_sum(v[i], first);
-                    second = square_sum(v[i + 32], second);
+                    first.add(v[i]);
+                    second.add(v[i + 32]);
                 }
             }
-            const float sum = common::warp_reduce_sum(first + second);
-            if (lane == 0) {
-                const float norm = row_inverse_rms(sum, row_source, kHidden, a.args.pair_eps);
-                inverse[t]       = {norm, norm};
-            }
+            first.merge(second);
+            first.sum_sq     = common::warp_sum(first.sum_sq);
+            first.max_abs    = warp_max_abs(first.max_abs);
+            const float norm = row_inverse_rms<32>(first, row_source, kHidden, a.args.pair_eps);
+            if (lane == 0) inverse[t] = {norm, norm};
         }
     }
     common::cp_wait<0>();
@@ -111,7 +109,7 @@ __global__ void tiled_down(Chunk a) {
         const bool dest = kk < kHidden;
         const auto* x   = (dest ? token.dest : token.message) + kk % kHidden;
 #pragma unroll
-        for (int v = tid; v < Tokens * K / 8; v += kPrefillThreads) {
+        for (int v = tid; v < Tokens * K / 8; v += Threads) {
             const int t = v / (K / 8), c = (v % (K / 8)) * 8;
             float4 lo{}, hi{};
             if (t < count) {
@@ -127,6 +125,7 @@ __global__ void tiled_down(Chunk a) {
             dst[3]           = __floats2bfloat162_rn(hi.z * norm, hi.w * norm);
         }
         __syncthreads();
+        if (warp < kPrefillWarps) {
 #pragma unroll
         for (int j = 0; j < K; j += 16) {
             unsigned wf[2];
@@ -138,8 +137,12 @@ __global__ void tiled_down(Chunk a) {
                 mma(acc[t], xf, wf);
             }
         }
+        }
         common::cp_wait<0>();
         __syncthreads();
+    }
+    if constexpr (!Stats) {
+        if (warp >= kPrefillWarps) return;
     }
     const int r = rank_tile * Ranks + warp % RankWarps * 8 + (lane & 3) * 2;
 #pragma unroll
@@ -195,7 +198,7 @@ __global__ void tiled_up(Chunk a) {
     const Token token(a, row);
     const auto* up = a.args.up + token.stream * (2 * kRank * kHidden) + feature * kRank;
     __shared__ __align__(16) Bf16 w[2 * Features * kRank], h[Tokens * kRank];
-    __shared__ float squares[Tokens][kPrefillWarps];
+    __shared__ RmsStats statistics[Tokens][kPrefillWarps];
 #pragma unroll
     for (int i = tid; i < 2 * Features * kRank / 8; i += kPrefillThreads) {
         const int r = i / (kRank / 8), k = (i % (kRank / 8)) * 8;
@@ -254,25 +257,25 @@ __global__ void tiled_up(Chunk a) {
 #pragma unroll
         for (int z = 0; z < 2; ++z) {
             const int m  = t * 16 + lane / 4 + z * 8;
-            float square = 0;
+            RmsStats stats{};
             if (m < count) {
                 const auto dst = *reinterpret_cast<const float2*>(token.dest + m * kHidden + d);
                 const auto msg = *reinterpret_cast<const float2*>(token.message + m * kHidden + d);
                 const float x  = blend(dst.x, msg.x, gain[t][2 * z], forget[t][2 * z]);
                 const float y  = blend(dst.y, msg.y, gain[t][2 * z + 1], forget[t][2 * z + 1]);
                 *reinterpret_cast<float2*>(a.blended + (row + m) * kHidden + d) = {x, y};
-                square                                                          = fmaf(x, x, y * y);
+                stats.add(float2{x, y});
             }
-            const float sum = common::warp_reduce_sum<4>(square);
-            if (m < count && lane % 4 == 0) squares[m][warp] = sum;
+            stats = warp_rms_stats<4>(stats);
+            if (m < count && lane % 4 == 0) statistics[m][warp] = stats;
         }
     }
     __syncthreads();
     if (tid < count) {
-        float ss = 0;
+        RmsStats stats{};
 #pragma unroll
-        for (int w = 0; w < kPrefillWarps; ++w) ss += squares[tid][w];
-        a.sums[(row + tid) * kUpTiles + tile] = ss;
+        for (int w = 0; w < kPrefillWarps; ++w) stats.merge(statistics[tid][w]);
+        a.sums[(row + tid) * kUpTiles + tile] = stats.pack();
     }
 }
 
@@ -285,11 +288,9 @@ __global__ void normalize_chunk(Chunk a) {
     pdl::trigger_dependents();
     pdl::wait_for_dependencies();
     if (tid < 32) {
-        float sum = 0;
-        for (int j = tid; j < Tiles; j += 32) sum += a.sums[row * Tiles + j];
-        sum = common::warp_reduce_sum(sum);
-        if (tid == 0)
-            scale = row_inverse_rms(sum, a.blended + row * kHidden, kHidden, a.args.norm_eps);
+        const float inverse = tile_inverse_rms(a.sums + row * Tiles, Tiles,
+                                               a.blended + row * kHidden, kHidden, a.args.norm_eps);
+        if (tid == 0) scale = inverse;
     }
     __syncthreads();
     const auto* blended = reinterpret_cast<const float4*>(a.blended + row * kHidden);
@@ -322,7 +323,7 @@ void run_prefill(Chunk a, cudaStream_t stream) {
         }
         CUDA_CHECK(pdl::launch_dependent({down_blocks, kPrefillThreads, 0, stream}, down, a));
     } else {
-        down<<<down_blocks, kPrefillThreads, 0, stream>>>(a);
+        down<<<down_blocks, kMediumDownThreads, 0, stream>>>(a);
         CUDA_CHECK(cudaGetLastError());
     }
     CUDA_CHECK(pdl::launch_dependent({tiles * kUpTiles, kPrefillThreads, 0, stream}, up, a));

@@ -4,36 +4,10 @@
 #include "ops/common/cuda/pipeline.cuh"
 #include "ops/common/numeric/convert.cuh"
 
-#include <cuda/atomic>
-
 namespace ninfer::ops::detail::loop_message {
 namespace {
 constexpr int kThreads = 256;
 constexpr int kWarps   = kThreads / 32;
-
-template <int FixedWidth = 0>
-__device__ __forceinline__ float2 pair_scales(const Token& row, int width, float eps, float* smem) {
-    float ds = 0, ms = 0;
-    const int count = (FixedWidth ? FixedWidth : width) / 4;
-    const auto* d   = reinterpret_cast<const float4*>(row.dest);
-    const auto* m   = reinterpret_cast<const float4*>(row.message);
-    for (int i = threadIdx.x; i < count; i += kThreads) {
-        ds = square_sum(d[i], ds);
-        ms = square_sum(m[i], ms);
-    }
-    ds = common::warp_reduce_sum(ds);
-    ms = common::warp_reduce_sum(ms);
-    if ((threadIdx.x & 31) == 0) {
-        smem[threadIdx.x / 32]          = ds;
-        smem[kWarps + threadIdx.x / 32] = ms;
-    }
-    __syncthreads();
-    const int lane = threadIdx.x & 31;
-    ds             = common::warp_sum<kWarps>(smem[lane % kWarps]);
-    ms             = common::warp_sum<kWarps>(smem[kWarps + lane % kWarps]);
-    return {row_inverse_rms(ds, row.dest, width, eps),
-            row_inverse_rms(ms, row.message, width, eps)};
-}
 
 __device__ __forceinline__ float dot8(uint4 lhs, uint4 rhs, float sum) {
     const unsigned a[]{lhs.x, lhs.y, lhs.z, lhs.w}, b[]{rhs.x, rhs.y, rhs.z, rhs.w};
@@ -47,8 +21,20 @@ __device__ __forceinline__ float dot8(uint4 lhs, uint4 rhs, float sum) {
     return sum;
 }
 
-__global__ void down_vector(Arguments a) {
-    __shared__ float scales[2 * kWarps];
+__device__ __forceinline__ float dot_pair4(float4 x, float scale, const Bf16* w, float sum) {
+    const auto first  = __bfloat1622float2(__floats2bfloat162_rn(x.x * scale, x.y * scale));
+    const auto second = __bfloat1622float2(__floats2bfloat162_rn(x.z * scale, x.w * scale));
+    const auto* pair  = reinterpret_cast<const __nv_bfloat162*>(w);
+    const auto lo = __bfloat1622float2(pair[0]), hi = __bfloat1622float2(pair[1]);
+    sum = fmaf(first.x, lo.x, sum);
+    sum = fmaf(first.y, lo.y, sum);
+    sum = fmaf(second.x, hi.x, sum);
+    return fmaf(second.y, hi.y, sum);
+}
+
+__global__ __launch_bounds__(kThreads, 4) void down_vector(Arguments a) {
+    __shared__ RmsStats stats[2][kWarps];
+    __shared__ float retry[2][kWarps];
     const int lane            = threadIdx.x % 32;
     const std::int64_t groups = (std::int64_t(a.rank) + kWarps - 1) / kWarps;
     for (std::int64_t block = blockIdx.x; block < std::int64_t(a.tokens) * a.streams * groups;
@@ -56,7 +42,7 @@ __global__ void down_vector(Arguments a) {
         const auto row = block / groups;
         const Token token(a, row);
         const int k      = int(block % groups) * kWarps + threadIdx.x / 32;
-        const auto scale = pair_scales(token, a.hidden, a.pair_eps, scales);
+        const auto scale = input_scales<kThreads>(token, a.hidden, a.pair_eps, stats, retry);
         if (k < a.rank) {
             const auto* w = a.down + (token.stream * a.rank + k) * (2 * a.hidden);
             float ds = 0, ms = 0;
@@ -67,6 +53,41 @@ __global__ void down_vector(Arguments a) {
                 ms            = fmaf(y, float(w[d + a.hidden]), ms);
             }
             const float sum = common::warp_reduce_sum(ds + ms);
+            if (lane == 0) a.latent[row * a.rank + k] = __float2bfloat16_rn(sum);
+        }
+        __syncthreads();
+    }
+}
+
+__global__ __launch_bounds__(kThreads, 4) void down_vector_prefill(Arguments a) {
+    // One CTA normalizes the row once and reuses the rounded pair for all ranks.
+    extern __shared__ __align__(16) Bf16 pair[];
+    __shared__ RmsStats stats[2][kWarps];
+    __shared__ float retry[2][kWarps];
+    const int tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
+    for (std::int64_t row = blockIdx.x; row < std::int64_t(a.tokens) * a.streams;
+         row += gridDim.x) {
+        const Token token(a, row);
+        const auto scale    = input_scales<kThreads>(token, a.hidden, a.pair_eps, stats, retry);
+        const auto* dest    = reinterpret_cast<const float4*>(token.dest);
+        const auto* message = reinterpret_cast<const float4*>(token.message);
+        for (int i = tid; i < a.hidden / 4; i += kThreads) {
+            const auto d = dest[i], m = message[i];
+            auto* dst = reinterpret_cast<__nv_bfloat162*>(pair + 4 * i);
+            auto* msg = reinterpret_cast<__nv_bfloat162*>(pair + a.hidden + 4 * i);
+            dst[0]    = __floats2bfloat162_rn(d.x * scale.x, d.y * scale.x);
+            dst[1]    = __floats2bfloat162_rn(d.z * scale.x, d.w * scale.x);
+            msg[0]    = __floats2bfloat162_rn(m.x * scale.y, m.y * scale.y);
+            msg[1]    = __floats2bfloat162_rn(m.z * scale.y, m.w * scale.y);
+        }
+        __syncthreads();
+        for (int k = warp; k < a.rank; k += kWarps) {
+            const auto* w       = a.down + (token.stream * a.rank + k) * (2 * a.hidden);
+            const auto* weights = reinterpret_cast<const uint4*>(w);
+            const auto* input   = reinterpret_cast<const uint4*>(pair);
+            float sum           = 0.F;
+            for (int i = lane; i < a.hidden / 4; i += 32) sum = dot8(input[i], weights[i], sum);
+            sum = common::warp_reduce_sum(sum);
             if (lane == 0) a.latent[row * a.rank + k] = __float2bfloat16_rn(sum);
         }
         __syncthreads();
@@ -95,43 +116,44 @@ __device__ __forceinline__ float projected_blend(const Token& token, const Bf16*
 template <bool Keep>
 __global__ void up_vector(Arguments a) {
     extern __shared__ float blended[];
-    __shared__ float sums[kWarps], scale;
+    __shared__ RmsStats partials[kWarps];
+    __shared__ float sums[kWarps];
     for (std::int64_t row = blockIdx.x; row < std::int64_t(a.tokens) * a.streams;
          row += gridDim.x) {
         const Token token(a, row);
         const auto* h = a.latent + row * a.rank;
         const auto* w = a.up + token.stream * (2 * a.hidden) * a.rank;
-        float squares = 0;
+        RmsStats stats{};
         for (int i = 0; i < a.hidden; i += kThreads / 8) {
             const int d   = i + threadIdx.x / 8;
             const float x = projected_blend(token, w, h, a.hidden, a.rank, d);
             if constexpr (Keep) {
                 if (threadIdx.x % 8 == 0 && d < a.hidden) blended[d] = x;
             }
-            squares = fmaf(x, x, squares);
+            stats.add(x);
         }
-        squares = common::block_reduce_sum<kThreads>(squares, sums);
+        publish_warp_stats(stats, partials);
+        __syncthreads();
+        stats = gather_rms_stats<kThreads>(partials);
+        float scale;
         if constexpr (Keep) {
-            if (threadIdx.x == 0) scale = row_inverse_rms(squares, blended, a.hidden, a.norm_eps);
-            __syncthreads();
+            scale = row_inverse_rms<kThreads>(stats, blended, a.hidden, a.norm_eps, sums);
         } else {
-            const bool retry = threadIdx.x == 0 && lost_squares(squares);
-            if (retry) scale = square_rescale(squares);
-            if (__syncthreads_or(retry)) {
-                const float factor = scale;
-                float scaled       = 0;
+            const auto normal = norm_scale(stats, a.hidden, a.norm_eps);
+            scale             = normal.inverse;
+            if (__builtin_expect(normal.retry_max != 0.F, false)) {
+                const RescaleSquares rescale(normal.retry_max);
+                float sum = 0;
                 for (int i = 0; i < a.hidden; i += kThreads / 8) {
-                    const int d   = i + threadIdx.x / 8;
-                    const float x = projected_blend(token, w, h, a.hidden, a.rank, d) * factor;
-                    scaled        = fmaf(x, x, scaled);
+                    const int d = i + threadIdx.x / 8;
+                    rescale.add(projected_blend(token, w, h, a.hidden, a.rank, d), sum);
                 }
-                scaled = common::block_reduce_sum<kThreads>(scaled, sums);
+                sum = common::block_reduce_sum<kThreads>(sum, sums);
                 if (threadIdx.x == 0)
-                    scale = scaled_inverse_rms(scaled, a.hidden, a.norm_eps, factor);
-            } else if (threadIdx.x == 0) {
-                scale = inverse_rms(squares, a.hidden, a.norm_eps);
+                    sums[0] = scaled_inverse_rms(sum, a.hidden, a.norm_eps, normal.retry_max);
+                __syncthreads();
+                scale = sums[0];
             }
-            __syncthreads();
         }
         if constexpr (Keep) {
             for (int d = threadIdx.x; d < a.hidden; d += kThreads)
@@ -150,30 +172,15 @@ __global__ void up_vector(Arguments a) {
 
 constexpr int kDecodeThreads = 128;
 
-__device__ __forceinline__ float dot_pair4(float4 x, float scale, const Bf16* w, float sum) {
-    const auto first  = __bfloat1622float2(__floats2bfloat162_rn(x.x * scale, x.y * scale));
-    const auto second = __bfloat1622float2(__floats2bfloat162_rn(x.z * scale, x.w * scale));
-    const auto* pair  = reinterpret_cast<const __nv_bfloat162*>(w);
-    const auto lo = __bfloat1622float2(pair[0]), hi = __bfloat1622float2(pair[1]);
-    sum = fmaf(first.x, lo.x, sum);
-    sum = fmaf(first.y, lo.y, sum);
-    sum = fmaf(second.x, hi.x, sum);
-    return fmaf(second.y, hi.y, sum);
-}
-
-template <bool InitializeCounter>
 __global__ void decode_down(Chunk a) {
     const int rows = a.tokens * a.streams, tid = threadIdx.x;
     const int rank = blockIdx.x % kRank, row = blockIdx.x / kRank % rows;
     const int split = blockIdx.x / kRank / rows;
     const Token token(a, row);
     const auto* w = a.args.down + (token.stream * kRank + rank) * (2 * kHidden) + split * kHidden;
-    __shared__ float sums[kDecodeThreads / 32], norm;
+    __shared__ RmsStats stats[kDecodeThreads / 32];
+    __shared__ float sums[kDecodeThreads / 32];
     __shared__ __align__(16) Bf16 weights[kHidden];
-    if constexpr (InitializeCounter) {
-        if (rank == 0 && split == 0 && tid == 0) a.done[row] = 0;
-    }
-
     for (int i = tid * 8; i < kHidden; i += 8 * kDecodeThreads)
         common::cp_async<16, Cache::cg>(weights + i, w + i);
     common::cp_commit();
@@ -182,19 +189,20 @@ __global__ void decode_down(Chunk a) {
     constexpr int packs = kHidden / 4, groups = (packs + kDecodeThreads - 1) / kDecodeThreads;
     const auto* source = reinterpret_cast<const float4*>(split == 0 ? token.dest : token.message);
     float4 input[groups];
-    float ss = 0;
+    RmsStats local{};
 #pragma unroll
     for (int i = 0; i < groups; ++i) {
         const int k = i * kDecodeThreads + tid;
         if (k < packs) {
             input[i] = source[k];
-            ss       = square_sum(input[i], ss);
+            local.add(input[i]);
         }
     }
-    ss = common::block_reduce_sum<kDecodeThreads>(ss, sums);
-    if (tid == 0)
-        norm =
-            row_inverse_rms(ss, reinterpret_cast<const float*>(source), kHidden, a.args.pair_eps);
+    publish_warp_stats(local, stats);
+    __syncthreads();
+    const float norm = row_inverse_rms<kDecodeThreads>(gather_rms_stats<kDecodeThreads>(stats),
+                                                       reinterpret_cast<const float*>(source),
+                                                       kHidden, a.args.pair_eps, sums);
     common::cp_wait<0>();
     __syncthreads();
 
@@ -208,7 +216,6 @@ __global__ void decode_down(Chunk a) {
     if (tid == 0) a.projection[(split * rows + row) * kRank + rank] = total;
 }
 
-template <bool Separate>
 __global__ void decode_blend(Chunk a) {
     constexpr int Features = kDecodeFeatures, Tiles = kDecodeTiles;
     const int row = blockIdx.x / Tiles, tile = blockIdx.x % Tiles;
@@ -217,15 +224,14 @@ __global__ void decode_blend(Chunk a) {
     const Token token(a, row);
     const auto* up = a.args.up + token.stream * (2 * kHidden * kRank) + tile * Features * kRank;
     __shared__ __align__(16) Bf16 weights[2 * Features * kRank], h[kRank];
-    __shared__ float warp_sums[kDecodeThreads / 32], inverse;
-    __shared__ bool last;
+    __shared__ RmsStats warp_stats[kDecodeThreads / 32];
 
     for (int i = tid * 8; i < 2 * Features * kRank; i += kDecodeThreads * 8) {
         const int source = i % (Features * kRank) + i / (Features * kRank) * kHidden * kRank;
         common::cp_async<16, Cache::cg>(weights + i, up + source);
     }
     common::cp_commit();
-    if constexpr (Separate) pdl::trigger_dependents();
+    pdl::trigger_dependents();
     pdl::wait_for_dependencies();
     if (tid < kRank)
         h[tid] = __float2bfloat16_rn(a.projection[row * kRank + tid] +
@@ -233,8 +239,8 @@ __global__ void decode_blend(Chunk a) {
     common::cp_wait<0>();
     __syncthreads();
 
-    auto* out    = a.blended + row * kHidden;
-    float ss     = 0;
+    auto* out = a.blended + row * kHidden;
+    RmsStats stats{};
     const int k0 = lane % 4 * 2;
     unsigned hp[4][2];
 #pragma unroll
@@ -257,43 +263,28 @@ __global__ void decode_blend(Chunk a) {
             const int j   = tile * Features + local;
             const float v = blend(token.dest[j], token.message[j], c0, c2);
             out[j]        = v;
-            ss            = fmaf(v, v, ss);
+            stats.add(v);
         }
     }
-    ss = common::block_reduce_sum<kDecodeThreads>(ss, warp_sums);
-    if (tid == 0) a.sums[row * Tiles + tile] = ss;
-    if constexpr (!Separate) {
-        // The release sequence publishes every tile and its sum to the last CTA.
-        // Stage one initializes the counter on every eager call and graph replay.
-        __syncthreads();
-        if (tid == 0) {
-            cuda::atomic_ref<unsigned, cuda::thread_scope_device> arrivals(a.done[row]);
-            last = arrivals.fetch_add(1, cuda::memory_order_acq_rel) == Tiles - 1;
-        }
-        __syncthreads();
-        if (!last) return;
-        if (tid < 32) {
-            float sum = 0;
+    publish_warp_stats(stats, warp_stats);
+    __syncthreads();
+    if (tid == 0) {
+        RmsStats total{};
 #pragma unroll
-            for (int j = tid; j < Tiles; j += 32) sum += a.sums[row * Tiles + j];
-            sum = common::warp_reduce_sum(sum);
-            if (tid == 0) inverse = row_inverse_rms(sum, out, kHidden, a.args.norm_eps);
-        }
-        __syncthreads();
-        for (int d = tid * 2; d < kHidden; d += kDecodeThreads * 2) {
-            const auto x = *reinterpret_cast<const float2*>(out + d);
-            const auto g =
-                __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(token.gamma + d));
-            *reinterpret_cast<__nv_bfloat162*>(token.out + d) =
-                __floats2bfloat162_rn((x.x * inverse) * g.x, (x.y * inverse) * g.y);
-        }
+        for (int i = 0; i < kDecodeThreads / 32; ++i) total.merge(warp_stats[i]);
+        a.sums[row * Tiles + tile] = total.pack();
     }
 }
 } // namespace
 
 void launch_generic(Arguments a, cudaStream_t stream) {
     const auto rows = std::int64_t(a.tokens) * a.streams;
-    down_vector<<<grid_size(rows * (a.rank / kWarps)), kThreads, 0, stream>>>(a);
+    constexpr int kRowsForSharedPair = 2 * 170;
+    if (rows >= kRowsForSharedPair && a.hidden <= 8192) {
+        down_vector_prefill<<<grid_size(rows), kThreads, 2 * a.hidden * sizeof(Bf16), stream>>>(a);
+    } else {
+        down_vector<<<grid_size(rows * (a.rank / kWarps)), kThreads, 0, stream>>>(a);
+    }
     CUDA_CHECK(cudaGetLastError());
     if (a.hidden <= 8192)
         up_vector<true><<<grid_size(rows), kThreads, a.hidden * sizeof(float), stream>>>(a);
@@ -302,15 +293,12 @@ void launch_generic(Arguments a, cudaStream_t stream) {
     CUDA_CHECK(cudaGetLastError());
 }
 
-void launch_decode(Chunk a, Route route, cudaStream_t stream) {
-    const int rows   = a.tokens * a.streams;
-    const bool last  = route == Route::DecodeLast;
-    const auto down  = last ? decode_down<true> : decode_down<false>;
-    const auto blend = last ? decode_blend<false> : decode_blend<true>;
-    down<<<rows * kRank * kDecodeSplits, kDecodeThreads, 0, stream>>>(a);
+void launch_decode(Chunk a, cudaStream_t stream) {
+    const int rows = a.tokens * a.streams;
+    decode_down<<<rows * kRank * kDecodeSplits, kDecodeThreads, 0, stream>>>(a);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(pdl::launch_dependent({unsigned(rows * kDecodeTiles), kDecodeThreads, 0, stream},
-                                     blend, a));
-    if (!last) launch_normalize(a, stream);
+                                     decode_blend, a));
+    launch_normalize(a, stream);
 }
 } // namespace ninfer::ops::detail::loop_message

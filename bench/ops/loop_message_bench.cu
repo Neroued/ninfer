@@ -96,13 +96,18 @@ struct BenchOptions {
     std::vector<int> tokens;
     std::string variant = "both";
     bool broadcast      = false;
+    bool zero_input     = false;
 };
 
+DeviceBuffer make_activation(std::size_t elements, unsigned seed, bool zero_input) {
+    return zero_input ? make_zeros(elements * sizeof(float)) : make_f32(elements, seed, -1.F, 1.F);
+}
+
 struct Fixture {
-    Fixture(int d, int r, int s, int m, bool broadcast)
+    Fixture(int d, int r, int s, int m, bool broadcast, bool zero_input)
         : d(d), r(r), s(s), m(m), sd(broadcast ? 1 : s),
-          x(make_f32(std::size_t(d) * m * sd, 101, -1.F, 1.F)),
-          msg(make_f32(std::size_t(d) * m * s, 103, -1.F, 1.F)),
+          x(make_activation(std::size_t(d) * m * sd, 101, zero_input)),
+          msg(make_activation(std::size_t(d) * m * s, 103, zero_input)),
           w(make_bf16(std::size_t(2) * d * r * s, 107, -0.04F, 0.04F)),
           u(make_bf16(std::size_t(2) * d * r * s, 109, -0.2F, 0.2F)),
           gamma(make_bf16(d, 113, 0.75F, 1.25F)), y(make_zeros(std::size_t(d) * m * s * 2)),
@@ -128,7 +133,7 @@ struct Fixture {
 void run(const BenchOptions& opt, int s, int m, const Blas* blas, L2FlushBuffer& flush, Csv& csv) {
     if (std::int64_t(m) * s > std::numeric_limits<int>::max())
         throw std::invalid_argument("benchmark row count exceeds the CUDA grid");
-    Fixture f(opt.d, opt.r, s, m, opt.broadcast);
+    Fixture f(opt.d, opt.r, s, m, opt.broadcast, opt.zero_input);
     const int rows = m * s, d = f.d;
     const std::size_t latent_bytes = std::size_t(f.r) * rows * 2;
     const std::size_t logical_bytes =
@@ -148,19 +153,20 @@ void run(const BenchOptions& opt, int s, int m, const Blas* blas, L2FlushBuffer&
                 const std::size_t peak =
                     policy == std::string_view("fused") ? f.arena.peak_used() : workspace;
                 csv.write({.op              = "loop_message_blend_rmsnorm",
-                           .format          = "bf16",
-                           .policy          = policy,
-                           .n               = d,
-                           .k               = f.r,
-                           .tokens          = m,
-                           .batch           = s,
-                           .workspace_bytes = workspace,
-                           .workspace_peak  = peak},
-                          result, execution, cache,
-                          std::to_string(f.sd) + ',' + std::to_string(logical_bytes) + ',' +
-                              pipeline_bytes + ',' + format_metric(flops, 0) + ',' +
-                              format_metric(floor, 3) + ',' +
-                              format_metric(100 * floor / result.gpu.median_us, 2));
+                                  .format          = "bf16",
+                                  .policy          = policy,
+                                  .n               = d,
+                                  .k               = f.r,
+                                  .tokens          = m,
+                                  .batch           = s,
+                                  .workspace_bytes = workspace,
+                                  .workspace_peak  = peak},
+                                 result, execution, cache,
+                                 std::to_string(f.sd) + ',' + std::to_string(logical_bytes) + ',' +
+                                     pipeline_bytes + ',' + format_metric(flops, 0) + ',' +
+                                     format_metric(floor, 3) + ',' +
+                                     format_metric(100 * floor / result.gpu.median_us, 2) + ',' +
+                                     std::to_string(opt.zero_input));
             }
         }
     };
@@ -204,7 +210,7 @@ int main(int argc, char** argv) try {
         if (flag == "--help") {
             std::cout << "loop_message_bench [--d D] [--rank R] [--streams 1,3] "
                          "[--tokens LIST | --sweep FIRST:LAST[:STEP]] "
-                         "[--variant fused|unfused|both] [--broadcast 0|1]\n";
+                         "[--variant fused|unfused|both] [--broadcast 0|1] [--zero-input 0|1]\n";
             help();
             return 0;
         }
@@ -221,6 +227,8 @@ int main(int argc, char** argv) try {
             opt.tokens = sweep(arg);
         else if (flag == "--broadcast")
             opt.broadcast = integer(arg, 0, 1) != 0;
+        else if (flag == "--zero-input")
+            opt.zero_input = integer(arg, 0, 1) != 0;
         else if (flag == "--variant" && (arg == "fused" || arg == "unfused" || arg == "both"))
             opt.variant = arg;
         else if (!parse(opt.timing, flag, arg))
@@ -234,7 +242,8 @@ int main(int argc, char** argv) try {
     if (opt.variant != "fused") blas = std::make_unique<Blas>();
     L2FlushBuffer flush(opt.timing.flush_bytes);
     Csv csv(opt.timing.csv_out,
-            "dest_streams,logical_bytes,pipeline_bytes,useful_flops,roofline_us,roofline_pct");
+            "dest_streams,logical_bytes,pipeline_bytes,useful_flops,roofline_us,roofline_pct,"
+            "zero_input");
     for (int s : opt.streams)
         for (int m : opt.tokens) run(opt, s, m, blas.get(), flush, csv);
     return 0;

@@ -387,6 +387,19 @@ int envelope() {
     return 0;
 }
 
+int inkling_prefill_capacity() {
+    constexpr std::size_t max_bytes = 10105344;
+    for (int streams : {1, 2, 3}) {
+        std::size_t exact_peak = 0;
+        for (int tokens = 1; tokens <= 4096; ++tokens)
+            exact_peak = std::max(exact_peak, capacity(2304, 64, streams, tokens, tokens));
+        const auto planned = capacity(2304, 64, streams, 1, 4096);
+        require(planned == exact_peak, "prefill interval does not cover its exact high-water mark");
+        require(planned <= max_bytes, "prefill interval exceeds the Inkling-2 workspace cap");
+    }
+    return 0;
+}
+
 int capacity_extent_overflow() {
     constexpr int max = std::numeric_limits<int>::max();
     rejects<std::overflow_error>([] { (void)capacity(2304, 64, max, 1, max); });
@@ -448,6 +461,37 @@ int rms_extremes(Shape shape, float input, float epsilon) {
     f.verify(0, true);
     return 0;
 }
+
+int rms_masked_rows(Shape shape) {
+    Fixture f(shape);
+    f.pair_eps = f.norm_eps = std::numeric_limits<float>::denorm_min();
+    std::fill(f.gamma.begin(), f.gamma.end(), 1.F);
+    for (int s = 0; s < shape.s; ++s) {
+        const auto base = std::size_t(s) * 2 * shape.d * shape.r;
+        f.down[base] = f.down[base + shape.d] = 0.5F;
+        f.up[base + shape.d * shape.r]        = 1.F;
+    }
+    const auto cuda = cuda_environment().context.execution_view();
+    auto run        = [&] {
+        f.upload_operands();
+        f.run(cuda);
+        CUDA_CHECK(cudaStreamSynchronize(cuda.stream()));
+        f.verify(0, true);
+    };
+    run();
+
+    constexpr float magnitudes[]{0.F, 0.75F, 1.e20F, 1.e-22F};
+    for (int row = 0; row < shape.m * shape.sd; ++row) {
+        const float x = magnitudes[(row % shape.m) % 4];
+        std::fill_n(f.d.data() + std::size_t(row) * shape.d, shape.d, x);
+    }
+    for (int row = 0; row < shape.m * shape.s; ++row) {
+        const float x = magnitudes[(row % shape.m) % 4];
+        std::fill_n(f.msg.data() + std::size_t(row) * shape.d, shape.d, x);
+    }
+    run();
+    return 0;
+}
 } // namespace
 
 int main(int argc, char** argv) {
@@ -477,9 +521,10 @@ int main(int argc, char** argv) {
     suite.add("rounding-generic", [] { return rounding_boundaries({256, 32, 2, 3, 2, 1}); });
     suite.add("validation", validation);
     suite.add("capacity-envelope", envelope);
+    suite.add("inkling-prefill-capacity", inkling_prefill_capacity);
     suite.add("capacity-extent-overflow", capacity_extent_overflow);
     suite.add("rms-overflow-decode", [] { return rms_overflow({2304, 64, 3, 1, 1, 3}); });
-    suite.add("rms-overflow-last-cta", [] { return rms_overflow({2304, 64, 3, 2, 3, 1}); });
+    suite.add("rms-overflow-decode-six-rows", [] { return rms_overflow({2304, 64, 3, 2, 3, 1}); });
     suite.add("rms-overflow-medium", [] { return rms_overflow({2304, 64, 3, 8, 1, 3}); });
     suite.add("rms-overflow-short-prefill", [] { return rms_overflow({2304, 64, 3, 77, 1, 3}); });
     suite.add("rms-overflow-prefill", [] { return rms_overflow({2304, 64, 3, 129, 1, 3}); });
@@ -504,14 +549,33 @@ int main(int argc, char** argv) {
             return rms_extremes(g, 0x1p-75F, std::numeric_limits<float>::denorm_min());
         });
     }
+    suite.add("rms-positive-subnormal-mean", [] {
+        return rms_extremes({8, 16, 1, 1, 1, 1}, 1.e-22F, std::numeric_limits<float>::denorm_min());
+    });
+    for (auto g : {Shape{2304, 64, 3, 1, 1, 1},
+                   {2304, 64, 2, 3, 1, 1},
+                   {2304, 64, 3, 17, 1, 1},
+                   {2304, 64, 3, 77, 1, 1},
+                   {2304, 64, 3, 129, 1, 1},
+                   {2304, 64, 3, 513, 1, 1},
+                   {2304, 64, 3, 1823, 1, 1},
+                   {8200, 16, 2, 7, 1, 1}}) {
+        for (bool broadcast : {true, false}) {
+            g.sd = g.sn      = broadcast ? 1 : g.s;
+            const auto label = "rms-masked-rows/" + std::to_string(g.d) + "/" +
+                               std::to_string(g.m) + "/" + (broadcast ? "broadcast" : "distinct");
+            suite.add(label, [g] { return rms_masked_rows(g); });
+        }
+    }
     suite.add("graph-decode-separate-finish", [] { return graph({2304, 64, 3, 1, 1, 3}); });
-    suite.add("graph-decode-last-cta", [] { return graph({2304, 64, 3, 2, 1, 3}); });
+    suite.add("graph-decode-six-rows", [] { return graph({2304, 64, 3, 2, 1, 3}); });
     suite.add("graph-medium", [] { return graph({2304, 64, 3, 17, 3, 1}); });
     suite.add("graph-short-prefill", [] { return graph({2304, 64, 3, 77, 3, 1}); });
     suite.add("graph-short-prefill-token-chunks", [] { return graph({2304, 64, 8, 97, 1, 8}); });
     suite.add("graph-short-prefill-stream-chunks", [] { return graph({2304, 64, 13, 49, 13, 1}); });
     suite.add("graph-prefill-wide-cluster", [] { return graph({2304, 64, 3, 829, 1, 3}); });
     suite.add("graph-prefill-narrow-cluster", [] { return graph({2304, 64, 3, 319, 3, 1}); });
+    suite.add("graph-prefill-32-token-cluster", [] { return graph({2304, 64, 3, 1823, 1, 3}); });
     suite.add("graph-generic", [] { return graph({256, 32, 2, 7, 1, 2}); });
     return suite.main(argc, argv);
 }

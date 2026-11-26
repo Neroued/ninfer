@@ -21,6 +21,7 @@ ninfer_add_op_bench(ninfer_axial_rope_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/a
 ninfer_add_op_bench(ninfer_add_bias_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/add_bias_bench.cu")
 ninfer_add_op_bench(ninfer_gelu_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/gelu_bench.cu")
 ninfer_add_op_bench(ninfer_layer_norm_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/layer_norm_bench.cu")
+ninfer_add_op_bench(ninfer_logit_softcap_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/logit_softcap_bench.cu")
 ninfer_add_op_bench(ninfer_embedding_interpolate_add_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/embedding_interpolate_add_bench.cu")
 ninfer_add_op_bench(ninfer_scatter_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/scatter_bench.cu")
 ninfer_add_op_bench(ninfer_scatter_bf16_batch_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/scatter_bf16_batch_bench.cu")

@@ -2,6 +2,7 @@
 
 void add_add_bias_cases(ninfer::test::OpSuite&);
 void add_gelu_cases(ninfer::test::OpSuite&);
+void add_logit_softcap_cases(ninfer::test::OpSuite&);
 void add_silu_mul_cases(ninfer::test::OpSuite&);
 void add_residual_add_cases(ninfer::test::OpSuite&);
 void add_sum_contributions_cases(ninfer::test::OpSuite&);
@@ -13,6 +14,7 @@ int main(int argc, char** argv) {
     ninfer::test::OpSuite suite;
     add_add_bias_cases(suite);
     add_gelu_cases(suite);
+    add_logit_softcap_cases(suite);
     add_silu_mul_cases(suite);
     add_residual_add_cases(suite);
     add_sum_contributions_cases(suite);

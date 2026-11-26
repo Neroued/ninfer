@@ -12,6 +12,7 @@ namespace {
 struct Options {
     measurement::Options timing;
     std::vector<ragged::SegmentSpec> segments;
+    std::vector<int> widths{1};
     int d = 2304, width = 1, batch = 1, stacked = 3, q = 1;
     bool snapshot = false, norm = true, conv_add = true, res = true, attn_add = true;
     ragged::StateOffsetForm state_form = ragged::StateOffsetForm::Distinct;
@@ -153,12 +154,13 @@ int main(int argc, char** argv) {
         for (int i = 1; i < argc; ++i) {
             const std::string_view flag = argv[i];
             if (flag == "--help") {
-                std::cout << "short_conv [--d D] [--width W --batch B | --ragged PARTITIONS]\n"
-                             "  --snapshot 0|1 --state-form "
-                          << ragged::state_form_options
-                          << " --mode all|standalone|fused|unfused\n"
-                             "  --stack N --queries Q --norm 0|1 --conv-addend 0|1 "
-                             "--residual 0|1 --attn-addend 0|1\n";
+                std::cout
+                    << "short_conv [--d D] [--width W[,W...] --batch B | --ragged PARTITIONS]\n"
+                       "  --snapshot 0|1 --state-form "
+                    << ragged::state_form_options
+                    << " --mode all|standalone|fused|unfused\n"
+                       "  --stack N --queries Q --norm 0|1 --conv-addend 0|1 "
+                       "--residual 0|1 --attn-addend 0|1\n";
                 measurement::help();
                 return 0;
             }
@@ -166,7 +168,7 @@ int main(int argc, char** argv) {
             if (flag == "--d")
                 o.d = measurement::integer(value);
             else if (flag == "--width")
-                o.width = measurement::integer(value);
+                o.widths = measurement::integers(value);
             else if (flag == "--batch")
                 o.batch = measurement::integer(value);
             else if (flag == "--ragged")
@@ -197,9 +199,12 @@ int main(int argc, char** argv) {
         }
         measurement::LogicalBenchmark benchmark(o.timing,
                                                 "conv_residual,conv_addend,attnres_addend");
-        if (o.segments.empty())
-            run(o, {}, benchmark);
-        else
+        if (o.segments.empty()) {
+            for (int width : o.widths) {
+                o.width = width;
+                run(o, {}, benchmark);
+            }
+        } else
             for (const auto& lengths : o.segments) run(o, lengths, benchmark);
         return 0;
     } catch (const std::exception& e) {

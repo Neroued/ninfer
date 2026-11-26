@@ -76,6 +76,12 @@ __device__ __forceinline__ void store_fp32(float* dst, const Values<V>& values) 
     }
 }
 
+__device__ __forceinline__ float warp_sum(float value) {
+#pragma unroll
+    for (int step = 16; step > 0; step /= 2) value += __shfl_down_sync(0xffffffff, value, step);
+    return value;
+}
+
 template <int Threads, int K>
 struct Reduction {
     // Alternating buffers let the next reduction begin without waiting for
@@ -100,19 +106,31 @@ struct Reduction {
             if (lane == 0) warp_sums[buffer][k][warp] = x;
         }
         __syncthreads();
+        constexpr int width = Count == 1 ? 32 : Count == 2 ? 16 : Count <= 4 ? 8 : 4;
+        const int metric = lane / width, local = lane % width;
+        float sum = Max ? -CUDART_INF_F : 0.0f;
+        if (metric < Count) {
 #pragma unroll
-        for (int k = 0; k < Count; ++k) {
-            float x = lane < Threads / 32 ? warp_sums[buffer][k][lane] : 0.0f;
-#pragma unroll
-            for (int delta = 1; delta < Threads / 32; delta <<= 1) {
-                const float other = __shfl_xor_sync(0xffffffff, x, delta);
-                if constexpr (Max)
-                    x = fmaxf(x, other);
-                else
-                    x += other;
+            for (int i = 0; i < Threads / 32; i += width) {
+                if (local + i < Threads / 32) {
+                    const float value = warp_sums[buffer][metric][local + i];
+                    if constexpr (Max)
+                        sum = fmaxf(sum, value);
+                    else
+                        sum += value;
+                }
             }
-            values[k] = __shfl_sync(0xffffffff, x, 0);
         }
+#pragma unroll
+        for (int delta = 1; delta < Threads / 32 && delta < width; delta <<= 1) {
+            const float other = __shfl_xor_sync(0xffffffff, sum, delta);
+            if constexpr (Max)
+                sum = fmaxf(sum, other);
+            else
+                sum += other;
+        }
+#pragma unroll
+        for (int k = 0; k < Count; ++k) values[k] = __shfl_sync(0xffffffff, sum, k * width);
         buffer ^= 1;
     }
 };
@@ -137,7 +155,13 @@ inline constexpr float kSourceScale = 0x1p-80f;
 
 __device__ __forceinline__ float rms_inverse(float squares, float inv_d, float eps,
                                              float scale = 1.0f) {
-    return rsqrtf(fmaf(squares, inv_d, (eps * scale) * scale));
+    const float mean = fmaf(squares, inv_d, (eps * scale) * scale);
+    // Keep subnormal epsilons representable without the library slow path.
+    const bool small  = mean < 0x1p-126f;
+    const float input = small ? mean * 0x1p24f : mean;
+    float inv;
+    asm("rsqrt.approx.ftz.f32 %0, %1;" : "=f"(inv) : "f"(input));
+    return small ? inv * 0x1p12f : inv;
 }
 
 template <int Q>
@@ -189,6 +213,65 @@ __device__ __forceinline__ void store_mixed(const Mix& a, std::int64_t plane, st
             for (int v = 0; v < V; ++v) y.x[v] = acc[q].x[v] * scales[q];
             store_fp32<V>(static_cast<float*>(a.out) + dst, y);
         }
+    }
+}
+
+template <int V, int Q, int Threads, int Packs, bool Exact, bool Norm, int K>
+__device__ __forceinline__ void finish_mix(const Mix& a, std::int64_t plane, std::int64_t col,
+                                           int first_query, Values<V> (&acc)[Packs][Q],
+                                           Reduction<Threads, K>& reduction, int buffer = 0) {
+    float scales[Q];
+    if constexpr (Norm) {
+        float stats[Q]{};
+#pragma unroll
+        for (int q = 0; q < Q; ++q) {
+#pragma unroll
+            for (int i = 0; i < Packs; ++i) {
+#pragma unroll
+                for (int v = 0; v < V; ++v) {
+                    const float value = acc[i][q].x[v];
+                    stats[q]          = fmaf(value, value, stats[q]);
+                }
+            }
+        }
+        reduction.reduce(stats, buffer);
+        bool overflow = false;
+#pragma unroll
+        for (int q = 0; q < Q; ++q) overflow |= !isfinite(stats[q]);
+        if (overflow) {
+            float scaled_squares[Q]{};
+#pragma unroll
+            for (int q = 0; q < Q; ++q) {
+                scales[q] = isfinite(stats[q]) ? 1.0f : kSourceScale;
+#pragma unroll
+                for (int i = 0; i < Packs; ++i) {
+#pragma unroll
+                    for (int v = 0; v < V; ++v) {
+                        const float value = acc[i][q].x[v] * scales[q];
+                        acc[i][q].x[v]    = value;
+                        scaled_squares[q] = fmaf(value, value, scaled_squares[q]);
+                    }
+                }
+            }
+            reduction.reduce(scaled_squares, buffer);
+#pragma unroll
+            for (int q = 0; q < Q; ++q)
+                scales[q] = rms_inverse(scaled_squares[q], a.inv_d, a.params.norm_eps, scales[q]);
+        } else {
+#pragma unroll
+            for (int q = 0; q < Q; ++q)
+                scales[q] = rms_inverse(stats[q], a.inv_d, a.params.norm_eps);
+        }
+    } else {
+#pragma unroll
+        for (int q = 0; q < Q; ++q) scales[q] = 1.0f;
+    }
+
+#pragma unroll
+    for (int i = 0; i < Packs; ++i) {
+        const auto c = (int(threadIdx.x) + i * Threads) * V;
+        if (Exact || c < a.d)
+            store_mixed<V, Q, Norm>(a, plane, col, first_query, c, acc[i], scales);
     }
 }
 
@@ -257,7 +340,7 @@ __device__ __forceinline__ void mix_resident(const Mix& a, int m, const Partial&
             if (s == a.stacked) {
 #pragma unroll
                 for (int q = 0; q < Q; ++q) {
-                    const float inv_den = __frcp_rn(mix.denominator[q]);
+                    const float inv_den = __fdividef(1.0f, mix.denominator[q]);
                     old_w[q] *= inv_den;
                     new_w[q] *= inv_den;
                 }
@@ -274,70 +357,19 @@ __device__ __forceinline__ void mix_resident(const Mix& a, int m, const Partial&
         }
     }
 
-    float scales[Q];
-    if constexpr (Norm) {
-        float stats[Q]{};
+    if constexpr (!Norm) {
 #pragma unroll
         for (int q = 0; q < Q; ++q) {
+            const float inv_den = __fdividef(1.0f, mix.denominator[q]);
 #pragma unroll
             for (int i = 0; i < Packs; ++i) {
 #pragma unroll
-                for (int v = 0; v < V; ++v) {
-                    const float value = acc[i][q].x[v];
-                    stats[q]          = fmaf(value, value, stats[q]);
-                }
+                for (int v = 0; v < V; ++v) acc[i][q].x[v] *= inv_den;
             }
         }
-        reduction.reduce(stats, buffer);
-        bool overflow = false;
-#pragma unroll
-        for (int q = 0; q < Q; ++q) overflow |= !isfinite(stats[q]);
-        if (overflow) {
-            float max_abs[Q]{};
-#pragma unroll
-            for (int q = 0; q < Q; ++q) {
-#pragma unroll
-                for (int i = 0; i < Packs; ++i) {
-#pragma unroll
-                    for (int v = 0; v < V; ++v)
-                        max_abs[q] = fmaxf(max_abs[q], fabsf(acc[i][q].x[v]));
-                }
-            }
-            reduction.template reduce<true>(max_abs, buffer);
-            float scaled_squares[Q]{};
-#pragma unroll
-            for (int q = 0; q < Q; ++q) {
-                scales[q] = isfinite(stats[q]) ? 1.0f : __frcp_rn(max_abs[q]);
-#pragma unroll
-                for (int i = 0; i < Packs; ++i) {
-#pragma unroll
-                    for (int v = 0; v < V; ++v) {
-                        const float value = acc[i][q].x[v] * scales[q];
-                        acc[i][q].x[v]    = value;
-                        scaled_squares[q] = fmaf(value, value, scaled_squares[q]);
-                    }
-                }
-            }
-            reduction.reduce(scaled_squares, buffer);
-#pragma unroll
-            for (int q = 0; q < Q; ++q)
-                scales[q] = rms_inverse(scaled_squares[q], a.inv_d, a.params.norm_eps, scales[q]);
-        } else {
-#pragma unroll
-            for (int q = 0; q < Q; ++q)
-                scales[q] = rms_inverse(stats[q], a.inv_d, a.params.norm_eps);
-        }
-    } else {
-#pragma unroll
-        for (int q = 0; q < Q; ++q) scales[q] = __frcp_rn(mix.denominator[q]);
     }
-
-#pragma unroll
-    for (int i = 0; i < Packs; ++i) {
-        const auto c = (int(threadIdx.x) + i * Threads) * V;
-        if (Exact || c < a.d)
-            store_mixed<V, Q, Norm>(a, plane, col, first_query, c, acc[i], scales);
-    }
+    finish_mix<V, Q, Threads, Packs, Exact, Norm>(a, plane, col, first_query, acc, reduction,
+                                                  buffer);
 }
 
 // One CTA caches scalar source coefficients for ordinary histories. Very large
@@ -412,7 +444,7 @@ cache_coefficients(const Mix& a, const Partial& partial, std::int64_t plane, std
         coeff.x = probability * coeff.y;
     }
     scratch.reduction.reduce(denominator, buffer);
-    const float inv_den = __frcp_rn(denominator[0]);
+    const float inv_den = __fdividef(1.0f, denominator[0]);
     for (int s = threadIdx.x; s <= a.stacked; s += Threads) scratch.coefficients[s].x *= inv_den;
     __syncthreads();
 }
@@ -458,7 +490,7 @@ __device__ __forceinline__ void mix_tiled(const Mix& a, int m, const Partial& pa
                     for (int v = 0; v < V; ++v)
                         acc[0].x[v] = fmaf(selected.x[v], new_w[0], acc[0].x[v] * old_w[0]);
                 }
-                const float inv_den = __frcp_rn(mix.denominator[0]);
+                const float inv_den = __fdividef(1.0f, mix.denominator[0]);
 #pragma unroll
                 for (int v = 0; v < V; ++v) acc[0].x[v] *= inv_den;
             }
@@ -503,10 +535,10 @@ template <int Threads, int Q, int Packs>
 using MixScratch =
     std::conditional_t<Packs != 0, Reduction<Threads, Q + 1>, GeneralScratch<Threads>>;
 
-template <int V, bool Norm>
+template <int V, int Threads, bool Norm>
 __device__ __forceinline__ void zero_mix(const Mix& a, int m) {
     const std::int64_t plane = std::int64_t(a.d) * a.columns, col = std::int64_t(m) * a.d;
-    for (std::int64_t c = threadIdx.x * V; c < a.d; c += blockDim.x * V) {
+    for (unsigned c = threadIdx.x * V; c < unsigned(a.d); c += Threads * V) {
         for (int q = 0; q < a.q; ++q) {
             const auto dst = q * plane + col + c;
             if constexpr (Norm)
@@ -517,6 +549,8 @@ __device__ __forceinline__ void zero_mix(const Mix& a, int m) {
     }
 }
 
+inline constexpr int kScalarResidentChannels = 512;
+
 // Select solely on representation, query register footprint and channel geometry.
 template <class Submit>
 void dispatch_mix(const Mix& a, Submit submit) {
@@ -525,7 +559,7 @@ void dispatch_mix(const Mix& a, Submit submit) {
             submit.template operator()<8, Q, 288, 1, true, Norm>();
         else if (a.d % 8 == 0 && a.d <= 4096)
             submit.template operator()<8, Q, 256, 2, false, Norm>();
-        else if (a.d % 8 != 0 && a.d <= 512)
+        else if (a.d % 8 != 0 && a.d <= kScalarResidentChannels)
             submit.template operator()<1, Q, 128, 4, false, Norm>();
         else if (a.d % 8 == 0)
             submit.template operator()<8, 1, 128, 0, false, Norm>();

@@ -372,6 +372,10 @@ int main(int argc, char** argv) {
         {Snapshot, 257, 8, {8, 0, 5, 1, 2}, Residual::Alias, true, true, false, 2, 5, true});
     add("snapshot_standalone_alias",
         {Snapshot, 1024, 5, {5, 0, 2}, Residual::Alias, true, false, false, 0, 1});
+    add("snapshot_standalone_tiled",
+        {Snapshot, 2304, 823, {823, 0, 819}, Residual::Alias, true, false, false, 0, 1});
+    add("snapshot_fused_many_sources_graph",
+        {Snapshot, 2312, 7, {7, 0, 2}, Residual::Alias, true, true, true, 11, 4, true});
     add("snapshot_batched_off_grid", {Snapshot,
                                       256,
                                       16,
@@ -406,6 +410,10 @@ int main(int argc, char** argv) {
                                true,
                                5,
                                1});
+    add("ragged_tiled_state_alias",
+        {Ragged, 2304, 0, {1, 2, 3, 4, 17, 1603, 123}, Residual::Alias, true, false, false, 0, 1});
+    add("ragged_scalar_prefill",
+        {Ragged, 1023, 0, {1, 3, 125}, Residual::Alias, true, true, true, 5, 4});
     add("ragged_single_graph",
         {Ragged, 1024, 0, {17}, Residual::Separate, true, true, false, 3, 2, true});
     add("ragged_unbounded_channels",

@@ -11,7 +11,7 @@ struct Conv {
     const std::int64_t *source_offsets, *destination_offsets;
     const std::int32_t *valid, *snapshot_slots, *prefix, *token_to_seq;
     Word *out, *destination;
-    int d, columns, width;
+    int d, columns, width, rows;
     bool overlapping_state;
 };
 

@@ -8,6 +8,7 @@ namespace ninfer::ops::short_conv_detail {
 using attn_res_detail::Values;
 using attn_res_detail::load_bf16;
 using attn_res_detail::store_bf16;
+inline constexpr float kConvScale = 0.44721359549995794f;
 
 struct Column {
     int first, row, pos, length;
@@ -64,9 +65,22 @@ __device__ __forceinline__ int aliased_snapshot(const Conv& a, const Column& col
     const auto src        = reinterpret_cast<std::uintptr_t>(history(a, col.row));
     const auto start      = reinterpret_cast<std::uintptr_t>(snapshot(a, col, 0));
     const auto slot_bytes = std::uint64_t(a.d) * 3 * sizeof(Word);
-    if (src >= start && (src - start) / slot_bytes < std::uint64_t(col.length))
-        return int((src - start) / slot_bytes);
-    return -1;
+    if (src < start) return -1;
+    const auto delta = src - start;
+    if (delta >= slot_bytes * col.length) return -1;
+    if (delta < slot_bytes) return 0;
+    if (delta <= UINT32_MAX) return unsigned(delta) / unsigned(slot_bytes);
+    // The reservation fits in the validated snapshot storage. Find a distant
+    // alias with exact integer comparisons without a device 64-bit divide.
+    int lo = 1, hi = col.length;
+    while (hi - lo > 1) {
+        const int mid = lo + (hi - lo) / 2;
+        if (mid * slot_bytes <= delta)
+            lo = mid;
+        else
+            hi = mid;
+    }
+    return lo;
 }
 
 // A single owner handles all history-dependent columns whenever another CTA
@@ -127,10 +141,7 @@ __device__ __forceinline__ Values<V> conv_sum(const Conv& a, const Column& col, 
     }
     Values<V> result;
 #pragma unroll
-    for (int v = 0; v < V; ++v) {
-        constexpr float scale = 0.44721359549995794f;
-        result.x[v]           = (sum.x[v] + input.x[v]) * scale;
-    }
+    for (int v = 0; v < V; ++v) { result.x[v] = (sum.x[v] + input.x[v]) * kConvScale; }
     return result;
 }
 
@@ -160,13 +171,18 @@ __device__ __forceinline__ Values<V> convolve(const Conv& a, const Column& col, 
     return result;
 }
 
-__device__ __forceinline__ uint4 convolve_pack(const Conv& a, const Column& col, int pos, int c) {
-    auto result        = conv_sum<8>(a, col, pos, c);
+__device__ __forceinline__ uint4 round_conv_pack(const Conv& a, const Word* current,
+                                                 Values<8> result) {
     const auto rounded = attn_res_detail::encode_bf16(result);
     if (!a.addend) return rounded;
     result = attn_res_detail::decode_bf16(rounded);
-    add_residual(a, a.x + (std::int64_t(col.first) + pos) * a.d + c, result);
+    add_residual(a, current, result);
     return attn_res_detail::encode_bf16(result);
+}
+
+__device__ __forceinline__ uint4 convolve_pack(const Conv& a, const Column& col, int pos, int c) {
+    const auto* current = a.x + (std::int64_t(col.first) + pos) * a.d + c;
+    return round_conv_pack(a, current, conv_sum<8>(a, col, pos, c));
 }
 
 template <int V, bool Snapshot>

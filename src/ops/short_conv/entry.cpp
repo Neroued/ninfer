@@ -117,6 +117,7 @@ Conv prepare(const Tensor& x, const Tensor& weight, const Layout& layout, const 
             d,
             static_cast<int>(columns),
             width,
+            rows,
             operand::overlaps(operand::range(src.data, src.bytes, op), destination_storage)};
 }
 

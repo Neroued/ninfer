@@ -130,9 +130,15 @@ int main(int argc, char** argv) {
     suite.add("odd_channels_graph", [] { return run(257, 3, 2, 5, true, true, false, true); });
     suite.add("seven_columns", [] { return run(256, 7, 0, 3, false, false, true, false); });
     suite.add("raw_graph", [] { return run(2304, 17, 7, 4, false, true, true, true); });
+    suite.add("large_source_group_graph",
+              [] { return run(2312, 31, 11, 4, true, true, true, true); });
+    suite.add("scalar_tail_multi_query",
+              [] { return run(509, 7, 11, 3, false, true, false, false); });
     suite.add("vision", [] { return run(1024, 63, 1, 2, true, false, false, false); });
     suite.add("large_channels", [] { return run(4096, 129, 2, 3, true, true, true, false); });
     suite.add("odd_large_channels", [] { return run(2305, 3, 3, 3, true, true, true, false); });
+    suite.add("odd_prefill_crossover",
+              [] { return run(2305, 129, 8, 3, true, true, true, false); });
     suite.add("unbounded_channels", [] { return run(4104, 3, 1, 5, false, true, false, false); });
     suite.add("norm_numerator_overflow", [] { return extreme_norm(1, 0x1p63f); });
     suite.add("norm_square_sum_overflow", [] { return extreme_norm(1024, 0x1p60f); });

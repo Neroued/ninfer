@@ -440,23 +440,24 @@ constexpr int kBf16ParentRows = 8576;
 constexpr ops::LinearProfile kBf16PairProfile{QType::BF16, kOutputRows, kBf16PairHidden};
 
 int run_bf16_pair_cases(std::span<const std::size_t> selected,
-                        std::span<const linear_suite::Case> cases, bool shared_parent,
+                        std::span<const linear_suite::Case> cases, int n, bool shared_parent,
                         bool alias_inputs) {
     using direct_bf16_weight::DeviceWeight;
     using direct_bf16_weight::make_patterned;
-    constexpr int n = kOutputRows, k = kBf16PairHidden;
+    constexpr int k = kBf16PairHidden;
+    const ops::LinearProfile profile{QType::BF16, n, k};
     const DeviceWeight first(make_patterned(shared_parent ? kBf16ParentRows : n, k, 439U));
     std::optional<DeviceWeight> second;
     if (!shared_parent) second.emplace(make_patterned(n, k, 467U));
     Weight w0, w1;
     if (shared_parent) {
         constexpr std::array shape{std::uint64_t(kBf16ParentRows), std::uint64_t(k)};
-        constexpr auto elements = std::uint64_t(n) * k;
+        const auto elements = std::uint64_t(n) * k;
         const WeightParent root{weight_geometry(QType::BF16, QuantLayout::Contiguous, shape),
                                 first.device.device(),
                                 static_cast<const std::byte*>(first.device.data())};
-        const WeightView v0{{n, k}, {{&root, 0, elements}}};
-        const WeightView v1{{n, k}, {{&root, elements, 2 * elements}}};
+        const WeightView v0{{std::uint64_t(n), k}, {{&root, 0, elements}}};
+        const WeightView v1{{std::uint64_t(n), k}, {{&root, elements, 2 * elements}}};
         w0 = ops::prepare_linear_weight({v0}).weight;
         w1 = native_weight(v1);
         if (w0.qdata != root.data || w1.qdata != root.data + elements * sizeof(std::uint16_t) ||
@@ -467,7 +468,7 @@ int run_bf16_pair_cases(std::span<const std::size_t> selected,
         w1 = second->view();
     }
     if (ops::linear_pair_workspace_capacity_bytes(w0, w1, 1, std::numeric_limits<int>::max()) ||
-        ops::linear_pair_workspace_capacity_bytes(kBf16PairProfile, kBf16PairProfile, 1,
+        ops::linear_pair_workspace_capacity_bytes(profile, profile, 1,
                                                   std::numeric_limits<int>::max()))
         throw std::runtime_error("BF16 pair: expected zero workspace capacity");
 
@@ -497,7 +498,7 @@ int run_bf16_pair_cases(std::span<const std::size_t> selected,
         const auto& call = cases[index];
         const int t      = call.t;
         auto rows        = sampled_indices(n);
-        if (t == 1) {
+        if (t == 1 || n <= 64) {
             rows.resize(n);
             std::iota(rows.begin(), rows.end(), 0);
         }
@@ -537,7 +538,7 @@ int run_bf16_pair_cases(std::span<const std::size_t> selected,
             context.synchronize();
             const auto check = [&](const GuardedDeviceBuffer& out, const auto& weight,
                                    const auto& input, const std::string& label) {
-                const auto actual = read_output(out.data(), t, rows, columns, label);
+                const auto actual = read_output(out.data(), t, rows, columns, label, n);
                 const auto expected =
                     linear_pair_oracle(weight, k, int(rows.size()), input, columns);
                 return actual.failures + compare_output(label, actual.selected, expected) +
@@ -626,13 +627,33 @@ void add_bf16_1024_pair_cases(linear_suite::Suite& suite) {
                     cases.push_back(
                         linear_suite::make_case("bf16", n, k, t, policy, execution, recipe));
             suite.add(std::move(cases), [=](auto selected, auto declared) {
-                return run_bf16_pair_cases(selected, declared, shared_parent, alias_inputs);
+                return run_bf16_pair_cases(selected, declared, n, shared_parent, alias_inputs);
             });
         }
     }
     suite.add(linear_suite::make_case("bf16", n, k, 0, policy, linear_suite::Execution::Eager,
                                       "invalid-geometry-interval-overlap"),
               reject_invalid_bf16_pair);
+}
+
+void add_bf16_32_pair_cases(linear_suite::Suite& suite) {
+    constexpr int n = 32, k = kBf16PairHidden;
+    constexpr auto policy = ops::LinearPolicy::A16Only;
+    constexpr std::array starts{2, 9, 65, 257, 513, 2049};
+    constexpr std::array anchors{4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 4097};
+    const auto tokens = conformance_tokens(starts, anchors);
+    for (bool alias_inputs : {false, true}) {
+        const std::string recipe =
+            alias_inputs ? "separate-weights-aliased-inputs" : "separate-weights-distinct-inputs";
+        std::vector<linear_suite::Case> cases;
+        for (int t : tokens)
+            for (auto execution : {linear_suite::Execution::Eager, linear_suite::Execution::Graph})
+                cases.push_back(
+                    linear_suite::make_case("bf16", n, k, t, policy, execution, recipe));
+        suite.add(std::move(cases), [=](auto selected, auto declared) {
+            return run_bf16_pair_cases(selected, declared, n, false, alias_inputs);
+        });
+    }
 }
 #endif
 
@@ -697,6 +718,7 @@ int main(int argc, char** argv) {
     }
 #if NINFER_TARGET_RTX5090
     add_bf16_1024_pair_cases(suite);
+    add_bf16_32_pair_cases(suite);
 #endif
     for (int k : {2048, 5120})
         suite.add(linear_suite::make_case("q8", 1024, k, 4, ops::LinearPolicy::A16Only,

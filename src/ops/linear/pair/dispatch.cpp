@@ -56,6 +56,7 @@ Bf16PairLaunch validate_bf16_pair_geometry(int n, int k, int max_tokens) {
     if (max_tokens > 0) {
         if (k == 128 && (n == 4096 || n == 8192)) return launch_bf16_pair_k128;
 #if NINFER_TARGET_RTX5090
+        if (n == 32 && k == 2304) return launch_bf16_pair_n32_k2304;
         if (n == 1024 && k == 2304) return launch_bf16_pair_n1024_k2304;
 #endif
     }

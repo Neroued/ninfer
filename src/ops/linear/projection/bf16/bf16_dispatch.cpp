@@ -13,6 +13,7 @@ struct ShapeEntry {
 
 constexpr std::array kShapes{
 #if NINFER_TARGET_RTX5090
+    ShapeEntry{32, 2304, select_bf16_n32_k2304},
     ShapeEntry{1024, 2304, select_bf16_n1024_k2304},
     ShapeEntry{768, 2304, select_bf16_n768_k2304},
     ShapeEntry{8576, 2304, select_bf16_n8576_k2304},

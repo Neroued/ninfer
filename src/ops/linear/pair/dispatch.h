@@ -15,6 +15,8 @@ LinearPairLaunch select_q8_pair_n1024_k5120(int tokens);
 LinearPairLaunch select_linear_pair(int k, int tokens);
 void launch_bf16_pair_k128(const Tensor&, const Tensor&, const Weight&, const Weight&, Tensor&,
                            Tensor&, cudaStream_t);
+void launch_bf16_pair_n32_k2304(const Tensor&, const Tensor&, const Weight&, const Weight&,
+                                Tensor&, Tensor&, cudaStream_t);
 void launch_bf16_pair_n1024_k2304(const Tensor&, const Tensor&, const Weight&, const Weight&,
                                   Tensor&, Tensor&, cudaStream_t);
 Bf16PairLaunch validate_bf16_pair_geometry(int n, int k, int max_tokens);

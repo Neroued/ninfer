@@ -29,6 +29,7 @@ void validate_swiglu_geometry(QType type, int rows, int k, bool clamped) {
         throw std::invalid_argument("linear_swiglu: unsupported clamped geometry");
     }
 #if NINFER_TARGET_RTX5090
+    if (type == QType::BF16 && rows == 18432 && k == 2304) return;
     if (type == QType::NVFP4 && rows == 28672 && k == 5120) return;
 #endif
 #if NINFER_TARGET_SPARK
@@ -55,6 +56,10 @@ LinearSwiGluLaunch select_q8_linear_swiglu(int rows, int k, int tokens) {
 
 void bf16_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor& out, float limit,
                                  bool clamped, cudaStream_t stream) {
+#if NINFER_TARGET_RTX5090
+    if (!clamped && weight.n == 18432 && weight.k == 2304)
+        return launch_bf16_swiglu_n18432_k2304(x, weight, out, stream);
+#endif
 #if NINFER_TARGET_SPARK
     if (!clamped && weight.n == 12288 && weight.k == 4096)
         return launch_bf16_swiglu_n12288_k4096(x, weight, out, stream);

@@ -49,9 +49,9 @@ ninfer_linear_format_tests(add bf16 q4 q5 q8 fp8 nvfp4)
 ninfer_linear_suite(swiglu
   test.cpp runner.cpp cases_bf16.cpp cases_q4.cpp cases_q8.cpp cases_nvfp4.cpp cases_fp8.cpp cases_bank.cpp
   cases_native.cpp)
-ninfer_linear_format_tests(swiglu q4 q8 fp8 nvfp4)
+ninfer_linear_format_tests(swiglu bf16 q4 q8 fp8 nvfp4)
 if(NINFER_TARGET STREQUAL "dgx_spark")
-  ninfer_linear_format_tests(swiglu bf16 mxfp8 fp8_block_fp32 nvfp4_mul)
+  ninfer_linear_format_tests(swiglu mxfp8 fp8_block_fp32 nvfp4_mul)
 endif()
 
 ninfer_linear_suite(pair test.cpp)

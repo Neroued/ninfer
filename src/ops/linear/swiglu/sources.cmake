@@ -29,6 +29,7 @@ if(NINFER_TARGET STREQUAL "rtx5090")
     "${CMAKE_CURRENT_LIST_DIR}/nvfp4/rtx5090/shapes/n28672_k5120/dispatch.cu"
     "${CMAKE_CURRENT_LIST_DIR}/nvfp4/rtx5090/shapes/n34816_k5120/a16.cu")
   target_sources(ninfer_ops_non_rdc PRIVATE
+    "${CMAKE_CURRENT_LIST_DIR}/bf16/rtx5090/shapes/n18432_k2304.cu"
     "${CMAKE_CURRENT_LIST_DIR}/nvfp4/rtx5090/shapes/n28672_k5120/tma.cu")
 endif()
 

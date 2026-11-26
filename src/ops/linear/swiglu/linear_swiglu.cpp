@@ -125,13 +125,11 @@ static void execute_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor
         return;
     }
 
-#if NINFER_TARGET_SPARK
     if (w.qtype == QType::BF16) {
         detail::validate_bf16_projection(x, w, {&out, 1}, nullptr, execution, "linear_swiglu");
         detail::bf16_linear_swiglu_dispatch(x, w, out, limit, clamped, execution.stream());
         return;
     }
-#endif
     const bool q8_weight    = w.qtype == QType::Q8_G32_FP16;
     const bool fp8_weight   = w.qtype == QType::FP8_E4M3FN_ROW_BF16;
     const bool nvfp4_weight = w.qtype == QType::NVFP4;

@@ -1,0 +1,70 @@
+#include "models/inkling2/load.h"
+
+namespace ninfer::models::inkling2 {
+
+ResolvedLoadPlan::ResolvedLoadPlan(const artifact::Reader& reader,
+                                   std::shared_ptr<const ModelDefinition> definition, RankPlan rank,
+                                   SelectedWeights selection,
+                                   artifact::MaterializationPlan materialization, Device device)
+    : reader_(&reader), definition_(std::move(definition)), rank_(std::move(rank)),
+      selection_(std::move(selection)), materialization_(std::move(materialization)),
+      device_(device) {
+    parents_.reserve(materialization_.tensors.size());
+    for (const auto& tensor : materialization_.tensors)
+        parents_.push_back({tensor.geometry, device_, nullptr, {}});
+    descriptions_ = bind_selected_weights(definition_->weight_data(), selection_,
+                                          materialization_.requests, parents_);
+}
+
+ResolvedLoadPlan resolve_rank_load(const artifact::Reader& reader,
+                                   std::shared_ptr<const ModelDefinition> definition, RankPlan rank,
+                                   Device device) {
+    if (!definition || definition->artifact_id() != reader.artifact_id())
+        throw artifact::ArtifactError("Inkling2 definition belongs to another artifact");
+    if (device.type() != DeviceType::CUDA)
+        throw artifact::ArtifactError("Inkling2 rank weights require a CUDA device");
+    if (rank.experts.size() != definition->expert_banks().size())
+        throw artifact::ArtifactError("Inkling2 rank expert ownership differs from its definition");
+
+    std::vector<ExpertWeightPartition> experts(definition->expert_banks().size());
+    for (const auto& layer : definition->weights().text.layers) {
+        const auto& m              = layer.moe;
+        experts.at(m.bank.index)   = {definition->expert_banks()[m.bank.index],
+                                      {m.gate, m.up, m.down},
+                                      rank.experts[m.bank.index]};
+    }
+    auto selection = select_weights(reader, definition->parameters(), definition->weight_data(),
+                                    rank.assemblies, experts, device);
+    auto storage   = artifact::plan_materialization(reader, selection.requests);
+    return {reader,
+            std::move(definition),
+            std::move(rank),
+            std::move(selection),
+            std::move(storage),
+            device};
+}
+
+std::unique_ptr<ModelShard> materialize_model(ResolvedLoadPlan&& plan, DeviceContext& device,
+                                              const StartupObserver* observer) {
+    if (!plan.definition_) throw artifact::ArtifactError("Inkling2 load plan was already consumed");
+    if (plan.device_ != device.device())
+        throw artifact::ArtifactError("Inkling2 materialization device differs from its plan");
+    auto definition         = std::move(plan.definition_);
+    const auto parent_count = plan.materialization_.tensors.size();
+    auto requests           = std::move(plan.materialization_.requests);
+    auto backing            = artifact::materialize(*plan.reader_, std::move(plan.materialization_),
+                                                    device.transfer_view(), observer);
+    auto out                = std::unique_ptr<ModelShard>(
+        new ModelShard(std::move(definition), std::move(plan.rank_), std::move(backing)));
+    out->parents_.reserve(parent_count);
+    for (std::size_t i = 0; i < parent_count; ++i)
+        out->parents_.push_back(out->backing_.parent({i}, device.device()));
+    out->weights_ = bind_selected_weights(out->definition_->weight_data(), plan.selection_,
+                                          requests, out->parents_);
+    out->experts_ =
+        bind_selected_experts(plan.selection_, requests, out->parents_, device.device());
+    out->expert_descriptions_ = std::move(plan.selection_.expert_descriptions);
+    return out;
+}
+
+} // namespace ninfer::models::inkling2

@@ -32,6 +32,10 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/swiglu/entry.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/topk_sigmoid_route/entry.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/topk_sigmoid_swiglu_moe/entry.cpp")
+if(NINFER_TARGET STREQUAL "rtx5090")
+  target_sources(ninfer_ops PRIVATE
+    "${CMAKE_CURRENT_LIST_DIR}/topk_sigmoid_route/bf16/rtx5090/shapes/h2304_e128_k8.cu")
+endif()
 if(NINFER_TARGET STREQUAL "dgx_spark")
   target_sources(ninfer_ops PRIVATE
     "${CMAKE_CURRENT_LIST_DIR}/swiglu/dgx_spark/nvfp4.cu"

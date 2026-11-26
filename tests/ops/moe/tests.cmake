@@ -60,6 +60,9 @@ ninfer_add_op_test(ninfer_moe_ep_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ep.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/ep_fixture.cpp"
   LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_sigmoid_route_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_sigmoid_route.cpp"
+  LIBRARIES ninfer_ops ninfer_linear_test_support)
 if(NINFER_TARGET STREQUAL "dgx_spark")
   ninfer_add_op_test(ninfer_moe_tp2_test
     PROCESSORS 2 COST 100
@@ -75,9 +78,6 @@ if(NINFER_TARGET STREQUAL "dgx_spark")
             "${CMAKE_CURRENT_LIST_DIR}/test_swiglu_bf16.cpp"
             "${CMAKE_CURRENT_LIST_DIR}/test_swiglu_fp8.cpp"
             "${CMAKE_CURRENT_LIST_DIR}/test_swiglu_q8.cpp"
-    LIBRARIES ninfer_ops ninfer_linear_test_support)
-  ninfer_add_op_test(ninfer_sigmoid_route_test
-    SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_sigmoid_route.cpp"
     LIBRARIES ninfer_ops ninfer_linear_test_support)
   ninfer_add_op_test(ninfer_moe_clamped_ep_test
     PROCESSORS 2 COST 90

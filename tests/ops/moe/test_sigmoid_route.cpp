@@ -6,10 +6,48 @@
 #include "ops/linear_common.h"
 #include "sigmoid_route_oracle.h"
 #include <array>
+#include <bit>
 
 namespace ninfer::test::sigmoid_route {
 namespace {
-constexpr int H = 4096, E = 288, K = 8;
+constexpr int K = 8;
+#if NINFER_TARGET_RTX5090
+constexpr int H = 2304, E = 128;
+
+Reference route_reference(const quantized_weight::PackedWeight& weight,
+                          std::span<const std::uint16_t> input, std::span<const float> bias,
+                          double factor, double epsilon) {
+    std::vector<std::pair<int, double>> nonzero;
+    for (int d = 0; d < H; ++d) {
+        const double value = bf16_to_f32(input[d]);
+        if (value != 0) nonzero.emplace_back(d, value);
+    }
+    std::array<double, E> probabilities{}, corrected{};
+    std::array<int, E> ids;
+    std::iota(ids.begin(), ids.end(), 0);
+    for (int e : ids) {
+        double dot = 0;
+        for (auto [d, value] : nonzero)
+            dot += quantized_weight::logical_weight_fp64(weight, e, d) * value;
+        probabilities[e] = 1.0 / (1.0 + std::exp(-dot));
+        corrected[e]     = probabilities[e] + bias[e];
+    }
+    std::partial_sort(ids.begin(), ids.begin() + K, ids.end(), [&](int a, int b) {
+        if (corrected[a] != corrected[b]) return corrected[a] > corrected[b];
+        return a < b;
+    });
+    Reference result;
+    std::copy_n(ids.begin(), K, result.ids.begin());
+    double sum = epsilon;
+    for (int id : result.ids) sum += probabilities[id];
+    for (int j = 0; j < K; ++j)
+        result.coefficients[j] = factor * probabilities[result.ids[j]] / sum;
+    return result;
+}
+#elif NINFER_TARGET_SPARK
+constexpr int H = 4096, E = 288;
+constexpr auto route_reference = reference;
+#endif
 constexpr ReductionCriterion kCoefficient{5e-6, 5e-7, 1e-5};
 
 struct Call {
@@ -38,7 +76,7 @@ int run(std::span<const Call> calls, int recipe = 0, bool repeated = false) {
     auto bits = activation(max, repeated);
     std::vector<float> bias(E);
     for (int e = 0; e < E; ++e)
-        bias[e] = (int(quantized_weight::detail::mix64(e + 2605) % 17) - 8) * .003f;
+        bias[e] = (int(quantized_weight::detail::mix64(e + 2605) % 17) - 8) * (1.f / 32);
     if (recipe) {
         std::fill(host.payload.begin(), host.payload.end(), 0);
         std::fill(bits.begin(), bits.end(), 0);
@@ -67,8 +105,14 @@ int run(std::span<const Call> calls, int recipe = 0, bool repeated = false) {
     }
     input_projection::DevicePackedWeight weight(std::move(host));
     GuardedDeviceBuffer input(bits.size() * 2), device_bias(E * 4);
-    const ops::SigmoidRouteProfile p{
-        {H, E, K}, recipe == 4 ? 3.f : 2.5f, recipe == 4 ? .5f : 1e-20f};
+    ops::SigmoidRouteProfile p{{H, E, K}, 8.f, 1e-20f};
+    if (recipe == 4) {
+        p.scaling_factor        = 3.f;
+        p.normalization_epsilon = .5f;
+    } else if (recipe == 5) {
+        p.scaling_factor        = std::numeric_limits<float>::max();
+        p.normalization_epsilon = std::numeric_limits<float>::max();
+    }
     const auto interval = ops::topk_sigmoid_route_workspace_capacity_bytes(p, 1, max);
     DeviceContext context;
     int failures = 0;
@@ -100,8 +144,10 @@ int run(std::span<const Call> calls, int recipe = 0, bool repeated = false) {
             def.capture(cuda.stream(), launch);
             graph.instantiate(def);
         }
-        for (int phase = 0; phase < (call.graph ? 2 : 1); ++phase) {
-            for (std::size_t row = 0; row < columns.size(); ++row) columns[row] = (row + phase) % 3;
+        const int phases = call.graph ? (call.padded ? 3 : 2) : 1;
+        for (int phase = 0; phase < phases; ++phase) {
+            for (std::size_t row = 0; row < columns.size(); ++row)
+                columns[row] = phase == 2 ? 0 : (row + phase) % 3;
             if (call.padded) valid.copy_from_host(columns.data(), valid.size());
             auto values      = bits;
             auto corrections = bias;
@@ -128,21 +174,24 @@ int run(std::span<const Call> calls, int recipe = 0, bool repeated = false) {
                 ref(got.size());
             Reference common{};
             if (repeated || recipe)
-                common = reference(weight.host, std::span(values).first(H), corrections,
-                                   p.scaling_factor, p.normalization_epsilon);
+                common = route_reference(weight.host, std::span(values).first(H), corrections,
+                                         p.scaling_factor, p.normalization_epsilon);
             for (int t = 0; t < call.t; ++t) {
                 if (call.padded && t % 2 >= columns[t / 2]) {
                     for (int j = 0; j < K; ++j) {
                         ref_ids[std::size_t(t) * K + j] = -1;
-                        if (got_coefficients[std::size_t(t) * K + j] != 0) ++failures;
+                        if (std::bit_cast<std::uint32_t>(
+                                got_coefficients[std::size_t(t) * K + j]) != 0)
+                            ++failures;
                     }
                     continue;
                 }
                 const auto value =
                     (repeated || recipe)
                         ? common
-                        : reference(weight.host, std::span(values).subspan(std::size_t(t) * H, H),
-                                    corrections, p.scaling_factor, p.normalization_epsilon);
+                        : route_reference(weight.host,
+                                          std::span(values).subspan(std::size_t(t) * H, H),
+                                          corrections, p.scaling_factor, p.normalization_epsilon);
                 for (int j = 0; j < K; ++j) {
                     ref_ids[std::size_t(t) * K + j] = value.ids[j];
                     ref[std::size_t(t) * K + j]     = value.coefficients[j];
@@ -156,7 +205,11 @@ int run(std::span<const Call> calls, int recipe = 0, bool repeated = false) {
                                                         std::as_bytes(std::span(values)), label) +
                         linear_common::verify_preserved(
                             device_bias.data(), std::as_bytes(std::span(corrections)), label);
-            if (ws.used() != 64 || ws.peak_used() > cap + 256 || cap > interval) ++failures;
+            if (call.padded)
+                failures += linear_common::verify_preserved(
+                    valid.data(), std::as_bytes(std::span(columns)), label);
+            if (ws.used() != 64 || ws.peak_used() != (cap ? cap + 256 : 64) || cap > interval)
+                ++failures;
         }
         std::array<std::byte, 256> prefix;
         prefix.fill(std::byte{0x5a});
@@ -173,7 +226,7 @@ int metadata() {
         try {
             f();
             ++failures;
-        } catch (const std::invalid_argument&) {};
+        } catch (const std::invalid_argument&) {}
     };
     for (int field = 0; field < 3; ++field) {
         auto bad = p;
@@ -192,14 +245,36 @@ int metadata() {
     for (auto [first, last] : std::array<std::pair<int, int>, 3>{{{0, 1}, {2, 1}, {-1, 17}}})
         rejected([&] { (void)ops::topk_sigmoid_route_workspace_capacity_bytes(p, first, last); });
     input_projection::DevicePackedWeight weight(linear_weights::make_bf16_weight(E, H, 2611));
-    const auto cap = ops::topk_sigmoid_route_workspace_capacity_bytes(p, 1, 1);
-    GuardedDeviceBuffer input(H * 2), bias(E * 4), ids(K * 4), coeff(K * 4), scratch(cap);
-    std::vector<std::byte> untouched(K * 4, std::byte{0xa6});
+#if NINFER_TARGET_RTX5090
+    constexpr int T            = 833;
+    const auto expect_capacity = [&](int first, int last, int logits_columns) {
+        if (ops::topk_sigmoid_route_workspace_capacity_bytes(p, first, last) !=
+            std::size_t(E) * logits_columns * sizeof(float))
+            ++failures;
+    };
+    expect_capacity(1, 832, 0);
+    expect_capacity(832, 833, 3 * 833);
+    expect_capacity(833, 833, 3 * 833);
+    expect_capacity(1792, 1793, 3 * 1792);
+    expect_capacity(1793, 2688, 2688);
+    expect_capacity(2688, 2689, 2688);
+    expect_capacity(1024, 4096, 3 * 1792);
+    expect_capacity(2689, 4256, 0);
+    expect_capacity(2689, 4257, 4257);
+    expect_capacity(1, 4608, 3 * 1792);
+    expect_capacity(1, 6144, 6144);
+#else
+    constexpr int T = 1;
+#endif
+    const auto cap = ops::topk_sigmoid_route_workspace_capacity_bytes(p, T, T);
+    GuardedDeviceBuffer input(H * T * 2), bias(E * 4), ids(K * T * 4), coeff(K * T * 4),
+        scratch(cap);
+    std::vector<std::byte> untouched(K * T * 4, std::byte{0xa6});
     ids.copy_from_host(untouched.data(), untouched.size());
     coeff.copy_from_host(untouched.data(), untouched.size());
-    Tensor x(input.span(), DType::BF16, {H, 1}), b(bias.span(), DType::FP32, {E});
-    ops::ExpertRoutes out{Tensor(ids.span(), DType::I32, {K, 1}),
-                          Tensor(coeff.span(), DType::FP32, {K, 1})};
+    Tensor x(input.span(), DType::BF16, {H, T}), b(bias.span(), DType::FP32, {E});
+    ops::ExpertRoutes out{Tensor(ids.span(), DType::I32, {K, T}),
+                          Tensor(coeff.span(), DType::FP32, {K, T})};
     MemoryArena ws(scratch.span());
     for (int field = 0; field < 6; ++field) {
         auto bad = weight.view();
@@ -214,19 +289,28 @@ int metadata() {
                                     cuda_environment().default_execution);
         });
     }
-    MemoryArena short_ws(scratch.span().subspan(0, cap - 256));
+    MemoryArena short_ws(scratch.span().subspan(0, cap - 1));
     try {
         ops::topk_sigmoid_route(x, p, weight.view(), b, out, {}, short_ws,
                                 cuda_environment().default_execution);
 
         ++failures;
     } catch (const std::bad_alloc&) {}
-    auto alias              = out;
-    alias.coefficients.data = ids.data();
-    rejected([&] {
-        ops::topk_sigmoid_route(x, p, weight.view(), b, alias, {}, ws,
-                                cuda_environment().default_execution);
-    });
+    const auto cuda = cuda_environment().default_execution;
+    MemoryArena input_scratch(input.span());
+    rejected(
+        [&] { ops::topk_sigmoid_route(x, p, weight.view(), b, out, {}, input_scratch, cuda); });
+    if (input_scratch.used() != 0 || short_ws.used() != 0 || ws.used() != 0) ++failures;
+    for (void* address : {ids.data(), input.data(), bias.data(), scratch.data()}) {
+        auto alias              = out;
+        alias.coefficients.data = address;
+        rejected([&] { ops::topk_sigmoid_route(x, p, weight.view(), b, alias, {}, ws, cuda); });
+    }
+    auto unaligned_x = x;
+    unaligned_x.data = static_cast<std::byte*>(input.data()) + 2;
+    rejected([&] { ops::topk_sigmoid_route(unaligned_x, p, weight.view(), b, out, {}, ws, cuda); });
+    const ops::MoeTokenValidity bad_validity{Tensor(ids.span(), DType::I32, {T}), T + 1};
+    rejected([&] { ops::topk_sigmoid_route(x, p, weight.view(), b, out, bad_validity, ws, cuda); });
     return failures + linear_common::verify_preserved(ids.data(), untouched, "route rejected IDs") +
            linear_common::verify_preserved(coeff.data(), untouched, "route rejected coefficients");
 }
@@ -237,14 +321,18 @@ int main(int argc, char** argv) {
     using namespace ninfer::test;
     using namespace ninfer::test::sigmoid_route;
     OpSuite suite;
-#if NINFER_TARGET_SPARK
     std::vector<Call> calls;
-    for (int t : {1,   2,   6,   8,   16,  17,  32,   33,   64,   65,  128,
-                  129, 256, 257, 511, 512, 513, 1024, 2048, 4096, 4097})
+    for (int t : {1,   2,   4,   6,   7,   8,   9,   16,   17,   32,   33,   64,  65,
+                  128, 129, 256, 257, 511, 512, 513, 1024, 1025, 2048, 4096, 4097})
         calls.push_back({t, false});
     for (int t :
          {1, 4, 6, 8, 16, 17, 32, 33, 64, 65, 128, 129, 256, 257, 512, 513, 1024, 2048, 4096})
         calls.push_back({t, true});
+#if NINFER_TARGET_RTX5090
+    for (int t :
+         {144, 145, 416, 417, 832, 833, 1344, 1345, 1792, 1793, 2688, 2689, 4032, 4033, 4256, 4257})
+        calls.push_back({t, false});
+#endif
     std::vector<OpCase> cases;
     for (auto c : calls)
         cases.push_back({"sigmoid-route/T" + std::to_string(c.t) + (c.graph ? "/graph" : "/eager"),
@@ -257,7 +345,7 @@ int main(int argc, char** argv) {
     for (int recipe = 1; recipe <= 4; ++recipe)
         suite.add("sigmoid-route/recipe" + std::to_string(recipe),
                   [recipe] {
-                      const std::array<Call, 11> c{{{1, false},
+                      const std::array<Call, 13> c{{{1, false},
                                                     {4, false},
                                                     {6, false},
                                                     {8, false},
@@ -266,11 +354,21 @@ int main(int argc, char** argv) {
                                                     {128, false},
                                                     {129, false},
                                                     {512, false},
+                                                    {1024, false},
+                                                    {3072, false},
                                                     {4097, false},
                                                     {4097, true}}};
                       return run(c, recipe);
                   },
                   {{"format", "bf16"}});
+#if NINFER_TARGET_RTX5090
+    suite.add("sigmoid-route/finite-normalization-extremes",
+              [] {
+                  const std::array<Call, 3> c{{{2, false}, {833, true}, {4096, true}}};
+                  return run(c, 5);
+              },
+              {{"format", "bf16"}});
+#endif
     suite.add("sigmoid-route/repeated-dense",
               [] {
                   const std::array<Call, 2> c{{{4097, false}, {4097, true}}};
@@ -280,10 +378,21 @@ int main(int argc, char** argv) {
     suite.add("sigmoid-route/metadata", metadata, {{"format", "bf16"}});
     suite.add("sigmoid-route/validity",
               [] {
-                  const std::array<Call, 1> calls{{{18, true, true}}};
+#if NINFER_TARGET_RTX5090
+                  const std::array<Call, 8> calls{{{2, true, true},
+                                                   {146, true, true},
+                                                   {642, true, true},
+                                                   {834, true, true},
+                                                   {1346, true, true},
+                                                   {2690, true, true},
+                                                   {4096, true, true},
+                                                   {4258, true, true}}};
+#else
+                  const std::array<Call, 3> calls{
+                      {{2, true, true}, {18, true, true}, {130, true, true}}};
+#endif
                   return run(calls);
               },
               {{"format", "bf16"}, {"execution", "graph"}, {"suite", "concurrency"}});
-#endif
     return suite.main(argc, argv);
 }

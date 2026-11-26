@@ -34,6 +34,12 @@ struct RouterLogitsOutput {
 };
 } // namespace
 
+const RouteProfile moe_sigmoid::registered_route{4096, 288, 8};
+
+std::size_t moe_sigmoid::workspace_capacity_bytes(int, int last) {
+    return std::size_t(registered_route.experts) * last * sizeof(float);
+}
+
 void moe_sigmoid::launch(const Tensor& x, const Weight& w, const Tensor& bias, ExpertRoutes& routes,
                          const SigmoidRouteProfile& profile, float* scores,
                          moe_cuda::TokenValidity validity, cudaStream_t stream) {

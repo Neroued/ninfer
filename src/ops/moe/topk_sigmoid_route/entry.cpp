@@ -1,5 +1,3 @@
-#include "core/platform.h"
-#include "core/layout.h"
 #include "ninfer/ops/moe.h"
 #include "ops/moe/operands.h"
 #include "ops/moe/topk_sigmoid_route/dispatch.h"
@@ -9,14 +7,11 @@
 namespace ninfer::ops {
 namespace {
 void validate(const SigmoidRouteProfile& p) {
-#if NINFER_TARGET_SPARK
-    if (p.route.hidden != 4096 || p.route.experts != 288 || p.route.top_k != 8 ||
-        !std::isfinite(p.scaling_factor) || p.scaling_factor <= 0 ||
+    const auto& route = detail::moe_sigmoid::registered_route;
+    if (p.route.hidden != route.hidden || p.route.experts != route.experts ||
+        p.route.top_k != route.top_k || !std::isfinite(p.scaling_factor) || p.scaling_factor <= 0 ||
         !std::isfinite(p.normalization_epsilon) || p.normalization_epsilon <= 0)
         throw std::invalid_argument("topk_sigmoid_route: unsupported profile or normalization");
-#else
-    throw std::invalid_argument("topk_sigmoid_route: no registered profile on this target");
-#endif
 }
 } // namespace
 
@@ -24,9 +19,7 @@ std::size_t topk_sigmoid_route_workspace_capacity_bytes(const SigmoidRouteProfil
                                                         int last) {
     validate(p);
     detail::validate_interval(first, last);
-    WorkspaceLayoutBuilder layout;
-    (void)layout.alloc(DType::FP32, {p.route.experts, last});
-    return layout.peak_bytes(1);
+    return detail::moe_sigmoid::workspace_capacity_bytes(first, last);
 }
 
 void topk_sigmoid_route(const Tensor& x, const SigmoidRouteProfile& p, const Weight& control,
@@ -39,15 +32,15 @@ void topk_sigmoid_route(const Tensor& x, const SigmoidRouteProfile& p, const Wei
     operands.sigmoid_control(control, p.route);
     operands.coefficient(bias, p.route.experts, false);
     operands.routes(routes, p.route.top_k, tokens, true);
-    auto scope = ws.scope();
-    MemoryArena scratch(
-        ws.alloc_bytes(topk_sigmoid_route_workspace_capacity_bytes(p, tokens, tokens)));
-    operands.workspace(scratch.storage());
+    auto scope    = ws.scope();
+    float* logits = nullptr;
+    if (const auto bytes = detail::moe_sigmoid::workspace_capacity_bytes(tokens, tokens)) {
+        const auto scratch = ws.alloc_bytes(bytes);
+        operands.workspace(scratch);
+        logits = static_cast<float*>(scratch.data);
+    }
     operands.finish();
-#if NINFER_TARGET_SPARK
-    auto scores = scratch.alloc(DType::FP32, {p.route.experts, tokens});
-    detail::moe_sigmoid::launch(x, control, bias, routes, p, static_cast<float*>(scores.data),
+    detail::moe_sigmoid::launch(x, control, bias, routes, p, logits,
                                 detail::moe_cuda::token_validity(validity), execution.stream());
-#endif
 }
 } // namespace ninfer::ops

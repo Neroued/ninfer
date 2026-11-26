@@ -613,8 +613,8 @@ class CyclicPrefixFixture {
     std::array<int, Lanes> frontier_{};
 
 public:
-    explicit CyclicPrefixFixture(int capacity)
-        : capacity_(capacity), padded_(capacity + 8),
+    explicit CyclicPrefixFixture(int capacity, int padding = 8)
+        : capacity_(capacity), padded_(capacity + padding),
           expected_k_(
               patterned_bits(static_cast<std::size_t>(kHeadDim) * padded_ * kKVHeads * Lanes, 91)),
           expected_v_(patterned_bits(expected_k_.size(), 137)), cache_k_(expected_k_.size() * 2),
@@ -655,10 +655,9 @@ public:
         int failures = 0;
         for (int phase = 0; phase < (replay ? 2 : 1); ++phase) {
             for (std::size_t i = 0; i < elements; ++i) {
-                auto kb = static_cast<std::uint16_t>(i * 40503 + width * 17 + phase * 103);
-                auto vb = static_cast<std::uint16_t>(i * 17351 + width * 31 + phase * 211);
-                if ((kb & 0x7f80u) == 0x7f80u) kb ^= 0x0080u;
-                if ((vb & 0x7f80u) == 0x7f80u) vb ^= 0x0080u;
+                const auto kb = static_cast<std::uint16_t>(i * 40503 + width * 17 + phase * 103);
+                auto vb       = static_cast<std::uint16_t>(i * 17351 + width * 31 + phase * 211);
+                if ((vb & 0x7fffu) > 0x7f80u) vb ^= 0x0080u;
                 input_k[i] = kb;
                 input_v[i] = vb;
             }
@@ -977,12 +976,53 @@ int ragged_d128_admission_case() {
                              too_long.view, Tensor(bp.span(), DType::I32, {kDFlash2Window + 1}),
                              one_fix.view(), exec);
     });
+    expect_ia("cyclic 1024 segment exceeds capacity", [&] {
+        constexpr int cap1024 = 1024;
+        RaggedFixture too_long({cap1024 + 1});
+        const auto big_bytes =
+            static_cast<std::size_t>(kHeadDim) * kKVHeads * (cap1024 + 1) * 2;
+        DeviceBuffer bk(dev, big_bytes), bv(dev, big_bytes), bp(dev, (cap1024 + 1) * 4);
+        const auto cap_elems =
+            static_cast<std::size_t>(kHeadDim) * cap1024 * kKVHeads * segments;
+        GuardedDeviceBuffer ck1024(cap_elems * 2), cv1024(cap_elems * 2);
+        std::vector<int> one{0};
+        CyclicFixture one_fix(ck1024, cv1024, cap1024, segments, one);
+        ops::kv_cache_append(Tensor(bk.span(), DType::BF16, {kHeadDim, kKVHeads, cap1024 + 1}),
+                             Tensor(bv.span(), DType::BF16, {kHeadDim, kKVHeads, cap1024 + 1}),
+                             too_long.view, Tensor(bp.span(), DType::I32, {cap1024 + 1}),
+                             one_fix.view(), exec);
+    });
     expect_ia("cyclic aliasing storage", [&] {
         Tensor aliased(view.k.records.storage.subspan(0, bytes), DType::BF16,
                        {kHeadDim, kKVHeads, tokens});
         ops::kv_cache_append(aliased, v, ragged.view, p, view, exec);
     });
     return failures;
+}
+
+int cyclic_rejection_case(int capacity, int padded, std::uint32_t max_count) {
+    constexpr int tokens   = 1025;
+    constexpr int batch    = 1;
+    const auto input_bytes = kHeadDim * kKVHeads * tokens * sizeof(std::uint16_t);
+    const auto field_bytes = kHeadDim * kKVHeads * padded * sizeof(std::uint16_t);
+    GuardedDeviceBuffer dk(input_bytes), dv(input_bytes), cache_k(field_bytes),
+        cache_v(field_bytes);
+    auto dp = to_device(std::vector<std::int32_t>(tokens, -1));
+    auto dc = to_device(std::vector<std::int32_t>{0});
+    const Tensor k(dk.span(), DType::BF16, {kHeadDim, kKVHeads, tokens, batch});
+    const Tensor v(dv.span(), DType::BF16, {kHeadDim, kKVHeads, tokens, batch});
+    const Tensor positions(dp.span(), DType::I32, {tokens, batch});
+    const Tensor counts(dc.span(), DType::I32, {batch});
+    constexpr std::array<std::int32_t, batch> lanes{-1};
+    CyclicFixture fixture(cache_k, cache_v, capacity, batch, lanes, padded);
+    try {
+        ops::kv_cache_append_prefix(k, v, positions, counts, {0, max_count}, fixture.view(),
+                                    ninfer::test::cuda_environment().default_execution);
+    } catch (const std::invalid_argument&) { return 0; }
+    cuda_synchronize();
+    std::cerr << "cyclic prefix accepted capacity=" << capacity << " padded_capacity=" << padded
+              << " max_count=" << max_count << '\n';
+    return 1;
 }
 
 } // namespace
@@ -1013,6 +1053,7 @@ void add_prefix_append_cases(ninfer::test::OpSuite& suite) {
     add(8, 8, 3 * kDFlash2Window - 4, true, {}, 8, kDFlash2Window);
     add(kDFlash2Window, kDFlash2Window, 3 * kDFlash2Window - kDFlash2Window / 2, true, {},
         kDFlash2Window, kDFlash2Window);
+    add(8, 8, 2 * 1024 - 1, true, {}, 8, 1024);
     suite.add("append/cyclic/graph/capacity4096/t16",
               [] { return cyclic_graph_replay_case(kDFlashWindow, 16); },
               {{"format", "bf16"}, {"execution", "graph"}});
@@ -1043,7 +1084,7 @@ void add_prefix_append_cases(ninfer::test::OpSuite& suite) {
                                           false, 0, false);
               },
               {{"format", "bf16"}, {"execution", "eager"}, {"suite", "concurrency"}});
-    for (int capacity : {kDFlash2Window, kDFlashWindow}) {
+    for (int capacity : {1024, kDFlash2Window, kDFlashWindow}) {
         suite.add("append/ragged/d128/cyclic/capacity" + std::to_string(capacity) + "/multi-graph",
                   [=] { return ragged_d128_case({1, 5, 65, 3}, true, capacity, true); },
                   {{"format", "bf16"}, {"execution", "graph"}});
@@ -1054,6 +1095,14 @@ void add_prefix_append_cases(ninfer::test::OpSuite& suite) {
                   },
                   {{"format", "bf16"}, {"execution", "eager"}, {"suite", "concurrency"}});
     }
+    suite.add("append/cyclic/reject/capacity512",
+              [] { return cyclic_rejection_case(512, 1088, 8); }, {{"format", "bf16"}});
+    suite.add("append/cyclic/reject/capacity1025",
+              [] { return cyclic_rejection_case(1025, 1088, 8); }, {{"format", "bf16"}});
+    suite.add("append/cyclic/reject/padded1023",
+              [] { return cyclic_rejection_case(1024, 1023, 8); }, {{"format", "bf16"}});
+    suite.add("append/cyclic/reject/max_count1025",
+              [] { return cyclic_rejection_case(1024, 1088, 1025); }, {{"format", "bf16"}});
 
     struct PrefixCase {
         int width, batch, kind;
@@ -1061,12 +1110,20 @@ void add_prefix_append_cases(ninfer::test::OpSuite& suite) {
         int upper = -1;
     };
 
-    for (int capacity : {2048, 4096}) {
+    for (int capacity : {1024, 2048, 4096}) {
         std::vector<PrefixCase> cases;
         const auto append = [&](int w, int b, int kind, bool graph, int upper = -1) {
             cases.push_back({w, b, kind, graph, upper});
         };
-        if (capacity == 2048) {
+        if (capacity == 1024) {
+            append(8, 1, 0, true, 0);
+            append(8, 1, 0, true);
+            append(8, 1, 2, false, 1);
+            append(16, 8, 1, true, 8);
+            append(128, 8, 1, true);
+            append(1025, 1, 2, true, 1024);
+            append(1024, 8, 1, true);
+        } else if (capacity == 2048) {
             for (int b = 1; b <= 8; ++b)
                 for (int w : {1, 2, 3, 7, 8, 9, 15, 16}) append(w, b, 1, b == 1 || b == 8);
             for (int w : {1, 3, 8, 9, 16})
@@ -1097,7 +1154,7 @@ void add_prefix_append_cases(ninfer::test::OpSuite& suite) {
             if (c.batch > 8) catalogue.back().tags.emplace_back("suite", "concurrency");
         }
         suite.add(std::move(catalogue), [=](auto selected) {
-            CyclicPrefixFixture fixture(capacity);
+            CyclicPrefixFixture fixture(capacity, capacity == 1024 ? 64 : 8);
             int failures = 0;
             for (auto i : selected) {
                 const auto c = cases[i];

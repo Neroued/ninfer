@@ -63,7 +63,6 @@ __global__ void prefix_cyclic_kernel(
     const std::int32_t* __restrict__ positions, const std::int32_t* __restrict__ counts,
     const std::int64_t* __restrict__ state_offsets, __nv_bfloat16* __restrict__ cache_k,
     __half* __restrict__ cache_v, int min_count, int max_count, int width, int padded_capacity) {
-    static_assert(Capacity == 2048 || Capacity == 4096);
     static_assert((Capacity & (Capacity - 1)) == 0);
     constexpr int UnitsPerToken = kKVCacheAppendPrefixHeads * kKVCacheAppendPrefixHeadDim / 8;
     const int unit              = static_cast<int>(blockIdx.x) * Threads + threadIdx.x;
@@ -86,6 +85,48 @@ __global__ void prefix_cyclic_kernel(
     const int slot     = position & (Capacity - 1);
     prefix_copy_cyclic_unit<Capacity>(k, v, cache_k, cache_v, token, unit_in_token, slot,
                                       padded_capacity);
+}
+
+template <int Capacity, unsigned TokensPerBlock>
+__global__ __launch_bounds__(
+    TokensPerBlock* kKVCacheAppendPrefixHeads* kKVCacheAppendPrefixHeadDim /
+    8) void prefix_cyclic_tiled_kernel(const int4* __restrict__ k, const int4* __restrict__ v,
+                                       const std::int32_t* __restrict__ positions,
+                                       const std::int32_t* __restrict__ counts,
+                                       const std::int64_t* __restrict__ state_offsets,
+                                       char* __restrict__ cache_k, char* __restrict__ cache_v,
+                                       unsigned min_count, unsigned max_count, unsigned width,
+                                       unsigned padded_capacity) {
+    static_assert((Capacity & (Capacity - 1)) == 0);
+    constexpr unsigned VectorsPerHead  = kKVCacheAppendPrefixHeadDim / 8;
+    constexpr unsigned VectorsPerToken = kKVCacheAppendPrefixHeads * VectorsPerHead;
+    const unsigned batch               = blockIdx.x;
+    const unsigned count               = counts[batch];
+    const unsigned local_token         = threadIdx.x / VectorsPerToken;
+    const unsigned head                = (threadIdx.x / VectorsPerHead) % kKVCacheAppendPrefixHeads;
+    const unsigned vector              = threadIdx.x % VectorsPerHead;
+    unsigned token                     = blockIdx.y * TokensPerBlock + local_token;
+    if (count < min_count || count > max_count || token >= count) return;
+
+    const auto input_row      = std::uint64_t{width} * batch;
+    const auto input          = input_row * VectorsPerToken + head * VectorsPerHead + vector;
+    const auto* row_k         = k + input;
+    const auto* row_v         = v + input;
+    const auto* row_positions = positions + input_row;
+    const auto field =
+        state_offsets[batch] +
+        (std::uint64_t{padded_capacity} * head * VectorsPerHead + vector) * sizeof(int4);
+    auto* row_cache_k     = reinterpret_cast<int4*>(cache_k + field);
+    auto* row_cache_v     = reinterpret_cast<int4*>(cache_v + field);
+    const unsigned stride = gridDim.y * TokensPerBlock;
+    do {
+        const unsigned slot = row_positions[token] & (Capacity - 1);
+        const int4 key      = row_k[token * VectorsPerToken];
+        const int4 value    = common::bf16x8_bits_to_f16x8_bits(row_v[token * VectorsPerToken]);
+        row_cache_k[slot * VectorsPerHead] = key;
+        row_cache_v[slot * VectorsPerHead] = value;
+        token += stride;
+    } while (token < count);
 }
 
 __global__ void prefix_paged_kernel(
@@ -135,7 +176,6 @@ __global__ void ragged_cyclic_kernel(
     const std::int32_t* __restrict__ positions, const std::int32_t* __restrict__ token_to_seq,
     const std::int64_t* __restrict__ state_offsets, __nv_bfloat16* __restrict__ cache_k,
     __half* __restrict__ cache_v, int tokens, int padded_capacity) {
-    static_assert(Capacity == 2048 || Capacity == 4096);
     static_assert((Capacity & (Capacity - 1)) == 0);
     constexpr int UnitsPerToken = kKVCacheAppendPrefixHeads * kKVCacheAppendPrefixHeadDim / 8;
     static_assert(UnitsPerToken == 128);

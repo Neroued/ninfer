@@ -67,7 +67,7 @@ void kv_cache_append(const Tensor& k, const Tensor& v, const RaggedSequenceView&
  * k/v are contiguous 16-byte-aligned BF16 [128,8,N] for N=ragged.total_tokens() and positions is
  * contiguous device I32 [N]. Each packed token t in [0,N) belongs to segment
  * s=ragged.token_to_seq[t] and is written to cyclic slot positions[t] mod capacity of record
- * cache.k.records.byte_offsets[s] (D=128, Hkv=8, capacity 2048 or 4096), storing K bit-for-bit and
+ * cache.k.records.byte_offsets[s] (D=128, Hkv=8, capacity 1024, 2048 or 4096), storing K bit-for-bit and
  * V as FP16_RNE(BF16 input). Each segment appends at most capacity tokens, cache storage does not
  * overlap inputs or record offsets, inputs are unchanged, and unaddressed slots are preserved.
  */
@@ -102,10 +102,10 @@ void kv_cache_append_prefix(const Tensor& k, const Tensor& v, const Tensor& posi
  * k/v, positions, counts, and their storage-conversion and mutation contracts match the paged
  * overload. The cache State fields select destination records through device I64 byte offsets
  * [B]. Each field is dense [128,padded_capacity,8] within its record and 16-byte aligned. D=128,
- * Hkv=8 and capacity 2048 or 4096. Absolute position p maps to slot p mod capacity. For a nonempty
- * prefix, the caller guarantees that the row's existing live interval ends immediately before
- * positions[0,b]. Advancing it by counts[b] makes every overwritten old slot dead, and one row
- * commits at most the ring capacity. A zero count reads no positions, record offsets or K/V and
+ * Hkv=8 and capacity 1024, 2048 or 4096. Absolute position p maps to slot p mod capacity. For a
+ * nonempty prefix, the caller guarantees that the row's existing live interval ends immediately
+ * before positions[0,b]. Advancing it by counts[b] makes every overwritten old slot dead, and one
+ * row commits at most the ring capacity. A zero count reads no positions, record offsets or K/V and
  * changes no cache bytes. Physical T is independent of the committed prefix length. Consequently,
  * no two live writes race for one physical slot. The Op does not own or publish the state frontier.
  */

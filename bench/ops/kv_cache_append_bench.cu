@@ -10,6 +10,7 @@
 
 #include "core/device.h"
 #include "core/cyclic_kv_cache.h"
+#include "core/decode_graph.h"
 #include "core/paged_kv_cache.h"
 #include "core/paged_kv_storage.h"
 #include "op_measurement.cuh"
@@ -116,7 +117,7 @@ struct Result {
                  "[--prefix-geometry d128-kv8|d256-kv4|d256-kv2|all] "
                  "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4|all] "
                  "[--layout paged|cyclic|all] [--tokens T,...] [--counts C,...] "
-                 "[--cyclic-capacity 2048|4096] [--batch B] "
+                 "[--cyclic-capacity 1024|2048|4096] [--batch B] "
                  "[--context L] [--execution eager|graph|both] [--cache cold|warm|both] "
                  "[--warmup N] [--repeat N] [--graph-calls N] [--max-count N] [--profile] "
                  "[--csv-out PATH]\n",
@@ -226,10 +227,11 @@ Options parse_options(int argc, char** argv) {
             options.counts =
                 parse_list(next("--counts requires a value"), 0, kPagedPrefixCapacity, "--counts");
         } else if (argument == "--cyclic-capacity") {
-            options.cyclic_capacity = parse_i32(next("--cyclic-capacity requires a value"), 2048,
+            options.cyclic_capacity = parse_i32(next("--cyclic-capacity requires a value"), 1024,
                                                 4096, "--cyclic-capacity");
-            if (options.cyclic_capacity != 2048 && options.cyclic_capacity != 4096) {
-                usage("--cyclic-capacity expects 2048 or 4096");
+            if (options.cyclic_capacity != 1024 && options.cyclic_capacity != 2048 &&
+                options.cyclic_capacity != 4096) {
+                usage("--cyclic-capacity expects 1024, 2048, or 4096");
             }
         } else if (argument == "--batch") {
             options.batch = parse_i32(next("--batch requires a value"), 1, INT32_MAX, "--batch");
@@ -513,9 +515,38 @@ double full_useful_bytes(const FullGeometry& geometry, KvCacheStorage storage,
 }
 
 template <class Case>
+bench::ColdTiming measure_warm_graph(Case& data, CudaExecutionView cuda, int warmup, int repeat,
+                                    int graph_calls) {
+    const auto stream = cuda.stream();
+    CudaEventTimer timer(bench::device_context(), stream);
+    DecodeGraphDefinition definition;
+    DecodeGraphExecutable graph;
+    definition.capture(stream, [&] {
+        // Establish a warm, active stream before the timing nodes in each replay.
+        constexpr int PreparationCalls = 16;
+        for (int i = 0; i < PreparationCalls; ++i) data.launch(cuda);
+        timer.start_external();
+        for (int i = 0; i < graph_calls; ++i) data.launch(cuda);
+        timer.record_stop_external();
+    });
+    graph.instantiate(definition);
+    for (int i = 0; i < warmup; ++i) graph.launch(stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    std::vector<double> samples;
+    samples.reserve(repeat);
+    for (int i = 0; i < repeat; ++i) {
+        graph.launch(stream);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        samples.push_back(timer.elapsed_ms() * 1000.0);
+    }
+    return bench::summarize_timings(std::move(samples));
+}
+
+template <class Case>
 bench::ColdTiming measure(Case& data, Execution execution, CacheState cache,
                           bench::measurement::BodyTimedGraph* graph, bench::L2FlushBuffer& flush,
-                          CudaExecutionView cuda, int warmup, int repeat) {
+                          CudaExecutionView cuda, int warmup, int repeat, int graph_calls) {
     if (execution == Execution::Eager) {
         const auto launch = [&](CudaExecutionView cuda) { data.launch(cuda); };
         return cache == CacheState::Cold
@@ -524,7 +555,7 @@ bench::ColdTiming measure(Case& data, Execution execution, CacheState cache,
     }
     return cache == CacheState::Cold
                ? bench::measure_cold_graph(*graph, flush, cuda, warmup, repeat)
-               : bench::measure_graph(*graph, cuda, warmup, repeat);
+               : measure_warm_graph(data, cuda, warmup, repeat, graph_calls);
 }
 
 void report(const Result& result) {
@@ -679,7 +710,7 @@ void collect_case(Case& data, Mode mode, const char* geometry, KvCacheStorage st
                           useful_bytes,
                           empty ? bench::ColdTiming{}
                                 : measure(data, execution, cache, &graph, flush, cuda,
-                                          options.warmup, options.repeat)};
+                                          options.warmup, options.repeat, options.graph_calls)};
             result.timing.median_us /= options.graph_calls;
             result.timing.min_us /= options.graph_calls;
             result.timing.p95_us /= options.graph_calls;

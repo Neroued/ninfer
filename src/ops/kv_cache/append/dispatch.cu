@@ -1,5 +1,6 @@
 #include "ops/kv_cache/append/dispatch.h"
 #include "core/device.h"
+#include "core/platform.h"
 #include "ops/common/host/operands.h"
 #include "ops/kv_cache/append/prefix.cuh"
 #include "ops/kv_cache/kernels/write.h"
@@ -35,6 +36,29 @@ void launch_cyclic(const Tensor& k, const Tensor& v, const Tensor& positions, co
         common::operand::state_field_base<__half>(cache.v), envelope.min_count, envelope.max_count,
         k.ne[2], cache.padded_capacity);
 }
+
+#if NINFER_TARGET_RTX5090
+template <int Capacity, unsigned TokensPerBlock>
+void launch_cyclic_tiled(const Tensor& k, const Tensor& v, const Tensor& positions,
+                         const Tensor& counts, CyclicKVCacheLayerView cache,
+                         KVCacheAppendPrefixExecutionEnvelope envelope, cudaStream_t stream) {
+    constexpr unsigned Threads =
+        TokensPerBlock * kKVCacheAppendPrefixHeads * kKVCacheAppendPrefixHeadDim / 8;
+    constexpr unsigned BlockBudget = 512;
+    const unsigned batch = k.ne[3];
+    const unsigned tiles = 1 + (envelope.max_count - 1) / TokensPerBlock;
+    // Bound empty CTAs under a wide envelope, then stride over the committed tokens.
+    const dim3 grid(batch, std::min(tiles, std::max(1u, BlockBudget / batch)));
+    prefix_cyclic_tiled_kernel<Capacity, TokensPerBlock><<<grid, Threads, 0, stream>>>(
+        static_cast<const int4*>(k.data), static_cast<const int4*>(v.data),
+        static_cast<const std::int32_t*>(positions.data),
+        static_cast<const std::int32_t*>(counts.data),
+        static_cast<const std::int64_t*>(cache.k.records.byte_offsets.data),
+        common::operand::state_field_base<char>(cache.k),
+        common::operand::state_field_base<char>(cache.v), envelope.min_count, envelope.max_count,
+        k.ne[2], cache.padded_capacity);
+}
+#endif
 
 } // namespace
 
@@ -78,7 +102,9 @@ void kv_cache_append_dispatch(const Tensor& k, const Tensor& v, const RaggedSequ
             common::operand::state_field_base<__nv_bfloat16>(cache.k),
             common::operand::state_field_base<__half>(cache.v), tokens, cache.padded_capacity);
     };
-    if (cache.capacity == 2048)
+    if (cache.capacity == 1024)
+        launch.template operator()<1024>();
+    else if (cache.capacity == 2048)
         launch.template operator()<2048>();
     else
         launch.template operator()<4096>();
@@ -145,10 +171,20 @@ void kv_cache_append_prefix_dispatch(const Tensor& k, const Tensor& v, const Ten
         else
             launch_cyclic<Capacity, 128>(k, v, positions, counts, cache, envelope, stream);
     };
-    if (cache.capacity == 2048)
+    if (cache.capacity == 1024) {
+#if NINFER_TARGET_RTX5090
+        if (k.ne[3] > 1 && threads == 128)
+            launch_cyclic_tiled<1024, 2>(k, v, positions, counts, cache, envelope, stream);
+        else
+            launch.template operator()<1024>();
+#else
+        launch.template operator()<1024>();
+#endif
+    } else if (cache.capacity == 2048) {
         launch.template operator()<2048>();
-    else
+    } else {
         launch.template operator()<4096>();
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 

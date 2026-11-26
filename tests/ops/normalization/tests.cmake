@@ -3,6 +3,7 @@ ninfer_add_op_test(ninfer_normalization_test
           "${CMAKE_CURRENT_LIST_DIR}/l2norm.cpp"
           "${CMAKE_CURRENT_LIST_DIR}/layer_norm.cpp"
           "${CMAKE_CURRENT_LIST_DIR}/weighted_sum_rmsnorm.cpp"
+          "${CMAKE_CURRENT_LIST_DIR}/scaled_residual_add_layer_norm.cpp"
           "${CMAKE_CURRENT_LIST_DIR}/rmsnorm_pack_tail.cpp"
           "${CMAKE_CURRENT_LIST_DIR}/rmsnorm.cpp"
           "${CMAKE_CURRENT_LIST_DIR}/gated_rmsnorm.cpp"

@@ -3,6 +3,7 @@
 void add_l2norm_cases(ninfer::test::OpSuite&);
 void add_layer_norm_cases(ninfer::test::OpSuite&);
 void add_weighted_sum_rmsnorm_cases(ninfer::test::OpSuite&);
+void add_scaled_residual_add_cases(ninfer::test::OpSuite&);
 void add_rmsnorm_pack_tail_cases(ninfer::test::OpSuite&);
 void add_rmsnorm_cases(ninfer::test::OpSuite&);
 void add_gated_rmsnorm_cases(ninfer::test::OpSuite&);
@@ -14,6 +15,7 @@ int main(int argc, char** argv) {
     add_l2norm_cases(suite);
     add_layer_norm_cases(suite);
     add_weighted_sum_rmsnorm_cases(suite);
+    add_scaled_residual_add_cases(suite);
     add_rmsnorm_pack_tail_cases(suite);
     add_rmsnorm_cases(suite);
     add_gated_rmsnorm_cases(suite);

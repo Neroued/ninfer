@@ -1,7 +1,6 @@
 #include "models/inkling2/execution/dspark.h"
 
 #include "core/transfer.h"
-#include "ninfer/ops/argmax.h"
 #include "ninfer/ops/embedding.h"
 #include "ninfer/ops/indexing.h"
 #include "ninfer/ops/kv_cache_append.h"
@@ -236,9 +235,10 @@ void propose_dspark(const Parameters& p, DSparkExecution e, const BatchView& cal
         auto flat = logits.view({vocab, b * steps});
         project(ordered, d.output_head, flat, arena, cuda);
     }
-    auto state  = arena.alloc(DType::BF16, {r, b});
-    auto latent = arena.alloc(DType::BF16, {r, b});
-    CUDA_CHECK(cudaMemsetAsync(state.data, 0, state.bytes(), cuda.stream()));
+    auto state       = proposal.initial_state;
+    auto next        = arena.alloc(DType::BF16, {r, b});
+    auto alternate   = steps > 1 ? arena.alloc(DType::BF16, {r, b}) : Tensor{};
+    auto latent      = arena.alloc(DType::BF16, {r, b});
     auto prev        = proposal.anchors;
     const int domain = dimension(p.profile->public_tokens);
     for (int s = 0; s < steps; ++s) {
@@ -246,10 +246,12 @@ void propose_dspark(const Parameters& p, DSparkExecution e, const BatchView& cal
         auto ids           = proposal.drafts.slice(1, s, 1).view({b});
         auto probabilities = proposal.probabilities.slice(1, s, 1).view({b});
         ops::markov_rnn_step(state, prev, context.slice(2, s, 1).view({3 * r, b}), m.w1_embed,
-                             m.w_recurrent, proposal.rows, state, latent, cuda);
-        ops::markov_logits_add_softcap(latent, m.fold_weight, m.fold_bias, step_logits, domain,
-                                       c.final_logit_softcapping, proposal.rows, step_logits, cuda);
-        ops::argmax_with_probability(step_logits, ids, probabilities, domain, arena, cuda);
+                             m.w_recurrent, proposal.rows, next, latent, cuda);
+        state = next;
+        std::swap(next, alternate);
+        ops::markov_logits_add_softcap_argmax(latent, m.fold_weight, m.fold_bias, step_logits,
+                                              domain, c.final_logit_softcapping, proposal.rows, ids,
+                                              probabilities, arena, cuda);
         prev = ids;
     }
 }
@@ -372,8 +374,9 @@ std::size_t dspark_proposal_bytes(const ModelProfile& p, int b, int steps,
         scratch(linear_bytes(d.output_head, steps * b, steps * b));
     }
     (void)a.alloc(DType::BF16, {r, b});
+    if (steps > 1) (void)a.alloc(DType::BF16, {r, b});
     (void)a.alloc(DType::BF16, {r, b});
-    scratch(ops::argmax_with_probability_workspace_capacity_bytes(p.public_tokens, b));
+    scratch(ops::markov_logits_add_softcap_argmax_workspace_capacity_bytes(p.public_tokens, b));
     return a.peak_bytes();
 }
 

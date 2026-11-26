@@ -3,6 +3,7 @@
 #include "ops/common/cuda/pipeline.cuh"
 
 #include <algorithm>
+#include <cooperative_groups.h>
 #include <cuda_bf16.h>
 
 namespace ninfer::ops::markov {
@@ -109,15 +110,16 @@ __global__ void step_256(const __grid_constant__ Problem p) {
     }
 }
 
-template <int Threads, int Group, int FixedRank, bool InPlace, bool Masked>
+template <int Threads, int Group, int FixedRank, bool InPlace, bool Masked, int Cluster = 1>
 __global__ void step_grouped(const __grid_constant__ Problem p) {
     extern __shared__ __align__(16) Bf16 staged[];
     constexpr int kChannels = Threads / Group;
     const int rank          = FixedRank ? FixedRank : p.rank;
     const int lane = threadIdx.x % Group, group = threadIdx.x / Group;
-    const int first  = InPlace ? 0 : blockIdx.x * kChannels;
-    const int end    = InPlace ? rank : min(rank, first + kChannels);
-    const auto plane = 2LL * rank * rank;
+    constexpr bool whole_row = InPlace && Cluster == 1;
+    const int first          = whole_row ? 0 : blockIdx.x * kChannels;
+    const int end            = whole_row ? rank : min(rank, first + kChannels);
+    const auto plane         = 2LL * rank * rank;
     for (std::int64_t b = blockIdx.y; b < p.batch; b += gridDim.y) {
         const auto row = b * rank;
         if constexpr (Masked) {
@@ -130,13 +132,15 @@ __global__ void step_grouped(const __grid_constant__ Problem p) {
         const auto* state = p.state + row;
         const auto* embed = p.embed + std::int64_t(p.tokens[b]) * rank;
         if constexpr (InPlace) {
-            // Every channel in this row reads the previous state. One CTA owns the row and
-            // completes the snapshot before it publishes any state updates.
+            // Finish the old-state snapshot across every block that can publish this row.
             for (int k = threadIdx.x * 8; k < rank; k += Threads * 8) {
                 common::store_vec(staged + k, common::load_vec<uint4>(state + k));
                 common::store_vec(staged + rank + k, common::load_vec<uint4>(embed + k));
             }
-            __syncthreads();
+            if constexpr (Cluster > 1)
+                cooperative_groups::this_cluster().sync();
+            else
+                __syncthreads();
             state = staged;
             embed = staged + rank;
         }
@@ -156,6 +160,69 @@ __global__ void step_grouped(const __grid_constant__ Problem p) {
         if constexpr (InPlace)
             if (b + gridDim.y < p.batch) __syncthreads();
     }
+}
+
+// Warps for different batch rows share the two channels' weights within the block.
+template <int Rows, bool Masked>
+__global__ void step_256_batched(const __grid_constant__ Problem p) {
+    constexpr int rank = 256, plane = 2 * rank * rank, channels = 2;
+    constexpr int threads = Rows * channels * 32;
+    __shared__ __align__(16) Bf16 weights[channels * 6 * rank];
+    const int tid = threadIdx.x, lane = tid % 32, warp = tid / 32;
+    const int c0 = blockIdx.x * channels;
+    const int k  = lane * 8;
+    for (int i = tid; i < channels * 6 * 32; i += threads) {
+        const int ch = i / (6 * 32), part = i / 32 % 6;
+        const auto* src = p.weights + (c0 + ch) * 2 * rank + (part / 2) * plane +
+                          (part % 2) * rank + (i % 32) * 8;
+        common::cp_async<16, Cache::cg>(weights + i * 8, src);
+    }
+    common::cp_commit();
+    common::cp_wait<0>();
+    __syncthreads();
+
+    const int channel = warp % channels;
+    const int c       = c0 + channel;
+    const auto* w     = weights + channel * 6 * rank + k;
+    for (std::int64_t b = blockIdx.y * Rows + warp / channels; b < p.batch; b += gridDim.y * Rows) {
+        const auto row = b * rank;
+        if constexpr (Masked) {
+            if (p.live[b] == 0) {
+                if (lane == 0) zero(p, row, c);
+                continue;
+            }
+        }
+        const auto* state   = p.state + row;
+        const auto* embed   = p.embed + std::int64_t(p.tokens[b]) * rank;
+        const auto s        = common::load_vec<uint4>(state + k);
+        const auto e        = common::load_vec<uint4>(embed + k);
+        const auto contract = [&](int offset) {
+            return dot_vector(e, common::load_vec<uint4>(w + offset + rank),
+                              dot_vector(s, common::load_vec<uint4>(w + offset), 0));
+        };
+        float gate      = contract(0);
+        float candidate = contract(2 * rank);
+        float readout   = contract(4 * rank);
+        reduce<32>(gate, candidate, readout);
+        if (lane == 0) publish(p, row, c, rank, state[c], gate, candidate, readout);
+    }
+}
+
+template <int Cluster, bool Masked>
+void step_in_place_256(Problem p, int rows, cudaStream_t stream) {
+    constexpr int threads = 1024 / Cluster;
+    cudaLaunchAttribute cluster{};
+    cluster.id             = cudaLaunchAttributeClusterDimension;
+    cluster.val.clusterDim = {Cluster, 1, 1};
+    cudaLaunchConfig_t config{};
+    config.gridDim          = dim3(Cluster, rows);
+    config.blockDim         = dim3(threads);
+    config.dynamicSmemBytes = 4 * 256;
+    config.stream           = stream;
+    config.attrs            = &cluster;
+    config.numAttrs         = 1;
+    CUDA_CHECK(
+        cudaLaunchKernelEx(&config, step_grouped<threads, 4, 256, true, Masked, Cluster>, p));
 }
 
 constexpr int kLargeStepThreads   = 256;
@@ -257,16 +324,23 @@ void launch_step(const Tensor& state, const Tensor& tokens, const Tensor& contex
         const auto stream = execution.stream();
         const int batch   = std::min(p.batch, 65535);
         if (output.data != state.data) {
-            const dim3 grid(p.rank / 2, batch);
-            if (p.rank == 256)
-                step_256<Masked><<<grid, 64, 0, stream>>>(p);
-            else
+            if (p.rank == 256) {
+                if (p.batch >= 4) {
+                    constexpr int rows = 4;
+                    const dim3 grid(p.rank / 2, std::min(65535, 1 + (p.batch - 1) / rows));
+                    step_256_batched<rows, Masked><<<grid, 64 * rows, 0, stream>>>(p);
+                } else {
+                    step_256<Masked><<<dim3(p.rank / 2, batch), 64, 0, stream>>>(p);
+                }
+            } else {
+                const dim3 grid(p.rank / 2, batch);
                 step_grouped<64, 32, 0, false, Masked><<<grid, 64, 0, stream>>>(p);
+            }
         } else {
             const dim3 grid(1, batch);
             constexpr int kSharedRank = 12 * 1024;
             if (p.rank == 256)
-                step_grouped<1024, 4, 256, true, Masked><<<grid, 1024, 1024, stream>>>(p);
+                step_in_place_256<4, Masked>(p, batch, stream);
             else if (p.rank <= kSharedRank)
                 step_grouped<1024, 4, 0, true, Masked><<<grid, 1024, 4 * p.rank, stream>>>(p);
             else {

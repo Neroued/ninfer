@@ -87,6 +87,7 @@ execution::DSparkProposal RankProgramImpl::proposal(const execution::BatchView& 
             row(g.proposal_columns, b),
             resources.tensor(d.stem_indices.at(index)),
             resources.tensor(d.tail_indices.at(index)),
+            resources.tensor(d.initial_markov_state).slice(1, 0, b),
             resources.packed(d.draft_ids, {stride, steps}).slice(0, 0, b),
             resources.packed(d.draft_probabilities, {stride, steps}).slice(0, 0, b)};
 }
@@ -115,7 +116,7 @@ void RankProgramImpl::execute_proposal(const execution::BatchView& main, int ste
                               {bucket, bucket}, bucket, cuda);
     timer.end_draft();
     if (readback) readback_proposal(main.rows, steps, true);
-    drafts_done.record(cuda.stream());
+    if (readback) drafts_done.record(cuda.stream());
     prepare_verify(main, steps);
 }
 
@@ -129,9 +130,9 @@ void RankProgramImpl::prepare_speculative(const SpeculativeWork& work) {
     std::uint32_t visible = 0;
     for (std::size_t i = 0; i < work.rows.size(); ++i) {
         if (!work.draft_extents[i]) continue;
-        const auto frontier = work.rows[i].main_frontier;
+        const auto frontier       = work.rows[i].main_frontier;
         const auto proposal_steps = std::min(g.head_columns, shape.max_context - 1U - frontier);
-        visible = std::max(visible, frontier + proposal_steps + 1U);
+        visible                   = std::max(visible, frontier + proposal_steps + 1U);
     }
     const auto draft_bucket = ops::select_context_bucket(visible);
     const bool readback     = !f.decision;
@@ -139,12 +140,18 @@ void RankProgramImpl::prepare_speculative(const SpeculativeWork& work) {
         const auto& route        = f.graph_route.emplace(f.physical.shape, g.verify_width, 0,
                                                          g.head_columns, g.graph_entry);
         const auto target_bucket = ops::select_context_bucket(f.batch.max_visible_tokens);
+        if (!readback) upload_sampling();
         (void)graphs->start_target(
             route, {
                        .bucket   = target_bucket,
                        .head     = true,
                        .proposal = {.buckets = {&draft_bucket, 1}, .readback = readback},
+                       .decision = !readback,
                    });
+        if (!readback) {
+            await_result();
+            return;
+        }
     } else {
         execute_proposal(f.batch, steps, draft_bucket, readback);
         execute_target(f.batch, true);

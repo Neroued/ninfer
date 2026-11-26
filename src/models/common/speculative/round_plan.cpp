@@ -5,6 +5,14 @@
 #include <stdexcept>
 
 namespace ninfer::models::speculative {
+namespace {
+
+std::uint32_t block_graph_columns(SpeculativeBackend backend, std::uint32_t width,
+                                  std::uint32_t max_drafts) {
+    return backend == SpeculativeBackend::DSpark ? width - 1 : max_drafts;
+}
+
+} // namespace
 
 DecodeGraphRoutes::DecodeGraphRoutes(const BatchExecutionPlan& batches, SpeculativeBackend backend,
                                      std::uint32_t k, std::span<const std::uint32_t> target_widths)
@@ -26,7 +34,10 @@ DecodeGraphRoutes::DecodeGraphRoutes(const BatchExecutionPlan& batches, Speculat
                 routes.push_back({shape, k + 1, depth, 0, id++});
         } else if (k && backend != SpeculativeBackend::None) {
             if (target_widths.empty()) routes.push_back({shape, k + 1, 0, k, id++});
-            for (const auto width : target_widths) routes.push_back({shape, width, 0, k, id++});
+            for (const auto width : target_widths) {
+                const auto columns = block_graph_columns(backend, width, k);
+                routes.push_back({shape, width, 0, columns, id++});
+            }
         }
     }
 }
@@ -86,7 +97,8 @@ void RoundRoute::validate(SpeculativeBackend backend, std::uint32_t k) const {
             throw std::invalid_argument("invalid MTP proposal route");
     } else if ((backend != SpeculativeBackend::DFlash && backend != SpeculativeBackend::DFlash2 &&
                 backend != SpeculativeBackend::DSpark) ||
-               mtp_steps || head_columns != (graph_entry ? k : width - 1)) {
+               mtp_steps ||
+               head_columns != (graph_entry ? block_graph_columns(backend, width, k) : width - 1)) {
         throw std::invalid_argument("invalid block proposal route");
     }
 }

@@ -15,7 +15,8 @@ void RankProgramImpl::commit(runtime::ExecutionTicket ticket, runtime::CommandSe
     auto& f = *compute;
     timer.resolve();
     const auto* forward = std::get_if<ForwardWork>(&f.request.work.operation);
-    f.release_vision = std::ranges::any_of(commit.rows, [](const auto& row) { return row.terminal; });
+    f.release_vision =
+        std::ranges::any_of(commit.rows, [](const auto& row) { return row.terminal; });
     if (std::holds_alternative<SpeculativeWork>(f.request.work.operation) ||
         (forward && forward->speculative)) {
         commit_speculative(commit);
@@ -57,9 +58,10 @@ void RankProgramImpl::commit_speculative(const Commit& commit) {
     auto* accepted = static_cast<int*>(host(io.accepted_columns).data);
     auto* last     = static_cast<int*>(host(io.last_columns).data);
     auto* lengths  = static_cast<int*>(host(frame.rows.count_columns).data);
-    std::fill_n(accepted, b, 0);
-    std::fill_n(last, b, -1);
-    std::fill_n(lengths, b, 0);
+    const int live = extent(f.physical.members.size());
+    std::fill_n(accepted + live, b - live, 0);
+    std::fill_n(last + live, b - live, -1);
+    std::fill_n(lengths + live, b - live, 0);
     bool any = false, count = false;
     const auto rows = work_rows(f.request.work);
     for (std::size_t i = 0; i < f.physical.members.size(); ++i) {

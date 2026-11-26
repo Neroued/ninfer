@@ -37,8 +37,8 @@ void RankProgramImpl::target_forward(const execution::BatchView& main, Tensor hi
 }
 
 void RankProgramImpl::forward() {
-    auto& f             = *compute;
-    const auto& work    = f.request.work;
+    auto& f          = *compute;
+    const auto& work = f.request.work;
     if (const auto* spec = std::get_if<SpeculativeWork>(&work.operation)) {
         prepare_speculative(*spec);
         return;
@@ -86,7 +86,14 @@ void RankProgramImpl::forward() {
                 resources.plan.decode_routes->select_route(f.physical.shape, shape.speculative, 0);
             const auto bucket =
                 ops::select_context_bucket(std::max(1U, f.batch.max_visible_tokens));
-            (void)graphs->start_target(*f.graph_route, {.bucket = bucket, .head = do_sample});
+            const bool device_decision = do_sample && f.decision.has_value();
+            if (device_decision) upload_sampling();
+            (void)graphs->start_target(
+                *f.graph_route, {.bucket = bucket, .head = do_sample, .decision = device_decision});
+            if (device_decision) {
+                await_result();
+                return;
+            }
         } else {
             execute_target(f.batch, do_sample);
         }
@@ -230,13 +237,11 @@ void RankProgramImpl::finish_forward() {
         control_counts();
         return;
     }
-    timer.record_result();
-    compute_done.record(cuda.stream());
-    f.phase = ComputePhase::AwaitResult;
+    await_result();
 }
 
 void RankProgramImpl::decide() {
-    auto& f = *compute;
+    auto& f          = *compute;
     const auto* spec = std::get_if<SpeculativeWork>(&f.request.work.operation);
     if (spec && !f.decision) request_decision();
     if (!f.decision) return;
@@ -258,9 +263,13 @@ void RankProgramImpl::decide() {
         sample(b, kind);
         copy_result(b, 1, kind);
     }
+    await_result();
+}
+
+void RankProgramImpl::await_result() {
     timer.record_result();
     compute_done.record(cuda.stream());
-    f.phase = ComputePhase::AwaitResult;
+    compute->phase = ComputePhase::AwaitResult;
 }
 
 void RankProgramImpl::result() {

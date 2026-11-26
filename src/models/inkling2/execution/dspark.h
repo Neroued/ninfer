@@ -25,6 +25,7 @@ using DSparkSubmit = std::function<void(const DSparkReadout&)>;
 
 struct DSparkProposal {
     Tensor anchors, base_positions, rows, valid_columns, stem_indices, tail_indices;
+    Tensor initial_state;         // Immutable zero BF16 Markov state [rank, B].
     Tensor drafts, probabilities; // [B, steps]
 };
 

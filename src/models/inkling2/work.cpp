@@ -64,8 +64,14 @@ BatchPlan plan_batch(std::span<const WorkRow> rows, const BatchExecutionPlan& pl
 std::shared_ptr<const speculative::DecodeGraphRoutes>
 make_decode_routes(const ExecutionShape& shape, const BatchExecutionPlan& batches) {
     if (batches.graph_shapes().empty()) return {};
-    return std::make_shared<const speculative::DecodeGraphRoutes>(
-        batches, shape.speculative, shape.draft_tokens, std::span<const std::uint32_t>{});
+    std::vector<std::uint32_t> widths;
+    if (shape.narrow_dspark_targets) {
+        for (const auto width : {2U, 4U})
+            if (width <= shape.draft_tokens) widths.push_back(width);
+        widths.push_back(shape.draft_tokens + 1);
+    }
+    return std::make_shared<const speculative::DecodeGraphRoutes>(batches, shape.speculative,
+                                                                  shape.draft_tokens, widths);
 }
 
 const BatchPlan& work_batch(const Work& work) {
@@ -300,14 +306,15 @@ void WorkContract::validate(const Work& work, runtime::FrameKind kind) const {
                     m->draft_extents.size() == rows.size(),
                 "speculative extent");
         const auto& g = *geometry;
-        bool live = false;
+        bool live     = false;
         for (std::size_t b = 0; b < rows.size(); ++b) {
-            const auto k = m->draft_extents[b];
+            const auto k                 = m->draft_extents[b];
             const auto context_remaining = shape.max_context - rows[b].main_frontier;
-            require(rows[b].ids.size() == 1 && k <= shape.draft_tokens &&
-                        (!k || g.path == ExecutionPath::Eager || g.head_columns < context_remaining) &&
-                        k < context_remaining,
-                    "speculative verify window");
+            require(
+                rows[b].ids.size() == 1 && k <= shape.draft_tokens &&
+                    (!k || g.path == ExecutionPath::Eager || g.head_columns < context_remaining) &&
+                    k < context_remaining,
+                "speculative verify window");
             live |= k != 0;
         }
         require(live, "speculative round has no proposals");

@@ -17,9 +17,9 @@ void control_layout(LayoutBuilder& b, FrameLayout& out, PhysicalBatchShape shape
     };
     const auto rows = [&] { return tensor(DType::I32, {n_rows}, "row metadata"); };
 
-    auto& g               = out.rows;
-    g.anchors             = rows();
-    g.live_rows           = rows();
+    auto& g        = out.rows;
+    g.anchors      = rows();
+    g.live_rows    = rows();
     out.decode.ids = out.dspark ? tensor(DType::I32, {width * n_rows}, "verify IDs") : g.anchors;
     out.decode.positions  = tensor(DType::I32, {width * n_rows}, "decode positions");
     g.valid_columns       = rows();
@@ -34,8 +34,8 @@ void control_layout(LayoutBuilder& b, FrameLayout& out, PhysicalBatchShape shape
         g.draft_extents    = rows();
         g.snapshot_slots   = rows();
     }
-    g.count_slots         = rows();
-    g.sampling_positions  = rows();
+    g.count_slots        = rows();
+    g.sampling_positions = rows();
     if (out.sampling) {
         out.sampling =
             tensor(DType::I32, {sizeof(ops::SamplingConfig) / sizeof(std::int32_t), n_rows},
@@ -135,6 +135,8 @@ FrameLayout plan_frame(LayoutBuilder& b, const execution::ModelProfile& p,
         const auto taps = dimension(p.config.dspark->target_layer_ids.size());
         d.prefill_aux   = tensor(DType::BF16, {hidden, taps, chunk}, "prefill DFlare taps");
         d.pending_aux   = tensor(DType::BF16, {hidden, taps, width * batch}, "decode DFlare taps");
+        d.initial_markov_state = tensor(
+            DType::BF16, {dimension(p.config.dspark->markov_rank), batch}, "zero Markov state");
         for (int bsize = 1; bsize <= batch; ++bsize) {
             for (int steps = 1; steps < width; ++steps) {
                 d.stem_indices.push_back(
@@ -155,12 +157,12 @@ FrameLayout plan_frame(LayoutBuilder& b, const execution::ModelProfile& p,
             if (logical.is_swa) {
                 const int dim = dimension(attn.head_dim), heads = dimension(attn.kv_heads);
                 const auto schema = cyclic_kv_storage_layout(s.swa_kv_storage, dim);
-                layer.k = tensor(schema.key.data_dtype,
-                                 {schema.key.data_leading_extent, heads, width, batch},
-                                 "verify SWA keys");
-                layer.v = tensor(schema.value.data_dtype,
-                                 {schema.value.data_leading_extent, heads, width, batch},
-                                 "verify SWA values");
+                layer.k           = tensor(schema.key.data_dtype,
+                                           {schema.key.data_leading_extent, heads, width, batch},
+                                           "verify SWA keys");
+                layer.v           = tensor(schema.value.data_dtype,
+                                           {schema.value.data_leading_extent, heads, width, batch},
+                                           "verify SWA values");
                 if (schema.key.has_scale())
                     layer.k_scales = tensor(schema.key.scale_dtype,
                                             {schema.key.scale_leading_extent, heads, width, batch},
@@ -190,8 +192,8 @@ FrameLayout plan_frame(LayoutBuilder& b, const execution::ModelProfile& p,
         out.output_counts = rows();
         const auto first  = out.sampled_ids->region.offset;
         if (out.dspark) out.top1_probabilities = tensor(DType::FP32, {batch}, "target confidence");
-        const auto& last  = out.dspark ? out.top1_probabilities.region : out.output_counts->region;
-        out.egress        = {first, last.offset + last.bytes - first, 256};
+        const auto& last = out.dspark ? out.top1_probabilities.region : out.output_counts->region;
+        out.egress       = {first, last.offset + last.bytes - first, 256};
     }
     if (out.dspark) {
         auto& d = *out.dspark;

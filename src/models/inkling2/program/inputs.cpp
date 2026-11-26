@@ -164,25 +164,30 @@ void RankProgramImpl::prepare_inputs(std::span<const WorkRow> rows, const BatchP
         return;
     }
 
-    const int b   = dimension(plan.shape.rows);
-    const int t   = dimension(width);
-    const auto& g = frame.rows;
-    std::fill_n(i32(g.live_rows), b, 0);
-    std::fill_n(i32(g.valid_columns), b, 0);
-    std::fill_n(i32(g.main_tables), b, -1);
-    std::fill_n(i32(g.count_slots), b, -1);
-    std::fill_n(i32(g.sampling_positions), b, 0);
-    std::fill_n(i32(g.anchors), b, 0);
-    std::fill_n(i32(frame.decode.positions), std::size_t(t) * b, 0);
-    std::fill_n(i64(g.source_offsets), b, -1);
-    std::fill_n(i64(g.destination_offsets), b, -1);
+    const int b    = dimension(plan.shape.rows);
+    const int t    = dimension(width);
+    const auto& g  = frame.rows;
+    const int live = extent(plan.members.size());
+    const auto pad = [&](const TensorRegion& region, int value) {
+        std::fill_n(i32(region) + live, b - live, value);
+    };
+    pad(g.live_rows, 0);
+    pad(g.valid_columns, 0);
+    pad(g.main_tables, -1);
+    pad(g.count_slots, -1);
+    pad(g.sampling_positions, 0);
+    pad(g.anchors, 0);
+    std::fill_n(i32(frame.decode.positions) + std::size_t(t) * live, std::size_t(t) * (b - live),
+                0);
+    std::fill_n(i64(g.source_offsets) + live, b - live, -1);
+    std::fill_n(i64(g.destination_offsets) + live, b - live, -1);
     if (frame.dspark) {
-        std::fill_n(i32(g.dspark_tables), b, -1);
-        std::fill_n(i32(g.base_positions), b, 0);
-        std::fill_n(i32(g.proposal_rows), b, 0);
-        std::fill_n(i32(g.proposal_columns), b, 0);
-        std::fill_n(i32(g.draft_extents), b, 0);
-        std::fill_n(i32(frame.decode.ids), b, 0);
+        pad(g.dspark_tables, -1);
+        pad(g.base_positions, 0);
+        pad(g.proposal_rows, 0);
+        pad(g.proposal_columns, 0);
+        pad(g.draft_extents, 0);
+        if (t == 1) pad(frame.decode.ids, 0);
         for (int i = 0; i < b; ++i) i32(g.snapshot_slots)[i] = i * t;
     }
 
@@ -202,9 +207,9 @@ void RankProgramImpl::prepare_inputs(std::span<const WorkRow> rows, const BatchP
         i32(g.sampling_positions)[idx]  = r.sampling_position;
         i32(g.anchors)[idx]             = count ? r.ids.front() : 0;
         if (frame.dspark) {
-            i32(g.dspark_tables)[idx]    = r.dspark_table.index;
-            i32(g.base_positions)[idx]   = r.main_frontier;
-            i32(g.proposal_rows)[idx]    = depth != 0;
+            i32(g.dspark_tables)[idx]  = r.dspark_table.index;
+            i32(g.base_positions)[idx] = r.main_frontier;
+            i32(g.proposal_rows)[idx]  = depth != 0;
             const auto proposal_steps =
                 std::min<std::uint32_t>(steps, shape.max_context - 1U - r.main_frontier);
             i32(g.proposal_columns)[idx] = depth ? proposal_steps + 1U : 0U;
@@ -220,7 +225,8 @@ void RankProgramImpl::prepare_inputs(std::span<const WorkRow> rows, const BatchP
 
     if (frame.sampling) {
         auto* configs = static_cast<ops::SamplingConfig*>(host(*frame.sampling).data);
-        std::fill_n(configs, b, ops::SamplingConfig{.temperature = 0, .top_k = 1, .top_p = 1});
+        std::fill_n(configs + live, b - live,
+                    ops::SamplingConfig{.temperature = 0, .top_k = 1, .top_p = 1});
         for (std::size_t i = 0; i < plan.members.size(); ++i)
             set_sampling_config(rows[plan.members[i]], static_cast<std::int32_t>(i));
     }
@@ -365,7 +371,8 @@ void RankProgramImpl::request_decision() {
 }
 
 void RankProgramImpl::upload_sampling() {
-    auto& f          = *compute;
+    auto& f = *compute;
+    if (f.decision->rows.empty()) return;
     const auto rows  = work_rows(f.request.work);
     auto mask_host   = host(*frame.grammar_masks);
     auto mask_device = resources.tensor(*frame.grammar_masks);

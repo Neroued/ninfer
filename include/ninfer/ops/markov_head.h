@@ -63,4 +63,18 @@ void markov_logits_add_softcap(const Tensor& latent, const Weight& folded_weight
                                std::int32_t token_domain, float softcap, const Tensor& live_rows,
                                Tensor& logits_out, CudaExecutionView execution);
 
+// Reduce the same BF16 logits over token_domain without materializing them. Writes contiguous
+// I32 [B] IDs (lowest ID on ties) and FP32 [B] softmax probabilities at those IDs. Consumed
+// logits must be finite. Inactive rows have ID 0 and probability 1 / token_domain.
+// Scratch and outputs are disjoint from each other and the inputs.
+[[nodiscard]] std::size_t
+markov_logits_add_softcap_argmax_workspace_capacity_bytes(std::int32_t max_token_domain,
+                                                          std::int32_t max_batch);
+
+void markov_logits_add_softcap_argmax(const Tensor& latent, const Weight& folded_weight,
+                                      const Tensor& folded_bias, const Tensor& base_logits,
+                                      std::int32_t token_domain, float softcap,
+                                      const Tensor& live_rows, Tensor& ids, Tensor& probabilities,
+                                      MemoryArena& workspace, CudaExecutionView execution);
+
 } // namespace ninfer::ops

@@ -2,16 +2,25 @@
 
 #include "core/platform.h"
 #include "models/inkling2/program/graph_inputs.h"
+#include "models/inkling2/work.h"
 
 #include <algorithm>
 #include <stdexcept>
 
 namespace ninfer::models::inkling2 {
 
+namespace {
+bool can_narrow_dspark_targets(const EngineOptions& options) noexcept {
+    return options.use_cuda_graph && options.purpose == EnginePurpose::Generation &&
+           options.speculative.backend == SpeculativeBackend::DSpark &&
+           options.speculative.length_policy == SpeculativeLengthPolicy::Adaptive &&
+           options.speculative.draft_tokens >= 2;
+}
+} // namespace
+
 RankPreparation::RankPreparation(const artifact::Reader& reader, RankLoadRequest request,
                                  DeviceContext& device)
-    : device_(device), options_(std::move(request.options)),
-      control_owner_(request.control_owner) {
+    : device_(device), options_(std::move(request.options)), control_owner_(request.control_owner) {
     if (request.artifact != reader.artifact_id())
         throw artifact::ArtifactError("Inkling2 worker artifact differs from coordinator");
     auto definition = read_definition(reader, load_options(options_));
@@ -70,9 +79,8 @@ void RankPreparation::create_probe(std::size_t context_bytes) {
     plan.capacity                           = {};
     plan.capacity.device_bytes              = context_bytes;
     plan.capacity.runtime_reservation_bytes = plan.reservation_bytes();
-    auto resources = std::make_unique<Resources>(std::move(plan), device_);
-    probe_         = std::make_unique<RankProgram>(instance_->parameters, std::move(resources),
-                                                   device_);
+    auto resources                          = std::make_unique<Resources>(std::move(plan), device_);
+    probe_ = std::make_unique<RankProgram>(instance_->parameters, std::move(resources), device_);
 }
 
 void RankPreparation::calibrate() {
@@ -119,9 +127,9 @@ void RankPreparation::prepare(runtime::ContextCapacity capacity, std::size_t ava
     plan.capacity = runtime::resolve_context_capacity(
         ContextCapacityPolicy::explicit_capacity(capacity.device_bytes), capacity_, available,
         available_host, NINFER_SHARED_PHYSICAL_MEMORY != 0, control_owner_);
-    auto resources     = std::make_unique<Resources>(std::move(plan), device_);
-    instance_->program = std::make_unique<RankProgram>(instance_->parameters, std::move(resources),
-                                                       device_);
+    auto resources = std::make_unique<Resources>(std::move(plan), device_);
+    instance_->program =
+        std::make_unique<RankProgram>(instance_->parameters, std::move(resources), device_);
 }
 
 void RankPreparation::release_resources() {
@@ -134,8 +142,14 @@ void RankPreparation::release_resources() {
     }
 }
 
-void RankPreparation::select_narrow_targets(bool enabled, GraphMemorySummary) {
-    if (enabled) throw std::logic_error("Inkling2 does not support narrow target catalog");
+void RankPreparation::select_narrow_targets(bool enabled, GraphMemorySummary measured) {
+    if ((enabled && (!plan_.use_cuda_graph || !can_narrow_dspark_targets(options_))) ||
+        (instance_ && instance_->program))
+        throw std::logic_error("Inkling2 cannot change the decode graph catalog");
+    probe_.reset();
+    plan_.shape.narrow_dspark_targets = enabled;
+    plan_.decode_routes               = make_decode_routes(plan_.shape, *plan_.batches);
+    graph_memory_                     = measured;
 }
 
 PreparedRankDescription RankPreparation::describe() const {
@@ -198,6 +212,10 @@ Startup::Startup(const artifact::Reader& reader, const artifact::Reader& rank,
 
 Frontend Startup::frontend(const EngineOptions& options) const {
     return create_frontend(*definition_, options);
+}
+
+bool Startup::narrow_targets(const EngineOptions& options) const noexcept {
+    return can_narrow_dspark_targets(options);
 }
 
 std::unique_ptr<RankPreparation> Startup::preparation(const artifact::Reader& reader,

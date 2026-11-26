@@ -1,4 +1,5 @@
 #include "ninfer/ops/markov_head.h"
+#include "ninfer/ops/argmax.h"
 
 #include "direct_bf16_weight.cuh"
 #include "op_measurement.cuh"
@@ -12,7 +13,7 @@ namespace {
 
 struct Options {
     measurement::Options timing;
-    std::vector<int> batches{1, 2, 3, 4, 5, 7, 8, 13, 16, 24};
+    std::vector<int> batches{1, 2, 4, 8, 16, 32};
     std::vector<int> steps{7};
     std::string op = "all";
     int h = 2304, rank = 256, vocab = 200064, domain = 200058, embed_vocab = 201024;
@@ -32,12 +33,12 @@ Options parse(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         const std::string_view flag = argv[i];
         if (flag == "--help") {
-            std::cout
-                << "Markov head: --op all|context|step|logits --batches B[,B...] --steps D[,D...]\n"
-                   "  --h H --rank R --vocab V --domain N --embed-vocab N --softcap F\n"
-                   "  --batch and --hidden are also accepted.\n"
-                   "  --alias 0|1 (state/logits output reuse, restored before each sample)\n"
-                   "Default vocabulary and token domain are 200064 and 200058.\n";
+            std::cout << "Markov head: --op all|context|step|logits|sample --batches B[,B...] "
+                         "--steps D[,D...]\n"
+                         "  --h H --rank R --vocab V --domain N --embed-vocab N --softcap F\n"
+                         "  --batch and --hidden are also accepted.\n"
+                         "  --alias 0|1 (state/logits output reuse, restored before each sample)\n"
+                         "Default vocabulary and token domain are 200064 and 200058.\n";
             measurement::help();
             std::exit(0);
         }
@@ -69,11 +70,12 @@ Options parse(int argc, char** argv) {
         } else if (!measurement::parse(o.timing, flag, value))
             throw std::invalid_argument("unknown option: " + std::string(flag));
     }
-    if (o.op != "all" && o.op != "context" && o.op != "step" && o.op != "logits")
+    if (o.op != "all" && o.op != "context" && o.op != "step" && o.op != "logits" &&
+        o.op != "sample")
         throw std::invalid_argument("invalid markov op");
     const bool context = o.op == "all" || o.op == "context";
     const bool step    = o.op == "all" || o.op == "step";
-    const bool logits  = o.op == "all" || o.op == "logits";
+    const bool logits  = o.op == "all" || o.op == "logits" || o.op == "sample";
     if ((context || step) && o.rank > std::numeric_limits<int>::max() / 3)
         throw std::invalid_argument("rank exceeds the benchmark fixture's row extent");
     if (context && (o.h <= 0 || std::ranges::any_of(o.steps, [](int d) { return d <= 0; })))
@@ -237,6 +239,64 @@ void logits_cases(Bench& bench) {
             });
     }
 }
+
+void sampling_cases(Bench& bench) {
+    const auto& o = bench.o;
+    const int r = o.rank, v = o.vocab;
+    const auto weights = make_direct_bf16_weight(v, r, 53);
+    auto bias          = make_bf16(v, 59);
+    const Tensor bias_view(bias.span(), DType::BF16, {v});
+    for (const int b : o.batches) {
+        auto latent  = make_bf16(std::size_t(r) * b, 61);
+        auto initial = make_bf16(std::size_t(v) * b, 67, -20.0f, 20.0f);
+        auto output  = make_buffer(initial.size());
+        auto ids     = make_buffer(sizeof(int) * b);
+        auto probs   = make_buffer(sizeof(float) * b);
+        const Tensor z(latent.span(), DType::BF16, {r, b});
+        const Tensor base(initial.span(), DType::BF16, {v, b});
+        Tensor logits(output.span(), DType::BF16, {v, b});
+        Tensor tokens(ids.span(), DType::I32, {b});
+        Tensor probabilities(probs.span(), DType::FP32, {b});
+        const auto separate_capacity =
+            ops::argmax_with_probability_workspace_capacity_bytes(o.domain, b);
+        const auto fused_capacity =
+            ops::markov_logits_add_softcap_argmax_workspace_capacity_bytes(o.domain, b);
+        auto scratch = make_buffer(std::max(separate_capacity, fused_capacity));
+        MemoryArena arena(scratch.span());
+        const auto input_bytes  = 2ULL * o.domain * (1ULL + r + b) + latent.size();
+        const auto result_bytes = ids.size() + probs.size();
+        const auto flops        = 2.0 * o.domain * r * b;
+        measurement::Row row{.op              = "markov_logits_add_softcap_argmax",
+                             .format          = "bf16",
+                             .policy          = "separate",
+                             .n               = v,
+                             .k               = r,
+                             .batch           = b,
+                             .workspace_bytes = separate_capacity};
+        bench.run(
+            row, input_bytes + result_bytes + output.size() + 2ULL * o.domain * b, flops,
+            [&](auto cuda) {
+                ops::markov_logits_add_softcap(z, weights.weight, bias_view, logits, o.domain,
+                                               o.softcap, {}, logits, cuda);
+                ops::argmax_with_probability(logits, tokens, probabilities, o.domain, arena, cuda);
+            },
+            [&](auto cuda) {
+                CUDA_CHECK(cudaMemcpyAsync(output.data(), initial.data(), initial.size(),
+                                           cudaMemcpyDeviceToDevice, cuda.stream()));
+            },
+            &arena);
+        row.policy          = "fused";
+        row.workspace_bytes = fused_capacity;
+        bench.run(
+            row, input_bytes + result_bytes, flops,
+            [&](auto cuda) {
+                ops::markov_logits_add_softcap_argmax(z, weights.weight, bias_view, base, o.domain,
+                                                      o.softcap, {}, tokens, probabilities, arena,
+                                                      cuda);
+            },
+            [](auto) {}, &arena);
+    }
+}
 } // namespace
 
 int main(int argc, char** argv) {
@@ -247,6 +307,7 @@ int main(int argc, char** argv) {
         if (options.op == "all" || options.op == "context") context_cases(bench);
         if (options.op == "all" || options.op == "step") step_cases(bench);
         if (options.op == "all" || options.op == "logits") logits_cases(bench);
+        if (options.op == "all" || options.op == "sample") sampling_cases(bench);
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

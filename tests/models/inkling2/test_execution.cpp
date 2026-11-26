@@ -90,7 +90,7 @@ std::shared_ptr<ex::ModelProfile> profile() {
 // The fixture supplies verified tensors to the commit stage, so only workspace for the draft
 // network and commit is required. The frame, State and paged history use production layouts.
 ink::ExecutionPlan storage_plan(std::shared_ptr<const ex::ModelProfile> p, KvCacheStorage storage,
-                                std::uint32_t max_context, bool graph) {
+                                std::uint32_t max_context, bool graph, bool narrow = false) {
     ink::ExecutionPlan plan;
     plan.profile = std::move(p);
     plan.shape   = {.max_context     = max_context,
@@ -99,7 +99,9 @@ ink::ExecutionPlan storage_plan(std::shared_ptr<const ex::ModelProfile> p, KvCac
                     .draft_tokens    = Drafts,
                     .swa_kv_storage  = storage,
                     .speculative     = SpeculativeBackend::DSpark,
-                    .length_policy   = SpeculativeLengthPolicy::Fixed};
+                    .length_policy =
+                      narrow ? SpeculativeLengthPolicy::Adaptive : SpeculativeLengthPolicy::Fixed,
+                    .narrow_dspark_targets = narrow};
     plan.batches = std::make_shared<const models::BatchExecutionPlan>(
         models::make_batch_execution_spec(Rows, 1, graph));
     plan.decode_routes  = ink::make_decode_routes(plan.shape, *plan.batches);
@@ -334,8 +336,8 @@ ink::SessionPlan session_plan(ink::ExecutionPlan p) {
 }
 
 struct HostSession {
-    explicit HostSession(bool graph)
-        : plan(storage_plan(profile(), KvCacheStorage::BFloat16, 112, graph)),
+    explicit HostSession(bool graph, bool narrow = false)
+        : plan(storage_plan(profile(), KvCacheStorage::BFloat16, 112, graph, narrow)),
           frontend(make_frontend(plan.shape.max_context)), executor(contract(plan)),
           session(prepare(plan), executor) {}
 
@@ -476,6 +478,22 @@ void verify_context_edge() {
         const auto& stats = result.rows.front().speculative;
         require(stats.fallback_steps == 1 && stats.bypass_steps == 0 && stats.proposed_tokens == 0,
                 "graph Session granted a proposal to the context-limited row");
+    }
+    {
+        HostSession f(true, true);
+        const std::array members{f.prefill(0, 90)};
+        for (const auto depth : {1U, static_cast<unsigned>(Drafts)}) {
+            f.reserve_decode(members);
+            require(f.session.start_decode_extents(members, std::array{depth}).has_value(),
+                    "explicit DSpark depth did not submit in the adaptive catalog");
+            const auto& spec     = std::get<ink::SpeculativeWork>(f.executor.last.operation);
+            const auto& geometry = *spec.speculative;
+            require(geometry.path == ExecutionPath::Graph && geometry.graph_entry &&
+                        geometry.verify_width == depth + 1 && geometry.head_columns == depth &&
+                        spec.draft_extents == std::vector{depth},
+                    "Inkling2 did not carry the selected graph width into verification");
+            f.commit(f.event<ink::PendingBatch>());
+        }
     }
 }
 

@@ -410,6 +410,55 @@ int test_logits(int r, int b, int v, int domain, float cap, Mask mask, bool alia
     return compare_words("logits", download<std::uint16_t>(f.out), f.reference(latent, mask));
 }
 
+int test_logits_argmax(int r, int b, int v, int domain, float cap, Mask mask) {
+    LogitsFixture f(r, b, v, domain, cap, false);
+    auto latent = values(std::size_t(r) * b, 83);
+    for (int row = 0; row < b; ++row) {
+        if (!active(mask, row)) {
+            std::fill_n(latent.data() + row * r, r, std::uint16_t{0x7fc0});
+        } else if (row % 4 == 0) {
+            // Force a BF16 softcap tie over two tiles, and keep the first ID away from zero.
+            auto* base       = f.base.data() + std::size_t(row) * v;
+            base[domain / 3] = base[domain - 1] = word(1024);
+        }
+    }
+    f.reset(mask);
+    auto zbuf    = to_device(latent);
+    auto maskbuf = to_device(row_mask(mask, b));
+    DeviceBuffer ibuf(device(), b * sizeof(int)), pbuf(device(), b * sizeof(float));
+    DeviceBuffer scratch(device(),
+                         ops::markov_logits_add_softcap_argmax_workspace_capacity_bytes(domain, b));
+    Tensor z(zbuf.span(), DType::BF16, {r, b}), live(maskbuf.span(), DType::I32, {b});
+    Tensor ids(ibuf.span(), DType::I32, {b}), probs(pbuf.span(), DType::FP32, {b});
+    MemoryArena arena(scratch.span());
+    auto input = mask == Mask::Dense ? Tensor{} : live;
+    ops::markov_logits_add_softcap_argmax(z, f.w.view, f.bias_view, f.x, domain, cap, input, ids,
+                                          probs, arena, execution());
+    cuda_synchronize(execution().stream());
+    const auto actual_ids   = download<int>(ids);
+    const auto actual_probs = download<float>(probs);
+    const auto expected     = f.reference(latent, mask);
+    int failures            = 0;
+    for (int row = 0; row < b; ++row) {
+        const auto* logits = expected.data() + std::size_t(row) * v;
+        int id             = 0;
+        for (int token = 1; token < domain; ++token)
+            if (real(logits[token]) > real(logits[id])) id = token;
+        double mass = 0.0;
+        for (int token = 0; token < domain; ++token)
+            mass += std::exp(real(logits[token]) - real(logits[id]));
+        const double probability = 1.0 / mass;
+        if (actual_ids[row] != id || !std::isfinite(actual_probs[row]) ||
+            std::abs(actual_probs[row] - probability) > 3.0e-6 * probability) {
+            std::cerr << "fused Markov row " << row << " B=" << b << " domain=" << domain
+                      << ": expected " << id << '/' << probability << ", got " << actual_ids[row]
+                      << '/' << actual_probs[row] << '\n';
+            ++failures;
+        }
+    }
+    return failures + (arena.used() != 0);
+}
+
 struct Graph {
     ~Graph() {
         if (exec) cudaGraphExecDestroy(exec);
@@ -535,12 +584,16 @@ int main(int argc, char** argv) {
     suite.add("context_k_tail", [] { return test_context(520, 48, 3, 3); });
     suite.add("context_batch_tile", [] { return test_context(512, 64, 3, 24); });
     suite.add("context_batch_aligned", [] { return test_context(2304, 64, 1, 16); });
+    suite.add("context_split_reduction_layout", [] { return test_context(520, 48, 67, 2); });
+    suite.add("context_dense_layout", [] { return test_context(520, 48, 97, 3); });
     suite.add("step_primary", [] { return test_step(256, 1, 201024, Mask::Dense, false); });
     suite.add("step_primary_mixed", [] { return test_step(256, 8, 1024, Mask::Mixed, false); });
     suite.add("step_mixed", [] { return test_step(128, 13, 1024, Mask::Mixed, false); });
     suite.add("step_rank_tail", [] { return test_step(48, 2, 33, Mask::All, true); });
     suite.add("step_odd_batch", [] { return test_step(64, 3, 65, Mask::Mixed, false); });
     suite.add("step_primary_in_place", [] { return test_step(256, 8, 1024, Mask::Mixed, true); });
+    suite.add("step_primary_single_in_place",
+              [] { return test_step(256, 1, 1024, Mask::Dense, true); });
     suite.add("step_all_inactive", [] { return test_step(64, 5, 1024, Mask::None, true); });
     suite.add("step_batch_aligned", [] { return test_step(128, 16, 1024, Mask::All, true); });
     suite.add("step_batch_tile", [] { return test_step(64, 24, 1019, Mask::Mixed, false); });
@@ -570,6 +623,24 @@ int main(int argc, char** argv) {
         return test_logits(64, 3, 1024, 1019, std::numeric_limits<float>::denorm_min(), Mask::Mixed,
                            true);
     });
+    suite.add("fused_argmax_all_batches", [] {
+        int failures = 0;
+        for (int b = 1; b <= 32; ++b) {
+            const int vocab  = 257 + b % 4;
+            const int domain = b == 2 ? 1 : vocab - b % 7;
+            const auto mask  = b % 2 ? Mask::Mixed : Mask::Dense;
+            failures += test_logits_argmax(48, b, vocab, domain, 30, mask);
+        }
+        return failures;
+    });
+    suite.add("fused_argmax_all_inactive",
+              [] { return test_logits_argmax(48, 5, 257, 219, 30, Mask::None); });
+    suite.add("fused_argmax_product_vocab",
+              [] { return test_logits_argmax(256, 8, 201216, 200058, 30, Mask::Mixed); });
+    suite.add("fused_argmax_wide_rank",
+              [] { return test_logits_argmax(256, 32, 4099, 4097, 30, Mask::Mixed); });
+    suite.add("fused_argmax_large_batch",
+              [] { return test_logits_argmax(64, 32, 32008, 32003, 30, Mask::Mixed); });
     suite.add("graph_recurrent_chain", test_graph_chain);
     suite.add("rejection", test_rejection);
     return suite.main(argc, argv);

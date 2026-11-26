@@ -40,6 +40,7 @@ public:
     void select_narrow_targets(bool enabled, GraphMemorySummary measured = {});
 
     [[nodiscard]] GraphMemorySummary graph_memory() const noexcept { return graph_memory_; }
+
     [[nodiscard]] PreparedRankDescription describe() const;
     [[nodiscard]] std::unique_ptr<Instance> finish() &&;
 
@@ -66,14 +67,16 @@ public:
     Startup(const artifact::Reader&, const artifact::Reader& rank, const EngineOptions&, Device);
 
     [[nodiscard]] const auto& definition() const { return definition_; }
+
     [[nodiscard]] Frontend frontend(const EngineOptions&) const;
-    [[nodiscard]] std::unique_ptr<Preparation> preparation(const artifact::Reader&,
-                                                           const EngineOptions&,
-                                                           DeviceContext&) const;
-    [[nodiscard]] bool narrow_targets(const EngineOptions&) const noexcept { return false; }
+    [[nodiscard]] std::unique_ptr<Preparation>
+    preparation(const artifact::Reader&, const EngineOptions&, DeviceContext&) const;
+    [[nodiscard]] bool narrow_targets(const EngineOptions&) const noexcept;
     [[nodiscard]] PreparedSession session(const PreparedRankDescription&,
                                           std::uint32_t checkpoint_interval) const;
+
     [[nodiscard]] Architecture architecture() const noexcept { return Architecture::Inkling2; }
+
     [[nodiscard]] std::string prefill_signature(std::uint32_t chunk) const;
 
 private:

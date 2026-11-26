@@ -128,6 +128,7 @@ void ResidentBody::prepare(DeviceContext& device, ParallelExecution* parallel,
                         readback_.capture(readback_stream, body);
                     });
             });
+            if (capture.decision) decision_.capture(stream, capture.decision);
         },
         parallel);
     if (handoff_ && !handoff_->appended())
@@ -149,6 +150,7 @@ void ResidentBody::start(CudaExecutionView cuda, const TargetReplay& replay,
     if (handoff_) handoff_->select(executable, replay.slot.value());
     head_.set_enabled(executable, replay.head);
     readback_.set_enabled(executable, replay.readback || replay.proposal.readback);
+    decision_.set_enabled(executable, replay.decision);
     graph_.launch(cuda, parallel_, work);
 }
 

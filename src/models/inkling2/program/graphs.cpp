@@ -67,8 +67,8 @@ ProposalCapture bind_proposal(RankProgramImpl& p, ops::ContextBucketRange bucket
             [&](const execution::DSparkReadout& actual) {
                 const auto& exp = expected.at(next++);
                 if (exp.q.data != actual.q.data || exp.k.data != actual.k.data ||
-                    exp.v.data != actual.v.data ||
-                    exp.out.data != actual.out.data || exp.scratch.data != actual.scratch.data)
+                    exp.v.data != actual.v.data || exp.out.data != actual.out.data ||
+                    exp.scratch.data != actual.scratch.data)
                     throw std::logic_error(
                         "Inkling2 DSpark Graph readout binding differs from execution");
                 record([actual](ops::ContextBucket b, CudaExecutionView cuda) {
@@ -112,10 +112,7 @@ GraphPreparationSample RankProgramImpl::prepare_graphs(GraphPreparationMode mode
         main = decode_batch(width, rows, shape.max_context);
         return TargetReplay{.bucket = buckets.last, .proposal = {.buckets = {&buckets.last, 1}}};
     };
-    bindings.warmup_target = [&](const speculative::RoundRoute&) { execute_target(main, true); };
-    bindings.target        = [&](const speculative::RoundRoute&) -> TargetCapture {
-        return bind_target(*this, buckets, main);
-    };
+    bindings.warmup_target   = [&](const speculative::RoundRoute&) { execute_target(main, true); };
     bindings.warmup_proposal = [&](const speculative::RoundRoute& route) {
         execute_proposal(main, extent(route.head_columns), buckets.last, false);
     };
@@ -128,6 +125,11 @@ GraphPreparationSample RankProgramImpl::prepare_graphs(GraphPreparationMode mode
         else
             sample(main.rows, SampleKind::NextToken);
         copy_result(main.rows, main.tokens);
+    };
+    bindings.target = [&](const speculative::RoundRoute& route) -> TargetCapture {
+        auto capture     = bind_target(*this, buckets, main);
+        capture.decision = [&, route] { bindings.decision(route); };
+        return capture;
     };
     if (parameters.dspark) {
         bindings.commit = [&](const speculative::RoundRoute&, const SectionRecorder&,

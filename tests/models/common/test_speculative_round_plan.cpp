@@ -166,7 +166,7 @@ void invalid_rounds() {
 
 void narrow_block_routes() {
     const BatchExecutionPlan batches(make_batch_execution_spec(4, 2, true));
-    for (const auto backend : {Backend::DFlash, Backend::DFlash2}) {
+    for (const auto backend : {Backend::DFlash, Backend::DFlash2, Backend::DSpark}) {
         for (const auto widths : {std::vector{4U, 8U}, std::vector{2U, 4U, 8U}}) {
             const DecodeGraphRoutes routes(batches, backend, 7, widths);
             for (const auto shape : batches.graph_shapes()) {
@@ -176,9 +176,16 @@ void narrow_block_routes() {
                 for (auto depth = 1U; depth <= 7; ++depth) {
                     const auto selected = routes.select_route(shape, backend, depth);
                     selected.validate(backend, 7);
-                    require(selected.width == *std::ranges::upper_bound(widths, depth) &&
-                                selected.head_columns == 7 && selected.covers(backend, depth),
+                    const auto width   = *std::ranges::upper_bound(widths, depth);
+                    const auto columns = backend == Backend::DSpark ? width - 1 : 7;
+                    require(selected.width == width && selected.head_columns == columns &&
+                                selected.covers(backend, depth),
                             "narrow route changed proposal depth or missed the smallest width");
+                    if (width < 8) {
+                        auto invalid         = selected;
+                        invalid.head_columns = backend == Backend::DSpark ? 7 : width - 1;
+                        rejects([&] { invalid.validate(backend, 7); });
+                    }
                 }
             }
         }
@@ -256,6 +263,7 @@ int main() {
         for (unsigned k : {1U, 2U, 4U, 5U}) check_routes(Backend::Mtp, k);
         for (const auto backend : {Backend::DFlash, Backend::DFlash2})
             for (unsigned k : {1U, 4U, 9U, 15U}) check_routes(backend, k);
+        for (unsigned k : {1U, 3U, 7U}) check_routes(Backend::DSpark, k);
         check_routes(Backend::None, 0);
         invalid_rounds();
         narrow_block_routes();

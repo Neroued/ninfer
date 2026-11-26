@@ -11,28 +11,34 @@ namespace {
 namespace operand = common::operand;
 using operand::Range;
 
-constexpr char kContext[] = "markov_rnn_context";
-constexpr char kStep[]    = "markov_rnn_step";
-constexpr char kLogits[]  = "markov_logits_add_softcap";
+constexpr char kContext[]      = "markov_rnn_context";
+constexpr char kStep[]         = "markov_rnn_step";
+constexpr char kLogits[]       = "markov_logits_add_softcap";
+constexpr char kLogitsArgmax[] = "markov_logits_add_softcap_argmax";
 
 void validate_rank(int rank, const char* op) {
     if (rank <= 0 || rank % 16 || rank > std::numeric_limits<int>::max() / 3)
         throw std::invalid_argument(std::string(op) + ": invalid rank");
 }
 
-std::size_t context_partial_bytes(int h, int r, int steps, int batch) {
+std::size_t context_partial_bytes(int h, int r, int steps, int batch, bool capacity = false) {
     validate_rank(r, kContext);
     if (h <= 0 || h % 8 || steps <= 0 || batch <= 0)
         throw std::invalid_argument(std::string(kContext) + ": invalid context extents");
-    const auto k_tiles = 1 + (h - 1) / markov::kContextKTile;
-    auto bytes         = operand::bytes(3ULL * r * batch, sizeof(float), kContext);
-    bytes              = operand::bytes(std::uint64_t(steps) + 1, bytes, kContext);
-    return operand::bytes(k_tiles, bytes, kContext);
+    const std::uint64_t columns = std::uint64_t(steps) * batch;
+    const auto base             = operand::bytes(3ULL * r * batch, sizeof(float), kContext);
+    if (!capacity && columns >= markov::kContextLargeColumns) return base;
+    const auto k_tiles                = 1 + (h - 1) / markov::kContextKTile;
+    constexpr std::uint64_t max_small = markov::kContextLargeColumns - 1;
+    const auto small_columns =
+        std::min(columns, max_small) + std::min<std::uint64_t>(batch, max_small);
+    const auto partial = operand::bytes(small_columns, 3ULL * r * sizeof(float), kContext);
+    return std::max(base, operand::bytes(k_tiles, partial, kContext));
 }
 
 Range tensor_range(const Tensor& t, DType dtype, std::initializer_list<int> dims, const char* op,
-                   const char* name, Device device) {
-    operand::tensor(t, dtype, dims, 16, op, name, device);
+                   const char* name, Device device, std::size_t alignment = 16) {
+    operand::tensor(t, dtype, dims, alignment, op, name, device);
     return operand::range(t, op);
 }
 
@@ -63,11 +69,33 @@ void disjoint_unless_exact(Range output, Range input, const char* op) {
         operand::disjoint(output, input, op);
 }
 
+auto logits_inputs(const Tensor& latent, const Weight& weight, const Tensor& bias,
+                   const Tensor& base, int domain, float cap, const Tensor& live, const char* op,
+                   Device device) {
+    const int rank = latent.ne[0], batch = latent.ne[1], vocab = weight.n;
+    validate_rank(rank, op);
+    if (domain < 1 || domain > vocab || !(cap > 0) || !std::isfinite(cap))
+        throw std::invalid_argument(std::string(op) + ": invalid token domain or softcap");
+    return std::array{tensor_range(latent, DType::BF16, {rank, batch}, op, "latent", device),
+                      bf16_weight(weight, vocab, rank, op, "folded_weight", device),
+                      tensor_range(bias, DType::BF16, {vocab}, op, "folded_bias", device),
+                      mask_range(live, batch, op, device),
+                      tensor_range(base, DType::BF16, {vocab, batch}, op, "base_logits", device)};
+}
+
+std::size_t logit_partial_bytes(int domain, int batch) {
+    if (domain <= 0 || batch <= 0)
+        throw std::invalid_argument(std::string(kLogitsArgmax) + ": invalid extents");
+    const auto tiles = 1 + (domain - 1) / markov::kLogitTile;
+    return operand::bytes(std::uint64_t(tiles) * batch, sizeof(markov::LogitTileResult),
+                          kLogitsArgmax);
+}
+
 } // namespace
 
 std::size_t markov_rnn_context_workspace_capacity_bytes(int hidden, int rank, int max_steps,
                                                         int max_batch) {
-    const auto bytes = context_partial_bytes(hidden, rank, max_steps, max_batch);
+    const auto bytes = context_partial_bytes(hidden, rank, max_steps, max_batch, true);
     if (bytes > std::numeric_limits<std::size_t>::max() - 15)
         throw std::overflow_error(std::string(kContext) + ": workspace capacity overflows");
     return bytes + 15; // Cover alignment at any arena cursor.
@@ -139,24 +167,55 @@ void markov_logits_add_softcap(const Tensor& latent, const Weight& folded_weight
                                const Tensor& folded_bias, const Tensor& base_logits,
                                int token_domain, float softcap, const Tensor& live_rows,
                                Tensor& logits_out, CudaExecutionView execution) {
-    const int rank = latent.ne[0], batch = latent.ne[1], vocab = folded_weight.n;
-    validate_rank(rank, kLogits);
-    if (token_domain < 1 || token_domain > vocab || !(softcap > 0) || !std::isfinite(softcap))
-        throw std::invalid_argument(std::string(kLogits) + ": invalid token domain or softcap");
     const auto device = execution.device();
-    const std::array inputs{
-        tensor_range(latent, DType::BF16, {rank, batch}, kLogits, "latent", device),
-        bf16_weight(folded_weight, vocab, rank, kLogits, "folded_weight", device),
-        tensor_range(folded_bias, DType::BF16, {vocab}, kLogits, "folded_bias", device),
-        mask_range(live_rows, batch, kLogits, device)};
-    const auto base =
-        tensor_range(base_logits, DType::BF16, {vocab, batch}, kLogits, "base_logits", device);
-    const auto output =
-        tensor_range(logits_out, DType::BF16, {vocab, batch}, kLogits, "logits_out", device);
-    disjoint_unless_exact(output, base, kLogits);
-    for (const auto input : inputs) operand::disjoint(output, input, kLogits);
+    const auto inputs = logits_inputs(latent, folded_weight, folded_bias, base_logits, token_domain,
+                                      softcap, live_rows, kLogits, device);
+    const auto output = tensor_range(logits_out, DType::BF16, {folded_weight.n, latent.ne[1]},
+                                     kLogits, "logits_out", device);
+    disjoint_unless_exact(output, inputs.back(), kLogits);
+    for (std::size_t i = 0; i + 1 < inputs.size(); ++i)
+        operand::disjoint(output, inputs[i], kLogits);
     markov::launch_logits(latent, folded_weight, folded_bias, base_logits, token_domain, softcap,
                           live_rows, logits_out, execution);
+}
+
+std::size_t markov_logits_add_softcap_argmax_workspace_capacity_bytes(int max_domain,
+                                                                      int max_batch) {
+    const auto bytes       = logit_partial_bytes(max_domain, max_batch);
+    constexpr auto padding = alignof(markov::LogitTileResult) - 1;
+    if (bytes > std::numeric_limits<std::size_t>::max() - padding)
+        throw std::overflow_error(std::string(kLogitsArgmax) + ": workspace capacity overflows");
+    return bytes + padding;
+}
+
+void markov_logits_add_softcap_argmax(const Tensor& latent, const Weight& folded_weight,
+                                      const Tensor& folded_bias, const Tensor& base_logits,
+                                      int token_domain, float softcap, const Tensor& live_rows,
+                                      Tensor& ids, Tensor& probabilities, MemoryArena& workspace,
+                                      CudaExecutionView execution) {
+    const auto device = execution.device();
+    const auto inputs = logits_inputs(latent, folded_weight, folded_bias, base_logits, token_domain,
+                                      softcap, live_rows, kLogitsArgmax, device);
+    const int batch   = latent.ne[1];
+    const auto tokens = tensor_range(ids, DType::I32, {batch}, kLogitsArgmax, "ids", device, 4);
+    const auto probs  = tensor_range(probabilities, DType::FP32, {batch}, kLogitsArgmax,
+                                     "probabilities", device, 4);
+    operand::disjoint(tokens, probs, kLogitsArgmax);
+    operand::device(workspace.device(), device, kLogitsArgmax, "workspace");
+    auto scope          = workspace.scope();
+    const auto scratch  = workspace.alloc_bytes(logit_partial_bytes(token_domain, batch),
+                                                alignof(markov::LogitTileResult));
+    const auto writable = operand::range(scratch.data, scratch.bytes, kLogitsArgmax);
+    operand::disjoint(tokens, writable, kLogitsArgmax);
+    operand::disjoint(probs, writable, kLogitsArgmax);
+    for (const auto input : inputs) {
+        operand::disjoint(tokens, input, kLogitsArgmax);
+        operand::disjoint(probs, input, kLogitsArgmax);
+        operand::disjoint(writable, input, kLogitsArgmax);
+    }
+    markov::launch_logits_argmax(latent, folded_weight, folded_bias, base_logits, token_domain,
+                                 softcap, live_rows, ids, probabilities,
+                                 static_cast<markov::LogitTileResult*>(scratch.data), execution);
 }
 
 } // namespace ninfer::ops

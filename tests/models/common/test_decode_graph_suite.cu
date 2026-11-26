@@ -23,6 +23,8 @@ void require(bool condition, const char* message) {
 
 __global__ void add(unsigned* values, unsigned amount) { *values += amount; }
 
+__global__ void add_from(unsigned* output, const unsigned* input) { *output += *input; }
+
 struct Fixture {
     DeviceContext& device;
     DeviceBuffer storage{device.device(), 16 * sizeof(unsigned)};
@@ -396,6 +398,65 @@ void check_narrow_block_sharing(Fixture& f) {
     }
 }
 
+void check_resident_decision(Fixture& f) {
+    constexpr auto backend = SpeculativeBackend::DSpark;
+    const BatchExecutionPlan batches({1, 1, {1}});
+    const std::array widths{2U, 4U, 8U};
+    const DecodeGraphRoutes routes(batches, backend, 7, widths);
+    DecodeGraphSuite suite(f.device, f.workspace, backend, false);
+    PinnedHostBuffer readback(sizeof(unsigned));
+    auto* result = static_cast<unsigned*>(readback.data());
+    const std::array proposal_buckets{ContextBucket::K2};
+    const auto sampling = [&] {
+        add_from<<<1, 1, 0, f.device.stream()>>>(f.values + 2, f.values + 1);
+        CUDA_CHECK(cudaMemcpyAsync(result, f.values + 2, sizeof(unsigned), cudaMemcpyDeviceToHost,
+                                   f.device.stream()));
+    };
+    DecodeGraphBindings bindings;
+    bindings.stage = [&](const RoundRoute&) {
+        return TargetReplay{.proposal = {.buckets = proposal_buckets}};
+    };
+    bindings.proposal = [&](const RoundRoute& route) {
+        ProposalCapture capture;
+        capture.steps.emplace_back().forward.body =
+            [run = f.increment(0, route.head_columns)](const auto&) { run(); };
+        return capture;
+    };
+    bindings.target = [&](const RoundRoute& route) -> TargetCapture {
+        return ResidentTargetCapture{
+            .body =
+                [run = f.increment(1, route.width)](const auto&, const auto&, const auto& head,
+                                                    const auto&) {
+                    run();
+                    head();
+                },
+            .head     = f.increment(1, 100),
+            .decision = sampling};
+    };
+    bindings.decision = [&](const RoundRoute&) { sampling(); };
+    GraphPreparation preparation(f.device, GraphPreparationMode::Capture);
+    suite.prepare(batches, routes, preparation, bindings);
+    for (const auto& route : routes.at({1, 1})) {
+        for (const bool resident : {true, false, true}) {
+            f.clear();
+            *result = 12345;
+            const auto replay =
+                TargetReplay{.proposal = {.buckets = proposal_buckets}, .decision = resident};
+            require(suite.contains(route) &&
+                        suite.start_target(route, replay) == TargetProgress::Complete,
+                    "DSpark graph route was unavailable");
+            require(f.read(0) == route.width - 1 && f.read(1) == route.width + 100,
+                    "resident decision changed the proposal or target");
+            if (!resident) {
+                require(*result == 12345, "disabled decision wrote host output");
+                suite.decide(route);
+            }
+            require(f.read(2) == route.width + 100 && *result == route.width + 100,
+                    "decision ran outside the requested stage or before the target head");
+        }
+    }
+}
+
 struct LayerControl {
     bool active = false, ready = false, pending = false;
     unsigned starts = 0, cancels = 0;
@@ -515,9 +576,10 @@ void check_layered(Fixture& f) {
     capture.layers = {
         ReadoutCapture{{binding}, [emit = binding.capture](const auto& record) { record(emit); }},
         OffloadedLayerCapture{}, ReadoutCapture{{}, [&](const auto&) { f.increment(3)(); }}};
-    capture.hook       = InterLayerHookCapture{1, [&](std::uint32_t slot, CudaExecutionView cuda) {
-                                             add<<<1, 1, 0, cuda.stream()>>>(f.values + 2, 1 + slot);
-                                         }};
+    capture.hook =
+        InterLayerHookCapture{1, [&](std::uint32_t slot, CudaExecutionView cuda) {
+                                  add<<<1, 1, 0, cuda.stream()>>>(f.values + 2, 1 + slot);
+                              }};
     capture.suffix     = f.increment(4);
     capture.head       = f.increment(5);
     capture.after_head = [&] { timing.record_stop_external(); };
@@ -582,6 +644,7 @@ int main() {
         check_suite(fixture, SpeculativeBackend::Mtp, ProposalTopology::SplitProposal);
         check_physical_sharing(fixture);
         check_narrow_block_sharing(fixture);
+        check_resident_decision(fixture);
         check_layered(fixture);
         return 0;
     } catch (const std::exception& error) {

@@ -53,6 +53,7 @@ struct DSparkFrameLayout {
     TensorRegion prefill_aux, pending_aux;
     RaggedLayout swa_ragged;
     TensorRegion swa_source_indices, last_aux_indices;
+    TensorRegion initial_markov_state;
     TensorRegion draft_ids, draft_probabilities, target_ids;
     TensorRegion accepted_columns, last_columns;
     LayoutRegion commit_ingress;

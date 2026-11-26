@@ -52,7 +52,7 @@ struct ComputeFrame {
     GpuExecutionObservation gpu;
     AttentionWorkCounters attention;
     bool sequence = false, timed_prefill = false, counts_pending = false;
-    bool head_ready = false;
+    bool head_ready     = false;
     bool release_vision = false;
 
     [[nodiscard]] std::span<const std::uint32_t> sampling_members() const noexcept {
@@ -99,7 +99,7 @@ public:
                         const execution::FullAttentionSubmit& = {});
     [[nodiscard]] execution::TextRun text_run(const execution::BatchView&, execution::StateUpdate);
     void main_forward(const execution::BatchView&, execution::StateUpdate, Tensor hidden,
-                      const execution::FullAttentionSubmit& = {},
+                      const execution::FullAttentionSubmit&        = {},
                       std::optional<models::vision::EmbeddingView> = {});
     void project_head(Tensor hidden);
 
@@ -122,6 +122,7 @@ public:
     void copy_result(std::int32_t rows, int width, SampleKind kind = SampleKind::NextToken);
     [[nodiscard]] MemorySpan host_output(const TensorRegion&);
     void finish_forward();
+    void await_result();
     void request_decision();
     void decide();
     void sample(std::int32_t rows, SampleKind);

@@ -66,6 +66,8 @@ struct ResidentTargetCapture {
                        const StreamSectionRecorder& readback)>
         body;
     GraphBody head;
+    // Optional device-only decision after the body and its head section.
+    GraphBody decision;
 };
 
 struct OffloadedLayerCapture {
@@ -100,6 +102,7 @@ struct TargetReplay {
     bool readback              = false;
     std::int32_t active_tokens = 0;
     ProposalReplay proposal;
+    bool decision = false;
 };
 
 enum class TargetProgress { Complete, WaitingLayer, AwaitingHook };
@@ -114,7 +117,7 @@ private:
     std::optional<ProposalBody> proposal_;
     std::vector<ContextBucketSite> main_sites_;
     std::optional<SlotPatchSite> handoff_;
-    DecodeGraphSection head_, readback_;
+    DecodeGraphSection head_, readback_, decision_;
     GraphSegment graph_;
     ParallelExecution* parallel_ = nullptr;
 };

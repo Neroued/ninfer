@@ -52,6 +52,7 @@ Resources::Resources(ExecutionPlan input, DeviceContext& device)
     if (plan.frame.token_counts) clear(*plan.frame.token_counts, 0);
     if (plan.frame.dspark) {
         const auto& d = *plan.frame.dspark;
+        clear(d.initial_markov_state, 0);
         for (std::uint32_t b = 1; b <= plan.shape.max_concurrency; ++b) {
             for (std::uint32_t steps = 1; steps <= plan.shape.draft_tokens; ++steps) {
                 const auto index = (b - 1) * plan.shape.draft_tokens + steps - 1;

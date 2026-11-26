@@ -3,6 +3,7 @@
 #include "core/pdl.cuh"
 #include "ops/common/cuda/mma.cuh"
 #include "ops/common/cuda/pipeline.cuh"
+#include "ops/common/cuda/reduce.cuh"
 
 #include <algorithm>
 #include <cuda_bf16.h>
@@ -125,11 +126,11 @@ __global__ void context_partial(const __grid_constant__ Problem p) {
     auto* act       = reinterpret_cast<Bf16*>(storage);
     auto* reduction = reinterpret_cast<float*>(storage);
     pdl::trigger_dependents();
-    const auto cols     = p.columns();
-    const int row       = blockIdx.x * kRows;
-    const bool is_frnn  = static_cast<int>(blockIdx.z) >= p.hidden_tiles;
-    const int z_tile    = is_frnn ? static_cast<int>(blockIdx.z) - p.hidden_tiles : blockIdx.z;
-    const int z_stride  = is_frnn ? static_cast<int>(gridDim.z) - p.hidden_tiles : p.hidden_tiles;
+    const auto cols    = p.columns();
+    const int row      = blockIdx.x * kRows;
+    const bool is_frnn = static_cast<int>(blockIdx.z) >= p.hidden_tiles;
+    const int z_tile   = is_frnn ? static_cast<int>(blockIdx.z) - p.hidden_tiles : blockIdx.z;
+    const int z_stride = is_frnn ? static_cast<int>(gridDim.z) - p.hidden_tiles : p.hidden_tiles;
     for (int split = blockIdx.y; split < p.splits; split += gridDim.y) {
         auto* out    = p.partial + split * p.plane();
         const int k0 = split * kContextKTile;
@@ -142,6 +143,8 @@ __global__ void context_partial(const __grid_constant__ Problem p) {
         if (split + gridDim.y < p.splits) __syncthreads();
     }
 }
+
+constexpr int kFinishStepTile = 16;
 
 template <int Splits>
 __global__ void context_finish(const __grid_constant__ Problem p) {
@@ -161,22 +164,117 @@ __global__ void context_finish(const __grid_constant__ Problem p) {
         float base = 0.0f;
         if (step_lane == 0) base = reduce(p.partial + (p.columns() + b) * p.rows + c) + p.bias[c];
         base = __shfl_sync(0xffffffff, base, lane % kChannels);
-        for (std::int64_t s = step_lane; s < p.steps; s += kStepLanes) {
-            const auto* src                          = p.partial + (b * p.steps + s) * p.rows + c;
-            p.output[(s * p.batch + b) * p.rows + c] = base + reduce(src);
+        for (std::int64_t first = blockIdx.z * kFinishStepTile; first < p.steps;
+             first += gridDim.z * kFinishStepTile) {
+            const auto end = min(first + kFinishStepTile, std::int64_t(p.steps));
+            for (std::int64_t s = first + step_lane; s < end; s += kStepLanes) {
+                const auto* src = p.partial + (b * p.steps + s) * p.rows + c;
+                p.output[(s * p.batch + b) * p.rows + c] = base + reduce(src);
+            }
+        }
+    }
+}
+
+constexpr int kDenseK       = 64;
+constexpr int kDenseRows    = 32;
+constexpr int kDenseColumns = 32;
+
+__global__ void context_base(const __grid_constant__ Problem p) {
+    constexpr int warps = 4;
+    const int lane      = threadIdx.x % 32;
+    const int row       = blockIdx.x * warps + threadIdx.x / 32;
+    const auto* w       = p.w_frnn + std::int64_t(row) * p.h;
+    for (std::int64_t b = blockIdx.y; b < p.batch; b += gridDim.y) {
+        const auto* x = p.frnn + b * p.h;
+        float sum     = 0;
+        for (std::int64_t k = lane * 8; k < p.h; k += 256) {
+            const auto a        = common::load_vec<uint4>(x + k);
+            const auto z        = common::load_vec<uint4>(w + k);
+            const auto dot_pair = [](unsigned lhs, unsigned rhs, float acc) {
+                return fmaf(__uint_as_float(lhs & 0xffff0000U), __uint_as_float(rhs & 0xffff0000U),
+                            fmaf(__uint_as_float(lhs << 16), __uint_as_float(rhs << 16), acc));
+            };
+            sum = dot_pair(a.x, z.x, sum);
+            sum = dot_pair(a.y, z.y, sum);
+            sum = dot_pair(a.z, z.z, sum);
+            sum = dot_pair(a.w, z.w, sum);
+        }
+        sum = common::warp_reduce_sum(sum);
+        if (lane == 0) p.partial[b * p.rows + row] = p.bias[row] + sum;
+    }
+}
+
+__global__ void context_dense(const __grid_constant__ Problem p) {
+    __shared__ __align__(16) Bf16 weights[kDenseRows * kDenseK];
+    __shared__ __align__(16) Bf16 activations[kDenseColumns * kDenseK];
+    constexpr int vectors = kDenseK / 8;
+    const int tid = threadIdx.x, lane = tid % 32, warp = tid / 32;
+    const int row0  = blockIdx.x * kDenseRows;
+    const int a_row = (warp % 2) * 16 + (lane & 15), a_k = (lane >> 4) * 8;
+    const int x_row = (warp / 2) * 8 + (lane & 7), x_k = (lane & 8) ? 8 : 0;
+    const auto a_base = common::smem_addr(weights + a_row * kDenseK);
+    const auto x_base = common::smem_addr(activations + x_row * kDenseK);
+    for (std::int64_t col0 = std::int64_t(blockIdx.y) * kDenseColumns; col0 < p.columns();
+         col0 += std::int64_t(gridDim.y) * kDenseColumns) {
+        float4 sum{};
+        for (std::int64_t k0 = 0; k0 < p.h; k0 += kDenseK) {
+            const int r = tid / vectors, k = (tid % vectors) * 8;
+            const auto col         = col0 + r;
+            const bool weight_live = row0 + r < p.rows && k0 + k < p.h;
+            const bool input_live  = col < p.columns() && k0 + k < p.h;
+            const int swizzle      = common::swizzle_xor_64(r, k);
+            common::cp_async_zfill<16, Cache::cg>(
+                weights + r * kDenseK + swizzle,
+                p.w_hidden + (weight_live ? std::int64_t(row0 + r) * p.h + k0 + k : 0),
+                weight_live ? 16 : 0);
+            common::cp_async_zfill<16, Cache::cg>(activations + r * kDenseK + swizzle,
+                                                  p.hidden + (input_live ? col * p.h + k0 + k : 0),
+                                                  input_live ? 16 : 0);
+            common::cp_commit();
+            common::cp_wait<0>();
+            __syncthreads();
+#pragma unroll
+            for (int k_mma = 0; k_mma < kDenseK; k_mma += 16) {
+                unsigned a0, a1, a2, a3, b0, b1;
+                common::ldmatrix_x4(a0, a1, a2, a3,
+                                    a_base + 2 * common::swizzle_xor_64(a_row, k_mma + a_k));
+                common::ldmatrix_x2(b0, b1,
+                                    x_base + 2 * common::swizzle_xor_64(x_row, k_mma + x_k));
+                common::mma_bf16(sum.x, sum.y, sum.z, sum.w, a0, a1, a2, a3, b0, b1);
+            }
+            __syncthreads();
+        }
+        const auto quad = common::mma_row_quad(sum);
+        const int row   = row0 + (warp % 2) * 16 + quad.row;
+        const auto col  = col0 + (warp / 2) * 8 + quad.column;
+        if (row < p.rows && col < p.columns()) {
+            const auto b    = p.batch == 1 ? 0 : col / p.steps;
+            const auto s    = col - b * p.steps;
+            const auto base = common::load_vec<float4>(p.partial + b * p.rows + row);
+            common::store_vec(p.output + (s * p.batch + b) * p.rows + row,
+                              make_float4(quad.values.x + base.x, quad.values.y + base.y,
+                                          quad.values.z + base.z, quad.values.w + base.w));
         }
     }
 }
 
 void submit(Problem p, cudaStream_t stream) {
     const auto cols = std::uint64_t(p.batch) * p.steps;
+    if (cols >= kContextLargeColumns) {
+        const dim3 base(p.rows / 4, std::min(p.batch, 65535));
+        context_base<<<base, 128, 0, stream>>>(p);
+        const dim3 grid(1 + (p.rows - 1) / kDenseRows,
+                        std::min<std::uint64_t>(65535, 1 + (cols - 1) / kDenseColumns));
+        context_dense<<<grid, kThreads, 0, stream>>>(p);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     const auto launch_partial = [&]<int Columns>() {
         constexpr int kBaseColumns = Columns <= 32 ? Columns : 32;
         const int hidden_tiles =
             static_cast<int>(std::min<std::uint64_t>(32767, 1 + (cols - 1) / Columns));
-        const int frnn_tiles =
-            std::min(32767, 1 + (p.batch - 1) / kBaseColumns);
-        p.hidden_tiles = hidden_tiles;
+        const int frnn_tiles = std::min(32767, 1 + (p.batch - 1) / kBaseColumns);
+        p.hidden_tiles       = hidden_tiles;
         const dim3 grid(p.rows / kRows, std::min(p.splits, 65535), hidden_tiles + frnn_tiles);
         context_partial<Columns><<<grid, kThreads, 0, stream>>>(p);
     };
@@ -190,9 +288,10 @@ void submit(Problem p, cudaStream_t stream) {
         launch_partial.template operator()<64>();
     CUDA_CHECK(cudaGetLastError());
 
-    const dim3 finish(p.rows / 8, std::min(p.batch, 65535));
+    const dim3 finish(p.rows / 8, std::min(p.batch, 65535),
+                      std::min(65535, 1 + (p.steps - 1) / kFinishStepTile));
     cudaLaunchAttribute dependency{};
-    dependency.id                                         = cudaLaunchAttributeProgrammaticStreamSerialization;
+    dependency.id = cudaLaunchAttributeProgrammaticStreamSerialization;
     dependency.val.programmaticStreamSerializationAllowed = 1;
     cudaLaunchConfig_t config{};
     config.gridDim  = finish;

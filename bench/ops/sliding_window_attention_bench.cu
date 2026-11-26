@@ -233,10 +233,12 @@ public:
     Case(std::int32_t window, std::int32_t tokens, std::int32_t batch, std::int32_t context,
          const Options& options)
         : geometry_{kHeadDim, options.query_heads, options.kv_heads}, window_(window),
-          tokens_(tokens), batch_(batch), workload_(workload::generate_context_query_workload(
-                                              context, tokens, batch, options.workload)),
+          block_(window == 1024), tokens_(tokens), batch_(batch),
+          workload_(
+              workload::generate_context_query_workload(context, tokens, batch, options.workload)),
           bucket_(options.workload.select_bucket(workload_.max_visible_tokens)),
-          workspace_bytes_(ops::sliding_window_attention_workspace_capacity_bytes(
+          workspace_bytes_((block_ ? ops::block_sliding_window_attention_workspace_capacity_bytes
+                                   : ops::sliding_window_attention_workspace_capacity_bytes)(
               geometry_, window, bucket_, batch, tokens, tokens)),
           q_(bench::make_bf16(
               static_cast<std::size_t>(kHeadDim) * geometry_.query_heads * tokens * batch, 101U)),
@@ -244,8 +246,8 @@ public:
               static_cast<std::size_t>(kHeadDim) * geometry_.kv_heads * tokens * batch, 103U)),
           query_v_(bench::make_bf16(
               static_cast<std::size_t>(kHeadDim) * geometry_.kv_heads * tokens * batch, 105U)),
-          positions_(ninfer::bench::device_context().device(),
-                     static_cast<std::size_t>(tokens) * batch * sizeof(std::int32_t)),
+          sequence_(ninfer::bench::device_context().device(),
+                    static_cast<std::size_t>(block_ ? 1 : tokens) * batch * sizeof(std::int32_t)),
           valid_(ninfer::bench::device_context().device(),
                  static_cast<std::size_t>(batch) * sizeof(std::int32_t)),
           lane_(ninfer::bench::device_context().device(),
@@ -263,14 +265,16 @@ public:
                           {kHeadDim, geometry_.kv_heads, tokens, batch}),
           query_v_tensor_(query_v_.span(), DType::BF16,
                           {kHeadDim, geometry_.kv_heads, tokens, batch}),
-          positions_tensor_(positions_.span(), DType::I32, {tokens, batch}),
+          sequence_tensor_(sequence_.span(), DType::I32,
+                           block_ ? std::initializer_list<std::int32_t>{batch}
+                                  : std::initializer_list<std::int32_t>{tokens, batch}),
           valid_tensor_(valid_.span(), DType::I32, {batch}),
           lane_tensor_(lane_.span(), DType::I64, {batch}),
           output_tensor_(output_.span(), DType::BF16,
                          {kHeadDim, geometry_.query_heads, tokens, batch}),
           context_view_(
               make_context_view(context_k_, context_v_, window, lane_tensor_, geometry_.kv_heads)) {
-        std::vector<std::int32_t> host_positions(static_cast<std::size_t>(tokens) * batch);
+        std::vector<std::int32_t> host_sequence(block_ ? batch : static_cast<std::size_t>(tokens) * batch);
         const auto& valids  = workload_.valid_columns;
         const auto& lengths = workload_.lengths;
         std::vector<std::int64_t> host_lanes(static_cast<std::size_t>(batch));
@@ -278,12 +282,16 @@ public:
             live_columns_ += valids[row];
             host_lanes[row] =
                 valids[row] ? std::int64_t(row) * kHeadDim * window * geometry_.kv_heads * 2 : -1;
+            if (block_) {
+                host_sequence[row] = lengths[row];
+                continue;
+            }
             for (std::int32_t token = 0; token < tokens; ++token) {
-                host_positions[static_cast<std::size_t>(row) * tokens + token] =
+                host_sequence[static_cast<std::size_t>(row) * tokens + token] =
                     token < valids[row] ? lengths[row] + token : -1234567;
             }
         }
-        CUDA_CHECK(cudaMemcpy(positions_.data(), host_positions.data(), positions_.size(),
+        CUDA_CHECK(cudaMemcpy(sequence_.data(), host_sequence.data(), sequence_.size(),
                               cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(valid_.data(), valids.data(), valid_.size(), cudaMemcpyHostToDevice));
         CUDA_CHECK(
@@ -291,10 +299,11 @@ public:
     }
 
     void launch(CudaExecutionView cuda) {
-        ops::sliding_window_attention(q_tensor_, query_k_tensor_, query_v_tensor_,
-                                      positions_tensor_, valid_tensor_, geometry_,
-                                      static_cast<std::uint32_t>(window_), kScale, context_view_,
-                                      bucket_, workspace_, output_tensor_, cuda);
+        const auto attention =
+            block_ ? ops::block_sliding_window_attention : ops::sliding_window_attention;
+        attention(q_tensor_, query_k_tensor_, query_v_tensor_, sequence_tensor_, valid_tensor_,
+                  geometry_, static_cast<std::uint32_t>(window_), kScale, context_view_, bucket_,
+                  workspace_, output_tensor_, cuda);
     }
 
     [[nodiscard]] std::size_t workspace_bytes() const noexcept { return workspace_bytes_; }
@@ -307,11 +316,12 @@ public:
         double bytes = 2. * 128 * geometry_.query_heads * tokens_ * batch_ + 4. * batch_;
         for (int b = 0; b < batch_; ++b)
             if (workload_.valid_columns[b]) {
-                bytes +=
-                    4. * 128 * geometry_.kv_heads * std::min(workload_.lengths[b], window_ - 1) +
-                    (2. * 128 * geometry_.query_heads + 4. * 128 * geometry_.kv_heads + 4.) *
-                        workload_.valid_columns[b] +
-                    8;
+                bytes += 4. * 128 * geometry_.kv_heads *
+                             std::min(workload_.lengths[b], block_ ? window_ : window_ - 1) +
+                         (2. * 128 * geometry_.query_heads + 4. * 128 * geometry_.kv_heads +
+                          (block_ ? 0. : 4.)) *
+                             workload_.valid_columns[b] +
+                         8 + (block_ ? 4 : 0);
             }
         return bytes;
     }
@@ -320,13 +330,15 @@ public:
         std::int64_t keys = 0;
         for (int b = 0; b < batch_; ++b)
             for (int t = 0; t < workload_.valid_columns[b]; ++t)
-                keys += std::min(workload_.lengths[b], std::max(0, window_ - 1 - t)) +
+                keys += std::min(workload_.lengths[b],
+                                 block_ ? window_ : std::max(0, window_ - 1 - t)) +
                         workload_.valid_columns[b];
         return 4. * 128 * geometry_.query_heads * keys;
     }
 private:
     ops::AttentionHeadGeometry geometry_;
     std::int32_t window_;
+    bool block_;
     std::int32_t tokens_;
     std::int32_t batch_;
     workload::ContextQueryWorkload workload_;
@@ -336,7 +348,7 @@ private:
     DeviceBuffer q_;
     DeviceBuffer query_k_;
     DeviceBuffer query_v_;
-    DeviceBuffer positions_;
+    DeviceBuffer sequence_;
     DeviceBuffer valid_;
     DeviceBuffer lane_;
     DeviceBuffer context_k_;
@@ -347,7 +359,7 @@ private:
     Tensor q_tensor_;
     Tensor query_k_tensor_;
     Tensor query_v_tensor_;
-    Tensor positions_tensor_;
+    Tensor sequence_tensor_;
     Tensor valid_tensor_;
     Tensor lane_tensor_;
     Tensor output_tensor_;

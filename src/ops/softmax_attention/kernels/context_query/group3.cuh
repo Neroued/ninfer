@@ -38,14 +38,13 @@ __device__ __forceinline__ float group3_weight(float m, float maximum) {
     return m == -CUDART_INF_F ? 0.F : common::exp2_approx(m - maximum);
 }
 
-template <bool Paged>
 __device__ __forceinline__ int group3_length(const Group3Arguments& a, int batch) {
-    return a.lengths[std::int64_t(batch) * (Paged ? 1 : a.tokens)];
+    return a.lengths[batch];
 }
 
 template <bool Paged, int BlockKeys>
 __device__ __forceinline__ int group3_work_tiles(const Group3Arguments& a, int length) {
-    const int history = Paged ? length : min(length, a.window_mask);
+    const int history = Paged ? length : min(length, a.window_mask + 1);
     return (history + BlockKeys - 1) / BlockKeys + 1;
 }
 
@@ -75,7 +74,7 @@ struct Group3Pipeline {
         const int rows       = width * 3;
         const int batch_rows = width * kGroup3Heads;
         const int valid      = a.valid[batch];
-        const int length     = valid > 0 ? group3_length<Paged>(a, batch) : 0;
+        const int length     = valid > 0 ? group3_length(a, batch) : 0;
         if (valid <= 0 || valid > width || length < 0 || length > a.max_context) {
             if constexpr (Direct) {
                 auto* out = a.output + std::int64_t(batch_rows) * D * batch;
@@ -94,7 +93,7 @@ struct Group3Pipeline {
             return;
         }
 
-        const int history       = Paged ? length : min(length, a.window_mask);
+        const int history       = Paged ? length : min(length, a.window_mask + 1);
         const int context_start = length - history;
         const int total_tiles   = group3_work_tiles<Paged, BlockKeys>(a, length);
         const int active        = min(total_tiles, a.splits);
@@ -112,10 +111,6 @@ struct Group3Pipeline {
         const int row0      = warp_m * 16 + gid;
         const int row1      = row0 + 8;
         const int live_rows = valid * 3;
-        const int pos0 =
-            !Paged && row0 < live_rows ? a.lengths[std::int64_t(batch) * width + row0 / 3] : 0;
-        const int pos1 =
-            !Paged && row1 < live_rows ? a.lengths[std::int64_t(batch) * width + row1 / 3] : 0;
         const auto* q             = a.q + std::int64_t(batch_rows) * D * batch;
         const auto* qk            = a.query_k + std::int64_t(width * kGroup3KVHeads) * D * batch;
         const auto* qv            = a.query_v + std::int64_t(width * kGroup3KVHeads) * D * batch;
@@ -267,10 +262,7 @@ struct Group3Pipeline {
                 for (int j = 0; j < 4; ++j) {
                     const int c         = n * 8 + 2 * lid + j % 2;
                     const bool row_live = (j < 2 ? row0 : row1) < live_rows;
-                    const bool visible =
-                        Paged || is_query || key0 + c >= (j < 2 ? pos0 : pos1) - a.window_mask;
-                    s[n][j] =
-                        row_live && c < key_count && visible ? s[n][j] * log_scale : -CUDART_INF_F;
+                    s[n][j] = row_live && c < key_count ? s[n][j] * log_scale : -CUDART_INF_F;
                 }
                 next0 = fmaxf(next0, fmaxf(s[n][0], s[n][1]));
                 next1 = fmaxf(next1, fmaxf(s[n][2], s[n][3]));
@@ -424,7 +416,7 @@ __device__ __forceinline__ void group3_reduce_row(const Group3Arguments& a, int 
     const int valid       = a.valid[batch];
     const auto output_row = std::int64_t(batch) * (a.tokens * kGroup3Heads) + row;
     auto* output          = a.output + output_row * kGroup3D;
-    const int length      = token < valid ? group3_length<Paged>(a, batch) : 0;
+    const int length      = token < valid ? group3_length(a, batch) : 0;
     if (valid > a.tokens || token >= valid || length < 0 || length > a.max_context) {
         if (lane < 16) {
             if constexpr (Aligned) {

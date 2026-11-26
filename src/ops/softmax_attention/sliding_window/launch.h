@@ -7,8 +7,16 @@ namespace ninfer::ops::detail {
 void launch_sliding_window_attention(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
                                      const Tensor& positions, const Tensor& valid_columns,
                                      float scale, const ConstCyclicKVCacheLayerView& context,
-                                     const SlidingWindowAttentionPlan& plan, Tensor& partial_acc,
+                                     const SlidingWindowLaunchShape& plan, Tensor& partial_acc,
                                      Tensor& partial_m, Tensor& partial_l, Tensor& out,
                                      cudaStream_t stream);
+
+void launch_block_sliding_window_attention(const Tensor& q, const Tensor& query_k,
+                                           const Tensor& query_v, const Tensor& context_lengths,
+                                           const Tensor& valid_columns, float scale,
+                                           const ConstCyclicKVCacheLayerView& context,
+                                           const BlockSlidingWindowAttentionPlan& plan,
+                                           Tensor& partial_acc, Tensor& partial_m,
+                                           Tensor& partial_l, Tensor& out, cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

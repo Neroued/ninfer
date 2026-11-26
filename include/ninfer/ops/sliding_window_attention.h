@@ -25,7 +25,7 @@ namespace ninfer::ops {
  * Symmetric non-causal sliding-window grouped-query attention.
  *
  * Registered profiles are D=128, (Hq,Hkv)=(32,8) with window/cyclic capacity 2048 or 4096,
- * (16,4) with capacity 2048, and (24,8) with capacity 1024. All use
+ * (16,4) with capacity 2048. All use
  * scale=1/sqrt(128), T=1..16, B>0.
  * q/out are contiguous BF16 [128,Hq,T,B], query_k/query_v are contiguous BF16 [128,Hkv,T,B],
  * positions is contiguous Device I32 [T,B], and Context K/V select dense
@@ -68,6 +68,40 @@ void sliding_window_attention(const Tensor& q, const Tensor& query_k, const Tens
  * size. Invalid profiles or ranges throw.
  */
 [[nodiscard]] std::size_t sliding_window_attention_workspace_capacity_bytes(
+    AttentionHeadGeometry geometry, std::uint32_t window, ContextBucketRange buckets,
+    std::int32_t batch_size, std::int32_t min_tokens, std::int32_t max_tokens);
+
+// Equal profiles permit capture reuse at fixed operands and workspace. Device context lengths,
+// valid columns and record offsets remain replay inputs.
+[[nodiscard]] OpGraphProfile
+block_sliding_window_attention_graph_profile(AttentionHeadGeometry geometry, std::uint32_t window,
+                                             ContextBucket bucket, std::int32_t batch_size,
+                                             std::int32_t tokens);
+
+/**
+ * Non-causal block-wide cyclic sliding-window attention with D=128, (Hq,Hkv)=(24,8),
+ * window=1024, scale=1/sqrt(128), T=1..16, B>0 and buckets K2 through M1.
+ *
+ * q, query_k, query_v, valid_columns, context, out and workspace have the same layouts,
+ * representations and aliasing requirements as sliding_window_attention. context_lengths is
+ * contiguous Device I32 [B]. In a live row b with V=valid_columns[b]>0 and L=context_lengths[b],
+ * every query i<V attends to committed keys at [max(0,L-window),L) (stored at p mod window)
+ * and all V temporary keys at query columns [0,V). The grouped-head mapping and softmax formula
+ * are the same as in sliding_window_attention. Columns i>=V produce exact BF16 zero. When V=0,
+ * the op reads only the row's valid count, with no reads from context_lengths, Q, K, V or offsets.
+ *
+ * For every live row the caller supplies 0<=L, 1<=V<=T and L+V<=context_bucket_tokens(bucket)
+ * and the selected records must contain the committed interval.
+ */
+void block_sliding_window_attention(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
+                                    const Tensor& context_lengths, const Tensor& valid_columns,
+                                    AttentionHeadGeometry geometry, std::uint32_t window,
+                                    float scale, const ConstCyclicKVCacheLayerView& context,
+                                    ContextBucket bucket, MemoryArena& workspace, Tensor& out,
+                                    CudaExecutionView execution);
+
+/** Return transient capacity for the inclusive bucket and T ranges at the exact batch size. */
+[[nodiscard]] std::size_t block_sliding_window_attention_workspace_capacity_bytes(
     AttentionHeadGeometry geometry, std::uint32_t window, ContextBucketRange buckets,
     std::int32_t batch_size, std::int32_t min_tokens, std::int32_t max_tokens);
 

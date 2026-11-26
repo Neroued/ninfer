@@ -58,7 +58,24 @@ struct Cache {
     int window, padded, kv_heads;
     bool boundary;
 
-    int query_heads() const { return kv_heads * (window == 1024 ? 3 : 4); }
+    bool block() const { return window == 1024; }
+
+    int query_heads() const { return kv_heads * (block() ? 3 : 4); }
+
+    void set_block_boundary(int length) {
+        std::fill(v.begin(), v.end(), 0.F);
+        // The oldest key has a distinctive value in every head and lane. Once wrapped,
+        // slot zero contains position 1024, with a different value than position zero.
+        for (int lane = 0; lane < Lanes; ++lane)
+            for (int head = 0; head < kv_heads; ++head)
+                for (int d = 0; d < D; ++d) {
+                    v[index(lane, head, length - window, d)] = 512.F;
+                    if (length > window) v[index(lane, head, window, d)] = 128.F;
+                }
+        v_bits = fp16_bits(v);
+        device_v.copy_from_host(v_bits.data(), v_bits.size() * 2);
+    }
+
     std::vector<float> k, v;
     std::vector<std::uint16_t> k_bits, v_bits;
     GuardedDeviceBuffer device_k, device_v;
@@ -121,11 +138,11 @@ struct Cache {
     }
 };
 
-// One naive FP64 oracle for all cache windows, every route, and every execution mode. The
-// cached interval and |key_position-query_position| predicate come from the public formula.
+// FP64 oracle over the committed interval and the full temporary block. The symmetric
+// operation additionally filters by absolute key/query distance.
 std::vector<double> oracle(const Cache& cache, int width, int batch, const std::vector<float>& q,
                            const std::vector<float>& qk, const std::vector<float>& qv,
-                           const std::vector<int>& positions, const std::vector<int>& valid,
+                           const std::vector<int>& lengths, const std::vector<int>& valid,
                            const std::vector<int>& lanes) {
     const int Hkv = cache.kv_heads, Hq = cache.query_heads();
     const ops::AttentionHeadGeometry geometry{D, Hq, Hkv};
@@ -134,11 +151,11 @@ std::vector<double> oracle(const Cache& cache, int width, int batch, const std::
         batch, std::uint64_t(batch) * width * cache.window * D * Hq, [&](int first, int last) {
             for (int b = first; b < last; ++b) {
                 if (valid[b] == 0) continue;
-                const int length        = positions[b * width];
+                const int length        = lengths[b];
                 const int start         = std::max(0, length - cache.window);
                 const int context_count = length - start;
                 for (int token = 0; token < valid[b]; ++token) {
-                    const int p = positions[b * width + token];
+                    const int p = length + token;
                     naive_dense_softmax_attention(
                         geometry, 1, context_count + valid[b], static_cast<double>(Scale),
                         [&](int d, int h, int) {
@@ -171,10 +188,10 @@ std::vector<double> oracle(const Cache& cache, int width, int batch, const std::
                                                 d]);
                         },
                         [&](int, int key) {
-                            const int kp = key < context_count
-                                               ? start + key
-                                               : positions[b * width + key - context_count];
-                            return std::abs(static_cast<std::int64_t>(kp) - p) < cache.window;
+                            const int kp =
+                                key < context_count ? start + key : length + key - context_count;
+                            return cache.block() ||
+                                   std::abs(static_cast<std::int64_t>(kp) - p) < cache.window;
                         },
                         [&](int d, int h, int, double value) {
                             out[((static_cast<std::size_t>(b) * width + token) * Hq + h) * D + d] =
@@ -227,24 +244,31 @@ int run_case(Cache& cache, int width, int batch, int base_context, ContextBucket
     }
     const ContextBucketRange buckets =
         cross_bucket ? ContextBucketRange{ContextBucket::K2, ContextBucket::M1} : initial_bucket;
-    const auto capacity = ops::sliding_window_attention_workspace_capacity_bytes(
-        geometry, cache.window, buckets, batch, width, width);
+    const auto capacity_query = cache.block()
+                                    ? ops::block_sliding_window_attention_workspace_capacity_bytes
+                                    : ops::sliding_window_attention_workspace_capacity_bytes;
+    const auto capacity = capacity_query(geometry, cache.window, buckets, batch, width, width);
+    auto sequence       = cache.block() ? lengths : positions;
     GuardedDeviceBuffer scratch(std::max<std::size_t>(capacity, 1));
     MemoryArena workspace(scratch.span().subspan(0, std::max<std::size_t>(capacity, 1)));
     GuardedDeviceBuffer dq(q_count * 2), dk(kv_count * 2), dv(kv_count * 2),
-        dp(positions.size() * 4), dvalid(batch * 4), dlane(batch * 8), output(q_count * 2);
+        dp(sequence.size() * 4), dvalid(batch * 4), dlane(batch * 8), output(q_count * 2);
     Tensor tq(dq.span(), DType::BF16, {D, Hq, width, batch}),
         tk(dk.span(), DType::BF16, {D, Hkv, width, batch}),
         tv(dv.span(), DType::BF16, {D, Hkv, width, batch});
-    Tensor tp(dp.span(), DType::I32, {width, batch}), tvalid(dvalid.span(), DType::I32, {batch}),
-        tlane(dlane.span(), DType::I64, {batch}),
+    Tensor tp(dp.span(), DType::I32,
+              cache.block() ? std::initializer_list<std::int32_t>{batch}
+                            : std::initializer_list<std::int32_t>{width, batch}),
+        tvalid(dvalid.span(), DType::I32, {batch}), tlane(dlane.span(), DType::I64, {batch}),
         to(output.span(), DType::BF16, {D, Hq, width, batch});
     auto context = cache.view(tlane);
     DeviceContext device;
     const auto execution = device.execution_view();
     const auto launch    = [&](ContextBucket bucket, CudaExecutionView cuda) {
-        ops::sliding_window_attention(tq, tk, tv, tp, tvalid, geometry, cache.window, Scale,
-                                         context, bucket, workspace, to, cuda);
+        const auto attention =
+            cache.block() ? ops::block_sliding_window_attention : ops::sliding_window_attention;
+        attention(tq, tk, tv, tp, tvalid, geometry, cache.window, Scale, context, bucket, workspace,
+                     to, cuda);
     };
     DecodeGraphDefinition definition;
     DecodeGraphExecutable graph;
@@ -255,8 +279,9 @@ int run_case(Cache& cache, int width, int batch, int base_context, ContextBucket
     int failures = 0;
     if (cross_bucket) {
         const auto profile = [&](ContextBucket bucket) {
-            return ops::sliding_window_attention_graph_profile(geometry, cache.window, bucket,
-                                                               batch, width);
+            const auto query = cache.block() ? ops::block_sliding_window_attention_graph_profile
+                                             : ops::sliding_window_attention_graph_profile;
+            return query(geometry, cache.window, bucket, batch, width);
         };
         const auto first  = profile(ContextBucket::K2);
         const auto second = profile(ContextBucket::K8);
@@ -315,7 +340,11 @@ int run_case(Cache& cache, int width, int batch, int base_context, ContextBucket
         dq.copy_from_host(q_bits.data(), q_bits.size() * 2);
         dk.copy_from_host(k_bits.data(), k_bits.size() * 2);
         dv.copy_from_host(v_bits.data(), v_bits.size() * 2);
-        dp.copy_from_host(positions.data(), positions.size() * 4);
+        sequence = cache.block() ? lengths : positions;
+        if (cache.block())
+            for (int b = 0; b < batch; ++b)
+                if (!valid[b]) sequence[b] = -1234567;
+        dp.copy_from_host(sequence.data(), sequence.size() * 4);
         dvalid.copy_from_host(valid.data(), batch * 4);
         auto offsets = cache.key_state->record_offsets(lanes);
         for (int b = 0; b < batch; ++b)
@@ -328,7 +357,7 @@ int run_case(Cache& cache, int width, int batch, int base_context, ContextBucket
             definition.capture(device.stream(), [&] { launch(bucket, execution); });
             graph.instantiate(definition);
         }
-        const auto expected = oracle(cache, width, batch, q, qk, value, positions, valid, lanes);
+        const auto expected     = oracle(cache, width, batch, q, qk, value, lengths, valid, lanes);
         const std::string label = "SWA window=" + std::to_string(cache.window) +
                                   " W=" + std::to_string(width) + " B=" + std::to_string(batch) +
                                   " L=" + std::to_string(base_context) +
@@ -340,6 +369,19 @@ int run_case(Cache& cache, int width, int batch, int base_context, ContextBucket
             const auto out_bits = from_device<std::uint16_t>(output.data(), q_count);
             failures += verify_reduction(check, from_device_bf16(output.data(), q_count), expected,
                                          Criterion);
+            if (cache.block() && cache.boundary && phase == 0) {
+                // Zero logits give every key equal weight. Check the oldest key's
+                // contribution at every query, including the anchor and the last column.
+                const double sum = 512. + (base_context > cache.window ? 128. : 0.) + 64.;
+                const auto expected_word = bf16_bits(
+                    {static_cast<float>(sum / (cache.window + width))}).front();
+                for (int i = 0; i < batch * width; ++i)
+                    if (out_bits[i * Hq * D] != expected_word) {
+                        std::cerr << check << ": oldest-key sentinel mismatch at column " << i
+                                  << '\n';
+                        ++failures;
+                    }
+            }
             for (int b = 0; b < batch; ++b) {
                 const auto begin =
                     out_bits.begin() + (static_cast<std::ptrdiff_t>(b) * width + valid[b]) * Hq * D;
@@ -376,15 +418,15 @@ int run_case(Cache& cache, int width, int batch, int base_context, ContextBucket
                                  from_device<std::uint16_t>(dk.data(), kv_count), k_bits);
         failures += verify_exact((label + " query V unchanged").c_str(),
                                  from_device<std::uint16_t>(dv.data(), kv_count), v_bits);
-        failures += verify_exact((label + " positions unchanged").c_str(),
-                                 from_device<int>(dp.data(), positions.size()), positions);
+        failures += verify_exact((label + " sequence metadata unchanged").c_str(),
+                                 from_device<int>(dp.data(), sequence.size()), sequence);
         failures += verify_exact((label + " valid unchanged").c_str(),
                                  from_device<int>(dvalid.data(), batch), valid);
         failures += verify_exact((label + " lanes unchanged").c_str(),
                                  from_device<std::int64_t>(dlane.data(), batch), offsets);
     }
     failures += dq.verify_guards("Q guards") + dk.verify_guards("query K guards") +
-                dv.verify_guards("query V guards") + dp.verify_guards("positions guards") +
+                dv.verify_guards("query V guards") + dp.verify_guards("sequence metadata guards") +
                 dvalid.verify_guards("valid guards") + dlane.verify_guards("lanes guards");
     return failures;
 }
@@ -485,6 +527,7 @@ int main(int argc, char** argv) {
         add(group3, width, 4, 1031, Prefix::Mixed, true);
     }
     for (int width : {2, 8, 16}) add({1024, true}, width, 1, 1024, Prefix::Full, true);
+    for (int length : {1025, 1031}) add({1024, true}, 8, 1, length, Prefix::Full, true);
     add(group3, 8, 8, 1023, Prefix::Mixed, true);
     add(group3, 16, 16, 128, Prefix::Mixed, true);
     add(group3, 8, 1, 1031, Prefix::Zero, true);
@@ -507,6 +550,7 @@ int main(int argc, char** argv) {
             int failures = 0;
             for (auto i : selected) {
                 auto c = cases[i];
+                if (cache.block() && boundary) cache.set_block_boundary(c.context);
                 failures +=
                     run_case(cache, c.width, c.batch, c.context, c.bucket, c.prefix, c.graph);
             }
@@ -537,16 +581,17 @@ int main(int argc, char** argv) {
              {std::tuple{16, 4, 2048}, {32, 8, 2048}, {24, 8, 1024}})
             for (int batch = 1; batch <= 8; ++batch) {
                 const ops::AttentionHeadGeometry geometry{D, query_heads, heads};
+                const auto capacity =
+                    window == 1024 ? ops::block_sliding_window_attention_workspace_capacity_bytes
+                                   : ops::sliding_window_attention_workspace_capacity_bytes;
                 for (auto [lo, hi] : {std::pair{1, 16}, {4, 5}, {8, 9}}) {
                     std::size_t peak = 0;
                     buckets.for_each([&](ContextBucket bucket) {
                         for (int width = lo; width <= hi; ++width)
-                            peak = std::max(peak,
-                                            ops::sliding_window_attention_workspace_capacity_bytes(
-                                                geometry, window, bucket, batch, width, width));
+                            peak = std::max(
+                                peak, capacity(geometry, window, bucket, batch, width, width));
                     });
-                    failures += peak != ops::sliding_window_attention_workspace_capacity_bytes(
-                                            geometry, window, buckets, batch, lo, hi);
+                    failures += peak != capacity(geometry, window, buckets, batch, lo, hi);
                 }
             }
         const auto reject = [&](auto&& fn) {
@@ -570,6 +615,22 @@ int main(int argc, char** argv) {
         reject([&] {
             (void)ops::sliding_window_attention_graph_profile(
                 geometry, 2048, static_cast<ContextBucket>(255), 1, 8);
+        });
+        reject([&] {
+            (void)ops::sliding_window_attention_graph_profile({D, 24, 8}, 1024, ContextBucket::K2,
+                                                              1, 8);
+        });
+        reject([&] {
+            (void)ops::block_sliding_window_attention_graph_profile(geometry, 2048,
+                                                                    ContextBucket::K2, 1, 8);
+        });
+        reject([&] {
+            (void)ops::sliding_window_attention_workspace_capacity_bytes({D, 24, 8}, 1024, buckets,
+                                                                         1, 1, 16);
+        });
+        reject([&] {
+            (void)ops::block_sliding_window_attention_workspace_capacity_bytes(geometry, 2048,
+                                                                               buckets, 1, 1, 16);
         });
         if (failures) std::cerr << "SWA workspace or profile validation failed\n";
         return failures;

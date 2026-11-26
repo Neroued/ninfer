@@ -7,18 +7,26 @@ namespace ninfer::ops::detail {
 
 inline constexpr std::int32_t kSlidingWindowMaxSplits = 32;
 
-struct SlidingWindowAttentionPlan {
+struct SlidingWindowLaunchShape {
     AttentionHeadGeometry geometry;
     std::int32_t tokens;
     std::int32_t reduce_warps;
     std::int32_t split_capacity;
     std::int32_t max_context;
     std::int32_t window;
-    Group3Schedule group3_schedule;
 };
 
-[[nodiscard]] SlidingWindowAttentionPlan
+struct BlockSlidingWindowAttentionPlan : SlidingWindowLaunchShape {
+    Group3Schedule schedule;
+};
+
+[[nodiscard]] SlidingWindowLaunchShape
 select_sliding_window_attention_plan(AttentionHeadGeometry geometry, std::uint32_t window,
                                      ContextBucket bucket, std::int32_t batch, std::int32_t tokens);
+
+[[nodiscard]] BlockSlidingWindowAttentionPlan
+select_block_sliding_window_attention_plan(AttentionHeadGeometry geometry, std::uint32_t window,
+                                           ContextBucket bucket, std::int32_t batch,
+                                           std::int32_t tokens);
 
 } // namespace ninfer::ops::detail

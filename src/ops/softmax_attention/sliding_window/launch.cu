@@ -52,35 +52,9 @@ void dispatch_tokens(std::int32_t tokens, Launch&& launch) {
 void launch_sliding_window_attention(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
                                      const Tensor& positions, const Tensor& valid_columns,
                                      float scale, const ConstCyclicKVCacheLayerView& context,
-                                     const SlidingWindowAttentionPlan& plan, Tensor& partial_acc,
+                                     const SlidingWindowLaunchShape& plan, Tensor& partial_acc,
                                      Tensor& partial_m, Tensor& partial_l, Tensor& out,
                                      cudaStream_t stream) {
-    if (plan.geometry.query_heads == 24) {
-        Group3Arguments args{
-            .q             = static_cast<const __nv_bfloat16*>(q.data),
-            .query_k       = static_cast<const __nv_bfloat16*>(query_k.data),
-            .query_v       = static_cast<const __nv_bfloat16*>(query_v.data),
-            .lengths       = static_cast<const std::int32_t*>(positions.data),
-            .valid         = static_cast<const std::int32_t*>(valid_columns.data),
-            .key_offsets   = static_cast<const std::int64_t*>(context.k.records.byte_offsets.data),
-            .value_offsets = static_cast<const std::int64_t*>(context.v.records.byte_offsets.data),
-            .context_k     = common::operand::state_field_base<const __nv_bfloat16>(context.k),
-            .context_v     = common::operand::state_field_base<const __half>(context.v),
-            .record_extent = static_cast<int>(context.padded_capacity),
-            .window_mask   = plan.window - 1,
-            .max_context   = plan.max_context,
-            .splits        = plan.split_capacity,
-            .tokens        = plan.tokens,
-            .scale         = scale,
-            .partial       = static_cast<__half*>(partial_acc.data),
-            .maxima        = static_cast<float*>(partial_m.data),
-            .normalizers   = static_cast<float*>(partial_l.data),
-            .output        = static_cast<__nv_bfloat16*>(out.data),
-        };
-        launch_group3<false>(args, q.ne[3], plan.group3_schedule, plan.reduce_warps, stream);
-        return;
-    }
-
     const bool direct = plan.split_capacity == 1;
     if ((plan.window != 2048 && plan.window != 4096) ||
         context.capacity != static_cast<std::uint32_t>(plan.window) ||
@@ -145,6 +119,37 @@ void launch_sliding_window_attention(const Tensor& q, const Tensor& query_k, con
         geometry.template operator()<4>();
     else
         geometry.template operator()<8>();
+}
+
+void launch_block_sliding_window_attention(const Tensor& q, const Tensor& query_k,
+                                           const Tensor& query_v, const Tensor& context_lengths,
+                                           const Tensor& valid_columns, float scale,
+                                           const ConstCyclicKVCacheLayerView& context,
+                                           const BlockSlidingWindowAttentionPlan& plan,
+                                           Tensor& partial_acc, Tensor& partial_m,
+                                           Tensor& partial_l, Tensor& out, cudaStream_t stream) {
+    Group3Arguments args{
+        .q             = static_cast<const __nv_bfloat16*>(q.data),
+        .query_k       = static_cast<const __nv_bfloat16*>(query_k.data),
+        .query_v       = static_cast<const __nv_bfloat16*>(query_v.data),
+        .lengths       = static_cast<const std::int32_t*>(context_lengths.data),
+        .valid         = static_cast<const std::int32_t*>(valid_columns.data),
+        .key_offsets   = static_cast<const std::int64_t*>(context.k.records.byte_offsets.data),
+        .value_offsets = static_cast<const std::int64_t*>(context.v.records.byte_offsets.data),
+        .context_k     = common::operand::state_field_base<const __nv_bfloat16>(context.k),
+        .context_v     = common::operand::state_field_base<const __half>(context.v),
+        .record_extent = static_cast<int>(context.padded_capacity),
+        .window_mask   = plan.window - 1,
+        .max_context   = plan.max_context,
+        .splits        = plan.split_capacity,
+        .tokens        = plan.tokens,
+        .scale         = scale,
+        .partial       = static_cast<__half*>(partial_acc.data),
+        .maxima        = static_cast<float*>(partial_m.data),
+        .normalizers   = static_cast<float*>(partial_l.data),
+        .output        = static_cast<__nv_bfloat16*>(out.data),
+    };
+    launch_group3<false>(args, q.ne[3], plan.schedule, plan.reduce_warps, stream);
 }
 
 } // namespace ninfer::ops::detail

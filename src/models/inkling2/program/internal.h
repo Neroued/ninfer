@@ -1,0 +1,148 @@
+#pragma once
+
+#include "models/common/graph/suite.h"
+#include "models/inkling2/execution/text.h"
+#include "models/inkling2/program/program.h"
+#include "ninfer/ops/sampling.h"
+#include "runtime/observability/gpu_timing.h"
+
+#include <deque>
+#include <memory>
+#include <optional>
+#include <vector>
+
+namespace ninfer::models::inkling2::detail {
+class GraphInputs;
+
+enum class ComputePhase {
+    Forward,
+    AwaitForward,
+    Decision,
+    AwaitResult,
+    Score,
+    AwaitScore,
+    PendingCommit,
+    Retiring
+};
+
+struct PackedPrefill {
+    execution::PackedPrefillUpdate update;
+    std::vector<std::uint32_t> sampled_members;
+};
+
+struct ComputeFrame {
+    runtime::ExecutionRequest<ExecutionTypes> request;
+    runtime::CommandSequence retirement;
+    ComputePhase phase = ComputePhase::Forward;
+    ComputeResult result;
+    std::optional<runtime::DecisionRequest> requested;
+    std::optional<runtime::DecisionInput> decision;
+    std::optional<WorkRow> window;
+    std::optional<PackedPrefill> packed;
+    ops::RaggedSequenceView sequence_ragged;
+    BatchPlan physical;
+    std::optional<speculative::RoundRoute> graph_route;
+    std::uint32_t control_row = 0, control_offset = 0, tokens = 0;
+    std::uint32_t score_at = 0, score_count = 0;
+    std::vector<float> logprobs;
+    execution::BatchView batch;
+    Tensor hidden;
+    Tensor sampled_hidden;
+    GpuExecutionObservation gpu;
+    AttentionWorkCounters attention;
+    bool sequence = false, timed_prefill = false, counts_pending = false;
+    bool head_ready = false;
+
+    [[nodiscard]] std::span<const std::uint32_t> sampling_members() const noexcept {
+        return packed ? packed->sampled_members : physical.members;
+    }
+};
+
+struct ContextFrame {
+    runtime::ExecutionRequest<ExecutionTypes> request;
+    bool submitted = false;
+};
+
+class RankProgramImpl {
+public:
+    RankProgramImpl(const execution::Parameters&, std::unique_ptr<Resources>, DeviceContext&);
+    ~RankProgramImpl();
+
+    void validate_work(const Work&, runtime::FrameKind) const;
+    void start(runtime::ExecutionRequest<ExecutionTypes>&&);
+    void validate_decision(runtime::ExecutionTicket, const runtime::DecisionInput&) const;
+    void supply(runtime::ExecutionTicket, runtime::CommandSequence, runtime::DecisionInput&&);
+    void prepare_commit(runtime::ExecutionTicket, const Commit&) const;
+    void commit(runtime::ExecutionTicket, runtime::CommandSequence, Commit&&);
+    void discard(runtime::ExecutionTicket, runtime::CommandSequence);
+    [[nodiscard]] bool can_discard(runtime::ExecutionTicket) const;
+    [[nodiscard]] std::optional<runtime::ExecutionEvent<ExecutionTypes>> poll();
+    void drain();
+
+    void advance_compute();
+    void advance_context();
+    void forward();
+    void forward_packed_prefill(const ForwardWork&);
+    GraphPreparationSample prepare_graphs(GraphPreparationMode);
+    void release_graphs();
+
+    void execute_target(const execution::BatchView&, bool head);
+    void begin_target(const execution::BatchView&, bool capture);
+    [[nodiscard]] Tensor target_hidden(const execution::BatchView&);
+    void target_forward(const execution::BatchView&, Tensor hidden,
+                        const execution::FullAttentionSubmit& = {});
+    [[nodiscard]] execution::TextRun text_run(const execution::BatchView&, execution::StateUpdate);
+    void main_forward(const execution::BatchView&, execution::StateUpdate, Tensor hidden,
+                      const execution::FullAttentionSubmit& = {});
+    void project_head(Tensor hidden);
+
+    void copy_result(std::int32_t rows);
+    void finish_forward();
+    void request_decision();
+    void decide();
+    void sample(std::int32_t rows, SampleKind);
+    void score();
+    void result();
+    void control_counts();
+
+    void prepare_inputs(std::span<const WorkRow>, const BatchPlan&, std::uint32_t tokens);
+    void prepare_packed_inputs(const ForwardWork&);
+    [[nodiscard]] ops::RaggedSequenceView upload_ragged(const RaggedLayout&, std::int32_t segments);
+    void set_sampling_config(const WorkRow&, std::int32_t slot);
+    void upload_sampling();
+    [[nodiscard]] execution::BatchView decode_batch(std::int32_t tokens, std::int32_t rows,
+                                                    std::uint32_t visible);
+    void select_frame(PhysicalBatchShape);
+    [[nodiscard]] Tensor row(const TensorRegion&, std::int32_t rows);
+    [[nodiscard]] MemorySpan host_region(const LayoutRegion&);
+    [[nodiscard]] Tensor host(const TensorRegion&);
+    void upload_region(const LayoutRegion&, std::size_t bytes);
+
+    [[nodiscard]] WorkContract contract() const;
+    [[nodiscard]] RankExecutionObservation observation() const;
+    [[nodiscard]] RankMemoryUsage memory() const;
+    [[nodiscard]] RankMemoryBudget budget() const;
+    void reset_peaks();
+
+    const execution::Parameters& parameters;
+    DeviceContext& device;
+    CudaExecutionView cuda;
+    std::unique_ptr<Resources> owner;
+    Resources& resources;
+    const ExecutionShape shape;
+    FrameLayout frame;
+    std::unique_ptr<GraphInputs> graph_inputs;
+    std::unique_ptr<models::DecodeGraphSuite> graphs;
+    GraphMemorySummary graph_memory;
+    std::unique_ptr<ComputeFrame> compute;
+    std::unique_ptr<ContextFrame> context;
+    std::vector<std::optional<runtime::ExecutionMember>> bindings;
+    std::deque<runtime::ExecutionEvent<ExecutionTypes>> events;
+    runtime::ExecutionGpuTimer timer;
+    std::optional<CudaEventTimer> prefill_timer;
+    CudaCompletionEvent compute_done, context_done;
+    std::size_t lifetime_peak = 0;
+    bool drained              = false;
+};
+
+} // namespace ninfer::models::inkling2::detail

@@ -1,0 +1,101 @@
+#include "models/inkling2/session/internal.h"
+
+#include <algorithm>
+#include <stdexcept>
+
+namespace ninfer::models::inkling2::detail {
+
+std::uint32_t SessionImpl::window_end(const Sequence& s, std::uint32_t begin,
+                                      std::uint32_t end) const {
+    end = std::min(end, begin + shape.prefill_chunk);
+    if (s.capture && s.next_capture < s.captures.size())
+        end = std::min(end, s.captures[s.next_capture].frontier);
+    return end;
+}
+
+std::uint32_t SessionImpl::unit_end(const Sequence& s, ExecutionUnitKind kind,
+                                    std::uint32_t tokens) const {
+    const auto frontier = s.continuation.metadata.main_frontier;
+    switch (kind) {
+    case ExecutionUnitKind::Prefill: {
+        const auto prompt = s.request->summary.prompt_tokens;
+        const auto limit  = tokens ? frontier + std::min(tokens, prompt - frontier) : prompt;
+        return window_end(s, frontier, limit);
+    }
+    case ExecutionUnitKind::Replay:
+        return window_end(s, frontier, s.replay_target);
+    case ExecutionUnitKind::Decode:
+        return frontier + (frontier < shape.max_context ? 1U : 0U);
+    case ExecutionUnitKind::Control:
+        return std::min(shape.max_context, frontier + tokens);
+    }
+    throw std::logic_error("invalid execution unit");
+}
+
+void SessionImpl::settle(Sequence& s, context::ContextTransaction& transaction) {
+    for (std::uint32_t i = 0; i < pool_count(); ++i) {
+        const auto frontier = s.continuation.metadata.main_frontier;
+        directory.pool(i).histories().settle_growth(s.histories[i], frontier, s.recovery_peak,
+                                                    transaction);
+    }
+    s.permit.reset();
+}
+
+void SessionImpl::settle(Sequence& s) {
+    auto transaction = directory.begin_transaction();
+    settle(s, transaction);
+    transaction.prepare_actions();
+    if (!actions(transaction).empty())
+        throw std::logic_error("settlement outside execution changed a live mapping");
+    transaction.mark_submitted();
+    transaction.mark_completed();
+    transaction.publish();
+}
+
+WorkRow SessionImpl::work_row(const Sequence& s, std::uint32_t tokens) const {
+    WorkRow row;
+    row.member            = member(s);
+    row.states            = selectors(s);
+    row.main_table        = directory.pool(0).histories().execution_row(s.histories[0].handle()).handle();
+    const auto& m         = s.continuation.metadata;
+    row.main_frontier     = m.main_frontier;
+    row.attention_rank    = m.placement.value;
+    row.sampling          = s.request->sampling;
+    row.sampling_position = m.main_frontier;
+    const auto start      = m.main_frontier;
+    if (start > s.ledger.size() || tokens > s.ledger.size() - start)
+        throw std::logic_error("execution input exceeds committed identity");
+    s.ledger.copy(start, start + tokens, row.ids);
+    return row;
+}
+
+void SessionImpl::prepare_write(Sequence& s, std::uint32_t end,
+                                context::ContextTransaction& transaction) {
+    if (s.write_destination.valid()) transaction.retain(directory.states(), s.continuation.image);
+    for (std::uint32_t i = 0; i < pool_count(); ++i) {
+        directory.pool(i).histories().prepare_write(
+            s.histories[i], s.continuation.metadata.main_frontier, end, transaction);
+    }
+}
+
+ContinuationMetadata SessionImpl::prepare_commit(Sequence& s, const WorkRow& row,
+                                                 std::uint32_t input_columns, bool retain_recovery,
+                                                 context::ContextTransaction& transaction) {
+    auto metadata = s.continuation.metadata;
+    if (input_columns) metadata.main_frontier = row.main_frontier + input_columns;
+    const auto peak = retain_recovery ? s.recovery_peak : 0;
+    for (std::uint32_t i = 0; i < pool_count(); ++i)
+        directory.pool(i).histories().prepare_commit(s.histories[i], metadata.main_frontier, peak,
+                                                     transaction);
+    return metadata;
+}
+
+void SessionImpl::adopt_commit(Sequence& s, const ContinuationMetadata& metadata,
+                               bool state_written, bool retain_recovery) noexcept {
+    if (state_written) complete_write(s);
+    s.continuation.metadata = metadata;
+    if (!retain_recovery) s.recovery_peak = 0;
+    s.permit.reset();
+}
+
+} // namespace ninfer::models::inkling2::detail

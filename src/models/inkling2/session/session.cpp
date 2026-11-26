@@ -1,0 +1,424 @@
+#include "models/inkling2/session/internal.h"
+
+#include "core/paged_kv_geometry.h"
+
+#include <algorithm>
+#include <stdexcept>
+
+namespace ninfer::models::inkling2::detail {
+
+SessionImpl::SessionImpl(std::shared_ptr<const ModelDefinition> model, SessionPlan prepared,
+                         std::unique_ptr<context::ContextDirectory> prepared_directory)
+    : definition(std::move(model)), plan(std::move(prepared)),
+      cost_model({plan.shape.speculative, plan.shape.draft_tokens, plan.batches->attention_owners(),
+                  definition->config().text.moe.experts, definition->config().text.moe.top_k, 0}),
+      shape(plan.shape), directory_owner(std::move(prepared_directory)),
+      directory(*directory_owner),
+      recovery_metadata(directory.metadata_budget(),
+                        shape.purpose == EnginePurpose::Generation ? shape.max_concurrency : 0,
+                        plan.states.size(), plan.states.size()),
+      checkpoints(Checkpoints::capacity_for_metadata(directory.metadata_budget().limit()),
+                  directory.metadata_budget(), &recovery_index) {
+    sequences.resize(shape.max_concurrency);
+    resident_sequences.reserve(shape.max_concurrency);
+    epochs.resize(shape.max_concurrency);
+    if (shape.purpose == EnginePurpose::Generation) {
+        count_storage.acquire(
+            TokenCountBuilder::capacity_bytes(definition->resources().text.public_token_count));
+        count_builder.prepare(definition->resources().text.public_token_count);
+    }
+    releases.reserve(shape.max_concurrency);
+    for (std::uint32_t i = 0; i < plan.states.size(); ++i) placements.push_back({i});
+    for (std::uint16_t i = 0; i < pool_count(); ++i)
+        pools.push_back({{i}, i == 0 ? "main" : "dspark"});
+}
+
+SessionImpl::~SessionImpl() { cleanup(); }
+
+std::uint32_t SessionImpl::pool_count() const noexcept { return plan.context.pools.size(); }
+
+bool SessionImpl::valid(SequenceHandle handle) const noexcept {
+    const auto found = resident_sequences.find(handle.value);
+    return found != resident_sequences.end() && found->second->epoch == handle.generation;
+}
+
+Sequence& SessionImpl::sequence(SequenceHandle handle) const {
+    const auto found = resident_sequences.find(handle.value);
+    if (found != resident_sequences.end() && found->second->epoch == handle.generation)
+        return *found->second;
+    throw std::logic_error("stale Inkling2 sequence");
+}
+
+SequenceHandle SessionImpl::handle(const Sequence& s) const { return {s.id, s.epoch}; }
+
+runtime::ExecutionMember SessionImpl::member(const Sequence& s) const {
+    return {handle(s), {{s.lane}, s.binding_generation}};
+}
+
+StateBindings SessionImpl::selectors(const Sequence& s) const {
+    StateBindings bindings;
+    for (const auto rank : directory.states().ranks(s.continuation.metadata.placement.value)) {
+        bindings.emplace(rank, directory.states().selectors(s.continuation.image,
+                                                            s.write_destination.valid()
+                                                                ? s.write_destination
+                                                                : s.continuation.image,
+                                                            rank));
+    }
+    return bindings;
+}
+
+ContextActions SessionImpl::actions(const context::ContextTransaction& transaction) const {
+    ContextActions out;
+    for (const auto& rank : plan.context.ranks) {
+        if (!transaction.actions(rank.rank).empty())
+            out.emplace(rank.rank, transaction.actions(rank.rank));
+    }
+    return out;
+}
+
+void SessionImpl::complete_write(Sequence& s) {
+    const auto source      = s.continuation.image;
+    const auto destination = s.write_destination.valid() ? s.write_destination : source;
+    directory.states().complete_write(source, destination);
+    s.continuation.image = destination;
+    s.write_destination  = {};
+}
+
+CaptureReservation::~CaptureReservation() {
+    if (destination.valid() && !states->release(destination)) std::terminate();
+    for (const auto& [record, role] : records) {
+        if (checkpoints->valid(record)) {
+            if (!checkpoints->erase(record)) std::terminate();
+        } else {
+            checkpoints->cancel(record);
+        }
+    }
+}
+
+Suspended::~Suspended() {
+    if (snapshot && owner->checkpoints.valid(*snapshot) && !owner->checkpoints.erase(*snapshot))
+        std::terminate();
+}
+
+void SessionImpl::release_residency(runtime::ResidencyId id) {
+    if (executor->failed() || !id.generation) return;
+    if (std::find(releases.begin(), releases.end(), id) == releases.end()) releases.push_back(id);
+}
+
+void SessionImpl::submit_releases() {
+    if (operation || release_ticket || releases.empty() || executor->failed()) return;
+    auto reservation = executor->try_reserve(runtime::FrameKind::Context);
+    if (!reservation) return;
+    Work work;
+    ContextWork release;
+    release.releases = std::move(releases);
+    work.operation   = std::move(release);
+    release_ticket   = executor->submit(std::move(*reservation), std::move(work));
+}
+
+void SessionImpl::clear(Sequence& s) noexcept {
+    s.computing = false;
+    if (const auto found = resident_sequences.find(s.id);
+        found != resident_sequences.end() && found->second == &s)
+        resident_sequences.erase(found);
+    try {
+        release_residency(member(s).residency);
+        s.capture.reset();
+        s.prefix = {};
+        for (auto& history : s.histories) history.reset();
+        auto& states = directory.states();
+        if (s.write_destination.valid()) {
+            states.abort_write(s.continuation.image, s.write_destination);
+            if (!states.release(s.write_destination)) std::terminate();
+            s.write_destination = {};
+        }
+        if (states.valid(s.continuation.image) &&
+            states.checkpoint_references(s.continuation.image) == 0 &&
+            !states.release(s.continuation.image))
+            std::terminate();
+        s.continuation.image = {};
+    } catch (...) { std::terminate(); }
+}
+
+void SessionImpl::cleanup() noexcept {
+    if (!executor) return;
+    pause_reservation.reset();
+    pending_maintenance.reset();
+    try {
+        executor->drain();
+    } catch (...) {
+    }
+    try {
+        if (compute) {
+            compute->context.fail_after_drain();
+            if (compute->completion) compute->completion->fail_after_drain();
+            compute.reset();
+        }
+        if (operation) operation->migration.fail_after_drain();
+        cancel_operation();
+        scoring.reset();
+        for (auto& s : sequences) {
+            if (s) clear(*s);
+            s.reset();
+        }
+        checkpoints.clear();
+        events.clear();
+        releases.clear();
+        release_ticket.reset();
+    } catch (...) { std::terminate(); }
+}
+
+PhysicalUsageSnapshot SessionImpl::usage() const noexcept { return directory.usage(); }
+
+} // namespace ninfer::models::inkling2::detail
+
+namespace ninfer::models::inkling2 {
+
+PreparedSession::PreparedSession(std::unique_ptr<detail::SessionImpl> impl)
+    : impl_(std::move(impl)) {}
+
+PreparedSession::~PreparedSession()                                     = default;
+PreparedSession::PreparedSession(PreparedSession&&) noexcept            = default;
+PreparedSession& PreparedSession::operator=(PreparedSession&&) noexcept = default;
+
+PreparedSession prepare_session(std::shared_ptr<const ModelDefinition> definition, SessionPlan plan,
+                                std::unique_ptr<context::ContextDirectory> directory) {
+    if (!definition) throw std::invalid_argument("invalid Inkling2 session definition");
+    if (!directory) throw std::invalid_argument("Inkling2 Session requires its prepared directory");
+    if (!plan.batches || plan.batches->resident_capacity() != plan.shape.max_concurrency ||
+        plan.batches->attention_owners() != plan.states.size())
+        throw std::invalid_argument("Inkling2 Session batch plan differs from prepared state");
+    plan.decode_routes = make_decode_routes(plan.shape, *plan.batches);
+    return PreparedSession(std::make_unique<detail::SessionImpl>(
+        std::move(definition), std::move(plan), std::move(directory)));
+}
+
+Session::Session(PreparedSession&& prepared, runtime::Executor<ExecutionTypes>& executor)
+    : impl_(std::move(prepared.impl_)) {
+    if (!impl_ || impl_->executor || !executor.epoch().value)
+        throw std::invalid_argument("invalid prepared Inkling2 Session");
+    impl_->executor            = &executor;
+    impl_->identity_generation = executor.epoch().value;
+}
+
+Session::~Session() = default;
+
+std::span<const runtime::KvPoolDescriptor> Session::kv_pools() const noexcept {
+    return impl_->pools;
+}
+
+PhysicalUsageSnapshot Session::physical_usage() const noexcept { return impl_->usage(); }
+
+std::optional<runtime::ExecutionTicket>
+Session::start_decode_probe(std::span<const SequenceHandle> members,
+                            const speculative::RoundRoute& route,
+                            std::span<const std::uint32_t> extents,
+                            std::span<const std::uint8_t> constrained, bool record_online_cost) {
+    return start_decode_round(
+        members, {.extents = extents, .route = &route, .record_online_cost = record_online_cost},
+        constrained);
+}
+
+std::optional<runtime::ExecutionTicket>
+Session::start_decode_extents(std::span<const SequenceHandle> members,
+                              std::span<const std::uint32_t> extents,
+                              std::span<const std::uint8_t> constrained) {
+    return start_decode_round(members, {.extents = extents}, constrained);
+}
+
+speculative::CostModelSummary Session::speculative_cost_summary() const noexcept {
+    return impl_->cost_model.summary();
+}
+
+std::vector<std::uint32_t> Session::decode_target_widths() const {
+    const auto& routes = impl_->plan.decode_routes;
+    return routes ? routes->target_widths() : std::vector<std::uint32_t>{};
+}
+
+speculative::CalibrationConstraints Session::calibration_constraints() const {
+    const auto& p = *impl_;
+    return {.model           = p.cost_model.config(),
+            .batches         = p.plan.batches.get(),
+            .path            = p.plan.decode_routes ? ExecutionPath::Graph : ExecutionPath::Eager,
+            .routes          = p.plan.decode_routes.get(),
+            .max_concurrency = p.shape.max_concurrency,
+            .max_context     = p.shape.max_context,
+            .kv_page_tokens  = kPagedKVPageSize,
+            .available_kv_pages =
+                speculative::available_calibration_pages(p.directory, placement_descriptions())};
+}
+
+std::optional<speculative::CostQuery>
+Session::decode_cost_query(runtime::ExecutionTicket) const noexcept {
+    return {};
+}
+
+void Session::fit_speculative_cost_model(std::span<const speculative::TimedCostAnchor> anchors,
+                                         double elapsed_ms) {
+    impl_->cost_model.fit(anchors, elapsed_ms);
+}
+
+std::uint32_t Session::decode_frontier(SequenceHandle handle) const {
+    return impl_->sequence(handle).continuation.metadata.main_frontier;
+}
+
+bool Session::has_context_operation() const noexcept {
+    return impl_->operation || impl_->pending_maintenance || impl_->release_ticket ||
+           !impl_->releases.empty();
+}
+
+bool Session::execution_pending(SequenceHandle handle) const noexcept {
+    const auto found = impl_->resident_sequences.find(handle.value);
+    return found != impl_->resident_sequences.end() && found->second->epoch == handle.generation &&
+           found->second->computing;
+}
+
+bool Session::context_blocks(SequenceHandle handle) const noexcept {
+    const auto& p = *impl_;
+    if (!p.valid(handle)) return false;
+    if (p.directory.maintenance_pending() || (p.operation && p.operation->preparing_resources))
+        return true;
+    if (!p.operation) return false;
+    const auto& s = p.sequence(handle);
+    if (const auto* bind = std::get_if<detail::BindOperation>(&p.operation->action)) {
+        (void)bind;
+        for (std::uint32_t i = 0; i < p.pool_count(); ++i) {
+            const auto* binding = p.operation->migration.binding(i);
+            if (binding && binding->blocks_writer(s.histories[i].handle())) return true;
+        }
+    } else if (const auto* capture = std::get_if<detail::CaptureOperation>(&p.operation->action)) {
+        return capture->lane == s.lane;
+    } else if (const auto* pause = std::get_if<detail::PauseOperation>(&p.operation->action)) {
+        return pause->lane == s.lane;
+    }
+    return false;
+}
+
+bool Session::recovery_pending(SequenceHandle handle) const noexcept {
+    return impl_->valid(handle) && impl_->sequence(handle).recovery_peak != 0;
+}
+
+void Session::cancel_context() {
+    if (impl_->operation) impl_->operation->migration.cancel();
+}
+
+void Session::supply(runtime::ExecutionTicket ticket, runtime::DecisionInput&& input) {
+    if (!impl_->compute || impl_->compute->ticket != ticket)
+        throw std::logic_error("decision input has no active Inkling2 execution");
+    impl_->executor->supply(ticket, std::move(input));
+}
+
+std::optional<SessionEvent> Session::poll() {
+    try {
+        auto& p = *impl_;
+        for (;;) {
+            if (!p.events.empty()) {
+                auto event = std::move(p.events.front());
+                p.events.pop_front();
+                return event;
+            }
+            if (p.pending_maintenance) (void)p.try_pending_maintenance();
+            p.submit_releases();
+            auto event = p.executor->poll();
+            if (!event) return {};
+            std::visit(
+                [&](auto&& value) {
+                    using T = std::decay_t<decltype(value)>;
+                    if constexpr (std::is_same_v<T, runtime::ExecutionFailed>) {
+                        throw std::runtime_error(value.message);
+                    } else if constexpr (std::is_same_v<T, runtime::DecisionNeeded>) {
+                        if (!p.compute || p.compute->ticket != value.ticket)
+                            throw std::logic_error("decision request belongs to another execution");
+                        p.events.push_back(
+                            {value.ticket, p.compute->members, std::move(value.request)});
+                    } else if constexpr (std::is_same_v<T, runtime::DecisionConsumed>) {
+                        if (!p.compute || p.compute->ticket != value.ticket)
+                            throw std::logic_error("decision upload belongs to another execution");
+                        p.events.push_back({value.ticket, p.compute->members, std::move(value)});
+                    } else if constexpr (std::is_same_v<T, runtime::ResultReady<ExecutionTypes>>) {
+                        if (p.release_ticket == value.ticket) {
+                            if (!std::holds_alternative<ContextResult>(value.result))
+                                throw std::logic_error(
+                                    "residency release returned a compute result");
+                        } else if (p.operation && p.operation->ticket == value.ticket) {
+                            p.operation->result.emplace(
+                                std::get<ContextResult>(std::move(value.result)));
+                        } else {
+                            if (!p.compute || p.compute->ticket != value.ticket)
+                                throw std::logic_error("result belongs to another execution");
+                            p.compute->observed_result = value.execution;
+                            if (auto* score = std::get_if<ScoreResult>(&value.result))
+                                p.finish_score(std::move(*score));
+                            else
+                                p.finish_result(std::get<ComputeResult>(std::move(value.result)));
+                        }
+                    } else if constexpr (std::is_same_v<T, runtime::DeviceRetired>) {
+                        if (p.release_ticket == value.ticket) {
+                            p.release_ticket.reset();
+                            if (p.scoring && p.scoring->finishing) {
+                                p.events.push_back({p.scoring->ticket,
+                                                    {},
+                                                    ScoreComplete{std::move(p.scoring->logprobs)}});
+                                p.scoring.reset();
+                            }
+                        } else if (p.operation && p.operation->ticket == value.ticket) {
+                            if (!p.operation->result)
+                                throw std::logic_error("context retired without its result");
+                            auto progress = p.complete_context();
+                            if (!progress.complete) return;
+                            if (p.scoring && !p.scoring->sequence) {
+                                if (!progress.published || !progress.sequence)
+                                    throw std::logic_error("scoring binding did not publish");
+                                p.scoring->sequence = progress.sequence;
+                                (void)p.submit_score();
+                            } else {
+                                p.events.push_back({value.ticket, {}, std::move(progress)});
+                            }
+                        } else if (p.compute && p.compute->ticket == value.ticket) {
+                            p.retire_compute(value);
+                        } else {
+                            throw std::logic_error("retirement belongs to another execution");
+                        }
+                    }
+                },
+                std::move(*event));
+        }
+    } catch (const std::exception& error) {
+        impl_->executor->fail(error.what());
+        throw;
+    }
+}
+
+void Session::fail_all_cleanup() noexcept { impl_->cleanup(); }
+
+ResumeState::ResumeState(std::unique_ptr<detail::Suspended> state) : state_(std::move(state)) {}
+ResumeState::~ResumeState()                                 = default;
+ResumeState::ResumeState(ResumeState&&) noexcept            = default;
+ResumeState& ResumeState::operator=(ResumeState&&) noexcept = default;
+
+bool ResumeState::has_snapshot() const noexcept { return state_ && state_->snapshot.has_value(); }
+std::optional<CheckpointHandle> ResumeState::snapshot_handle() const noexcept {
+    return state_ ? state_->snapshot : std::nullopt;
+}
+std::uint32_t ResumeState::frontier() const noexcept { return state_ ? state_->frontier : 0; }
+
+runtime::PrefixId Session::checkpoint_prefix(CheckpointHandle h) const {
+    return impl_->checkpoints.at(h).snapshot.input_prefix().id();
+}
+
+std::vector<runtime::PrefixId> Session::matching_prefixes(const RequestBasePlan& base) const {
+    return base.plan_->query.ancestors();
+}
+
+std::vector<runtime::PrefixRelation>
+Session::recovery_relations(std::span<const runtime::PrefixId> ids) const {
+    return impl_->prefixes.relations(ids);
+}
+
+bool Session::recovery_precedes(runtime::PrefixId a, std::uint32_t af, runtime::PrefixId b,
+                                std::uint32_t bf) const {
+    return af <= bf && impl_->prefixes.valid(a) && impl_->prefixes.valid(b) &&
+           impl_->prefixes.is_prefix(a, b);
+}
+
+} // namespace ninfer::models::inkling2

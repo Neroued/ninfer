@@ -5,6 +5,7 @@
 #include "models/qwen3_5/runtime_types.h"
 #include "models/qwen4_exp/runtime_types.h"
 #include "models/glm5next/runtime_types.h"
+#include "models/inkling2/runtime_types.h"
 
 #include <variant>
 
@@ -18,7 +19,8 @@ namespace ninfer::runtime {
 using ActiveModel =
     std::variant<std::unique_ptr<InferenceInstance<models::qwen3_5::RuntimeTypes>>,
                  std::unique_ptr<InferenceInstance<models::qwen4_exp::RuntimeTypes>>,
-                 std::unique_ptr<InferenceInstance<models::glm5next::RuntimeTypes>>>;
+                 std::unique_ptr<InferenceInstance<models::glm5next::RuntimeTypes>>,
+                 std::unique_ptr<InferenceInstance<models::inkling2::RuntimeTypes>>>;
 
 struct ConstructedModel {
     ActiveModel instance;

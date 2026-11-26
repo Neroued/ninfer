@@ -1,0 +1,153 @@
+#pragma once
+
+#include "models/common/batch.h"
+#include "models/common/context/contract.h"
+#include "models/common/context/directory/history.h"
+#include "models/common/context/directory/state.h"
+#include "models/common/parallel.h"
+#include "models/common/speculative/round_plan.h"
+#include "models/common/token_input.h"
+#include "models/inkling2/execution_shape.h"
+#include "runtime/executor/contract.h"
+
+#include <map>
+#include <optional>
+#include <span>
+#include <variant>
+#include <vector>
+
+namespace ninfer::models::inkling2 {
+
+using StateBindings  = std::map<std::uint32_t, context::StateSelectors>;
+using ContextActions = std::map<std::uint32_t, context::ContextActions>;
+
+struct WorkRow {
+    runtime::ExecutionMember member;
+    std::uint32_t attention_rank = 0;
+    StateBindings states;
+    context::TableRow main_table;
+    context::TableRow dspark_table;
+    std::uint32_t main_frontier = 0;
+    std::vector<TokenId> ids;
+    std::optional<TokenId> control_last_token;
+    ResolvedSamplingParameters sampling;
+    std::uint32_t sampling_position = 0;
+    bool constrained                = false;
+    bool sample                     = false;
+};
+
+struct BatchPlan {
+    PhysicalBatchShape shape;
+    std::vector<std::uint32_t> members;
+    std::vector<IndexRange> owners;
+    bool operator==(const BatchPlan&) const = default;
+};
+
+[[nodiscard]] BatchPlan plan_batch(std::span<const WorkRow>, const BatchExecutionPlan&,
+                                   bool decode);
+
+[[nodiscard]] std::shared_ptr<const speculative::DecodeGraphRoutes>
+make_decode_routes(const ExecutionShape&, const BatchExecutionPlan&);
+
+enum class ForwardKind : std::uint8_t { Prefill, Replay, Ordinary, Control };
+enum class SampleKind : std::uint8_t { None, FirstToken, NextToken };
+
+struct ForwardWork {
+    ForwardKind kind  = ForwardKind::Prefill;
+    SampleKind sample = SampleKind::None;
+    std::vector<WorkRow> rows;
+    BatchPlan batch;
+    std::shared_ptr<const SpeculativeExecutionGeometry> speculative;
+};
+
+struct SpeculativeWork {
+    std::vector<WorkRow> rows;
+    std::vector<std::uint32_t> draft_extents;
+    BatchPlan batch;
+    std::shared_ptr<const SpeculativeExecutionGeometry> speculative;
+};
+
+struct ResidencyBinding {
+    runtime::ExecutionMember member;
+    TokenCounts counts;
+};
+
+struct ContextWork {
+    std::vector<ResidencyBinding> bindings;
+    std::vector<runtime::ResidencyId> releases;
+};
+
+struct ScoreWork {
+    WorkRow row;
+    std::vector<TokenId> targets;
+    std::uint32_t first_target_column = 0;
+    BatchPlan batch;
+};
+
+struct Work {
+    ContextActions actions;
+    std::variant<ForwardWork, SpeculativeWork, ContextWork, ScoreWork> operation;
+};
+
+struct RowResult {
+    std::uint32_t processed = 0;
+    std::vector<TokenId> tokens;
+    std::uint32_t dead_positions = 0, drafts = 0, accepted_drafts = 0;
+    std::vector<float> draft_confidences;
+    std::optional<float> target_top1_probability;
+};
+
+struct ComputeResult {
+    std::vector<RowResult> rows;
+};
+
+struct ContextResult {
+    std::vector<runtime::ContextTransferObservation> transfers;
+};
+
+struct ScoreResult {
+    std::uint32_t processed = 0;
+    std::vector<float> logprobs;
+};
+
+using Result = std::variant<ComputeResult, ContextResult, ScoreResult>;
+
+struct CommitRow {
+    runtime::ExecutionMember member;
+    StateBindings states;
+    std::uint32_t accepted = 0;
+    bool terminal = false, cancelled = false, failed = false;
+};
+
+struct Commit {
+    std::vector<CommitRow> rows;
+    ContextActions actions;
+};
+
+struct ExecutionTypes {
+    using Work   = inkling2::Work;
+    using Result = inkling2::Result;
+    using Commit = inkling2::Commit;
+    [[nodiscard]] static ExecutionWork describe_work(const Work&);
+};
+
+struct WorkContract {
+    ExecutionShape shape;
+    std::shared_ptr<const BatchExecutionPlan> batches;
+    std::uint32_t vocabulary = 0, public_tokens = 0, ranks = 1;
+    std::uint32_t control_token_limit = 0;
+    std::shared_ptr<const speculative::DecodeGraphRoutes> decode_routes;
+    void validate(const Work&, runtime::FrameKind) const;
+    void validate(const Work&, const Result&, const Commit&) const;
+    void validate_commit(const Work&, std::span<const RowResult>, const Commit&) const;
+    void validate(const Work&, const runtime::DecisionRequest&,
+                  const runtime::DecisionInput&) const;
+};
+
+[[nodiscard]] std::span<const WorkRow> work_rows(const Work&);
+[[nodiscard]] const BatchPlan& work_batch(const Work&);
+void prepare_batch(Work&, const BatchExecutionPlan&);
+[[nodiscard]] const context::ContextActions& local_actions(const ContextActions&,
+                                                           std::uint32_t rank);
+
+} // namespace ninfer::models::inkling2

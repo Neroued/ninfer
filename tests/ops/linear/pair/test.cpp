@@ -1,10 +1,12 @@
 #include "core/weight.h"
+#include "core/platform.h"
 #include "cuda_fixture.h"
 #include "ops/linear/support.h"
 #include "core/decode_graph.h"
 
 #include "ninfer/ops/linear_pair.h"
 #include "ninfer/ops/weight_input.h"
+#include "ops/direct_bf16_weight.h"
 #include "ops/linear_common.h"
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
@@ -18,6 +20,8 @@
 #include <cstdint>
 #include <iostream>
 #include <limits>
+#include <numeric>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -68,9 +72,10 @@ struct PairFixture {
     quantized_weight::PackedWeight second_storage;
 };
 
-std::vector<std::int32_t> conformance_tokens(const ShapeCase& shape) {
+std::vector<std::int32_t> conformance_tokens(std::span<const std::int32_t> route_starts,
+                                             std::span<const std::int32_t> route_interiors) {
     std::vector<std::int32_t> result{1};
-    for (const std::int32_t boundary : shape.route_starts) {
+    for (const std::int32_t boundary : route_starts) {
         if (boundary <= 1) {
             throw std::invalid_argument("linear_pair test: route starts must be greater than one");
         }
@@ -80,7 +85,7 @@ std::vector<std::int32_t> conformance_tokens(const ShapeCase& shape) {
             result.push_back(boundary + 1);
         }
     }
-    for (const std::int32_t interior : shape.route_interiors) {
+    for (const std::int32_t interior : route_interiors) {
         if (interior <= 0) {
             throw std::invalid_argument("linear_pair test: route interior must be positive");
         }
@@ -429,9 +434,212 @@ int bf16_pair(int n, int t) {
     return failures;
 }
 
+#if NINFER_TARGET_RTX5090
+constexpr int kBf16PairHidden = 2304;
+constexpr int kBf16ParentRows = 8576;
+constexpr ops::LinearProfile kBf16PairProfile{QType::BF16, kOutputRows, kBf16PairHidden};
+
+int run_bf16_pair_cases(std::span<const std::size_t> selected,
+                        std::span<const linear_suite::Case> cases, bool shared_parent,
+                        bool alias_inputs) {
+    using direct_bf16_weight::DeviceWeight;
+    using direct_bf16_weight::make_patterned;
+    constexpr int n = kOutputRows, k = kBf16PairHidden;
+    const DeviceWeight first(make_patterned(shared_parent ? kBf16ParentRows : n, k, 439U));
+    std::optional<DeviceWeight> second;
+    if (!shared_parent) second.emplace(make_patterned(n, k, 467U));
+    Weight w0, w1;
+    if (shared_parent) {
+        constexpr std::array shape{std::uint64_t(kBf16ParentRows), std::uint64_t(k)};
+        constexpr auto elements = std::uint64_t(n) * k;
+        const WeightParent root{weight_geometry(QType::BF16, QuantLayout::Contiguous, shape),
+                                first.device.device(),
+                                static_cast<const std::byte*>(first.device.data())};
+        const WeightView v0{{n, k}, {{&root, 0, elements}}};
+        const WeightView v1{{n, k}, {{&root, elements, 2 * elements}}};
+        w0 = ops::prepare_linear_weight({v0}).weight;
+        w1 = native_weight(v1);
+        if (w0.qdata != root.data || w1.qdata != root.data + elements * sizeof(std::uint16_t) ||
+            w0.payload != root.data || w1.payload != root.data)
+            throw std::runtime_error("BF16 pair: weight views must borrow the parent payload");
+    } else {
+        w0 = first.view();
+        w1 = second->view();
+    }
+    if (ops::linear_pair_workspace_capacity_bytes(w0, w1, 1, std::numeric_limits<int>::max()) ||
+        ops::linear_pair_workspace_capacity_bytes(kBf16PairProfile, kBf16PairProfile, 1,
+                                                  std::numeric_limits<int>::max()))
+        throw std::runtime_error("BF16 pair: expected zero workspace capacity");
+
+    int maximum_t = 0;
+    for (auto index : selected) maximum_t = std::max(maximum_t, cases[index].t);
+    const auto activation0 = make_activation(k, maximum_t, 531U);
+    const auto activation1 = make_activation(k, maximum_t, 719U);
+    auto changed           = activation0;
+    for (auto& bits : changed) bits ^= 0x8000U;
+    auto input0 = to_device(activation0);
+    auto input1 = alias_inputs ? DeviceBuffer{} : to_device(activation1);
+
+    const auto materialize_rows = [=](const DeviceWeight& weight, int first_row,
+                                      std::span<const std::int32_t> rows) {
+        std::vector<float> represented;
+        represented.reserve(rows.size() * k);
+        for (int row : rows) {
+            const auto* bits = weight.host.bits.data() + std::size_t(first_row + row) * k;
+            for (int column = 0; column < k; ++column)
+                represented.push_back(bf16_to_f32(bits[column]));
+        }
+        return represented;
+    };
+    auto& context = cuda_environment().context;
+    int failures  = 0;
+    for (auto index : selected) {
+        const auto& call = cases[index];
+        const int t      = call.t;
+        auto rows        = sampled_indices(n);
+        if (t == 1) {
+            rows.resize(n);
+            std::iota(rows.begin(), rows.end(), 0);
+        }
+        const auto columns      = sampled_indices(t);
+        const auto represented0 = materialize_rows(first, 0, rows);
+        const auto represented1 =
+            materialize_rows(shared_parent ? first : *second, shared_parent ? n : 0, rows);
+        const auto bytes = std::size_t(t) * n * sizeof(std::uint16_t);
+        GuardedDeviceBuffer output0(bytes), output1(bytes);
+        const Tensor x0(input0.span(), DType::BF16, {k, t});
+        const Tensor x1(alias_inputs ? input0.span() : input1.span(), DType::BF16, {k, t});
+        Tensor y0(output0.span(), DType::BF16, {n, t}), y1(output1.span(), DType::BF16, {n, t});
+        const auto launch = [&] {
+            ops::linear_pair(x0, x1, w0, w1, y0, y1, context.execution_view());
+        };
+
+        const bool replay = call.execution == linear_suite::Execution::Graph;
+        DecodeGraphDefinition definition;
+        DecodeGraphExecutable graph;
+        cuda_synchronize();
+        if (replay) {
+            definition.capture(context.stream(), launch);
+            graph.instantiate(definition);
+        }
+        const auto input_bytes = std::size_t(t) * k * sizeof(std::uint16_t);
+        for (int phase = 0; phase < (replay ? 2 : 1); ++phase) {
+            const auto& values0 = phase ? changed : activation0;
+            const auto& values1 = alias_inputs ? values0 : activation1;
+            if (phase) input0.copy_from_host(changed.data(), input_bytes);
+            output0.fill(0xff);
+            output1.fill(0xff);
+            cuda_synchronize();
+            if (replay)
+                graph.launch(context.stream());
+            else
+                launch();
+            context.synchronize();
+            const auto check = [&](const GuardedDeviceBuffer& out, const auto& weight,
+                                   const auto& input, const std::string& label) {
+                const auto actual = read_output(out.data(), t, rows, columns, label);
+                const auto expected =
+                    linear_pair_oracle(weight, k, int(rows.size()), input, columns);
+                return actual.failures + compare_output(label, actual.selected, expected) +
+                       out.verify_guards(label.c_str());
+            };
+            failures += check(output0, represented0, values0, call.id + " first");
+            failures += check(output1, represented1, values1, call.id + " second");
+        }
+        if (replay) input0.copy_from_host(activation0.data(), input_bytes);
+    }
+    failures += first.verify_preserved("BF16 pair first weight");
+    if (second) failures += second->verify_preserved("BF16 pair second weight");
+    return failures;
+}
+
+int reject_invalid_bf16_pair() {
+    constexpr int n = kOutputRows, k = kBf16PairHidden;
+    constexpr auto profile = kBf16PairProfile;
+    auto& context          = cuda_environment().context;
+    const auto execution   = context.execution_view();
+    DeviceBuffer input(context.device(), k * 2), output(context.device(), n * 2 + 16);
+    DeviceBuffer other_output(context.device(), n * 2);
+    DeviceBuffer weights(context.device(), std::size_t(n) * k * 2);
+    const Weight w = direct_bf16_weight::device_weight(n, k, weights.span());
+    const Tensor x(input.span(), DType::BF16, {k, 1});
+    Tensor y0(output.span(), DType::BF16, {n, 1});
+    Tensor y1(other_output.span(), DType::BF16, {n, 1});
+    int failures       = 0;
+    const auto rejects = [&](std::string_view label, const auto& operation) {
+        try {
+            operation();
+            std::cerr << "BF16 pair accepted " << label << '\n';
+            ++failures;
+        } catch (const std::invalid_argument&) {}
+    };
+    for (auto [lo, hi] : {std::pair{0, 1}, std::pair{-1, 8}, std::pair{8, 7}}) {
+        rejects("invalid profile interval",
+                [&] { (void)ops::linear_pair_workspace_capacity_bytes(profile, profile, lo, hi); });
+        rejects("invalid weight interval",
+                [&] { (void)ops::linear_pair_workspace_capacity_bytes(w, w, lo, hi); });
+    }
+    const ops::LinearProfile unknown{QType::BF16, n, k + 64};
+    rejects("unsupported profiles",
+            [&] { (void)ops::linear_pair_workspace_capacity_bytes(unknown, unknown, 1, 2); });
+    rejects("mismatched profiles",
+            [&] { (void)ops::linear_pair_workspace_capacity_bytes(profile, unknown, 1, 2); });
+    auto bad_weight = w;
+    bad_weight.k    = k + 64;
+    rejects("mismatched weights",
+            [&] { (void)ops::linear_pair_workspace_capacity_bytes(w, bad_weight, 1, 2); });
+    rejects("unsupported weights",
+            [&] { (void)ops::linear_pair_workspace_capacity_bytes(bad_weight, bad_weight, 1, 2); });
+    bad_weight        = w;
+    bad_weight.layout = QuantLayout::RowSplit;
+    rejects("invalid BF16 representation",
+            [&] { ops::linear_pair(x, x, w, bad_weight, y0, y1, execution); });
+    Tensor overlapping(static_cast<std::byte*>(output.data()) + 16, context.device(), DType::BF16,
+                       {n, 1});
+    rejects("overlapping outputs",
+            [&] { ops::linear_pair(x, x, w, w, y0, overlapping, execution); });
+    Tensor input_overlap(input.span(), DType::BF16, {n, 1});
+    rejects("input and output overlap",
+            [&] { ops::linear_pair(x, x, w, w, input_overlap, y1, execution); });
+    Tensor weight_overlap(weights.span(), DType::BF16, {n, 1});
+    rejects("weight and output overlap",
+            [&] { ops::linear_pair(x, x, w, w, y0, weight_overlap, execution); });
+    return failures;
+}
+
+void add_bf16_1024_pair_cases(linear_suite::Suite& suite) {
+    constexpr int n = kOutputRows, k = kBf16PairHidden;
+    constexpr auto policy = ops::LinearPolicy::A16Only;
+    constexpr std::array starts{2,   9,   17,   33,   65,   129,  193,  321,  481,  561,  641,
+                                801, 961, 1121, 1281, 1441, 1681, 1921, 2353, 2561, 2817, 3841};
+    constexpr std::array anchors{4, 8, 16, 32, 64, 128, 1023, 1024, 1025, 2048, 4096, 4097};
+    const auto tokens = conformance_tokens(starts, anchors);
+    for (bool shared_parent : {false, true}) {
+        for (bool alias_inputs : {false, true}) {
+            const std::string recipe =
+                std::string(shared_parent ? "parent-views" : "separate-weights") +
+                (alias_inputs ? "-aliased-inputs" : "-distinct-inputs");
+            std::vector<linear_suite::Case> cases;
+            for (int t : tokens)
+                for (auto execution :
+                     {linear_suite::Execution::Eager, linear_suite::Execution::Graph})
+                    cases.push_back(
+                        linear_suite::make_case("bf16", n, k, t, policy, execution, recipe));
+            suite.add(std::move(cases), [=](auto selected, auto declared) {
+                return run_bf16_pair_cases(selected, declared, shared_parent, alias_inputs);
+            });
+        }
+    }
+    suite.add(linear_suite::make_case("bf16", n, k, 0, policy, linear_suite::Execution::Eager,
+                                      "invalid-geometry-interval-overlap"),
+              reject_invalid_bf16_pair);
+}
+#endif
+
 void add_shape(linear_suite::Suite& suite, const ShapeCase& shape) {
     std::vector<Invocation> calls;
-    for (int t : conformance_tokens(shape)) calls.push_back({t});
+    for (int t : conformance_tokens(shape.route_starts, shape.route_interiors))
+        calls.push_back({t});
     calls.push_back({shape.k == 2048 ? 16 : 24, true});
     std::vector<linear_suite::Case> cases;
     for (auto& call : calls) {
@@ -487,6 +695,9 @@ int main(int argc, char** argv) {
                                               linear_suite::Execution::Graph, "independent-inputs"),
                       [=] { return bf16_pair(n, t); });
     }
+#if NINFER_TARGET_RTX5090
+    add_bf16_1024_pair_cases(suite);
+#endif
     for (int k : {2048, 5120})
         suite.add(linear_suite::make_case("q8", 1024, k, 4, ops::LinearPolicy::A16Only,
                                           linear_suite::Execution::Graph, "independent-inputs"),

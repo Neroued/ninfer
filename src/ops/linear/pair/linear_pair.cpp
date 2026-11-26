@@ -55,8 +55,7 @@ std::size_t linear_pair_workspace_capacity_bytes(LinearProfile first, LinearProf
         first.n != second.n || first.k != second.k)
         throw std::invalid_argument("linear_pair: invalid matrix profiles or token interval");
     if (first.qtype == QType::BF16) {
-        if ((first.n != 4096 && first.n != 8192) || first.k != 128)
-            throw std::invalid_argument("linear_pair: unsupported BF16 geometry");
+        (void)detail::validate_bf16_pair_geometry(first.n, first.k, max_tokens);
     } else if (first.qtype == QType::Q8_G32_FP16 && first.n == 1024)
         (void)detail::select_linear_pair(first.k, max_tokens);
     else
@@ -71,14 +70,13 @@ void linear_pair(const Tensor& x, const Tensor& second_input, const Weight& firs
     require_matrix(second_input, second.k, x.ne[1], execution);
     require_matrix(first_out, first.n, x.ne[1], execution);
     require_matrix(second_out, second.n, x.ne[1], execution);
-    detail::validate_pair_weights(first, second, x.ne[1]);
+    const auto bf16_launch = detail::validate_pair_weights(first, second, x.ne[1]);
     if (first.device != execution.device() || second.device != execution.device()) {
         throw std::invalid_argument("linear_pair: weights belong to another device");
     }
     require_nonoverlap(x, second_input, first, second, first_out, second_out);
-    if (first.qtype == QType::BF16)
-        detail::launch_bf16_pair(x, second_input, first, second, first_out, second_out,
-                                 execution.stream());
+    if (bf16_launch)
+        bf16_launch(x, second_input, first, second, first_out, second_out, execution.stream());
     else if (x.data == second_input.data)
         detail::select_linear_pair(x.ne[0], x.ne[1])(x, first, second, first_out, second_out,
                                                      execution.stream());

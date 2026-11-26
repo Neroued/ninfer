@@ -1,4 +1,5 @@
 #include "ops/linear/pair/dispatch.h"
+#include "core/platform.h"
 #include "ops/common/host/operands.h"
 #include <cstddef>
 #include <stdexcept>
@@ -51,11 +52,21 @@ LinearPairLaunch select_linear_pair(int k, int tokens) {
     throw std::invalid_argument("linear_pair: unsupported shape or token extent");
 }
 
-void validate_pair_weights(const Weight& first, const Weight& second, int max_tokens) {
+Bf16PairLaunch validate_bf16_pair_geometry(int n, int k, int max_tokens) {
+    if (max_tokens > 0) {
+        if (k == 128 && (n == 4096 || n == 8192)) return launch_bf16_pair_k128;
+#if NINFER_TARGET_RTX5090
+        if (n == 1024 && k == 2304) return launch_bf16_pair_n1024_k2304;
+#endif
+    }
+    throw std::invalid_argument("linear_pair: unsupported BF16 geometry or token extent");
+}
+
+Bf16PairLaunch validate_pair_weights(const Weight& first, const Weight& second, int max_tokens) {
     if (first.qtype == QType::BF16 && second.qtype == QType::BF16) {
-        if (max_tokens <= 0 || (first.n != 4096 && first.n != 8192) || first.k != 128 ||
-            second.n != first.n || second.k != first.k)
-            throw std::invalid_argument("linear_pair: unsupported BF16 geometry");
+        if (second.n != first.n || second.k != first.k)
+            throw std::invalid_argument("linear_pair: BF16 pair geometry must match");
+        const auto launch = validate_bf16_pair_geometry(first.n, first.k, max_tokens);
         for (const auto* w : {&first, &second})
             if (w->ndim != 2 || w->shape[0] != w->n || w->shape[1] != w->k ||
                 w->padded_shape[0] != w->n || w->padded_shape[1] != w->k ||
@@ -64,11 +75,12 @@ void validate_pair_weights(const Weight& first, const Weight& second, int max_to
                 w->payload_bytes < std::uint64_t(w->n) * w->k * 2 ||
                 !common::operand::aligned(w->qdata, 16))
                 throw std::invalid_argument("linear_pair: invalid BF16 weight");
-        return;
+        return launch;
     }
     (void)select_linear_pair(first.k, max_tokens);
     require_weight(first, first.k);
     require_weight(second, first.k);
     if (first.k == 2048) require_adjacent_parent_views(first, second);
+    return nullptr;
 }
 } // namespace ninfer::ops::detail

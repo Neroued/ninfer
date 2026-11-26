@@ -55,7 +55,7 @@ if(NINFER_TARGET STREQUAL "dgx_spark")
 endif()
 
 ninfer_linear_suite(pair test.cpp)
-ninfer_linear_format_tests(pair q8)
+ninfer_linear_format_tests(pair bf16 q8)
 
 ninfer_linear_suite(topk test.cpp keys.cpp)
 ninfer_linear_format_tests(topk q4 q8 fp8)

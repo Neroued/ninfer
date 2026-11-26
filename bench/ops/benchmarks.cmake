@@ -86,6 +86,9 @@ if(NINFER_TARGET STREQUAL "rtx5090")
   target_include_directories(ninfer_moe_softcap_bench PRIVATE "${PROJECT_SOURCE_DIR}/tests")
   ninfer_add_op_bench(ninfer_moe_cpu_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/moe/cpu.cpp")
   target_link_libraries(ninfer_moe_cpu_bench PRIVATE ninfer_cpu_executor)
+  ninfer_add_op_bench(ninfer_loop_message_bench
+    SOURCES "${CMAKE_CURRENT_LIST_DIR}/loop_message_bench.cu")
+  target_link_libraries(ninfer_loop_message_bench PRIVATE CUDA::cublas)
 endif()
 ninfer_add_op_bench(ninfer_linear_pair_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/linear_pair_bench.cu")
 ninfer_add_op_bench(ninfer_context_kv_materialize_bench

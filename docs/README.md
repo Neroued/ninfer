@@ -55,6 +55,6 @@ Published artifact downloads are listed in the [project README](../README.md).
 
 [未完成事项](issue-checklist.md)保留待处理问题与 MLA 性能工作。
 Qwen4-27B 的[架构与量化](designs/qwen4-27b-rtx5090.md)保留独立预研的几何假设与表示选择。
-Inkling-2-Mini 的[扩展 Op 规范](designs/inkling2-extended-ops-rtx5090.md)与[新增 Op 规范](designs/inkling2-new-ops-rtx5090.md)记录 RTX 5090 算子接口合同与性能目标。
+Inkling-2-Mini 的[扩展 Op 规范](designs/inkling2-extended-ops-rtx5090.md)、[新增 Op 规范](designs/inkling2-new-ops-rtx5090.md)与[整模接入方案](designs/inkling2-model-integration-rtx5090.md)记录 RTX 5090 算子合同、组件边界与实施节奏。
 
 Qwen3.8-Flash-Next 使用 Qwen4Exp；Qwen3.8-27B 使用 Qwen3.5。

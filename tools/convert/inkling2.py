@@ -749,17 +749,17 @@ class Builder:
             )
             if is_swa:
                 self.group(
-                    p + "attention/query",
-                    p + "attention/relative",
-                    p + "attention/output_gate",
                     p + "attention/key",
                     p + "attention/value",
+                    p + "attention/query",
+                    p + "attention/output_gate",
+                    p + "attention/relative",
                 )
             else:
                 self.group(
                     p + "attention/query",
-                    p + "attention/relative",
                     p + "attention/output_gate",
+                    p + "attention/relative",
                 )
                 self.add(
                     p + "attention/k_conv_proj",
@@ -1131,7 +1131,7 @@ class Builder:
                     store=mtp,
                     consumed=consumed,
                 )
-            self.group(*(p + "attention/" + r for r in ("query", "key", "value")))
+            self.group(*(p + "attention/" + r for r in ("key", "value", "query")))
             for role, field in (("context_key", "k_proj_ctx"), ("context_value", "v_proj_ctx")):
                 self.add(
                     p + "attention/" + role,

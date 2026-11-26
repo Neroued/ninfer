@@ -400,14 +400,14 @@ def test_inkling2_loop_full_components_conversion(tmp_path: Path):
         # SWA packed 5-way parent vs Full packed 3-way parent
         swa_spans = [
             _parts(art, f"text/layers/0/attention/{r}")[0]
-            for r in ("query", "relative", "output_gate", "key", "value")
+            for r in ("key", "value", "query", "output_gate", "relative")
         ]
         assert len({s[0] for s in swa_spans}) == 1
         assert all(a[2] == b[1] for a, b in zip(swa_spans, swa_spans[1:]))
 
         full_q_spans = [
             _parts(art, f"text/layers/1/attention/{r}")[0]
-            for r in ("query", "relative", "output_gate")
+            for r in ("query", "output_gate", "relative")
         ]
         assert len({s[0] for s in full_q_spans}) == 1
         assert _parts(art, "text/layers/1/attention/key")[0][0] != full_q_spans[0][0]

@@ -126,6 +126,7 @@ Json make_report(const Options& options, const RunDescription& run, const Corpus
           {"max_context_tokens", run.engine.max_context},
           {"prefill_chunk_tokens", run.engine.prefill_chunk},
           {"kv_dtype", kv_cache_profile_info(run.engine.kv_cache).name},
+          {"swa_kv_dtype", kv_cache_profile_info(run.engine.swa_kv_cache).name},
           {"linear_state_dtype", linear_state_dtype_name(run.engine.linear_state_dtype)},
           {"context_pools", product::context_capacity_json(run.engine.context_pools)},
           {"context_token_capacity_estimate", run.engine.context_token_capacity_estimate}}},

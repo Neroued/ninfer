@@ -136,6 +136,7 @@ void encode_rank_options(Encoder& out, const EngineOptions& o) {
     out.u32(o.max_concurrency);
     out.u32(o.prefill_chunk);
     out.u8(static_cast<std::uint8_t>(o.kv_cache));
+    out.u8(static_cast<std::uint8_t>(o.swa_kv_cache));
     out.u8(static_cast<std::uint8_t>(o.linear_state_dtype));
     out.u8(static_cast<std::uint8_t>(o.speculative.backend));
     out.u32(o.speculative.draft_tokens);
@@ -157,6 +158,7 @@ EngineOptions decode_rank_options(Decoder& in) {
     o.max_concurrency                   = in.u32();
     o.prefill_chunk                     = in.u32();
     o.kv_cache                          = static_cast<KvCacheStorage>(in.u8());
+    o.swa_kv_cache                      = static_cast<KvCacheStorage>(in.u8());
     o.linear_state_dtype                = static_cast<LinearStateDType>(in.u8());
     o.speculative.backend               = static_cast<SpeculativeBackend>(in.u8());
     o.speculative.draft_tokens          = in.u32();

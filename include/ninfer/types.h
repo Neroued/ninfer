@@ -62,7 +62,7 @@ static_assert(SpeculativeLengthPolicy{} == SpeculativeLengthPolicy::Adaptive);
 
 struct SpeculativeOptions {
     SpeculativeBackend backend = SpeculativeBackend::None;
-    // Startup-fixed K: MTP 1..5; DFlash and DFlash2 1..15 (query width K+1).
+    // Startup-fixed K: MTP 1..5; DFlash and DFlash2 1..15; DSpark 1..7 (query width K+1).
     std::uint32_t draft_tokens = 0;
     ProposalHead proposal_head = ProposalHead::Full;
     SpeculativeLengthPolicy length_policy = SpeculativeLengthPolicy::Adaptive;
@@ -176,6 +176,7 @@ struct EngineOptions {
     std::uint32_t prefill_chunk = 0;
     MoeOptions moe;
     KvCacheStorage kv_cache             = KvCacheStorage::BFloat16;
+    KvCacheStorage swa_kv_cache         = KvCacheStorage::BFloat16;
     LinearStateDType linear_state_dtype = LinearStateDType::Float32;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;

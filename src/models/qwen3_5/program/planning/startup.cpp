@@ -637,6 +637,8 @@ void validate_target_options(const execution::ModelProfile& profile, DeviceConte
                                         std::to_string(kDFlashDecodeMaximumDrafts) + "]");
         }
         break;
+    case SpeculativeBackend::DSpark:
+        throw std::invalid_argument("DSpark speculative backend is not supported by Qwen3.5");
     }
     if (device.compute_capability() != 120) {
         throw std::invalid_argument("Qwen3.5 family runtime requires compute capability 12.0");

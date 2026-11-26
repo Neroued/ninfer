@@ -11,7 +11,8 @@ DecodeGraphRoutes::DecodeGraphRoutes(const BatchExecutionPlan& batches, Speculat
     : backend_(backend) {
     if (k == UINT32_MAX) throw std::invalid_argument("invalid graph draft window");
     if (!target_widths.empty() &&
-        ((backend != SpeculativeBackend::DFlash && backend != SpeculativeBackend::DFlash2) ||
+        ((backend != SpeculativeBackend::DFlash && backend != SpeculativeBackend::DFlash2 &&
+          backend != SpeculativeBackend::DSpark) ||
          target_widths.front() < 2 || target_widths.back() != k + 1 ||
          !std::ranges::is_sorted(target_widths) ||
          std::ranges::adjacent_find(target_widths) != target_widths.end()))
@@ -83,7 +84,8 @@ void RoundRoute::validate(SpeculativeBackend backend, std::uint32_t k) const {
         if (!mtp_steps || mtp_steps >= width || head_columns ||
             (graph_entry ? width != k + 1 : mtp_steps + 1 != width))
             throw std::invalid_argument("invalid MTP proposal route");
-    } else if ((backend != SpeculativeBackend::DFlash && backend != SpeculativeBackend::DFlash2) ||
+    } else if ((backend != SpeculativeBackend::DFlash && backend != SpeculativeBackend::DFlash2 &&
+                backend != SpeculativeBackend::DSpark) ||
                mtp_steps || head_columns != (graph_entry ? k : width - 1)) {
         throw std::invalid_argument("invalid block proposal route");
     }

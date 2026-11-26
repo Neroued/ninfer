@@ -15,7 +15,8 @@ ProposalTopology proposal_topology(SpeculativeBackend backend, bool handoff,
     if (!handoff && !schedule) {
         if (backend == SpeculativeBackend::Mtp && (!parallel || parallel->supports_graph_gating()))
             return ProposalTopology::FusedGatedMtp;
-        if (backend == SpeculativeBackend::DFlash || backend == SpeculativeBackend::DFlash2)
+        if (backend == SpeculativeBackend::DFlash || backend == SpeculativeBackend::DFlash2 ||
+            backend == SpeculativeBackend::DSpark)
             return ProposalTopology::FusedBlock;
     }
     return ProposalTopology::SplitProposal;

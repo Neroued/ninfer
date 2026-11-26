@@ -541,6 +541,7 @@ std::string format_server_start_json(const std::string& server_instance_id, std:
                                       {"prefill_chunk", engine_options.prefill_chunk},
                                       {"log_stats_interval_ms", options.launch.logging.stats_interval_ms},
                                       {"kv_cache", kv_cache_name(engine_options.kv_cache)},
+                                      {"swa_kv_cache", kv_cache_name(engine_options.swa_kv_cache)},
                                       {"linear_state_dtype",
                                        ninfer::linear_state_dtype_name(engine_options.linear_state_dtype)},
                                       {"vision", engine_options.enable_vision},

@@ -168,6 +168,7 @@ std::uint64_t VisionConfig::merge_width() const {
 
 Config parse_config(const artifact::Directory& directory, const LoadOptions& options) {
     if (options.dflash()) throw ArtifactError("GLM5Next has no DFlash component");
+    if (options.dspark()) throw ArtifactError("GLM5Next has no DSpark component");
     try {
         Config out{text_config(directory.component("text").config), {}, options.mtp()};
         if (options.vision)

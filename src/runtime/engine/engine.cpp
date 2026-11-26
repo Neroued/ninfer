@@ -254,6 +254,7 @@ private:
         description.max_concurrency = options.max_concurrency;
         description.prefill_chunk      = options.prefill_chunk;
         description.kv_cache           = options.kv_cache;
+        description.swa_kv_cache       = options.swa_kv_cache;
         description.linear_state_dtype = options.linear_state_dtype;
         std::visit(
             [&](const auto& instance) {

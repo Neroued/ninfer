@@ -486,6 +486,39 @@ void test_context_display() {
             "Context display lost the shared estimate or expanded beyond one line");
 }
 
+void test_swa_and_dspark_options(const Files& files) {
+    const auto def = parse({"ninfer", "m.ninfer", "--prompt", "hi"});
+    require(def.launch.engine.swa_kv_cache == ninfer::KvCacheStorage::BFloat16,
+            "default swa_kv_dtype must be bf16");
+    const auto fp8 = parse({"ninfer", "m.ninfer", "--prompt", "hi", "--swa-kv-dtype", "fp8",
+                            "--spec", "dspark"});
+    require(fp8.launch.engine.swa_kv_cache == ninfer::KvCacheStorage::Fp8E4m3fnGroup128Ue8m0 &&
+                fp8.launch.engine.speculative.backend == ninfer::SpeculativeBackend::DSpark &&
+                fp8.launch.engine.speculative.draft_tokens == 7,
+            "swa-kv-dtype fp8 and dspark default draft_tokens=7 failed");
+    const auto custom = parse({"ninfer", "m.ninfer", "--prompt", "hi", "--spec", "dspark",
+                               "--draft-tokens", "4"});
+    require(custom.launch.engine.speculative.draft_tokens == 4,
+            "dspark explicit draft_tokens failed");
+    const auto toml = files.write(
+        "model.path = 'm.ninfer'\ncli.prompt = 'hi'\n"
+        "[engine]\nswa_kv_dtype = 'fp8'\n[speculative]\nbackend = 'dspark'\ndraft_tokens = 5\n");
+    const auto from_file = parse({"ninfer", "--config", toml.string()});
+    require(from_file.launch.engine.swa_kv_cache == ninfer::KvCacheStorage::Fp8E4m3fnGroup128Ue8m0 &&
+                from_file.launch.engine.speculative.backend == ninfer::SpeculativeBackend::DSpark &&
+                from_file.launch.engine.speculative.draft_tokens == 5,
+            "TOML swa_kv_dtype / dspark failed");
+    (void)rejection([&] {
+        parse({"ninfer", "m.ninfer", "--prompt", "hi", "--swa-kv-dtype", "nvfp4"});
+    });
+    (void)rejection([&] {
+        parse({"ninfer", "m.ninfer", "--prompt", "hi", "--spec", "dspark", "--draft-tokens", "8"});
+    });
+    (void)rejection([&] {
+        parse({"ninfer", "m.ninfer", "--prompt", "hi", "--spec", "dspark", "--draft-tokens", "0"});
+    });
+}
+
 } // namespace
 
 int main() {
@@ -498,6 +531,7 @@ int main() {
         test_file_errors_and_example(files);
         test_deployment(files);
         test_context_display();
+        test_swa_and_dspark_options(files);
         std::cout << "ok\n";
         return 0;
     } catch (const std::exception& error) {

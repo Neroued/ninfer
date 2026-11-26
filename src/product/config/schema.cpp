@@ -23,6 +23,8 @@ constexpr FieldSpec kFields[] = {
      "Per-request context limit (8192; perplexity defaults to its scoring window).", Scope::Common},
     {Field::KvDtype, "engine.kv_dtype", "--kv-dtype", "", "bf16|int8|fp8|nvfp4|k8v4",
      "KV representation.", Scope::Common},
+    {Field::SwaKvDtype, "engine.swa_kv_dtype", "--swa-kv-dtype", "", "bf16|fp8",
+     "Sliding-window attention KV representation (bf16).", Scope::Common},
     {Field::LinearStateDtype, "engine.linear_state_dtype", "--linear-state-dtype", "", "fp32|bf16",
      "Linear attention recurrent state representation (fp32).", Scope::Common},
     {Field::ContextCapacity, "engine.context_capacity", "--context-capacity", "", "SIZE|auto",
@@ -53,10 +55,10 @@ constexpr FieldSpec kFields[] = {
      Scope::Generation, ConfigurationUnit::Bytes},
     {Field::CostPresets, "context_cache.cost_presets", "--context-cost-presets", "", "FILE",
      "Context-cost JSON overrides; empty uses built-in defaults."},
-    {Field::SpecBackend, "speculative.backend", "--spec", "", "none|mtp|dflash|dflash2",
+    {Field::SpecBackend, "speculative.backend", "--spec", "", "none|mtp|dflash|dflash2|dspark",
      "Speculative backend; none resets drafts, proposal head, and length policy."},
     {Field::DraftTokens, "speculative.draft_tokens", "--draft-tokens", "", "N",
-     "MTP: 1..5; DFlash/DFlash2: 1..15; none: 0."},
+     "MTP: 1..5; DFlash/DFlash2: 1..15; DSpark: 1..7 (default 7); none: 0."},
     {Field::ProposalHead, "speculative.proposal_head", "--proposal-head", "", "full|optimized",
      "Proposal head representation."},
     {Field::SpecLengthPolicy, "speculative.length_policy", "--spec-length-policy", "",
@@ -382,10 +384,12 @@ FieldValue parse_field_value(Field field, const RawValue& value, bool command_li
         return real(value, command_line, -2, 2);
     case Field::KvDtype:
         return enumeration(value, {"bf16", "int8", "fp8", "nvfp4", "k8v4"});
+    case Field::SwaKvDtype:
+        return enumeration(value, {"bf16", "fp8"});
     case Field::LinearStateDtype:
         return enumeration(value, {"fp32", "bf16"});
     case Field::SpecBackend:
-        return enumeration(value, {"none", "mtp", "dflash", "dflash2"});
+        return enumeration(value, {"none", "mtp", "dflash", "dflash2", "dspark"});
     case Field::ProposalHead:
         return enumeration(value, {"full", "optimized"});
     case Field::SpecLengthPolicy:

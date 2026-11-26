@@ -382,6 +382,9 @@ ParsedOptions parse(int argc, char** argv, EntryPoint entry,
         case Field::KvDtype:
             engine.kv_cache = kv_storage(string());
             break;
+        case Field::SwaKvDtype:
+            engine.swa_kv_cache = kv_storage(string());
+            break;
         case Field::LinearStateDtype:
             engine.linear_state_dtype = linear_state_dtype_from_option(string());
             break;
@@ -567,6 +570,10 @@ ParsedOptions parse(int argc, char** argv, EntryPoint entry,
     if (engine.artifact_path.empty())
         throw std::invalid_argument("model.path or a model artifact argument is required");
     if (applies_to(field_spec(Field::SpecBackend), entry)) {
+        if (engine.speculative.backend == SpeculativeBackend::DSpark &&
+            !assignment(merged, Field::DraftTokens)) {
+            engine.speculative.draft_tokens = 7;
+        }
         try {
             validate_speculative_cli_options(engine.speculative);
         } catch (const std::invalid_argument& error) {

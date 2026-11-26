@@ -223,6 +223,7 @@ Config parse_config(const artifact::Directory& directory, const LoadOptions& opt
             (options.vision || options.speculative != SpeculativeBackend::None)) {
             throw ArtifactError("CausalScoring loads the Text backbone only");
         }
+        if (options.dspark()) { throw ArtifactError("Qwen3.5 has no DSpark component"); }
         if (options.speculative != SpeculativeBackend::None &&
             options.speculative_component().empty()) {
             throw ArtifactError("unknown speculative backend");

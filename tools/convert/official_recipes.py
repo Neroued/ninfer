@@ -682,9 +682,79 @@ def glm5next_fp4_local(model, recipe, sources):
                 )
 
 
+def inkling2(model, recipe, sources):
+    """Preserve native Inkling-2 BF16/NVFP4_MUL/MXFP8 representations and layouts."""
+    if model.config["architectures"] != ["Inkling2ForCausalLM"]:
+        raise ValueError("inkling2 requires Inkling2 mathematics")
+    cfg = model.config
+    recipe.provenance.update(
+        mapping="inkling2_v1",
+        moe_w13_order="deinterleaved_gate_then_up",
+        vocab_padding="truncated_64_aligned_zero_padded",
+        dspark_fold="offline_fp64_unembed_hidden_out",
+    )
+    recipe.place("text/*", (0,))
+    if "vision" in model.components:
+        recipe.place("vision/*", (1, 0))
+    if "dspark" in model.components:
+        for role in ("token_embedding", "embed_norm", "output_head"):
+            recipe.share("dspark/" + role, "text/" + role)
+        recipe.place("dspark/*", (2, 0))
+
+    h = cfg["hidden_size"]
+    intermediate = cfg["intermediate_size"]
+    experts = cfg["n_routed_experts"]
+    width = h * intermediate
+    for layer in range(cfg["num_hidden_layers"]):
+        p = f"text/layers/{layer}/moe/experts/"
+        gate_param = model.parameters[p + "gate"]
+        fmt = gate_param.direct_format
+        matrices = {
+            role: model.parameters[p + role].source.matrix_sources
+            for role in ("gate", "up", "down")
+        }
+        if any(len(values) != experts for values in matrices.values()):
+            raise ValueError(f"{p}: expert bank must retain individual matrix sources")
+        gu_parts, down_parts = [], []
+        for expert in range(experts):
+            first, last = expert * width, (expert + 1) * width
+            for role in ("gate", "up"):
+                gu_parts.append((p + role, first, last, matrices[role][expert]))
+            down_parts.append((p + "down", first, last, matrices["down"][expert]))
+        if fmt == "nvfp4_mul":
+            method, layout, policy = (
+                import_encoded,
+                "batched_block_scale_k16_m128x4_v1",
+                "A16Only",
+            )
+        elif fmt == "mxfp8":
+            method, layout, policy = import_encoded, "row_group_scale_v1", "AllowA8"
+        elif fmt == "bf16":
+            method, layout, policy = cast_direct, "contiguous_le_v1", "A16Only"
+        else:
+            raise ValueError(f"{p}: unsupported expert format {fmt!r}")
+        for parts, shape, order in (
+            (gu_parts, (experts, 2 * intermediate, h), 0),
+            (down_parts, (experts, h, intermediate), 1),
+        ):
+            recipe.parent(
+                parts,
+                shape=shape,
+                format=fmt,
+                method=method,
+                layout=layout,
+                order=(3, layer, order),
+            )
+        for role in ("gate", "up", "down"):
+            name = p + role
+            for input_name in model.parameters[name].inputs:
+                recipe.use(name, input_name, activation_policy=policy)
+
+
 RECIPES = {
     "glm5next": glm5next,
     "glm5next_fp4_local": glm5next_fp4_local,
+    "inkling2": inkling2,
     "qwen3_6_27b": qwen3_6_27b,
     "qwen3_6_27b_nvfp4": qwen3_6_27b_nvfp4,
     "qwen3_8_27b": qwen3_8_27b,

@@ -17,6 +17,7 @@ from .methods import SOURCE_CACHE_BYTES
 from .pipeline import convert
 from .proposal import DEFAULT_RANKING, add_official_proposal
 from .glm5next import build_model as build_glm5next
+from .inkling2 import build_model as build_inkling2
 from .qwen3_5 import build_model as build_qwen3_5
 from .qwen4_exp import build_model as build_qwen4_exp
 from .recipe import Recipe
@@ -126,7 +127,7 @@ def main(argv=None):
     parser.add_argument(
         "--components",
         default="text",
-        help="comma-separated text,vision,mtp,dflash,dflash2",
+        help="comma-separated text,vision,mtp,dflash,dflash2,dspark",
     )
     parser.add_argument(
         "--resource",
@@ -180,10 +181,24 @@ def main(argv=None):
         companions = {
             key: sources[key] for key in ("dflash", "dflash2") if key in components
         }
+        if "dspark" in components:
+            if "dspark" in paths:
+                companions["dspark"] = sources["dspark"]
+            else:
+                mtp_path = base.root / "mtp.safetensors"
+                if not mtp_path.is_file():
+                    raise ValueError(
+                        f"selected dspark requires {mtp_path} or --source dspark=PATH"
+                    )
+                companions["dspark"] = stack.enter_context(SafetensorsSource(mtp_path))
         architectures = base.config.get("architectures", [])
         adapters = {
             "Glm5NextForCausalLM": build_glm5next,
             "Glm5NextForConditionalGeneration": build_glm5next,
+            "Inkling2ForCausalLM": build_inkling2,
+            "Inkling2ForConditionalGeneration": build_inkling2,
+            "Inkling2LoopForCausalLM": build_inkling2,
+            "Inkling2LoopForConditionalGeneration": build_inkling2,
             "Qwen3_5ForCausalLM": build_qwen3_5,
             "Qwen3_5ForConditionalGeneration": build_qwen3_5,
             "Qwen3_5MoeForCausalLM": build_qwen3_5,

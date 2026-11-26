@@ -141,3 +141,5 @@ ninfer_add_op_bench(ninfer_context_kv_materialize_bf16_bench
 
 ninfer_add_op_bench(ninfer_block_attn_res_bench
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/block_attn_res_bench.cu")
+ninfer_add_op_bench(ninfer_short_conv_bench
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/short_conv_bench.cu")

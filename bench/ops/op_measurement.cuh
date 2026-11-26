@@ -311,26 +311,37 @@ private:
 // One complete, stateless or restored Op with a logical-byte roofline model.
 class LogicalBenchmark {
 public:
-    explicit LogicalBenchmark(const Options& options)
+    explicit LogicalBenchmark(const Options& options, std::string_view extra_columns = {})
         : options_(options), flush_(options.flush_bytes),
-          csv_(options.csv_out, "logical_bytes,logical_gb_s,bandwidth_reference_us") {}
+          csv_(options.csv_out,
+               with_extra("logical_bytes,logical_gb_s,bandwidth_reference_us", extra_columns)) {}
 
     template <class Launch, class Restore>
-    void run(const Row& row, std::size_t logical_bytes, Launch&& launch, Restore&& restore) {
+    void run(const Row& row, std::size_t logical_bytes, Launch&& launch, Restore&& restore,
+             std::string_view extra_values = {}) {
         for (const auto& execution : selections(options_.execution, "graph", "eager"))
             for (const auto& cache : selections(options_.cache, "cold", "warm")) {
                 const auto result =
                     measure(launch, restore, flush_, device_context().execution_view(), options_,
                             execution, cache);
+                auto fields = std::to_string(logical_bytes) + ',' +
+                              format_metric(logical_bytes / (result.gpu.median_us * 1000), 3, "") +
+                              ',' +
+                              format_metric(logical_bytes / (kRoofline.memory_gbs * 1000), 3, "");
                 csv_.write(row, result, execution, cache,
-                           std::to_string(logical_bytes) + ',' +
-                               format_metric(logical_bytes / (result.gpu.median_us * 1000), 3, "") +
-                               ',' +
-                               format_metric(logical_bytes / (kRoofline.memory_gbs * 1000), 3, ""));
+                           with_extra(std::move(fields), extra_values));
             }
     }
 
 private:
+    static std::string with_extra(std::string fields, std::string_view extra) {
+        if (!extra.empty()) {
+            fields += ',';
+            fields += extra;
+        }
+        return fields;
+    }
+
     Options options_;
     L2FlushBuffer flush_;
     Csv csv_;

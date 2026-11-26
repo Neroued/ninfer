@@ -229,7 +229,8 @@ void packed(const RelativeAttentionQueryInputs& in, const RaggedSequenceView& ra
 #if NINFER_TARGET_RTX5090
     launch_ragged(query(call, scale), view, swa, cache.storage,
                   static_cast<const int*>(ragged.cu_seqlens.data), n, segments,
-                  static_cast<RaggedTile*>(scratch.data), tiles, execution.stream());
+                  static_cast<RaggedTile*>(scratch.data), tiles, execution.multiprocessor_count(),
+                  execution.stream());
 #else
     (void)swa;
     (void)view;

@@ -23,9 +23,13 @@ constexpr auto kKvHeads = kGeometry.kv_heads;
 constexpr int kWindow = 1024, kRel = 16;
 constexpr float kScale = 0.08838834764831845f;
 
-std::size_t split_traffic(bool swa, const relative::DecodePlan& plan, int history) {
+std::size_t split_traffic(bool swa, bool fp8, const relative::DecodePlan& plan, int history) {
     if (plan.splits == 1) return 0;
-    const int tile        = swa && !plan.simt ? relative::kSwaVerifyKeyTile : relative::kKeyTile;
+    const int splits = relative::active_decode_splits(history, plan.splits, plan.streaming_splits);
+    const int tile   = !swa        ? relative::kKeyTile
+                       : plan.simt ? relative::kSwaDecodeKeyTile
+                       : fp8       ? relative::kKeyTile
+                                   : relative::kSwaVerifyKeyTile;
     const int first_query = history - plan.width;
     const int first_tile  = swa ? std::max(0, first_query - kWindow + 1) / tile : 0;
     const int tiles       = (history - 1) / tile + 1 - first_tile;
@@ -33,14 +37,14 @@ std::size_t split_traffic(bool swa, const relative::DecodePlan& plan, int histor
     for (int p = first_query; p < history; ++p) {
         const int lo = (swa ? std::max(0, p - kWindow + 1) / tile : 0) - first_tile;
         const int hi = p / tile + 1 - first_tile;
-        for (int split = 0; split < plan.splits; ++split) {
-            const auto interval = relative::split_tile_interval(tiles, plan.splits, split);
+        for (int split = 0; split < splits; ++split) {
+            const auto interval = relative::split_tile_interval(tiles, splits, split);
             active += std::max(lo, interval.first) < std::min(hi, interval.end);
         }
     }
     // Every split writes an LSE. Only splits intersecting a row's visible keys write
     // an output vector. The combine kernel reads the same logical operands.
-    const auto elements = std::size_t(plan.width) * plan.splits + active * kDim;
+    const auto elements = std::size_t(plan.width) * splits + active * kDim;
     return 2 * sizeof(float) * kHeads * plan.batch * elements;
 }
 
@@ -342,7 +346,7 @@ public:
         if (!ragged) {
             const auto plan =
                 relative::select_decode(swa, options.storage, bucket, batch, width, sms);
-            scratch_traffic = split_traffic(swa, plan, history);
+            scratch_traffic = split_traffic(swa, fp8, plan, history);
         } else if (batch > 1) {
             scratch_traffic =
                 2 * sizeof(relative::RaggedTile) * relative::ragged_tiles(width, batch) +

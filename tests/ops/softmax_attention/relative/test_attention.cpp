@@ -249,15 +249,16 @@ public:
             const auto region = packed_->layout().planes[index].tensor;
             return {{packed_->storage(), offsets}, {region, 1, region.region.bytes}};
         };
-        CyclicKVCacheLayerView v{.k               = field(0),
-                                 .v               = field(1),
-                                 .k_scales        = packed_->layout().planes.size() == 4 ? field(2) : StateFieldView{},
-                                 .v_scales        = packed_->layout().planes.size() == 4 ? field(3) : StateFieldView{},
-                                 .capacity        = kWindow,
-                                 .padded_capacity = static_cast<unsigned>(slots_),
-                                 .num_kv_heads    = kKvHeads,
-                                 .head_dim        = kDim,
-                                 .storage         = storage_};
+        CyclicKVCacheLayerView v{
+            .k               = field(0),
+            .v               = field(1),
+            .k_scales        = packed_->layout().planes.size() == 4 ? field(2) : StateFieldView{},
+            .v_scales        = packed_->layout().planes.size() == 4 ? field(3) : StateFieldView{},
+            .capacity        = kWindow,
+            .padded_capacity = static_cast<unsigned>(slots_),
+            .num_kv_heads    = kKvHeads,
+            .head_dim        = kDim,
+            .storage         = storage_};
         return v;
     }
 
@@ -561,6 +562,53 @@ int graph_bucket_patch(bool swa, KvCacheStorage storage, int width) {
     return errors;
 }
 
+int swa_direct_decode_replay() {
+    Fixture f(true, KvCacheStorage::BFloat16, 1, 1, 1027, 8);
+    f.workspace    = MemoryArena({nullptr, 0, cuda_environment().context.device()});
+    f.live[0]      = 0;
+    f.positions[0] = INT32_MIN;
+    f.upload(0);
+    const auto stream = cuda_environment().context.stream();
+    DecodeGraphDefinition graph;
+    DecodeGraphKernelSlice slice;
+    graph.capture(stream, [&] { slice.capture(stream, [&] { f.launch(); }); });
+    if (slice.size() != 1) return 1;
+    DecodeGraphExecutable executable;
+    executable.instantiate(graph);
+    executable.launch(stream);
+    int errors = f.check("direct SWA inactive row");
+    f.live[0]  = 1;
+    for (const int position : {63, 383, 511, 1026}) {
+        f.positions[0] = position;
+        f.upload(position);
+        executable.launch(stream);
+        errors += f.check("direct SWA position " + std::to_string(position));
+    }
+    return errors;
+}
+
+int full_fp8_split_replay() {
+    constexpr int history = context_bucket_tokens(ContextBucket::K128);
+    Fixture f(false, KvCacheStorage::Fp8E4m3fnGroup128Ue8m0, 1, 1, history, 8);
+    f.positions[0] = history / 2;
+    f.upload(1);
+    const auto stream = cuda_environment().context.stream();
+    DecodeGraphDefinition graph;
+    graph.capture(stream, [&] { f.launch(); });
+    DecodeGraphExecutable executable;
+    executable.instantiate(graph);
+    executable.launch(stream);
+    int errors     = f.check("full FP8 shorter context");
+    f.positions[0] = history - 1;
+    f.upload(2);
+    executable.launch(stream);
+    errors += f.check("full FP8 longer context on replay");
+    f.positions[0] = history / 2;
+    f.upload(3);
+    executable.launch(stream);
+    return errors + f.check("full FP8 shorter context on replay");
+}
+
 int batched_case(bool swa, KvCacheStorage storage, int batch, int width, int history) {
     Fixture f(swa, storage, batch, width, history, history < 129 ? kDim : 8);
     for (int b = 0; b < batch; ++b) {
@@ -591,6 +639,26 @@ int ragged_case(bool swa, KvCacheStorage storage, const std::vector<int>& length
     f.upload(2);
     f.launch();
     return f.check("ragged N=" + std::to_string(n));
+}
+
+int bf16_ragged_position_replay() {
+    constexpr int tokens = 449;
+    Fixture f(false, KvCacheStorage::BFloat16, 1, tokens, 2 * tokens, 8,
+              std::make_unique<RaggedFixture>(std::vector{tokens}));
+    std::iota(f.positions.begin(), f.positions.end(), 0);
+    f.upload(1);
+    const auto stream = cuda_environment().context.stream();
+    DecodeGraphDefinition graph;
+    graph.capture(stream, [&] { f.launch(); });
+    DecodeGraphExecutable executable;
+    executable.instantiate(graph);
+    executable.launch(stream);
+    int errors = f.check("ragged contiguous positions");
+
+    for (auto& position : f.positions) position *= 2;
+    f.upload(2);
+    executable.launch(stream);
+    return errors + f.check("ragged nonconsecutive positions on replay");
 }
 
 int chunk_batched(KvCacheStorage storage, int width, int start) {
@@ -776,6 +844,9 @@ int main(int argc, char** argv) {
                           {{"format", format}});
             }
             if (!swa) {
+                if (storage == KvCacheStorage::Fp8E4m3fnGroup128Ue8m0)
+                    suite.add(name + "/graph/split_replay", full_fp8_split_replay,
+                              {{"format", format}});
                 suite.add(name + "/largest_bucket",
                           [=] {
                               return batched_case(false, storage, 1, 1,
@@ -784,6 +855,9 @@ int main(int argc, char** argv) {
                           {{"format", format}});
             }
             if (swa) {
+                if (storage == KvCacheStorage::BFloat16)
+                    suite.add(name + "/direct_decode_replay", swa_direct_decode_replay,
+                              {{"format", format}});
                 suite.add(name + "/expired_slot", [=] { return expired_slot(storage); },
                           {{"format", format}});
                 if (storage == KvCacheStorage::Fp8E4m3fnGroup128Ue8m0)
@@ -805,6 +879,8 @@ int main(int argc, char** argv) {
                           {{"format", format}});
             }
             if (!swa && storage == KvCacheStorage::BFloat16) {
+                suite.add(name + "/ragged/position_replay", bf16_ragged_position_replay,
+                          {{"format", format}});
                 suite.add(name + "/weak_tail", [] { return bf16_weak_tail(131072, 1, 204.0f); },
                           {{"format", format}});
                 suite.add(name + "/weak_tail_after_strong_prefix",

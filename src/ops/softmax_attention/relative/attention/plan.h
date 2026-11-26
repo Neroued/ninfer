@@ -8,7 +8,8 @@ inline constexpr auto kOp = "relative_softmax_attention";
 inline constexpr int kDim = 128, kHeads = 24, kKvHeads = 8, kGroup = 3;
 inline constexpr int kRelDim = 16, kExtent = 1024, kWindow = 1024;
 inline constexpr int kMaxWidth = 16, kRaggedRows = 64, kKeyTile = 32;
-inline constexpr int kSwaVerifyKeyTile = 16;
+inline constexpr int kSwaDecodeKeyTile = 16, kSwaVerifyKeyTile = 16;
+inline constexpr int kDirectSwaDecodeStripe = 32;
 inline constexpr int kScratchAlignment = 16, kMaxSplits = 128;
 
 struct TileInterval {
@@ -29,9 +30,21 @@ __host__ __device__
 struct DecodePlan {
     int batch, width, splits;
     bool simt;
+    bool direct_swa      = false;
+    int streaming_splits = 0;
     [[nodiscard]] std::size_t rows() const;
     [[nodiscard]] std::size_t bytes() const;
 };
+
+#if defined(__CUDACC__)
+__host__ __device__
+#endif
+    constexpr int
+    active_decode_splits(std::int64_t tokens, int splits, int streaming_splits) {
+    return streaming_splits != 0 && tokens >= std::int64_t(streaming_splits) * (2 * kExtent)
+               ? streaming_splits
+               : splits;
+}
 
 struct RaggedTile {
     int first, count, sequence, sequence_first;
@@ -87,6 +100,6 @@ struct Partials {
 void launch_decode(Query, CacheView, bool swa, KvCacheStorage, const int* valid, DecodePlan,
                    Partials, cudaStream_t);
 void launch_ragged(Query, CacheView, bool swa, KvCacheStorage, const int* prefix, int tokens,
-                   int segments, RaggedTile*, int tiles, cudaStream_t);
+                   int segments, RaggedTile*, int tiles, int sms, cudaStream_t);
 
 } // namespace ninfer::ops::relative

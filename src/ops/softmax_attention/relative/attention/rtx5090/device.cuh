@@ -43,9 +43,9 @@ __device__ __forceinline__ float quad_max(float x) {
     return fmaxf(x, __shfl_xor_sync(kWarp, x, 2));
 }
 
-__device__ __forceinline__ float quad_sum(float x) {
-    x += __shfl_xor_sync(kWarp, x, 1);
-    return x + __shfl_xor_sync(kWarp, x, 2);
+__device__ __forceinline__ float quad_sum(float x, unsigned mask = kWarp) {
+    x += __shfl_xor_sync(mask, x, 1);
+    return x + __shfl_xor_sync(mask, x, 2);
 }
 
 struct KeyRange {
@@ -62,6 +62,10 @@ __device__ __forceinline__ KeyRange key_range(const int* positions, int count, i
         lo = positions[0];
         hi = positions[count - 1];
         if (lo < 0 || hi < lo) return {0, 0, 0, -1};
+    } else if constexpr (QueryRows == 1) {
+        if (!count) return {0, 0, 0, -1};
+        lo = hi = positions[0];
+        if (hi < 0 || hi > limit) return {0, 0, 0, -1};
     } else {
         int local_min = INT_MAX, local_max = -1;
 #pragma unroll
@@ -88,7 +92,7 @@ __device__ __forceinline__ int position_limit(CacheView cache) {
     return static_cast<int>(min(std::int64_t(INT_MAX), std::int64_t(cache.stride) * 64 - 1));
 }
 
-template <bool Swa, bool Fp8, bool AllowChunk = Swa>
+template <bool Swa, bool Fp8>
 struct CacheRows {
     static constexpr int Bytes = Fp8 ? kDim : 2 * kDim;
     const unsigned char *k{}, *v{}, *ks{}, *vs{};
@@ -104,10 +108,8 @@ struct CacheRows {
         const std::int64_t offset = std::int64_t(head) * stride;
 
         if constexpr (Swa) {
-            if constexpr (AllowChunk) {
-                chunk = cache.chunk;
-                if (!history) return;
-            }
+            chunk = cache.chunk;
+            if (!history) return;
             k = cache.k.base + cache.k.offsets[row] + offset * Bytes;
             v = cache.v.base + cache.v.offsets[row] + offset * Bytes;
             if constexpr (Fp8) {
@@ -126,7 +128,7 @@ struct CacheRows {
     }
 
     __device__ __forceinline__ bool is_chunk(int key) const {
-        if constexpr (AllowChunk) return chunk.k && key >= chunk_start;
+        if constexpr (Swa) return chunk.k && key >= chunk_start;
         return false;
     }
 

@@ -36,24 +36,37 @@ DecodePlan select_decode(bool swa, KvCacheStorage storage, ContextBucket bucket,
             "relative_softmax_attention: expected positive B and W in 1..16");
     const bool simt  = width == 1;
     const auto heads = std::int64_t(batch) * kKvHeads;
-    // Target several resident CTAs for streaming memory, up to one CTA per small key
-    // interval. The split budget falls with the number of query fragments per CTA.
+    const bool fp8   = storage == KvCacheStorage::Fp8E4m3fnGroup128Ue8m0;
+    // A CTA can cover a whole cyclic window. Use the direct path when all output
+    // stripes fit in one wave, without making the graph depend on device positions.
+    if (simt && swa && !fp8 &&
+        std::int64_t(batch) * kHeads * (kDim / kDirectSwaDecodeStripe) <= sms)
+        return {batch, width, 1, simt, true};
     const int query_fragments = (width * kGroup + 15) / 16;
-    const bool swa_fp8        = swa && storage == KvCacheStorage::Fp8E4m3fnGroup128Ue8m0;
-    // SWA BF16 decode saturates bandwidth at 2 waves while smaller FP8 tiles need 5 waves
-    // to hide memory latency; SWA verify uses >=4 waves so narrow widths (qf=1) split
-    // across SMs while wider verify (qf>=2) keeps combine traffic bounded.
-    const int waves = swa ? (simt ? (swa_fp8 ? 5 : 2) : std::max(4, 2 * query_fragments))
-                          : (simt ? 5 : 8);
-    // Compressed Decode can keep more CTAs in flight without increasing cache traffic.
-    const bool compressed_decode = simt && storage == KvCacheStorage::Fp8E4m3fnGroup128Ue8m0;
-    const auto budget =
-        std::int64_t(waves) * sms + (compressed_decode ? 2 * std::int64_t(sms) / 3 : 0);
+    // Short compressed decode benefits from fewer partials, while larger
+    // batches and long paged histories need more CTAs in flight.
+    const bool small_fp8_decode = fp8 && 2 * heads <= sms && (swa || visible <= 8192);
+    const auto wave_tail        = 2 * std::int64_t(sms) / 3;
+    const auto short_budget     = 2 * std::int64_t(sms) + wave_tail;
+    const auto short_splits     = std::max<std::int64_t>(1, short_budget / heads);
+    const auto keys_per_split   = visible / short_splits;
+    // A narrower grid also works for a small batch of long streams once each CTA
+    // has enough keys to amortize the partial reduction and enough peers to hide latency.
+    const bool streaming_fp8_decode = fp8 && !swa && heads <= sms / 8 &&
+                                      keys_per_split >= 2 * kExtent &&
+                                      keys_per_split <= 4 * kExtent;
+    const int waves    = simt ? (swa && !fp8 ? 2 : (fp8 ? (small_fp8_decode ? 2 : 5) : 3))
+                              : (swa || fp8 ? std::max(4, 2 * query_fragments) : 8);
+    const auto budget  = std::int64_t(sms) * waves + (simt && fp8 ? wave_tail : 0);
     const auto target  = std::max<std::int64_t>(1, budget / (heads * query_fragments));
-    const int min_keys = !swa && storage == KvCacheStorage::BFloat16 ? 2 * kKeyTile : kKeyTile;
+    const int min_keys = !swa && !fp8 ? 2 * kKeyTile : kKeyTile;
     const int splits   = static_cast<int>(
         std::min({target, std::int64_t(visible / min_keys), std::int64_t(kMaxSplits)}));
-    return {batch, width, splits, simt};
+    // The bucket sizes the graph and scratch. A replay can have fewer live keys than
+    // the bucket ceiling, so choose how many CTAs process KV from the device positions.
+    const int streaming_splits =
+        simt && streaming_fp8_decode && short_splits < splits ? static_cast<int>(short_splits) : 0;
+    return {batch, width, splits, simt, false, streaming_splits};
 }
 
 std::size_t DecodePlan::rows() const { return std::uint64_t(batch) * width * kHeads * splits; }
@@ -90,9 +103,14 @@ OpGraphProfile graph_profile(AttentionHeadGeometry geometry, KvCacheStorage stor
     const auto plan = select_decode(swa, storage, bucket, batch, width, sms);
     // Both W=1 SWA forms bind the optional chunk in the same kernel argument.
     // Presence requires neither a different launch sequence nor different scratch.
-    const std::array words{std::uint64_t(swa),         std::uint64_t(storage),
-                           std::uint64_t(batch),       std::uint64_t(width),
-                           std::uint64_t(plan.splits), std::uint64_t(plan.simt),
+    const std::array words{std::uint64_t(swa),
+                           std::uint64_t(storage),
+                           std::uint64_t(batch),
+                           std::uint64_t(width),
+                           std::uint64_t(plan.splits),
+                           std::uint64_t(plan.simt),
+                           std::uint64_t(plan.direct_swa),
+                           std::uint64_t(plan.streaming_splits),
                            std::uint64_t(masked)};
     return detail::make_op_graph_profile(words);
 }

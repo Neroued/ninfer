@@ -6,6 +6,7 @@
 #include "core/decode_graph.h"
 #include "core/platform.h"
 
+#include <algorithm>
 #include <array>
 
 using namespace ninfer;
@@ -20,6 +21,7 @@ enum class Kind { Projection, Split, SwiGlu };
 enum class Recipe { Random, Cancellation, NegativeGate, AlternateLimit };
 
 constexpr ReductionCriterion kA16{1.0 / 256, 1.0e-7, 2.0 / 256};
+constexpr std::array kDefaultGraphTokens{17, 257};
 
 int run(Kind kind, int n, int k, Recipe recipe, std::span<const std::size_t> selected,
         std::span<const linear_suite::Case> cases) {
@@ -163,7 +165,8 @@ int run(Kind kind, int n, int k, Recipe recipe, std::span<const std::size_t> sel
 }
 
 void add(linear_suite::Suite& suite, int n, int k, std::span<const int> tokens,
-         Recipe recipe = Recipe::Random, Kind kind = Kind::Projection) {
+         Recipe recipe = Recipe::Random, Kind kind = Kind::Projection,
+         std::span<const int> graph_tokens = kDefaultGraphTokens) {
     std::vector<linear_suite::Case> cases;
     const std::string label = std::string(kind == Kind::Split    ? "split-bias"
                                           : kind == Kind::SwiGlu ? "swiglu-bias"
@@ -175,7 +178,7 @@ void add(linear_suite::Suite& suite, int n, int k, std::span<const int> tokens,
     for (int t : tokens)
         cases.push_back(linear_suite::make_case("bf16", n, k, t, ops::LinearPolicy::A16Only,
                                                 linear_suite::Execution::Eager, label));
-    for (int t : {17, 257})
+    for (int t : graph_tokens)
         cases.push_back(linear_suite::make_case("bf16", n, k, t, ops::LinearPolicy::A16Only,
                                                 linear_suite::Execution::Graph, label));
     suite.add(std::move(cases), [=](auto selected, auto entries) {
@@ -183,13 +186,12 @@ void add(linear_suite::Suite& suite, int n, int k, std::span<const int> tokens,
     });
 }
 
-int validate(Kind kind) {
-    const int n    = kind == Kind::Projection ? 1024 : kind == Kind::Split ? 3072 : 8192;
-    const int rows = kind == Kind::SwiGlu ? n / 2 : 1024;
-    auto host      = direct_bf16_weight::make_patterned(n, 1024, 29);
+int validate(Kind kind, int n, int k) {
+    const int rows = kind == Kind::SwiGlu ? n / 2 : kind == Kind::Split ? n / 3 : n;
+    auto host      = direct_bf16_weight::make_patterned(n, k, 29);
     direct_bf16_weight::DeviceWeight storage(std::move(host));
     auto weight = storage.view();
-    GuardedDeviceBuffer dx(2048), db(n * 2);
+    GuardedDeviceBuffer dx(k * 2), db(n * 2);
     std::vector<GuardedDeviceBuffer> buffers;
     std::vector<Tensor> outputs;
     for (int i = 0; i < (kind == Kind::Split ? 3 : 1); ++i) {
@@ -197,7 +199,7 @@ int validate(Kind kind) {
         outputs.emplace_back(buffers.back().span(), DType::BF16,
                              std::initializer_list<int>{rows, 1});
     }
-    Tensor x(dx.span(), DType::BF16, {1024, 1}), bias(db.span(), DType::BF16, {n});
+    Tensor x(dx.span(), DType::BF16, {k, 1}), bias(db.span(), DType::BF16, {n});
     auto execution  = cuda_environment().default_execution;
     float limit     = 10.F;
     const auto call = [&] {
@@ -209,40 +211,98 @@ int validate(Kind kind) {
             ops::linear_swiglu(x, weight, bias, outputs[0], limit, execution);
     };
     int failures      = 0;
-    const auto reject = [&] {
+    const auto reject = [&](const auto& invalid_call) {
         try {
-            call();
+            invalid_call();
             ++failures;
         } catch (const std::invalid_argument&) {}
     };
     const auto original_bias = bias;
     bias.dtype               = DType::FP32;
-    reject();
+    reject(call);
     bias       = original_bias;
     bias.nb[0] = 4;
-    reject();
+    reject(call);
     bias        = original_bias;
     bias.device = Device::cpu();
-    reject();
+    reject(call);
     bias                       = original_bias;
     const auto original_output = outputs[0];
     outputs[0].data            = bias.data;
-    reject();
+    reject(call);
     outputs[0]    = original_output;
     weight.layout = QuantLayout::RowSplit;
-    reject();
+    reject(call);
     weight = storage.view();
+    if (kind == Kind::Projection) {
+        const auto capacity = [=](int first, int last) {
+            return ops::linear_bias_workspace_capacity_bytes(
+                QType::BF16, n, k, ops::LinearPolicy::A16Only, first, last);
+        };
+        if (capacity(1, std::numeric_limits<int>::max()) != 0) {
+            std::cerr << "BF16 bias: expected zero workspace\n";
+            ++failures;
+        }
+        reject([&] { (void)capacity(0, 1); });
+        reject([&] { (void)capacity(2, 1); });
+    }
     if (kind == Kind::Split) {
-        const auto original = outputs[1];
-        outputs[1].data     = outputs[0].data;
-        reject();
-        outputs[1] = original;
+        const auto second = outputs[1];
+        outputs[1].data   = outputs[0].data;
+        reject(call);
+        outputs[1]      = second;
+        outputs[0].data = x.data;
+        reject(call);
+        outputs[0].data = const_cast<void*>(weight.qdata);
+        reject(call);
+        outputs[0]       = original_output;
+        outputs[1].ne[0] = rows - 16;
+        reject(call);
+        outputs[1] = second;
+        x.ne[1]    = 0;
+        reject(call);
+        x.ne[1]    = 1;
+        bias.ne[0] = n - 1;
+        reject(call);
+        bias = original_bias;
+
+        constexpr auto policy = ops::LinearPolicy::A16Only;
+        const std::array segments{rows, rows, rows};
+        const auto capacity = [&](int first, int last) {
+            return ops::linear_split_bias_workspace_capacity_bytes(QType::BF16, n, k, segments,
+                                                                   policy, first, last);
+        };
+        if (capacity(1, std::numeric_limits<int>::max()) != 0) {
+            std::cerr << "BF16 split bias: expected zero workspace capacity\n";
+            ++failures;
+        }
+        reject([&] { (void)capacity(0, 1); });
+        reject([&] { (void)capacity(2, 1); });
+        reject([&] {
+            (void)ops::linear_split_bias_workspace_capacity_bytes(
+                QType::BF16, n, k, std::array{rows - 16, rows + 16, rows}, policy, 1, 1);
+        });
+#if NINFER_TARGET_RTX5090
+        reject([&] {
+            (void)ops::linear_split_bias_workspace_capacity_bytes(QType::MXFP8, n, k, segments,
+                                                                  policy, 1, 1);
+        });
+#endif
+        MemoryArena cpu_workspace({nullptr, 0, Device::cpu()});
+        reject(
+            [&] { ops::linear_split(x, weight, bias, outputs, policy, cpu_workspace, execution); });
+        MemoryArena empty({nullptr, 0, execution.device()});
+        ops::linear_split(x, weight, bias, outputs, policy, empty, execution);
+        if (empty.used() != 0 || empty.peak_used() != 0) {
+            std::cerr << "BF16 split bias: expected zero workspace use\n";
+            ++failures;
+        }
     }
     if (kind == Kind::SwiGlu) {
         for (float invalid : {0.F, -1.F, std::numeric_limits<float>::infinity(),
                               std::numeric_limits<float>::quiet_NaN()}) {
             limit = invalid;
-            reject();
+            reject(call);
         }
     }
     cuda_synchronize();
@@ -256,12 +316,57 @@ int validate(Kind kind) {
 int main(int argc, char** argv) {
     linear_suite::Suite suite;
     linear_bias::add_native_cases(suite);
+#if NINFER_TARGET_RTX5090
+    constexpr int n = 768, k = 2304;
+    suite.add(linear_suite::make_case("bf16", n, k, 1, ops::LinearPolicy::A16Only,
+                                      linear_suite::Execution::Eager, "bias-operands"),
+              [] { return validate(Kind::Projection, n, k); });
+    std::vector<int> tokens{1, 4, 8, 128, 512, 1023, 1024, 1025, 2048, 4096, 4097};
+    for (int boundary :
+         {2, 25, 49, 81, 225, 385, 641, 897, 1121, 1345, 1793, 2241, 2689, 3137, 3585}) {
+        for (int t : {boundary - 1, boundary, boundary + 1}) tokens.push_back(t);
+    }
+    std::sort(tokens.begin(), tokens.end());
+    tokens.erase(std::unique(tokens.begin(), tokens.end()), tokens.end());
+    add(suite, n, k, tokens, Recipe::Random, Kind::Projection, tokens);
+
+    const std::array cancellation{1,    8,    32,   64,   128,  256,  512, 768,
+                                  1024, 1280, 1536, 2048, 2560, 3072, 4097};
+    add(suite, n, k, cancellation, Recipe::Cancellation, Kind::Projection, cancellation);
+
+    const auto add_vision = [&](Kind kind, int rows, int hidden,
+                                std::initializer_list<int> boundaries) {
+        suite.add(linear_suite::make_case("bf16", rows, hidden, 1, ops::LinearPolicy::A16Only,
+                                          linear_suite::Execution::Eager, "bias-operands"),
+                  [=] { return validate(kind, rows, hidden); });
+
+        std::vector<int> points{1, 4, 8, 128, 512, 1023, 1024, 1025, 2048, 4096, 4097};
+        for (int t : boundaries) points.insert(points.end(), {t - 1, t, t + 1});
+        std::sort(points.begin(), points.end());
+        points.erase(std::unique(points.begin(), points.end()), points.end());
+        add(suite, rows, hidden, points, Recipe::Random, kind, points);
+
+        std::vector<int> cancel{1};
+        cancel.insert(cancel.end(), boundaries.begin(), boundaries.end());
+        cancel.push_back(4097);
+        add(suite, rows, hidden, cancel, Recipe::Cancellation, kind, cancel);
+    };
+    add_vision(Kind::Split, 3072, 1024,
+               {2, 17, 49, 81, 145, 193, 337, 449, 561, 673, 785, 897, 1121, 1345, 1569, 1793, 1921, 2017, 2241});
+    add_vision(Kind::Projection, 1024, 1024,
+               {2, 113, 321, 641, 801, 1009, 1177, 1345, 1681, 2017, 2353, 2689, 3361, 4033});
+    add_vision(Kind::Projection, 4096, 1024,
+               {2, 48, 64, 97, 161, 241, 321, 401, 481, 561, 641, 801, 961, 1041, 1457, 1601});
+    add_vision(
+        Kind::Projection, 1024, 4096,
+        {2, 35, 73, 129, 257, 481, 641, 801, 1009, 1177, 1345, 1601, 2017, 2353, 2689, 3361, 4033});
+#endif
 #if NINFER_TARGET_SPARK
     for (auto kind : {Kind::Projection, Kind::Split, Kind::SwiGlu}) {
         const int n = kind == Kind::Projection ? 1024 : kind == Kind::Split ? 3072 : 8192;
         suite.add(linear_suite::make_case("bf16", n, 1024, 1, ops::LinearPolicy::A16Only,
                                           linear_suite::Execution::Eager, "bias-operands"),
-                  [kind] { return validate(kind); });
+                  [kind, n] { return validate(kind, n, 1024); });
     }
     add(suite, 1024, 1176,
         std::array{1,   4,   8,   15,  16,  17,  31,  32,   33,   127,  128,  129,  191,  192,

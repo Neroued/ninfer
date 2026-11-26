@@ -9,6 +9,12 @@ namespace ninfer::ops::detail::linear_bias {
 
 Launch select_launch(int rows, int k, int columns) {
     if (columns <= 0) throw std::invalid_argument("linear_bias: columns must be positive");
+#if NINFER_TARGET_RTX5090
+    if (rows == 768 && k == 2304) return select_n768_k2304(columns);
+    if (rows == 1024 && k == 1024) return select_n1024_k1024(columns);
+    if (rows == 4096 && k == 1024) return select_n4096_k1024(columns);
+    if (rows == 1024 && k == 4096) return select_n1024_k4096(columns);
+#endif
 #if NINFER_TARGET_SPARK
     if (rows == 1024 && k == 1176) return select_n1024_k1176(columns);
     if (rows == 1024 && k == 1024) return select_n1024_k1024(columns);

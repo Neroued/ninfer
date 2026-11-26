@@ -64,6 +64,7 @@ if(NINFER_TARGET STREQUAL "dgx_spark")
 endif()
 
 ninfer_linear_suite(bias test.cpp cases_native.cpp)
+ninfer_linear_format_tests(bias bf16)
 if(NINFER_TARGET STREQUAL "dgx_spark")
-  ninfer_linear_format_tests(bias bf16 mxfp8 nvfp4_mul)
+  ninfer_linear_format_tests(bias mxfp8 nvfp4_mul)
 endif()

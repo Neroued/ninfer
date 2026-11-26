@@ -288,6 +288,48 @@ GrammarCompiler::compile_model(std::string_view identity,
     return std::unique_ptr<GrammarSession>(new GrammarSession(std::move(session)));
 }
 
+xgrammar::Grammar GrammarCompiler::build_constraint(const OutputConstraint& constraint) const {
+    const auto error_kind = constraint_error_kind(constraint.kind);
+    try {
+        auto choices = constraint.choices;
+        if (constraint.kind == OutputConstraintKind::Choice) {
+            if (!constraint.source.empty())
+                throw std::invalid_argument("choice uses literal alternatives, not source text");
+            std::sort(choices.begin(), choices.end());
+            choices.erase(std::unique(choices.begin(), choices.end()), choices.end());
+        } else if (!choices.empty()) {
+            throw std::invalid_argument("literal alternatives require a choice constraint");
+        }
+        if (constraint.kind == OutputConstraintKind::Grammar) {
+            auto parsed = xgrammar::Grammar::FromEBNF(constraint.source, "root");
+            validate(parsed, impl_->vocab, impl_->eos);
+            return parsed;
+        }
+        if (constraint.kind == OutputConstraintKind::Choice) { return choice_grammar(choices); }
+        if (constraint.kind == OutputConstraintKind::Regex) {
+            validate_utf8(constraint.source);
+            return xgrammar::GrammarNormalizer::Apply(
+                ScalarRegex().Apply(xgrammar::Grammar::FromRegex(
+                    xgrammar::NormalizeRegexPattern(constraint.source, true))));
+        }
+        return build_json_grammar(constraint);
+    } catch (const xgrammar::JSONSchemaCompileError& error) {
+        RequestErrorKind kind = RequestErrorKind::InvalidJsonSchema;
+        if (error.kind == xgrammar::SchemaErrorType::kUnsupportedSchema)
+            kind = RequestErrorKind::UnsupportedJsonSchema;
+        else if (error.kind == xgrammar::SchemaErrorType::kUnsatisfiableSchema)
+            kind = RequestErrorKind::UnsatisfiableJsonSchema;
+        throw RequestError(kind,
+                           std::string(error.what()) + " at " +
+                               (error.pointer.empty() ? "/" : error.pointer),
+                           error.pointer);
+    } catch (const xgrammar::LogFatalError& error) {
+        throw RequestError(error_kind, error.what());
+    } catch (const RequestError&) { throw; } catch (const std::invalid_argument& error) {
+        throw RequestError(error_kind, error.what());
+    }
+}
+
 std::unique_ptr<GrammarSession> GrammarCompiler::compile(const OutputConstraint& constraint,
                                                          std::string_view close,
                                                          std::string_view continuation) {
@@ -310,22 +352,7 @@ std::unique_ptr<GrammarSession> GrammarCompiler::compile(const OutputConstraint&
         auto compiled = impl_->compiler.CompileCachedGrammar(
             key,
             [&] {
-                auto grammar = [&]() -> xgrammar::Grammar {
-                    if (constraint.kind == OutputConstraintKind::Grammar) {
-                        auto parsed = xgrammar::Grammar::FromEBNF(constraint.source, "root");
-                        validate(parsed, impl_->vocab, impl_->eos);
-                        return parsed;
-                    } else if (constraint.kind == OutputConstraintKind::Choice) {
-                        return choice_grammar(choices);
-                    } else if (constraint.kind == OutputConstraintKind::Regex) {
-                        validate_utf8(constraint.source);
-                        return xgrammar::GrammarNormalizer::Apply(
-                            ScalarRegex().Apply(xgrammar::Grammar::FromRegex(
-                                xgrammar::NormalizeRegexPattern(constraint.source, true))));
-                    } else {
-                        return build_json_grammar(constraint);
-                    }
-                }();
+                auto grammar = build_constraint(constraint);
                 if (!close.empty())
                     grammar = xgrammar::Grammar::Concat({reasoning_prefix(close), grammar});
                 return grammar;

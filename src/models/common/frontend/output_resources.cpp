@@ -42,9 +42,10 @@ StopPolicy merge_stop_policy(const text::Tokenizer& tokenizer, std::span<const T
 
 } // namespace
 
-OutputResources::OutputResources(const TextResources& resources, std::size_t cache_bytes)
+OutputResources::OutputResources(const TextResources& resources, std::size_t cache_bytes,
+                                 std::vector<TokenId> token_level_specials)
     : tokenizer(resources.tokenizer), defaults{.token_ids = resources.stop_token_ids},
-      cache_bytes_(cache_bytes) {
+      cache_bytes_(cache_bytes), token_level_specials_(std::move(token_level_specials)) {
     if (!tokenizer) throw std::invalid_argument("output resources require a tokenizer");
 }
 
@@ -61,6 +62,24 @@ text::GrammarCompiler& OutputResources::grammars() const {
             if (!tokenizer->is_valid_token(static_cast<TokenId>(id))) continue;
             const auto decoded = tokenizer->decoded_token(static_cast<TokenId>(id));
             if (!decoded.special) vocab[id] = decoded.bytes;
+        }
+        // Assign unique invalid-UTF-8 sentinels to model-declared token-level framing specials
+        // so XGrammar keeps them out of special_token_ids_ (allowing AddTokenSet /
+        // AddExcludeTokenSet) while making them unmatchable by any UTF-8 byte/regex/JSON rule.
+        for (const TokenId id : token_level_specials_) {
+            if (!tokenizer->is_valid_token(id)) continue;
+            if (std::find(defaults.token_ids.begin(), defaults.token_ids.end(), id) !=
+                defaults.token_ids.end())
+                continue;
+            const auto u = static_cast<std::uint32_t>(id);
+            vocab[static_cast<std::size_t>(id)] = {
+                '\xff',
+                '\xfe',
+                static_cast<char>((u >> 0) & 0xffU),
+                static_cast<char>((u >> 8) & 0xffU),
+                static_cast<char>((u >> 16) & 0xffU),
+                static_cast<char>((u >> 24) & 0xffU),
+            };
         }
         grammar_ = std::make_unique<text::GrammarCompiler>(std::move(vocab), defaults.token_ids,
                                                            cache_bytes_);

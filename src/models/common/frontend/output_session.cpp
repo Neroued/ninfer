@@ -31,6 +31,17 @@ void append_delta(DecodedOutput& output, OutputChannel channel, std::string text
     }
 }
 
+void append_event_delta(PublishedOutput& output, OutputChannel channel, std::string text) {
+    if (text.empty()) { return; }
+    if (!output.empty()) {
+        if (auto* prev = std::get_if<OutputDelta>(&output.back()); prev && prev->channel == channel) {
+            prev->text += text;
+            return;
+        }
+    }
+    output.emplace_back(OutputDelta{.channel = channel, .text = std::move(text)});
+}
+
 std::string consume_generated_utf8(std::string& pending) {
     std::string decoded;
     decoded.reserve(pending.size());
@@ -307,6 +318,90 @@ void terminalize(DecoderState& state, const StopPolicy& policy, DecodedOutput& e
     state.terminal     = true;
 }
 
+struct StopEventMatch {
+    bool found                      = false;
+    std::uint32_t committed_tokens  = 0;
+    std::uint64_t byte_cut          = 0;
+    std::uint32_t declaration_order = 0;
+    PublishedOutput output;
+};
+
+bool stop_event_match_precedes(std::uint32_t committed_tokens, std::uint64_t byte_cut,
+                               std::uint32_t declaration_order,
+                               const StopEventMatch& current) noexcept {
+    if (!current.found) { return true; }
+    if (committed_tokens != current.committed_tokens) {
+        return committed_tokens < current.committed_tokens;
+    }
+    if (byte_cut != current.byte_cut) { return byte_cut < current.byte_cut; }
+    return declaration_order < current.declaration_order;
+}
+
+void feed_channel_events(DecoderState& state, OutputChannel channel, std::string_view text,
+                         const StopPolicy& policy, PublishedOutput& emitted,
+                         std::uint32_t committed_tokens, StopEventMatch* best_match) {
+    if (text.empty()) { return; }
+    std::string combined          = state.stop_pending[channel_index(channel)];
+    const std::size_t old_pending = combined.size();
+    combined.append(text);
+    const std::uint64_t combined_start = state.decoded_bytes - old_pending;
+
+    if (best_match != nullptr) {
+        for (std::size_t declaration = 0; declaration < policy.strings.size(); ++declaration) {
+            const StopString& stop = policy.strings[declaration];
+            if (stop.channel != channel) { continue; }
+            const std::size_t found = combined.find(stop.text);
+            if (found == std::string::npos) { continue; }
+            const std::uint64_t byte_cut = combined_start + found;
+            const auto order             = static_cast<std::uint32_t>(declaration);
+            if (!stop_event_match_precedes(committed_tokens, byte_cut, order, *best_match)) {
+                continue;
+            }
+            PublishedOutput candidate = emitted;
+            append_event_delta(candidate, channel, combined.substr(0, found));
+            if (stop.include_in_output) { append_event_delta(candidate, channel, stop.text); }
+            *best_match = StopEventMatch{.found             = true,
+                                         .committed_tokens  = committed_tokens,
+                                         .byte_cut          = byte_cut,
+                                         .declaration_order = order,
+                                         .output            = std::move(candidate)};
+        }
+    }
+
+    const std::size_t hold = stop_hold_size(combined, channel, policy);
+    append_event_delta(emitted, channel, combined.substr(0, combined.size() - hold));
+    state.stop_pending[channel_index(channel)] = combined.substr(combined.size() - hold);
+    state.decoded_bytes += text.size();
+}
+
+void close_channel_events(DecoderState& state, OutputChannel channel, PublishedOutput& emitted) {
+    std::string& pending = state.stop_pending[channel_index(channel)];
+    append_event_delta(emitted, channel, std::move(pending));
+    pending.clear();
+}
+
+void feed_structured_events(DecoderState& state, PublishedOutput&& events, const StopPolicy& policy,
+                            PublishedOutput& emitted, std::uint32_t committed_tokens,
+                            StopEventMatch* best_match) {
+    for (OutputEvent& ev : events) {
+        if (auto* delta = std::get_if<OutputDelta>(&ev)) {
+            feed_channel_events(state, delta->channel, delta->text, policy, emitted,
+                                committed_tokens, best_match);
+        } else if (best_match == nullptr || !best_match->found) {
+            emitted.push_back(std::move(ev));
+        }
+    }
+}
+
+void terminalize_structured(DecoderState& state, PublishedOutput&& tail, const StopPolicy& policy,
+                            PublishedOutput& emitted, std::uint32_t committed_tokens) {
+    feed_structured_events(state, std::move(tail), policy, emitted, committed_tokens, nullptr);
+    close_channel_events(state, OutputChannel::Reasoning, emitted);
+    close_channel_events(state, OutputChannel::Content, emitted);
+    state.stop_pending = {};
+    state.terminal     = true;
+}
+
 DecoderState terminal_state(DecoderState state) {
     state.utf8_pending.clear();
     state.think_marker_pending.clear();
@@ -320,17 +415,31 @@ DecoderState terminal_state(DecoderState state) {
 class OutputSession::Impl {
 public:
     Impl(OutputSessionOptions options, std::unique_ptr<BodyDecoder> body_,
-         std::unique_ptr<text::GrammarSession> grammar_)
+         std::unique_ptr<text::GrammarSession> grammar_,
+         std::unique_ptr<StructuredOutputDecoder> structured_)
         : tokenizer(std::move(options.tokenizer)), reasoning(std::move(options.reasoning)),
           policy(std::move(options.stop)),
           thinking_control_tokens(reasoning ? reasoning->control_tokens : nullptr),
           preserve_special(options.presentation.raw ||
                            options.presentation.preserve_special_tokens),
           split_reasoning(options.starts_in_reasoning && !options.presentation.raw),
-          body(std::move(body_)), grammar(std::move(grammar_)) {
+          body(std::move(body_)), structured(std::move(structured_)), grammar(std::move(grammar_)) {
         if (!tokenizer) throw std::invalid_argument("output session requires a tokenizer");
+        if (body && structured)
+            throw std::invalid_argument("output session cannot combine body and structured decoders");
         if (options.thinking.budget && *options.thinking.budget == 0)
             throw std::invalid_argument("thinking budget must be positive");
+        if (structured) {
+            if (options.thinking.budget &&
+                (structured->in_reasoning() || structured->may_enter_reasoning()) &&
+                (!thinking_control_tokens || thinking_control_tokens->empty()))
+                throw std::invalid_argument("thinking budget requires model control tokens");
+            saw_content           = options.has_content_prefix;
+            state.in_reasoning    = structured->in_reasoning();
+            semantic.budget       = options.thinking.budget;
+            semantic.in_reasoning = structured->in_reasoning();
+            return;
+        }
         if (options.starts_in_reasoning && (!reasoning || reasoning->close.empty()))
             throw std::invalid_argument("reasoning output requires closing semantics");
         if (options.starts_in_reasoning && options.thinking.budget &&
@@ -359,7 +468,9 @@ public:
     SemanticThinkingState semantic;
     SemanticThinkingState preview_semantic;
     DecodedOutput preview_output;
+    PublishedOutput preview_events;
     std::unique_ptr<BodyDecoder> body;
+    std::unique_ptr<StructuredOutputDecoder> structured;
     bool preview_ready                 = false;
     FinishReason preview_finish_reason = FinishReason::None;
     std::unique_ptr<text::GrammarSession> grammar;
@@ -388,8 +499,10 @@ ReasoningFormat::ReasoningFormat(std::string close_,
       control_tokens(std::move(control_tokens_)), strip_content_leading(strip_content_leading_) {}
 
 OutputSession::OutputSession(OutputSessionOptions options, std::unique_ptr<BodyDecoder> body,
-                             std::unique_ptr<text::GrammarSession> grammar)
-    : impl_(std::make_unique<Impl>(std::move(options), std::move(body), std::move(grammar))) {}
+                             std::unique_ptr<text::GrammarSession> grammar,
+                             std::unique_ptr<StructuredOutputDecoder> structured)
+    : impl_(std::make_unique<Impl>(std::move(options), std::move(body), std::move(grammar),
+                                   std::move(structured))) {}
 
 bool OutputSession::constrained() const noexcept { return impl_ && impl_->grammar != nullptr; }
 
@@ -404,7 +517,9 @@ void OutputSession::constraint_uploaded(std::size_t bytes) noexcept {
 std::optional<ConstraintObservation> OutputSession::constraint_observation() const {
     if (!constrained()) return {};
     auto result = impl_->grammar->observation();
-    if (impl_->body && impl_->body->branch() != ConstraintOutputBranch::Undecided)
+    if (impl_->structured && impl_->structured->branch() != ConstraintOutputBranch::Undecided)
+        result.branch = impl_->structured->branch();
+    else if (impl_->body && impl_->body->branch() != ConstraintOutputBranch::Undecided)
         result.branch = impl_->body->branch();
     else if (impl_->saw_content || (!impl_->state.in_reasoning && result.complete))
         result.branch = ConstraintOutputBranch::Content;
@@ -419,8 +534,10 @@ std::uint32_t OutputSession::grammar_masks(std::span<const TokenId> drafts,
 
 void OutputSession::discard_preview() {
     if (impl_->grammar) { impl_->grammar->discard(); }
+    if (impl_->structured) { impl_->structured->discard_preview(); }
     impl_->preview_ready = false;
     impl_->preview_output.clear();
+    impl_->preview_events.clear();
 }
 
 runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> tokens,
@@ -443,15 +560,21 @@ runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> to
         throw std::invalid_argument("generated-token budget has an invalid limit reason");
     }
 
-    impl_->preview_state            = impl_->state;
-    impl_->preview_semantic         = impl_->semantic;
+    impl_->preview_state    = impl_->state;
+    impl_->preview_semantic = impl_->semantic;
     impl_->preview_output.clear();
+    impl_->preview_events.clear();
 
     const auto complete = [&](std::uint32_t count, FinishReason reason,
                               runtime::ContinuationAction continuation =
                                   runtime::ContinuationAction::Decode) {
         if (reason != FinishReason::None) { impl_->preview_semantic.control_pending = false; }
-        impl_->accept_grammar(tokens.first(count));
+        try {
+            impl_->accept_grammar(tokens.first(count));
+        } catch (...) {
+            if (impl_->structured) { impl_->structured->discard_preview(); }
+            throw;
+        }
         impl_->preview_finish_reason = reason;
         impl_->preview_ready         = true;
         return runtime::OutputDecision{
@@ -460,6 +583,94 @@ runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> to
             .continuation    = continuation,
         };
     };
+
+    if (impl_->structured) {
+        impl_->structured->begin_preview();
+        try {
+            for (std::size_t index = 0; index < tokens.size(); ++index) {
+                const std::uint32_t count                    = static_cast<std::uint32_t>(index + 1);
+                const TokenId token                          = tokens[index];
+                const ninfer::text::DecodedTokenView decoded = impl_->tokenizer->decoded_token(token);
+
+                const bool stop_token =
+                    std::find(impl_->policy.token_ids.begin(), impl_->policy.token_ids.end(),
+                              token) != impl_->policy.token_ids.end();
+                if (stop_token && !impl_->policy.publish_stop_token) {
+                    auto tail = impl_->structured->preview_finish(FinishReason::StopToken);
+                    terminalize_structured(impl_->preview_state, std::move(tail), impl_->policy,
+                                           impl_->preview_events, count);
+                    impl_->preview_semantic.in_reasoning = false;
+                    return complete(count, FinishReason::StopToken);
+                }
+
+                auto step = impl_->structured->preview_token(token, decoded.bytes, decoded.special,
+                                                             /*is_control=*/false);
+                if (step.count_reasoning_token) {
+                    ++impl_->preview_state.reasoning_tokens;
+                    ++impl_->preview_semantic.model_thinking_tokens;
+                    if (impl_->preview_semantic.budget && !impl_->preview_semantic.applied &&
+                        impl_->preview_semantic.model_thinking_tokens >
+                            *impl_->preview_semantic.budget) {
+                        throw std::logic_error("model output exceeded the licensed thinking budget");
+                    }
+                }
+                impl_->preview_state.in_reasoning    = step.in_reasoning_after;
+                impl_->preview_semantic.in_reasoning = step.in_reasoning_after;
+
+                StopEventMatch match;
+                feed_structured_events(impl_->preview_state, std::move(step.events), impl_->policy,
+                                       impl_->preview_events, count, &match);
+                if (match.found) {
+                    (void)impl_->structured->preview_finish(FinishReason::StopString);
+                    impl_->preview_state = terminal_state(std::move(impl_->preview_state));
+                    impl_->preview_state.matched_stop_order = match.declaration_order;
+                    impl_->preview_semantic.in_reasoning    = false;
+                    impl_->preview_events                   = std::move(match.output);
+                    return complete(match.committed_tokens, FinishReason::StopString);
+                }
+
+                if (stop_token) {
+                    auto tail = impl_->structured->preview_finish(FinishReason::StopToken);
+                    terminalize_structured(impl_->preview_state, std::move(tail), impl_->policy,
+                                           impl_->preview_events, count);
+                    impl_->preview_semantic.in_reasoning = false;
+                    return complete(count, FinishReason::StopToken);
+                }
+
+                if (impl_->preview_semantic.in_reasoning && impl_->preview_semantic.budget &&
+                    !impl_->preview_semantic.applied &&
+                    impl_->preview_semantic.model_thinking_tokens ==
+                        *impl_->preview_semantic.budget) {
+                    if (count == total_budget_remaining) {
+                        auto tail = impl_->structured->preview_finish(limit_reason);
+                        terminalize_structured(impl_->preview_state, std::move(tail), impl_->policy,
+                                               impl_->preview_events, count);
+                        impl_->preview_semantic.in_reasoning = false;
+                        return complete(count, limit_reason);
+                    }
+                    if (impl_->thinking_control_tokens &&
+                        total_budget_remaining - count >= impl_->thinking_control_tokens->size()) {
+                        impl_->preview_semantic.control_pending = true;
+                        return complete(count, FinishReason::None,
+                                        runtime::ContinuationAction::ApplyTargetControl);
+                    }
+                }
+            }
+
+            const auto count = static_cast<std::uint32_t>(tokens.size());
+            if (tokens.size() == total_budget_remaining) {
+                auto tail = impl_->structured->preview_finish(limit_reason);
+                terminalize_structured(impl_->preview_state, std::move(tail), impl_->policy,
+                                       impl_->preview_events, count);
+                impl_->preview_semantic.in_reasoning = false;
+                return complete(count, limit_reason);
+            }
+            return complete(count, FinishReason::None);
+        } catch (...) {
+            impl_->structured->discard_preview();
+            throw;
+        }
+    }
 
     for (std::size_t index = 0; index < tokens.size(); ++index) {
         const std::uint32_t count                    = static_cast<std::uint32_t>(index + 1);
@@ -557,9 +768,42 @@ runtime::OutputDecision OutputSession::preview_control(std::span<const TokenId> 
         throw std::invalid_argument("thinking control span exceeds the remaining output budget");
     }
 
-    impl_->preview_state            = impl_->state;
-    impl_->preview_semantic         = impl_->semantic;
+    impl_->preview_state    = impl_->state;
+    impl_->preview_semantic = impl_->semantic;
     impl_->preview_output.clear();
+    impl_->preview_events.clear();
+    if (impl_->structured) {
+        impl_->structured->begin_preview();
+        try {
+            for (std::size_t index = 0; index < tokens.size(); ++index) {
+                const TokenId token                          = tokens[index];
+                const ninfer::text::DecodedTokenView decoded = impl_->tokenizer->decoded_token(token);
+                auto step = impl_->structured->preview_token(token, decoded.bytes, decoded.special,
+                                                             /*is_control=*/true);
+                impl_->preview_state.in_reasoning    = step.in_reasoning_after;
+                impl_->preview_semantic.in_reasoning = step.in_reasoning_after;
+                feed_structured_events(impl_->preview_state, std::move(step.events), impl_->policy,
+                                       impl_->preview_events, static_cast<std::uint32_t>(index + 1),
+                                       nullptr);
+            }
+            if (impl_->preview_semantic.in_reasoning) {
+                throw std::logic_error(
+                    "canonical thinking control did not close the thinking phase");
+            }
+            impl_->preview_semantic.control_pending = false;
+            impl_->preview_semantic.applied         = true;
+            impl_->preview_semantic.injected_tokens = static_cast<std::uint32_t>(tokens.size());
+            impl_->accept_grammar(tokens);
+            impl_->preview_finish_reason = FinishReason::None;
+            impl_->preview_ready         = true;
+            return runtime::OutputDecision{
+                .accepted_tokens = static_cast<std::uint32_t>(tokens.size()),
+            };
+        } catch (...) {
+            impl_->structured->discard_preview();
+            throw;
+        }
+    }
     for (std::size_t index = 0; index < tokens.size(); ++index) {
         const TokenId token                          = tokens[index];
         const ninfer::text::DecodedTokenView decoded = impl_->tokenizer->decoded_token(token);
@@ -589,7 +833,9 @@ runtime::OutputDecision OutputSession::preview_control(std::span<const TokenId> 
 
 void OutputSession::validate_generation_capacity(std::uint32_t effective_output_tokens) const {
     if (impl_ == nullptr) { throw std::logic_error("output session is empty"); }
-    if (!impl_->semantic.budget || !impl_->semantic.in_reasoning ||
+    const bool may_think = impl_->semantic.in_reasoning ||
+                           (impl_->structured && impl_->structured->may_enter_reasoning());
+    if (!impl_->semantic.budget || !may_think ||
         effective_output_tokens <= *impl_->semantic.budget) {
         return;
     }
@@ -612,11 +858,25 @@ runtime::OutputDecision OutputSession::preview_terminal(FinishReason reason) {
         reason == FinishReason::StopToken) {
         throw std::invalid_argument("invalid between-round terminal decoder reason");
     }
-    impl_->preview_state            = impl_->state;
+    impl_->preview_state                    = impl_->state;
     impl_->preview_semantic                 = impl_->semantic;
     impl_->preview_semantic.control_pending = false;
     impl_->preview_output.clear();
-    terminalize(impl_->preview_state, impl_->policy, impl_->preview_output, 0);
+    impl_->preview_events.clear();
+    if (impl_->structured) {
+        impl_->structured->begin_preview();
+        try {
+            auto tail = impl_->structured->preview_finish(reason);
+            terminalize_structured(impl_->preview_state, std::move(tail), impl_->policy,
+                                   impl_->preview_events, 0);
+            impl_->preview_semantic.in_reasoning = false;
+        } catch (...) {
+            impl_->structured->discard_preview();
+            throw;
+        }
+    } else {
+        terminalize(impl_->preview_state, impl_->policy, impl_->preview_output, 0);
+    }
     impl_->preview_finish_reason = reason;
     impl_->preview_ready         = true;
     return runtime::OutputDecision{.accepted_tokens = 0, .finish_reason = reason};
@@ -627,11 +887,24 @@ PublishedOutput OutputSession::commit_preview() {
     using std::swap;
     swap(impl_->state, impl_->preview_state);
     swap(impl_->semantic, impl_->preview_semantic);
-    DecodedOutput decoded = std::move(impl_->preview_output);
-    impl_->preview_output.clear();
     impl_->preview_ready = false;
     if (impl_->grammar) impl_->grammar->confirm();
 
+    if (impl_->structured) {
+        impl_->structured->commit_preview();
+        PublishedOutput output = std::move(impl_->preview_events);
+        impl_->preview_events.clear();
+        for (const OutputEvent& event : output) {
+            if (const auto* delta = std::get_if<OutputDelta>(&event);
+                delta && delta->channel == OutputChannel::Content && !delta->text.empty()) {
+                impl_->saw_content = true;
+            }
+        }
+        return output;
+    }
+
+    DecodedOutput decoded = std::move(impl_->preview_output);
+    impl_->preview_output.clear();
     PublishedOutput output;
     const auto append = [&](PublishedOutput events) {
         output.insert(output.end(), std::make_move_iterator(events.begin()),
@@ -653,14 +926,17 @@ PublishedOutput OutputSession::commit_preview() {
 }
 
 std::vector<GeneratedToolCall> OutputSession::take_tool_calls() noexcept {
+    if (impl_ && impl_->structured) return impl_->structured->take_tool_calls();
     return impl_ && impl_->body ? impl_->body->take_tool_calls() : std::vector<GeneratedToolCall>{};
 }
 
 std::optional<ToolOutputError> OutputSession::output_error() const {
+    if (impl_ && impl_->structured) return impl_->structured->error();
     return impl_ && impl_->body ? impl_->body->error() : std::nullopt;
 }
 
 ToolCallParseDiagnostics OutputSession::tool_call_parse_diagnostics() const noexcept {
+    if (impl_ && impl_->structured) return impl_->structured->diagnostics();
     return impl_ && impl_->body ? impl_->body->diagnostics() : ToolCallParseDiagnostics{};
 }
 

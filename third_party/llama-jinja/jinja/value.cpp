@@ -1165,29 +1165,32 @@ const func_builtins& value_object_t::get_builtins() const {
          }},
         {"dictsort",
          [](const func_args& args) -> value {
-             value val_input   = args.get_pos(0);
-             value val_case    = args.get_kwarg_or_pos("case_sensitive", 1);
-             value val_by      = args.get_kwarg_or_pos("by", 2);
-             value val_reverse = args.get_kwarg_or_pos("reverse", 3);
-             // FIXME: sorting is currently always case sensitive
-             // const bool case_sensitive = val_case->as_bool(); // undefined == false
-             const bool reverse = val_reverse->as_bool(); // undefined == false
+             args.ensure_vals<value_object>();
+             value val_input           = args.get_pos(0);
+             value val_case            = args.get_kwarg_or_pos("case_sensitive", 1);
+             value val_by              = args.get_kwarg_or_pos("by", 2);
+             value val_reverse         = args.get_kwarg_or_pos("reverse", 3);
+             const bool case_sensitive = val_case->as_bool(); // undefined == false
+             const bool reverse        = val_reverse->as_bool(); // undefined == false
              const bool by_value =
-                 is_val<value_string>(val_by) && val_by->as_string().str() == "value" ? true
-                                                                                      : false;
-             auto result = mk_val<value_object>(val_input); // copy
-             std::sort(result->val_obj.begin(), result->val_obj.end(),
-                       [&](const auto& a, const auto& b) {
-                           if (by_value) {
-                               return value_compare(a.second, b.second,
-                                                    reverse ? value_compare_op::gt
-                                                            : value_compare_op::lt);
-                           } else {
-                               return value_compare(a.first, b.first,
-                                                    reverse ? value_compare_op::gt
-                                                            : value_compare_op::lt);
-                           }
-                       });
+                 is_val<value_string>(val_by) && val_by->as_string().str() == "value";
+             auto lower_if_needed = [&](const value& v) -> value {
+                 if (case_sensitive || !is_val<value_string>(v)) return v;
+                 std::string s = v->as_string().str();
+                 for (char& c : s) {
+                     if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+                 }
+                 return mk_val<value_string>(std::move(s));
+             };
+             auto sorted = val_input->as_ordered_object();
+             std::stable_sort(sorted.begin(), sorted.end(), [&](const auto& a, const auto& b) {
+                 const value lhs = lower_if_needed(by_value ? a.second : a.first);
+                 const value rhs = lower_if_needed(by_value ? b.second : b.first);
+                 return value_compare(lhs, rhs,
+                                      reverse ? value_compare_op::gt : value_compare_op::lt);
+             });
+             auto result = mk_val<value_array>();
+             for (const auto& pair : sorted) { result->push_back(mk_val<value_tuple>(pair)); }
              return result;
          }},
         {"join", object_join_not_implemented},

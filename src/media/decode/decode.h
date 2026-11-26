@@ -47,6 +47,18 @@ struct ImageInfo {
     int height = 0;
 };
 
+enum class AlphaComposite : std::uint8_t {
+    Drop,
+    White,
+    Checkerboard8x8,
+};
+
+struct ImageDecodeOptions {
+    AlphaComposite alpha        = AlphaComposite::Drop;
+    bool apply_exif_orientation = true;
+    bool repair_jpeg_eoi        = false;
+};
+
 struct Video {
     int width        = 0;
     int height       = 0;
@@ -82,11 +94,13 @@ struct VideoSelection {
     int minimum_frames = 1;
 };
 
-ImageInfo inspect_image(std::span<const std::uint8_t> bytes, const Policy& policy);
+ImageInfo inspect_image(std::span<const std::uint8_t> bytes, const Policy& policy,
+                        const ImageDecodeOptions& options = {});
 VideoSource probe_video(std::span<const std::uint8_t> bytes, const Policy& policy);
 VideoInfo inspect_video(std::span<const std::uint8_t> bytes, const Policy& policy,
                         const VideoSelection& selection);
-Image decode_image(std::span<const std::uint8_t> bytes, const Policy& policy);
+Image decode_image(std::span<const std::uint8_t> bytes, const Policy& policy,
+                   const ImageDecodeOptions& options = {});
 Video decode_video(std::span<const std::uint8_t> bytes, const Policy& policy,
                    const VideoSelection& selection);
 

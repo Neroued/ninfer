@@ -4,6 +4,8 @@ add_library(ninfer_model_loading STATIC
   common/frontend/resources.cpp
   glm5next/frontend/resources.cpp
   glm5next/frontend/processor_config.cpp
+  inkling2/frontend/resources.cpp
+  inkling2/frontend/processor_config.cpp
   common/bindings.cpp
   common/dflash/config.cpp
   common/dflash/weights.cpp
@@ -31,6 +33,15 @@ add_library(ninfer_model_control STATIC
   glm5next/frontend/tool_decoder.cpp
   glm5next/frontend/tool_grammar.cpp
   glm5next/prefix_identity.cpp
+  inkling2/frontend/chat_template.cpp
+  inkling2/frontend/prompt_layout.cpp
+  inkling2/frontend/frontend.cpp
+  inkling2/frontend/output.cpp
+  inkling2/frontend/tool_contract.cpp
+  inkling2/frontend/block_decoder.cpp
+  inkling2/frontend/tool_grammar.cpp
+  inkling2/frontend/processor.cpp
+  inkling2/prefix_identity.cpp
   common/frontend/output_resources.cpp
   common/frontend/output_session.cpp
   common/frontend/tools.cpp

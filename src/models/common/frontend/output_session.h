@@ -60,6 +60,32 @@ public:
     virtual ConstraintOutputBranch branch() const noexcept            = 0;
 };
 
+// Model-owned token-framed output parser (e.g., typed multi-block streams delimited by
+// special framing tokens). Runs transactionally alongside OutputSession's stop/budget/grammar
+// policies without leaking model-specific token contracts into OutputSession.
+class StructuredOutputDecoder {
+public:
+    struct PreviewStep {
+        PublishedOutput events;
+        bool count_reasoning_token = false;
+        bool in_reasoning_after    = false;
+    };
+
+    virtual ~StructuredOutputDecoder()                                      = default;
+    [[nodiscard]] virtual bool in_reasoning() const noexcept                = 0;
+    [[nodiscard]] virtual bool may_enter_reasoning() const noexcept         = 0;
+    virtual void begin_preview()                                            = 0;
+    [[nodiscard]] virtual PreviewStep preview_token(TokenId token, std::string_view bytes,
+                                                    bool is_special, bool is_control) = 0;
+    [[nodiscard]] virtual PublishedOutput preview_finish(FinishReason reason)         = 0;
+    virtual void commit_preview() noexcept                                            = 0;
+    virtual void discard_preview() noexcept                                           = 0;
+    [[nodiscard]] virtual std::vector<GeneratedToolCall> take_tool_calls() noexcept   = 0;
+    [[nodiscard]] virtual ToolCallParseDiagnostics diagnostics() const noexcept       = 0;
+    [[nodiscard]] virtual std::optional<ToolOutputError> error() const                = 0;
+    [[nodiscard]] virtual ConstraintOutputBranch branch() const noexcept              = 0;
+};
+
 struct OutputSessionOptions {
     std::shared_ptr<const text::Tokenizer> tokenizer;
     std::shared_ptr<const ReasoningFormat> reasoning;
@@ -74,7 +100,8 @@ class OutputSession {
 public:
     OutputSession() noexcept;
     OutputSession(OutputSessionOptions options, std::unique_ptr<BodyDecoder> body,
-                  std::unique_ptr<text::GrammarSession> grammar);
+                  std::unique_ptr<text::GrammarSession> grammar,
+                  std::unique_ptr<StructuredOutputDecoder> structured = nullptr);
     ~OutputSession();
     OutputSession(OutputSession&&) noexcept;
     OutputSession& operator=(OutputSession&&) noexcept;

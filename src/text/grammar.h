@@ -76,6 +76,7 @@ public:
     [[nodiscard]] std::unique_ptr<GrammarSession> compile(const OutputConstraint& constraint,
                                                           std::string_view reasoning_close,
                                                           std::string_view continuation);
+    [[nodiscard]] xgrammar::Grammar build_constraint(const OutputConstraint& constraint) const;
     // Model-owned composition, built only on a miss in the same bounded compiler cache.
     [[nodiscard]] std::unique_ptr<GrammarSession>
     compile_model(std::string_view identity, const std::function<xgrammar::Grammar()>& build,

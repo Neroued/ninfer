@@ -323,7 +323,8 @@ public:
         (void)receive();
     }
 
-    Image rgb(const AVFrame* frame, int orientation, bool composite_alpha = false) {
+    Image rgb(const AVFrame* frame, int orientation,
+              AlphaComposite alpha_mode = AlphaComposite::Drop) {
         const int width  = frame->width;
         const int height = frame->height;
         if (width <= 0 || height <= 0) {
@@ -337,8 +338,10 @@ public:
         out.height = height;
         const AVPixFmtDescriptor* descriptor =
             av_pix_fmt_desc_get(static_cast<AVPixelFormat>(frame->format));
-        const bool alpha = composite_alpha && descriptor != nullptr &&
-                           (descriptor->flags & AV_PIX_FMT_FLAG_ALPHA) != 0;
+        const bool has_alpha =
+            (descriptor != nullptr && (descriptor->flags & AV_PIX_FMT_FLAG_ALPHA) != 0) ||
+            frame->format == AV_PIX_FMT_PAL8;
+        const bool alpha                       = alpha_mode != AlphaComposite::Drop && has_alpha;
         const AVPixelFormat destination_format = alpha ? AV_PIX_FMT_RGBA : AV_PIX_FMT_RGB24;
         AvImageBuffer converted(width, height, destination_format);
         constexpr int conversion_flags = SWS_BILINEAR | SWS_FULL_CHR_H_INT | SWS_ACCURATE_RND;
@@ -366,10 +369,13 @@ public:
                 std::uint8_t* destination =
                     out.rgb.data() + static_cast<std::size_t>(y) * width * 3;
                 for (int x = 0; x < width; ++x) {
-                    const int a = source[4 * x + 3];
+                    const int a  = source[4 * x + 3];
+                    const int bg = alpha_mode == AlphaComposite::Checkerboard8x8
+                                       ? ((((x / 8) + (y / 8)) % 2 == 0) ? 204 : 153)
+                                       : 255;
                     for (int c = 0; c < 3; ++c) {
                         destination[3 * x + c] = static_cast<std::uint8_t>(
-                            ((255 - a) * 255 + a * source[4 * x + c] + 127) / 255);
+                            ((255 - a) * bg + a * source[4 * x + c] + 127) / 255);
                     }
                 }
             }
@@ -548,18 +554,37 @@ VideoScan scan_video(std::span<const std::uint8_t> bytes, const Policy& policy,
     return scan;
 }
 
+std::span<const std::uint8_t> maybe_repair_jpeg_eoi(std::span<const std::uint8_t> bytes,
+                                                    bool repair_eoi,
+                                                    std::vector<std::uint8_t>& scratch) {
+    if (!repair_eoi || !is_jpeg(bytes) ||
+        (bytes.size() >= 2 && bytes[bytes.size() - 2] == 0xff && bytes[bytes.size() - 1] == 0xd9)) {
+        return bytes;
+    }
+    scratch.assign(bytes.begin(), bytes.end());
+    scratch.push_back(0xff);
+    scratch.push_back(0xd9);
+    return scratch;
+}
+
 } // namespace
 
-ImageInfo inspect_image(std::span<const std::uint8_t> bytes, const Policy& policy) {
+ImageInfo inspect_image(std::span<const std::uint8_t> bytes, const Policy& policy,
+                        const ImageDecodeOptions& options) {
     validate_input(bytes, policy);
     if (policy.checkpoint) { policy.checkpoint(); }
     if (is_jpeg(bytes)) {
-        ImageInfo result = detail::inspect_jpeg(bytes, policy);
-        if (exif_orientation(bytes) >= 5) { std::swap(result.width, result.height); }
+        std::vector<std::uint8_t> repaired;
+        const auto view  = maybe_repair_jpeg_eoi(bytes, options.repair_jpeg_eoi, repaired);
+        ImageInfo result = detail::inspect_jpeg(view, policy);
+        if (options.apply_exif_orientation && exif_orientation(view) >= 5) {
+            std::swap(result.width, result.height);
+        }
         return result;
     }
     Decoder decoder(bytes, policy.max_decoded_pixels);
-    const int orientation = orientation_from_rotation(rotation_of(decoder.stream()));
+    const int orientation =
+        options.apply_exif_orientation ? orientation_from_rotation(rotation_of(decoder.stream())) : 1;
     ImageInfo result;
     decoder.frames([&](int index, const AVFrame* frame) {
         if (policy.checkpoint) { policy.checkpoint(); }
@@ -599,19 +624,24 @@ VideoInfo inspect_video(std::span<const std::uint8_t> bytes, const Policy& polic
     return out;
 }
 
-Image decode_image(std::span<const std::uint8_t> bytes, const Policy& policy) {
+Image decode_image(std::span<const std::uint8_t> bytes, const Policy& policy,
+                   const ImageDecodeOptions& options) {
     validate_input(bytes, policy);
     if (policy.checkpoint) { policy.checkpoint(); }
     if (is_jpeg(bytes)) {
-        return apply_orientation(detail::decode_jpeg(bytes, policy), exif_orientation(bytes));
+        std::vector<std::uint8_t> repaired;
+        const auto view     = maybe_repair_jpeg_eoi(bytes, options.repair_jpeg_eoi, repaired);
+        const int orient    = options.apply_exif_orientation ? exif_orientation(view) : 1;
+        return apply_orientation(detail::decode_jpeg(view, policy), orient);
     }
     Decoder decoder(bytes, policy.max_decoded_pixels);
-    const int orientation = orientation_from_rotation(rotation_of(decoder.stream()));
+    const int orientation =
+        options.apply_exif_orientation ? orientation_from_rotation(rotation_of(decoder.stream())) : 1;
     Image result;
     decoder.frames([&](int index, const AVFrame* frame) {
         if (policy.checkpoint) { policy.checkpoint(); }
         if (index == 0) {
-            result = decoder.rgb(frame, orientation);
+            result = decoder.rgb(frame, orientation, options.alpha);
             return false;
         }
         return true;
@@ -633,7 +663,7 @@ Video decode_video(std::span<const std::uint8_t> bytes, const Policy& policy,
     out.frames.reserve(plan.indices.size());
     const VideoScan scan = scan_video(
         bytes, policy, plan, [&](Decoder& decoder, const AVFrame* frame, int orientation) {
-            out.frames.push_back(decoder.rgb(frame, orientation, true));
+            out.frames.push_back(decoder.rgb(frame, orientation, AlphaComposite::White));
         });
     out.width  = scan.first_frame.width;
     out.height = scan.first_frame.height;

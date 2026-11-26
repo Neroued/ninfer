@@ -44,6 +44,8 @@ struct Options {
     int batch          = 1;
     int mtp_k          = 3;
     int drafts         = 7;
+    int token_domain   = kTokenDomain;
+    int physical_rows  = kPhysicalRows;
     int extent         = 0;
     bool extent_set    = false;
     bool force_general = false;
@@ -54,7 +56,8 @@ struct Options {
 
 void usage(const char* argv0) {
     std::printf("usage: %s [--sample|--mtp|--dflash2|--matrix] [--mode greedy|stochastic] "
-                "[--batch N] [--mtp-k 1..5] [--drafts 1..15] [--extent 0..K] [--top-k 1..20] "
+                "[--batch N] [--token-domain N] [--physical-rows N] [--mtp-k 1..5] [--drafts "
+                "1..15] [--extent 0..K] [--top-k 1..20] "
                 "[--no-counts] [--general] [--mixed] [--reject-at J] [--warmup N] [--repeat N] "
                 "[--row-extents N,...] [--live-rows 0,1,...] [--mask]\n",
                 argv0);
@@ -101,6 +104,10 @@ Options parse_args(int argc, char** argv) {
             }
         } else if (arg == "--batch") {
             options.batch = parse_int(need_value("--batch"), "--batch");
+        } else if (arg == "--token-domain") {
+            options.token_domain = parse_int(need_value("--token-domain"), "--token-domain");
+        } else if (arg == "--physical-rows") {
+            options.physical_rows = parse_int(need_value("--physical-rows"), "--physical-rows");
         } else if (arg == "--mtp-k") {
             options.mtp_k = parse_int(need_value("--mtp-k"), "--mtp-k");
         } else if (arg == "--extent") {
@@ -150,6 +157,10 @@ Options parse_args(int argc, char** argv) {
         throw std::invalid_argument("--mtp-k must be in [1,5]");
     }
     if (options.batch < 1) { throw std::invalid_argument("--batch must be positive"); }
+    if (options.token_domain < 1 || options.token_domain > options.physical_rows)
+        throw std::invalid_argument("require 1 <= --token-domain <= --physical-rows");
+    if (options.batch > INT32_MAX / 16)
+        throw std::invalid_argument("--batch is too large for the verification columns");
     if (options.drafts < 1 || options.drafts > 15)
         throw std::invalid_argument("--drafts must be in [1,15]");
     const int drafts = options.dflash2 ? options.drafts : options.matrix ? 5 : options.mtp_k;
@@ -162,6 +173,12 @@ Options parse_args(int argc, char** argv) {
         (options.row_extents.size() != std::size_t(options.batch) ||
          *std::max_element(options.row_extents.begin(), options.row_extents.end()) > drafts))
         throw std::invalid_argument("row extents must fit B and K");
+    const int max_extent =
+        options.row_extents.empty()
+            ? options.extent
+            : *std::max_element(options.row_extents.begin(), options.row_extents.end());
+    if (options.dflash2 && max_extent > 0 && options.token_domain < kDFlash2Candidates)
+        throw std::invalid_argument("live sparse proposals require at least 16 distinct token IDs");
     if (options.matrix && (!options.row_extents.empty() || !options.live_rows.empty() ||
                            options.extent_set || options.reject_at >= 0))
         throw std::invalid_argument("explicit extents/rejection require one acceptance profile");
@@ -179,16 +196,20 @@ Options parse_args(int argc, char** argv) {
     return options;
 }
 
-DeviceBuffer make_logits(int cols) {
-    std::vector<std::uint16_t> host(static_cast<std::size_t>(kPhysicalRows) * cols);
+int target_id(int column, int token_domain) {
+    return (17 + std::int64_t(column) * 7919) % token_domain;
+}
+
+DeviceBuffer make_logits(int cols, int physical_rows, int token_domain) {
+    std::vector<std::uint16_t> host(static_cast<std::size_t>(physical_rows) * cols);
     for (int col = 0; col < cols; ++col) {
-        const int hot = (17 + col * 7919) % kTokenDomain;
-        for (int row = 0; row < kPhysicalRows; ++row) {
-            float value = fixture::uniform(static_cast<std::uint64_t>(col) * kPhysicalRows + row,
+        const int hot = target_id(col, token_domain);
+        for (int row = 0; row < physical_rows; ++row) {
+            float value = fixture::uniform(static_cast<std::uint64_t>(col) * physical_rows + row,
                                            101U, -8.F, -7.F);
             if (row == hot) { value = 8.0f; }
-            if (row >= kTokenDomain) { value = 20.0f; }
-            host[static_cast<std::size_t>(col) * kPhysicalRows + row] = f32_to_bf16(value);
+            if (row >= token_domain) { value = 20.0f; }
+            host[static_cast<std::size_t>(col) * physical_rows + row] = f32_to_bf16(value);
         }
     }
     DeviceBuffer device(ninfer::bench::device_context().device(),
@@ -205,7 +226,8 @@ DeviceBuffer make_i32(const std::vector<std::int32_t>& host) {
 }
 
 DeviceBuffer make_batch_configs(DeviceBuffer& counts, int batch, Mode mode, bool counts_active,
-                                int top_k, bool mixed, const DeviceBuffer& masks, int columns) {
+                                int top_k, bool mixed, const DeviceBuffer& masks, int columns,
+                                int token_domain) {
     std::vector<ops::SamplingConfig> configs(static_cast<std::size_t>(batch));
     for (int row = 0; row < batch; ++row) {
         ops::SamplingConfig& config = configs[static_cast<std::size_t>(row)];
@@ -216,10 +238,10 @@ DeviceBuffer make_batch_configs(DeviceBuffer& counts, int batch, Mode mode, bool
         config.seed                 = 20260716ull + static_cast<unsigned long long>(row);
         config.token_counts         = mode == Mode::Stochastic && counts_active
                                           ? static_cast<std::int32_t*>(counts.data()) +
-                                        static_cast<std::size_t>(row) * kTokenDomain
+                                        static_cast<std::size_t>(row) * token_domain
                                           : nullptr;
         if (masks.size()) {
-            const int words = (kTokenDomain + 31) / 32;
+            const int words = 1 + (token_domain - 1) / 32;
             config.mask     = {static_cast<const std::uint32_t*>(masks.data()) +
                                    std::size_t(row) * columns * words,
                                words};
@@ -229,7 +251,8 @@ DeviceBuffer make_batch_configs(DeviceBuffer& counts, int batch, Mode mode, bool
             config.presence_penalty  = row % 3 == 0 ? 0.0f : 1.0f;
             config.frequency_penalty = row % 3 == 1 ? 0.125f : 0.0f;
             config.token_counts =
-                counts_active ? static_cast<int*>(counts.data()) + row * kTokenDomain : nullptr;
+                counts_active ? static_cast<int*>(counts.data()) + std::size_t(row) * token_domain
+                              : nullptr;
         }
     }
     DeviceBuffer device(ninfer::bench::device_context().device(),
@@ -280,21 +303,21 @@ private:
     measurement::Csv csv_;
 };
 
-DeviceBuffer make_counts(int batch) {
-    std::vector<std::int32_t> values(std::size_t(kTokenDomain) * batch, 0);
+DeviceBuffer make_counts(int batch, int token_domain) {
+    std::vector<std::int32_t> values(std::size_t(token_domain) * batch, 0);
     for (int b = 0; b < batch; ++b)
-        for (int v = b; v < kTokenDomain; v += 113)
-            values[std::size_t(b) * kTokenDomain + v] = 1 + v % 5;
+        for (std::int64_t v = b; v < token_domain; v += 113)
+            values[std::size_t(b) * token_domain + v] = 1 + v % 5;
     return make_i32(values);
 }
 
-DeviceBuffer make_masks(int columns, int batch, bool enabled) {
+DeviceBuffer make_masks(int columns, int batch, bool enabled, int token_domain) {
     if (!enabled) return {};
-    const int words = (kTokenDomain + 31) / 32;
+    const int words = 1 + (token_domain - 1) / 32;
     std::vector<std::int32_t> values(std::size_t(words) * columns * batch, -1);
     for (int b = 0; b < batch; ++b)
         for (int c = 0; c < columns; ++c)
-            for (int v = (b + c) % 7; v < kTokenDomain; v += 7)
+            for (std::int64_t v = (b + c) % 7; v < token_domain; v += 7)
                 values[(std::size_t(b) * columns + c) * words + v / 32] &=
                     ~(std::uint32_t{1} << (v % 32));
     return make_i32(values);
@@ -307,21 +330,26 @@ std::vector<std::int32_t> extents(const Options& o, int columns) {
 }
 
 std::size_t decision_bytes(const Options& o, int columns, const std::vector<std::int32_t>& active,
-                           bool acceptance) {
+                           bool acceptance, bool raw_sparse = false) {
     std::size_t bytes = o.live_rows.empty() ? 0 : std::size_t(o.batch) * sizeof(std::int32_t);
     for (int b = 0; b < o.batch; ++b) {
         if (!o.live_rows.empty() && !o.live_rows[b]) {
             bytes += std::size_t(acceptance ? columns + 1 : 1) * sizeof(std::int32_t);
             continue;
         }
+        const int used = acceptance ? active[b] + 1 : 1;
+        if (raw_sparse) {
+            // Extent, the valid target/draft prefix, and all output slots and count.
+            bytes += std::size_t(2 * used + columns + 1) * sizeof(std::int32_t);
+            continue;
+        }
         bytes += sizeof(ops::SamplingConfig);
         const bool stochastic = o.mixed ? b % 3 == 2 : o.mode == Mode::Stochastic;
         const bool penalties  = o.mixed ? b % 3 != 0 : stochastic && o.counts_active;
-        const int used        = acceptance ? active[b] + 1 : 1;
         if (!acceptance || stochastic || penalties || o.mask)
-            bytes += std::size_t(used) * kTokenDomain * 2;
-        if (o.counts_active && penalties) bytes += std::size_t(kTokenDomain) * 4;
-        if (o.mask) bytes += std::size_t(used) * ((kTokenDomain + 31) / 32) * 4;
+            bytes += std::size_t(used) * o.token_domain * 2;
+        if (o.counts_active && penalties) bytes += std::size_t(o.token_domain) * 4;
+        if (o.mask) bytes += std::size_t(used) * (1 + (o.token_domain - 1) / 32) * 4;
         if (acceptance) {
             // Full valid prefix: drafts, extent/length input, and all output slots.
             bytes += std::size_t(used - 1 + columns + 3) * 4;
@@ -335,30 +363,30 @@ std::size_t decision_bytes(const Options& o, int columns, const std::vector<std:
 }
 
 void run_sample(DeviceBuffer& logits, const Options& o, DecisionBenchmark& benchmark) {
-    const int batch = o.batch;
-    auto counts     = make_counts(batch);
-    auto masks      = make_masks(1, batch, o.mask);
-    auto configs =
-        make_batch_configs(counts, batch, o.mode, o.counts_active, o.top_k, o.mixed, masks, 1);
+    const int batch   = o.batch;
+    auto counts       = make_counts(batch, o.token_domain);
+    auto masks        = make_masks(1, batch, o.mask, o.token_domain);
+    auto configs      = make_batch_configs(counts, batch, o.mode, o.counts_active, o.top_k, o.mixed,
+                                           masks, 1, o.token_domain);
     auto out          = make_zeros(std::size_t(batch) * 4);
     auto positions    = make_i32(std::vector<std::int32_t>(batch, 4096));
     auto live         = o.live_rows.empty() ? DeviceBuffer{} : make_i32(o.live_rows);
     const auto active = live.size() ? Tensor(live.span(), DType::I32, {batch}) : Tensor{};
-    Tensor tl(logits.span(), DType::BF16, {kPhysicalRows, batch}),
+    Tensor tl(logits.span(), DType::BF16, {o.physical_rows, batch}),
         to(out.span(), DType::I32, {batch}), tp(positions.span(), DType::I32, {batch});
-    const auto bytes = ops::sampling_workspace_capacity_bytes(kTokenDomain, batch, batch);
+    const auto bytes = ops::sampling_workspace_capacity_bytes(o.token_domain, batch, batch);
     DeviceBuffer backing(device_context().device(), bytes);
     MemoryArena workspace(backing.span());
     measurement::Row row{.op              = "sample",
                          .format          = "bf16",
-                         .n               = kPhysicalRows,
-                         .k               = kTokenDomain,
+                         .n               = o.physical_rows,
+                         .k               = o.token_domain,
                          .batch           = batch,
                          .workspace_bytes = bytes};
     benchmark.run(
         row, o, decision_bytes(o, 1, {}, false),
         [&](CudaExecutionView cuda) {
-            ops::sample(tl, to, kTokenDomain,
+            ops::sample(tl, to, o.token_domain,
                         static_cast<const ops::SamplingConfig*>(configs.data()), tp,
                         ops::kSamplePurposeDecode, active, workspace, cuda);
             row.workspace_peak = workspace.peak_used();
@@ -368,16 +396,16 @@ void run_sample(DeviceBuffer& logits, const Options& o, DecisionBenchmark& bench
 
 void run_mtp(DeviceBuffer& logits, const Options& o, DecisionBenchmark& benchmark) {
     const int batch = o.batch, k = o.mtp_k, columns = k + 1;
-    auto counts  = make_counts(batch);
-    auto masks   = make_masks(columns, batch, o.mask);
+    auto counts  = make_counts(batch, o.token_domain);
+    auto masks   = make_masks(columns, batch, o.mask, o.token_domain);
     auto configs = make_batch_configs(counts, batch, o.mode, o.counts_active, o.top_k, o.mixed,
-                                      masks, columns);
+                                      masks, columns, o.token_domain);
     std::vector<std::int32_t> targets(std::size_t(columns) * batch), drafts(std::size_t(k) * batch);
     for (int b = 0; b < batch; ++b)
         for (int c = 0; c < columns; ++c) {
-            const int id             = (17 + (b * columns + c) * 7919) % kTokenDomain;
+            const int id             = target_id(b * columns + c, o.token_domain);
             targets[b * columns + c] = id;
-            if (c < k) drafts[b * k + c] = c == o.reject_at ? (id + 1) % kTokenDomain : id;
+            if (c < k) drafts[b * k + c] = c == o.reject_at ? (id + 1) % o.token_domain : id;
         }
     const auto active = extents(o, columns);
     auto dt = make_i32(targets), dd = make_i32(drafts), de = make_i32(active);
@@ -386,19 +414,19 @@ void run_mtp(DeviceBuffer& logits, const Options& o, DecisionBenchmark& benchmar
     const auto live_tensor = live.size() ? Tensor(live.span(), DType::I32, {batch}) : Tensor{};
     auto licensed = make_zeros(std::size_t(columns) * batch * 4), num = make_zeros(batch * 4);
     Tensor tt(dt.span(), DType::I32, {columns, batch}),
-        tl(logits.span(), DType::BF16, {kPhysicalRows, columns, batch}),
+        tl(logits.span(), DType::BF16, {o.physical_rows, columns, batch}),
         td(dd.span(), DType::I32, {k, batch}), te(de.span(), DType::I32, {batch}),
         tlen(lengths.span(), DType::I32, {batch}),
         tout(licensed.span(), DType::I32, {columns, batch}), tn(num.span(), DType::I32, {batch});
     const auto bytes = ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
-        kTokenDomain, k, k, batch, batch);
+        o.token_domain, k, k, batch, batch);
     DeviceBuffer backing(device_context().device(), bytes);
     MemoryArena workspace(backing.span());
     measurement::Row row{.op              = "accept-greedy-drafts",
                          .format          = "bf16",
                          .valid           = list_counts(active),
-                         .n               = kPhysicalRows,
-                         .k               = kTokenDomain,
+                         .n               = o.physical_rows,
+                         .k               = o.token_domain,
                          .tokens          = columns,
                          .batch           = batch,
                          .workspace_bytes = bytes};
@@ -406,7 +434,7 @@ void run_mtp(DeviceBuffer& logits, const Options& o, DecisionBenchmark& benchmar
         row, o, decision_bytes(o, columns, active, true),
         [&](CudaExecutionView cuda) {
             ops::speculative_accept_greedy_drafts(
-                tt, tl, td, te, tlen, tout, tn, kTokenDomain,
+                tt, tl, td, te, tlen, tout, tn, o.token_domain,
                 static_cast<const ops::SamplingConfig*>(configs.data()), live_tensor, workspace,
                 cuda);
             row.workspace_peak = workspace.peak_used();
@@ -420,10 +448,11 @@ void run_dflash2(DeviceBuffer& logits, const Options& options, DecisionBenchmark
     const Mode mode          = options.mode;
     const bool counts_active = options.counts_active;
     const int top_k          = options.top_k;
-    auto counts              = make_counts(batch);
-    auto masks               = make_masks(kDFlash2Columns, batch, options.mask);
-    DeviceBuffer configs     = make_batch_configs(counts, batch, mode, counts_active, top_k,
-                                                  options.mixed, masks, kDFlash2Columns);
+    auto counts              = make_counts(batch, options.token_domain);
+    auto masks = make_masks(kDFlash2Columns, batch, options.mask, options.token_domain);
+    DeviceBuffer configs =
+        make_batch_configs(counts, batch, mode, counts_active, top_k, options.mixed, masks,
+                           kDFlash2Columns, options.token_domain);
 
     std::vector<std::int32_t> target_host(static_cast<std::size_t>(kDFlash2Columns) * batch);
     std::vector<std::int32_t> draft_host(static_cast<std::size_t>(kDFlash2Drafts) * batch);
@@ -433,7 +462,7 @@ void run_dflash2(DeviceBuffer& logits, const Options& options, DecisionBenchmark
     for (int row = 0; row < batch; ++row) {
         for (int column = 0; column < kDFlash2Columns; ++column) {
             const int flat                              = row * kDFlash2Columns + column;
-            target_host[static_cast<std::size_t>(flat)] = (17 + flat * 7919) % kTokenDomain;
+            target_host[static_cast<std::size_t>(flat)] = target_id(flat, options.token_domain);
         }
         for (int draft = 0; draft < kDFlash2Drafts; ++draft) {
             const int selected = target_host[static_cast<std::size_t>(row) * kDFlash2Columns +
@@ -442,7 +471,8 @@ void run_dflash2(DeviceBuffer& logits, const Options& options, DecisionBenchmark
             const std::size_t base =
                 (static_cast<std::size_t>(row) * kDFlash2Drafts + draft) * kDFlash2Candidates;
             for (int candidate = 0; candidate < kDFlash2Candidates; ++candidate) {
-                candidate_host[base + candidate] = (selected + candidate) % kTokenDomain;
+                candidate_host[base + candidate] =
+                    (std::int64_t(selected) + candidate) % options.token_domain;
             }
             q_host[base] = mode == Mode::Greedy ? 1.0f : 0.5f;
             if (mode == Mode::Stochastic) q_host[base + 1] = 0.5f;
@@ -474,7 +504,7 @@ void run_dflash2(DeviceBuffer& logits, const Options& options, DecisionBenchmark
                                  static_cast<std::size_t>(batch) * sizeof(std::int32_t));
 
     Tensor ttargets(targets.span(), DType::I32, {kDFlash2Columns, batch});
-    Tensor tlogits(logits.span(), DType::BF16, {kPhysicalRows, kDFlash2Columns, batch});
+    Tensor tlogits(logits.span(), DType::BF16, {options.physical_rows, kDFlash2Columns, batch});
     Tensor tdrafts(drafts.span(), DType::I32, {kDFlash2Drafts, batch});
     Tensor tcandidates(candidates.span(), DType::I32, {kDFlash2Candidates, kDFlash2Drafts, batch});
     Tensor tq(proposal_q.span(), DType::FP32, {kDFlash2Candidates, kDFlash2Drafts, batch});
@@ -488,7 +518,7 @@ void run_dflash2(DeviceBuffer& logits, const Options& options, DecisionBenchmark
     };
     const std::size_t workspace_bytes =
         ops::speculative_accept_sparse_drafts_workspace_capacity_bytes(
-            kTokenDomain, envelope, kDFlash2Drafts, kDFlash2Drafts, batch, batch);
+            options.token_domain, envelope, kDFlash2Drafts, kDFlash2Drafts, batch, batch);
     ninfer::DeviceBuffer workspace_storage(ninfer::bench::device_context().device(),
                                            std::max<std::size_t>(workspace_bytes, 256));
     MemoryArena workspace(workspace_storage.span());
@@ -497,20 +527,23 @@ void run_dflash2(DeviceBuffer& logits, const Options& options, DecisionBenchmark
     const auto live_tensor = live.size() ? Tensor(live.span(), DType::I32, {batch}) : Tensor{};
     const auto launch      = [&](CudaExecutionView cuda) {
         ops::speculative_accept_sparse_drafts(ttargets, tlogits, tdrafts, tcandidates, tq, textents,
-                                                   tlengths, tlicensed, tlicensed_counts, kTokenDomain,
-                                                   config_ptr, envelope, live_tensor, workspace, cuda);
+                                                   tlengths, tlicensed, tlicensed_counts,
+                                                   options.token_domain, config_ptr, envelope,
+                                                   live_tensor, workspace, cuda);
     };
 
     measurement::Row row{.op              = "accept-sparse-drafts",
                          .format          = "bf16",
                          .valid           = list_counts(active),
-                         .n               = kPhysicalRows,
-                         .k               = kTokenDomain,
+                         .n               = options.physical_rows,
+                         .k               = options.token_domain,
                          .tokens          = kDFlash2Columns,
                          .batch           = batch,
                          .workspace_bytes = workspace_bytes};
     benchmark.run(
-        row, options, decision_bytes(options, kDFlash2Columns, active, true),
+        row, options,
+        decision_bytes(options, kDFlash2Columns, active, true,
+                       envelope.all_rows_greedy_without_penalties),
         [&](CudaExecutionView cuda) {
             launch(cuda);
             row.workspace_peak = workspace.peak_used();
@@ -534,7 +567,7 @@ int main(int argc, char** argv) {
                            : std::max({options.sample ? options.batch : 1,
                                        options.mtp ? options.batch * (options.mtp_k + 1) : 1,
                                        options.dflash2 ? options.batch * (options.drafts + 1) : 1});
-        DeviceBuffer logits = make_logits(max_cols);
+        DeviceBuffer logits = make_logits(max_cols, options.physical_rows, options.token_domain);
         measurement::hardware();
         DecisionBenchmark benchmark(options);
         if (options.matrix) {

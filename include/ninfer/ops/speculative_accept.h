@@ -57,7 +57,8 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
                                       const SamplingConfig* configs, const Tensor& live_rows,
                                       MemoryArena& workspace, CudaExecutionView execution);
 
-// The inclusive draft interval describes W-1. The raw-greedy envelope requires no workspace.
+// The inclusive draft interval describes W-1 (1..15). token_domain and batch sizes must be
+// positive. The raw-greedy envelope requires no workspace.
 [[nodiscard]] std::size_t speculative_accept_sparse_drafts_workspace_capacity_bytes(
     std::int32_t token_domain, SpeculativeAcceptExecutionEnvelope envelope, std::int32_t min_drafts,
     std::int32_t max_drafts, std::int32_t min_batch, std::int32_t max_batch);
@@ -67,13 +68,15 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
  *
  * For P=current_extents[b], only columns 0..P are live. Greedy rows accept the longest prefix
  * matching the adjusted target argmax, then emit a correction/bonus. Positive-temperature rows
- * use min(1,p(d)/q(d)) acceptance; first rejection samples normalized max(p-q,0), and full
- * acceptance samples the target bonus column. Target filtering, prefix penalties and RNG
+ * use min(1,p(d)/q(d)) acceptance; first rejection samples normalized max(p-q,0) and falls
+ * back to p if rounding leaves zero residual mass. Full acceptance samples the target bonus
+ * column. Target filtering, prefix penalties and RNG
  * positions/purposes follow speculative_accept_greedy_drafts.
  *
- * Registered profile: token_domain=248077, W=2..16, D=1..15, B>=1.
- * BF16 logits [248320,W,B], I32 target_tokens/licensed_tokens [W,B], I32 drafts [D,B],
- * I32 candidate_ids and FP32 proposal_q [16,D,B], I32
+ * W=2..16, D=1..15, B>=1. Device BF16 logits [physical_rows,W,B] with
+ * 1 <= token_domain <= physical_rows, including 200058/200064 and 248077/248320.
+ * Only rows [0,token_domain) participate. I32 target_tokens/licensed_tokens [W,B], I32 drafts
+ * [D,B], I32 candidate_ids and FP32 proposal_q [16,D,B], I32
  * current_extents/base_positions/licensed_counts [B]. drafts permits positive, naturally aligned,
  * non-overlapping strides. IDs and q each have a contiguous candidate axis and independent
  * positive, aligned, non-overlapping outer strides. Other tensors are contiguous. Live extents lie

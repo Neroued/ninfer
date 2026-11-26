@@ -105,6 +105,16 @@ speculative_sparse_warp_greedy(const int* target_tokens, TokenRows drafts, int* 
     speculative_sparse_warp_store(drafts, k, row, a, terminal, licensed_tokens, licensed_counts);
 }
 
+__device__ __forceinline__ float speculative_warp_cdf(float weight) {
+    const int lane = threadIdx.x & 31;
+#pragma unroll
+    for (int offset = 1; offset < 32; offset *= 2) {
+        const float earlier = __shfl_up_sync(0xffffffffU, weight, offset);
+        if (lane >= offset) weight += earlier;
+    }
+    return weight;
+}
+
 __device__ __forceinline__ void
 speculative_sparse_warp_accept(Workspace workspace, TokenRows drafts, SparseProposalView proposal,
                                const SamplingConfig& cfg, int k, int row, int extent, bool greedy,
@@ -127,17 +137,21 @@ speculative_sparse_warp_accept(Workspace workspace, TokenRows drafts, SparseProp
                     break;
                 }
             }
-            const float qd = speculative_sparse_probability(proposal.ids.at(row, lane),
-                                                            proposal.q.at(row, lane), d);
-            const float u  = sampling_uniform(cfg.seed, old_length + lane + 1,
-                                              kSamplePurposeSpeculativeAccept, 0);
-            reject         = !(pd >= qd || u * qd < pd);
+            if (pd == 0.F) {
+                reject = true;
+            } else if (pd < 1.F) {
+                const float qd = speculative_sparse_probability(proposal.ids.at(row, lane),
+                                                                proposal.q.at(row, lane), d);
+                const float u  = sampling_uniform(cfg.seed, old_length + lane + 1,
+                                                  kSamplePurposeSpeculativeAccept, 0);
+                reject         = !(pd >= qd || u * qd < pd);
+            }
         }
     }
     const unsigned failures = __ballot_sync(0xffffffffU, reject);
     const int a             = failures ? __ffs(failures) - 1 : extent;
     int terminal;
-    if (greedy)
+    if (greedy || workspace.dist_support[a] == 1)
         terminal = workspace.dist_idx[sampling_dist_offset(a, 0)];
     else {
         const int n  = workspace.dist_support[a];
@@ -153,13 +167,13 @@ speculative_sparse_warp_accept(Workspace workspace, TokenRows drafts, SparseProp
                 weight        = fmaxf(weight - q, 0.0f);
             }
         }
-        float cdf = weight;
-#pragma unroll
-        for (int offset = 1; offset < 32; offset *= 2) {
-            const float earlier = __shfl_up_sync(0xffffffffU, cdf, offset);
-            if (lane >= offset) cdf += earlier;
+        float cdf  = speculative_warp_cdf(weight);
+        float mass = __shfl_sync(0xffffffffU, cdf, 31);
+        if (!(mass > 0.0f) && a < extent) {
+            weight = lane < n ? workspace.dist_prob[sampling_dist_offset(a, lane)] : 0.0f;
+            cdf    = speculative_warp_cdf(weight);
+            mass   = __shfl_sync(0xffffffffU, cdf, 31);
         }
-        const float mass = __shfl_sync(0xffffffffU, cdf, 31);
         const int purpose =
             a < extent ? kSamplePurposeSpeculativeCorrection : kSamplePurposeSpeculativeBonus;
         const float u           = sampling_uniform(cfg.seed, old_length + a + 1, purpose, 0);
@@ -167,10 +181,9 @@ speculative_sparse_warp_accept(Workspace workspace, TokenRows drafts, SparseProp
         const unsigned positive = __ballot_sync(0xffffffffU, lane < n && weight > 0.0f);
         const unsigned candidates =
             __ballot_sync(0xffffffffU, lane < n && weight > 0.0f && goal < cdf);
-        const int selected = !(mass > 0.0f) ? 0
-                             : candidates   ? __ffs(candidates) - 1
-                             : positive     ? 31 - __clz(positive)
-                                            : 0;
+        const int selected = candidates ? __ffs(candidates) - 1
+                             : positive ? 31 - __clz(positive)
+                                        : 0;
         terminal           = __shfl_sync(0xffffffffU, token, selected);
     }
     speculative_sparse_warp_store(drafts, k, row, a, terminal, licensed_tokens, licensed_counts);

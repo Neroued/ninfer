@@ -1,8 +1,20 @@
 #include "ops/linear/add/dispatch.h"
+#include "core/platform.h"
 
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
+LinearAddLaunch select_bf16_linear_add(std::int32_t rows, std::int32_t k, std::int32_t tokens) {
+    if (tokens > 0) {
+        if (rows == 5120 && k == 6144) return select_bf16_linear_add_n5120_k6144(tokens);
+#if NINFER_TARGET_RTX5090
+        if (rows == 2304 && k == 3072) return select_bf16_linear_add_n2304_k3072(tokens);
+        if (rows == 2304 && k == 9216) return select_bf16_linear_add_n2304_k9216(tokens);
+#endif
+    }
+    throw std::invalid_argument("bf16 linear_add: unsupported shape or token extent");
+}
+
 LinearAddLaunch select_q5_linear_add(std::int32_t rows, std::int32_t k, std::int32_t tokens) {
     if (tokens > 0) {
         if (rows == 5120 && k == 6144) return select_q5_linear_add_n5120_k6144(tokens);

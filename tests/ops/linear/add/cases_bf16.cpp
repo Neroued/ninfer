@@ -1,4 +1,5 @@
 #include "core/weight.h"
+#include "core/platform.h"
 #include "cuda_fixture.h"
 #include "core/buffer.h"
 #include "ops/linear/add/runner.h"
@@ -9,8 +10,12 @@
 
 #include <array>
 #include <exception>
+#include <initializer_list>
 #include <iostream>
+#include <limits>
+#include <set>
 #include <stdexcept>
+#include <vector>
 
 namespace {
 
@@ -80,6 +85,107 @@ void bf16_a16_conformance(ninfer::test::linear_suite::Suite& suite) {
               bf16_a16_rejections);
 }
 
+#if NINFER_TARGET_RTX5090
+int inkling_bf16_rejections(int k) {
+    using namespace ninfer;
+    constexpr int n = 2304;
+    int failures    = 0;
+    if (ops::linear_add_workspace_capacity_bytes(QType::BF16, n, k, 1,
+                                                 std::numeric_limits<int>::max()) != 0) {
+        std::cerr << "BF16 LinearAdd expected zero workspace for K=" << k << '\n';
+        ++failures;
+    }
+    failures += expect_invalid(
+        [&] { (void)ops::linear_add_workspace_capacity_bytes(QType::BF16, n, k, 0, 1); },
+        "BF16 LinearAdd invalid token interval");
+    failures += expect_invalid(
+        [&] { (void)ops::linear_add_workspace_capacity_bytes(QType::BF16, n, k - 8, 1, 1); },
+        "BF16 LinearAdd unsupported geometry");
+
+    const auto& env   = test::cuda_environment();
+    const auto device = env.context.device();
+    DeviceBuffer input(device, sizeof(std::uint16_t) * k);
+    DeviceBuffer residual(device, sizeof(std::uint16_t) * n);
+    DeviceBuffer weight_storage(device, sizeof(std::uint16_t) * n * k);
+    DeviceBuffer workspace_storage(device, 1);
+    MemoryArena workspace(workspace_storage.span());
+    const Tensor x(input.span(), DType::BF16, {k, 1});
+    Tensor out(residual.span(), DType::BF16, {n, 1});
+    Weight weight{};
+    weight.device = device;
+    weight.qtype  = QType::BF16;
+    weight.layout = QuantLayout::Contiguous;
+    weight.qdata  = weight_storage.data();
+    weight.n      = n;
+    weight.k      = k;
+
+    failures += expect_invalid(
+        [&] {
+            Tensor invalid = x;
+            invalid.dtype  = DType::FP16;
+            ops::linear_add(invalid, weight, out, workspace, env.default_execution);
+        },
+        "BF16 LinearAdd activation dtype");
+    failures += expect_invalid(
+        [&] {
+            Tensor invalid = out;
+            invalid.ne[1]  = 2;
+            ops::linear_add(x, weight, invalid, workspace, env.default_execution);
+        },
+        "BF16 LinearAdd residual token extent");
+    failures += expect_invalid(
+        [&] {
+            Tensor alias(input.span(), DType::BF16, {n, 1});
+            ops::linear_add(x, weight, alias, workspace, env.default_execution);
+        },
+        "BF16 LinearAdd overlapping activation and residual");
+    failures += expect_invalid(
+        [&] {
+            Weight invalid = weight;
+            invalid.layout = QuantLayout::RowSplit;
+            ops::linear_add(x, invalid, out, workspace, env.default_execution);
+        },
+        "BF16 LinearAdd weight layout");
+    return failures;
+}
+
+void run_inkling_bf16_add(ninfer::test::linear_suite::Suite& suite, int k,
+                          std::initializer_list<int> boundaries) {
+    using namespace ninfer;
+    using namespace ninfer::test::linear_add;
+    constexpr int n = 2304;
+    std::set<int> points{1, 4, 8, 1023, 1024, 1025, 4096, 4097};
+    for (int boundary : boundaries)
+        for (int tokens : {boundary - 1, boundary, boundary + 1})
+            if (tokens > 0) points.insert(tokens);
+
+    std::vector<Invocation> calls;
+    for (int tokens : points) {
+        calls.push_back({.tokens = tokens, .graph = GraphReplay::OriginalZeroOriginal});
+    }
+    add_cases(suite, QType::BF16,
+              {.n                = n,
+               .k                = k,
+               .seed             = static_cast<std::uint32_t>(n + k + 719),
+               .invocations      = calls,
+               .fixture          = FixturePattern::Hashed,
+               .columns          = Samples::Uniform32,
+               .interval_witness = true});
+    namespace linear_suite = ninfer::test::linear_suite;
+    suite.add(linear_suite::make_case("bf16", n, k, 0, ops::LinearPolicy::A16Only,
+                                      linear_suite::Execution::Eager, "metadata"),
+              [k] { return inkling_bf16_rejections(k); });
+}
+#endif
+
 } // namespace
 
-void ninfer::test::linear_add::add_bf16_cases(Suite& suite) { bf16_a16_conformance(suite); }
+void ninfer::test::linear_add::add_bf16_cases(Suite& suite) {
+    bf16_a16_conformance(suite);
+#if NINFER_TARGET_RTX5090
+    run_inkling_bf16_add(suite, 3072,
+                         {1, 8, 16, 64, 128, 224, 256, 288, 448, 512, 576, 672, 896, 1152, 1344});
+    run_inkling_bf16_add(suite, 9216, {1,   8,   16,  32,  64,   72,   80,   96,   224,  256, 288,
+                                       448, 576, 672, 896, 1152, 1344, 1792, 2304, 3136, 3584});
+#endif
+}

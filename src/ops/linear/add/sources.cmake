@@ -17,6 +17,13 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/q8/shapes/n5120_k6144.cu"
 )
 
+if(NINFER_TARGET STREQUAL "rtx5090")
+  target_sources(ninfer_ops PRIVATE
+    "${CMAKE_CURRENT_LIST_DIR}/bf16/rtx5090/shapes/n2304_k3072.cu"
+    "${CMAKE_CURRENT_LIST_DIR}/bf16/rtx5090/shapes/n2304_k9216.cu"
+  )
+endif()
+
 target_sources(ninfer_ops_non_rdc PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/shapes/n5120_k17408_tma.cu"
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/shapes/n5120_k6144_tma.cu"

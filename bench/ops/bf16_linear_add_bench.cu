@@ -1,4 +1,4 @@
-// Cold-cache public-Op benchmark for BF16 LinearAdd [5120,6144].
+// Cold-cache public-Op benchmark for BF16 LinearAdd.
 
 #include "common/roofline.h"
 #include "core/weight.h"
@@ -9,7 +9,6 @@
 #include "direct_bf16_weight.cuh"
 #include "op_measurement.cuh"
 
-#include <cuda_profiler_api.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -29,13 +28,13 @@ using namespace ninfer;
 
 namespace {
 
-constexpr std::int32_t kRows               = 5120;
-constexpr std::int32_t kHidden             = 6144;
 constexpr std::uint64_t kDefaultFlushBytes = 256ULL << 20;
 constexpr int kDefaultWarmup               = 3;
 constexpr int kDefaultRepeat               = 20;
 
 struct Options {
+    std::int32_t n = 5120;
+    std::int32_t k = 6144;
     std::vector<std::int32_t> tokens{
         1,  2,  3,  4,  5,   6,   7,   8,   9,   10,   11,   12,   13,   14,   15, 16,
         17, 18, 19, 20, 21,  22,  23,  24,  25,  26,   27,   28,   29,   30,   31, 32,
@@ -45,6 +44,7 @@ struct Options {
     int repeat                = kDefaultRepeat;
     std::uint64_t flush_bytes = kDefaultFlushBytes;
     bool profile              = false;
+    std::string execution     = "eager";
     std::string csv_out;
 };
 
@@ -70,8 +70,17 @@ Options parse_options(int argc, char** argv) {
             if (++index >= argc) { throw std::invalid_argument(std::string("missing ") + label); }
             return argv[index];
         };
-        if (argument == "--t-sweep") {
-            options.tokens = bench::measurement::integers(next("--t-sweep value"));
+        if (argument == "--n") {
+            options.n = bench::measurement::integer(next("--n value"));
+        } else if (argument == "--k") {
+            options.k = bench::measurement::integer(next("--k value"));
+        } else if (argument == "--execution") {
+            const auto mode = next("--execution value");
+            if (mode != "eager" && mode != "graph")
+                throw std::invalid_argument("--execution expects eager or graph");
+            options.execution = mode;
+        } else if (argument == "--tokens" || argument == "--t-sweep") {
+            options.tokens = bench::measurement::integers(next("token list"));
         } else if (argument == "--sweep") {
             const auto range = next("--sweep value");
             if (std::count(range.begin(), range.end(), ':') != 2)
@@ -89,9 +98,11 @@ Options parse_options(int argc, char** argv) {
         } else if (argument == "--profile") {
             options.profile = true;
         } else if (argument == "--help" || argument == "-h") {
-            std::printf("Usage: %s [--t-sweep 1,4,... | --sweep BEGIN:END:STEP] "
+            std::printf("Usage: %s [--n N] [--k K] [--execution eager|graph] "
+                        "[--tokens 1,4,... | --t-sweep 1,4,... | --sweep BEGIN:END:STEP] "
                         "[--warmup N] [--repeat N] "
-                        "[--flush-bytes N] [--csv-out PATH] [--profile]\n",
+                        "[--flush-bytes N] [--csv-out PATH] [--profile]\n"
+                        "Defaults are N=5120, K=6144, eager. Graph timing brackets the Op body.\n",
                         argv[0]);
             std::exit(0);
         } else {
@@ -111,17 +122,15 @@ Options parse_options(int argc, char** argv) {
     return options;
 }
 
-Result make_result(std::int32_t tokens, const bench::ColdTiming& timing,
-                   std::uint64_t weight_bytes) {
-    const std::uint64_t x_bytes        = 2ULL * static_cast<std::uint64_t>(kHidden) * tokens;
-    const std::uint64_t residual_bytes = 2ULL * static_cast<std::uint64_t>(kRows) * tokens;
-    const std::uint64_t logical_bytes  = weight_bytes + x_bytes + 2ULL * residual_bytes;
-    const double useful_flops =
-        2.0 * static_cast<double>(kRows) * static_cast<double>(kHidden) * tokens;
-    const double seconds = timing.median_us * 1.0e-6;
+Result make_result(std::int32_t tokens, const bench::ColdTiming& timing, std::uint64_t weight_bytes,
+                   const Options& options) {
+    const std::uint64_t x_bytes       = 2ULL * options.k * tokens;
+    const std::uint64_t logical_bytes = weight_bytes + x_bytes + 4ULL * options.n * tokens;
+    const double useful_flops         = 2.0 * options.n * options.k * tokens;
+    const double seconds              = timing.median_us * 1.0e-6;
     const double memory_floor_us =
         static_cast<double>(logical_bytes) / (bench::kRoofline.memory_gbs * 1.0e9) * 1.0e6;
-    // T=1..4 use SIMT; only the larger-T routes execute BF16 MMA.
+    // Keep the compute reference out of the small-T region, which can use SIMT.
     const double tensor_peak =
         tokens >= 5 ? bench::kRoofline.bf16_f32_tflops : std::numeric_limits<double>::quiet_NaN();
     const double compute_floor_us  = useful_flops / (tensor_peak * 1.0e6);
@@ -165,7 +174,7 @@ void write_csv(const Options& options, const std::vector<Result>& results) {
     std::ofstream out(path);
     out << "T,median_us,min_us,p95_us,logical_bytes,useful_flops,effective_gbs,"
            "sustained_read_pct,useful_tflops,bf16_tc_pct,memory_floor_us,compute_floor_us,"
-           "roofline_pct,warmup,repeat,flush_bytes\n";
+           "roofline_pct,warmup,repeat,flush_bytes,N,K,execution\n";
     for (const Result& result : results) {
         out << result.tokens << ',' << result.timing.median_us << ',' << result.timing.min_us << ','
             << result.timing.p95_us << ',' << result.logical_bytes << ',' << result.useful_flops
@@ -174,7 +183,8 @@ void write_csv(const Options& options, const std::vector<Result>& results) {
             << ',' << result.memory_floor_us << ','
             << bench::format_metric(result.compute_floor_us, 6, "") << ','
             << bench::format_metric(result.roofline_pct, 6, "") << ',' << options.warmup << ','
-            << options.repeat << ',' << options.flush_bytes << '\n';
+            << options.repeat << ',' << options.flush_bytes << ',' << options.n << ',' << options.k
+            << ',' << options.execution << '\n';
     }
 }
 
@@ -184,59 +194,42 @@ int main(int argc, char** argv) {
     try {
         const Options options         = parse_options(argc, argv);
         const std::int32_t max_tokens = options.tokens.back();
-        cudaStream_t stream           = nullptr;
-        CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-        const auto cuda = ninfer::bench::device_context().execution_view(stream);
+        const auto capacity           = ops::linear_add_workspace_capacity_bytes(
+            QType::BF16, options.n, options.k, options.tokens.front(), max_tokens);
+        const auto cuda = bench::device_context().execution_view();
 
         bench::L2FlushBuffer flush(options.flush_bytes);
-        DeviceBuffer input = bench::make_bf16(static_cast<std::size_t>(kHidden) * max_tokens, 101U);
+        DeviceBuffer input =
+            bench::make_bf16(static_cast<std::size_t>(options.k) * max_tokens, 101U);
         DeviceBuffer residual =
-            bench::make_bf16(static_cast<std::size_t>(kRows) * max_tokens, 103U);
+            bench::make_bf16(static_cast<std::size_t>(options.n) * max_tokens, 103U);
         bench::SavedBuffer residual_initial(residual);
         const auto restore = [&](CudaExecutionView cuda) { residual_initial.restore(cuda); };
-        bench::DirectBf16Weight weight = bench::make_direct_bf16_weight(kRows, kHidden, 0x61U);
-        ninfer::DeviceBuffer workspace_storage(ninfer::bench::device_context().device(), 1);
+        auto weight        = bench::make_direct_bf16_weight(options.n, options.k, 0x61U);
+        DeviceBuffer workspace_storage(cuda.device(), std::max<std::size_t>(capacity, 1));
         MemoryArena workspace(workspace_storage.span());
 
-        if (options.profile) {
-            const std::int32_t tokens = options.tokens.front();
-            Tensor x(input.span(), DType::BF16, {kHidden, tokens});
-            Tensor out(residual.span(), DType::BF16, {kRows, tokens});
-            for (int index = 0; index < options.warmup; ++index) {
-                restore(cuda);
-                bench::flush_l2(flush, cuda);
-                ops::linear_add(x, weight.weight, out, workspace, cuda);
-            }
-            CUDA_CHECK(cudaStreamSynchronize(stream));
-            restore(cuda);
-            bench::flush_l2(flush, cuda);
-            CUDA_CHECK(cudaStreamSynchronize(stream));
-            std::printf("PROFILE op=linear_add T=%d\n", tokens);
-            CUDA_CHECK(cudaProfilerStart());
-            ops::linear_add(x, weight.weight, out, workspace, cuda);
-            CUDA_CHECK(cudaStreamSynchronize(stream));
-            CUDA_CHECK(cudaProfilerStop());
-            CUDA_CHECK(cudaStreamDestroy(stream));
-            return 0;
-        }
+        bench::measurement::Options measurement;
+        measurement.warmup  = options.warmup;
+        measurement.repeat  = options.profile ? 1 : options.repeat;
+        measurement.profile = options.profile;
 
         std::vector<Result> results;
         for (const std::int32_t tokens : options.tokens) {
-            Tensor x(input.span(), DType::BF16, {kHidden, tokens});
-            Tensor out(residual.span(), DType::BF16, {kRows, tokens});
+            Tensor x(input.span(), DType::BF16, {options.k, tokens});
+            Tensor out(residual.span(), DType::BF16, {options.n, tokens});
             const auto launch = [&](CudaExecutionView cuda) {
                 ops::linear_add(x, weight.weight, out, workspace, cuda);
             };
-            Result result =
-                make_result(tokens,
-                            bench::measure_cold_launch_prepared(restore, launch, flush, cuda,
-                                                                options.warmup, options.repeat),
-                            weight.model_weight_bytes());
+            if (options.profile) std::printf("PROFILE op=linear_add T=%d\n", tokens);
+            const auto timing = bench::measurement::measure(launch, restore, flush, cuda,
+                                                            measurement, options.execution, "cold");
+            if (options.profile) return 0;
+            Result result = make_result(tokens, timing.gpu, weight.model_weight_bytes(), options);
             print_result(result);
             results.push_back(std::move(result));
         }
         write_csv(options, results);
-        CUDA_CHECK(cudaStreamDestroy(stream));
         return 0;
     } catch (const std::exception& error) {
         std::fprintf(stderr, "ninfer_bf16_linear_add_bench: %s\n", error.what());

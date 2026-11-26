@@ -86,9 +86,12 @@ std::vector<cudaGraphNode_t> dependent_nodes(cudaGraphNode_t node) {
     check_graph(cudaGraphNodeGetDependentNodes(node, nullptr, nullptr, &count),
                 "cudaGraphNodeGetDependentNodes");
     std::vector<cudaGraphNode_t> nodes(count);
-    if (count)
-        check_graph(cudaGraphNodeGetDependentNodes(node, nodes.data(), nullptr, &count),
+    if (count) {
+        // Omitting edge data makes CUDA reject queries that include programmatic edges.
+        std::vector<cudaGraphEdgeData> edges(count);
+        check_graph(cudaGraphNodeGetDependentNodes(node, nodes.data(), edges.data(), &count),
                     "cudaGraphNodeGetDependentNodes");
+    }
     return nodes;
 }
 

@@ -10,7 +10,7 @@ namespace ninfer::ops {
  *                        / sqrt(sum_j input[j,i,b]^2 / D + epsilon), for 1 <= i <= g.
  *
  * Input is BF16 [D,W,B], weight is BF16 [D], and output is BF16 [D,g*B], with
- * D=4096 or 5120, W=2..16, 1<=g<W and B>=1. Epsilon is positive and finite.
+ * D=2304, 4096 or 5120, W=2..16, 1<=g<W and B>=1. Epsilon is positive and finite.
  * All tensors are contiguous, non-null, 16-byte aligned and
  * pairwise disjoint. Uses plain multiplicative gain. Anchor columns input[:,0,b] are not read.
  * Writes all of output and preserves inputs. All operands belong to execution.device().

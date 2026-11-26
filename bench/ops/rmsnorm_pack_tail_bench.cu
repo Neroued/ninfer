@@ -1,5 +1,6 @@
 // Complete fused normalization and packing, with one public Op per sample.
 #include "ninfer/ops/rmsnorm_pack_tail.h"
+#include "common/gpu_activity.cuh"
 #include "op_measurement.cuh"
 #include <climits>
 #include <iomanip>
@@ -8,6 +9,8 @@ using namespace ninfer;
 namespace m = ninfer::bench::measurement;
 
 namespace {
+constexpr int kConditionUs = 200;
+
 struct Options {
     m::Options timing;
     int hidden = 5120, calls = 1;
@@ -22,15 +25,16 @@ Options parse(int argc, char** argv) {
         const std::string_view flag(argv[i]);
         if (flag == "--help") {
             std::cout
-                << "usage: ninfer_rmsnorm_pack_tail_bench [--hidden 4096|5120] [--epsilon E]\n"
+                << "usage: ninfer_rmsnorm_pack_tail_bench [--hidden 2304|4096|5120] [--epsilon E]\n"
                    "  --widths W,... (2..16) --batches B,... (B>=1)\n"
-                   "  --calls N (1..64): repeated read-only inputs, warm cache only\n";
+                   "  --calls N (1..64): repeated read-only inputs, warm cache only\n"
+                << "  " << kConditionUs << " us of GPU activity precedes each timed sample\n";
             m::help();
             std::exit(0);
         }
         const auto value = m::take(argc, argv, i);
         if (flag == "--hidden")
-            o.hidden = m::integer(value, 4096, 5120);
+            o.hidden = m::integer(value, 2304, 5120);
         else if (flag == "--calls")
             o.calls = m::integer(value, 1, 64);
         else if (flag == "--epsilon") {
@@ -45,7 +49,8 @@ Options parse(int argc, char** argv) {
         else if (!m::parse(o.timing, flag, value))
             throw std::invalid_argument("unknown flag: " + std::string(flag));
     }
-    if (o.hidden != 4096 && o.hidden != 5120) throw std::invalid_argument("hidden: 4096|5120");
+    if (o.hidden != 2304 && o.hidden != 4096 && o.hidden != 5120)
+        throw std::invalid_argument("hidden: 2304|4096|5120");
     if (o.timing.profile && o.widths.size() * o.batches.size() != 1)
         throw std::invalid_argument("profile requires one extent");
     if (o.calls > 1 && o.timing.cache != "warm")
@@ -68,6 +73,7 @@ void run(const Options& o, int width, int batch, bench::L2FlushBuffer& flush, m:
     const auto launch = [&](CudaExecutionView cuda) {
         for (int i = 0; i < o.calls; ++i) ops::rmsnorm_pack_tail(x, w, o.epsilon, y, cuda);
     };
+    const auto prepare = [](CudaExecutionView cuda) { bench::condition_gpu(cuda, kConditionUs); };
     const std::size_t bytes = std::size_t(o.hidden) * (4ULL * columns + 2);
     m::Row row{.op     = "rmsnorm_pack_tail",
                .format = "bf16",
@@ -76,8 +82,7 @@ void run(const Options& o, int width, int batch, bench::L2FlushBuffer& flush, m:
                .batch  = batch};
     for (const auto& execution : m::selections(o.timing.execution, "graph", "eager"))
         for (const auto& cache : m::selections(o.timing.cache, "cold", "warm")) {
-            const auto result =
-                m::measure(launch, [](CudaExecutionView) {}, flush, e, o.timing, execution, cache);
+            const auto result = m::measure(launch, prepare, flush, e, o.timing, execution, cache);
             std::ostringstream metadata;
             metadata << std::setprecision(9) << o.epsilon << ',' << bytes << ','
                      << bench::format_metric(bytes / (bench::kRoofline.memory_gbs * 1000), 3, "")

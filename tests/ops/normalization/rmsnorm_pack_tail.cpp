@@ -195,5 +195,22 @@ void add_rmsnorm_pack_tail_cases(ninfer::test::OpSuite& suite) {
               [] { return run_case(2, 1, 1802U, false, 4096, 1.e-5F, 1.e-4F); });
     suite.add("rmsnorm_pack_tail/epsilon",
               [] { return run_case(3, 2, 1803U, false, 5120, 3.e-4F, .01F); });
+    for (int width : {2, 8, 16}) {
+        for (int batch : {1, 4, 8, 32, 64}) {
+            suite.add(
+                "rmsnorm_pack_tail/h2304/w" + std::to_string(width) + "/b" + std::to_string(batch),
+                [=] { return run_case(width, batch, 1900U + width * 64 + batch, false, 2304); },
+                {{"execution", "eager"}});
+        }
+    }
+    suite.add("rmsnorm_pack_tail/h2304/graph/w8/b4/g3",
+              [] { return run_case(8, 4, 1901U, true, 2304, 1.e-6F, 2.F, 3); },
+              {{"execution", "graph"}});
+    suite.add("rmsnorm_pack_tail/h2304/graph/w8/b64/g7",
+              [] { return run_case(8, 64, 1904U, true, 2304); }, {{"execution", "graph"}});
+    suite.add("rmsnorm_pack_tail/h2304/graph/w16/b8/g15",
+              [] { return run_case(16, 8, 1902U, true, 2304); }, {{"execution", "graph"}});
+    suite.add("rmsnorm_pack_tail/h2304/epsilon",
+              [] { return run_case(2, 1, 1903U, false, 2304, 1.e-6F, 1.e-4F); });
     suite.add("rmsnorm_pack_tail/contract", contract);
 }

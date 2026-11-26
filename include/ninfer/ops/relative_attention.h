@@ -205,5 +205,102 @@ void relative_attention_commit_cyclic_kv(const RelativeAttentionChunkKV& chunk_k
                                          const Tensor& positions, CyclicKVCacheLayerView kv_cache,
                                          CudaExecutionView execution);
 
+/**
+ * Query-side operands for relative_softmax_attention.
+ * Public API passes compact prepared `r` and `rel_logits_proj` [16, 1024] (32 KB),
+ * never a pre-materialized sheared bias tensor.
+ */
+struct RelativeAttentionQueryInputs {
+    Tensor q;               // Contiguous BF16 [128, 24, W, B] or [128, 24, N]
+    Tensor r;               // Contiguous BF16 [16,  24, W, B] or [16,  24, N]
+    Tensor rel_logits_proj; // Contiguous BF16 [16, 1024] (d_rel=16 fastest, distance 0..1023 outer)
+    Tensor gate;            // Contiguous BF16 [128, 24, W, B] or [128, 24, N]
+    Tensor sink;            // Contiguous BF16 [24,  W, B] or [24, N]
+    Tensor positions;       // Contiguous Device I32 [W, B] or [N]
+};
+
+/**
+ * Causal Grouped-Query Attention with Relative Logit Bias + Fused Gate/Sink Epilogue.
+ *
+ * Supported profile:
+ *   geometry = {head_dim = 128, query_heads = 24, kv_heads = 8} (G = 3),
+ *   scale = 1 / sqrt(128), d_rel = 16, rel_extent = 1024, SWA window = 1024,
+ *   storage in {KvCacheStorage::BFloat16, KvCacheStorage::Fp8E4m3fnGroup128Ue8m0},
+ *   buckets K2 through M1.
+ *
+ * Exact math for each live query (h, i) at absolute position p_i (kvh = h / 3):
+ *   - Visible key set J:
+ *       SWA (CyclicKVCacheLayerView, capacity=1024): J = [max(0, p_i - 1023), p_i].
+ *         - Single-token decode fast path (batched W == 1 with empty chunk_kv): all keys in J
+ *           read cache at slot p_j % 1024 (including the newly written p_i).
+ *         - Two-segment path (chunk_kv non-empty; required for batched W > 1 and all ragged):
+ *           let L be the sequence's chunk start position (positions[0, b] or
+ *           positions[cu_seqlens[s]]). Committed history keys p_j < L read cache[p_j % 1024];
+ *           current-chunk keys p_j >= L read chunk_kv at local index (p_j - L).
+ *       Full (PagedKVBatchLayerView):                J = [0, p_i], page = p_j / 64, slot = p_j % 64
+ *   - Decoded K[:, kvh, p_j], V[:, kvh, p_j] follow cache.storage (BF16/FP16 or FP8 G128/UE8M0).
+ *   - Distance d = p_i - p_j >= 0:
+ *       rel_bias(p_j) = (d < 1024) ? sum_{u=0..15} FP32(r[u, h, i]) * FP32(rel_logits_proj[u, d])
+ *                                  : 0.0f
+ *   - score(p_j)   = scale * dot(q[:, h, i], K[:, kvh, p_j]) + rel_bias(p_j)
+ *   - lse          = log(sum_{j in J} exp(score(p_j)))                           (natural log)
+ *   - attn_val     = sum_{j in J} softmax(score)[j] * V[:, kvh, p_j]
+ *   - out[:, h, i] = RN_BF16(attn_val * sigmoid(FP32(gate[:, h, i]))
+ *                                     * sigmoid(lse - FP32(sink[h, i])))
+ *
+ * Inactive batched columns (i >= valid_columns[b]) write exact BF16 zero and read no cache.
+ * Cache and chunk_kv are strictly read-only; out is disjoint from all inputs, cache, chunk_kv,
+ * and workspace.
+ */
+void relative_softmax_attention(const RelativeAttentionQueryInputs& inputs,
+                                const Tensor& valid_columns, AttentionHeadGeometry geometry,
+                                std::uint32_t window, float scale,
+                                const ConstCyclicKVCacheLayerView& cache,
+                                const RelativeAttentionChunkKV& chunk_kv, ContextBucket bucket,
+                                MemoryArena& workspace, Tensor& out, CudaExecutionView execution);
+
+void relative_softmax_attention(const RelativeAttentionQueryInputs& inputs,
+                                const Tensor& valid_columns, const Tensor& kv_table_rows,
+                                AttentionHeadGeometry geometry, float scale,
+                                const ConstPagedKVBatchLayerView& cache, ContextBucket bucket,
+                                MemoryArena& workspace, Tensor& out, CudaExecutionView execution);
+
+void relative_softmax_attention(const RelativeAttentionQueryInputs& inputs,
+                                const RaggedSequenceView& ragged, AttentionHeadGeometry geometry,
+                                std::uint32_t window, float scale,
+                                const ConstCyclicKVCacheLayerView& cache,
+                                const RelativeAttentionChunkKV& chunk_kv, ContextBucket bucket,
+                                MemoryArena& workspace, Tensor& out, CudaExecutionView execution);
+
+void relative_softmax_attention(const RelativeAttentionQueryInputs& inputs,
+                                const RaggedSequenceView& ragged, const Tensor& kv_table_rows,
+                                AttentionHeadGeometry geometry, float scale,
+                                const ConstPagedKVBatchLayerView& cache, ContextBucket bucket,
+                                MemoryArena& workspace, Tensor& out, CudaExecutionView execution);
+
+[[nodiscard]] std::size_t relative_softmax_attention_swa_workspace_capacity_bytes(
+    AttentionHeadGeometry geometry, KvCacheStorage storage, std::uint32_t window,
+    ContextBucketRange buckets, std::int32_t batch_size, std::int32_t min_tokens,
+    std::int32_t max_tokens, std::int32_t multiprocessor_count);
+
+[[nodiscard]] std::size_t relative_softmax_attention_full_workspace_capacity_bytes(
+    AttentionHeadGeometry geometry, KvCacheStorage storage, ContextBucketRange buckets,
+    std::int32_t batch_size, std::int32_t min_tokens, std::int32_t max_tokens,
+    std::int32_t multiprocessor_count);
+
+[[nodiscard]] std::size_t relative_softmax_attention_ragged_workspace_capacity_bytes(
+    AttentionHeadGeometry geometry, KvCacheStorage storage, bool is_swa, ContextBucketRange buckets,
+    std::int32_t min_tokens, std::int32_t max_tokens, std::int32_t min_segments,
+    std::int32_t max_segments, std::int32_t multiprocessor_count);
+
+[[nodiscard]] OpGraphProfile relative_softmax_attention_swa_graph_profile(
+    AttentionHeadGeometry geometry, KvCacheStorage storage, std::uint32_t window,
+    ContextBucket bucket, std::int32_t batch_size, std::int32_t tokens,
+    std::int32_t multiprocessor_count, bool masked = true);
+
+[[nodiscard]] OpGraphProfile relative_softmax_attention_full_graph_profile(
+    AttentionHeadGeometry geometry, KvCacheStorage storage, ContextBucket bucket,
+    std::int32_t batch_size, std::int32_t tokens, std::int32_t multiprocessor_count,
+    bool masked = true);
 
 } // namespace ninfer::ops

@@ -33,3 +33,4 @@ target_sources(ninfer_ops_non_rdc PRIVATE
 include("${CMAKE_CURRENT_LIST_DIR}/qsa/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/kpool_mla/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/relative/prepare/sources.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/relative/attention/sources.cmake")

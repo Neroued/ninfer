@@ -9,7 +9,7 @@ namespace ninfer::ops {
  * Apply plain per-head RMSNorm followed by full-head split-half 1-D RoPE in place.
  *
  * q is BF16 [128,Hq,W,B], k is BF16 [128,Hkv,W,B], q_norm_weight and k_norm_weight
- * are BF16 [128], and positions is I32 [W,B]. Supported (Hq,Hkv) are (32,8) and (16,4),
+ * are BF16 [128], and positions is I32 [W,B]. Supported (Hq,Hkv) are (32,8), (24,8), and (16,4),
  * with W=2..16 and B>=1. Epsilon and theta are positive and finite. For each head and
  * physical token, the complete mathematical operation is
  *

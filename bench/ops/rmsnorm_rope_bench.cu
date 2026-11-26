@@ -1,5 +1,6 @@
 // Complete public-Op timing; in-place operands are restored before each sample.
 #include "ninfer/ops/rmsnorm_rope.h"
+#include "common/gpu_activity.cuh"
 #include "op_measurement.cuh"
 #include <iomanip>
 #include <sstream>
@@ -14,7 +15,7 @@ struct Options {
     std::string form        = "pair";
     std::vector<int> widths = m::sweep("2:16"), batches = m::sweep("1:8");
     std::vector<int> tokens{1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048};
-    int key_heads = 8, position = 1'048'560, calls = 1;
+    int query_heads = 0, key_heads = 8, position = 1'048'560, calls = 1;
     float epsilon = 1.e-6F, theta = 1.e7F;
 };
 
@@ -33,11 +34,12 @@ Options parse(int argc, char** argv) {
         const std::string_view flag(argv[i]);
         if (flag == "--help") {
             std::cout << "usage: ninfer_rmsnorm_rope_bench [--form pair|single] "
-                         "[--key-heads 4|8] [--epsilon E] [--theta T] [--position P]\n"
+                         "[--query-heads 16|24|32] [--key-heads 4|8] "
+                         "[--epsilon E] [--theta T] [--position P]\n"
                          "  --widths W,... (2..16) --batches B,... (B>=1) "
                          "--tokens T,... (T>=1)\n"
                          "  --calls N (1..64): independent restored operands, warm cache only\n"
-                         "Pair uses Hq=4*Hkv. Defaults: Hkv=8, epsilon=1e-6, theta=1e7.\n";
+                         "Pair defaults to Hq=4*Hkv. Defaults: Hkv=8, epsilon=1e-6, theta=1e7.\n";
             m::help();
             std::exit(0);
         }
@@ -46,6 +48,8 @@ Options parse(int argc, char** argv) {
             if (value != "pair" && value != "single")
                 throw std::invalid_argument("form: pair|single");
             o.form = value;
+        } else if (flag == "--query-heads") {
+            o.query_heads = m::integer(value, 16, 32);
         } else if (flag == "--key-heads") {
             o.key_heads = m::integer(value, 4, 8);
             if (o.key_heads != 4 && o.key_heads != 8) throw std::invalid_argument("key heads: 4|8");
@@ -66,6 +70,9 @@ Options parse(int argc, char** argv) {
         else if (!m::parse(o.timing, flag, value))
             throw std::invalid_argument("unknown flag: " + std::string(flag));
     }
+    if (o.form == "single" && o.query_heads != 0)
+        throw std::invalid_argument("--query-heads requires --form pair");
+    if (o.form == "pair" && o.query_heads == 0) o.query_heads = 4 * o.key_heads;
     if (o.timing.profile &&
         (o.form == "pair" ? o.widths.size() * o.batches.size() != 1 : o.tokens.size() != 1))
         throw std::invalid_argument("profile requires one extent");
@@ -80,7 +87,7 @@ void run(const Options& o, int width, int batch, bench::L2FlushBuffer& flush, m:
     const auto extent = std::int64_t(width) * batch;
     if (extent > INT_MAX || std::int64_t(o.position) + extent - 1 > INT_MAX)
         throw std::invalid_argument("token extent or position is not representable");
-    const int tokens = static_cast<int>(extent), qh = pair ? 4 * o.key_heads : 0;
+    const int tokens = static_cast<int>(extent), qh = o.query_heads;
     const std::size_t q_count = std::size_t(128) * qh * tokens;
     const std::size_t k_count = std::size_t(128) * o.key_heads * tokens;
     auto q                    = bench::make_bf16(std::max(q_count * o.calls, std::size_t(1)), 101U);
@@ -126,7 +133,12 @@ void run(const Options& o, int width, int batch, bench::L2FlushBuffer& flush, m:
                .batch       = batch};
     for (const auto& execution : m::selections(o.timing.execution, "graph", "eager"))
         for (const auto& cache : m::selections(o.timing.cache, "cold", "warm")) {
-            const auto result = m::measure(launch, restore, flush, e, o.timing, execution, cache);
+            const auto prepare = [&](CudaExecutionView cuda) {
+                restore(cuda);
+                // The cold L2 sweep already provides an activity prelude before timing.
+                if (cache == "warm") bench::condition_gpu(cuda, 200);
+            };
+            const auto result = m::measure(launch, prepare, flush, e, o.timing, execution, cache);
             std::ostringstream metadata;
             metadata << std::setprecision(9) << o.epsilon << ',' << o.theta << ',' << o.position
                      << ',' << bytes << ','

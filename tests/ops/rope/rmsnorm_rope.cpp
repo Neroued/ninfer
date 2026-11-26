@@ -33,6 +33,12 @@ struct Profile {
 
 constexpr Profile kQwen{32, 8, 1.e-6F, 1.e7F};
 constexpr Profile kGlm{16, 4, 1.e-5F, 10000.F};
+constexpr Profile kInkling{24, 8, 1.e-6F, 1.e6F};
+
+struct PairStorage {
+    std::size_t activation_offset = 0, weight_offset = 0;
+    bool shared_weights = false;
+};
 
 struct OracleResult {
     std::vector<double> output;
@@ -191,35 +197,42 @@ int execute(Launch launch, Reset reset, Check check, bool graph) {
 }
 
 int run_pair_case(int width, int batch, int first_position, std::uint32_t seed, bool graph = false,
-                  Profile profile = kQwen, float magnitude = 4.F) {
+                  Profile profile = kQwen, float magnitude = 4.F, PairStorage storage = {}) {
     const int tokens          = width * batch;
     const std::size_t q_count = static_cast<std::size_t>(kHeadDim) * profile.query_heads * tokens;
     const std::size_t k_count = static_cast<std::size_t>(kHeadDim) * profile.key_heads * tokens;
-    const auto q              = make_bf16_values(q_count, seed, -magnitude, magnitude);
-    const auto k              = make_bf16_values(k_count, seed + 1U, -magnitude, magnitude);
+    auto q                    = make_bf16_values(q_count, seed, -magnitude, magnitude);
+    auto k                    = make_bf16_values(k_count, seed + 1U, -magnitude, magnitude);
     const auto q_weight       = make_bf16_values(kHeadDim, seed + 2U, 0.25F, 1.75F);
     const auto k_weight       = make_bf16_values(kHeadDim, seed + 3U, 0.25F, 1.75F);
     auto positions            = make_positions(tokens, first_position);
-    const auto q_bits         = bf16_bits(q);
-    const auto k_bits         = bf16_bits(k);
+    auto q_bits               = bf16_bits(q);
+    auto k_bits               = bf16_bits(k);
     const auto q_weight_bits  = bf16_bits(q_weight);
     const auto k_weight_bits  = bf16_bits(k_weight);
 
-    GuardedDeviceBuffer q_device(q_count * sizeof(std::uint16_t));
-    GuardedDeviceBuffer k_device(k_count * sizeof(std::uint16_t));
-    q_device.copy_from_host(q_bits.data(), q_device.bytes());
-    k_device.copy_from_host(k_bits.data(), k_device.bytes());
-    DeviceBuffer q_weight_device = to_device(q_weight_bits);
-    DeviceBuffer k_weight_device = to_device(k_weight_bits);
+    GuardedDeviceBuffer q_device(q_count * sizeof(std::uint16_t), 256 + storage.activation_offset);
+    GuardedDeviceBuffer k_device(k_count * sizeof(std::uint16_t), 256 + storage.activation_offset);
+    GuardedDeviceBuffer q_weight_device(kHeadDim * sizeof(std::uint16_t),
+                                        256 + storage.weight_offset);
+    GuardedDeviceBuffer k_weight_device(kHeadDim * sizeof(std::uint16_t),
+                                        256 + storage.weight_offset);
+    q_weight_device.copy_from_host(q_weight_bits.data(), q_weight_device.bytes());
+    k_weight_device.copy_from_host(k_weight_bits.data(), k_weight_device.bytes());
+    const auto& actual_k_weight  = storage.shared_weights ? q_weight : k_weight;
+    auto& actual_k_weight_device = storage.shared_weights ? q_weight_device : k_weight_device;
     DeviceBuffer position_device = to_device(positions);
     Tensor q_tensor(q_device.span(), DType::BF16, {kHeadDim, profile.query_heads, width, batch});
     Tensor k_tensor(k_device.span(), DType::BF16, {kHeadDim, profile.key_heads, width, batch});
     Tensor q_weight_tensor(q_weight_device.span(), DType::BF16, {kHeadDim});
-    Tensor k_weight_tensor(k_weight_device.span(), DType::BF16, {kHeadDim});
+    Tensor k_weight_tensor(actual_k_weight_device.span(), DType::BF16, {kHeadDim});
     Tensor position_tensor(position_device.span(), DType::I32, {width, batch});
     const std::string label = "rmsnorm_rope pair Hq=" + std::to_string(profile.query_heads) +
                               " W=" + std::to_string(width) + " B=" + std::to_string(batch) +
-                              " graph=" + std::to_string(graph);
+                              " graph=" + std::to_string(graph) +
+                              " theta=" + std::to_string(profile.theta) +
+                              " activation_offset=" + std::to_string(storage.activation_offset) +
+                              " weight_offset=" + std::to_string(storage.weight_offset);
     int failures = execute(
         [&](CudaExecutionView cuda) {
             ops::rmsnorm_rope(position_tensor, q_weight_tensor, k_weight_tensor, profile.epsilon,
@@ -230,6 +243,16 @@ int run_pair_case(int width, int batch, int first_position, std::uint32_t seed, 
             for (int b = 0; b < batch; ++b)
                 for (int i = 0; i < width; ++i)
                     positions[b * width + i] = (b % 2 ? 17 : first_position) + i + replay * 123;
+            if (profile.query_heads == kInkling.query_heads) {
+                if (tokens > 2) positions[1] = 0;
+                positions.back() = -first_position - replay * 123;
+            }
+            if (replay != 0) {
+                std::rotate(q.begin(), q.begin() + 17, q.end());
+                std::rotate(k.begin(), k.begin() + 31, k.end());
+                q_bits = bf16_bits(q);
+                k_bits = bf16_bits(k);
+            }
             cuda_check(cudaMemcpyAsync(position_device.data(), positions.data(),
                                        positions.size() * sizeof(std::int32_t),
                                        cudaMemcpyHostToDevice, stream),
@@ -245,22 +268,25 @@ int run_pair_case(int width, int batch, int first_position, std::uint32_t seed, 
             return verify_profile(
                        label + " q", from_device_bf16(q_device.data(), q_count),
                        fused_oracle(q, q_weight, positions, profile.query_heads, profile)) +
-                   verify_profile(label + " k", from_device_bf16(k_device.data(), k_count),
-                                  fused_oracle(k, k_weight, positions, profile.key_heads, profile));
+                   verify_profile(
+                       label + " k", from_device_bf16(k_device.data(), k_count),
+                       fused_oracle(k, actual_k_weight, positions, profile.key_heads, profile));
         },
         graph);
 
     failures += q_device.verify_guards(label + " q guards");
     failures += k_device.verify_guards(label + " k guards");
+    failures += q_weight_device.verify_guards(label + " q weight guards");
+    failures += k_weight_device.verify_guards(label + " k weight guards");
     failures +=
         verify_exact((label + " positions").c_str(),
                      from_device<std::int32_t>(position_device, positions.size()), positions);
-    failures += verify_exact((label + " q weight").c_str(),
-                             from_device<std::uint16_t>(q_weight_device, q_weight_bits.size()),
-                             q_weight_bits);
-    failures += verify_exact((label + " k weight").c_str(),
-                             from_device<std::uint16_t>(k_weight_device, k_weight_bits.size()),
-                             k_weight_bits);
+    failures += verify_exact(
+        (label + " q weight").c_str(),
+        from_device<std::uint16_t>(q_weight_device.data(), q_weight_bits.size()), q_weight_bits);
+    failures += verify_exact(
+        (label + " k weight").c_str(),
+        from_device<std::uint16_t>(k_weight_device.data(), k_weight_bits.size()), k_weight_bits);
     return failures;
 }
 
@@ -315,6 +341,32 @@ int run_single_case(int tokens, int first_position, std::uint32_t seed, bool gra
     return failures;
 }
 
+int run_large_gain_case() {
+    constexpr int width = 2;
+    std::vector<float> q(kHeadDim * kInkling.query_heads * width, 1.F);
+    const std::vector<float> k(kHeadDim * kInkling.key_heads * width, 1.F);
+    std::vector<float> weight(kHeadDim, 1.F);
+    const std::vector<std::int32_t> positions(width, 1);
+    for (std::size_t i = 0; i < q.size(); i += kHeadDim) q[i] = 1.25F;
+    // The first normalized value exceeds FP32 range. Both rotated values fit in BF16.
+    weight.front() = bf16_to_f32(f32_to_bf16(3.e38F));
+    auto q_device  = to_device(bf16_bits(q));
+    auto k_device  = to_device(bf16_bits(k));
+    auto w_device  = to_device(bf16_bits(weight));
+    auto p_device  = to_device(positions);
+    Tensor query(q_device.span(), DType::BF16, {kHeadDim, kInkling.query_heads, width});
+    Tensor key(k_device.span(), DType::BF16, {kHeadDim, kInkling.key_heads, width});
+    Tensor w(w_device.span(), DType::BF16, {kHeadDim});
+    Tensor p(p_device.span(), DType::I32, {width});
+    ops::rmsnorm_rope(p, w, w, kInkling.epsilon, kInkling.theta, query, key,
+                      cuda_environment().default_execution);
+    cuda_synchronize();
+    return verify_profile("rmsnorm_rope large gain q", from_device_bf16(q_device.data(), q.size()),
+                          fused_oracle(q, weight, positions, kInkling.query_heads, kInkling)) +
+           verify_profile("rmsnorm_rope large gain k", from_device_bf16(k_device.data(), k.size()),
+                          fused_oracle(k, weight, positions, kInkling.key_heads, kInkling));
+}
+
 int contract() {
     const auto e = cuda_environment().default_execution;
     DeviceBuffer storage(e.device(), 16384);
@@ -323,9 +375,10 @@ int contract() {
         weight(storage.span().subspan(10240, 256), DType::BF16, {128}),
         positions(storage.span().subspan(10496, 8), DType::I32, {2});
     int failures = 0;
-    auto reject  = [&](auto launch) {
+    auto reject  = [&](auto launch, const char* label = "legacy contract") {
         try {
             launch();
+            std::cerr << "rmsnorm_rope accepted invalid input: " << label << '\n';
             ++failures;
         } catch (const std::invalid_argument&) {}
     };
@@ -343,6 +396,42 @@ int contract() {
     k.ne[1] = 4;
     k.data  = q.data;
     reject([&] { ops::rmsnorm_rope(positions, weight, weight, 1.e-5F, 10000.F, q, k, e); });
+
+    DeviceBuffer q_storage(e.device(), 128 * 32 * 17 * sizeof(std::uint16_t));
+    DeviceBuffer k_storage(e.device(), 128 * 16 * 17 * sizeof(std::uint16_t));
+    DeviceBuffer p_storage(e.device(), 17 * sizeof(std::int32_t));
+    const auto reject_pair = [&](int query_heads, int key_heads, int width) {
+        Tensor query(q_storage.span(), DType::BF16, {128, query_heads, width});
+        Tensor key(k_storage.span(), DType::BF16, {128, key_heads, width});
+        Tensor p(p_storage.span(), DType::I32, {width});
+        reject(
+            [&] {
+                ops::rmsnorm_rope(p, weight, weight, kInkling.epsilon, kInkling.theta, query, key,
+                                  e);
+            },
+            "pair geometry");
+    };
+    reject_pair(24, 4, 2);
+    reject_pair(32, 4, 2);
+    reject_pair(24, 16, 2);
+    reject_pair(24, 8, 1);
+    reject_pair(24, 8, 17);
+
+    Tensor query(q_storage.span(), DType::BF16, {128, 24, 2});
+    Tensor key(k_storage.span(), DType::BF16, {128, 8, 2});
+    Tensor aliased_key(q_storage.span().subspan(4, key.bytes()), DType::BF16, {128, 8, 2});
+    Tensor aliased_weight(q_storage.span().subspan(query.bytes() - 4, weight.bytes()), DType::BF16,
+                          {128});
+    Tensor aliased_positions(k_storage.span().subspan(key.bytes() - 4, positions.bytes()),
+                             DType::I32, {2});
+    const auto inkling = [&](const Tensor& p, const Tensor& kw, Tensor& key) {
+        ops::rmsnorm_rope(p, weight, kw, kInkling.epsilon, kInkling.theta, query, key, e);
+    };
+    reject([&] { inkling(positions, weight, aliased_key); }, "q/k overlap");
+    reject([&] { inkling(positions, aliased_weight, key); }, "q/key weight overlap");
+    reject([&] { inkling(aliased_positions, weight, key); }, "k/positions overlap");
+    query.ne[3] = std::numeric_limits<int>::max() / 2 + 1;
+    reject([&] { inkling(positions, weight, key); }, "pair token extent overflow");
     return failures;
 }
 
@@ -390,6 +479,44 @@ void add_rmsnorm_rope_cases(ninfer::test::OpSuite& suite) {
               {{"execution", "graph"}});
     suite.add("rmsnorm_rope/glm/pair/epsilon",
               [] { return run_pair_case(2, 1, 0, 0x3002U, false, kGlm, 1.e-4F); });
+    for (int width = 2; width <= 16; ++width) {
+        constexpr int batches[]{1, 3, 8};
+        const int batch = batches[(width - 2) % 3];
+        suite.add(
+            "rmsnorm_rope/inkling/pair/w" + std::to_string(width) + "/b" + std::to_string(batch),
+            [=] {
+                return run_pair_case(width, batch, 1'048'560, 0x6000U + width, false, kInkling);
+            });
+    }
+    for (const auto [width, batch] : {std::pair{8, 32}, {16, 64}}) {
+        suite.add("rmsnorm_rope/inkling/pair/w" + std::to_string(width) + "/b" +
+                      std::to_string(batch),
+                  [=] { return run_pair_case(width, batch, 1'048'560, 0x6100U, false, kInkling); },
+                  {{"suite", "concurrency"}});
+    }
+    suite.add("rmsnorm_rope/inkling/pair/unaligned",
+              [] { return run_pair_case(7, 3, 1'048'560, 0x6200U, false, kInkling, 4.F, {4, 4}); });
+    suite.add("rmsnorm_rope/inkling/pair/shared_weight_graph",
+              [] {
+                  return run_pair_case(8, 8, 1'048'560, 0x6201U, true, kInkling, 4.F,
+                                       {.shared_weights = true});
+              },
+              {{"execution", "graph"}});
+    suite.add("rmsnorm_rope/inkling/pair/wide_angles",
+              [] {
+                  auto wide  = kInkling;
+                  wide.theta = 1.e-4F;
+                  return run_pair_case(5, 3, 1'048'560, 0x6202U, true, wide, .01F, {0, 4, true}) +
+                         run_pair_case(8, 4, 1'048'560, 0x6203U, false, wide);
+              },
+              {{"execution", "graph"}});
+    suite.add("rmsnorm_rope/inkling/pair/exponent_range", [] {
+        auto tiny_epsilon    = kInkling;
+        tiny_epsilon.epsilon = std::numeric_limits<float>::denorm_min();
+        return run_pair_case(2, 1, 1'048'560, 0x6204U, false, kInkling, 1.e30F) +
+               run_pair_case(3, 1, 1'048'560, 0x6205U, false, tiny_epsilon, 1.e-22F);
+    });
+    suite.add("rmsnorm_rope/inkling/pair/large_gain", run_large_gain_case);
     for (int tokens : {1, 16, 256, 512, 2048}) {
         suite.add("rmsnorm_rope/glm/single/t" + std::to_string(tokens),
                   [=] { return run_single_case(tokens, 1'048'560, 0x4000U, tokens == 2048, kGlm); },

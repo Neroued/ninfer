@@ -3,6 +3,7 @@
 #include "ops/common/host/operands.h"
 #include "core/device.h"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstddef>
@@ -57,6 +58,53 @@ void dispatch(const Tensor& positions, const Tensor* q_norm_weight, const Tensor
         route.template operator()<false>();
     else
         route.template operator()<true>();
+}
+
+template <int Heads, int Lanes, bool WideAngles, bool BypassL1 = false>
+void launch_pair24(const Tensor& positions, const Tensor& q_weight, const Tensor& k_weight,
+                   Tensor& q, Tensor& k, int tokens, float epsilon,
+                   const detail::RopeD128Frequencies& frequencies, cudaStream_t stream) {
+    constexpr int groups = 32 / Heads;
+    auto* p              = static_cast<const std::int32_t*>(positions.data);
+    auto* qp             = static_cast<__nv_bfloat162*>(q.data);
+    auto* kp             = static_cast<__nv_bfloat162*>(k.data);
+    // The public extent may exceed the capacity of a flattened grid of head groups.
+    while (tokens > 0) {
+        const int count = std::min(tokens, std::numeric_limits<int>::max() / groups);
+        detail::rmsnorm_rope_d128_pair24_kernel<Heads, Lanes, WideAngles, BypassL1>
+            <<<count * groups, Heads * Lanes, 0, stream>>>(
+                p, static_cast<const __nv_bfloat162*>(q_weight.data),
+                static_cast<const __nv_bfloat162*>(k_weight.data), qp, kp, epsilon, frequencies);
+        tokens -= count;
+        p += count;
+        qp += std::int64_t(count) * 24 * 64;
+        kp += std::int64_t(count) * 8 * 64;
+    }
+}
+
+void dispatch_pair24(const Tensor& positions, const Tensor& q_weight, const Tensor& k_weight,
+                     Tensor& q, Tensor& k, int tokens, float epsilon, float theta,
+                     cudaStream_t stream) {
+    static const auto inkling = detail::make_rope_d128_frequencies(1.e6F);
+    const auto frequencies    = theta == 1.e6F ? inkling : detail::rope_d128_frequencies(theta);
+    if (theta < 1.F) {
+        launch_pair24<8, 32, true>(positions, q_weight, k_weight, q, k, tokens, epsilon,
+                                   frequencies, stream);
+        return;
+    }
+
+    const bool aligned =
+        common::operand::aligned(q.data, 16) && common::operand::aligned(k.data, 16) &&
+        common::operand::aligned(q_weight.data, 16) && common::operand::aligned(k_weight.data, 16);
+    if (!aligned)
+        launch_pair24<8, 32, false>(positions, q_weight, k_weight, q, k, tokens, epsilon,
+                                    frequencies, stream);
+    else if (tokens <= 32)
+        launch_pair24<2, 16, false, true>(positions, q_weight, k_weight, q, k, tokens, epsilon,
+                                          frequencies, stream);
+    else
+        launch_pair24<8, 8, false>(positions, q_weight, k_weight, q, k, tokens, epsilon,
+                                   frequencies, stream);
 }
 
 void require_parameters(float epsilon, float theta) {
@@ -115,8 +163,10 @@ void rmsnorm_rope(const Tensor& positions, const Tensor& q_norm_weight, const Te
         throw std::invalid_argument("rmsnorm_rope: pair batch or flattened extent is invalid");
     }
     const int query_heads = q.ne[1], key_heads = k.ne[1];
-    if (!((query_heads == 32 && key_heads == 8) || (query_heads == 16 && key_heads == 4)))
-        throw std::invalid_argument("rmsnorm_rope: pair (Hq,Hkv) must be (32,8) or (16,4)");
+    if (!((query_heads == 32 && key_heads == 8) || (query_heads == 24 && key_heads == 8) ||
+          (query_heads == 16 && key_heads == 4)))
+        throw std::invalid_argument(
+            "rmsnorm_rope: pair (Hq,Hkv) must be (32,8), (24,8), or (16,4)");
     require_tensor(q, DType::BF16, {kHeadDim, query_heads, width, batch}, "q", execution.device());
     require_tensor(k, DType::BF16, {kHeadDim, key_heads, width, batch}, "k", execution.device());
     require_tensor(q_norm_weight, DType::BF16, {kHeadDim, 1, 1, 1}, "q norm weight",
@@ -127,6 +177,9 @@ void rmsnorm_rope(const Tensor& positions, const Tensor& q_norm_weight, const Te
     require_pair_nonoverlap(positions, q_norm_weight, k_norm_weight, q, k);
     if (query_heads == 16)
         dispatch<16, 4>(positions, &q_norm_weight, k_norm_weight, &q, k, width * batch, epsilon,
+                        theta, stream);
+    else if (query_heads == 24)
+        dispatch_pair24(positions, q_norm_weight, k_norm_weight, q, k, width * batch, epsilon,
                         theta, stream);
     else
         dispatch<32, 8>(positions, &q_norm_weight, k_norm_weight, &q, k, width * batch, epsilon,

@@ -196,11 +196,25 @@ void verify_host(const std::filesystem::path& artifact_path) {
                         full->uses(lw.moe.down).size() == expected_uses,
                     "per-pass use count mismatch at physical layer " + std::to_string(l));
             for (std::uint32_t pass = 0; pass < expected_uses; ++pass) {
-                const auto expected_policy =
-                    l < 20 ? ops::LinearPolicy::A16Only : ops::LinearPolicy::AllowA8;
-                require(full->input(WeightUseId{lw.moe.gate, pass}).policy == expected_policy &&
-                            full->input(WeightUseId{lw.moe.down, pass}).policy == expected_policy,
-                        "MoE linear policy mismatch at physical layer " + std::to_string(l));
+                const auto gate_in = full->input(WeightUseId{lw.moe.gate, pass});
+                const auto down_in = full->input(WeightUseId{lw.moe.down, pass});
+                if (l < 20) {
+                    const bool valid_a16 = gate_in.policy == ops::LinearPolicy::A16Only &&
+                                           down_in.policy == ops::LinearPolicy::A16Only;
+                    const bool valid_a4 =
+                        gate_in.policy == ops::LinearPolicy::AllowA4 &&
+                        down_in.policy == ops::LinearPolicy::AllowA4 &&
+                        gate_in.calibration.operation == ops::ActivationScaleOperation::Multiply &&
+                        down_in.calibration.operation == ops::ActivationScaleOperation::Multiply &&
+                        !gate_in.calibration.values().empty() &&
+                        !down_in.calibration.values().empty();
+                    require(valid_a16 || valid_a4,
+                            "MoE linear policy mismatch at physical layer " + std::to_string(l));
+                } else {
+                    require(gate_in.policy == ops::LinearPolicy::AllowA8 &&
+                                down_in.policy == ops::LinearPolicy::AllowA8,
+                            "MoE linear policy mismatch at physical layer " + std::to_string(l));
+                }
             }
 
             const auto gu_geom   = reader.geometry(banks[l].gate_up.object);

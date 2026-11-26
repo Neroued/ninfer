@@ -138,3 +138,6 @@ ninfer_add_op_bench(ninfer_linear_bias_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/
 
 ninfer_add_op_bench(ninfer_context_kv_materialize_bf16_bench
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/context_kv_materialize_bf16_bench.cu")
+
+ninfer_add_op_bench(ninfer_block_attn_res_bench
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/block_attn_res_bench.cu")

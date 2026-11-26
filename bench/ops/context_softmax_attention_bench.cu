@@ -12,7 +12,7 @@
 #include "core/device.h"
 #include "core/paged_kv_cache.h"
 #include "context_bucket_workload.h"
-#include "ninfer_bench_common.h"
+#include "op_measurement.cuh"
 
 #include <cuda_profiler_api.h>
 #include <cuda_runtime.h>
@@ -24,6 +24,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -35,11 +36,9 @@ namespace workload = ninfer::bench::workload;
 namespace {
 
 constexpr std::int32_t kHeadDim        = 128;
-constexpr std::int32_t kQueryHeads     = 32;
 constexpr std::int32_t kKvHeads        = 8;
-constexpr std::int32_t kMaximumContext = ops::context_bucket_tokens(ops::ContextBucket::K256);
+constexpr std::int32_t kMaximumContext = ops::context_bucket_tokens(ops::ContextBucket::M1);
 constexpr float kScale                 = 0.08838834764831844055F;
-constexpr ops::AttentionHeadGeometry kGeometry{kHeadDim, kQueryHeads, kKvHeads};
 constexpr std::size_t kFlushBytes = std::size_t{256} << 20;
 
 enum class Execution : std::uint8_t { Eager, Graph, Both };
@@ -50,22 +49,26 @@ struct Options {
     std::vector<std::int32_t> batches{1};
     std::vector<std::int32_t> tokens{1, 2, 4, 8, 12, 16};
     std::vector<std::int32_t> contexts{0, 128, 2048, 8192, 32768, 131072, 262144};
+    ops::AttentionHeadGeometry geometry{kHeadDim, 32, kKvHeads};
     workload::ContextQueryOptions workload;
     Execution execution = Execution::Graph;
     CacheMode cache     = CacheMode::Cold;
     int warmup          = 5;
     int repeat          = 50;
+    bool body_timer     = false;
     bool profile        = false;
     std::string csv_out;
 };
 
 struct Result {
+    ops::AttentionHeadGeometry geometry;
     std::int32_t batch;
     std::int32_t tokens;
     std::int32_t context;
     ops::ContextBucket bucket;
     std::string_view lengths, valid;
     std::size_t graph_nodes;
+    const char* timer_scope;
     Execution execution;
     CacheState cache;
     std::size_t workspace_bytes;
@@ -75,19 +78,21 @@ struct Result {
 };
 
 [[noreturn]] void usage(const char* message) {
-    std::fprintf(stderr,
-                 "error: %s\n"
-                 "usage: ninfer_context_softmax_attention_bench "
-                 "[--batch B,...] [--tokens 1,...,16] [--context 0,...,262144] [--envelope-max N] "
-                 "[--bucket auto|2k|8k|16k|32k|64k|128k|256k] "
-                 "[--length-dist uniform|skewed-1long|staggered|shared-prefix] "
-                 "[--valid-dist full|ragged|with-inert] [--valid full|half|mixed|zero] "
-                 "[--lengths uniform|mixed] "
-                 "[--execution eager|graph|both] [--cache cold|warm|both] "
-                 "[--warmup N] [--repeat N] [--profile] [--csv-out PATH]\n"
-                 "--context is committed history and excludes the query block.\n"
-                 "--envelope-max sets the auto bucket input when supplied.\n",
-                 message);
+    std::fprintf(
+        stderr,
+        "error: %s\n"
+        "usage: ninfer_context_softmax_attention_bench "
+        "[--query-heads 24|32] [--kv-heads 8] [--batch B,...] [--tokens 1,...,16] "
+        "[--context 0,...,1048576] [--envelope-max N] "
+        "[--bucket auto|2k|8k|16k|32k|64k|128k|256k|512k|1m] "
+        "[--length-dist uniform|skewed-1long|staggered|shared-prefix] "
+        "[--valid-dist full|ragged|with-inert] [--valid full|half|mixed|zero] "
+        "[--lengths uniform|mixed] "
+        "[--execution eager|graph|both] [--graph-timer launch|body] [--cache cold|warm|both] "
+        "[--warmup N] [--repeat N] [--profile] [--csv-out PATH]\n"
+        "--context is committed history and excludes the query block.\n"
+        "--envelope-max sets the auto bucket input when supplied.\n",
+        message);
     std::exit(2);
 }
 
@@ -132,6 +137,12 @@ Options parse_options(int argc, char** argv) {
             options.tokens = parse_list(next("--tokens requires a value"), 1, 16, "--tokens");
         } else if (argument == "--batch" || argument == "--batches") {
             options.batches = parse_list(next("--batch requires a value"), 1, INT32_MAX, "--batch");
+        } else if (argument == "--query-heads") {
+            options.geometry.query_heads =
+                parse_i32(next("--query-heads requires a value"), 24, 32, "--query-heads");
+        } else if (argument == "--kv-heads") {
+            options.geometry.kv_heads =
+                parse_i32(next("--kv-heads requires a value"), kKvHeads, kKvHeads, "--kv-heads");
         } else if (argument == "--context") {
             options.contexts =
                 parse_list(next("--context requires a value"), 0, kMaximumContext, "--context");
@@ -166,6 +177,10 @@ Options parse_options(int argc, char** argv) {
                 options.execution = Execution::Both;
             else
                 usage("--execution expects eager, graph, or both");
+        } else if (argument == "--graph-timer") {
+            const std::string_view value(next("--graph-timer requires a value"));
+            if (value != "body" && value != "launch") usage("--graph-timer expects launch or body");
+            options.body_timer = value == "body";
         } else if (argument == "--cache") {
             const std::string_view value(next("--cache requires a value"));
             if (value == "cold")
@@ -242,14 +257,15 @@ PagedKVBatchLayerView make_context_view(tool::PackedKVFixture& packed, DeviceBuf
 class Case {
 public:
     Case(std::int32_t tokens, std::int32_t context, std::int32_t batch, const Options& options)
-        : workload_(workload::generate_context_query_workload(context, tokens, batch,
+        : geometry_(options.geometry),
+          workload_(workload::generate_context_query_workload(context, tokens, batch,
                                                               options.workload, kPagedKVPageSize)),
           bucket_(options.workload.select_bucket(workload_.max_history)),
           workspace_bytes_(ops::context_softmax_attention_workspace_capacity_bytes(
-              kGeometry, bucket_, batch, tokens, tokens)),
+              geometry_, bucket_, batch, tokens, tokens)),
           mapping_(make_page_mapping(workload_)),
-          q_(bench::make_bf16(static_cast<std::size_t>(kHeadDim) * kQueryHeads * tokens * batch,
-                              101U)),
+          q_(bench::make_bf16(
+              static_cast<std::size_t>(kHeadDim) * geometry_.query_heads * tokens * batch, 101U)),
           query_k_(bench::make_bf16(static_cast<std::size_t>(kHeadDim) * kKvHeads * tokens * batch,
                                     103U)),
           query_v_(bench::make_bf16(static_cast<std::size_t>(kHeadDim) * kKvHeads * tokens * batch,
@@ -260,17 +276,18 @@ public:
           context_length_(ninfer::bench::device_context().device(), sizeof(std::int32_t) * batch),
           valid_(ninfer::bench::device_context().device(), sizeof(std::int32_t) * batch),
           table_row_(ninfer::bench::device_context().device(), sizeof(std::int32_t) * batch),
-          output_(bench::make_zeros(static_cast<std::size_t>(kHeadDim) * kQueryHeads * tokens *
-                                    batch * 2)),
+          output_(bench::make_zeros(static_cast<std::size_t>(kHeadDim) * geometry_.query_heads *
+                                    tokens * batch * 2)),
           workspace_storage_(bench::make_buffer(std::max<std::size_t>(workspace_bytes_, 1))),
           workspace_(workspace_storage_.span()),
-          q_tensor_(q_.span(), DType::BF16, {kHeadDim, kQueryHeads, tokens, batch}),
+          q_tensor_(q_.span(), DType::BF16, {kHeadDim, geometry_.query_heads, tokens, batch}),
           query_k_tensor_(query_k_.span(), DType::BF16, {kHeadDim, kKvHeads, tokens, batch}),
           query_v_tensor_(query_v_.span(), DType::BF16, {kHeadDim, kKvHeads, tokens, batch}),
           length_tensor_(context_length_.span(), DType::I32, {batch}),
           valid_tensor_(valid_.span(), DType::I32, {batch}),
           table_row_tensor_(table_row_.span(), DType::I32, {batch}),
-          output_tensor_(output_.span(), DType::BF16, {kHeadDim, kQueryHeads, tokens, batch}),
+          output_tensor_(output_.span(), DType::BF16,
+                         {kHeadDim, geometry_.query_heads, tokens, batch}),
           context_view_(make_context_view(packed_, block_table_, mapping_.logical_pages, batch)) {
         std::vector<std::int32_t> rows(batch);
         for (int b = 0; b < batch; ++b) rows[b] = workload_.valid_columns[b] ? b : -1;
@@ -297,7 +314,7 @@ public:
 
     void launch(CudaExecutionView cuda) {
         ops::context_softmax_attention(q_tensor_, query_k_tensor_, query_v_tensor_, length_tensor_,
-                                       valid_tensor_, table_row_tensor_, kGeometry, kScale,
+                                       valid_tensor_, table_row_tensor_, geometry_, kScale,
                                        context_view_, bucket_, workspace_, output_tensor_, cuda);
     }
 
@@ -306,7 +323,7 @@ public:
     [[nodiscard]] ops::ContextBucket bucket() const noexcept { return bucket_; }
 
     [[nodiscard]] double useful_bytes() const {
-        constexpr double q_bytes  = 2. * kHeadDim * kQueryHeads;
+        const double q_bytes      = 2. * kHeadDim * geometry_.query_heads;
         constexpr double kv_bytes = 4. * kHeadDim * kKvHeads;
         double bytes              = q_bytes * output_tensor_.ne[2] * output_tensor_.ne[3];
         int live_rows             = 0;
@@ -325,10 +342,11 @@ public:
             const int live = workload_.valid_columns[row];
             visits += double(live) * (workload_.lengths[row] + live);
         }
-        return 4. * kHeadDim * kQueryHeads * visits;
+        return 4. * kHeadDim * geometry_.query_heads * visits;
     }
 
 private:
+    ops::AttentionHeadGeometry geometry_;
     workload::ContextQueryWorkload workload_;
     ops::ContextBucket bucket_;
     std::size_t workspace_bytes_;
@@ -360,9 +378,10 @@ const char* execution_name(Execution execution) {
 
 const char* cache_name(CacheState cache) { return cache == CacheState::Cold ? "cold" : "warm"; }
 
-bench::ColdTiming measure(Case& data, Execution execution, CacheState cache,
-                          bench::TimedGraph* graph, bench::L2FlushBuffer& flush,
-                          CudaExecutionView cuda, int warmup, int repeat) {
+template <class Graph>
+bench::ColdTiming measure(Case& data, Execution execution, CacheState cache, const Graph* graph,
+                          bench::L2FlushBuffer& flush, CudaExecutionView cuda, int warmup,
+                          int repeat) {
     if (execution == Execution::Eager) {
         const auto launch = [&](CudaExecutionView cuda) { data.launch(cuda); };
         return cache == CacheState::Cold
@@ -378,13 +397,14 @@ void report(const Result& result) {
     const double seconds = result.timing.median_us * 1.0e-6;
     const double gbps    = result.useful_bytes / seconds / 1.0e9;
     const double tflops  = result.useful_flops / seconds / 1.0e12;
-    std::printf("entry=context execution=%-5s cache=%-4s B=%d T=%2d L=%6d "
-                "bucket=%s lengths=%s valid=%s graph_nodes=%zu workspace=%8zu "
+    std::printf("entry=context execution=%-5s cache=%-4s Hq=%d Hkv=%d B=%d T=%2d L=%6d "
+                "bucket=%s lengths=%s valid=%s graph_nodes=%zu timer=%s workspace=%8zu "
                 "median=%9.3f us min=%9.3f us p95=%9.3f us useful=%8.1f GB/s "
                 "(%5.1f%% of %.0f) math=%7.2f TFLOP/s (%5s%% of %s)\n",
-                execution_name(result.execution), cache_name(result.cache), result.batch,
-                result.tokens, result.context, ops::context_bucket_name(result.bucket).data(),
-                result.lengths.data(), result.valid.data(), result.graph_nodes,
+                execution_name(result.execution), cache_name(result.cache),
+                result.geometry.query_heads, result.geometry.kv_heads, result.batch, result.tokens,
+                result.context, ops::context_bucket_name(result.bucket).data(),
+                result.lengths.data(), result.valid.data(), result.graph_nodes, result.timer_scope,
                 result.workspace_bytes, result.timing.median_us, result.timing.min_us,
                 result.timing.p95_us, gbps, gbps / bench::kRoofline.memory_gbs * 100.0,
                 bench::kRoofline.memory_gbs, tflops,
@@ -399,14 +419,17 @@ void write_csv(const Options& options, const std::vector<Result>& results) {
     std::ofstream output(path);
     if (!output) { throw std::runtime_error("failed to open CSV output"); }
     output << "entry,execution,cache,B,T,context,workspace_bytes,useful_bytes,useful_flops,"
-              "median_us,min_us,p95_us,bucket,lengths,valid,graph_nodes\n";
+              "median_us,min_us,p95_us,bucket,lengths,valid,graph_nodes,query_heads,kv_heads,timer_"
+              "scope\n";
     for (const Result& result : results) {
         output << "context," << execution_name(result.execution) << ',' << cache_name(result.cache)
                << ',' << result.batch << ',' << result.tokens << ',' << result.context << ','
                << result.workspace_bytes << ',' << result.useful_bytes << ',' << result.useful_flops
                << ',' << result.timing.median_us << ',' << result.timing.min_us << ','
                << result.timing.p95_us << ',' << ops::context_bucket_name(result.bucket) << ','
-               << result.lengths << ',' << result.valid << ',' << result.graph_nodes << '\n';
+               << result.lengths << ',' << result.valid << ',' << result.graph_nodes << ','
+               << result.geometry.query_heads << ',' << result.geometry.kv_heads << ','
+               << result.timer_scope << '\n';
     }
 }
 
@@ -472,10 +495,17 @@ int main(int argc, char** argv) {
                 for (const std::int32_t tokens : options.tokens) {
                     Case data(tokens, context, batch, options);
                     bench::TimedGraph graph;
+                    std::optional<bench::measurement::BodyTimedGraph> body_graph;
                     if (options.execution != Execution::Eager) {
                         data.launch(cuda);
                         CUDA_CHECK(cudaStreamSynchronize(stream));
-                        graph.capture(cuda, [&](CudaExecutionView cuda) { data.launch(cuda); });
+                        const auto launch = [&](CudaExecutionView cuda) { data.launch(cuda); };
+                        if (options.body_timer) {
+                            body_graph.emplace();
+                            body_graph->capture(cuda, launch);
+                        } else {
+                            graph.capture(cuda, launch);
+                        }
                     }
                     for (const Execution execution : {Execution::Eager, Execution::Graph}) {
                         if ((options.execution == Execution::Eager &&
@@ -489,20 +519,34 @@ int main(int argc, char** argv) {
                                 (options.cache == CacheMode::Warm && cache != CacheState::Warm)) {
                                 continue;
                             }
-                            Result result{batch,
+                            const bool is_graph     = execution == Execution::Graph;
+                            const auto nodes        = !is_graph    ? 0
+                                                      : body_graph ? body_graph->body_nodes()
+                                                                   : graph.nodes();
+                            const char* timer_scope = !is_graph    ? "eager-launch"
+                                                      : body_graph ? "gpu-body"
+                                                                   : "graph-launch";
+                            const auto timing =
+                                is_graph && body_graph
+                                    ? measure(data, execution, cache, &*body_graph, flush, cuda,
+                                              options.warmup, options.repeat)
+                                    : measure(data, execution, cache, &graph, flush, cuda,
+                                              options.warmup, options.repeat);
+                            Result result{options.geometry,
+                                          batch,
                                           tokens,
                                           context,
                                           data.bucket(),
                                           options.workload.length_name(),
                                           options.workload.valid_name(),
-                                          execution == Execution::Graph ? graph.nodes() : 0,
+                                          nodes,
+                                          timer_scope,
                                           execution,
                                           cache,
                                           data.workspace_bytes(),
                                           data.useful_bytes(),
                                           data.useful_flops(),
-                                          measure(data, execution, cache, &graph, flush, cuda,
-                                                  options.warmup, options.repeat)};
+                                          timing};
                             report(result);
                             results.push_back(result);
                         }

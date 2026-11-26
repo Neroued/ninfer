@@ -35,7 +35,8 @@ constexpr int kKVHeads = 8;
 constexpr int kPage    = 64;
 constexpr float kScale = 0.08838834764831844055f;
 constexpr ops::AttentionHeadGeometry kGeometry{kD, kQHeads, kKVHeads};
-constexpr ContextBucketRange kBuckets{ContextBucket::K2, ContextBucket::K256};
+constexpr ops::AttentionHeadGeometry kGroup3{kD, 24, kKVHeads};
+constexpr ContextBucketRange kBuckets{ContextBucket::K2, ContextBucket::M1};
 
 constexpr ReductionCriterion kContextQueryBf16Criterion{
     .relative_l2                     = 2.95e-3,
@@ -43,11 +44,11 @@ constexpr ReductionCriterion kContextQueryBf16Criterion{
     .gross_relative_to_max_reference = 5.7e-3,
 };
 
-std::size_t q_index(int d, int q_head, int token) {
+std::size_t q_index(int d, int q_head, int token, int query_heads = kQHeads) {
     return static_cast<std::size_t>(d) +
            static_cast<std::size_t>(kD) *
                (static_cast<std::size_t>(q_head) +
-                static_cast<std::size_t>(kQHeads) * static_cast<std::size_t>(token));
+                static_cast<std::size_t>(query_heads) * static_cast<std::size_t>(token));
 }
 
 std::size_t query_kv_index(int d, int kv_head, int token) {
@@ -68,6 +69,7 @@ enum class MappingPattern {
     Identity,
     Offset,
     Fragmented,
+    Shuffled,
 };
 
 std::vector<std::int32_t> page_mapping(int logical_pages, MappingPattern pattern) {
@@ -83,6 +85,10 @@ std::vector<std::int32_t> page_mapping(int logical_pages, MappingPattern pattern
         case MappingPattern::Fragmented:
             mapping[static_cast<std::size_t>(page)] = 2 * page + 1;
             break;
+        case MappingPattern::Shuffled:
+            mapping[static_cast<std::size_t>(page)] =
+                page % 2 == 0 ? logical_pages + page : logical_pages - page;
+            break;
         }
     }
     return mapping;
@@ -96,6 +102,8 @@ const char* mapping_name(MappingPattern pattern) {
         return "offset";
     case MappingPattern::Fragmented:
         return "fragmented";
+    case MappingPattern::Shuffled:
+        return "shuffled";
     }
     return "unknown";
 }
@@ -155,12 +163,15 @@ void context_attention_oracle(const std::vector<float>& q, const std::vector<flo
                               const std::vector<float>& query_v,
                               const std::vector<float>& context_k,
                               const std::vector<float>& context_v, int tokens, int context_length,
-                              int valid_columns, int padded_context, std::vector<double>& out) {
-    out.assign(static_cast<std::size_t>(kD) * kQHeads * tokens, 0.0);
+                              int valid_columns, int padded_context, std::vector<double>& out,
+                              ops::AttentionHeadGeometry geometry = kGeometry) {
+    out.assign(static_cast<std::size_t>(kD) * geometry.query_heads * tokens, 0.0);
     const int key_count = context_length + valid_columns;
     naive_dense_softmax_attention(
-        kGeometry, valid_columns, key_count, static_cast<double>(kScale),
-        [&](int d, int head, int token) { return static_cast<double>(q[q_index(d, head, token)]); },
+        geometry, valid_columns, key_count, static_cast<double>(kScale),
+        [&](int d, int head, int token) {
+            return static_cast<double>(q[q_index(d, head, token, geometry.query_heads)]);
+        },
         [&](int d, int head, int key) {
             return key < context_length
                        ? static_cast<double>(context_k[context_index(d, head, key, padded_context)])
@@ -174,7 +185,9 @@ void context_attention_oracle(const std::vector<float>& q, const std::vector<flo
                              query_v[query_kv_index(d, head, key - context_length)]);
         },
         [](int, int) { return true; },
-        [&](int d, int head, int token, double value) { out[q_index(d, head, token)] = value; });
+        [&](int d, int head, int token, double value) {
+            out[q_index(d, head, token, geometry.query_heads)] = value;
+        });
 }
 
 KVPageGeometry context_geometry() {
@@ -214,13 +227,14 @@ enum class InputProfile {
 };
 
 int run_case(int tokens, int context_length, ContextBucket bucket, InputProfile profile,
-             MappingPattern mapping_pattern, int valid_columns, int table_pages) {
+             MappingPattern mapping_pattern, int valid_columns, int table_pages,
+             ops::AttentionHeadGeometry geometry, bool unaligned = false) {
     if (valid_columns < 0) valid_columns = tokens;
     const int populated_pages        = (context_length + kPage - 1) / kPage;
     const int logical_pages          = std::max({populated_pages, table_pages, 1});
     const int logical_stride         = std::max(populated_pages, 1) * kPage;
     const int physical_pages         = 2 * populated_pages + 1;
-    const std::size_t q_count        = static_cast<std::size_t>(kD) * kQHeads * tokens;
+    const std::size_t q_count        = static_cast<std::size_t>(kD) * geometry.query_heads * tokens;
     const std::size_t query_kv_count = static_cast<std::size_t>(kD) * kKVHeads * tokens;
     const std::size_t logical_context_count =
         static_cast<std::size_t>(kD) * logical_stride * kKVHeads;
@@ -256,7 +270,7 @@ int run_case(int tokens, int context_length, ContextBucket bucket, InputProfile 
 
     std::vector<double> reference;
     context_attention_oracle(q, query_k, query_v, context_k, context_v, tokens, context_length,
-                             valid_columns, logical_stride, reference);
+                             valid_columns, logical_stride, reference, geometry);
 
     auto mapping = page_mapping(populated_pages, mapping_pattern);
     mapping.resize(logical_pages, -1);
@@ -266,15 +280,27 @@ int run_case(int tokens, int context_length, ContextBucket bucket, InputProfile 
     const std::vector<float> physical_v = scatter_context(context_v, logical_stride, scattered_rows,
                                                           physical_pages, mapping, 7001u + seed);
 
-    const auto q_expected         = bf16_bits(q);
-    const auto query_k_expected   = bf16_bits(query_k);
-    const auto query_v_expected   = bf16_bits(query_v);
+    auto q_expected               = bf16_bits(q);
+    auto query_k_expected         = bf16_bits(query_k);
+    auto query_v_expected         = bf16_bits(query_v);
     const auto context_k_expected = bf16_bits(physical_k);
     const auto context_v_expected = fp16_bits(physical_v);
-    const std::vector<int> length_expected{context_length};
+    const std::vector<int> length_expected{valid_columns == 0 ? -1 : context_length};
     const std::vector<int> valid_expected{valid_columns};
-    const std::vector<int> table_row_expected{0};
+    const std::vector<int> table_row_expected{valid_columns == 0 ? -1 : 0};
+    std::fill(q_expected.begin() + std::size_t(valid_columns) * kD * geometry.query_heads,
+              q_expected.end(), 0x7fc1);
+    std::fill(query_k_expected.begin() + std::size_t(valid_columns) * kD * kKVHeads,
+              query_k_expected.end(), 0x7fc1);
+    std::fill(query_v_expected.begin() + std::size_t(valid_columns) * kD * kKVHeads,
+              query_v_expected.end(), 0x7fc1);
 
+    const std::size_t padding = unaligned ? sizeof(std::uint16_t) : 0;
+    if (unaligned) {
+        q_expected.insert(q_expected.begin(), 0x7f7f);
+        query_k_expected.insert(query_k_expected.begin(), 0x7f7f);
+        query_v_expected.insert(query_v_expected.begin(), 0x7f7f);
+    }
     DeviceBuffer d_q       = to_device(q_expected);
     DeviceBuffer d_query_k = to_device(query_k_expected);
     DeviceBuffer d_query_v = to_device(query_v_expected);
@@ -287,25 +313,29 @@ int run_case(int tokens, int context_length, ContextBucket bucket, InputProfile 
     DeviceBuffer d_length    = to_device_i32(length_expected);
     DeviceBuffer d_valid     = to_device_i32(valid_expected);
     DeviceBuffer d_table_row = to_device_i32(table_row_expected);
-    GuardedDeviceBuffer d_out(q_count * sizeof(std::uint16_t));
+    GuardedDeviceBuffer d_out(q_count * sizeof(std::uint16_t) + padding);
     d_out.fill(0x7f);
 
-    Tensor q_tensor(d_q.span(), DType::BF16, {kD, kQHeads, tokens, 1});
-    Tensor query_k_tensor(d_query_k.span(), DType::BF16, {kD, kKVHeads, tokens, 1});
-    Tensor query_v_tensor(d_query_v.span(), DType::BF16, {kD, kKVHeads, tokens, 1});
+    Tensor q_tensor(d_q.span().subspan(padding), DType::BF16,
+                    {kD, geometry.query_heads, tokens, 1});
+    Tensor query_k_tensor(d_query_k.span().subspan(padding), DType::BF16,
+                          {kD, kKVHeads, tokens, 1});
+    Tensor query_v_tensor(d_query_v.span().subspan(padding), DType::BF16,
+                          {kD, kKVHeads, tokens, 1});
     Tensor length_tensor(d_length.span(), DType::I32, {1});
     Tensor valid_tensor(d_valid.span(), DType::I32, {1});
     Tensor table_row_tensor(d_table_row.span(), DType::I32, {1});
-    Tensor out_tensor(d_out.span(), DType::BF16, {kD, kQHeads, tokens, 1});
+    Tensor out_tensor(d_out.span().subspan(padding), DType::BF16,
+                      {kD, geometry.query_heads, tokens, 1});
     PagedKVBatchLayerView context     = make_context_view(packed, d_table, logical_pages);
     const std::size_t workspace_bytes = ops::context_softmax_attention_workspace_capacity_bytes(
-        kGeometry, bucket, 1, tokens, tokens);
+        geometry, bucket, 1, tokens, tokens);
     ninfer::DeviceBuffer workspace_storage(ninfer::test::cuda_environment().context.device(),
                                            std::max<std::size_t>(workspace_bytes, 1));
     MemoryArena workspace(workspace_storage.span());
 
     ops::context_softmax_attention(q_tensor, query_k_tensor, query_v_tensor, length_tensor,
-                                   valid_tensor, table_row_tensor, kGeometry, kScale, context,
+                                   valid_tensor, table_row_tensor, geometry, kScale, context,
                                    bucket, workspace, out_tensor,
                                    ninfer::test::cuda_environment().default_execution);
     cuda_synchronize();
@@ -320,19 +350,31 @@ int run_case(int tokens, int context_length, ContextBucket bucket, InputProfile 
 
     int failures =
         valid_columns == 0
-            ? verify_exact(label.c_str(), from_device<std::uint16_t>(d_out.data(), q_count),
+            ? verify_exact(label.c_str(), from_device<std::uint16_t>(out_tensor.data, q_count),
                            std::vector<std::uint16_t>(q_count, 0))
-            : verify_reduction(label.c_str(), from_device_bf16(d_out.data(), q_count), reference,
+            : verify_reduction(label.c_str(), from_device_bf16(out_tensor.data, q_count), reference,
                                kContextQueryBf16Criterion);
+    if (valid_columns > 0 && valid_columns < tokens) {
+        const auto bits          = from_device<std::uint16_t>(out_tensor.data, q_count);
+        const auto live_elements = std::size_t(valid_columns) * kD * geometry.query_heads;
+        failures +=
+            verify_exact("context attention inert tail",
+                         std::vector<std::uint16_t>(bits.begin() + live_elements, bits.end()),
+                         std::vector<std::uint16_t>(q_count - live_elements, 0));
+    }
+    if (unaligned)
+        failures += verify_exact("context attention leading output padding",
+                                 from_device<std::uint16_t>(d_out.data(), 1),
+                                 std::vector<std::uint16_t>{0x7f7f});
     failures += d_out.verify_guards((label + " output guards").c_str());
     failures += verify_exact((label + " q unchanged").c_str(),
-                             from_device<std::uint16_t>(d_q, q_count), q_expected);
-    failures +=
-        verify_exact((label + " query k unchanged").c_str(),
-                     from_device<std::uint16_t>(d_query_k, query_kv_count), query_k_expected);
-    failures +=
-        verify_exact((label + " query v unchanged").c_str(),
-                     from_device<std::uint16_t>(d_query_v, query_kv_count), query_v_expected);
+                             from_device<std::uint16_t>(d_q, q_expected.size()), q_expected);
+    failures += verify_exact((label + " query k unchanged").c_str(),
+                             from_device<std::uint16_t>(d_query_k, query_k_expected.size()),
+                             query_k_expected);
+    failures += verify_exact((label + " query v unchanged").c_str(),
+                             from_device<std::uint16_t>(d_query_v, query_v_expected.size()),
+                             query_v_expected);
     failures += verify_exact((label + " context k unchanged").c_str(),
                              download_context(packed, 0, physical_pages), context_k_expected);
     failures += verify_exact((label + " context v unchanged").c_str(),
@@ -353,14 +395,13 @@ int run_case(int tokens, int context_length, ContextBucket bucket, InputProfile 
     return failures;
 }
 
-int graph_mapping_replay_case() {
-    constexpr int tokens            = 1;
+int graph_mapping_replay_case(int tokens, ops::AttentionHeadGeometry geometry) {
     constexpr int context_length    = 65;
     constexpr int logical_pages     = 2;
     constexpr int logical_capacity  = logical_pages * kPage;
     constexpr int physical_pages    = 6;
     constexpr int logical_stride    = 128;
-    const std::size_t q_count       = static_cast<std::size_t>(kD) * kQHeads * tokens;
+    const std::size_t q_count       = static_cast<std::size_t>(kD) * geometry.query_heads * tokens;
     const std::size_t query_count   = static_cast<std::size_t>(kD) * kKVHeads * tokens;
     const std::size_t context_count = static_cast<std::size_t>(kD) * logical_stride * kKVHeads;
     const std::size_t physical_count =
@@ -399,7 +440,7 @@ int graph_mapping_replay_case() {
 
     std::vector<double> reference;
     context_attention_oracle(q, query_k, query_v, context_k, context_v, tokens, context_length,
-                             tokens, logical_stride, reference);
+                             tokens, logical_stride, reference, geometry);
 
     DeviceBuffer d_q       = to_device(bf16_bits(q));
     DeviceBuffer d_query_k = to_device(bf16_bits(query_k));
@@ -413,39 +454,44 @@ int graph_mapping_replay_case() {
     DeviceBuffer d_valid     = to_device_i32({tokens});
     DeviceBuffer d_table_row = to_device_i32({0});
     GuardedDeviceBuffer d_out(q_count * sizeof(std::uint16_t));
-    Tensor q_tensor(d_q.span(), DType::BF16, {kD, kQHeads, tokens, 1});
+    Tensor q_tensor(d_q.span(), DType::BF16, {kD, geometry.query_heads, tokens, 1});
     Tensor query_k_tensor(d_query_k.span(), DType::BF16, {kD, kKVHeads, tokens, 1});
     Tensor query_v_tensor(d_query_v.span(), DType::BF16, {kD, kKVHeads, tokens, 1});
     Tensor length_tensor(d_length.span(), DType::I32, {1});
     Tensor valid_tensor(d_valid.span(), DType::I32, {1});
     Tensor table_row_tensor(d_table_row.span(), DType::I32, {1});
-    Tensor out_tensor(d_out.span(), DType::BF16, {kD, kQHeads, tokens, 1});
+    Tensor out_tensor(d_out.span(), DType::BF16, {kD, geometry.query_heads, tokens, 1});
     PagedKVBatchLayerView context = make_context_view(packed, d_table, logical_pages);
-    constexpr auto bucket         = ContextBucket::K2;
-    ninfer::DeviceBuffer workspace_storage(ninfer::test::cuda_environment().context.device(),
-                                           ops::context_softmax_attention_workspace_capacity_bytes(
-                                               kGeometry, bucket, 1, tokens, tokens));
+    const auto buckets            = ContextBucketRange{ContextBucket::K2, ContextBucket::K32};
+    auto& device                  = cuda_environment().context;
+    const auto execution          = device.execution_view();
+    const auto stream             = execution.stream();
+    DeviceBuffer workspace_storage(device.device(),
+                                   ops::context_softmax_attention_workspace_capacity_bytes(
+                                       geometry, buckets, 1, tokens, tokens));
     MemoryArena workspace(workspace_storage.span());
+    const auto launch = [&](ContextBucket bucket) {
+        ops::context_softmax_attention(q_tensor, query_k_tensor, query_v_tensor, length_tensor,
+                                       valid_tensor, table_row_tensor, geometry, kScale, context,
+                                       bucket, workspace, out_tensor, execution);
+    };
 
-    cudaStream_t stream        = nullptr;
-    cudaGraph_t graph          = nullptr;
-    cudaGraphExec_t executable = nullptr;
-    cuda_check(cudaStreamCreate(&stream), "create context-attention stream");
-    const auto stream_execution = ninfer::test::cuda_environment().context.execution_view(stream);
-    cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal),
-               "begin context-attention capture");
-    ops::context_softmax_attention(q_tensor, query_k_tensor, query_v_tensor, length_tensor,
-                                   valid_tensor, table_row_tensor, kGeometry, kScale, context,
-                                   bucket, workspace, out_tensor, stream_execution);
-    cuda_check(cudaStreamEndCapture(stream, &graph), "end context-attention capture");
-    cuda_check(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0),
-               "instantiate context-attention graph");
-
+    DecodeGraphDefinition definition;
+    DecodeGraphKernelSlice slice;
+    definition.capture(stream, [&] { slice.capture(stream, [&] { launch(ContextBucket::K2); }); });
+    DecodeGraphExecutable executable;
+    executable.instantiate(definition);
+    constexpr std::array replay_buckets{ContextBucket::K2, ContextBucket::K32, ContextBucket::K8};
+    static_assert(replay_buckets.size() == replay_mappings.size());
     int failures = 0;
-    for (const auto& replay_mapping : replay_mappings) {
+    for (std::size_t replay = 0; replay < replay_mappings.size(); ++replay) {
+        const auto& replay_mapping = replay_mappings[replay];
         const auto offsets = packed.table_offsets(replay_mapping);
         d_table.copy_from_host(offsets.data(), offsets.size() * sizeof(std::int64_t));
-        cuda_check(cudaGraphLaunch(executable, stream), "launch context-attention graph");
+        DecodeGraphKernelPatch patch;
+        patch.capture(stream, [&] { launch(replay_buckets[replay]); });
+        executable.update_slice(slice, patch);
+        executable.launch(stream);
         cuda_synchronize(stream);
         const std::vector<std::int32_t> mapping(replay_mapping.begin(), replay_mapping.end());
         const std::string label =
@@ -458,20 +504,18 @@ int graph_mapping_replay_case() {
                                  packed.table_offsets(mapping));
     }
 
-    cudaGraphExecDestroy(executable);
-    cudaGraphDestroy(graph);
-    cudaStreamDestroy(stream);
     failures += d_out.verify_guards("context-attention graph output guards");
     return failures;
 }
 
-int batch_table_case(int batch, bool empty = false, bool direct_graph = false) {
+int batch_table_case(int batch, bool empty = false, bool direct_graph = false,
+                     ops::AttentionHeadGeometry geometry = kGeometry) {
     constexpr int tokens            = 2;
     constexpr int cache_rows        = 2;
     constexpr int logical_pages     = 2;
     constexpr int logical_capacity  = logical_pages * kPage;
     constexpr int physical_pages    = 6;
-    const std::size_t row_q_count   = static_cast<std::size_t>(kD) * kQHeads * tokens;
+    const std::size_t row_q_count   = static_cast<std::size_t>(kD) * geometry.query_heads * tokens;
     const std::size_t row_kv_count  = static_cast<std::size_t>(kD) * kKVHeads * tokens;
     const std::size_t logical_count = static_cast<std::size_t>(kD) * logical_capacity * kKVHeads;
     const std::size_t physical_count =
@@ -499,7 +543,18 @@ int batch_table_case(int batch, bool empty = false, bool direct_graph = false) {
     round_to_bf16(physical_k);
     round_to_bf16(physical_v);
 
-    const std::vector<std::int32_t> block_tables{0, 2, 5, 3};
+    const bool shared_prefix = geometry.query_heads == kGroup3.query_heads;
+    // Distinct logical rows share their first physical page and diverge on the second.
+    if (shared_prefix) {
+        for (int head = 0; head < kKVHeads; ++head) {
+            const auto first = context_index(0, head, 0, logical_capacity);
+            std::copy_n(logical_k.begin() + first, kPage * kD,
+                        logical_k.begin() + logical_count + first);
+            std::copy_n(logical_v.begin() + first, kPage * kD,
+                        logical_v.begin() + logical_count + first);
+        }
+    }
+    const std::vector<std::int32_t> block_tables{shared_prefix ? 5 : 0, 2, 5, 3};
     for (int row = 0; row < cache_rows; ++row) {
         const std::vector<float> row_k(
             logical_k.begin() + static_cast<std::ptrdiff_t>(row * logical_count),
@@ -536,13 +591,13 @@ int batch_table_case(int batch, bool empty = false, bool direct_graph = false) {
     GuardedDeviceBuffer d_out(row_q_count * batch * sizeof(std::uint16_t));
     d_out.fill(0x7f);
 
-    Tensor q_tensor(d_q.span(), DType::BF16, {kD, kQHeads, tokens, batch});
+    Tensor q_tensor(d_q.span(), DType::BF16, {kD, geometry.query_heads, tokens, batch});
     Tensor query_k_tensor(d_query_k.span(), DType::BF16, {kD, kKVHeads, tokens, batch});
     Tensor query_v_tensor(d_query_v.span(), DType::BF16, {kD, kKVHeads, tokens, batch});
     Tensor length_tensor(d_lengths.span(), DType::I32, {batch});
     Tensor valid_tensor(d_valid.span(), DType::I32, {batch});
     Tensor table_row_tensor(d_table_rows.span(), DType::I32, {batch});
-    Tensor out_tensor(d_out.span(), DType::BF16, {kD, kQHeads, tokens, batch});
+    Tensor out_tensor(d_out.span(), DType::BF16, {kD, geometry.query_heads, tokens, batch});
     auto context          = make_context_view(packed, d_tables, logical_pages, cache_rows);
     constexpr auto bucket = ContextBucket::K2;
 
@@ -565,20 +620,20 @@ int batch_table_case(int batch, bool empty = false, bool direct_graph = false) {
         std::vector<double> row_expected;
         context_attention_oracle(row_q, row_query_k, row_query_v, row_context_k, row_context_v,
                                  tokens, lengths[static_cast<std::size_t>(b)],
-                                 valid[static_cast<std::size_t>(b)], logical_capacity,
-                                 row_expected);
+                                 valid[static_cast<std::size_t>(b)], logical_capacity, row_expected,
+                                 geometry);
         std::copy(row_expected.begin(), row_expected.end(),
                   expected.begin() + static_cast<std::ptrdiff_t>(b * row_q_count));
     }
 
     auto& device     = cuda_environment().context;
     const auto bytes = ops::context_softmax_attention_workspace_capacity_bytes(
-        kGeometry, bucket, batch, tokens, tokens);
+        geometry, bucket, batch, tokens, tokens);
     DeviceBuffer workspace_storage(device.device(), std::max<std::size_t>(bytes, 1));
     MemoryArena workspace(workspace_storage.span());
     const auto launch = [&](CudaExecutionView cuda) {
         ops::context_softmax_attention(q_tensor, query_k_tensor, query_v_tensor, length_tensor,
-                                       valid_tensor, table_row_tensor, kGeometry, kScale, context,
+                                       valid_tensor, table_row_tensor, geometry, kScale, context,
                                        bucket, workspace, out_tensor, cuda);
     };
     if (direct_graph) {
@@ -603,10 +658,10 @@ int batch_table_case(int batch, bool empty = false, bool direct_graph = false) {
     return failures;
 }
 
-int graph_bucket_case(int tokens) {
-    constexpr int batch = 4, longest = 140000, physical_pages = 2;
+int graph_bucket_case(int tokens, ops::AttentionHeadGeometry geometry = kGeometry) {
+    constexpr int batch = 4, longest = 1048576, physical_pages = 2;
     constexpr int logical_pages = (longest + kPage - 1) / kPage;
-    const std::size_t q_count   = std::size_t(kD) * kQHeads * tokens;
+    const std::size_t q_count   = std::size_t(kD) * geometry.query_heads * tokens;
     const std::size_t kv_count  = std::size_t(kD) * kKVHeads * tokens;
     const auto component        = [](int head, int d) {
         return (head % 2 == 0 ? 1.F : -1.F) * (d % 2 == 0 ? 1.F : 0.5F);
@@ -632,7 +687,10 @@ int graph_bucket_case(int tokens) {
     std::vector<std::int32_t> mapping(logical_pages * batch);
     for (int row = 0; row < batch; ++row)
         for (int page = 0; page < logical_pages; ++page)
-            mapping[row * logical_pages + page] = (row + page) % physical_pages;
+            mapping[row * logical_pages + page] =
+                geometry.query_heads == kGroup3.query_heads && page == 0
+                    ? 1
+                    : (row + page) % physical_pages;
 
     auto& device    = cuda_environment().context;
     const auto cuda = device.execution_view();
@@ -647,34 +705,33 @@ int graph_bucket_case(int tokens) {
     auto d_valid   = to_device_i32({0, 0, 0, 0});
     auto d_rows    = to_device_i32({-1, -1, -1, -1});
     GuardedDeviceBuffer out(q_count * batch * sizeof(std::uint16_t));
-    Tensor tq(d_q.span(), DType::BF16, {kD, kQHeads, tokens, batch});
+    Tensor tq(d_q.span(), DType::BF16, {kD, geometry.query_heads, tokens, batch});
     Tensor tk(d_query_k.span(), DType::BF16, {kD, kKVHeads, tokens, batch});
     Tensor tv(d_query_v.span(), DType::BF16, {kD, kKVHeads, tokens, batch});
     Tensor lengths(d_lengths.span(), DType::I32, {batch});
     Tensor valid(d_valid.span(), DType::I32, {batch});
     Tensor rows(d_rows.span(), DType::I32, {batch});
-    Tensor to(out.span(), DType::BF16, {kD, kQHeads, tokens, batch});
+    Tensor to(out.span(), DType::BF16, {kD, geometry.query_heads, tokens, batch});
     const auto context = make_context_view(packed, d_table, logical_pages, batch);
     const auto bytes   = ops::context_softmax_attention_workspace_capacity_bytes(
-        kGeometry, kBuckets, batch, tokens, tokens);
+        geometry, kBuckets, batch, tokens, tokens);
     GuardedDeviceBuffer scratch(bytes);
     MemoryArena workspace(scratch.span());
     const auto launch = [&](ContextBucket bucket, CudaExecutionView execution) {
-        ops::context_softmax_attention(tq, tk, tv, lengths, valid, rows, kGeometry, kScale, context,
+        ops::context_softmax_attention(tq, tk, tv, lengths, valid, rows, geometry, kScale, context,
                                        bucket, workspace, to, execution);
     };
 
-    for (auto unsupported :
-         {ContextBucket::K512, ContextBucket::M1, static_cast<ContextBucket>(255)}) {
+    {
         try {
-            launch(unsupported, cuda);
+            launch(static_cast<ContextBucket>(255), cuda);
             cuda_synchronize(cuda.stream());
             std::cerr << "context attention accepted an unsupported execution bucket\n";
             return 1;
         } catch (const std::invalid_argument&) {}
     }
     const auto profile = [&](ContextBucket bucket) {
-        return ops::context_softmax_attention_graph_profile(kGeometry, bucket, batch, tokens);
+        return ops::context_softmax_attention_graph_profile(geometry, bucket, batch, tokens);
     };
     const auto base_profile = profile(ContextBucket::K2);
     std::vector<CapturedKernelSequence> captures;
@@ -683,15 +740,25 @@ int graph_bucket_case(int tokens) {
         captures.emplace_back(cuda, [&](auto execution) { launch(bucket, execution); });
         const bool base =
             bucket <= ContextBucket::K64 || (bucket == ContextBucket::K128 && tokens <= 8);
-        if (captures.back().params().size() != 2 || (profile(bucket) == base_profile) != base ||
-            (base && !same_kernel_launches(captures.front(), captures.back()))) {
+        if (captures.back().params().size() != 2 ||
+            (geometry.query_heads == kGeometry.query_heads &&
+             (profile(bucket) == base_profile) != base)) {
             std::cerr << "context attention T=" << tokens
                       << " bucket=" << ops::context_bucket_name(bucket)
                       << ": unexpected graph profile or captured launch\n";
             ++failures;
         }
+        for (std::size_t index = 0; index < captures.size(); ++index) {
+            const auto previous = ops::kAllContextBuckets[index];
+            if (profile(previous) == profile(bucket) &&
+                !same_kernel_launches(captures[index], captures.back())) {
+                std::cerr << "equal context graph profiles produced different launches\n";
+                ++failures;
+            }
+        }
     });
-    if (failures || profile(ContextBucket::K128) == profile(ContextBucket::K256))
+    if (failures || (geometry.query_heads == kGeometry.query_heads &&
+                     profile(ContextBucket::K128) == profile(ContextBucket::K256)))
         return failures + 1;
 
     struct Step {
@@ -704,7 +771,9 @@ int graph_bucket_case(int tokens) {
         Step{ContextBucket::K8, {128, 4096, 0, -1}},
         Step{ContextBucket::K64, {0, 128, 4096, -1}},
         Step{ContextBucket::K128, {4096, 128, 0, -1}},
-        Step{ContextBucket::K256, {0, 128, 4096, longest}},
+        Step{ContextBucket::K256, {0, 128, 4096, 262144}},
+        Step{ContextBucket::K512, {0, 128, 65, 524288}},
+        Step{ContextBucket::M1, {63, 64, 32768, longest}},
         Step{ContextBucket::K2, {128, 0, 96, -1}},
     };
     FlatGraphPatchHarness patched(captures.front()), updated(captures.front());
@@ -716,7 +785,7 @@ int graph_bucket_case(int tokens) {
         d_rows.copy_from_host(selectors.data(), sizeof(selectors));
 
         // With zero logits the independent softmax is the mean over all logical keys. Repeated
-        // page mappings keep the 140k history compact, and both updates must round to these bits.
+        // page mappings keep the 1M history compact, and both updates must round to these bits.
         std::vector<std::uint16_t> expected(q_count * batch);
         for (int b = 0; b < batch; ++b) {
             if (live[b] == 0) continue;
@@ -727,10 +796,11 @@ int graph_bucket_case(int tokens) {
             }
             const double mean = sum / (history[b] + live[b]);
             for (int t = 0; t < live[b]; ++t)
-                for (int h = 0; h < kQHeads; ++h)
+                for (int h = 0; h < geometry.query_heads; ++h)
                     for (int d = 0; d < kD; ++d)
-                        expected[b * q_count + q_index(d, h, t)] =
-                            f32_to_bf16(static_cast<float>(mean * component(h / 4, d)));
+                        expected[b * q_count + q_index(d, h, t, geometry.query_heads)] =
+                            f32_to_bf16(static_cast<float>(
+                                mean * component(h / (geometry.query_heads / kKVHeads), d)));
         }
         const auto label = "context attention T=" + std::to_string(tokens) +
                            " bucket=" + std::string(ops::context_bucket_name(bucket));
@@ -792,8 +862,8 @@ void add_context_attention_cases(ninfer::test::OpSuite& suite) {
                 (void)ops::context_softmax_attention_workspace_capacity_bytes(
                     kGeometry, {ContextBucket::K8, ContextBucket::K2}, 1, 1, 16);
             });
-            for (auto bucket :
-                 {ContextBucket::K512, ContextBucket::M1, static_cast<ContextBucket>(255)}) {
+            {
+                const auto bucket = static_cast<ContextBucket>(255);
                 reject([&] {
                     (void)ops::context_softmax_attention_workspace_capacity_bytes(
                         kGeometry, {ContextBucket::K2, bucket}, 1, 1, 16);
@@ -802,21 +872,37 @@ void add_context_attention_cases(ninfer::test::OpSuite& suite) {
                     (void)ops::context_softmax_attention_graph_profile(kGeometry, bucket, 1, 8);
                 });
             }
+            for (int batch : {1, 4, 8, 128}) {
+                std::size_t peak = 0;
+                kBuckets.for_each([&](auto bucket) {
+                    for (int tokens = 1; tokens <= 16; ++tokens)
+                        peak =
+                            std::max(peak, ops::context_softmax_attention_workspace_capacity_bytes(
+                                               kGroup3, bucket, batch, tokens, tokens));
+                });
+                failures += peak != ops::context_softmax_attention_workspace_capacity_bytes(
+                                        kGroup3, kBuckets, batch, 1, 16);
+            }
             return failures;
         },
         {{"format", "bf16"}});
     const auto add = [&](int tokens, int length, ContextBucket bucket = ContextBucket::K2,
                          MappingPattern mapping = MappingPattern::Identity, int valid = -1,
-                         int table_pages = 0, InputProfile input = InputProfile::Random) {
-        const auto id = "context_attention/t" + std::to_string(tokens) + "/l" +
-                        std::to_string(length) + "/bucket" +
-                        std::string(ops::context_bucket_name(bucket)) + "/valid" +
+                         int table_pages = 0, InputProfile input = InputProfile::Random,
+                         ops::AttentionHeadGeometry geometry = kGeometry) {
+        const std::string prefix = geometry.query_heads == kGroup3.query_heads
+                                       ? "context_attention/q24/"
+                                       : "context_attention/";
+        const auto id = prefix + "t" + std::to_string(tokens) + "/l" + std::to_string(length) +
+                        "/bucket" + std::string(ops::context_bucket_name(bucket)) + "/valid" +
                         std::to_string(valid) + "/mapping" + std::to_string(int(mapping)) +
                         "/input" + std::to_string(int(input));
-        suite.add(
-            id,
-            [=] { return run_case(tokens, length, bucket, input, mapping, valid, table_pages); },
-            {{"format", "bf16"}, {"execution", "eager"}});
+        suite.add(id,
+                  [=] {
+                      return run_case(tokens, length, bucket, input, mapping, valid, table_pages,
+                                      geometry);
+                  },
+                  {{"format", "bf16"}, {"execution", "eager"}});
     };
     add(1, 0);
     add(2, 1);
@@ -831,7 +917,34 @@ void add_context_attention_cases(ninfer::test::OpSuite& suite) {
     add(4, 0, ContextBucket::K2, MappingPattern::Identity, 4, 2, InputProfile::QueryVisibility);
     add(8, 0, ContextBucket::K2, MappingPattern::Identity, 0);
     add(8, 65, ContextBucket::K2, MappingPattern::Fragmented, 0);
-    suite.add("context_attention/graph_mapping", graph_mapping_replay_case,
+    const auto add_group3 = [&](int tokens, int length, int valid = -1) {
+        add(tokens, length, ops::select_context_bucket(length), MappingPattern::Shuffled, valid, 0,
+            InputProfile::Random, kGroup3);
+    };
+    add_group3(1, 0);
+    add_group3(4, 1);
+    add_group3(8, 63, 5);
+    add_group3(16, 64);
+    add_group3(4, 65);
+    add_group3(8, 65, 0);
+    add_group3(16, 2048, 12);
+    add_group3(8, 8192);
+    add_group3(4, 32768);
+    suite.add("context_attention/q24/unaligned_bf16_views",
+              [] {
+                  return run_case(8, 65, ContextBucket::K2, InputProfile::Random,
+                                  MappingPattern::Shuffled, 5, 0, kGroup3, true);
+              },
+              {{"format", "bf16"}});
+    for (int tokens : {8, 16})
+        suite.add("context_attention/q24/cross_bucket/t" + std::to_string(tokens),
+                  [=] { return graph_bucket_case(tokens, kGroup3); },
+                  {{"format", "bf16"}, {"execution", "graph"}});
+    suite.add("context_attention/graph_mapping",
+              [] { return graph_mapping_replay_case(1, kGeometry); },
+              {{"format", "bf16"}, {"execution", "graph"}});
+    suite.add("context_attention/q24/split_graph_mapping",
+              [] { return graph_mapping_replay_case(8, kGroup3); },
               {{"format", "bf16"}, {"execution", "graph"}});
     for (int tokens : {4, 16})
         suite.add("context_attention/cross_bucket/t" + std::to_string(tokens),
@@ -841,9 +954,14 @@ void add_context_attention_cases(ninfer::test::OpSuite& suite) {
         suite.add("context_attention/batch_table/b" + std::to_string(batch),
                   [=] { return batch_table_case(batch); },
                   {{"suite", batch > 8 ? "concurrency" : "context_attention"}, {"format", "bf16"}});
+    suite.add("context_attention/q24/shared_prefix/b5",
+              [] { return batch_table_case(5, false, false, kGroup3); }, {{"format", "bf16"}});
     suite.add("context_attention/batch_table/b129_empty",
               [] { return batch_table_case(129, true); },
               {{"suite", "concurrency"}, {"format", "bf16"}});
+    suite.add("context_attention/q24/b128_direct_graph",
+              [] { return batch_table_case(128, false, true, kGroup3); },
+              {{"suite", "concurrency"}, {"format", "bf16"}, {"execution", "graph"}});
     suite.add("context_attention/batch_table/b256_direct_graph",
               [] { return batch_table_case(256, false, true); },
               {{"suite", "concurrency"}, {"format", "bf16"}, {"execution", "graph"}});

@@ -16,13 +16,13 @@ namespace {
 
 constexpr std::int32_t kMaximumGridRows = 65535;
 constexpr std::int32_t kHeadDim         = 128;
-constexpr std::int32_t kQHeads          = 32;
 constexpr std::int32_t kKVHeads         = 8;
 constexpr float kExpectedScale          = 0.08838834764831844055f;
 
 void require_profile(AttentionHeadGeometry geometry, const char* op) {
     if (!valid_attention_head_geometry(geometry) || geometry.head_dim != kHeadDim ||
-        geometry.query_heads != kQHeads || geometry.kv_heads != kKVHeads) {
+        (geometry.query_heads != 32 && geometry.query_heads != 24) ||
+        geometry.kv_heads != kKVHeads) {
         throw std::invalid_argument(std::string(op) + ": unsupported head geometry");
     }
 }
@@ -58,15 +58,17 @@ struct PartialWorkspace {
 };
 
 template <class Allocator>
-PartialWorkspace allocate_workspace(Allocator& workspace, std::int32_t tokens,
-                                    const detail::ContextAttentionPlan& plan,
+PartialWorkspace allocate_workspace(Allocator& workspace, const detail::ContextAttentionPlan& plan,
                                     std::int32_t batch_size) {
     if (plan.route == detail::ContextAttentionRoute::Direct) return {};
     const int splits = plan.split_capacity;
+    const int heads  = plan.geometry.query_heads;
+    const int tokens = plan.tokens;
     return {
-        workspace.alloc(DType::BF16, {kHeadDim, kQHeads, tokens, splits * batch_size}),
-        workspace.alloc(DType::FP32, {kQHeads, tokens, splits * batch_size}),
-        workspace.alloc(DType::FP32, {kQHeads, tokens, splits * batch_size}),
+        workspace.alloc(heads == 24 ? DType::FP16 : DType::BF16,
+                        {kHeadDim, heads, tokens, splits * batch_size}),
+        workspace.alloc(DType::FP32, {heads, tokens, splits * batch_size}),
+        workspace.alloc(DType::FP32, {heads, tokens, splits * batch_size}),
     };
 }
 
@@ -77,12 +79,13 @@ OpGraphProfile context_softmax_attention_graph_profile(AttentionHeadGeometry geo
                                                        std::int32_t batch_size,
                                                        std::int32_t tokens) {
     require_profile(geometry, "context_softmax_attention graph");
-    const auto plan = detail::select_context_attention_plan(bucket, batch_size, tokens);
+    const auto plan = detail::select_context_attention_plan(geometry, bucket, batch_size, tokens);
     const std::uint64_t words[]{
         std::uint64_t(geometry.head_dim), std::uint64_t(geometry.query_heads),
         std::uint64_t(geometry.kv_heads), std::uint64_t(batch_size),
         std::uint64_t(plan.tokens),       std::uint64_t(plan.route),
-        std::uint64_t(plan.key_block),    std::uint64_t(plan.split_capacity)};
+        std::uint64_t(plan.key_block),    std::uint64_t(plan.split_capacity),
+        std::uint64_t(plan.reduce_warps), std::uint64_t(plan.group3_schedule)};
     return detail::make_op_graph_profile(words);
 }
 
@@ -99,9 +102,10 @@ std::size_t context_softmax_attention_workspace_capacity_bytes(AttentionHeadGeom
     std::size_t maximum = 0;
     buckets.for_each([&](ContextBucket bucket) {
         for (int tokens = min_tokens; tokens <= max_tokens; ++tokens) {
-            const auto plan = detail::select_context_attention_plan(bucket, batch_size, tokens);
+            const auto plan =
+                detail::select_context_attention_plan(geometry, bucket, batch_size, tokens);
             WorkspaceLayoutBuilder layout;
-            (void)allocate_workspace(layout, tokens, plan, std::min(batch_size, kMaximumGridRows));
+            (void)allocate_workspace(layout, plan, std::min(batch_size, kMaximumGridRows));
             maximum = std::max(maximum, layout.peak_bytes(1));
         }
     });
@@ -132,14 +136,14 @@ void context_softmax_attention(const Tensor& q, const Tensor& query_k, const Ten
     }
     const std::int32_t tokens = q.ne[2];
     const std::int32_t batch  = q.ne[3];
-    const auto plan           = detail::select_context_attention_plan(bucket, batch, tokens);
-    common::operand::shape(q, {kHeadDim, kQHeads, tokens, batch}, op, "q");
+    const auto plan = detail::select_context_attention_plan(geometry, bucket, batch, tokens);
+    common::operand::shape(q, {kHeadDim, geometry.query_heads, tokens, batch}, op, "q");
     common::operand::shape(query_k, {kHeadDim, kKVHeads, tokens, batch}, op, "query k");
     common::operand::shape(query_v, {kHeadDim, kKVHeads, tokens, batch}, op, "query v");
     common::operand::shape(context_lengths, {batch, 1, 1, 1}, op, "context lengths");
     common::operand::shape(valid_columns, {batch, 1, 1, 1}, op, "valid columns");
     common::operand::shape(table_rows, {batch, 1, 1, 1}, op, "table rows");
-    common::operand::shape(out, {kHeadDim, kQHeads, tokens, batch}, op, "out");
+    common::operand::shape(out, {kHeadDim, geometry.query_heads, tokens, batch}, op, "out");
     common::operand::contiguous_nonnull(q, op, "q", execution.device());
     common::operand::contiguous_nonnull(query_k, op, "query k", execution.device());
     common::operand::contiguous_nonnull(query_v, op, "query v", execution.device());
@@ -155,7 +159,7 @@ void context_softmax_attention(const Tensor& q, const Tensor& query_k, const Ten
     for (std::int64_t begin = 0; begin < batch; begin += kMaximumGridRows) {
         const int rows = std::min<std::int64_t>(kMaximumGridRows, batch - begin);
         auto scope     = workspace.scope();
-        auto partial   = allocate_workspace(workspace, tokens, plan, rows);
+        auto partial   = allocate_workspace(workspace, plan, rows);
         auto output    = out.slice(3, begin, rows);
         detail::launch_context_attention(
             q.slice(3, begin, rows), query_k.slice(3, begin, rows), query_v.slice(3, begin, rows),

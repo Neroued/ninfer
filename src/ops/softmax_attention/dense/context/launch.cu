@@ -1,6 +1,7 @@
 #include "ops/softmax_attention/dense/context/launch.h"
 
 #include "core/device.h"
+#include "ops/softmax_attention/kernels/context_query/group3_launch.cuh"
 #include "ops/softmax_attention/kernels/context_query/paged.cuh"
 
 #include <algorithm>
@@ -62,6 +63,32 @@ void launch_context_attention(const Tensor& q, const Tensor& query_k, const Tens
     const int max_context =
         static_cast<int>(std::min<std::int64_t>(context_bucket_tokens(kContextAttentionMaxBucket),
                                                 std::int64_t(logical_pages) * kPagedKVPageSize));
+    if (plan.geometry.query_heads == 24) {
+        Group3Arguments args{
+            .q          = static_cast<const __nv_bfloat16*>(q.data),
+            .query_k    = static_cast<const __nv_bfloat16*>(query_k.data),
+            .query_v    = static_cast<const __nv_bfloat16*>(query_v.data),
+            .lengths    = static_cast<const std::int32_t*>(context_lengths.data),
+            .valid      = static_cast<const std::int32_t*>(valid_columns.data),
+            .table_rows = static_cast<const std::int32_t*>(table_rows.data),
+            .key_offsets =
+                static_cast<const std::int64_t*>(context.k_pages.records.page_offsets.data),
+            .context_k     = static_cast<const __nv_bfloat16*>(context.k_pages.data()),
+            .context_v     = static_cast<const __half*>(context.v_pages.data()),
+            .record_extent = logical_pages,
+            .max_context   = max_context,
+            .splits        = plan.split_capacity,
+            .tokens        = plan.tokens,
+            .scale         = scale,
+            .partial       = static_cast<__half*>(partial_acc.data),
+            .maxima        = static_cast<float*>(partial_m.data),
+            .normalizers   = static_cast<float*>(partial_l.data),
+            .output        = static_cast<__nv_bfloat16*>(out.data),
+        };
+        launch_group3<true>(args, q.ne[3], plan.group3_schedule, plan.reduce_warps, stream);
+        return;
+    }
+
     dispatch_tokens(plan.tokens, [&]<int Tokens, int Warps>() {
         if (plan.split_capacity < 1 || plan.split_capacity > kContextQueryMaxSplit) {
             throw std::invalid_argument("context_softmax_attention: inconsistent plan");

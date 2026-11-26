@@ -159,8 +159,8 @@ causal_softmax_attention_graph_profile(AttentionHeadGeometry geometry, KvCacheSt
 /**
  * Non-causal grouped-query attention over persistent context plus one live query block.
  *
- * The registered profile is D=128, Hq=32, Hkv=8 (group 4), scale=1/sqrt(128), T=1..16, and
- * B>0. q/out are contiguous BF16 [128,32,T,B], query_k/query_v are contiguous BF16
+ * The registered profiles are D=128, Hq in {24,32}, Hkv=8, scale=1/sqrt(128), T=1..16, and
+ * B>0. q/out are contiguous BF16 [128,Hq,T,B], query_k/query_v are contiguous BF16
  * [128,8,T,B], and context_lengths, valid_columns, and table_rows are contiguous device I32 [B].
  * The read-only BFloat16 context stores BF16 K and FP16 V fields [128,64,8] within each
  * packed page record. Its I64 [logical_pages,table_rows] table contains arena-relative byte
@@ -173,7 +173,7 @@ causal_softmax_attention_graph_profile(AttentionHeadGeometry geometry, KvCacheSt
  * context and temporary query K/V remain separate physical segments; every input and cache byte is
  * unchanged, and out is the only observable mutation and is completely overwritten.
  *
- * Buckets K2 through K256 are supported. For every live row (V>0), the caller guarantees
+ * Buckets K2 through M1 are supported. For every live row (V>0), the caller guarantees
  * 0 <= L <= min(context_bucket_tokens(bucket), logical_pages * 64) and materialized block table
  * entries for every logical page intersecting [0,L). The bucket determines launch and workspace
  * capacity. The visible keys and numerical semantics follow the device inputs. Fixed geometry

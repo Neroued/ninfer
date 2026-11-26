@@ -178,12 +178,12 @@ void verify_host(const std::filesystem::path& artifact_path) {
                     "dynamic conv proj presence mismatch");
             if (phys.is_swa) {
                 require_contiguous(data,
-                                   {lw.attention.query, lw.attention.relative,
-                                    lw.attention.output_gate, lw.attention.key, lw.attention.value},
+                                   {lw.attention.key, lw.attention.value, lw.attention.query,
+                                    lw.attention.output_gate, lw.attention.relative},
                                    "SWA attention layer " + std::to_string(l));
             } else {
                 require_contiguous(
-                    data, {lw.attention.query, lw.attention.relative, lw.attention.output_gate},
+                    data, {lw.attention.query, lw.attention.output_gate, lw.attention.relative},
                     "Full attention layer " + std::to_string(l));
             }
 
@@ -222,7 +222,7 @@ void verify_host(const std::filesystem::path& artifact_path) {
         // DSpark packing groups & shared bindings
         for (std::uint32_t l = 0; l < cfg.dspark->num_layers; ++l) {
             const auto& dl = w.dspark->layers[l];
-            require_contiguous(data, {dl.query, dl.key, dl.value},
+            require_contiguous(data, {dl.key, dl.value, dl.query},
                                "DSpark QKV layer " + std::to_string(l));
             require_contiguous(data, {dl.context_key, dl.context_value},
                                "DSpark context KV layer " + std::to_string(l));
@@ -326,8 +326,8 @@ int main(int argc, char** argv) {
             if (const char* env = std::getenv("NINFER_INKLING2_ARTIFACT"); env && *env)
                 artifact_path = env;
             else
-                artifact_path = std::filesystem::path(NINFER_SOURCE_DIR) /
-                                ".agent-tmp/inkling2-convert/inkling2_mini_a16.ninfer";
+                artifact_path =
+                    std::filesystem::path(NINFER_SOURCE_DIR) / "out/inkling2_mini.ninfer";
         }
         if (!std::filesystem::exists(artifact_path)) {
             std::cout << "SKIP Inkling2 loading test: artifact not found at " << artifact_path

@@ -85,7 +85,7 @@ create_output_session(const OutputResources& resources, const PreparedOutput& pr
         }
         matcher = compile_inkling_grammar(resources.text.grammars(), resources.framing,
                                           prompt.initial_block, prompt.continuation_content,
-                                          constraint, tool_constraint ? tools : nullptr,
+                                          constraint, tool_constraint ? tools : nullptr, may_think,
                                           thinking.budget.has_value());
     }
 

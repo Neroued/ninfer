@@ -32,7 +32,7 @@ xgrammar::Grammar build_grammar(const text::GrammarCompiler& compiler, const Fra
                                 InitialBlock initial_block,
                                 const std::optional<OutputConstraint>& body,
                                 const std::shared_ptr<const ToolCallOutputContract>& tools,
-                                bool thinking_budget_active) {
+                                bool allow_thinking, bool thinking_budget_active) {
     const std::vector<int32_t> all_framing = {
         framing.message_model,
         framing.content_thinking,
@@ -121,6 +121,10 @@ xgrammar::Grammar build_grammar(const text::GrammarCompiler& compiler, const Fra
     }
 
     const auto think_or_text_between = [&]() {
+        if (!allow_thinking) {
+            return builder.AddRepeatFromExpr("text_star", builder.AddRuleRef(free_text_block), 0,
+                                             -1);
+        }
         const int32_t block = builder.AddRuleWithHint(
             "think_or_text_block",
             builder.AddChoices(
@@ -130,21 +134,25 @@ xgrammar::Grammar build_grammar(const text::GrammarCompiler& compiler, const Fra
 
     const auto build_between_root = [&]() -> int32_t {
         if (body && !has_tools) {
+            if (!allow_thinking) return builder.AddRuleRef(constrained_text_block);
             return builder.AddSequence(
                 {builder.AddRepeatFromExpr("think_star", builder.AddRuleRef(thinking_block), 0, -1),
                  builder.AddRuleRef(constrained_text_block)});
         }
         if (tools_forbid && !body) { return think_or_text_between(); }
         if (tools_require) {
+            if (!allow_thinking) return builder.AddRuleRef(tool_calls_between);
             const int32_t think_prefix = builder.AddRepeatFromExpr(
                 "think_prefix", builder.AddRuleRef(thinking_block), 0, single_think ? 1 : -1);
             return builder.AddSequence({think_prefix, builder.AddRuleRef(tool_calls_between)});
         }
         if (has_tools && body) {
+            const int32_t tail = builder.AddChoices(
+                {builder.AddRuleRef(constrained_text_block), builder.AddRuleRef(tool_calls_between)});
+            if (!allow_thinking) return tail;
             return builder.AddSequence(
                 {builder.AddRepeatFromExpr("think_star", builder.AddRuleRef(thinking_block), 0, -1),
-                 builder.AddChoices({builder.AddRuleRef(constrained_text_block),
-                                     builder.AddRuleRef(tool_calls_between)})});
+                 tail});
         }
         if (has_tools) {
             return builder.AddSequence(
@@ -160,32 +168,39 @@ xgrammar::Grammar build_grammar(const text::GrammarCompiler& compiler, const Fra
             "think_then_m",
             builder.AddSequence({builder.AddRuleRef(thinking_after_m), tok(framing.message_model)}));
         if (body && !has_tools) {
+            if (!allow_thinking) return builder.AddRuleRef(constrained_text_after_m);
             return builder.AddSequence(
                 {builder.AddRepeatFromExpr("think_m_star", builder.AddRuleRef(think_then_m), 0, -1),
                  builder.AddRuleRef(constrained_text_after_m)});
         }
         if (tools_forbid && !body) {
-            return builder.AddSequence(
-                {builder.AddChoices(
-                     {builder.AddRuleRef(thinking_after_m), builder.AddRuleRef(free_text_after_m)}),
-                 think_or_text_between()});
+            const int32_t first = allow_thinking
+                                      ? builder.AddChoices({builder.AddRuleRef(thinking_after_m),
+                                                            builder.AddRuleRef(free_text_after_m)})
+                                      : builder.AddRuleRef(free_text_after_m);
+            return builder.AddSequence({first, think_or_text_between()});
         }
         if (tools_require) {
+            if (!allow_thinking) return builder.AddRuleRef(tool_calls_header);
             const int32_t think_prefix = builder.AddRepeatFromExpr(
                 "think_m_prefix", builder.AddRuleRef(think_then_m), 0, single_think ? 1 : -1);
             return builder.AddSequence({think_prefix, builder.AddRuleRef(tool_calls_header)});
         }
         if (has_tools && body) {
+            const int32_t tail = builder.AddChoices({builder.AddRuleRef(constrained_text_after_m),
+                                                     builder.AddRuleRef(tool_calls_header)});
+            if (!allow_thinking) return tail;
             return builder.AddSequence(
                 {builder.AddRepeatFromExpr("think_m_star", builder.AddRuleRef(think_then_m), 0, -1),
-                 builder.AddChoices({builder.AddRuleRef(constrained_text_after_m),
-                                     builder.AddRuleRef(tool_calls_header)})});
+                 tail});
         }
         if (has_tools) {
+            const int32_t first = allow_thinking
+                                      ? builder.AddChoices({builder.AddRuleRef(thinking_after_m),
+                                                            builder.AddRuleRef(free_text_after_m)})
+                                      : builder.AddRuleRef(free_text_after_m);
             const int32_t non_tool_first = builder.AddSequence(
-                {builder.AddChoices(
-                     {builder.AddRuleRef(thinking_after_m), builder.AddRuleRef(free_text_after_m)}),
-                 think_or_text_between(),
+                {first, think_or_text_between(),
                  builder.AddRepeatFromExpr("opt_tools", builder.AddRuleRef(tool_calls_between), 0,
                                            1)});
             return builder.AddChoices({builder.AddRuleRef(tool_calls_header), non_tool_first});
@@ -238,13 +253,14 @@ compile_inkling_grammar(text::GrammarCompiler& compiler, const FramingTokens& fr
                         InitialBlock initial_block, std::string_view continuation,
                         const std::optional<OutputConstraint>& body,
                         const std::shared_ptr<const ToolCallOutputContract>& tools,
-                        bool thinking_budget_active) {
+                        bool allow_thinking, bool thinking_budget_active) {
     Json identity{
         {"inkling2_grammar", 1},
         {"initial_block", static_cast<int>(initial_block)},
         {"framing",
          {framing.message_model, framing.content_thinking, framing.content_text,
           framing.content_invoke_tool_json, framing.end_message}},
+        {"allow_thinking", allow_thinking},
         {"budget", thinking_budget_active},
     };
     if (body) {
@@ -282,7 +298,7 @@ compile_inkling_grammar(text::GrammarCompiler& compiler, const FramingTokens& fr
         return compiler.compile_model(
             identity.dump(),
             [&] {
-                return build_grammar(compiler, framing, initial_block, body, tools,
+                return build_grammar(compiler, framing, initial_block, body, tools, allow_thinking,
                                      thinking_budget_active);
             },
             /*reasoning_close=*/{}, grammar_continuation);

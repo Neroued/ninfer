@@ -17,6 +17,6 @@ compile_inkling_grammar(text::GrammarCompiler& compiler, const FramingTokens& fr
                         InitialBlock initial_block, std::string_view continuation,
                         const std::optional<OutputConstraint>& body,
                         const std::shared_ptr<const ToolCallOutputContract>& tools,
-                        bool thinking_budget_active);
+                        bool allow_thinking, bool thinking_budget_active);
 
 } // namespace ninfer::models::inkling2

@@ -84,7 +84,6 @@ struct Work {
     bool graph = false, decision = false, delay = false;
     std::int32_t fail_rank = -1;
     std::int32_t only_rank = -1;
-    bool await_cancel      = false;
     ctx::ContextActions actions;
 };
 
@@ -127,11 +126,10 @@ struct Codec {
         if (work.only_rank >= 0) {
             require(work.operation == Operation::State, "partial-owner work must be local");
             const auto owner = static_cast<dist::RankId>(work.only_rank);
-            return {{owner}, owner};
+            return {{owner}, {}, owner};
         }
-        rt::protocol::Scope out{{}, topology.output_rank};
-        for (const auto& rank : topology.ranks) out.owners.push_back(rank.rank);
-        return out;
+        const auto& replica = topology.replica(0);
+        return {replica.ranks, replica.ranks, replica.result_owner};
     }
 
     void encode_work(wire::Encoder& out, const Work& w, dist::RankId rank) const {
@@ -143,7 +141,6 @@ struct Codec {
         out.boolean(w.delay);
         out.i32(w.fail_rank);
         out.i32(w.only_rank);
-        out.boolean(w.await_cancel);
         if (peer_operation(w.operation))
             ctx::encode_actions(out, peer_actions(w.operation, w.count, rank));
     }
@@ -156,8 +153,7 @@ struct Codec {
                   in.boolean(),
                   in.boolean(),
                   in.i32(),
-                  in.i32(),
-                  in.boolean()};
+                  in.i32()};
         if (peer_operation(work.operation)) work.actions = ctx::decode_actions(in);
         return work;
     }
@@ -184,10 +180,12 @@ struct Codec {
     }
 
     Result merge_context_results(const rt::protocol::Scope& scope,
+                                 const dist::ReplicaTopology& replica,
                                  const std::vector<std::optional<Result>>& results) const {
-        const auto expected = results.at(scope.result_owner).value();
-        for (auto rank : scope.owners)
-            require(results.at(rank)->state == expected.state, "rank states disagree");
+        const auto expected = results.at(replica.local_index(scope.result_owner)).value();
+        for (auto rank : scope.participants)
+            require(results.at(replica.local_index(rank))->state == expected.state,
+                    "rank states disagree");
         return expected;
     }
 };
@@ -222,7 +220,6 @@ public:
         f.request     = std::move(request);
         f.command     = f.request.command;
         f.phase       = Phase::Running;
-        f.cancelled   = false;
         const auto& w = f.request.work;
         if (w.fail_rank == static_cast<std::int32_t>(group_.rank()))
             throw std::runtime_error("injected rank execution failure");
@@ -305,29 +302,21 @@ public:
     }
 
     bool can_discard(rt::ExecutionTicket ticket) const {
-        if (ticket.frame.kind == rt::FrameKind::Context)
-            return context_.request.ticket == ticket && context_.phase == Phase::Running;
-        return compute_.request.ticket == ticket &&
+        return ticket.frame.kind == rt::FrameKind::Compute && compute_.request.ticket == ticket &&
                (compute_.phase == Phase::Decision || compute_.phase == Phase::Result);
     }
 
     void discard(rt::ExecutionTicket ticket, rt::CommandSequence command) {
-        auto& f = find(ticket);
-        require(can_discard(ticket), "fixture cancelled an unfinished communication stage");
-        f.command = command;
-        if (ticket.frame.kind == rt::FrameKind::Context) {
-            f.cancelled = true;
-            return;
-        }
-        f.done.record(device_.stream());
-        f.phase = Phase::Retiring;
+        require(can_discard(ticket), "fixture discard requires compute at decision or result");
+        compute_.command = command;
+        compute_.done.record(device_.stream());
+        compute_.phase = Phase::Retiring;
     }
 
     std::optional<rt::ExecutionEvent<Types>> poll() {
         for (auto* f : {&compute_, &context_}) {
             if (f->phase == Phase::Empty || f->phase == Phase::Decision ||
                 f->phase == Phase::Result || !f->done.ready() ||
-                (f->request.work.await_cancel && !f->cancelled) ||
                 std::chrono::steady_clock::now() < f->ready_at)
                 continue;
             if (f->phase == Phase::Retiring) {
@@ -342,10 +331,6 @@ public:
                 migration_.finish();
             } else if (f->request.work.operation != Operation::State)
                 verify(*f);
-            if (f->cancelled) {
-                f->phase = Phase::Retiring;
-                continue;
-            }
             if (f->phase == Phase::Running && f->request.work.decision) {
                 f->phase = Phase::Decision;
                 events_.emplace_back(rt::DecisionNeeded{f->request.ticket, {0, 32, {{0, {}}}}});
@@ -401,8 +386,7 @@ private:
         CommunicationGraphWork communication;
         rt::ExecutionRequest<Types> request;
         rt::CommandSequence command;
-        Phase phase    = Phase::Empty;
-        bool cancelled = false;
+        Phase phase = Phase::Empty;
         std::chrono::steady_clock::time_point ready_at;
         std::size_t input_bytes = 0, output_bytes = 0;
     };
@@ -861,7 +845,7 @@ int worker(dist::CommunicationPolicy policy) {
             Program program(connection);
             connection.send(wire::Kind::Ready);
             rt::WorkerLoop<Types, Program, Codec> loop(connection, program, {});
-            while (loop.advance()) std::this_thread::yield();
+            while (loop.advance()) {}
         }
         // A periodic resource sample may already be in flight when Shutdown reaches a rank.
         RankSnapshot final_sample;
@@ -869,7 +853,8 @@ int worker(dist::CommunicationPolicy policy) {
         final_sample.node = connection.bootstrap().identity.node;
         wire::Encoder sample;
         rt::protocol::encode(sample, final_sample);
-        connection.send(wire::Kind::Observation, std::move(sample).take(), false);
+        (void)connection.try_send_traffic(wire::Kind::Observation, std::move(sample).take(),
+                                          dist::Traffic::Telemetry);
         connection.shutdown();
         return 0;
     } catch (const std::exception& error) {
@@ -883,12 +868,15 @@ using Executor = rt::DistributedExecutor<Types, Codec>;
 void run(Executor& executor, Work work, std::uint64_t& expected_state, bool cancel = false) {
     const auto kind =
         context_operation(work.operation) ? rt::FrameKind::Context : rt::FrameKind::Compute;
-    work.await_cancel = cancel && kind == rt::FrameKind::Context;
-    auto reservation  = executor.try_reserve(kind);
+    auto reservation = executor.try_reserve(kind);
     require(bool(reservation), "execution frame was not retired");
     const auto ticket = executor.submit(std::move(*reservation), work);
     require(!executor.try_reserve(kind), "submitted frame was released before retirement");
-    if (cancel) executor.discard(ticket);
+    if (cancel) {
+        executor.discard(ticket);
+        if (kind == rt::FrameKind::Context)
+            require(!executor.try_reserve(kind), "cancelled Context frame was released early");
+    }
     bool result = false, retired = false;
     const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(30);
     while (!retired) {
@@ -963,16 +951,11 @@ void run_compute_with_context(Executor& executor, std::uint64_t& expected_state)
 int coordinator(int argc, char** argv) {
     require((argc == 3 || argc == 5) && std::string_view(argv[1]) == "--config",
             "usage: ninfer_distributed_execution_test --config FILE");
-    const auto deployment = product::read_deployment_file(argv[2]);
-    dist::ExecutionTopology topology;
-    topology.plan        = 1;
-    topology.output_rank = 0;
-    const auto size      = static_cast<std::uint32_t>(deployment.ranks.size());
+    auto deployment = product::read_deployment_file(argv[2]);
+    const auto size = static_cast<std::uint32_t>(deployment.ranks.size());
     require(size == 2, "this integration fixture requires two workers");
-    topology.ranks.resize(size);
-    for (const auto& r : deployment.ranks)
-        topology.ranks[r.rank] = {r.rank,         r.node,         0,  r.device,
-                                  {r.rank, size}, {r.rank, size}, {}, {}};
+    deployment.parallel = {.tp = size, .ep = size, .dp = 1, .pp = 1, .adp = 1};
+    auto topology       = dist::build_cluster_topology(deployment);
     topology.groups.push_back({0, {0, 1}});
     topology.groups.push_back({1, {0, 1}, dist::GroupUsage::PeerExchange});
     topology.groups.push_back({2, {0, 1}, dist::GroupUsage::PeerExchange});
@@ -1000,7 +983,7 @@ int coordinator(int argc, char** argv) {
                 std::this_thread::yield();
             }
         }
-        return group;
+        return group->take_replica(0);
     };
     Executor executor(prepare(), {1, 1}, {}, 1);
     executor.bind_to_current_thread();

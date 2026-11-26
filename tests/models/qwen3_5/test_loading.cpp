@@ -69,7 +69,45 @@ struct ModelFixture {
         if (!input.empty()) { use(name, input); }
     }
 
-    ModelFixture() {
+    void moe_ffn(const std::string& layer) {
+        constexpr std::uint64_t experts = 4, hidden = 128, intermediate = 64, shared = 24;
+        auto& config            = file.root["components"]["text"]["config"];
+        config["architectures"] = {"Qwen3_5MoeForCausalLM"};
+        config["model_type"]    = "qwen3_5_moe_text";
+        config.erase("intermediate_size");
+        config["num_experts"]                     = experts;
+        config["num_experts_per_tok"]             = 2;
+        config["moe_intermediate_size"]           = intermediate;
+        config["shared_expert_intermediate_size"] = shared;
+
+        const auto prefix = layer + "moe/";
+        const auto input  = layer + "ffn_input";
+        parameter(prefix + "router", {experts, hidden}, input);
+        parameter(prefix + "shared_score", {1, hidden}, input);
+        parameter(prefix + "shared/gate", {shared, hidden}, input);
+        parameter(prefix + "shared/up", {shared, hidden}, input);
+        parameter(prefix + "shared/down", {hidden, shared}, prefix + "shared/product");
+
+        tensor("expert-gate-up", {experts * 2 * intermediate, hidden}, QType::Q4_G64_FP16,
+               QuantLayout::RowSplit);
+        tensor("expert-down", {experts * hidden, intermediate}, QType::Q4_G64_FP16,
+               QuantLayout::RowSplit);
+        const auto bind = [&](const std::string& name, const char* object, std::uint64_t begin,
+                              std::uint64_t size, const std::string& source) {
+            file.root["bindings"][name] = {
+                {"parts", Json::array({{{"object", object}, {"range", {begin, begin + size}}}})}};
+            use(name, source);
+        };
+        constexpr auto elements = hidden * intermediate;
+        for (std::uint64_t e = 0; e < experts; ++e) {
+            const auto expert = prefix + "experts/" + std::to_string(e) + "/";
+            bind(expert + "gate", "expert-gate-up", 2 * e * elements, elements, input);
+            bind(expert + "up", "expert-gate-up", (2 * e + 1) * elements, elements, input);
+            bind(expert + "down", "expert-down", e * elements, elements, expert + "product");
+        }
+    }
+
+    explicit ModelFixture(bool moe = false) {
         file.payload.clear();
         file.root = {{"components",
                       {{"text",
@@ -120,11 +158,15 @@ struct ModelFixture {
         parameter(p + "attention/query_norm", {8});
         parameter(p + "attention/key_norm", {8});
         parameter(p + "attention/output", {128, 16}, p + "attention/gated_output");
-        parameter(p + "mlp/gate", {24, 128}, p + "ffn_input");
-        parameter(p + "mlp/up", {24, 128}, p + "ffn_input");
-        tensor("down-storage", {128, 24}, QType::Q6_G64_FP16, QuantLayout::RowSplit);
-        file.root["bindings"][p + "mlp/down"] = {{"object", "down-storage"}};
-        use(p + "mlp/down", p + "mlp/product");
+        if (moe) {
+            moe_ffn(p);
+        } else {
+            parameter(p + "mlp/gate", {24, 128}, p + "ffn_input");
+            parameter(p + "mlp/up", {24, 128}, p + "ffn_input");
+            tensor("down-storage", {128, 24}, QType::Q6_G64_FP16, QuantLayout::RowSplit);
+            file.root["bindings"][p + "mlp/down"] = {{"object", "down-storage"}};
+            use(p + "mlp/down", p + "mlp/product");
+        }
 
         Json vocab    = Json::object();
         unsigned next = 256;
@@ -389,6 +431,35 @@ void invalid_model_data() {
     bad([](Json& root) { root["components"]["text"]["config"]["vocab_size"] = 264; });
 }
 
+void selected_rank_load() {
+    ModelFixture fixture;
+    fixture.file.write();
+    artifact::Reader reader(fixture.file.entry);
+    const auto definition = q35::read_definition(reader);
+    auto rank             = q35::plan_single_rank(*definition);
+    const auto gpu        = Device::cuda(0);
+    require(q35::resolve_rank_load(reader, definition, rank, gpu)
+                    .materialization()
+                    .device_capacity_bytes > 0,
+            "Qwen3.5 rank plan did not materialize selected weights");
+
+    const auto id       = definition->weights().text.token_embedding;
+    const auto& shape   = definition->parameter(id).shape;
+    const auto elements = weight_element_count(shape);
+    std::erase(rank.whole, id);
+    rank.assemblies.push_back(
+        {shape, {{id, 0, 0, shape[0], shape[1], 0, 0}}, {{id, shape, 0, elements}}});
+    (void)q35::resolve_rank_load(reader, definition, rank, gpu);
+
+    auto& binding = rank.assemblies.front().bindings.front();
+    ++binding.end;
+    rejects([&] { (void)q35::resolve_rank_load(reader, definition, rank, gpu); },
+            "rank assembly accepted a binding beyond its storage");
+    binding.end -= 2;
+    rejects([&] { (void)q35::resolve_rank_load(reader, definition, rank, gpu); },
+            "rank assembly accepted a binding shorter than its logical shape");
+}
+
 void cold_matrix_profile() {
     const auto geometry = weight_geometry(QType::NVFP4, QuantLayout::BatchedBlockScaleK16M128x4,
                                           std::array<std::uint64_t, 3>{2, 256, 128});
@@ -404,6 +475,32 @@ void cold_matrix_profile() {
             "cold matrix profile did not preserve the local NVFP4 matrix layout");
 }
 
+void row_split_moe_rank_load() {
+    ModelFixture fixture(/*moe=*/true);
+    fixture.file.write();
+    const artifact::Reader reader(fixture.file.entry);
+    const auto definition = q35::read_definition(reader);
+    const DeploymentOptions deployment{
+        .control_host = "127.0.0.1",
+        .parallel     = {.dp = 2},
+        .nodes        = {{.worker = "/ninfer-worker", .artifact = fixture.file.entry}},
+        .ranks        = {{0, 0, 0}, {1, 0, 1}}};
+    const auto parallel = q35::plan_parallel(*definition, deployment);
+    require(parallel.ranks.size() == 2, "Qwen3.5-MoE plan did not produce two replicas");
+    for (const auto& replica : deployment.ranks) {
+        const auto result = q35::resolve_rank_load(
+            reader, definition, parallel.ranks.at(replica.rank), Device::cuda(replica.device));
+        const auto banks = result.expert_data();
+        require(result.materialization().device_capacity_bytes > 0 && banks.size() == 1 &&
+                    banks[0].subset == ops::ExpertSubsetKind::All &&
+                    banks[0].gate_up.shape == artifact::Shape{4, 128, 128} &&
+                    banks[0].down.shape == artifact::Shape{4, 128, 64} &&
+                    banks[0].gate_up.layout == QuantLayout::RowSplit &&
+                    banks[0].down.layout == QuantLayout::RowSplit,
+                "Qwen3.5-MoE rank did not plan complete rank-3 RowSplit banks");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -412,6 +509,8 @@ int main() {
         native_uses();
         matrix_calibration();
         cold_matrix_profile();
+        selected_rank_load();
+        row_split_moe_rank_load();
         invalid_model_data();
         std::cout << "model config, binding, resources and Use checks passed\n";
         return 0;

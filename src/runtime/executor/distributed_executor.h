@@ -22,22 +22,32 @@ public:
     using Result = typename Types::Result;
     using Commit = typename Types::Commit;
 
-    DistributedExecutor(std::unique_ptr<distributed::ExecutionGroup> group,
+    DistributedExecutor(std::unique_ptr<distributed::ReplicaGroup> group,
                         ExecutionCapacity capacity, Codec codec, std::uint32_t max_decode_rows,
                         std::vector<RankSnapshot> initial_observations = {})
-        : Executor<Types>(max_decode_rows), group_(std::move(group)), pool_(capacity),
-          codec_(std::move(codec)), budget_(codec_.control_budget()),
+        : Executor<Types>(max_decode_rows), group_(std::move(group)), replica_(group_->replica()),
+          pool_(capacity), codec_(std::move(codec)), budget_(codec_.control_budget()),
           compute_(capacity.compute_frames), context_(capacity.context_frames),
-          progress_(group_->topology().ranks.size()), measurement_reports_(progress_.size()),
-          measurement_errors_(progress_.size()) {
-        this->observations_.resize(progress_.size());
-        if (!initial_observations.empty()) this->observations_ = std::move(initial_observations);
+          progress_(replica_.ranks.size()), measurement_reports_(progress_.size()),
+          measurement_errors_(progress_.size()), peer_commands_(progress_.size(), 0) {
+        const auto local_count = replica_.ranks.size();
+        this->observations_.resize(local_count);
+        if (initial_observations.size() == local_count) {
+            this->observations_ = std::move(initial_observations);
+        } else if (initial_observations.size() == group_->topology().ranks.size()) {
+            for (std::size_t i = 0; i < local_count; ++i)
+                this->observations_[i] = std::move(initial_observations.at(replica_.ranks[i]));
+        } else if (!initial_observations.empty()) {
+            throw std::invalid_argument(
+                "initial observations do not match replica or cluster rank count");
+        }
         const auto model_budget = budget_;
-        for (const auto& rank : group_->topology().ranks) {
-            this->observations_[rank.rank].rank = rank.rank;
-            this->observations_[rank.rank].node = rank.node;
-            const auto& observed                = this->observations_[rank.rank];
-            budget_.report                      = std::max(
+        for (std::size_t i = 0; i < local_count; ++i) {
+            const auto& rank            = group_->topology().rank(replica_.ranks[i]);
+            this->observations_[i].rank = rank.rank;
+            this->observations_[i].node = rank.node;
+            const auto& observed        = this->observations_[i];
+            budget_.report              = std::max(
                 budget_.report,
                 protocol::with_communication_capacity(model_budget, observed.communication).report);
             this->rank_descriptions_.push_back(
@@ -45,18 +55,26 @@ public:
                  observed.physical_memory && observed.physical_memory->shared_physical_memory,
                  rank.tp, rank.ep, rank.dp, rank.pp, rank.adp});
             // Runtime communication counters start at activation, after preparation and capture.
-            for (auto& group : this->observations_[rank.rank].communication)
-                for (auto& backend : group.backends) {
+            for (auto& comm_group : this->observations_[i].communication)
+                for (auto& backend : comm_group.backends) {
                     backend.eager = {};
                     backend.graph = {};
                 }
         }
         group_->reserve_control_capacity(
-            protocol::control_transport_limits(budget_, pool_.capacity(), progress_.size(), true));
+            protocol::control_transport_limits(budget_, pool_.capacity(), local_count, true));
     }
 
     ~DistributedExecutor() override {
         if (!closed_) group_->fail("distributed executor released with live execution");
+    }
+
+    [[nodiscard]] int poll_fd() const noexcept { return group_->poll_fd(); }
+
+    void wait(std::chrono::milliseconds timeout) const { group_->wait(timeout); }
+
+    void wait_for_activity(std::chrono::milliseconds timeout) const override {
+        group_->wait(timeout);
     }
 
     // Coordinator calls are serialized by the Engine. CUDA affinity belongs to remote workers.
@@ -77,20 +95,43 @@ public:
         codec_.validate_work(work, reservation.frame().kind);
         auto scope = codec_.scope(work, group_->topology());
         scope.validate(group_->topology());
+        for (const auto rank : scope.participants) (void)replica_.local_index(rank);
         ExecutionTicket id{epoch(), next_execution_ + 1, reservation.frame()};
         Flight prepared;
         prepared.ticket = id;
         prepared.scope  = std::move(scope);
-        if constexpr (requires { codec_.prepare_inputs(work, group_->topology()); })
-            prepared.inputs = inputs_.begin(codec_.prepare_inputs(work, group_->topology()));
         prepared.work.emplace(std::move(work));
         prepared.phase = Phase::Inputs;
-        prepared.retired.resize(group_->topology().ranks.size());
-        prepared.context_results.resize(group_->topology().ranks.size());
-        prepared.consumed.resize(group_->topology().ranks.size());
-        (void)pool_.accept(std::move(reservation));
+        prepared.retired.resize(replica_.ranks.size());
+        prepared.context_results.resize(replica_.ranks.size());
+        prepared.consumed.resize(replica_.ranks.size());
         prepared.clock.start(Types::describe_work(*prepared.work), observation_time_ns());
-        slot(id.frame) = std::move(prepared);
+
+        // Empty keys mark work that can submit without using the single media transfer slot.
+        if constexpr (requires { codec_.prepare_inputs(*prepared.work, replica_); }) {
+            if (!codec_.has_inputs(*prepared.work)) prepared.inputs.emplace();
+        } else {
+            prepared.inputs.emplace();
+        }
+        const bool prepare_now =
+            !prepared.inputs && !input_owner_ && !inputs_.has_pending_releases() &&
+            (pending_submits_.empty() || slot(pending_submits_.back()).inputs.has_value());
+        pending_submits_.push_back(id.frame);
+        bool accepted = false;
+        try {
+            (void)pool_.accept(std::move(reservation));
+            accepted     = true;
+            auto& flight = slot(id.frame);
+            flight       = std::move(prepared);
+            if (prepare_now) prepare_inputs(flight);
+        } catch (...) {
+            pending_submits_.pop_back();
+            if (accepted) {
+                slot(id.frame) = {};
+                pool_.retire(id.frame);
+            }
+            throw;
+        }
         ++next_execution_;
         try {
             progress_inputs();
@@ -104,17 +145,23 @@ public:
         if (flight.phase != Phase::Decision || !flight.decision ||
             input.stage != flight.decision->stage)
             throw std::logic_error("decision input does not match pending execution");
+        if (flight.scope.decision_owners.empty())
+            throw std::logic_error("decision supply has no decision owners in scope");
         codec_.validate_decision(*flight.work, *flight.decision, input);
-        protocol::Envelope envelope{id, {next_command_ + 1}, group_->topology().plan, flight.scope};
-        auto messages   = encode(envelope, distributed::wire::Kind::Supply,
-                                 [&](auto& out, auto) { protocol::encode(out, input); });
+        protocol::Envelope envelope{
+            id, {next_command_ + 1}, 0, group_->topology().plan, flight.scope};
+        try {
+            (void)send_to_peers(flight.scope.decision_owners, envelope,
+                                distributed::wire::Kind::Supply, distributed::Traffic::Continuation,
+                                [&](auto& out, auto) { protocol::encode(out, input); });
+        } catch (const std::exception& e) {
+            fail(e.what());
+            return;
+        }
         flight.command  = envelope.command;
         flight.phase    = Phase::Running;
         flight.supplied = true;
         ++next_command_;
-        try {
-            send(messages, true);
-        } catch (const std::exception& e) { fail(e.what()); }
     }
 
     [[nodiscard]] CommitReceipt commit(ExecutionTicket id, Commit decisions) override {
@@ -123,13 +170,14 @@ public:
         if (flight.phase != Phase::Result || !flight.result)
             throw std::logic_error("commit has no pending distributed result");
         codec_.validate_commit(*flight.work, *flight.result, decisions);
-        protocol::Envelope envelope{id, {next_command_ + 1}, group_->topology().plan, flight.scope};
-        auto messages =
-            encode(envelope, distributed::wire::Kind::Commit,
-                   [&](auto& out, auto rank) { codec_.encode_commit(out, decisions, rank); });
+        protocol::Envelope envelope{
+            id, {next_command_ + 1}, 0, group_->topology().plan, flight.scope};
         // Receipt is produced only after the complete fanout has entered the ordered queue.
         try {
-            send(messages, true);
+            (void)send_to_peers(
+                flight.scope.participants, envelope, distributed::wire::Kind::Commit,
+                distributed::Traffic::Continuation,
+                [&](auto& out, auto rank) { codec_.encode_commit(out, decisions, rank); });
         } catch (const std::exception& e) {
             fail(e.what());
             throw;
@@ -143,30 +191,68 @@ public:
 
     void discard(ExecutionTicket id) override {
         require_available();
+        const auto suppress_result = [&] {
+            std::erase_if(events_, [&](const Event& event) {
+                return std::visit(
+                    [&](const auto& value) {
+                        using T = std::decay_t<decltype(value)>;
+                        return value.ticket == id && (std::is_same_v<T, DecisionNeeded> ||
+                                                      std::is_same_v<T, DecisionConsumed> ||
+                                                      std::is_same_v<T, ResultReady<Types>>);
+                    },
+                    event);
+            });
+        };
+        if (id.frame.kind == FrameKind::Context) {
+            if (std::any_of(events_.begin(), events_.end(), [&](const auto& event) {
+                    const auto* retired = std::get_if<DeviceRetired>(&event);
+                    return retired && retired->ticket == id;
+                })) {
+                suppress_result();
+                return;
+            }
+            auto& flight = find(id);
+            if (flight.phase == Phase::Discarding) return;
+            suppress_result();
+            flight.clock.resolve(observation_time_ns());
+            if (flight.phase == Phase::Inputs) {
+                events_.emplace_back(DeviceRetired{
+                    id, flight.command, {}, flight.clock.finish(observation_time_ns())});
+                retire_inputs(flight);
+                std::erase(pending_submits_, id.frame);
+                pool_.retire(id.frame);
+                flight = {};
+            } else {
+                // Accepted Context work retires naturally with its Submit command.
+                flight.phase = Phase::Discarding;
+            }
+            return;
+        }
+
         auto& flight = find(id);
         if (flight.phase == Phase::Discarding || flight.phase == Phase::Retiring) return;
         if (flight.phase == Phase::Inputs) {
             flight.cancel_requested = true;
             return;
         }
-        protocol::Envelope envelope{id, {next_command_ + 1}, group_->topology().plan, flight.scope};
-        auto messages  = encode(envelope, distributed::wire::Kind::Discard, [](auto&, auto) {});
+        const auto mode = flight.supplied ? protocol::DiscardMode::AfterSupply
+                                          : protocol::DiscardMode::BeforeSupply;
+        protocol::Envelope envelope{
+            id, {next_command_ + 1}, 0, group_->topology().plan, flight.scope};
+        suppress_result();
+        try {
+            (void)send_to_peers(flight.scope.participants, envelope,
+                                distributed::wire::Kind::Discard,
+                                distributed::Traffic::Continuation,
+                                [&](auto& out, auto) { out.u8(static_cast<std::uint8_t>(mode)); });
+        } catch (const std::exception& e) {
+            fail(e.what());
+            return;
+        }
         flight.command = envelope.command;
         flight.phase   = Phase::Discarding;
         flight.clock.resolve(observation_time_ns());
         ++next_command_;
-        std::erase_if(events_, [&](const Event& event) {
-            return std::visit(
-                [&](const auto& value) {
-                    using T = std::decay_t<decltype(value)>;
-                    return value.ticket == id && (std::is_same_v<T, DecisionNeeded> ||
-                                                  std::is_same_v<T, ResultReady<Types>>);
-                },
-                event);
-        });
-        try {
-            send(messages, true);
-        } catch (const std::exception& e) { fail(e.what()); }
     }
 
     [[nodiscard]] std::optional<Event> poll() override {
@@ -176,13 +262,14 @@ public:
             while (auto incoming = group_->poll()) {
                 auto& message = incoming->message;
                 distributed::wire::Decoder in(message.payload);
+                const auto local_idx = replica_.local_index(incoming->peer);
                 if (message.kind == distributed::wire::Kind::Observation) {
                     auto snapshot = protocol::rank_snapshot(in);
                     in.finish();
                     const auto& identity = group_->topology().rank(incoming->peer);
                     if (snapshot.rank != identity.rank || snapshot.node != identity.node)
                         throw std::logic_error("resource observation has an invalid rank");
-                    auto& previous = this->observations_.at(incoming->peer);
+                    auto& previous = this->observations_.at(local_idx);
                     if (snapshot.stamp.sequence <= previous.stamp.sequence) continue;
                     snapshot.received_ns         = observation_time_ns();
                     snapshot.gpu_intervals       = previous.gpu_intervals;
@@ -208,6 +295,12 @@ public:
                     previous = std::move(snapshot);
                     continue;
                 }
+                if (message.kind == distributed::wire::Kind::InputCredit) {
+                    const auto count = in.u64();
+                    in.finish();
+                    inputs_.acknowledge_chunks(incoming->peer, count);
+                    continue;
+                }
                 if (message.kind == distributed::wire::Kind::InputReady) {
                     const auto id = in.u64();
                     in.finish();
@@ -217,9 +310,9 @@ public:
                 if (message.kind == distributed::wire::Kind::Progress) {
                     const auto applied = in.u64(), retired = in.u64();
                     in.finish();
-                    if (applied > next_command_ || retired > applied)
+                    if (applied > peer_commands_.at(local_idx) || retired > applied)
                         throw std::logic_error("rank progressed past accepted commands");
-                    auto& progress = progress_.at(incoming->peer);
+                    auto& progress = progress_.at(local_idx);
                     if (applied < progress.applied || retired < progress.retired)
                         throw std::logic_error("rank progress moved backwards");
                     progress = {applied, retired};
@@ -231,23 +324,23 @@ public:
                         throw std::logic_error(
                             "rank resource report exceeded its prepared capacity");
                     if (!measurement_query_ || in.u64() != measurement_query_ ||
-                        measurement_reports_.at(incoming->peer))
+                        measurement_reports_.at(local_idx))
                         throw std::logic_error("unexpected measurement acknowledgement");
-                    measurement_errors_.at(incoming->peer) = in.string();
-                    auto updated                           = protocol::rank_snapshot(in);
-                    const auto& identity = group_->topology().rank(incoming->peer);
+                    measurement_errors_.at(local_idx) = in.string();
+                    auto updated                      = protocol::rank_snapshot(in);
+                    const auto& identity              = group_->topology().rank(incoming->peer);
                     if (updated.rank != identity.rank || updated.node != identity.node)
                         throw std::logic_error("measurement report has an invalid rank");
-                    auto& previous              = this->observations_[incoming->peer];
+                    auto& previous              = this->observations_[local_idx];
                     updated.gpu_intervals       = previous.gpu_intervals;
                     updated.communication_eager = previous.communication_eager;
                     updated.communication_graph = previous.communication_graph;
                     updated.compute_paths       = previous.compute_paths;
                     updated.attention           = previous.attention;
                     merge_host_observations(updated.host, previous.host);
-                    previous                                        = std::move(updated);
-                    this->observations_[incoming->peer].received_ns = observation_time_ns();
-                    measurement_reports_[incoming->peer]            = true;
+                    previous                                   = std::move(updated);
+                    this->observations_[local_idx].received_ns = observation_time_ns();
+                    measurement_reports_[local_idx]            = true;
                     in.finish();
                     continue;
                 }
@@ -281,31 +374,50 @@ public:
 
     void drain() override {
         if (closed_) return;
-        if (failed_) {
-            group_->fail("draining failed execution group");
-            pool_.retire_submitted();
-            closed_ = true;
-            return;
+        for (const auto& flight : compute_) {
+            if (failed_) break;
+            if (flight.phase != Phase::Empty) discard(flight.ticket);
         }
-        for (auto* flights : {&compute_, &context_})
-            for (const auto& flight : *flights)
-                if (flight.phase != Phase::Empty && flight.ticket.frame.kind == FrameKind::Compute)
-                    discard(flight.ticket);
         const auto until = std::chrono::steady_clock::now() + group_->shutdown_timeout();
-        while (pool_.in_flight() && !failed_) {
+        while ((pool_.in_flight() || inputs_.has_pending_releases()) && !failed_) {
             if (std::chrono::steady_clock::now() >= until) {
                 fail("distributed execution drain timed out");
                 break;
             }
-            (void)poll();
-            std::this_thread::yield();
+            if (!poll()) group_->wait(std::chrono::milliseconds(1));
         }
-        if (failed_)
-            group_->fail("execution failed while draining");
-        else
-            group_->shutdown();
+
+        std::exception_ptr shutdown_error;
+        if (!failed_) {
+            try {
+                group_->shutdown();
+            } catch (...) { shutdown_error = std::current_exception(); }
+        }
+        // The failed group will never consume further input messages. Release both the codec
+        // binding and any uploads that had yet to hand off their payload to a worker.
+        if (input_owner_) {
+            try {
+                retire_codec_inputs(*slot(input_owner_->frame).work);
+            } catch (...) {
+                if (!shutdown_error) shutdown_error = std::current_exception();
+            }
+        }
+        input_owner_.reset();
+        inputs_ = {};
+        compute_.clear();
+        context_.clear();
+        pending_submits_.clear();
+        events_.clear();
         pool_.retire_submitted();
         closed_ = true;
+        if (failed_ || shutdown_error) {
+            try {
+                group_->wait_for_workers();
+            } catch (...) {
+                if (!shutdown_error) throw;
+            }
+            if (shutdown_error) std::rethrow_exception(shutdown_error);
+        }
     }
 
     void fail(std::string message) override {
@@ -362,7 +474,7 @@ private:
         std::vector<std::optional<Result>> context_results;
         std::vector<std::optional<DecisionConsumed>> consumed;
         std::vector<bool> retired;
-        std::vector<InputTransfers::Key> inputs;
+        std::optional<std::vector<InputTransfers::Key>> inputs;
         bool supplied = false, consumed_published = false, result_published = false;
         bool cancel_requested = false;
         ExecutionClock clock;
@@ -384,68 +496,115 @@ private:
         if (closed_ || failed_) throw std::runtime_error("distributed executor is unavailable");
     }
 
-    void progress_inputs() {
-        inputs_.progress(*group_, epoch().value);
-        for (auto* flights : {&compute_, &context_})
-            for (auto& flight : *flights) {
-                if (flight.phase != Phase::Inputs || !inputs_.ready(flight.inputs)) continue;
-                protocol::Envelope envelope{
-                    flight.ticket, {next_command_ + 1}, group_->topology().plan, flight.scope};
-                auto messages =
-                    encode(envelope, distributed::wire::Kind::Submit, [&](auto& out, auto rank) {
-                        codec_.encode_work(out, *flight.work, rank);
-                    });
-                send(messages, false);
-                flight.command = envelope.command;
-                flight.phase   = Phase::Running;
-                ++next_command_;
-                if (flight.cancel_requested) discard(flight.ticket);
-            }
+    void retire_codec_inputs(const Work& work) {
+        if constexpr (requires { codec_.retire_inputs(work); }) (void)codec_.retire_inputs(work);
     }
 
-    void retire_inputs(const Work& work) {
-        if constexpr (requires { codec_.retire_inputs(work); }) {
-            for (const auto& release : codec_.retire_inputs(work)) {
-                distributed::wire::Encoder out;
-                out.u64(release.id);
-                auto message = std::make_shared<const distributed::wire::Message>(
-                    distributed::wire::Message{distributed::wire::Kind::InputRelease, epoch().value,
-                                               std::move(out).take()});
-                std::vector<distributed::OutgoingMessage> requests;
-                for (const auto& rank : group_->topology().ranks)
-                    requests.push_back({rank.rank, message});
-                send(requests, true);
-                inputs_.release(release.id);
+    void prepare_inputs(Flight& flight) {
+        auto& keys = flight.inputs.emplace();
+        if constexpr (requires { codec_.prepare_inputs(*flight.work, replica_); }) {
+            auto resources = codec_.prepare_inputs(*flight.work, replica_);
+            if (resources.empty()) return;
+
+            // Preparing media installs a single coordinator-side codec binding. Validate the
+            // entire transfer before publishing any frames or assigning ownership to the ticket.
+            try {
+                for (const auto& resource : resources)
+                    if (!flight.scope.contains(resource.rank))
+                        throw std::invalid_argument("execution input peer is outside scope");
+                InputTransfers::validate_frames(resources, group_->limits());
+                keys = inputs_.begin(std::move(resources));
+            } catch (...) {
+                retire_codec_inputs(*flight.work);
+                throw;
             }
+            input_owner_ = flight.ticket;
         }
+    }
+
+    void progress_inputs() {
+        inputs_.progress(*group_, epoch().value);
+        while (!pending_submits_.empty()) {
+            const auto frame = pending_submits_.front();
+            auto& flight     = slot(frame);
+            if (flight.phase != Phase::Inputs) {
+                pending_submits_.pop_front();
+                continue;
+            }
+            if (!flight.inputs) {
+                if (input_owner_ || inputs_.has_pending_releases()) break;
+                prepare_inputs(flight);
+                if (input_owner_) inputs_.progress(*group_, epoch().value);
+            }
+            if (!inputs_.ready(*flight.inputs)) break;
+            protocol::Envelope envelope{
+                flight.ticket, {next_command_ + 1}, 0, group_->topology().plan, flight.scope};
+            const bool sent =
+                send_to_peers(flight.scope.participants, envelope, distributed::wire::Kind::Submit,
+                              distributed::Traffic::Work, [&](auto& out, auto rank) {
+                                  codec_.encode_work(out, *flight.work, rank);
+                              });
+            if (!sent) break;
+            pending_submits_.pop_front();
+            flight.command = envelope.command;
+            flight.phase   = Phase::Running;
+            ++next_command_;
+            if (flight.cancel_requested) discard(flight.ticket);
+        }
+    }
+
+    void retire_inputs(const Flight& flight) {
+        if (input_owner_ != flight.ticket) return;
+        retire_codec_inputs(*flight.work);
+        inputs_.release(*flight.inputs);
+        input_owner_.reset();
     }
 
     void measurement_boundary(MeasurementCommand command) {
         require_available();
+        const auto until = std::chrono::steady_clock::now() + group_->shutdown_timeout();
+        while (inputs_.has_pending_releases() && !failed_) {
+            if (std::chrono::steady_clock::now() >= until) {
+                fail("rank input release drain timed out before measurement");
+                throw std::runtime_error("rank input release drain timed out before measurement");
+            }
+            if (auto event = poll()) {
+                if (const auto* error = std::get_if<ExecutionFailed>(&*event))
+                    throw std::runtime_error(error->message);
+            } else {
+                group_->wait(std::chrono::milliseconds(1));
+            }
+        }
+        require_available();
         std::fill(measurement_reports_.begin(), measurement_reports_.end(), false);
         std::fill(measurement_errors_.begin(), measurement_errors_.end(), std::string{});
-        distributed::wire::Encoder out;
-        out.u64(++measurement_query_);
-        out.u64(next_command_);
-        out.u8(static_cast<std::uint8_t>(command.action));
-        out.boolean(command.profile);
-        auto message = std::make_shared<distributed::wire::Message>(distributed::wire::Message{
-            distributed::wire::Kind::Measurement, epoch().value, std::move(out).take()});
+        const auto query = ++measurement_query_;
         std::vector<distributed::OutgoingMessage> messages;
-        for (const auto& rank : group_->topology().ranks) messages.push_back({rank.rank, message});
-        send(messages, true);
+        messages.reserve(replica_.ranks.size());
+        for (std::size_t i = 0; i < replica_.ranks.size(); ++i) {
+            distributed::wire::Encoder out;
+            out.u64(query);
+            out.u64(peer_commands_[i]);
+            out.u8(static_cast<std::uint8_t>(command.action));
+            out.boolean(command.profile);
+            auto message = std::make_shared<distributed::wire::Message>(distributed::wire::Message{
+                distributed::wire::Kind::Measurement, epoch().value, std::move(out).take()});
+            messages.push_back({replica_.ranks[i], std::move(message)});
+        }
+        if (!group_->try_send(messages, distributed::Traffic::Continuation))
+            throw std::logic_error("measurement exceeded its reserved control capacity");
         std::deque<Event> deferred;
-        const auto until = std::chrono::steady_clock::now() + group_->shutdown_timeout();
         while (std::any_of(measurement_reports_.begin(), measurement_reports_.end(),
                            [](const auto& value) { return !value; })) {
             if (std::chrono::steady_clock::now() >= until) {
                 std::string message = "rank measurement boundary timed out at command " +
                                       std::to_string(next_command_);
-                for (std::size_t rank = 0; rank < progress_.size(); ++rank)
-                    if (!measurement_reports_[rank])
-                        message += "; rank " + std::to_string(rank) +
-                                   " applied=" + std::to_string(progress_[rank].applied) +
-                                   " retired=" + std::to_string(progress_[rank].retired);
+                for (std::size_t i = 0; i < progress_.size(); ++i)
+                    if (!measurement_reports_[i])
+                        message += "; rank " + std::to_string(replica_.ranks[i]) +
+                                   " expected=" + std::to_string(peer_commands_[i]) +
+                                   " applied=" + std::to_string(progress_[i].applied) +
+                                   " retired=" + std::to_string(progress_[i].retired);
                 fail(message);
                 throw std::runtime_error(message);
             }
@@ -453,47 +612,52 @@ private:
                 if (const auto* error = std::get_if<ExecutionFailed>(&*event))
                     throw std::runtime_error(error->message);
                 deferred.push_back(std::move(*event));
-            } else
-                std::this_thread::yield();
+            } else {
+                group_->wait(std::chrono::milliseconds(1));
+            }
         }
         events_.insert(events_.begin(), std::make_move_iterator(deferred.begin()),
                        std::make_move_iterator(deferred.end()));
-        for (std::size_t rank = 0; rank < measurement_errors_.size(); ++rank)
-            if (!measurement_errors_[rank].empty())
-                throw std::runtime_error("rank " + std::to_string(rank) + ": " +
-                                         measurement_errors_[rank]);
+        for (std::size_t i = 0; i < measurement_errors_.size(); ++i)
+            if (!measurement_errors_[i].empty())
+                throw std::runtime_error("rank " + std::to_string(replica_.ranks[i]) + ": " +
+                                         measurement_errors_[i]);
     }
 
     template <class Encode>
-    std::vector<distributed::OutgoingMessage>
-    encode(const protocol::Envelope& envelope, distributed::wire::Kind kind, Encode encode_body) {
-        std::vector<distributed::OutgoingMessage> result;
-        result.reserve(group_->topology().ranks.size());
-        for (const auto& rank : group_->topology().ranks) {
+    [[nodiscard]] bool send_to_peers(std::span<const distributed::RankId> recipients,
+                                     const protocol::Envelope& envelope,
+                                     distributed::wire::Kind kind, distributed::Traffic traffic,
+                                     Encode encode_body) {
+        std::vector<distributed::OutgoingMessage> messages;
+        messages.reserve(recipients.size());
+        for (const auto rank_id : recipients) {
+            const auto local_idx        = replica_.local_index(rank_id);
+            auto rank_envelope          = envelope;
+            rank_envelope.peer_sequence = peer_commands_.at(local_idx) + 1;
             distributed::wire::Encoder out;
-            protocol::encode(out, envelope);
-            if (envelope.scope.contains(rank.rank)) encode_body(out, rank.rank);
+            protocol::encode(out, rank_envelope);
+            encode_body(out, rank_id);
             auto payload = std::move(out).take();
             const auto limit =
                 kind == distributed::wire::Kind::Submit
                     ? budget_.work(envelope.ticket.frame.kind)
                     : (kind == distributed::wire::Kind::Supply ? budget_.decision : budget_.commit);
             if (payload.size() > limit)
-                throw std::logic_error("rank " + std::to_string(rank.rank) + " message " +
+                throw std::logic_error("rank " + std::to_string(rank_id) + " message " +
                                        std::to_string(static_cast<unsigned>(kind)) + " encoded " +
                                        std::to_string(payload.size()) + " bytes; Codec bound is " +
                                        std::to_string(limit));
             auto message = std::make_shared<distributed::wire::Message>(
                 distributed::wire::Message{kind, epoch().value, std::move(payload)});
-            result.push_back({rank.rank, std::move(message)});
+            messages.push_back({rank_id, std::move(message)});
         }
-        return result;
-    }
-
-    void send(std::span<const distributed::OutgoingMessage> messages, bool continuation) {
-        if (!group_->try_send(messages, continuation ? distributed::Traffic::Continuation
-                                                     : distributed::Traffic::Work))
+        if (!group_->try_send(messages, traffic)) {
+            if (traffic == distributed::Traffic::Work) return false;
             throw std::logic_error("execution exceeded its reserved control capacity");
+        }
+        for (const auto rank_id : recipients) ++peer_commands_.at(replica_.local_index(rank_id));
+        return true;
     }
 
     void publish_result(Flight& f) {
@@ -513,7 +677,8 @@ private:
                 if constexpr (std::is_same_v<T, ExecutionFailed>) {
                     throw std::runtime_error("rank " + std::to_string(rank) + ": " + value.message);
                 } else {
-                    auto& f = find(value.ticket);
+                    auto& f              = find(value.ticket);
+                    const auto local_idx = replica_.local_index(rank);
                     if (!f.scope.contains(rank))
                         throw std::logic_error("event came from an unrelated rank");
                     if constexpr (std::is_same_v<T, DecisionNeeded>) {
@@ -524,14 +689,18 @@ private:
                         f.phase    = Phase::Decision;
                         events_.emplace_back(std::move(value));
                     } else if constexpr (std::is_same_v<T, DecisionConsumed>) {
-                        if (!f.decision || value.stage != f.decision->stage || f.consumed.at(rank))
+                        if (f.phase == Phase::Discarding) return;
+                        if (!f.scope.is_decision_owner(rank) || !f.decision ||
+                            value.stage != f.decision->stage || f.consumed.at(local_idx))
                             throw std::logic_error("decision consumption arrived out of order");
-                        f.consumed[rank] = std::move(value);
-                        if (std::all_of(f.scope.owners.begin(), f.scope.owners.end(),
-                                        [&](auto r) { return f.consumed[r].has_value(); })) {
+                        f.consumed[local_idx] = std::move(value);
+                        if (std::all_of(f.scope.decision_owners.begin(),
+                                        f.scope.decision_owners.end(), [&](auto r) {
+                                            return f.consumed[replica_.local_index(r)].has_value();
+                                        })) {
                             DecisionConsumed combined{f.ticket, f.decision->stage, {}};
-                            for (auto r : f.scope.owners)
-                                for (const auto& row : f.consumed[r]->rows) {
+                            for (auto r : f.scope.decision_owners)
+                                for (const auto& row : f.consumed[replica_.local_index(r)]->rows) {
                                     auto found = std::find_if(
                                         combined.rows.begin(), combined.rows.end(),
                                         [&](const auto& v) { return v.member == row.member; });
@@ -541,20 +710,22 @@ private:
                                         found->bytes += row.bytes;
                                 }
                             f.consumed_published = true;
-                            if (f.phase != Phase::Discarding)
-                                events_.emplace_back(std::move(combined));
+                            events_.emplace_back(std::move(combined));
                             publish_result(f);
                         }
                     } else if constexpr (std::is_same_v<T, ResultReady<Types>>) {
                         if (f.phase == Phase::Discarding) return;
                         if (f.ticket.frame.kind == FrameKind::Context) {
-                            if (f.context_results.at(rank))
+                            if (f.context_results.at(local_idx))
                                 throw std::logic_error("duplicate context result");
-                            f.context_results[rank] = std::move(value.result);
-                            if (std::all_of(
-                                    f.scope.owners.begin(), f.scope.owners.end(),
-                                    [&](auto r) { return f.context_results[r].has_value(); }))
-                                f.result = codec_.merge_context_results(f.scope, f.context_results);
+                            f.context_results[local_idx] = std::move(value.result);
+                            if (std::all_of(f.scope.participants.begin(),
+                                            f.scope.participants.end(), [&](auto r) {
+                                                return f.context_results[replica_.local_index(r)]
+                                                    .has_value();
+                                            }))
+                                f.result = codec_.merge_context_results(f.scope, replica_,
+                                                                        f.context_results);
                         } else {
                             if (rank != f.scope.result_owner || f.result)
                                 throw std::logic_error("unexpected compute result owner");
@@ -562,17 +733,19 @@ private:
                         }
                         publish_result(f);
                     } else if constexpr (std::is_same_v<T, DeviceRetired>) {
-                        this->observe_retirement(rank, value.observed,
+                        this->observe_retirement(static_cast<std::uint32_t>(local_idx),
+                                                 value.observed,
                                                  value.ticket.frame.kind == FrameKind::Compute);
                         merge_gpu_intervals(f.gpu, value.observed.gpu);
                         if (f.ticket.frame.kind == FrameKind::Compute &&
                             f.phase != Phase::Retiring && f.phase != Phase::Discarding)
                             throw std::logic_error("compute frame retired before resolution");
-                        if (value.command != f.command || f.retired.at(rank))
+                        if (value.command != f.command || f.retired.at(local_idx))
                             throw std::logic_error("stale or duplicate rank retirement");
-                        f.retired[rank] = true;
-                        if (std::all_of(f.scope.owners.begin(), f.scope.owners.end(),
-                                        [&](auto r) { return f.retired[r]; })) {
+                        f.retired[local_idx] = true;
+                        if (std::all_of(
+                                f.scope.participants.begin(), f.scope.participants.end(),
+                                [&](auto r) { return f.retired[replica_.local_index(r)]; })) {
                             if (f.ticket.frame.kind == FrameKind::Context &&
                                 f.phase != Phase::Discarding && !f.result_published)
                                 throw std::logic_error("context retired before publication");
@@ -580,7 +753,7 @@ private:
                             observed.max_rank_gpu = f.gpu;
                             this->observe_execution(observed);
                             events_.emplace_back(DeviceRetired{f.ticket, f.command, {}, observed});
-                            retire_inputs(*f.work);
+                            retire_inputs(f);
                             pool_.retire(f.ticket.frame);
                             f = {};
                         }
@@ -590,12 +763,15 @@ private:
             event);
     }
 
-    std::unique_ptr<distributed::ExecutionGroup> group_;
+    std::unique_ptr<distributed::ReplicaGroup> group_;
+    distributed::ReplicaTopology replica_;
     ExecutionPool pool_;
     Codec codec_;
     protocol::ControlBudget budget_;
     InputTransfers inputs_;
+    std::optional<ExecutionTicket> input_owner_;
     std::vector<Flight> compute_, context_;
+    std::deque<FrameId> pending_submits_;
 
     struct Progress {
         std::uint64_t applied = 0, retired = 0;
@@ -604,6 +780,7 @@ private:
     std::vector<Progress> progress_;
     std::vector<bool> measurement_reports_;
     std::vector<std::string> measurement_errors_;
+    std::vector<std::uint64_t> peer_commands_;
     std::deque<Event> events_;
     std::optional<ExecutionFailed> failure_;
     std::uint64_t next_execution_ = 0, next_command_ = 0;

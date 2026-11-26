@@ -14,20 +14,30 @@ std::vector<std::int32_t> integers(wire::Decoder& in) {
     for (auto& value : values) value = in.i32();
     return values;
 }
+
+const vision::Work* find_produced_visual(const Work& work) {
+    const auto* forward = std::get_if<ForwardWork>(&work.operation);
+    if (!forward || !forward->visual || !forward->visual->window.produce) return nullptr;
+    return &*forward->visual;
+}
 } // namespace
 
+bool ExecutionCodec::has_inputs(const Work& work) const noexcept {
+    return find_produced_visual(work) != nullptr;
+}
+
 std::vector<runtime::InputResource>
-ExecutionCodec::prepare_inputs(const Work& work, const distributed::ExecutionTopology& topology) {
-    const auto* forward = std::get_if<ForwardWork>(&work.operation);
-    if (!forward || !forward->visual || !forward->visual->window.produce) return {};
-    const auto& visual = *forward->visual;
-    if (!visual.input || visual.input->batches.size() != topology.ranks.size())
+ExecutionCodec::prepare_inputs(const Work& work, const distributed::ReplicaTopology& replica) {
+    const auto* production = find_produced_visual(work);
+    if (!production) return {};
+    const auto& visual = *production;
+    if (!visual.input || visual.input->batches.size() != replica.ranks.size())
         throw std::logic_error("Vision production does not cover the execution ranks");
-    inputs_.install(visual);
     std::vector<runtime::InputResource> result;
-    for (const auto& rank : topology.ranks) {
-        const auto& batch = visual.input->batches.at(rank.rank);
-        runtime::InputResource resource{rank.rank, visual.window.id, {}, {}, visual.input};
+    for (std::size_t local_idx = 0; local_idx < replica.ranks.size(); ++local_idx) {
+        const auto global_rank = replica.ranks[local_idx];
+        const auto& batch      = visual.input->batches.at(local_idx);
+        runtime::InputResource resource{global_rank, visual.window.id, {}, {}, visual.input};
         wire::Encoder out;
         models::vision::encode_window(out, visual.window);
         out.u32(batch.features);
@@ -41,15 +51,12 @@ ExecutionCodec::prepare_inputs(const Work& work, const distributed::ExecutionTop
         resource.metadata = std::move(out).take();
         result.push_back(std::move(resource));
     }
+    inputs_.install(visual);
     return result;
 }
 
-std::vector<runtime::InputRelease> ExecutionCodec::retire_inputs(const Work& work) {
-    const auto* forward = std::get_if<ForwardWork>(&work.operation);
-    if (!forward || !forward->visual || !forward->visual->window.produce) return {};
-    const auto id = forward->visual->window.id;
-    inputs_.release_payload(id);
-    return {{id}};
+void ExecutionCodec::retire_inputs(const Work& work) {
+    if (const auto* visual = find_produced_visual(work)) inputs_.release_payload(visual->window.id);
 }
 
 std::optional<std::uint64_t> ExecutionCodec::receive_input(wire::Kind kind,

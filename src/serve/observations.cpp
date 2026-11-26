@@ -197,7 +197,9 @@ void ServiceObservations::done(std::uint64_t id, const GenerationOutcome& outcom
     }
     event(cancelled ? "request_cancelled" : "request_completed", id,
           {{"prompt_tokens", outcome.prompt_tokens},
-           {"completion_tokens", outcome.completion_tokens}});
+           {"completion_tokens", outcome.completion_tokens},
+           {"replica_id", outcome.stats.replica_id ? nlohmann::json(*outcome.stats.replica_id)
+                                                   : nlohmann::json(nullptr)}});
 }
 
 void ServiceObservations::rejected(std::uint64_t id) {

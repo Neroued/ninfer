@@ -163,6 +163,14 @@ struct Commit {
     context::ContextActions context;
 };
 
+void validate_forward_work(const ForwardWork&, std::uint32_t prefill_chunk,
+                           std::uint32_t control_limit, std::uint32_t public_tokens);
+void validate_narrowing(const DecodeWork&, std::uint32_t max_context);
+void validate_decision_rows(const Work&, const runtime::DecisionInput&, std::uint32_t vocabulary,
+                            std::span<const std::uint32_t> verify_drafts);
+void validate_commit_rows(const Work&, const Commit&, std::span<const std::int32_t> counts);
+void validate_commit_rows(const Work&, const Commit&, std::span<const std::uint32_t> counts);
+
 // Freezes physical geometry while preserving the logical member order.
 void plan_work_batch(Work&, const BatchExecutionPlan&);
 

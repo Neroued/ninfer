@@ -34,8 +34,9 @@ ResolvedLoadPlan resolve_rank_load(const artifact::Reader& reader,
     for (const auto& layer : definition->weights().text.layers)
         if (const auto* m = std::get_if<MoeWeights>(&layer.ffn)) append(*m);
     if (definition->weights().mtp) append(definition->weights().mtp->moe);
-    auto selection = select_weights(reader, definition->parameters(), definition->weight_data(),
-                                    rank.assemblies, experts, device);
+    auto selection =
+        select_weights(reader, definition->parameters(), definition->weight_data(), rank.whole,
+                       rank.assemblies, experts, rank.omitted, device);
     auto storage   = artifact::plan_materialization(reader, selection.requests);
     return {
         reader, std::move(definition), std::move(rank), std::move(selection), std::move(storage),

@@ -7,6 +7,7 @@
 #include "runtime/engine/startup_memory.h"
 #include "artifact/reader.h"
 #include "artifact/formats.h"
+#include "models/common/startup.h"
 #include "models/registry.h"
 #include "core/startup.h"
 #include "core/platform.h"
@@ -27,58 +28,44 @@ inline bool preserves_context_capacity(const ContextCapacityResolution& narrow,
     return keeps_context_capacity(narrow.device_bytes, baseline.device_bytes);
 }
 
-inline bool preserves_group_context_capacity(std::span<const ContextCapacityResolution> narrow,
-                                             std::span<const ContextCapacityResolution> baseline) {
-    return std::ranges::equal(narrow, baseline, preserves_context_capacity);
-}
-
-inline std::vector<ContextCapacityResolution>
-group_baseline_capacity_upper_bound(std::span<const RankPreparationReport> reports,
-                                    std::span<const RankMemoryBudget> budgets) {
-    std::vector<RankCapacityOffer> offers;
-    offers.reserve(reports.size());
-    std::optional<std::size_t> owner;
-    for (std::size_t rank = 0; rank < reports.size(); ++rank) {
-        const auto& report = reports[rank];
-        auto& offer       = offers.emplace_back(report.capacity);
-        offer.available_bytes += budgets[rank].graphs->rebuild_estimate_bytes;
-        if (report.control_owner) owner = rank;
-    }
-    const auto policy = ContextCapacityPolicy::automatic();
-    auto upper = resolve_group_context_capacity(policy, offers, owner);
-    if (!owner) return upper;
-
-    // Bound each rank independently. With the other non-owner ranks at their minimum,
-    // the metadata owner's rank order cannot understate a baseline rank's capacity.
-    auto minimum = offers;
-    for (std::size_t rank = 0; rank < offers.size(); ++rank) {
-        if (rank == *owner) continue;
-        auto& offer = minimum[rank];
-        offer.available_bytes = offer.plan.reservation_bytes(offer.plan.minimum_capacity());
-    }
-    for (std::size_t rank = 0; rank < offers.size(); ++rank) {
-        auto maximal = minimum;
-        maximal[rank] = offers[rank];
-        upper[rank] = resolve_group_context_capacity(policy, maximal, owner)[rank];
-    }
-    return upper;
-}
-
 template <class Plan>
 struct CalibratedPlan {
     Plan startup;
     GraphMemorySummary graph;
 };
 
+template <class Setup, class... TargetOptions>
+auto plan_local_context(const Setup& setup, DeviceContext& device, const EngineOptions& options,
+                        models::WeightPlacement placement, std::size_t available,
+                        std::size_t available_host, const TargetOptions&... targets) {
+    auto plan = setup.plan(device, options, placement, available, available_host, targets...);
+    if (!plan || options.purpose != EnginePurpose::CausalScoring ||
+        options.context_capacity.mode != ContextCapacityMode::Automatic)
+        return plan;
+
+    const auto& capacity = plan->capacity;
+    const auto limit = scoring_context_capacity_limit(
+        capacity.minimum_device_bytes, capacity.reference.device_bytes, capacity.block_bytes);
+    if (capacity.device_bytes > limit) {
+        // Finalize the native plan at the bounded size before constructing any backing.
+        auto bounded = options;
+        bounded.context_capacity = ContextCapacityPolicy::explicit_capacity(limit);
+        plan = setup.plan(device, bounded, placement, available, available_host, targets...);
+        if (plan) plan->capacity.mode = ContextCapacityMode::Automatic;
+    }
+    return plan;
+}
+
 template <class Setup>
 auto replan(const Setup& setup, DeviceContext& device, const EngineOptions& options,
             const typename Setup::ExecutionPlan& candidate, std::size_t offered,
             std::size_t available_host) {
     if constexpr (requires { candidate.preparation.target_widths; })
-        return setup.plan(device, options, candidate.placement, offered, available_host,
-                          candidate.preparation.target_widths);
+        return plan_local_context(setup, device, options, candidate.placement, offered,
+                                  available_host, candidate.preparation.target_widths);
     else
-        return setup.plan(device, options, candidate.placement, offered, available_host);
+        return plan_local_context(setup, device, options, candidate.placement, offered,
+                                  available_host);
 }
 
 template <class Setup>
@@ -240,12 +227,13 @@ initialize_program(const Setup& setup, RankModelInstance<typename Setup::Types>&
             std::optional<CalibratedPlan<typename Setup::ExecutionPlan>> narrow, baseline;
             const auto calibrate_baseline = [&] {
                 const auto [offered, host] = offer();
-                auto plan = setup.plan(device, options, candidate.placement, offered, host);
+                auto plan = plan_local_context(setup, device, options, candidate.placement,
+                                               offered, host);
                 return plan ? calibrated_now(std::move(*plan)) : decltype(baseline){};
             };
             try {
-                auto plan = setup.plan(device, options, candidate.placement, available, available_host,
-                                       widths);
+                auto plan = plan_local_context(setup, device, options, candidate.placement,
+                                               available, available_host, widths);
                 if (plan) narrow = calibrated_now(std::move(*plan));
             } catch (const DeviceAllocationError&) {
             } catch (const ContextBudgetError&) {}
@@ -335,8 +323,8 @@ BuiltModel<typename Setup::Types> build_local_model(const artifact::Reader& read
                 if (choice.host_bytes > remaining) continue;
                 remaining -= choice.host_bytes;
             }
-            auto plan = setup.plan(device, options, choice.placement, remaining,
-                                      host_available - choice.host_bytes);
+            auto plan = plan_local_context(setup, device, options, choice.placement, remaining,
+                                           host_available - choice.host_bytes);
             if (plan) return plan;
         }
         return std::optional<typename Setup::ExecutionPlan>{};

@@ -6,7 +6,9 @@
 #include "ninfer/types.h"
 
 #include <algorithm>
+#include <chrono>
 #include <stdexcept>
+#include <thread>
 
 namespace ninfer::runtime {
 
@@ -30,6 +32,9 @@ public:
     virtual void discard(ExecutionTicket)                                                    = 0;
     [[nodiscard]] virtual std::optional<ExecutionEvent<Types>> poll()                        = 0;
     virtual void flush()                                                                     = 0;
+    virtual void wait_for_activity(std::chrono::milliseconds) const {
+        std::this_thread::yield();
+    }
     // Closes submission and completes all physical readers before control owners are released.
     virtual void drain()                                                  = 0;
     virtual void fail(std::string message)                                = 0;

@@ -23,7 +23,7 @@ struct CapturePoint {
 };
 
 struct RequestPlan {
-    qwen::PreparedPromptData prompt;
+    std::shared_ptr<const qwen::PreparedPromptData> prompt;
     runtime::RequestPlanSummary summary;
     context::PrefixQuery query;
     std::uint32_t domain = 0;
@@ -31,7 +31,7 @@ struct RequestPlan {
     [[nodiscard]] context::InputIdentityView identity_view(context::TokenView tokens) const;
 
     [[nodiscard]] context::InputIdentityView identity_view() const {
-        return identity_view(context::TokenView(prompt.token_ids));
+        return identity_view(context::TokenView(prompt->token_ids));
     }
 
     std::vector<CapturePoint> captures;

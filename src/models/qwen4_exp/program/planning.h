@@ -41,6 +41,7 @@ struct ExecutionPlan {
     std::size_t pinned_draft_bytes       = 0;
     runtime::ContextCapacityResolution capacity;
     std::uint32_t checkpoint_interval = 8192;
+    bool shared_physical_memory       = false;
     bool graph_probe                  = false;
 
     [[nodiscard]] std::size_t device_bytes() const;
@@ -81,5 +82,6 @@ plan_execution(std::shared_ptr<const execution::ModelProfile>, ple::disk::TableG
 
 [[nodiscard]] runtime::ContextCapacityPlan
 describe_execution_capacity(std::shared_ptr<const execution::ModelProfile>, const EngineOptions&,
-                            std::shared_ptr<const BatchExecutionPlan>, DeviceContext&);
+                            std::shared_ptr<const BatchExecutionPlan>, DeviceContext&,
+                            ple::disk::TableGeometry);
 } // namespace ninfer::models::qwen4_exp

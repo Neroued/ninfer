@@ -48,7 +48,7 @@ Startup::plan(DeviceContext& device, const EngineOptions& options, WeightPlaceme
                                                                            : 1024U);
     trial.prefill_chunk          = chunk;
     const auto& policy           = options.context_capacity;
-    constexpr bool shared_memory = NINFER_SHARED_PHYSICAL_MEMORY != 0;
+    const bool shared_memory     = device_memory_snapshot(device.device()).shared_physical_memory;
     auto prototype               = host_experts ? offload_ : nullptr;
     auto planner = make_sequence_planner(profile, device, trial, prototype, target_widths);
     const auto& capacity_plan   = planner.capacity_plan();

@@ -22,7 +22,7 @@ runtime::protocol::ControlBudget control_budget(const ModelDefinition& definitio
         static_cast<std::uint32_t>(definition.resources().text.control_tokens->size()),
         p.batches,
         p.decode_routes};
-    const auto payloads = contract.payload_capacity(scope.owners.size());
+    const auto payloads = contract.payload_capacity(scope.participants.size());
     // Generated tokens are bounded by speculative positions. Scoring emits
     // at most one prefill chunk; context observations are coalesced by resource/direction.
     const auto event = runtime::protocol::rank_execution_observation_capacity() + 96 +
@@ -69,7 +69,7 @@ GroupExecutionPlan plan_group_execution(const ParallelPlan& parallel,
         auto& parts = context.state.layouts.front().parts;
         parts.insert(parts.end(), local_state.parts.begin(), local_state.parts.end());
         context.state.logical_capacity =
-            std::max(context.state.logical_capacity, session.context.state.logical_capacity);
+            std::min(context.state.logical_capacity, session.context.state.logical_capacity);
         context.metadata_budget_bytes += session.context.metadata_budget_bytes;
         for (std::size_t i = 0; i < context.pools.size(); ++i) {
             auto& pool        = context.pools[i];
@@ -77,8 +77,7 @@ GroupExecutionPlan plan_group_execution(const ParallelPlan& parallel,
             if (pool.pool_id != local.pool_id || pool.page_capacity != local.page_capacity ||
                 pool.table_rows != local.table_rows)
                 throw std::invalid_argument("Qwen4Exp history geometry differs across ranks");
-            pool.logical_pages = std::max(pool.logical_pages, local.logical_pages);
-            pool.histories     = std::max(pool.histories, local.histories);
+            pool.logical_pages = std::min(pool.logical_pages, local.logical_pages);
             pool.parts.insert(pool.parts.end(), local.parts.begin(), local.parts.end());
         }
         plan.capacity.compute_frames =
@@ -103,11 +102,13 @@ ExecutionCodec::ExecutionCodec(const ModelDefinition& definition,
                 static_cast<std::uint32_t>(definition.resources().text.control_tokens->size()),
                 rank.session.batches,
                 rank.session.decode_routes} {
-    rank_               = rank.observation.rank;
-    ranks_              = topology.ranks.size();
-    max_features_       = rank.session.vision_max_features;
-    scope_.result_owner = topology.output_rank;
-    for (const auto& r : topology.ranks) scope_.owners.push_back(r.rank);
+    replica_                = topology.replica_for_rank(rank.observation.rank);
+    rank_                   = replica_.local_index(rank.observation.rank);
+    ranks_                  = static_cast<std::uint32_t>(replica_.ranks.size());
+    max_features_           = rank.session.vision_max_features;
+    scope_.participants     = replica_.ranks;
+    scope_.decision_owners  = replica_.ranks;
+    scope_.result_owner     = replica_.result_owner;
     scope_.validate(topology);
     auto described = rank;
     described.observation.communication.clear();
@@ -133,16 +134,16 @@ runtime::protocol::Scope ExecutionCodec::scope(const Work& work,
     const auto* context = std::get_if<ContextWork>(&work.operation);
     if (!context || !context->bindings.empty() || !context->releases.empty()) return scope_;
     runtime::protocol::Scope scope;
-    for (const auto& [rank, actions] : work.actions)
-        if (!actions.empty()) scope.owners.push_back(rank);
-    if (scope.owners.empty()) return scope_;
-    scope.result_owner = scope.owners.front();
+    for (const auto& [local_rank, actions] : work.actions)
+        if (!actions.empty()) scope.participants.push_back(replica_.global_rank(local_rank));
+    if (scope.participants.empty()) return scope_;
+    scope.result_owner = scope.participants.front();
     return scope;
 }
 
 void ExecutionCodec::encode_work(wire::Encoder& out, const Work& work,
                                  distributed::RankId rank) const {
-    qwen4_exp::encode_work(out, work, inputs_, rank);
+    qwen4_exp::encode_work(out, work, inputs_, replica_.local_index(rank));
 }
 
 Work ExecutionCodec::decode_work(wire::Decoder& in) const {
@@ -151,7 +152,7 @@ Work ExecutionCodec::decode_work(wire::Decoder& in) const {
 
 void ExecutionCodec::encode_commit(wire::Encoder& out, const Commit& commit,
                                    distributed::RankId rank) const {
-    qwen4_exp::encode_commit(out, commit, rank);
+    qwen4_exp::encode_commit(out, commit, replica_.local_index(rank));
 }
 
 Commit ExecutionCodec::decode_commit(wire::Decoder& in) const {
@@ -168,13 +169,16 @@ Result ExecutionCodec::decode_result(wire::Decoder& in) const {
 
 Result
 ExecutionCodec::merge_context_results(const runtime::protocol::Scope& scope,
+                                      const distributed::ReplicaTopology& replica,
                                       const std::vector<std::optional<Result>>& results) const {
     ContextResult combined;
-    for (auto rank : scope.owners) {
-        const auto& local = std::get<ContextResult>(results.at(rank).value());
-        for (const auto& transfer : local.transfers) {
-            if (transfer.rank != rank)
+    for (auto global_rank : scope.participants) {
+        const auto local_idx = replica.local_index(global_rank);
+        const auto& local    = std::get<ContextResult>(results.at(local_idx).value());
+        for (auto transfer : local.transfers) {
+            if (transfer.rank != local_idx)
                 throw std::logic_error("Qwen4Exp transfer observation has a foreign rank");
+            transfer.rank = global_rank;
             combined.transfers.push_back(transfer);
         }
     }

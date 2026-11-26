@@ -1,3 +1,14 @@
+set(ninfer_cluster_topology_libs ninfer_deployment)
+if(NINFER_ENABLE_DISTRIBUTED)
+  list(APPEND ninfer_cluster_topology_libs ninfer_distributed_wire)
+endif()
+ninfer_add_test(ninfer_cluster_topology_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_cluster_topology.cpp"
+  LIBRARIES ${ninfer_cluster_topology_libs})
+if(NINFER_ENABLE_DISTRIBUTED)
+  target_compile_definitions(ninfer_cluster_topology_test PRIVATE NINFER_ENABLE_DISTRIBUTED=1)
+endif()
+
 if(NINFER_ENABLE_DISTRIBUTED AND NINFER_BUILD_ENGINE)
   ninfer_add_test(ninfer_distributed_protocol_test
     SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_protocol.cpp"

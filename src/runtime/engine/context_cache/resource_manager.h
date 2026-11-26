@@ -111,13 +111,24 @@ public:
         std::uint64_t ordinal           = 0;
     };
 
-    explicit ResourceManager(bool enabled, ContextMachineCostModel costs)
-        : enabled_(enabled), costs_(std::move(costs)) {}
+    explicit ResourceManager(bool enabled, ContextMachineCostModel costs,
+                             std::optional<std::uint32_t> max_cached_checkpoints = std::nullopt)
+        : enabled_(enabled), costs_(std::move(costs)),
+          max_cached_checkpoints_(max_cached_checkpoints) {}
 
     ResourceManager(const ResourceManager&)            = delete;
     ResourceManager& operator=(const ResourceManager&) = delete;
     ResourceManager(ResourceManager&&)                 = default;
     ResourceManager& operator=(ResourceManager&&)      = default;
+
+    void set_prefix_observer(typename PrefixIndex<Model>::Observer observer) {
+        index_.set_observer(std::move(observer));
+    }
+
+    // Revisit the cap after Native retires an operation and releases its checkpoint leases.
+    void refresh(Session& session) { prune(session); }
+
+    [[nodiscard]] std::size_t cached_checkpoint_count() const noexcept { return index_.size(); }
 
     [[nodiscard]] const PrefixCacheStatistics& statistics() const noexcept {
         return index_.statistics();
@@ -396,6 +407,7 @@ public:
         waiting_.erase(found->second);
         waiting_lookup_.erase(found);
         for (const auto handle : held) release_unreferenced(session, handle);
+        enforce_checkpoint_cap(session);
     }
 
     // Called exactly once after Native's irreversible bind commit. The choice preserves logical
@@ -500,6 +512,7 @@ public:
             shared_lookup_.emplace(shared_.back().ordinal, std::prev(shared_.end()));
             add_reference(handle, &References::shared, shared_.back().ordinal);
             index_.insert(session, handle, summary.role);
+            enforce_checkpoint_cap(session);
         } else {
             auto* owner = find_owner(token);
             if (!owner) {
@@ -537,6 +550,7 @@ public:
                 owner->points.push_back({handle, summary.role});
                 add_reference(handle, &References::owners, owner->token);
                 index_.insert(session, handle, summary.role);
+                enforce_checkpoint_cap(session);
             }
         }
     }
@@ -1491,7 +1505,10 @@ private:
 
     void prune(Session& session) {
         const auto revision = session.checkpoint_catalog_revision();
-        if (!references_dirty_ && revision == pruned_revision_) return;
+        if (!references_dirty_ && revision == pruned_revision_) {
+            enforce_checkpoint_cap(session);
+            return;
+        }
         demand_capacity_ = std::max<std::size_t>(256, session.checkpoint_extent() * 2);
         std::vector<Handle> stale;
         for (const auto& [handle, refs] : references_)
@@ -1507,6 +1524,43 @@ private:
         }
         references_dirty_ = false;
         pruned_revision_  = revision;
+        enforce_checkpoint_cap(session);
+    }
+
+    void enforce_checkpoint_cap(Session& session) {
+        if (!max_cached_checkpoints_ || index_.size() <= *max_cached_checkpoints_) return;
+        std::unordered_set<std::uint32_t> active_inputs;
+        for (const auto& owner : owners_) {
+            if (!owner.active) continue;
+            for (const auto& point : owner.points)
+                if (point.role == CheckpointRole::InputReplay)
+                    active_inputs.insert(point.handle.index);
+        }
+        bool evicted = false;
+        for (const auto& entry : ranked_victims(session)) {
+            if (index_.size() <= *max_cached_checkpoints_) break;
+            if (!session.valid_checkpoint(entry.handle)) continue;
+            if (active_inputs.contains(entry.handle.index)) continue;
+            if (session.checkpoint_metadata(entry.handle).leased) continue;
+            if (!may_revoke({&entry.handle, 1}, ReclaimRights{ReclaimPurpose::OptionalWrite}))
+                continue;
+            if (session.release_checkpoint(entry.handle)) {
+                forget(entry.handle, true);
+                evicted = true;
+            }
+        }
+        if (evicted) {
+            for (auto it = owners_.begin(); it != owners_.end();) {
+                if (!it->active && it->points.empty()) {
+                    owner_lookup_.erase(it->token);
+                    it = owners_.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            references_dirty_ = false;
+            pruned_revision_  = session.checkpoint_catalog_revision();
+        }
     }
 
     struct RankedVictim {
@@ -2118,6 +2172,7 @@ private:
 
     bool enabled_;
     ContextMachineCostModel costs_;
+    std::optional<std::uint32_t> max_cached_checkpoints_;
     PrefixIndex<Model> index_;
     std::list<Owner> owners_;
     std::list<Shared> shared_;

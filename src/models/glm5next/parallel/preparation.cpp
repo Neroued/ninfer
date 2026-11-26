@@ -4,10 +4,11 @@
 
 namespace ninfer::models::glm5next {
 
-context::ContextDirectorySpec plan_group_context(const ParallelPlan& parallel,
-                                                 std::span<const RankResourceDescription> ranks) {
-    if (ranks.empty() || ranks.size() != parallel.ranks.size())
-        throw std::invalid_argument("GLM5Next prepared rank count differs from its parallel plan");
+context::ContextDirectorySpec
+plan_replica_context(std::span<const RankPlan> expected_ranks,
+                     std::span<const RankResourceDescription> ranks) {
+    if (ranks.empty() || ranks.size() != expected_ranks.size())
+        throw std::invalid_argument("GLM5Next prepared rank count differs from its replica plan");
     context::ContextDirectorySpec out;
     out.state.logical_capacity = UINT32_MAX;
     out.state.layouts.resize(ranks.size());
@@ -17,7 +18,7 @@ context::ContextDirectorySpec plan_group_context(const ParallelPlan& parallel,
     for (std::size_t rank = 0; rank < ranks.size(); ++rank) {
         const auto& r = ranks[rank];
         const auto& c = r.context;
-        if (r.rank != parallel.ranks[rank].rank || r.rank != rank ||
+        if (r.rank != expected_ranks[rank].rank || r.rank != rank ||
             r.shape != ranks.front().shape || r.batches != ranks.front().batches ||
             c.ranks.size() != 1 || c.ranks.front().rank != rank ||
             c.state.layouts.size() != ranks.size() || c.pools.size() != out.pools.size() ||
@@ -61,9 +62,9 @@ context::ContextDirectorySpec plan_group_context(const ParallelPlan& parallel,
     return out;
 }
 
-PreparedContext prepare_context(const ParallelPlan& parallel,
-                                std::span<const RankResourceDescription> ranks) {
-    auto spec = plan_group_context(parallel, ranks);
+PreparedContext prepare_replica_context(std::span<const RankPlan> expected_ranks,
+                                        std::span<const RankResourceDescription> ranks) {
+    auto spec = plan_replica_context(expected_ranks, ranks);
     PreparedContext out{ranks.front().shape,
                         std::make_shared<const BatchExecutionPlan>(ranks.front().batches),
                         {},

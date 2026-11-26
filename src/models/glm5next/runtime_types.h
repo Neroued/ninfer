@@ -13,6 +13,7 @@ struct RuntimeTypes {
     using Profile           = execution::ModelProfile;
     using Frontend          = glm5next::Frontend;
     using PreparedPrompt    = glm5next::PreparedPrompt;
+    using PromptPrefixKeyer = glm5next::PromptPrefixKeyer;
     using OutputSession     = models::frontend::OutputSession;
     using PublishedOutput   = models::frontend::PublishedOutput;
     using SequencePlan      = ExecutionPlan;

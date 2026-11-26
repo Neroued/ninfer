@@ -212,8 +212,8 @@ int main() {
     failures += check(server.at("server").at("default_thinking_budget") == 512,
                       "server thinking budget missing");
     failures += check(server.at("engine").at("kv_cache") == "fp8", "KV type missing");
-    failures += check(server.at("engine").at("linear_state_dtype") == "bf16",
-                      "linear state dtype missing");
+    failures +=
+        check(server.at("engine").at("linear_state_dtype") == "bf16", "linear state dtype missing");
     options.launch.engine.kv_cache = ninfer::KvCacheStorage::Nvfp4Group16;
     engine_options.kv_cache        = options.launch.engine.kv_cache;
     description.kv_cache           = options.launch.engine.kv_cache;
@@ -512,6 +512,7 @@ int main() {
     outcome.stats.speculative.fallback_steps        = 2;
     outcome.stats.speculative.accepted_per_position = {290, 240, 190};
     outcome.stats.engine_request_id                 = 991;
+    outcome.stats.replica_id                        = 1U;
     outcome.stats.scheduling                        = {
                                .preemptions          = 3,
                                .snapshot_restores    = 1,
@@ -533,6 +534,7 @@ int main() {
                       "terminal log cannot be joined to the same public request and response");
     failures +=
         check(done.at("generation").at("engine_request_id") == 991 &&
+                  done.at("generation").at("replica_id") == 1 &&
                   done.at("generation").at("scheduling") == Json{{"preemptions", 3},
                                                                  {"snapshot_restores", 1},
                                                                  {"direct_restores", 0},
@@ -838,8 +840,9 @@ int main() {
     const Json error =
         Json::parse(format_request_error_json("serve-test", 4000, context, "generation failed"));
     failures += check(error.at("event") == "request_error", "request error event mismatch");
-    failures += check(error.at("error").at("message") == "generation failed",
-                      "request error message missing");
+    failures += check(error.at("error").at("message") == "generation failed" &&
+                          error.at("error").at("replica_id").is_null(),
+                      "unassigned request error must retain its message and null replica");
 
     const OperationalRecord internal_failure = render_request_failure(
         context,
@@ -1048,27 +1051,40 @@ int main() {
     {
         JsonlRequestLog writer("test-instance", log_path.string());
         writer.write_request_rejected(rejected_context);
-        writer.write_request_error(context, "generation failed");
+        auto replica = std::make_shared<std::atomic<std::optional<std::uint32_t>>>(std::nullopt);
+        auto failed_context          = context;
+        failed_context.error_replica = replica;
+        replica->store(1);
+        writer.write_request_error(failed_context, "generation failed");
+        writer.write_request_error(context, "engine unavailable");
     }
     std::ifstream input(log_path);
     std::string first_line;
     std::string second_line;
     std::string third_line;
+    std::string fourth_line;
     std::string extra_line;
     std::getline(input, first_line);
     std::getline(input, second_line);
     std::getline(input, third_line);
+    std::getline(input, fourth_line);
     std::getline(input, extra_line);
     failures += check(!first_line.empty() && !second_line.empty() && !third_line.empty() &&
-                          extra_line.empty(),
+                          !fourth_line.empty() && extra_line.empty(),
                       "JSONL writer did not append exactly one flushed line per event");
     if (!first_line.empty() && !second_line.empty() && !third_line.empty()) {
         failures += check(Json::parse(first_line).at("event") == "request_start",
                           "first appended event mismatch");
         failures += check(Json::parse(second_line).at("event") == "request_rejected",
                           "second appended event mismatch");
-        failures += check(Json::parse(third_line).at("event") == "request_error",
-                          "third appended event mismatch");
+        const auto logged_error = Json::parse(third_line);
+        failures += check(logged_error.at("event") == "request_error" &&
+                              logged_error.at("error").at("replica_id") == 1,
+                          "request error record lost the assigned replica");
+    }
+    if (!fourth_line.empty()) {
+        failures += check(Json::parse(fourth_line).at("error").at("replica_id").is_null(),
+                          "unassigned request error must log a null replica");
     }
     input.close();
     std::filesystem::remove(log_path);

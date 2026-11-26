@@ -29,7 +29,9 @@ public:
         implementation.initialize_graphs();
     }
 
-    [[nodiscard]] runtime::ExecutionCapacity capacity() const noexcept { return {1, 1}; }
+    [[nodiscard]] runtime::ExecutionCapacity capacity() const noexcept {
+        return q35::RankProgram::capacity();
+    }
 
     void validate_work(const q35::Work& work, runtime::FrameKind kind) const {
         implementation.validate_work(work, kind);
@@ -59,6 +61,10 @@ public:
         auto description = committed ? std::optional(commit) : std::nullopt;
         implementation.commit(ticket, command, std::move(commit));
         if (committed) committed(ticket, *description);
+    }
+
+    [[nodiscard]] bool can_discard(runtime::ExecutionTicket ticket) const noexcept {
+        return implementation.can_discard(ticket);
     }
 
     void discard(runtime::ExecutionTicket ticket, runtime::CommandSequence command) {

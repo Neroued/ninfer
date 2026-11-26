@@ -1,4 +1,5 @@
 #include "runtime/executor/protocol.h"
+#include "runtime/executor/input.h"
 #include "distributed/transport.h"
 
 #include <algorithm>
@@ -8,24 +9,30 @@
 namespace ninfer::runtime::protocol {
 namespace wire = distributed::wire;
 
-std::size_t work_payload_memory(const WorkPayloadCapacity& p, ExecutionCapacity frames,
-                                std::size_t ranks, bool coordinator) {
+std::size_t worker_payload_memory(const WorkPayloadCapacity& p, ExecutionCapacity frames) {
+    const auto continuation = (p.decision + p.commit) * frames.compute_frames;
+    // Context snapshots own one count vector, independent of the number of recipients.
+    return 3 * (p.compute_work * frames.compute_frames + continuation) +
+           (p.context_work + p.rank_context_storage) * frames.context_frames;
+}
+
+std::size_t coordinator_payload_memory(const WorkPayloadCapacity& p, ExecutionCapacity frames,
+                                       std::size_t ranks) {
     const auto work =
         p.compute_work * frames.compute_frames + p.context_work * frames.context_frames;
     const auto continuation = (p.decision + p.commit) * frames.compute_frames;
-    // Context snapshots own one count vector, independent of the number of recipients.
-    // The model reports native Context storage separately from the encoded payload.
-    const auto worker = 3 * (p.compute_work * frames.compute_frames + continuation) +
-                        (p.context_work + p.rank_context_storage) * frames.context_frames;
     // Encoder vectors can grow to twice their payload. Compute rows are retained by Session
     // and Executor; a Context snapshot moves from Session into Executor without a second copy.
     const auto retained_compute = std::max(p.compute_work, p.compute_result);
-    const auto control          = coordinator ? 2 * ranks * (work + continuation) +
-                                           4 * ranks * retained_compute * frames.compute_frames +
-                                           p.coordinator_context_storage * frames.context_frames +
-                                           2 * ranks * continuation
-                                              : 0;
-    return worker + control;
+    return 2 * ranks * (work + continuation) +
+           4 * ranks * retained_compute * frames.compute_frames +
+           p.coordinator_context_storage * frames.context_frames + 2 * ranks * continuation;
+}
+
+std::size_t work_payload_memory(const WorkPayloadCapacity& p, ExecutionCapacity frames,
+                                std::size_t ranks, bool coordinator) {
+    return worker_payload_memory(p, frames) +
+           (coordinator ? coordinator_payload_memory(p, frames, ranks) : 0);
 }
 
 distributed::TransportLimits control_transport_limits(const ControlBudget& b,
@@ -68,16 +75,31 @@ distributed::TransportLimits control_transport_limits(const ControlBudget& b,
     };
 
     const std::size_t compute = frames.compute_frames, context = frames.context_frames;
+    const std::size_t input_window_msgs = InputTransfers::kMaxInFlightChunksPerPeer + 3;
+    const std::size_t input_window_bytes =
+        InputTransfers::kMaxInFlightChunksPerPeer * (InputTransfers::kChunkBytes + 128) + (64ULL << 10);
+
     Queue submits, commands, responses;
     submits.add(b.compute_work, compute);
     submits.add(b.context_work, context);
     commands.add(b.decision, compute);
     commands.add(b.commit, compute);
-    commands.add(128, 2 * compute + 1); // Discard, InputRelease, measurement/shutdown.
+    commands.add(8, compute + context); // InputRelease.
+    commands.add(256, 2 * compute + 2); // Discard, measurement/shutdown.
     responses.add(b.event, 6 * compute + 3 * context);
-    responses.add(16, 8 * compute + 3 * context); // Applied/retired progress.
+    responses.add(16, input_window_msgs); // InputCredit acknowledgements.
     responses.add(report, 1);
-    responses.add(128, 2); // Input readiness and terminal acknowledgement.
+    responses.add(128, 4); // InputReady and terminal acknowledgement.
+
+    limits.input_messages =
+        std::max(limits.input_messages, input_window_msgs * (coordinator ? ranks : 1));
+    limits.input_bytes =
+        std::max(limits.input_bytes, input_window_bytes * (coordinator ? ranks : 1));
+    limits.telemetry_messages = std::max<std::size_t>(limits.telemetry_messages,
+                                                      4 * (coordinator ? ranks : 1));
+    limits.telemetry_bytes =
+        std::max(limits.telemetry_bytes, (report + 256) * 2 * (coordinator ? ranks : 1));
+
     Queue incoming;
     if (coordinator) {
         submits.multiply(ranks);
@@ -87,14 +109,15 @@ distributed::TransportLimits control_transport_limits(const ControlBudget& b,
     } else {
         incoming.append(submits);
         incoming.append(commands);
+        incoming.add(0, input_window_msgs);
+        incoming.append({input_window_bytes, 0});
         commands = responses;
     }
     limits.queued_bytes          = std::max(limits.queued_bytes, submits.bytes);
     limits.queued_messages       = std::max(limits.queued_messages, submits.messages);
     limits.continuation_bytes    = std::max(limits.continuation_bytes, commands.bytes);
     limits.continuation_messages = std::max(limits.continuation_messages, commands.messages);
-    incoming.append({limits.input_bytes, limits.input_messages});
-    limits.received_bytes    = std::max(limits.received_bytes, incoming.bytes);
+    limits.received_bytes    = std::max({limits.received_bytes, incoming.bytes, limits.message_bytes});
     limits.received_messages = std::max(limits.received_messages, incoming.messages);
     return limits;
 }
@@ -118,17 +141,32 @@ void encode_measurement_report(wire::Encoder& out, std::uint64_t query, std::str
 
 void Scope::validate(const distributed::ExecutionTopology& topology) const {
     std::set<distributed::RankId> members;
-    if (owners.empty()) throw std::invalid_argument("execution has no owners");
-    for (auto owner : owners) {
-        (void)topology.rank(owner);
-        if (!members.insert(owner).second) throw std::invalid_argument("duplicate execution owner");
+    if (participants.empty()) throw std::invalid_argument("execution has no participants");
+    for (auto member : participants) {
+        (void)topology.rank(member);
+        if (!members.insert(member).second)
+            throw std::invalid_argument("duplicate execution participant");
     }
     if (!members.contains(result_owner))
-        throw std::invalid_argument("result rank is not an execution owner");
+        throw std::invalid_argument("result rank is not an execution participant");
+    std::set<distributed::RankId> decisions;
+    for (auto owner : decision_owners) {
+        if (!members.contains(owner))
+            throw std::invalid_argument("decision owner is not an execution participant");
+        if (!decisions.insert(owner).second)
+            throw std::invalid_argument("duplicate decision owner");
+    }
+    if (!decision_owners.empty() && !decisions.contains(result_owner))
+        throw std::invalid_argument("result owner must participate in decision_owners");
 }
 
 bool Scope::contains(distributed::RankId rank) const noexcept {
-    return std::find(owners.begin(), owners.end(), rank) != owners.end();
+    return std::find(participants.begin(), participants.end(), rank) != participants.end();
+}
+
+bool Scope::is_decision_owner(distributed::RankId rank) const noexcept {
+    return std::find(decision_owners.begin(), decision_owners.end(), rank) !=
+           decision_owners.end();
 }
 
 void encode(wire::Encoder& out, ExecutionTicket t) {
@@ -154,20 +192,26 @@ ExecutionTicket ticket(wire::Decoder& in) {
 void encode(wire::Encoder& out, const Envelope& e) {
     encode(out, e.ticket);
     out.u64(e.command.value);
+    out.u64(e.peer_sequence);
     out.u64(e.plan);
     out.u32(e.scope.result_owner);
-    out.u64(e.scope.owners.size());
-    for (auto rank : e.scope.owners) out.u32(rank);
+    out.u64(e.scope.participants.size());
+    for (auto rank : e.scope.participants) out.u32(rank);
+    out.u64(e.scope.decision_owners.size());
+    for (auto rank : e.scope.decision_owners) out.u32(rank);
 }
 
 Envelope envelope(wire::Decoder& in) {
     Envelope out;
     out.ticket             = ticket(in);
     out.command.value      = in.u64();
+    out.peer_sequence      = in.u64();
     out.plan               = in.u64();
     out.scope.result_owner = in.u32();
-    out.scope.owners.resize(in.count(4));
-    for (auto& rank : out.scope.owners) rank = in.u32();
+    out.scope.participants.resize(in.count(4));
+    for (auto& rank : out.scope.participants) rank = in.u32();
+    out.scope.decision_owners.resize(in.count(4));
+    for (auto& rank : out.scope.decision_owners) rank = in.u32();
     return out;
 }
 

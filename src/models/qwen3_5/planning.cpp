@@ -121,6 +121,15 @@ SequencePlanner make_sequence_planner(const execution::Parameters& parameters,
     return make_sequence_planner(parameters.profile, device, options);
 }
 
+SequencePlan make_graph_probe_sequence_plan(std::shared_ptr<const execution::ModelProfile> profile,
+                                            DeviceContext& device, const EngineOptions& options,
+                                            std::shared_ptr<const moe::Plan> moe,
+                                            std::span<const std::uint32_t> target_widths,
+                                            GraphProbeBacking backing) {
+    return SequencePlan(detail::make_graph_probe_plan(std::move(profile), device, options,
+                                                      std::move(moe), target_widths, backing));
+}
+
 SequencePlanner make_sequence_planner(std::shared_ptr<const execution::ModelProfile> profile,
                                       DeviceContext& device, const EngineOptions& options,
                                       std::shared_ptr<const moe::Plan> moe,

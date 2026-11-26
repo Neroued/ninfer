@@ -15,3 +15,10 @@ target_sources(ninfer_model_control PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/session/reclaim.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/session/context_operation.cpp"
 )
+
+if(NINFER_ENABLE_DISTRIBUTED)
+  target_sources(ninfer_model_control PRIVATE
+    "${CMAKE_CURRENT_LIST_DIR}/wire.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/parallel/wire.cpp"
+  )
+endif()

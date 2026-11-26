@@ -10,6 +10,45 @@ IndexRange partition_range(std::uint32_t total, std::uint32_t parts, std::uint32
     return {rank * (total / parts), total / parts};
 }
 
+IndexRange partition_vocabulary_range(std::uint32_t vocabulary, std::uint32_t parts,
+                                      std::uint32_t rank) {
+    if (!vocabulary || !parts || rank >= parts || vocabulary < parts)
+        throw std::invalid_argument("vocabulary partition requires nonempty shards per rank");
+    if (parts == 1) return {0, vocabulary};
+    constexpr std::uint32_t kAlignment = 128;
+    if (std::uint64_t(vocabulary) >= std::uint64_t(kAlignment) * parts) {
+        const std::uint32_t blocks = vocabulary / kAlignment;
+        const std::uint32_t base   = blocks / parts;
+        const std::uint32_t extra  = blocks % parts;
+        const std::uint32_t block_begin =
+            rank < extra ? rank * (base + 1) : extra * (base + 1) + (rank - extra) * base;
+        const std::uint32_t block_count = rank < extra ? (base + 1) : base;
+        const std::uint32_t begin       = block_begin * kAlignment;
+        const std::uint32_t size =
+            (rank + 1 == parts) ? (vocabulary - begin) : (block_count * kAlignment);
+        return {begin, size};
+    }
+    const std::uint32_t base  = vocabulary / parts;
+    const std::uint32_t extra = vocabulary % parts;
+    const std::uint32_t begin =
+        rank < extra ? rank * (base + 1) : extra * (base + 1) + (rank - extra) * base;
+    const std::uint32_t size = rank < extra ? (base + 1) : base;
+    return {begin, size};
+}
+
+void validate_vocabulary_partition(const BoundWeight& head, IndexRange range) {
+    for (const auto& part : head.view.parts) {
+        const auto& g    = part.parent->geometry;
+        const auto block = g.layout == QuantLayout::BlockScaleK16M128x4 ||
+                                   g.layout == QuantLayout::BatchedBlockScaleK16M128x4
+                               ? 128
+                           : g.layout == QuantLayout::Csf32 ? 32
+                                                            : g.scale_block_rows;
+        if (range.begin % block || range.size % block)
+            throw artifact::ArtifactError("vocabulary shard splits a quantized row block");
+    }
+}
+
 void append_parameter_slice(std::vector<artifact::MatrixSlice>& out, const artifact::Reader& reader,
                             const artifact::ParameterReference& reference,
                             const ParameterSlice& s) {

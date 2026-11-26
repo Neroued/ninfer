@@ -64,7 +64,8 @@ std::string format_request_done_json(const std::string& server_instance_id,
                                      const GenerationOutcome& outcome);
 std::string format_request_error_json(const std::string& server_instance_id,
                                       std::uint64_t timestamp_unix_ms,
-                                      const RequestLogContext& context, const std::string& message);
+                                      const RequestLogContext& context, const std::string& message,
+                                      std::optional<std::uint32_t> replica_id = {});
 std::string format_throughput_json(const std::string& server_instance_id,
                                    std::uint64_t timestamp_unix_ms, const ThroughputReport& report);
 

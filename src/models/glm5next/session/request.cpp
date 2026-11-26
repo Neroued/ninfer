@@ -6,8 +6,8 @@ namespace ninfer::models::glm5next::detail {
 
 bool RequestPlan::can_checkpoint(std::uint32_t frontier) const {
     if (!frontier) return false;
-    if (!complete_input_frontier(prompt.prefix_view(),
-                                 std::min<std::size_t>(frontier, prompt.token_ids.size())))
+    if (!complete_input_frontier(prompt->prefix_view(),
+                                 std::min<std::size_t>(frontier, prompt->token_ids.size())))
         return false;
     return true;
 }
@@ -26,7 +26,7 @@ const runtime::RequestPlanSummary& RequestBasePlan::summary() const noexcept {
 }
 
 const models::frontend::PreparedContextCache& RequestBasePlan::context_cache() const noexcept {
-    return plan_->prompt.context_cache;
+    return plan_->prompt->context_cache;
 }
 
 std::optional<PrefixKey> RequestBasePlan::prefix_key(std::uint32_t f) const {
@@ -34,12 +34,17 @@ std::optional<PrefixKey> RequestBasePlan::prefix_key(std::uint32_t f) const {
     return plan_->query.key(f);
 }
 
-RequestBasePlan Session::plan_request(PreparedPrompt&& prompt,
+std::uint32_t Session::prefix_domain() const noexcept {
+    return static_cast<std::uint32_t>(impl_->shape.kv_storage) |
+           (static_cast<std::uint32_t>(impl_->shape.linear_state_dtype) << 24U);
+}
+
+RequestBasePlan Session::plan_request(PreparedPrompt prompt,
                                       const runtime::ResolvedExecutionOptions& options) {
     auto& p           = *impl_;
     auto plan         = std::make_shared<detail::RequestPlan>();
-    plan->prompt      = PreparedPromptAccess::take(std::move(prompt));
-    const auto& input = plan->prompt;
+    plan->prompt      = PreparedPromptAccess::shared(prompt);
+    const auto& input = *plan->prompt;
     const auto count  = input.token_ids.size();
     if (!count || count > p.shape.max_context)
         throw std::invalid_argument("GLM5Next requires a nonempty prepared prompt within capacity");

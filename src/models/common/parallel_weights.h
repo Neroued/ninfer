@@ -2,6 +2,8 @@
 
 #include "models/common/moe/weights.h"
 #include "models/common/parallel.h"
+#include "models/load_options.h"
+#include "artifact/framing.h"
 
 #include <array>
 #include <optional>
@@ -41,6 +43,7 @@ struct CalibrationSelection {
 struct SelectedWeights {
     std::vector<artifact::TensorRequest> requests;
     std::vector<LocalWeightBinding> bindings;
+    std::vector<bool> omitted;
     std::vector<ExpertSelection> experts;
     std::vector<moe::ExpertDescription> expert_descriptions;
     std::vector<CalibrationSelection> calibrations;
@@ -48,17 +51,26 @@ struct SelectedWeights {
 
 struct ExpertWeightPartition {
     moe::BankDescription bank;
-    std::array<WeightId, 3> parameters;
+    std::vector<WeightId> parameters;
     ExpertPartition partition;
 };
 
-// Parameters and Uses retain their WeightId order. Expert partitions produce indexed
-// entries or packed banks; calibration retains the logical matrix domain.
+[[nodiscard]] std::uint64_t rank_weight_digest(const artifact::ArtifactId&, LoadOptions,
+                                               std::span<const std::uint64_t> rank_geometry,
+                                               std::span<const WeightId> whole,
+                                               std::span<const WeightId> omitted,
+                                               std::span<const ParameterAssembly>,
+                                               std::span<const ExpertPartition>);
+
+// Every destination parameter in [0, references.size()) must be classified exactly once across
+// whole, assemblies[].bindings[].parameter, experts[].parameters, and omitted.
 [[nodiscard]] SelectedWeights select_weights(const artifact::Reader&,
                                              std::span<const artifact::ParameterReference>,
                                              std::span<const BoundWeight>,
+                                             std::span<const WeightId> whole,
                                              std::span<const ParameterAssembly>,
-                                             std::span<const ExpertWeightPartition>, Device);
+                                             std::span<const ExpertWeightPartition>,
+                                             std::span<const WeightId> omitted, Device);
 [[nodiscard]] std::vector<BoundWeight> bind_selected_weights(std::span<const BoundWeight>,
                                                              const SelectedWeights&,
                                                              std::span<const artifact::StorageId>,

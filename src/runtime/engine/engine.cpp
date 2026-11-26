@@ -6,7 +6,7 @@
 #include "runtime/contract/sampling.h"
 #include "runtime/contract/request.h"
 #include "runtime/engine/causal_score_core.h"
-#include "runtime/engine/engine_core.h"
+#include "runtime/engine/engine_coordinator.h"
 #include "runtime/engine/startup.h"
 
 #include <algorithm>
@@ -180,15 +180,15 @@ GenerationResult GenerationHandle::wait(OutputSink* sink, const CancellationView
 class Engine::Impl {
 public:
     using Qwen35         = runtime::InferenceInstance<models::qwen3_5::RuntimeTypes>;
-    using GenerationCore = runtime::EngineCore<Qwen35>;
+    using GenerationCore = runtime::EngineCoordinator<Qwen35>;
     using ScoringCore    = runtime::CausalScoreCore<Qwen35>;
     using Qwen4          = runtime::InferenceInstance<models::qwen4_exp::RuntimeTypes>;
     using Glm            = runtime::InferenceInstance<models::glm5next::RuntimeTypes>;
     using Core =
         std::variant<std::monostate, std::unique_ptr<GenerationCore>, std::unique_ptr<ScoringCore>,
-                     std::unique_ptr<runtime::EngineCore<Qwen4>>,
+                     std::unique_ptr<runtime::EngineCoordinator<Qwen4>>,
                      std::unique_ptr<runtime::CausalScoreCore<Qwen4>>,
-                     std::unique_ptr<runtime::EngineCore<Glm>>,
+                     std::unique_ptr<runtime::EngineCoordinator<Glm>>,
                      std::unique_ptr<runtime::CausalScoreCore<Glm>>>;
 
     explicit Impl(EngineOptions engine_options)
@@ -212,7 +212,7 @@ public:
                     core = std::make_unique<runtime::CausalScoreCore<Instance>>(*instance);
                     phase.complete();
                 } else {
-                    auto generation = std::make_unique<runtime::EngineCore<Instance>>(
+                    auto generation = std::make_unique<runtime::EngineCoordinator<Instance>>(
                         *instance, options, std::move(constructed.context_cost));
                     startup.speculative = generation->take_speculative_startup();
                     core                = std::move(generation);
@@ -257,18 +257,36 @@ private:
         description.linear_state_dtype = options.linear_state_dtype;
         std::visit(
             [&](const auto& instance) {
-                description.context_token_capacity_estimate =
-                    runtime::estimate_context_token_capacity(instance->context_capacities);
-                const auto usage = instance->session->physical_usage();
-                for (const auto& pool : usage.pools)
-                    description.context_pools.push_back(
-                        {pool.rank, pool.domain, pool.capacity_bytes, pool.block_bytes});
                 startup.ranks = instance->rank_budgets;
-                for (const auto& pool : instance->session->kv_pools())
-                    description.kv_pools.push_back({pool.id.index, std::string(pool.label), 0});
-                const auto ranks = instance->executor->rank_descriptions();
-                description.ranks.assign(ranks.begin(), ranks.end());
-                description.placements = instance->session->placement_descriptions();
+                std::uint64_t total_token_capacity = 0;
+                for (std::uint32_t r = 0; r < instance->replicas.size(); ++r) {
+                    const auto& rep = *instance->replicas[r];
+                    total_token_capacity +=
+                        runtime::estimate_context_token_capacity(rep.context_capacities);
+                    const auto usage = rep.session->physical_usage();
+                    const auto ranks = rep.executor->rank_descriptions();
+                    for (const auto& pool : usage.pools)
+                        description.context_pools.push_back({ranks[pool.rank].rank, pool.domain,
+                                                             pool.capacity_bytes,
+                                                             pool.block_bytes});
+                    if (r == 0) {
+                        for (const auto& pool : rep.session->kv_pools())
+                            description.kv_pools.push_back(
+                                {pool.id.index, std::string(pool.label), 0});
+                    }
+                    description.ranks.insert(description.ranks.end(), ranks.begin(), ranks.end());
+                    auto placements = rep.session->placement_descriptions();
+                    for (auto& p : placements) {
+                        p.replica_id = r;
+                        for (auto& attn_rank : p.attention_ranks) {
+                            if (attn_rank < ranks.size()) { attn_rank = ranks[attn_rank].rank; }
+                        }
+                        description.placements.push_back(std::move(p));
+                    }
+                }
+                std::sort(description.ranks.begin(), description.ranks.end(),
+                          [](const auto& a, const auto& b) { return a.rank < b.rank; });
+                description.context_token_capacity_estimate = total_token_capacity;
             },
             active);
     }

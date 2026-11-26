@@ -18,6 +18,22 @@ ninfer_add_test(ninfer_context_capacity_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_context_capacity.cpp"
   LIBRARIES ninfer_runtime_support)
 
+ninfer_add_test(ninfer_dp_router_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_dp_router.cpp"
+  LIBRARIES ninfer_runtime_support)
+
+add_executable(ninfer_multi_replica_engine_test
+  "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_multi_replica_engine.cpp")
+ninfer_test_includes(ninfer_multi_replica_engine_test)
+target_link_libraries(ninfer_multi_replica_engine_test PRIVATE
+  ninfer_model_execution ninfer_runtime_support)
+target_compile_definitions(ninfer_multi_replica_engine_test PRIVATE
+  NINFER_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+add_test(NAME ninfer_multi_replica_engine_test
+  COMMAND ${Python3_EXECUTABLE} -B "${PROJECT_SOURCE_DIR}/tests/models/glm5next/test_loading.py"
+    $<TARGET_FILE:ninfer_multi_replica_engine_test>)
+set_tests_properties(ninfer_multi_replica_engine_test PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=")
+
 ninfer_add_test(ninfer_sampling_defaults_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_sampling_defaults.cpp"
   LIBRARIES ninfer_engine ninfer_core)

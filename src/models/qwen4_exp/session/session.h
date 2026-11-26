@@ -335,7 +335,8 @@ public:
     Session& operator=(const Session&) = delete;
 
     [[nodiscard]] std::span<const runtime::KvPoolDescriptor> kv_pools() const noexcept;
-    [[nodiscard]] RequestBasePlan plan_request(qwen::PreparedPrompt&&,
+    [[nodiscard]] std::uint32_t prefix_domain() const noexcept;
+    [[nodiscard]] RequestBasePlan plan_request(qwen::PreparedPrompt,
                                                const runtime::ResolvedExecutionOptions&);
     [[nodiscard]] std::vector<PlacementDescriptor> placement_descriptions() const;
     [[nodiscard]] std::span<const runtime::PlacementId> placements(const RequestBasePlan&) const;
@@ -362,6 +363,7 @@ public:
         evaluate_recovery(std::span<const CheckpointHandle>) const;
     [[nodiscard]] std::size_t checkpoint_extent() const noexcept;
     [[nodiscard]] std::uint64_t checkpoint_catalog_revision() const noexcept;
+    [[nodiscard]] std::uint64_t checkpoint_lease_revision() const noexcept;
     [[nodiscard]] std::vector<runtime::ContextTransferRequirement>
         checkpoint_restore_requirements(CheckpointHandle) const;
     [[nodiscard]] bool valid_checkpoint(CheckpointHandle) const noexcept;

@@ -1,19 +1,13 @@
 #pragma once
 
+#include "models/common/qwen/vision/wire.h"
 #include "distributed/wire.h"
 #include "models/qwen4_exp/work.h"
 
 namespace ninfer::models::qwen4_exp {
 
 // A single frozen window mapping survives release of the raw production payload.
-class VisionInputBindings {
-public:
-    void install(qwen::VisionWork);
-    void release_payload(std::uint64_t);
-    [[nodiscard]] qwen::VisionWork get(std::uint64_t id, bool produce) const;
-private:
-    std::optional<qwen::VisionWork> current_;
-};
+using qwen::VisionInputBindings;
 
 void encode_work(distributed::wire::Encoder&, const Work&, const VisionInputBindings&,
                  std::uint32_t rank);

@@ -12,6 +12,10 @@ std::uint64_t Session::checkpoint_catalog_revision() const noexcept {
     return impl_->checkpoints.revision();
 }
 
+std::uint64_t Session::checkpoint_lease_revision() const noexcept {
+    return impl_->checkpoints.lease_revision();
+}
+
 std::vector<runtime::ContextTransferRequirement>
 Session::checkpoint_restore_requirements(CheckpointHandle h) const {
     return impl_->checkpoints.at(h).snapshot.restore_requirements(impl_->directory);
@@ -113,7 +117,7 @@ Session::inspect_source(const RequestBasePlan& base, std::optional<CheckpointHan
     const auto end    = resume ? resume->frontier() : base.summary().prompt_tokens;
     if (out.reused_tokens > end) return {};
     out.remaining_work = models::vision::recovery_work(
-        base.plan_->prompt.vision_items, [](const auto& item) -> const auto& { return item; },
+        base.plan_->prompt->vision_items, [](const auto& item) -> const auto& { return item; },
         out.reused_tokens, end, p.shape.prefill_chunk, p.plan.vision_max_features);
     if (h) {
         const auto& c      = p.checkpoints.at(*h);

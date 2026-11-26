@@ -2,7 +2,7 @@
 #include "models/glm5next/session/internal.h"
 #include "models/glm5next/startup.h"
 #include "models/glm5next/runtime_types.h"
-#include "runtime/engine/engine_core.h"
+#include "runtime/engine/engine_coordinator.h"
 #include "runtime/executor/execution_pool.h"
 #include "core/platform.h"
 #if NINFER_ENABLE_DISTRIBUTED
@@ -159,7 +159,9 @@ public:
     glm::ComputeResult computed;
 
     explicit Executor(glm::WorkContract c)
-        : rt::Executor<glm::ExecutionTypes>(c.shape.max_concurrency), contract(std::move(c)) {}
+        : rt::Executor<glm::ExecutionTypes>(c.shape.max_concurrency), contract(std::move(c)) {
+        rank_descriptions_.push_back({});
+    }
 
     void observe_sample(const ExecutionSample& sample) { observe_execution(sample); }
 
@@ -1374,28 +1376,36 @@ void mtp_transactions(std::shared_ptr<const glm::ModelDefinition> definition) {
     }
 }
 
-// Real EngineCore + real Session/Directory, with deterministic executor completions.
+template <class Types = glm::RuntimeTypes>
+auto make_engine_instance(std::shared_ptr<const glm::ModelDefinition> definition,
+                          const glm::SessionPlan& layout) {
+    auto executor = std::make_unique<Executor>(
+        glm::WorkContract{layout.shape, layout.batches, definition->config().text.vocabulary,
+                          definition->resources().text.public_token_count, 2, 0, 0,
+                          glm::make_decode_routes(layout.shape, *layout.batches)});
+    auto prepared = glm::prepare_session(definition, layout,
+                                         std::make_unique<ctx::ContextDirectory>(layout.context));
+    return rt::InferenceInstance<Types>(definition, make_frontend(), std::move(executor),
+                                        std::move(prepared), {});
+}
+
+// Real EngineCoordinator + real Session/Directory, with deterministic executor completions.
 // The four-page catalog fits either full request but not both requests' next growth.
 // No model arithmetic or GPU is involved in this scheduling/lifecycle check.
 void engine_pressure(std::shared_ptr<const glm::ModelDefinition> definition, bool inject_failure,
                      bool stop_during_replay = false) {
-    Fixture f(definition, true);
-
-    struct Instance {
-        using ModelContract = glm::RuntimeTypes;
-        glm::Frontend& frontend;
-        Executor* executor;
-        glm::Session* session;
-    } instance{f.frontend, &f.executor, &f.session};
+    auto instance  = make_engine_instance(definition, plan(*definition, true));
+    auto& executor = static_cast<Executor&>(*instance.replicas.front()->executor);
+    auto& frontend = instance.frontend;
 
     EngineOptions options;
     options.max_context           = 256;
     options.max_concurrency       = 3;
     options.context_cache.enabled = false;
-    f.executor.unit_time_ns       = 500'000'000;
-    f.executor.defer_binding      = 3;
-    f.executor.hold_poll          = true;
-    rt::EngineCore<Instance> engine(instance, options, {});
+    executor.unit_time_ns         = 500'000'000;
+    executor.defer_binding        = 3;
+    executor.hold_poll            = true;
+    rt::EngineCoordinator<decltype(instance)> engine(instance, options, {});
     using Submission = decltype(engine)::Submission;
     std::array<Submission, 3> submitted;
     std::array<GenerationResult, 3> results;
@@ -1404,8 +1414,7 @@ void engine_pressure(std::shared_ptr<const glm::ModelDefinition> definition, boo
     for (unsigned row = 0; row < submitted.size(); ++row) {
         // The first two rows reach Decode after one chunk. Their next pages force
         // pressure before the newest binding can process any prompt tokens.
-        auto prompt =
-            f.frontend.prepare_tokens(std::vector<TokenId>(row == 2 ? 128 : 64, row), true);
+        auto prompt = frontend.prepare_tokens(std::vector<TokenId>(row == 2 ? 128 : 64, row), true);
         const auto summary = prompt.summary();
         rt::ResolvedRequestOptions request;
         request.execution.requested_output_tokens = 120;
@@ -1419,12 +1428,12 @@ void engine_pressure(std::shared_ptr<const glm::ModelDefinition> definition, boo
     }
     std::atomic<bool> replay_blocked{false};
     if (stop_during_replay)
-        f.executor.replay_submitted = [&] {
-            f.executor.hold_poll = true;
+        executor.replay_submitted = [&] {
+            executor.hold_poll   = true;
             replay_blocked       = true;
         };
-    if (inject_failure) f.executor.fail_poll = true;
-    f.executor.hold_poll = false;
+    if (inject_failure) executor.fail_poll = true;
+    executor.hold_poll   = false;
     const auto deadline  = std::chrono::steady_clock::now() + std::chrono::seconds(10);
     std::array<std::jthread, 3> consumers;
     for (unsigned row = 0; row < submitted.size(); ++row)
@@ -1455,7 +1464,7 @@ void engine_pressure(std::shared_ptr<const glm::ModelDefinition> definition, boo
             }
         }
         require(!engine.is_available(), "failed Engine remained available");
-        auto prompt        = f.frontend.prepare_tokens({0}, true);
+        auto prompt        = frontend.prepare_tokens({0}, true);
         const auto summary = prompt.summary();
         bool unavailable   = false;
         try {
@@ -1505,22 +1514,17 @@ void engine_pressure(std::shared_ptr<const glm::ModelDefinition> definition, boo
 }
 
 void engine_stop(std::shared_ptr<const glm::ModelDefinition> definition) {
-    Fixture f(definition, true);
-
-    struct Instance {
-        using ModelContract = glm::RuntimeTypes;
-        glm::Frontend& frontend;
-        Executor* executor;
-        glm::Session* session;
-    } instance{f.frontend, &f.executor, &f.session};
+    auto instance  = make_engine_instance(definition, plan(*definition, true));
+    auto& executor = static_cast<Executor&>(*instance.replicas.front()->executor);
+    auto& frontend = instance.frontend;
 
     EngineOptions options;
     options.max_context           = 256;
     options.max_concurrency       = 3;
     options.context_cache.enabled = false;
-    f.executor.hold_poll          = true;
-    rt::EngineCore<Instance> engine(instance, options, {});
-    auto prompt        = f.frontend.prepare_tokens(std::vector<TokenId>(128, 0), true);
+    executor.hold_poll            = true;
+    rt::EngineCoordinator<decltype(instance)> engine(instance, options, {});
+    auto prompt        = frontend.prepare_tokens(std::vector<TokenId>(128, 0), true);
     const auto summary = prompt.summary();
     rt::ResolvedRequestOptions request;
     request.execution.requested_output_tokens = 100;
@@ -1548,7 +1552,7 @@ void engine_stop(std::shared_ptr<const glm::ModelDefinition> definition) {
     const auto snapshot = engine.snapshot();
     require(snapshot.status == EngineStatus::Stopping && !snapshot.runtime.running_requests &&
                 !snapshot.runtime.waiting_requests && !snapshot.runtime.state_objects &&
-                !snapshot.runtime.history_objects && !f.executor.has_pending_work(),
+                !snapshot.runtime.history_objects && !executor.has_pending_work(),
             "stop retained pending work or Context ownership");
 }
 
@@ -1615,26 +1619,15 @@ struct DeferredExecutionRuntime : glm::RuntimeTypes {
 
 void execution_decision_survives_deferral(std::shared_ptr<const glm::ModelDefinition> definition) {
     auto layout   = plan(*definition);
-    auto frontend = make_frontend();
-    Executor executor({layout.shape, layout.batches, definition->config().text.vocabulary,
-                       definition->resources().text.public_token_count, 2});
-    DeferredExecutionSession session(
-        glm::prepare_session(definition, layout,
-                             std::make_unique<ctx::ContextDirectory>(layout.context)),
-        executor);
-
-    struct Instance {
-        using ModelContract = DeferredExecutionRuntime;
-        glm::Frontend& frontend;
-        Executor* executor;
-        DeferredExecutionSession* session;
-    } instance{frontend, &executor, &session};
+    auto instance  = make_engine_instance<DeferredExecutionRuntime>(definition, layout);
+    auto& frontend = instance.frontend;
+    auto& session  = *instance.replicas.front()->session;
 
     EngineOptions options;
     options.max_context           = 256;
     options.max_concurrency       = 3;
     options.context_cache.enabled = true;
-    rt::EngineCore<Instance> engine(instance, options, {});
+    rt::EngineCoordinator<decltype(instance)> engine(instance, options, {});
     rt::ResolvedRequestOptions request;
     request.execution.requested_output_tokens = 1;
     request.execution.allow_prefix_reuse      = true;
@@ -1736,30 +1729,20 @@ void engine_packed_prefill(std::shared_ptr<const glm::ModelDefinition> definitio
                            bool cancel_in_flight = false) {
     auto layout                = plan(*definition);
     layout.shape.prefill_chunk = 128;
-    auto frontend              = make_frontend();
-    Executor executor({layout.shape, layout.batches, definition->config().text.vocabulary,
-                       definition->resources().text.public_token_count, 2});
-    PackedPrefillSession session(
-        glm::prepare_session(definition, layout,
-                             std::make_unique<ctx::ContextDirectory>(layout.context)),
-        executor);
-
-    struct Instance {
-        using ModelContract = PackedPrefillRuntime;
-        glm::Frontend& frontend;
-        Executor* executor;
-        PackedPrefillSession* session;
-    } instance{frontend, &executor, &session};
+    auto instance              = make_engine_instance<PackedPrefillRuntime>(definition, layout);
+    auto& frontend             = instance.frontend;
+    auto& session              = *instance.replicas.front()->session;
 
     EngineOptions options;
     options.max_context            = 256;
     options.max_concurrency        = 3;
     options.context_cache.enabled  = true;
+    auto& executor                 = static_cast<Executor&>(*instance.replicas.front()->executor);
     executor.hold_poll             = true;
     executor.defer_binding         = 2;
     executor.deferred_bind_flushes = 8;
     executor.hold_mixed_prefill    = cancel_in_flight;
-    rt::EngineCore<Instance> engine(instance, options, {});
+    rt::EngineCoordinator<decltype(instance)> engine(instance, options, {});
     const auto submit = [&](std::uint32_t length, TokenId token, bool cache, bool stream = false) {
         auto prompt        = frontend.prepare_tokens(std::vector<TokenId>(length, token), cache);
         const auto summary = prompt.summary();
@@ -1829,25 +1812,15 @@ void engine_packed_prefill(std::shared_ptr<const glm::ModelDefinition> definitio
 
 void independent_prefill(std::shared_ptr<const glm::ModelDefinition> definition) {
     auto layout   = plan(*definition);
-    auto frontend = make_frontend();
-    Executor executor({layout.shape, layout.batches, definition->config().text.vocabulary,
-                       definition->resources().text.public_token_count, 2});
-    WaitingCaptureSession session(
-        glm::prepare_session(definition, layout,
-                             std::make_unique<ctx::ContextDirectory>(layout.context)),
-        executor);
-
-    struct Instance {
-        using ModelContract = WaitingCaptureRuntime;
-        glm::Frontend& frontend;
-        Executor* executor;
-        WaitingCaptureSession* session;
-    } instance{frontend, &executor, &session};
+    auto instance  = make_engine_instance<WaitingCaptureRuntime>(definition, layout);
+    auto& frontend = instance.frontend;
+    auto& executor = static_cast<Executor&>(*instance.replicas.front()->executor);
+    auto& session  = *instance.replicas.front()->session;
 
     EngineOptions options;
     options.max_context     = 256;
     options.max_concurrency = 3;
-    rt::EngineCore<Instance> engine(instance, options, {});
+    rt::EngineCoordinator<decltype(instance)> engine(instance, options, {});
     rt::ResolvedRequestOptions request;
     request.execution.requested_output_tokens = 1;
     request.output.raw                        = true;
@@ -1876,27 +1849,22 @@ void independent_prefill(std::shared_ptr<const glm::ModelDefinition> definition)
 }
 
 void cancelled_prefix_statistics(std::shared_ptr<const glm::ModelDefinition> definition) {
-    Fixture f(definition);
-
-    struct Instance {
-        using ModelContract = glm::RuntimeTypes;
-        glm::Frontend& frontend;
-        Executor* executor;
-        glm::Session* session;
-    } instance{f.frontend, &f.executor, &f.session};
+    auto instance  = make_engine_instance(definition, plan(*definition));
+    auto& executor = static_cast<Executor&>(*instance.replicas.front()->executor);
+    auto& frontend = instance.frontend;
 
     EngineOptions options;
     options.max_context              = 256;
     options.max_concurrency          = 3;
     options.context_cache.enabled    = true;
-    f.executor.hold_prefill_frontier = 128;
-    rt::EngineCore<Instance> engine(instance, options, {});
+    executor.hold_prefill_frontier   = 128;
+    rt::EngineCoordinator<decltype(instance)> engine(instance, options, {});
     rt::ResolvedRequestOptions request;
     request.execution.requested_output_tokens = 1;
     request.output.raw                        = true;
     request.stop.include_model_defaults       = false;
     auto submit                               = [&](unsigned length) {
-        auto prompt        = f.frontend.prepare_tokens(std::vector<TokenId>(length, 0), true);
+        auto prompt        = frontend.prepare_tokens(std::vector<TokenId>(length, 0), true);
         const auto summary = prompt.summary();
         return engine.submit(std::move(prompt), summary, 0, request, OutputConsumerMode::Aggregate,
                                                            {});
@@ -1908,14 +1876,14 @@ void cancelled_prefix_statistics(std::shared_ptr<const glm::ModelDefinition> def
     (void)engine.measure({rt::MeasurementAction::Reset});
     auto pending        = submit(224);
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-    while (!f.executor.hold_poll && std::chrono::steady_clock::now() < deadline)
+    while (!executor.hold_poll && std::chrono::steady_clock::now() < deadline)
         std::this_thread::yield();
-    require(f.executor.hold_poll, "cancellation fixture did not reach partial prefill");
+    require(executor.hold_poll, "cancellation fixture did not reach partial prefill");
     unsigned checks      = 0;
     const auto cancelled = pending.wait(nullptr, CancellationView([&] {
                                             // The first check publishes cancellation; the next
                                             // allows its device reader to retire.
-                                            if (++checks == 2) f.executor.hold_poll = false;
+                                            if (++checks == 2) executor.hold_poll = false;
                                             return true;
                                         }));
     require(cancelled.finish_reason == FinishReason::Cancelled &&
@@ -1929,7 +1897,7 @@ void cancelled_prefix_statistics(std::shared_ptr<const glm::ModelDefinition> def
                 cancelled.stats.computed_prefill_tokens < 224 - 64,
             "cancelled prefill lost its admitted prefix or completed work");
     (void)engine.measure({rt::MeasurementAction::Reset});
-    require(!engine.snapshot().runtime.running_requests && !f.executor.has_pending_work(),
+    require(!engine.snapshot().runtime.running_requests && !executor.has_pending_work(),
             "cancelled prefill retained execution resources");
 }
 

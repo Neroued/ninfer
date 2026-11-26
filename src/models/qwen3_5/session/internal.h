@@ -297,6 +297,9 @@ public:
     explicit SessionImpl(SessionPlan);
     std::uint64_t next_lane_mark();
     ~SessionImpl();
+    [[nodiscard]] RequestBasePlan
+    plan_request(std::shared_ptr<const qwen::PreparedPromptData> prompt,
+                 const runtime::ResolvedExecutionOptions& options);
     [[nodiscard]] RequestBasePlan plan_request(qwen::PreparedPromptData&& prompt,
                                                const runtime::ResolvedExecutionOptions& options);
     [[nodiscard]] std::optional<SourceCandidate>

@@ -60,7 +60,7 @@ public:
         void reset() noexcept {
             if (owner_) {
                 if (!owner_->valid(handle_) || !owner_->slot(handle_.index).pins) std::terminate();
-                --owner_->slot(handle_.index).pins;
+                if (--owner_->slot(handle_.index).pins == 0) ++owner_->lease_revision_;
                 owner_ = nullptr;
             }
         }
@@ -178,8 +178,11 @@ public:
         return sizeof(*this) + (slots_ ? slots_->storage_bytes() : 0);
     }
 
-    // Semantic index lifetime; residency and leases do not change immutable checkpoint identity.
+    // Semantic index lifetime; residency and leases do not change checkpoint identity.
     [[nodiscard]] const std::uint64_t& revision() const noexcept { return revision_; }
+
+    // Advances when the last pin is released and a checkpoint becomes evictable.
+    [[nodiscard]] std::uint64_t lease_revision() const noexcept { return lease_revision_; }
 
     [[nodiscard]] const Slot& operator[](std::size_t index) const { return slot(index); }
 
@@ -348,5 +351,6 @@ private:
     MetadataCapacity* index_       = nullptr;
     std::uint64_t next_generation_ = 0;
     std::uint64_t revision_        = 1;
+    std::uint64_t lease_revision_  = 0;
 };
 } // namespace ninfer::models::context

@@ -63,8 +63,8 @@ static_assert(SpeculativeLengthPolicy{} == SpeculativeLengthPolicy::Adaptive);
 struct SpeculativeOptions {
     SpeculativeBackend backend = SpeculativeBackend::None;
     // Startup-fixed K: MTP 1..5; DFlash and DFlash2 1..15 (query width K+1).
-    std::uint32_t draft_tokens = 0;
-    ProposalHead proposal_head = ProposalHead::Full;
+    std::uint32_t draft_tokens            = 0;
+    ProposalHead proposal_head            = ProposalHead::Full;
     SpeculativeLengthPolicy length_policy = SpeculativeLengthPolicy::Adaptive;
 };
 
@@ -135,6 +135,9 @@ struct ContextCacheOptions {
     std::optional<std::size_t> host_capacity_bytes;
     // Target spacing for optional intermediate prefill checkpoints.
     std::uint32_t checkpoint_interval = 8192;
+    // Optional cap on unique advertised checkpoints retained per replica; unleased excess
+    // checkpoints are evicted without building full recovery-cost cursors.
+    std::optional<std::uint32_t> max_cached_checkpoints_per_replica;
 };
 
 struct ContextCostOptions {
@@ -742,6 +745,8 @@ struct GenerationObservationOptions {
     // Optional for either consumer mode. No scheduling events are retained when unset.
     GenerationSchedulingObserver scheduling;
     GenerationFirstTokenObserver first_token;
+    // Reports the assigned replica on the consumer thread before a request error is rethrown.
+    std::function<void(std::uint32_t)> error_replica;
 };
 
 class CancellationView {
@@ -764,7 +769,8 @@ struct PreparationControl {
 
 struct RequestStats {
     // Unique within this Engine instance; diagnostic correlation only.
-    std::uint64_t engine_request_id    = 0;
+    std::uint64_t engine_request_id = 0;
+    std::optional<std::uint32_t> replica_id;
     std::uint32_t reused_prompt_tokens = 0;
     // Completed initial prefill, excluding cached tokens and separately counted replay work.
     std::uint32_t computed_prefill_tokens = 0;
@@ -794,6 +800,7 @@ struct GenerationResult {
     std::uint32_t reasoning_tokens = 0;
     FinishReason finish_reason     = FinishReason::None;
     std::optional<std::string> matched_stop_string;
+    std::optional<std::uint32_t> replica_id;
     RequestStats stats;
 };
 

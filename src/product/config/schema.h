@@ -27,6 +27,7 @@ enum class Field {
     PrefixReuse,
     CheckpointInterval,
     HostCapacity,
+    MaxCachedCheckpointsPerReplica,
     CostPresets,
     SpecBackend,
     DraftTokens,
@@ -109,6 +110,7 @@ using StartupPatch = std::array<std::optional<Assignment>, static_cast<std::size
 struct FileConfiguration {
     StartupPatch fields;
     std::optional<DeploymentOptions> deployment;
+    bool auto_expanded_shared_ranks = false;
     std::map<std::string, ConfigSource, std::less<>> deployment_sources;
 };
 

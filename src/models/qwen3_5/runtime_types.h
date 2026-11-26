@@ -13,6 +13,7 @@ struct RuntimeTypes {
     using Profile           = execution::ModelProfile;
     using Frontend          = qwen::Frontend;
     using PreparedPrompt    = qwen::PreparedPrompt;
+    using PromptPrefixKeyer = qwen::PromptPrefixKeyer;
     using OutputSession     = models::frontend::OutputSession;
     using PublishedOutput   = models::frontend::PublishedOutput;
     using SequencePlanner   = qwen3_5::SequencePlanner;

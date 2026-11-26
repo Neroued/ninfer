@@ -14,8 +14,10 @@ struct RankPlan {
     std::uint32_t rank = 0, size = 1, ep_size = 1;
     IndexRange kda_heads, vocabulary, dense_intermediate, shared_intermediate;
     std::optional<DraftPartition> draft;
+    std::vector<WeightId> whole;
     std::vector<ParameterAssembly> assemblies;
     std::vector<ExpertPartition> experts;
+    std::vector<WeightId> omitted;
 };
 
 struct ParallelPlan {
@@ -23,6 +25,8 @@ struct ParallelPlan {
     std::vector<RankPlan> ranks;
 };
 
+[[nodiscard]] std::uint64_t compute_rank_shard_digest(const artifact::ArtifactId&, LoadOptions,
+                                                      const RankPlan&);
 [[nodiscard]] RankPlan plan_single_rank(const ModelDefinition&);
 [[nodiscard]] ParallelPlan plan_parallel(const ModelDefinition&, const DeploymentOptions&);
 

@@ -413,21 +413,17 @@ int coordinator(int argc, char** argv) {
             if (bytes % (2ULL * o.width))
                 throw std::invalid_argument("pipeline payload must contain whole RMSNorm rows");
     if (maximum > (1ULL << 30)) throw std::invalid_argument("benchmark payload exceeds 1 GiB");
-    const auto deployment = product::read_deployment_file(o.config);
+    auto deployment = product::read_deployment_file(o.config);
     if (deployment.ranks.size() != 2)
         throw std::invalid_argument("collective benchmark requires two ranks");
-    dist::ExecutionTopology topology;
-    topology.plan        = 1;
-    topology.output_rank = 0;
-    topology.ranks.resize(2);
-    for (const auto& r : deployment.ranks)
-        topology.ranks[r.rank] = {r.rank, r.node, 0, r.device, {r.rank, 2}, {r.rank, 2}, {}, {}};
-    topology.groups = {{0,
-                        {0, 1},
-                        (o.operation == "peer" || o.operation == "send")
-                            ? dist::GroupUsage::PeerExchange
-                            : dist::GroupUsage::General}};
-    topology.roles  = {{"tp", 0}, {"ep", 0}};
+    deployment.parallel = {.tp = 2, .ep = 2, .dp = 1, .pp = 1, .adp = 1};
+    auto topology       = dist::build_cluster_topology(deployment);
+    topology.groups     = {{0,
+                            {0, 1},
+                            (o.operation == "peer" || o.operation == "send")
+                                ? dist::GroupUsage::PeerExchange
+                                : dist::GroupUsage::General}};
+    topology.roles      = {{"tp", 0}, {"ep", 0}};
     const std::array<std::string, 4> args{"--worker", o.backend, std::to_string(maximum),
                                           o.operation};
     dist::ExecutionGroup group(

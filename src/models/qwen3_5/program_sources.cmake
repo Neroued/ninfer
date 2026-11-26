@@ -23,3 +23,13 @@ target_sources(ninfer_model_execution PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/program/planning/moe.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/planning/moe_priority.cpp"
 )
+
+if(NINFER_ENABLE_DISTRIBUTED)
+  target_sources(ninfer_model_execution PRIVATE
+    "${CMAKE_CURRENT_LIST_DIR}/parallel/preparation.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/parallel/startup.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/parallel/codec.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/parallel/inputs.cpp"
+  )
+  target_link_libraries(ninfer_model_execution PRIVATE ninfer_runtime_distributed)
+endif()

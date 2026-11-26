@@ -6,6 +6,8 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -17,6 +19,7 @@ struct CpuProcessor {
     std::uint32_t cpu = 0;
     std::optional<std::uint32_t> core;
     std::optional<std::uint32_t> cache;
+    std::optional<std::uint32_t> numa;
 };
 
 struct CpuCache {
@@ -31,15 +34,21 @@ struct CpuTopologyInfo {
     std::vector<CpuCache> caches;
 };
 
-// A snapshot limited to the discovering thread's allowed affinity. Discovery does not bind it.
+enum class CpuDiscoveryScope : std::uint8_t {
+    CurrentThread, // Limited to the discovering thread's inherited affinity.
+    AllowedNode    // Whole OS-allowed machine topology, including PCIe/NUMA locality.
+};
+
+// Discovery does not change the calling thread's CPU binding.
 class CpuTopology {
 public:
-    CpuTopology();
+    explicit CpuTopology(CpuDiscoveryScope scope = CpuDiscoveryScope::CurrentThread);
     ~CpuTopology();
     CpuTopology(const CpuTopology&)            = delete;
     CpuTopology& operator=(const CpuTopology&) = delete;
 
     [[nodiscard]] const CpuTopologyInfo& info() const noexcept;
+    [[nodiscard]] CpuAffinity device_locality_cpus(std::string_view pci_bus_id) const;
 
 private:
     struct Impl;
@@ -51,6 +60,12 @@ private:
 [[nodiscard]] CpuAffinity current_thread_affinity(const CpuTopology&);
 // Only changes the calling thread; requested CPUs must belong to the snapshot.
 void bind_current_thread(const CpuTopology&, std::span<const std::uint32_t> cpus);
+
+// Assigns each available core once, preferring workers whose GPU is local to the core.
+// Locality lists are indexed by node-local rank. When physical cores are oversubscribed,
+// SMT siblings may be assigned separately before any logical CPUs are shared.
+[[nodiscard]] std::vector<CpuAffinity>
+plan_node_worker_affinity(const CpuTopologyInfo&, std::span<const CpuAffinity> localities);
 
 struct CpuTeamPlan {
     CpuAffinity worker_cpus; // One fixed CPU per worker; order defines rank.
@@ -102,6 +117,8 @@ struct CpuIdentity {
 [[nodiscard]] CpuFeatures current_cpu_features() noexcept;
 
 namespace cpu_detail {
+
+[[nodiscard]] std::optional<std::string> canonical_pci_bus_id(std::string_view);
 
 struct FeatureRegisters {
     std::uint32_t leaf1_ecx = 0, leaf7_0_ebx = 0, leaf7_0_ecx = 0, leaf7_1_eax = 0;

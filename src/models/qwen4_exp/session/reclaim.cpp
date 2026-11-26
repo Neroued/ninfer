@@ -726,7 +726,7 @@ runtime::PauseCostQuote Session::pause_cost(SequenceHandle h, const PauseOption&
         s.phase == detail::Phase::Replay ? s.replay_target : s.continuation.metadata.main_frontier;
     const auto work = [&](std::uint32_t begin) {
         return models::vision::recovery_work(
-            s.request->prompt.vision_items, [](const auto& item) -> const auto& { return item; },
+            s.request->prompt->vision_items, [](const auto& item) -> const auto& { return item; },
             begin, end, p.shape.prefill_chunk, p.plan.vision_max_features);
     };
     runtime::PauseCostQuote quote;

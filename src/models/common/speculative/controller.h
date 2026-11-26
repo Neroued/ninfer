@@ -3,6 +3,15 @@
 #include "models/common/speculative/cost_model.h"
 #include "runtime/contract/execution.h"
 
+namespace ninfer::models {
+namespace speculative {
+struct SequenceSpeculativeState;
+}
+void encode_speculative_state(distributed::wire::Encoder&,
+                              const speculative::SequenceSpeculativeState&);
+speculative::SequenceSpeculativeState decode_speculative_state(distributed::wire::Decoder&);
+} // namespace ninfer::models
+
 namespace ninfer::models::speculative {
 
 inline constexpr std::uint32_t kMaxSpeculativeDrafts = 15;
@@ -16,6 +25,10 @@ struct SequenceSpeculativeState {
     [[nodiscard]] float draft_attempt_weight(std::uint32_t position) const noexcept;
 
 private:
+    friend void models::encode_speculative_state(distributed::wire::Encoder&,
+                                                 const SequenceSpeculativeState&);
+    friend SequenceSpeculativeState models::decode_speculative_state(distributed::wire::Decoder&);
+
     void decay(float factor) noexcept;
 
     std::array<float, kMaxSpeculativeDrafts> attempts_{};

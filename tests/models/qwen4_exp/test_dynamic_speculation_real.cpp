@@ -143,7 +143,8 @@ int main(int argc, char** argv) {
                     auto built = runtime::detail::build_distributed_model<q::ParallelStartup>(
                         reader, o, std::chrono::steady_clock::now());
                     auto& instance = *built.instance;
-                    exercise(*instance.session, *instance.executor, instance.frontend, o,
+                    auto& replica  = *instance.replicas.front();
+                    exercise(*replica.session, *replica.executor, instance.frontend, o,
                              graph ? ExecutionPath::Graph : ExecutionPath::Eager,
                              instance.definition->config().text.hidden);
                     continue;

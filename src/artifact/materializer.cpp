@@ -286,6 +286,26 @@ bool MaterializedArtifact::has_device(ObjectHandle handle) const noexcept {
            tensors_[object_storage_[handle.index]->index].device.has_value();
 }
 
+std::size_t cuda_weight_staging_headroom(const Reader& reader) {
+    std::size_t block_bytes = 0, alignment = 1;
+    for (std::size_t file = 0; file < reader.directory().files.size(); ++file) {
+        if (!reader.directory().files[file].payload_bytes) continue;
+        try {
+            const auto source = reader.open_file(file, io::ReadMode::Direct);
+            const auto view   = source.view();
+            block_bytes       = std::max(
+                block_bytes, static_cast<std::size_t>(align_up(
+                                 kReadBlockBytes, view.offset_alignment, "direct read block")));
+            alignment = std::max(alignment, view.memory_alignment);
+        } catch (const ArtifactError&) {
+            // The rank's materialization reports errors for the files it actually uses.
+        }
+    }
+    return checked_add(checked_mul(Slot::allocation_bytes(block_bytes, alignment, true),
+                                   kMaximumSlotCount, "weight staging"),
+                       kCsfRepackScratchBytes, "CSF staging");
+}
+
 MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& plan,
                                  std::optional<CudaExecutionView> execution,
                                  const StartupObserver* startup_observer) {

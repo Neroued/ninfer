@@ -27,8 +27,10 @@ void encode_rank_load(Encoder& out, const RankLoadRequest& request) {
     for (auto r : {p.gdn_keys, p.gdn_values, p.qsa_queries, p.qsa_kv, p.vocabulary, p.ple_shards})
         range(out, r);
     out.u32(p.shared_intermediate);
+    encode_weight_ids(out, p.whole);
     encode_assemblies(out, p.assemblies);
     encode_expert_partitions(out, p.experts);
+    encode_weight_ids(out, p.omitted);
     encode_rank_options(out, request.options);
     encode_batch_execution_spec(out, request.batches);
     out.u64(request.host_reservation_bytes);
@@ -51,8 +53,10 @@ RankLoadRequest decode_rank_load(Decoder& in) {
     p.vocabulary                   = range(in);
     p.ple_shards                   = range(in);
     p.shared_intermediate          = in.u32();
+    p.whole                        = decode_weight_ids(in);
     p.assemblies                   = decode_assemblies(in);
     p.experts                      = decode_expert_partitions(in);
+    p.omitted                      = decode_weight_ids(in);
     request.options                = decode_rank_options(in);
     request.batches                = decode_batch_execution_spec(in);
     request.host_reservation_bytes = in.u64();

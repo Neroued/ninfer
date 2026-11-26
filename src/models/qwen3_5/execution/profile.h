@@ -13,6 +13,10 @@
 #include <variant>
 #include <vector>
 
+namespace ninfer::models::moe {
+struct ExpertDescription;
+}
+
 namespace ninfer::models::qwen3_5 {
 class ModelDefinition;
 
@@ -97,7 +101,8 @@ struct ModelProfile {
     std::optional<ProposalProfile> proposal;
 };
 
-[[nodiscard]] std::shared_ptr<const ModelProfile> describe_model(const ModelDefinition&);
+[[nodiscard]] std::shared_ptr<const ModelProfile>
+describe_model(const ModelDefinition&, std::span<const moe::ExpertDescription> = {});
 
 } // namespace execution
 } // namespace ninfer::models::qwen3_5

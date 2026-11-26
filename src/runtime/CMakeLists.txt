@@ -4,6 +4,7 @@ add_library(ninfer_runtime_support STATIC
   engine/context_cache/capture_policy.cpp
   engine/context_cache/placement_policy.cpp
   engine/context_capacity.cpp
+  engine/dp_router.cpp
   engine/startup_memory.cpp
   engine/public_types.cpp
   executor/measurement.cpp

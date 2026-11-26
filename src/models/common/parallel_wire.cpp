@@ -87,6 +87,17 @@ std::vector<ExpertPartition> decode_expert_partitions(Decoder& in) {
     return partitions;
 }
 
+void encode_weight_ids(Encoder& out, std::span<const WeightId> ids) {
+    out.u64(ids.size());
+    for (const auto id : ids) out.u64(id.index);
+}
+
+std::vector<WeightId> decode_weight_ids(Decoder& in) {
+    std::vector<WeightId> ids(in.count(8));
+    for (auto& id : ids) id = {in.u64()};
+    return ids;
+}
+
 void encode_assemblies(Encoder& out, std::span<const ParameterAssembly> assemblies) {
     out.u64(assemblies.size());
     for (const auto& a : assemblies) {
@@ -147,7 +158,11 @@ void encode_rank_options(Encoder& out, const EngineOptions& o) {
     out.boolean(o.observability.gpu_timing);
     out.boolean(o.context_cache.enabled);
     out.u32(o.context_cache.checkpoint_interval);
-    out.u64(o.context_cache.host_capacity_bytes.value_or(0));
+    out.boolean(o.context_cache.host_capacity_bytes.has_value());
+    if (o.context_cache.host_capacity_bytes) out.u64(*o.context_cache.host_capacity_bytes);
+    out.boolean(o.context_cache.max_cached_checkpoints_per_replica.has_value());
+    if (o.context_cache.max_cached_checkpoints_per_replica)
+        out.u32(*o.context_cache.max_cached_checkpoints_per_replica);
 }
 
 EngineOptions decode_rank_options(Decoder& in) {
@@ -168,8 +183,93 @@ EngineOptions decode_rank_options(Decoder& in) {
     o.observability.gpu_timing          = in.boolean();
     o.context_cache.enabled             = in.boolean();
     o.context_cache.checkpoint_interval = in.u32();
-    o.context_cache.host_capacity_bytes = in.u64();
+    if (in.boolean()) o.context_cache.host_capacity_bytes = in.u64();
+    if (in.boolean()) o.context_cache.max_cached_checkpoints_per_replica = in.u32();
     return o;
+}
+
+void encode_speculative_state(Encoder& out, const speculative::SequenceSpeculativeState& s) {
+    for (float v : s.attempts_) out.f32(v);
+    for (float v : s.accepts_) out.f32(v);
+    out.boolean(s.last_target_top1_prob_.has_value());
+    if (s.last_target_top1_prob_) out.f32(*s.last_target_top1_prob_);
+    for (std::uint16_t v : s.last_draft_confidences_) out.u16(v);
+    out.u8(s.last_draft_count_);
+}
+
+speculative::SequenceSpeculativeState decode_speculative_state(Decoder& in) {
+    speculative::SequenceSpeculativeState s;
+    for (float& v : s.attempts_) v = in.f32();
+    for (float& v : s.accepts_) v = in.f32();
+    if (in.boolean()) s.last_target_top1_prob_ = in.f32();
+    for (std::uint16_t& v : s.last_draft_confidences_) v = in.u16();
+    s.last_draft_count_ = in.u8();
+    if (s.last_draft_count_ > speculative::kMaxSpeculativeDrafts) {
+        throw std::invalid_argument("speculative state draft count exceeds window maximum");
+    }
+    return s;
+}
+
+void encode_speculative_cost_model(Encoder& out, const speculative::SpeculativeCostModel& m) {
+    const auto& cfg = m.config_;
+    out.u8(static_cast<std::uint8_t>(cfg.backend));
+    out.u32(cfg.max_drafts);
+    out.u32(cfg.owner_count);
+    out.u32(cfg.num_experts);
+    out.u32(cfg.experts_per_token);
+    out.u32(cfg.hybrid_max_tokens);
+    for (double w : m.weights_) out.f64(w);
+    out.boolean(m.calibration_.fitted);
+    out.u64(m.calibration_.anchor_count);
+    out.f64(m.calibration_.calibration_elapsed_ms);
+    out.u64(m.calibration_.online_cell_count);
+    out.u64(m.online_.size());
+    for (const auto& [key, cell] : m.online_) {
+        out.u32(key.rows);
+        out.u32(key.width);
+        out.u32(key.mtp_steps);
+        out.u32(key.head_columns);
+        out.u8(static_cast<std::uint8_t>(key.target_bucket));
+        out.boolean(key.full_resident);
+        out.f64(cell.weighted_sum);
+        out.f64(cell.weighted_count);
+    }
+}
+
+speculative::SpeculativeCostModel decode_speculative_cost_model(Decoder& in) {
+    speculative::CostModelConfig cfg;
+    cfg.backend           = static_cast<SpeculativeBackend>(in.u8());
+    cfg.max_drafts        = in.u32();
+    cfg.owner_count       = in.u32();
+    cfg.num_experts       = in.u32();
+    cfg.experts_per_token = in.u32();
+    cfg.hybrid_max_tokens = in.u32();
+    speculative::SpeculativeCostModel out(cfg);
+    for (double& w : out.weights_) w = in.f64();
+    out.calibration_.fitted                 = in.boolean();
+    out.calibration_.anchor_count           = in.u64();
+    out.calibration_.calibration_elapsed_ms = in.f64();
+    out.calibration_.online_cell_count      = in.u64();
+    const auto count                        = in.count(kSpeculativeCostCellWireBytes);
+    if (count > speculative::kMaxOnlineSpeculativeCostCells)
+        throw std::invalid_argument("speculative cost table exceeds its cell capacity");
+    for (std::size_t n = 0; n < count; ++n) {
+        speculative::SpeculativeCostModel::OnlineCellKey key{
+            .rows          = in.u32(),
+            .width         = in.u32(),
+            .mtp_steps     = in.u32(),
+            .head_columns  = in.u32(),
+            .target_bucket = static_cast<ops::ContextBucket>(in.u8()),
+            .full_resident = in.boolean(),
+        };
+        speculative::SpeculativeCostModel::OnlineCell cell{
+            .weighted_sum   = in.f64(),
+            .weighted_count = in.f64(),
+        };
+        if (!ops::valid_context_bucket(key.target_bucket) || !out.online_.emplace(key, cell).second)
+            throw std::invalid_argument("invalid or duplicate speculative cost cell");
+    }
+    return out;
 }
 
 } // namespace ninfer::models

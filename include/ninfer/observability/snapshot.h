@@ -161,6 +161,7 @@ struct RankDescriptor {
 struct PlacementDescriptor {
     std::uint32_t id = 0;
     std::vector<std::uint32_t> attention_ranks;
+    std::uint32_t replica_id = 0;
 };
 
 struct EngineDescription {
@@ -222,9 +223,23 @@ struct ScoringStatistics {
     DurationCounter wall;
 };
 
+struct ReplicaSnapshot {
+    std::uint32_t replica_id                        = 0;
+    bool healthy                                    = true;
+    EngineStatus status                             = EngineStatus::Ready;
+    std::uint64_t available_context_tokens_estimate = 0;
+    std::optional<std::uint64_t> progress_owner;
+    RuntimeStats runtime;
+    ExecutionStatistics executions{};
+    std::vector<ExecutionCounters> decode_by_batch;
+    std::vector<ExecutionProgress> in_flight;
+    std::vector<RankSnapshot> ranks;
+};
+
 struct EngineSnapshot {
     MediaCacheSummary media;
     SnapshotStamp stamp;
+    std::uint64_t available_context_tokens_estimate = 0;
     RuntimeStats runtime;
     ExecutionStatistics executions{};
     // Entry B-1 counts each retired decode batch once, independent of request exposure.
@@ -232,10 +247,14 @@ struct EngineSnapshot {
     std::vector<ExecutionProgress> in_flight;
     EngineStatus status = EngineStatus::Ready;
     std::optional<std::uint64_t> progress_owner;
+    std::optional<std::uint32_t> progress_owner_replica;
     // Absent unless explicitly requested; an empty included vector means no live requests.
     std::optional<std::vector<RequestSnapshot>> requests;
     ScoringStatistics scoring;
     std::vector<RankSnapshot> ranks;
+    std::vector<PhysicalDeviceMemorySample> physical_devices;
+    std::vector<PhysicalNodeMemorySample> physical_nodes;
+    std::vector<ReplicaSnapshot> replicas;
 };
 
 } // namespace ninfer

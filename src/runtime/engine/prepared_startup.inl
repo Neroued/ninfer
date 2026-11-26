@@ -86,7 +86,8 @@ build_prepared_local_model(const artifact::Reader& reader, EngineOptions& option
         const auto offered = std::min(no_graphs ? room : report.capacity.available_bytes,
                                       maximum_runtime);
         return resolve_context_capacity(options.context_capacity, report.capacity.plan, offered,
-                                        budget.available_host(snapshot), snapshot.shared_physical_memory);
+                                        budget.available_host(snapshot),
+                                        snapshot.shared_physical_memory, true, options.purpose);
     };
     const auto gated_capacity = [&](const DeviceMemorySnapshot& before) {
         auto value = resolve(before);

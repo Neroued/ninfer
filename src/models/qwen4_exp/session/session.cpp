@@ -244,8 +244,9 @@ WorkRow SessionImpl::work_row(const Sequence& s, std::uint32_t tokens) const {
     s.ledger.copy(start, start + tokens, row.ids);
     row.rope_positions.resize(3ULL * tokens);
     const auto position = [&](std::uint32_t p, std::uint32_t axis) {
-        return p < s.request->prompt.token_ids.size() ? s.request->prompt.position_axis(axis)[p]
-                                                      : static_cast<std::int32_t>(p) + m.rope_delta;
+        return p < s.request->prompt->token_ids.size()
+                   ? s.request->prompt->position_axis(axis)[p]
+                   : static_cast<std::int32_t>(p) + m.rope_delta;
     };
     for (std::uint32_t axis = 0; axis < 3; ++axis) {
         row.previous_rope[axis] = start ? position(start - 1, axis) : 0;

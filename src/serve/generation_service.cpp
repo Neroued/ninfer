@@ -380,11 +380,20 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
                                            ninfer::GenerationObservationOptions observation,
                                            std::function<bool()> is_cancelled,
                                            ContextCacheHints context_cache) const {
-    return prepare_impl(request, consumer_mode, std::move(observation), std::move(is_cancelled),
-                        std::move(context_cache),
-                        options_.launch.engine.context_cache.enabled ? CacheParticipation::ReadWrite
-                                                                     : CacheParticipation::Disabled,
-                        DeadlinePolicy::ClientPendingTimeout);
+    auto error_replica = std::make_shared<std::atomic<std::optional<std::uint32_t>>>(std::nullopt);
+    observation.error_replica =
+        [error_replica, callback = std::move(observation.error_replica)](std::uint32_t replica_id) {
+            error_replica->store(replica_id, std::memory_order_relaxed);
+            if (callback) callback(replica_id);
+        };
+    auto prepared =
+        prepare_impl(request, consumer_mode, std::move(observation), std::move(is_cancelled),
+                     std::move(context_cache),
+                     options_.launch.engine.context_cache.enabled ? CacheParticipation::ReadWrite
+                                                                  : CacheParticipation::Disabled,
+                     DeadlinePolicy::ClientPendingTimeout);
+    prepared.error_replica = std::move(error_replica);
+    return prepared;
 }
 
 PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request,

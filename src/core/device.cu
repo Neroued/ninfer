@@ -1,5 +1,7 @@
 #include "core/device.h"
 
+#include <cuda_profiler_api.h>
+
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
@@ -68,6 +70,12 @@ void cuda_check(cudaError_t err, const char* expr, const char* file, int line) {
                  cudaGetErrorName(err), cudaGetErrorString(err));
     std::abort();
 }
+
+void start_device_profiler() { CUDA_CHECK(cudaProfilerStart()); }
+
+void stop_device_profiler() { CUDA_CHECK(cudaProfilerStop()); }
+
+void cancel_device_profiler() noexcept { (void)cudaProfilerStop(); }
 
 DeviceContext::DeviceContext(int device_id) : device_(Device::cuda(device_id)) {
     const unsigned int sync_flags = sync_schedule_from_environment();

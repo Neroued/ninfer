@@ -42,6 +42,7 @@ struct SequencePlanningInputs {
     bool use_cuda_graph               = true;
     bool causal_scoring               = false;
     std::int32_t multiprocessor_count = 0;
+    bool shared_physical_memory       = false;
     ContextCacheOptions context_cache;
     std::size_t vision_memory_budget_bytes = 0;
 };

@@ -5,6 +5,10 @@
 namespace ninfer::runtime {
 
 [[nodiscard]] std::size_t device_budget(std::size_t available);
+[[nodiscard]] std::size_t host_memory_shortfall(DeviceMemorySnapshot, std::size_t reservation);
+[[nodiscard]] std::int64_t retained_startup_bytes(DeviceMemorySnapshot before,
+                                                  DeviceMemorySnapshot after,
+                                                  std::size_t owned_bytes);
 
 // Startup has one Device owner. Snapshots are taken with its transfers and work settled.
 // Re-read after destroying a candidate: retained driver storage is already charged.
@@ -19,6 +23,10 @@ public:
     [[nodiscard]] std::size_t available_host(DeviceMemorySnapshot current) const noexcept;
     [[nodiscard]] bool fits(DeviceMemorySnapshot current) const noexcept;
     [[nodiscard]] std::size_t shortfall(DeviceMemorySnapshot current) const noexcept;
+    // The caller supplies the full outstanding node reservation when the pool is shared.
+    [[nodiscard]] std::size_t
+    device_shortfall(DeviceMemorySnapshot current, std::size_t node_reservation,
+                     std::size_t additional_device_bytes = 0) const noexcept;
     // Tightens the next explicit runtime offer after a completed over-budget preparation.
     // Separate Host shortages cannot be recovered by reducing Device backing.
     [[nodiscard]] std::size_t corrected_runtime_limit(DeviceMemorySnapshot current,

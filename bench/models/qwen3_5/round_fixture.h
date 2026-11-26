@@ -40,13 +40,14 @@ inline std::string device_name(int ordinal) {
 
 class RoundFixture {
 public:
-    explicit RoundFixture(Instance& instance) : instance_(instance) {
-        instance_.executor->bind_to_current_thread();
+    explicit RoundFixture(Instance& instance)
+        : instance_(instance), replica_(*instance.replicas.front()) {
+        replica_.executor->bind_to_current_thread();
     }
 
     model::SequenceHandle bind(std::vector<TokenId> tokens, runtime::LaneId lane,
                                std::uint32_t output_tokens) {
-        auto& session = *instance_.session;
+        auto& session = *replica_.session;
         auto prompt   = instance_.frontend.prepare_tokens(std::move(tokens), false);
         runtime::ResolvedExecutionOptions options;
         options.requested_output_tokens = output_tokens;
@@ -91,7 +92,7 @@ public:
                              std::uint32_t draft_tokens) {
         const auto batch = sequences.size();
         if (!batch) throw std::invalid_argument("empty benchmark batch");
-        auto& session = *instance_.session;
+        auto& session = *replica_.session;
         std::vector<runtime::RoundBudget> budgets(batch);
         std::vector<model::ExecutionUnit> units(batch);
         std::vector<runtime::CommitDecision> decisions(batch);
@@ -134,15 +135,15 @@ public:
     }
 
     model::AbortResult release(model::SequenceHandle sequence) {
-        auto result = instance_.session->abort(sequence);
+        auto result = replica_.session->abort(sequence);
         if (result.status != runtime::ConsumeStatus::Consumed) {
             throw std::runtime_error("benchmark could not release its active sequence");
         }
-        while (instance_.session->has_context_operation() ||
-               instance_.executor->has_pending_work()) {
-            if (instance_.session->poll())
+        while (replica_.session->has_context_operation() ||
+               replica_.executor->has_pending_work()) {
+            if (replica_.session->poll())
                 throw std::logic_error("unexpected result during release");
-            instance_.executor->flush();
+            replica_.executor->flush();
             std::this_thread::yield();
         }
         return result;
@@ -160,8 +161,8 @@ private:
     template <class Result>
     Result await(std::optional<runtime::ExecutionTicket> ticket = {}) {
         for (;;) {
-            instance_.executor->flush();
-            auto event = call([&] { return instance_.session->poll(); });
+            replica_.executor->flush();
+            auto event = call([&] { return replica_.session->poll(); });
             if (event) {
                 if constexpr (!std::is_same_v<Result, runtime::ExecutionComplete>) {
                     if ((!ticket || event->ticket == *ticket) &&
@@ -182,13 +183,14 @@ private:
         const auto complete = await<runtime::ExecutionComplete>(ticket);
         if (complete.row_count != sequences.size() ||
             std::any_of(sequences.begin(), sequences.end(), [&](const auto sequence) {
-                return instance_.session->execution_pending(sequence);
+                return replica_.session->execution_pending(sequence);
             })) {
             throw std::logic_error("benchmark commit did not retire its complete membership");
         }
     }
 
     Instance& instance_;
+    runtime::ReplicaInstance<model::RuntimeTypes>& replica_;
     double host_call_ms_ = 0;
 };
 

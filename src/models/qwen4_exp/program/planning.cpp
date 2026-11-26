@@ -85,6 +85,7 @@ ExecutionPlan physical_plan(std::shared_ptr<const execution::ModelProfile> profi
         throw std::invalid_argument("Qwen4Exp batch plan differs from execution configuration");
     out.batches = std::move(batches);
     out.profile = std::move(profile);
+    out.shared_physical_memory = device_memory_snapshot(device.device()).shared_physical_memory;
     out.shape   = describe_execution_shape(*out.profile, o);
     if (out.shape.cuda_graph)
         out.decode_routes = std::make_shared<const speculative::DecodeGraphRoutes>(
@@ -180,7 +181,7 @@ std::size_t ExecutionPlan::host_reservation_bytes() const {
 }
 
 std::size_t ExecutionPlan::device_reservation_bytes() const {
-    return device_bytes() + ((NINFER_SHARED_PHYSICAL_MEMORY != 0) ? host_reservation_bytes() : 0);
+    return device_bytes() + (shared_physical_memory ? host_reservation_bytes() : 0);
 }
 
 namespace {
@@ -240,8 +241,7 @@ std::optional<ExecutionPlan> plan_execution(std::shared_ptr<const execution::Mod
                                   : budget.minimum_capacity();
         const auto required =
             budget.reservation_bytes(capacity) +
-            ((control_owner && NINFER_SHARED_PHYSICAL_MEMORY != 0) ? budget.control_bytes(capacity)
-                                                                   : 0);
+            ((control_owner && out.shared_physical_memory) ? budget.control_bytes(capacity) : 0);
         if (required > available) return {};
         const auto geometries =
             moe::decode_geometries(*out.batches, o.speculative.draft_tokens + 1);
@@ -258,11 +258,10 @@ std::optional<ExecutionPlan> plan_execution(std::shared_ptr<const execution::Mod
                               : minimum;
     const auto reserved = budget.reservation_bytes(required);
     const auto metadata =
-        (control_owner && NINFER_SHARED_PHYSICAL_MEMORY != 0) ? budget.control_bytes(required) : 0;
+        (control_owner && out.shared_physical_memory) ? budget.control_bytes(required) : 0;
     if (reserved > available || metadata > available - reserved) return {};
-    out.capacity =
-        runtime::resolve_context_capacity(policy, budget, available, available_host_bytes,
-                                          NINFER_SHARED_PHYSICAL_MEMORY != 0, control_owner);
+    out.capacity = runtime::resolve_context_capacity(
+        policy, budget, available, available_host_bytes, out.shared_physical_memory, control_owner);
     out.capacity.mode       = o.context_capacity.mode;
     out.checkpoint_interval = o.context_cache.checkpoint_interval;
     return out;
@@ -291,13 +290,13 @@ ExecutionPlan plan_graph_probe(std::shared_ptr<const execution::ModelProfile> pr
     return plan;
 }
 
-runtime::ContextCapacityPlan describe_execution_capacity(
-    std::shared_ptr<const execution::ModelProfile> profile, const EngineOptions& supplied,
-    std::shared_ptr<const BatchExecutionPlan> batches, DeviceContext& device) {
+runtime::ContextCapacityPlan
+describe_execution_capacity(std::shared_ptr<const execution::ModelProfile> profile,
+                            const EngineOptions& supplied,
+                            std::shared_ptr<const BatchExecutionPlan> batches,
+                            DeviceContext& device, ple::disk::TableGeometry table) {
     const auto o = options(*profile, supplied);
-    if (profile->local.size == 1)
-        throw std::invalid_argument("resident rank capacity requires partitioned execution");
-    return capacity_plan(physical_plan(profile, {}, o, std::move(batches), device, nullptr), o);
+    return capacity_plan(physical_plan(profile, table, o, std::move(batches), device, nullptr), o);
 }
 
 } // namespace ninfer::models::qwen4_exp

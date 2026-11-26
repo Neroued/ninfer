@@ -1,10 +1,21 @@
 #include "ninfer/deployment.h"
 
 #include <algorithm>
+#include <cstdint>
+#include <optional>
 #include <set>
 #include <stdexcept>
+#include <utility>
 
 namespace ninfer {
+namespace {
+
+std::optional<std::uint64_t> checked_product(std::uint64_t a, std::uint64_t b) noexcept {
+    if (b && a > UINT64_MAX / b) return std::nullopt;
+    return a * b;
+}
+
+} // namespace
 
 void validate_deployment(const DeploymentOptions& options) {
     const auto fail = [](const char* message) {
@@ -16,6 +27,17 @@ void validate_deployment(const DeploymentOptions& options) {
         fail("connection and shutdown timeouts must be positive");
     const auto& p = options.parallel;
     if (!p.tp || !p.ep || !p.dp || !p.pp || !p.adp) fail("parallel sizes must be positive");
+    const auto dp_pp = checked_product(p.dp, p.pp);
+    const auto world = dp_pp ? checked_product(*dp_pp, p.tp) : std::nullopt;
+    if (!world || *world != options.ranks.size())
+        fail("dp * pp * tp must match deployed rank count");
+    if (p.tp % p.adp != 0) fail("tp must be divisible by adp");
+    const auto dp_tp     = checked_product(p.dp, p.tp);
+    const bool pp1_valid = p.pp == 1 && (p.tp % p.ep == 0 ||
+                                         (p.ep % p.tp == 0 && dp_tp && (*dp_tp % p.ep == 0)));
+    const bool ppn_valid = p.dp == 1 && p.pp > 1 && p.tp % p.ep == 0;
+    if (!pp1_valid && !ppn_valid) fail("unsupported parallel nesting combination");
+
     std::set<std::uint32_t> nodes;
     for (const auto& node : options.nodes) {
         if (!nodes.insert(node.id).second) fail("duplicate node ID");
@@ -39,13 +61,21 @@ void validate_deployment(const DeploymentOptions& options) {
         if (rank.rank >= options.ranks.size() || !ranks.insert(rank.rank).second)
             fail("global ranks must be unique and cover [0,world_size)");
         if (!nodes.contains(rank.node)) fail("rank refers to an absent node");
-        if (rank.device < 0 || !devices.emplace(rank.node, rank.device).second)
+        if (rank.device < 0) fail("rank device must be nonnegative");
+        if (!options.allow_shared_device && !devices.emplace(rank.node, rank.device).second)
             fail("each rank requires a distinct nonnegative node/device pair");
     }
     for (const auto node : nodes)
         if (std::none_of(options.ranks.begin(), options.ranks.end(),
                          [node](const auto& rank) { return rank.node == node; }))
             fail("node has no ranks");
+}
+
+DeploymentOptions normalize_deployment(DeploymentOptions options) {
+    validate_deployment(options);
+    std::sort(options.ranks.begin(), options.ranks.end(),
+              [](const auto& a, const auto& b) { return a.rank < b.rank; });
+    return options;
 }
 
 } // namespace ninfer

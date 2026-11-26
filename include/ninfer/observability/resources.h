@@ -113,6 +113,20 @@ struct PhysicalMemorySample {
     std::uint64_t sampled_ns    = 0;
 };
 
+struct PhysicalDeviceMemorySample {
+    std::uint32_t node = 0;
+    int device         = 0;
+    PhysicalMemorySample sample;
+};
+
+struct PhysicalNodeMemorySample {
+    std::uint32_t node                   = 0;
+    std::uint64_t system_total_bytes     = 0;
+    std::uint64_t system_available_bytes = 0;
+    bool shared_physical_memory          = false;
+    std::uint64_t sampled_ns             = 0;
+};
+
 struct RankMemoryBudget {
     std::uint64_t limit_bytes                       = 0;
     std::uint64_t runtime_reservation_bytes         = 0;

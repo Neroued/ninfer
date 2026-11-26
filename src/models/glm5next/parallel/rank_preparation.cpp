@@ -9,31 +9,52 @@
 namespace ninfer::models::glm5next {
 namespace {
 
-RankLoadRequest request(std::span<const std::byte> payload,
+RankLoadRequest request(const artifact::Reader& reader, std::span<const std::byte> payload,
                         const distributed::RankIdentity& identity,
                         const StartupObserver& observer) {
     distributed::wire::Decoder in(payload);
     auto r = decode_rank_load(in);
     in.finish();
-    if (r.rank.rank != identity.rank || r.rank.size != identity.tp.size ||
-        identity.tp.rank != identity.rank || identity.ep.size != r.rank.ep_size ||
-        identity.ep.rank != (r.rank.ep_size == 1 ? 0U : r.rank.rank) ||
-        identity.adp.size != r.rank.size || identity.adp.rank != identity.rank ||
-        identity.dp.size != 1 || identity.pp.size != 1)
+    if (r.artifact != reader.artifact_id())
+        throw artifact::ArtifactError("GLM5Next worker artifact differs from coordinator");
+    if (r.rank.rank != identity.tp.rank || r.rank.size != identity.tp.size ||
+        identity.ep.size != r.rank.ep_size ||
+        identity.ep.rank != (r.rank.ep_size == 1 ? 0U : identity.tp.rank) ||
+        identity.adp.size != r.rank.size || identity.adp.rank != identity.tp.rank ||
+        identity.dp.size < 1 || identity.pp.size != 1)
         throw std::invalid_argument("GLM5Next rank plan differs from worker identity");
+    if (compute_rank_shard_digest(reader.artifact_id(), models::load_options(r.options), r.rank) !=
+        identity.shard_digest)
+        throw std::invalid_argument("GLM5Next rank shard digest differs from topology plan");
     r.options.startup_observer = observer;
     return r;
 }
 
+const distributed::GroupDescription&
+find_role_group(const distributed::ExecutionTopology& topology, std::string_view role_name,
+                distributed::RankId rank) {
+    for (const auto& role : topology.roles) {
+        if (role.role != role_name) continue;
+        const auto& group = topology.group(role.group);
+        if (std::find(group.members.begin(), group.members.end(), rank) != group.members.end())
+            return group;
+    }
+    throw std::invalid_argument("GLM5Next role group is absent for rank: " +
+                                std::string(role_name));
+}
+
 ContextCommunication context_group(const distributed::ExecutionTopology& topology,
+                                   const distributed::RankIdentity& identity,
                                    distributed::CommunicationContext& communication) {
-    if (topology.ranks.size() == 1) return {};
-    const auto role = std::find_if(topology.roles.begin(), topology.roles.end(),
-                                   [](const auto& r) { return r.role == "context"; });
-    if (role == topology.roles.end())
-        throw std::invalid_argument("GLM5Next context group is absent");
-    const auto& group = topology.group(role->group);
-    return {&communication.group(group.id), group.members};
+    if (identity.tp.size == 1) return {};
+    const auto& group   = find_role_group(topology, "context", identity.rank);
+    const auto& replica = topology.replica_for_rank(identity.rank);
+    std::vector<std::uint32_t> local_members;
+    local_members.reserve(group.members.size());
+    for (const auto member_rank : group.members) {
+        local_members.push_back(replica.local_index(member_rank));
+    }
+    return {&communication.group(group.id), std::move(local_members)};
 }
 
 } // namespace
@@ -43,8 +64,11 @@ RankPreparation::RankPreparation(const artifact::Reader& reader, std::span<const
                                  const distributed::ExecutionTopology& topology,
                                  distributed::CommunicationContext& communication,
                                  const StartupObserver& observer)
-    : RankPreparation(reader, request(payload, identity, observer), device,
-                      context_group(topology, communication)) {
+    : RankPreparation(reader, request(reader, payload, identity, observer), device,
+                      context_group(topology, identity, communication), identity.rank,
+                      identity.node) {
+    const auto& replica     = topology.replica_for_rank(identity.rank);
+    const auto local_ranks  = static_cast<std::uint32_t>(replica.ranks.size());
     const WorkContract contract{plan_.shape,
                                 plan_.batches,
                                 plan_.profile->config.text.vocabulary,
@@ -52,15 +76,13 @@ RankPreparation::RankPreparation(const artifact::Reader& reader, std::span<const
                                 plan_.profile->local.size,
                                 0,
                                 plan_.profile->control_token_limit};
-    memory_.host_reservation_bytes +=
-        runtime::protocol::work_payload_memory(contract.payload_capacity(topology.ranks.size()),
-                                               {1, 1}, topology.ranks.size(), control_owner_);
-    const auto role = std::find_if(topology.roles.begin(), topology.roles.end(),
-                                   [](const auto& r) { return r.role == "tensor"; });
-    if (role == topology.roles.end())
-        throw std::invalid_argument("GLM5Next tensor group is absent");
-    const auto& group = topology.group(role->group);
-    binding_          = {&communication.group(group.id), group.index(topology.output_rank)};
+    memory_.host_reservation_bytes = runtime::protocol::work_payload_memory(
+        contract.payload_capacity(local_ranks), RankProgram::capacity(), local_ranks, false);
+    if (identity.tp.size > 1) {
+        const auto& group    = find_role_group(topology, "tensor", identity.rank);
+        const auto result_id = replica.result_owner;
+        binding_             = {&communication.group(group.id), group.index(result_id)};
+    }
 }
 
 ExecutionCodec RankPreparation::codec(const distributed::ExecutionTopology& topology) const {

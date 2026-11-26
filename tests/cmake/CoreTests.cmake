@@ -33,7 +33,7 @@ set(sync_flags 1 4 2 0)
 foreach(mode flags IN ZIP_LISTS sync_modes sync_flags)
   add_test(NAME ninfer_device_sync_${mode}_test COMMAND ninfer_device_test ${flags})
   set_tests_properties(ninfer_device_sync_${mode}_test PROPERTIES
-    ENVIRONMENT "NINFER_CUDA_SYNC=${mode}" SKIP_RETURN_CODE 77)
+    ENVIRONMENT "NINFER_CUDA_SYNC=${mode}" SKIP_RETURN_CODE 77 LABELS "gpu")
 endforeach()
 foreach(mode IN ITEMS invalid empty)
   add_test(NAME ninfer_device_sync_${mode}_test COMMAND ninfer_device_test --invalid-sync)
@@ -82,16 +82,17 @@ set_tests_properties(
   ninfer_decode_graph_test
   ninfer_arena_test
   ninfer_state_store_test
-  PROPERTIES SKIP_RETURN_CODE 77)
+  PROPERTIES SKIP_RETURN_CODE 77 LABELS "gpu")
 
 ninfer_add_test(ninfer_weight_bank_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_weight_bank.cpp"
   LIBRARIES ninfer_core)
+set_tests_properties(ninfer_weight_bank_test PROPERTIES SKIP_RETURN_CODE 77 LABELS "gpu")
 
 ninfer_add_test(ninfer_expert_cache_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_expert_cache.cu"
           "${CMAKE_CURRENT_LIST_DIR}/../expert_cache_cuda_errors.cpp"
   LIBRARIES ninfer_core)
-set_tests_properties(ninfer_expert_cache_test PROPERTIES TIMEOUT 60)
+set_tests_properties(ninfer_expert_cache_test PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77 LABELS "gpu")
 
 ninfer_test_interpose(ninfer_expert_cache_test
   cudaEventRecord cudaMemcpyAsync cudaMemcpyBatchAsync cudaStreamSynchronize cudaStreamWaitEvent

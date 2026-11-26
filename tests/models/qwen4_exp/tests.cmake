@@ -16,13 +16,13 @@ foreach(mode IN ITEMS host gpu)
       $<TARGET_FILE:ninfer_ple_disk_prepare_test> --${mode})
   set_tests_properties(ninfer_ple_disk_prepare_${mode}_test PROPERTIES TIMEOUT 30)
 endforeach()
-set_tests_properties(ninfer_ple_disk_prepare_gpu_test PROPERTIES SKIP_RETURN_CODE 77)
+set_tests_properties(ninfer_ple_disk_prepare_gpu_test PROPERTIES SKIP_RETURN_CODE 77 LABELS "gpu")
 set_tests_properties(ninfer_ple_disk_prepare_host_test PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=")
 
 ninfer_add_test(ninfer_ple_upload_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/ple/test_upload.cpp"
   LIBRARIES ninfer_model_execution)
-set_tests_properties(ninfer_ple_upload_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
+set_tests_properties(ninfer_ple_upload_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30 LABELS "gpu")
 ninfer_add_test(ninfer_qwen4_exp_loading_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_loading_real.cpp"
   LIBRARIES ninfer_model_execution)

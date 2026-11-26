@@ -18,7 +18,7 @@ public:
     RankProgram(const RankProgram&)            = delete;
     RankProgram& operator=(const RankProgram&) = delete;
 
-    [[nodiscard]] runtime::ExecutionCapacity capacity() const noexcept;
+    [[nodiscard]] static constexpr runtime::ExecutionCapacity capacity() noexcept { return {1, 1}; }
     void validate_work(const Work&, runtime::FrameKind) const;
     void validate_decision(runtime::ExecutionTicket, const runtime::DecisionInput&) const;
     void prepare_commit(runtime::ExecutionTicket, Commit&) const;
@@ -27,8 +27,13 @@ public:
     void supply(runtime::ExecutionTicket, runtime::CommandSequence, runtime::DecisionInput&&);
     void commit(runtime::ExecutionTicket, runtime::CommandSequence, Commit&&);
     void discard(runtime::ExecutionTicket, runtime::CommandSequence);
+    [[nodiscard]] bool can_discard(runtime::ExecutionTicket) const noexcept;
+    [[nodiscard]] MemorySpan input_storage() noexcept;
     [[nodiscard]] std::optional<runtime::ExecutionEvent<ExecutionTypes>> poll();
     void drain();
+
+    GraphPreparationSample prepare_execution(GraphPreparationMode = GraphPreparationMode::Complete);
+    void release_execution();
 
     [[nodiscard]] RankMemoryUsage observe_resources() const;
     [[nodiscard]] std::optional<GraphMemorySummary> graph_memory_observation() const;
@@ -42,6 +47,9 @@ private:
                                                             SequencePlan&&, DeviceContext&,
                                                             const StartupObserver&,
                                                             GraphPreparationMode);
+    friend std::unique_ptr<RankProgram>
+    create_uninitialized_rank_program(const execution::Parameters&, SequencePlan&&, DeviceContext&,
+                                      const StartupObserver&);
 };
 
 } // namespace ninfer::models::qwen3_5

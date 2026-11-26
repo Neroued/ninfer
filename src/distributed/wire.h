@@ -37,6 +37,8 @@ enum class Kind : std::uint32_t {
     InputEnd,
     InputReady,
     InputRelease,
+    InputCredit,
+    Heartbeat,
     StartupProgress,
     CommunicationPrepared,
     CommunicationSelect,
@@ -165,6 +167,8 @@ struct Header {
 [[nodiscard]] Header decode_header(std::span<const std::byte>);
 void encode(Encoder&, const RankIdentity&);
 [[nodiscard]] RankIdentity decode_rank_identity(Decoder&);
+void encode(Encoder&, const ReplicaTopology&);
+[[nodiscard]] ReplicaTopology decode_replica_topology(Decoder&);
 void encode(Encoder&, const ExecutionTopology&);
 [[nodiscard]] ExecutionTopology decode_topology(Decoder&);
 

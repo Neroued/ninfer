@@ -44,6 +44,10 @@ const artifact::ParameterReference& ModelDefinition::parameter(WeightId id) cons
     return impl_->references.at(id.index);
 }
 
+std::span<const artifact::ParameterReference> ModelDefinition::parameters() const {
+    return impl_->references;
+}
+
 std::span<const WeightUse> ModelDefinition::uses(WeightId id) const {
     return impl_->descriptions.at(id.index).uses;
 }

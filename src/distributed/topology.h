@@ -2,6 +2,7 @@
 
 #include "ninfer/deployment.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <span>
 #include <string>
@@ -23,10 +24,23 @@ struct GroupDescription {
 };
 
 struct RankIdentity {
-    RankId rank        = 0;
-    std::uint32_t node = 0, local_rank = 0;
-    int device = 0;
+    RankId rank                = 0;
+    std::uint32_t node         = 0, local_rank = 0;
+    int device                 = 0;
     ParallelCoordinate tp, ep, dp, pp, adp;
+    std::uint64_t shard_digest = 0;
+};
+
+struct ReplicaTopology {
+    std::uint32_t replica_id        = 0;
+    std::uint32_t failure_domain_id = 0;
+    RankId result_owner             = 0;
+    std::vector<RankId> ranks;
+    std::vector<std::vector<RankId>> stage_ranks;
+
+    [[nodiscard]] std::uint32_t local_index(RankId global_rank) const;
+    [[nodiscard]] RankId global_rank(std::uint32_t local_index) const;
+    [[nodiscard]] bool contains(RankId global_rank) const noexcept;
 };
 
 struct RoleGroup {
@@ -37,16 +51,21 @@ struct RoleGroup {
 // Ordered physical groups are distinct from model roles. Several roles may use one group.
 struct ExecutionTopology {
     std::uint64_t plan = 0;
-    RankId output_rank = 0;
     std::vector<RankIdentity> ranks;
+    std::vector<ReplicaTopology> replicas;
     std::vector<GroupDescription> groups;
     std::vector<RoleGroup> roles;
 
     void validate(const DeploymentOptions&) const;
     [[nodiscard]] const RankIdentity& rank(RankId) const;
+    [[nodiscard]] const ReplicaTopology& replica(std::uint32_t replica_id) const;
+    [[nodiscard]] const ReplicaTopology& replica_for_rank(RankId global_rank) const;
     [[nodiscard]] const GroupDescription& group(GroupId) const;
 };
 
+[[nodiscard]] ExecutionTopology build_cluster_topology(const DeploymentOptions&);
+[[nodiscard]] std::uint64_t compute_topology_plan_digest(std::span<const std::byte> artifact_id,
+                                                         const ExecutionTopology&);
 [[nodiscard]] std::string process_name(const RankIdentity&);
 [[nodiscard]] std::string rank_description(const RankIdentity&);
 

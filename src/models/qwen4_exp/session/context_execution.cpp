@@ -23,7 +23,7 @@ ResidencyBinding SessionImpl::context_binding(BindOperation& operation) {
         sequence.id           = next_sequence++;
         sequence.epoch        = identity_generation;
         sequence.request      = operation.request;
-        sequence.ledger       = context::RequestLedger(operation.request->prompt.token_ids);
+        sequence.ledger       = context::RequestLedger(operation.request->prompt->token_ids);
         sequence.reused       = operation.frontier;
         sequence.captures     = operation.request->captures;
         sequence.last_saved   = operation.frontier;
@@ -50,12 +50,12 @@ ResidencyBinding SessionImpl::context_binding(BindOperation& operation) {
     if (operation.source) {
         sequence.continuation.metadata =
             checkpoints.at(*operation.source).snapshot.continuation().metadata;
-        sequence.continuation.metadata.rope_delta = sequence.request->prompt.rope_delta;
+        sequence.continuation.metadata.rope_delta = sequence.request->prompt->rope_delta;
     } else {
         const auto eos                 = definition->config().text.ple.eos;
         sequence.continuation.metadata = {
             0,
-            sequence.request->prompt.rope_delta,
+            sequence.request->prompt->rope_delta,
             {eos, eos},
             definition->options().mtp() ? std::optional<std::uint32_t>{0} : std::nullopt};
     }

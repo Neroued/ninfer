@@ -32,10 +32,13 @@ struct ControlBudget {
 [[nodiscard]] ControlBudget with_communication_capacity(ControlBudget,
                                                         std::span<const CommunicationStatistics>);
 
-[[nodiscard]] constexpr std::size_t envelope_capacity(std::size_t owners) {
-    return 57 + 4 * owners;
+[[nodiscard]] constexpr std::size_t envelope_capacity(std::size_t ranks) {
+    return 80 + 8 * ranks;
 }
 
+[[nodiscard]] std::size_t worker_payload_memory(const WorkPayloadCapacity&, ExecutionCapacity);
+[[nodiscard]] std::size_t coordinator_payload_memory(const WorkPayloadCapacity&, ExecutionCapacity,
+                                                     std::size_t ranks);
 [[nodiscard]] std::size_t work_payload_memory(const WorkPayloadCapacity&, ExecutionCapacity,
                                               std::size_t ranks, bool coordinator);
 
@@ -44,18 +47,23 @@ struct ControlBudget {
                                                                     std::size_t ranks,
                                                                     bool coordinator);
 
+enum class DiscardMode : std::uint8_t { BeforeSupply = 0, AfterSupply = 1 };
+
 struct Scope {
-    std::vector<distributed::RankId> owners;
+    std::vector<distributed::RankId> participants;
+    std::vector<distributed::RankId> decision_owners;
     distributed::RankId result_owner = 0;
 
     void validate(const distributed::ExecutionTopology&) const;
     [[nodiscard]] bool contains(distributed::RankId) const noexcept;
+    [[nodiscard]] bool is_decision_owner(distributed::RankId) const noexcept;
 };
 
 struct Envelope {
     ExecutionTicket ticket;
     CommandSequence command;
-    std::uint64_t plan = 0;
+    std::uint64_t peer_sequence = 0;
+    std::uint64_t plan          = 0;
     Scope scope;
 };
 

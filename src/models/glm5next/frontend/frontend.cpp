@@ -136,15 +136,19 @@ public:
     std::unique_ptr<Processor> processor;
 };
 
-PreparedPrompt::PreparedPrompt() noexcept                            = default;
-PreparedPrompt::~PreparedPrompt()                                    = default;
-PreparedPrompt::PreparedPrompt(PreparedPrompt&&) noexcept            = default;
-PreparedPrompt& PreparedPrompt::operator=(PreparedPrompt&&) noexcept = default;
+PreparedPrompt::PreparedPrompt() noexcept                                 = default;
+PreparedPrompt::~PreparedPrompt()                                         = default;
+PreparedPrompt::PreparedPrompt(const PreparedPrompt&) noexcept            = default;
+PreparedPrompt& PreparedPrompt::operator=(const PreparedPrompt&) noexcept = default;
+PreparedPrompt::PreparedPrompt(PreparedPrompt&&) noexcept                 = default;
+PreparedPrompt& PreparedPrompt::operator=(PreparedPrompt&&) noexcept      = default;
 
-PreparedPrompt::PreparedPrompt(std::unique_ptr<PreparedPromptData> data) noexcept
+PreparedPrompt::PreparedPrompt(std::shared_ptr<PreparedPromptData> data) noexcept
     : data_(std::move(data)) {}
 
 PreparedPrompt::operator bool() const noexcept { return data_ != nullptr; }
+
+bool PreparedPrompt::reusable() const noexcept { return data_ && data_->identity.reusable; }
 
 PromptSummary PreparedPrompt::summary() const {
     const auto& data = PreparedPromptAccess::view(*this);
@@ -162,10 +166,38 @@ const PreparedPromptData& PreparedPromptAccess::view(const PreparedPrompt& promp
     return *prompt.data_;
 }
 
+std::shared_ptr<const PreparedPromptData>
+PreparedPromptAccess::shared(const PreparedPrompt& prompt) {
+    if (!prompt.data_) throw std::invalid_argument("prepared prompt is empty");
+    return prompt.data_;
+}
+
 PreparedPromptData PreparedPromptAccess::take(PreparedPrompt&& prompt) {
     if (!prompt.data_) throw std::invalid_argument("prepared prompt is empty");
     auto data = std::move(prompt.data_);
-    return std::move(*data);
+    if (data.use_count() == 1) { return std::move(*data); }
+    return *data;
+}
+
+PromptPrefixKeyer::PromptPrefixKeyer(const PreparedPrompt& prompt, std::uint32_t domain)
+    : data_(prompt.data_), domain_(domain),
+      max_frontier_(data_ && data_->identity.reusable ? checked_count(data_->token_ids.size())
+                                                      : 0) {}
+
+runtime::PrefixKey PromptPrefixKeyer::key_at(std::uint32_t frontier) const {
+    if (!data_ || frontier == 0 || frontier > max_frontier_) {
+        throw std::out_of_range("prompt prefix frontier is out of range");
+    }
+    if (!media_ready_) {
+        media_.reserve(data_->identity.media.size());
+        for (const auto& m : data_->identity.media) {
+            media_.push_back({&m.item, &m.preparation_digest});
+        }
+        media_ready_ = true;
+    }
+    context::InputIdentityView view{.tokens = context::TokenView(data_->token_ids),
+                                    .media  = media_};
+    return fingerprints_.key(domain_, view, frontier);
 }
 
 Frontend make_frontend(const FrontendResources& resources,
@@ -195,7 +227,7 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     PromptBoundaries boundaries;
     auto rendered = impl_->chat.render(input.messages, input.options, input.context_cache.markers,
                                        boundaries, control);
-    auto data     = std::make_unique<PreparedPromptData>();
+    auto data     = std::make_shared<PreparedPromptData>();
     std::vector<std::vector<text::ByteSpan>> media_spans;
     if (!rendered.media.empty()) {
         auto prepared = impl_->processor->prepare(media_sources(rendered, input.messages),
@@ -245,7 +277,7 @@ PreparedPrompt Frontend::prepare_tokens(std::vector<TokenId> tokens,
     for (const auto token : tokens)
         if (!impl_->tokenizer->is_valid_token(token))
             throw std::invalid_argument("prompt token is outside the checkpoint vocabulary");
-    auto data                                = std::make_unique<PreparedPromptData>();
+    auto data                                = std::make_shared<PreparedPromptData>();
     data->token_ids                          = std::move(tokens);
     data->identity.reusable                  = allow_prefix_identity;
     data->context_cache.update_session_index = false;

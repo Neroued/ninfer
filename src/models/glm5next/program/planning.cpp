@@ -15,6 +15,9 @@ std::uint32_t count(std::uint64_t value) {
 
 ExecutionShape shape(const execution::ModelProfile& p, const EngineOptions& o,
                      KvCacheVectorFormat index_format) {
+    if (p.local.size == 1 && (p.draft || (o.speculative.backend == SpeculativeBackend::DFlash2 &&
+                                          o.speculative.draft_tokens > 0)))
+        throw std::invalid_argument("GLM5Next DFlash2 requires TP=2");
     if (load_options(o) != p.options)
         throw std::invalid_argument("GLM5Next execution components differ from selected weights");
     if (!o.max_context || o.max_context > p.config.text.max_context || !o.max_concurrency)
@@ -94,15 +97,16 @@ std::size_t ExecutionPlan::device_bytes() const {
 }
 
 std::size_t ExecutionPlan::reservation_bytes() const {
-    return device_bytes() + (NINFER_SHARED_PHYSICAL_MEMORY ? pinned_bytes() : 0);
+    return device_bytes() + (shared_physical_memory ? pinned_bytes() : 0);
 }
 
 ExecutionPlan plan_execution(std::shared_ptr<const execution::ModelProfile> profile,
                              const EngineOptions& o, KvCacheVectorFormat index_format, int sm_count,
-                             BatchExecutionSpec batches) {
+                             bool shared_physical_memory, BatchExecutionSpec batches) {
     if (!profile)
         throw std::invalid_argument("GLM5Next execution planning requires its weight profile");
     ExecutionPlan out;
+    out.shared_physical_memory = shared_physical_memory;
     out.profile = std::move(profile);
     out.shape   = shape(*out.profile, o, index_format);
     out.batches = std::make_shared<const BatchExecutionPlan>(std::move(batches));
@@ -181,7 +185,7 @@ runtime::ContextCapacityPlan describe_execution_capacity(const ExecutionPlan& p)
                     count(std::uint64_t(concurrent) * (pages(short_tokens - 1) + suffix_pages))));
     out.fixed_device_bytes = p.fixed_bytes + p.workspace.bytes +
                              (p.workspace.vision ? p.workspace.vision->output_bytes : 0) +
-                             (NINFER_SHARED_PHYSICAL_MEMORY ? p.pinned_bytes() : 0);
+                             (p.shared_physical_memory ? p.pinned_bytes() : 0);
     out.fixed_host_bytes = p.pinned_bytes();
     // The selected TP plan has equal KDA shards. Describe whole logical objects for metadata
     // costs, while charging allocator metadata to each rank and fixed control storage once.

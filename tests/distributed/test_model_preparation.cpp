@@ -31,6 +31,7 @@ std::vector<wire::Payload> exchange(distributed::ExecutionGroup& group,
         out.u64(capacity.device_bytes);
         out.u64(capacity.control_reservation_bytes);
         out.u64(capacity.planned_slack_bytes);
+        out.u64(prepared.host_reservations.by_node.at(rank.node));
         messages.push_back(
             {rank.rank, std::make_shared<const wire::Message>(wire::Message{
                             wire::Kind::Enter, group.epoch(), std::move(out).take()})});
@@ -54,8 +55,17 @@ std::vector<wire::Payload> exchange(distributed::ExecutionGroup& group,
 }
 
 void rebuild(distributed::ExecutionGroup& group, rt::GroupPreparation& prepared) {
-    auto reports = exchange(group, prepared, rt::PreparationAction::Release, wire::Kind::Prepared);
+    const auto released =
+        exchange(group, prepared, rt::PreparationAction::Release, wire::Kind::Prepared);
     ++prepared.attempt;
+    for (const auto& response : released) {
+        wire::Decoder ack(response);
+        require(ack.u64() == group.topology().plan && ack.u32() == prepared.attempt,
+                "release acknowledgement has the wrong attempt");
+        ack.finish();
+    }
+    const auto reports =
+        exchange(group, prepared, rt::PreparationAction::SampleBaseline, wire::Kind::Prepared);
     for (std::size_t i = 0; i < reports.size(); ++i) {
         wire::Decoder in(reports[i]);
         require(in.u64() == group.topology().plan && in.u32() == prepared.attempt,
@@ -64,19 +74,40 @@ void rebuild(distributed::ExecutionGroup& group, rt::GroupPreparation& prepared)
         in.finish();
         require(report.read_bytes == prepared.reports[i].read_bytes &&
                     report.upload_bytes == prepared.reports[i].upload_bytes &&
-                    report.weight_bytes == prepared.reports[i].weight_bytes,
-                "Program rebuild reloaded immutable weights");
+                    report.weight_bytes == prepared.reports[i].weight_bytes &&
+                    report.free_after_weights_bytes == prepared.reports[i].free_after_weights_bytes,
+                "Program rebuild changed its immutable weights or post-weight baseline");
         prepared.reports[i] = report;
     }
-    prepared.layouts.clear();
-    for (const auto& bytes :
-         exchange(group, prepared, rt::PreparationAction::Allocate, wire::Kind::Allocated)) {
-        wire::Decoder in(bytes);
+    const auto require_accepted = [&](wire::Decoder& in) {
         require(in.u64() == group.topology().plan && in.u32() == prepared.attempt && in.boolean(),
                 "Program rebuild did not fit");
         require(in.string().empty(), "successful rebuild returned a failure");
+        require(in.u64() == 0 && in.u64() == 0 &&
+                    in.u8() == static_cast<std::uint8_t>(rt::AllocationRetry::None),
+                "successful rebuild returned memory shortfall feedback");
+    };
+    for (auto phase : {rt::PreparationAction::Allocate, rt::PreparationAction::PrepareExecution}) {
+        for (const auto& bytes : exchange(group, prepared, phase, wire::Kind::Allocated)) {
+            wire::Decoder in(bytes);
+            require_accepted(in);
+            require(in.bytes().empty(), "allocation returned an unexpected layout");
+            in.finish();
+        }
+    }
+    prepared.layouts.clear();
+    for (const auto& bytes :
+         exchange(group, prepared, rt::PreparationAction::CheckMemory, wire::Kind::Allocated)) {
+        wire::Decoder in(bytes);
+        require_accepted(in);
         const auto layout = in.bytes();
         prepared.layouts.emplace_back(wire::Bytes(layout.begin(), layout.end()));
+        (void)in.u64();
+        (void)in.u64();
+        (void)in.u64();
+        (void)in.u64();
+        (void)in.boolean();
+        require(in.u64() > 0, "memory check returned no sample");
         in.finish();
     }
 }
@@ -234,19 +265,21 @@ int main(int argc, char** argv) {
         for (const auto& rank : parallel.ranks) {
             wire::Encoder out;
             const auto node = parallel.topology.rank(rank.rank).node;
-            q4::encode_rank_load(
-                out, {definition->artifact_id(), rank, options, batches,
-                      node == deployment.coordinator_node ? options.media_live_bytes : 0,
-                      node == deployment.coordinator_node});
+            q4::encode_rank_load(out, {definition->artifact_id(), rank, options, batches, 0,
+                                       node == deployment.coordinator_node});
             payloads.push_back(std::move(out).take());
         }
         auto group = std::make_unique<distributed::ExecutionGroup>(
             deployment, parallel.topology, StartupObserver{}, [](auto rank, std::string_view text) {
                 std::cerr << "[rank " << rank << "] " << text << '\n';
             });
-        auto prepared =
-            rt::prepare_execution_group(*group, payloads, options.context_capacity,
-                                        options.memory_headroom_bytes, std::chrono::minutes(15));
+        auto prepared = rt::prepare_execution_group(
+            *group, payloads, options.context_capacity,
+            rt::GroupPreparationOptions{.memory_headroom_bytes = options.memory_headroom_bytes,
+                                        .frontend_host_bytes =
+                                            options.media_live_bytes + options.grammar_cache_bytes,
+                                        .coordinator_node = deployment.coordinator_node},
+            std::chrono::minutes(15));
         rebuild(*group, prepared);
         std::vector<q4::RankExecutionDescription> descriptions;
         for (std::size_t i = 0; i < prepared.layouts.size(); ++i) {
@@ -270,7 +303,7 @@ int main(int argc, char** argv) {
         rt::activate_execution_group(*group, prepared, std::chrono::seconds(30));
         std::vector<RankSnapshot> initial;
         for (const auto& d : descriptions) initial.push_back(d.observation);
-        Executor executor(std::move(group), plan.capacity, std::move(codec),
+        Executor executor(group->take_replica(0), plan.capacity, std::move(codec),
                           options.max_concurrency, std::move(initial));
         executor.bind_to_current_thread();
         contexts(executor, plan.session);

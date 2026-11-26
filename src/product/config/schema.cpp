@@ -51,6 +51,9 @@ constexpr FieldSpec kFields[] = {
     {Field::HostCapacity, "context_cache.host_capacity", "--host-cache-capacity", "",
      "SIZE|default", "Shared Host State/KV and in-flight capacity; 0B disables backing.",
      Scope::Generation, ConfigurationUnit::Bytes},
+    {Field::MaxCachedCheckpointsPerReplica, "context_cache.max_cached_checkpoints_per_replica",
+     "--max-cached-checkpoints-per-replica", "", "N|none|default",
+     "Maximum unique advertised checkpoints retained per replica; none/default disables cap."},
     {Field::CostPresets, "context_cache.cost_presets", "--context-cost-presets", "", "FILE",
      "Context-cost JSON overrides; empty uses built-in defaults."},
     {Field::SpecBackend, "speculative.backend", "--spec", "", "none|mtp|dflash|dflash2",
@@ -291,11 +294,13 @@ FieldValue parse_field_value(Field field, const RawValue& value, bool command_li
     switch (field) {
     case Field::PrefixReuse:
     case Field::HostCapacity:
+    case Field::MaxCachedCheckpointsPerReplica:
     case Field::PrefillChunk:
     case Field::MaxTokens:
     case Field::Seed:
     case Field::SpecLengthPolicy:
         if (is("default")) return DefaultValue{};
+        if (field == Field::MaxCachedCheckpointsPerReplica && is("none")) return DefaultValue{};
         break;
     case Field::Thinking:
     case Field::PreserveThinking:
@@ -331,6 +336,7 @@ FieldValue parse_field_value(Field field, const RawValue& value, bool command_li
         return integer(value, command_line, 0, std::numeric_limits<int>::max());
     case Field::MaxContext:
     case Field::CheckpointInterval:
+    case Field::MaxCachedCheckpointsPerReplica:
     case Field::MaxPendingRequests:
     case Field::MaxTokens:
     case Field::ThinkingBudget:

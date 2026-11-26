@@ -5,11 +5,28 @@
 
 #include <array>
 
+namespace ninfer::distributed::wire {
+class Encoder;
+class Decoder;
+} // namespace ninfer::distributed::wire
+
+namespace ninfer::models {
+namespace speculative {
+class SpeculativeCostModel;
+}
+void encode_speculative_cost_model(distributed::wire::Encoder&,
+                                   const speculative::SpeculativeCostModel&);
+speculative::SpeculativeCostModel decode_speculative_cost_model(distributed::wire::Decoder&);
+} // namespace ninfer::models
+
 namespace ninfer::models::speculative {
 
 namespace detail {
 class RouteCost;
 }
+
+// Bound the online table independently of the lifetime and concurrency of a session.
+inline constexpr std::size_t kMaxOnlineSpeculativeCostCells = 4096;
 
 struct CostModelConfig {
     SpeculativeBackend backend      = SpeculativeBackend::None;
@@ -78,6 +95,9 @@ public:
 
 private:
     friend class detail::RouteCost;
+    friend void models::encode_speculative_cost_model(distributed::wire::Encoder&,
+                                                      const SpeculativeCostModel&);
+    friend SpeculativeCostModel models::decode_speculative_cost_model(distributed::wire::Decoder&);
 
     struct OnlineCellKey {
         std::uint32_t rows, width, mtp_steps, head_columns;

@@ -638,8 +638,10 @@ void validate_target_options(const execution::ModelProfile& profile, DeviceConte
         }
         break;
     }
-    if (device.compute_capability() != 120) {
-        throw std::invalid_argument("Qwen3.5 family runtime requires compute capability 12.0");
+    const int cc = device.compute_capability();
+    if (cc != 120 && cc != 121) {
+        throw std::invalid_argument(
+            "Qwen3.5 family runtime requires compute capability 12.0 or 12.1");
     }
 }
 
@@ -680,9 +682,9 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     if (impl->workspace.vision)
         impl->device_reservation_bytes +=
             impl->workspace.vision->output_bytes +
-            (NINFER_SHARED_PHYSICAL_MEMORY ? impl->workspace.vision->encoder.host_staging_bytes
+            (inputs.shared_physical_memory ? impl->workspace.vision->encoder.host_staging_bytes
                                            : 0);
-    if constexpr (NINFER_SHARED_PHYSICAL_MEMORY != 0)
+    if (inputs.shared_physical_memory)
         impl->device_reservation_bytes =
             checked_add(impl->device_reservation_bytes, impl->persistent.pinned_bytes(),
                         "sequence unified memory capacity");
@@ -713,18 +715,19 @@ make_sequence_planner_impl(std::shared_ptr<const execution::ModelProfile> profil
         .max_concurrency = options.max_concurrency,
         .prefill_chunk =
             std::min(options.prefill_chunk ? options.prefill_chunk : 1024U, options.max_context),
-        .draft_window               = options.speculative.draft_tokens,
-        .speculative_backend        = options.speculative.backend,
-        .length_policy              = options.speculative.length_policy,
-        .kv_storage                 = options.kv_cache,
-        .linear_state_dtype         = options.linear_state_dtype,
-        .proposal_head              = options.speculative.proposal_head,
-        .features                   = models::load_options(options),
-        .gpu_timing                 = options.observability.gpu_timing,
-        .use_cuda_graph             = options.use_cuda_graph,
-        .causal_scoring             = options.purpose == EnginePurpose::CausalScoring,
-        .multiprocessor_count       = device.multiprocessor_count(),
-        .context_cache              = options.context_cache,
+        .draft_window           = options.speculative.draft_tokens,
+        .speculative_backend    = options.speculative.backend,
+        .length_policy          = options.speculative.length_policy,
+        .kv_storage             = options.kv_cache,
+        .linear_state_dtype     = options.linear_state_dtype,
+        .proposal_head          = options.speculative.proposal_head,
+        .features               = models::load_options(options),
+        .gpu_timing             = options.observability.gpu_timing,
+        .use_cuda_graph         = options.use_cuda_graph,
+        .causal_scoring         = options.purpose == EnginePurpose::CausalScoring,
+        .multiprocessor_count   = device.multiprocessor_count(),
+        .shared_physical_memory = device_memory_snapshot(device.device()).shared_physical_memory,
+        .context_cache          = options.context_cache,
         .vision_memory_budget_bytes = options.vision_memory_budget_bytes,
     };
     auto planner           = std::make_unique<SequencePlannerImpl>();

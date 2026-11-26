@@ -25,8 +25,10 @@ void encode_rank_load(Encoder& out, const RankLoadRequest& request) {
             out.u32(r.begin);
             out.u32(r.size);
         }
+    encode_weight_ids(out, p.whole);
     encode_assemblies(out, p.assemblies);
     encode_expert_partitions(out, p.experts);
+    encode_weight_ids(out, p.omitted);
     encode_rank_options(out, request.options);
     encode_batch_execution_spec(out, request.batches);
     out.u8(static_cast<std::uint8_t>(request.index_format));
@@ -51,8 +53,10 @@ RankLoadRequest decode_rank_load(Decoder& in) {
                         &p.draft->intermediate})
             *r = {in.u32(), in.u32()};
     }
+    p.whole                        = decode_weight_ids(in);
     p.assemblies                   = decode_assemblies(in);
     p.experts                      = decode_expert_partitions(in);
+    p.omitted                      = decode_weight_ids(in);
     request.options                = decode_rank_options(in);
     request.batches                = decode_batch_execution_spec(in);
     request.index_format           = static_cast<KvCacheVectorFormat>(in.u8());

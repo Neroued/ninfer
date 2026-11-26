@@ -34,6 +34,7 @@ RequestLogContext make_request_log_context(std::uint64_t id, std::string protoco
     context.sampling                          = prepared.sampling;
     context.acquisition_seconds               = prepared.acquisition_seconds;
     context.preparation                       = prepared.preparation;
+    context.error_replica                     = prepared.error_replica;
     return context;
 }
 

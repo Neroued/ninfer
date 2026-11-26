@@ -160,11 +160,7 @@ Json transfer(const ContextTransferSeries& value) {
                          {"copy_operations", value[i].copy_operations}};
     return out;
 }
-} // namespace
-
-EngineSnapshot observation_delta(EngineSnapshot current, const EngineSnapshot& baseline) {
-    auto& value        = current.runtime;
-    const auto& before = baseline.runtime;
+void subtract_runtime_stats(RuntimeStats& value, const RuntimeStats& before) {
     subtract_fields(value, before, kRuntimeCounters);
     subtract_fields(value.host_work, before.host_work, kHostCounters);
     value.requests.submitted -= before.requests.submitted;
@@ -189,15 +185,14 @@ EngineSnapshot observation_delta(EngineSnapshot current, const EngineSnapshot& b
         counter.adopted -= prior.adopted;
         counter.reused_tokens -= prior.reused_tokens;
     }
-    for (std::size_t i = 0; i < current.executions.size(); ++i)
-        subtract_execution(current.executions[i], baseline.executions[i]);
-    for (std::size_t i = 0; i < current.decode_by_batch.size(); ++i)
-        if (i < baseline.decode_by_batch.size())
-            subtract_execution(current.decode_by_batch[i], baseline.decode_by_batch[i]);
-    for (auto& rank : current.ranks) {
-        const auto prior = std::find_if(baseline.ranks.begin(), baseline.ranks.end(),
+}
+
+void subtract_rank_snapshots(std::vector<RankSnapshot>& ranks,
+                             std::span<const RankSnapshot> baseline_ranks) {
+    for (auto& rank : ranks) {
+        const auto prior = std::find_if(baseline_ranks.begin(), baseline_ranks.end(),
                                         [&](const auto& r) { return r.rank == rank.rank; });
-        if (prior == baseline.ranks.end()) continue;
+        if (prior == baseline_ranks.end()) continue;
         for (auto field : {&RankHostStatistics::submit_ns, &RankHostStatistics::progress_ns,
                            &RankHostStatistics::supply_ns, &RankHostStatistics::commit_ns,
                            &RankHostStatistics::discard_ns})
@@ -236,6 +231,30 @@ EngineSnapshot observation_delta(EngineSnapshot current, const EngineSnapshot& b
                   &PleReadStats::shared_pages, &PleReadStats::reads, &PleReadStats::read_bytes,
                   &PleReadStats::uploaded_bytes})
                 (*rank.memory.ple).*field -= (*prior->memory.ple).*field;
+    }
+}
+} // namespace
+
+EngineSnapshot observation_delta(EngineSnapshot current, const EngineSnapshot& baseline) {
+    subtract_runtime_stats(current.runtime, baseline.runtime);
+    for (std::size_t i = 0; i < current.executions.size(); ++i)
+        subtract_execution(current.executions[i], baseline.executions[i]);
+    for (std::size_t i = 0; i < current.decode_by_batch.size(); ++i)
+        if (i < baseline.decode_by_batch.size())
+            subtract_execution(current.decode_by_batch[i], baseline.decode_by_batch[i]);
+    subtract_rank_snapshots(current.ranks, baseline.ranks);
+    for (auto& replica : current.replicas) {
+        const auto prior =
+            std::find_if(baseline.replicas.begin(), baseline.replicas.end(),
+                         [&](const auto& r) { return r.replica_id == replica.replica_id; });
+        if (prior == baseline.replicas.end()) continue;
+        subtract_runtime_stats(replica.runtime, prior->runtime);
+        for (std::size_t i = 0; i < replica.executions.size(); ++i)
+            subtract_execution(replica.executions[i], prior->executions[i]);
+        for (std::size_t i = 0; i < replica.decode_by_batch.size(); ++i)
+            if (i < prior->decode_by_batch.size())
+                subtract_execution(replica.decode_by_batch[i], prior->decode_by_batch[i]);
+        subtract_rank_snapshots(replica.ranks, prior->ranks);
     }
     for (auto field : {&MediaCacheSummary::hits, &MediaCacheSummary::misses,
                        &MediaCacheSummary::singleflight_waits, &MediaCacheSummary::evictions,
@@ -287,7 +306,9 @@ Json observation_json(const EngineSnapshot& snapshot, std::uint64_t now) {
         {"sampled_ns", snapshot.stamp.sampled_ns},
         {"sample_age_ns", now >= snapshot.stamp.sampled_ns ? now - snapshot.stamp.sampled_ns : 0},
         {"status", statuses[static_cast<std::size_t>(snapshot.status)]},
+        {"available_context_tokens_estimate", snapshot.available_context_tokens_estimate},
         {"progress_owner", optional(snapshot.progress_owner)},
+        {"progress_owner_replica", optional(snapshot.progress_owner_replica)},
         {"runtime", std::move(runtime)},
         {"context", context_usage_json(r)},
         {"execution_latency_bounds_ns", kExecutionLatencyBoundsNs}};
@@ -305,7 +326,8 @@ Json observation_json(const EngineSnapshot& snapshot, std::uint64_t now) {
              {"pending_retirement_bytes", resource.pending_retirement_bytes}});
     out["placements"] = Json::array();
     for (const auto& p : r.placements)
-        out["placements"].push_back({{"id", p.id},
+        out["placements"].push_back({{"replica_id", p.replica_id},
+                                     {"id", p.id},
                                      {"resident", p.resident},
                                      {"prefilling", p.prefilling},
                                      {"decoding", p.decoding},
@@ -328,7 +350,8 @@ Json observation_json(const EngineSnapshot& snapshot, std::uint64_t now) {
                            {"valid_target_tokens", geometry->valid_target_tokens},
                            {"mtp_steps", geometry->mtp_steps},
                            {"head_columns", geometry->head_columns}};
-        out["in_flight"].push_back({{"id", unit.id},
+        out["in_flight"].push_back({{"replica_id", unit.replica_id},
+                                    {"id", unit.id},
                                     {"started_ns", unit.started_ns},
                                     {"kind", kKinds[static_cast<std::size_t>(unit.work.kind)]},
                                     {"stage", kStages[static_cast<std::size_t>(unit.stage)]},
@@ -385,12 +408,49 @@ Json observation_json(const EngineSnapshot& snapshot, std::uint64_t now) {
                          {"scored_tokens", snapshot.scoring.scored_tokens},
                          {"active_jobs", snapshot.scoring.active_jobs},
                          {"wall", duration(snapshot.scoring.wall)}};
+    out["physical_devices"] = Json::array();
+    for (const auto& dev : snapshot.physical_devices) {
+        const auto& p = dev.sample;
+        out["physical_devices"].push_back({{"node", dev.node},
+                                           {"device", dev.device},
+                                           {"cuda_total_bytes", p.cuda_total_bytes},
+                                           {"cuda_free_bytes", p.cuda_free_bytes},
+                                           {"system_total_bytes", p.system_total_bytes},
+                                           {"system_available_bytes", p.system_available_bytes},
+                                           {"shared_physical_memory", p.shared_physical_memory},
+                                           {"sampled_ns", p.sampled_ns}});
+    }
+    out["physical_nodes"] = Json::array();
+    for (const auto& node : snapshot.physical_nodes)
+        out["physical_nodes"].push_back({{"node", node.node},
+                                         {"system_total_bytes", node.system_total_bytes},
+                                         {"system_available_bytes", node.system_available_bytes},
+                                         {"shared_physical_memory", node.shared_physical_memory},
+                                         {"sampled_ns", node.sampled_ns}});
+    out["replicas"] = Json::array();
+    for (const auto& replica : snapshot.replicas) {
+        Json rep_runtime = fields_json(replica.runtime, kRuntimeCounters);
+        rep_runtime.update(fields_json(replica.runtime, kRuntimeGauges));
+        rep_runtime["requests"] = {{"submitted", replica.runtime.requests.submitted},
+                                   {"completed", replica.runtime.requests.completed},
+                                   {"cancelled", replica.runtime.requests.cancelled},
+                                   {"failed", replica.runtime.requests.failed}};
+        out["replicas"].push_back(
+            {{"replica_id", replica.replica_id},
+             {"healthy", replica.healthy},
+             {"status", statuses[static_cast<std::size_t>(replica.status)]},
+             {"available_context_tokens_estimate", replica.available_context_tokens_estimate},
+             {"progress_owner", optional(replica.progress_owner)},
+             {"runtime", std::move(rep_runtime)},
+             {"context", context_usage_json(replica.runtime)}});
+    }
     if (snapshot.requests) {
         out["requests"] = Json::array();
         for (const auto& q : *snapshot.requests)
             out["requests"].push_back(
                 {{"id", q.id},
                  {"phase", request_phase_name(q.phase)},
+                 {"replica_id", optional(q.replica_id)},
                  {"placement", optional(q.placement)},
                  {"submitted_ns", q.submitted_ns},
                  {"admitted_ns", optional(q.admitted_ns)},

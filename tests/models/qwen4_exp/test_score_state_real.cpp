@@ -93,6 +93,10 @@ public:
         implementation.commit(ticket, command, std::move(commit));
     }
 
+    [[nodiscard]] bool can_discard(runtime::ExecutionTicket ticket) const {
+        return implementation.can_discard(ticket);
+    }
+
     void discard(runtime::ExecutionTicket ticket, runtime::CommandSequence command) {
         implementation.discard(ticket, command);
     }

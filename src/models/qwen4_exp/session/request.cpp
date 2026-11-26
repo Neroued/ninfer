@@ -12,12 +12,12 @@ bool RequestPlan::can_checkpoint(std::uint32_t frontier) const {
 
 context::InputIdentityView RequestPlan::identity_view(context::TokenView tokens) const {
     context::InputIdentityView out{.tokens = tokens, .media = media};
-    out.types           = prompt.token_types;
-    out.generated_delta = prompt.rope_delta;
-    const auto count    = prompt.token_ids.size();
+    out.types           = prompt->token_types;
+    out.generated_delta = prompt->rope_delta;
+    const auto count    = prompt->token_ids.size();
     for (std::size_t axis = 0; axis < 3; ++axis)
         out.positions[axis] =
-            std::span<const std::int32_t>(prompt.positions).subspan(axis * count, count);
+            std::span<const std::int32_t>(prompt->positions).subspan(axis * count, count);
     return out;
 }
 
@@ -38,7 +38,7 @@ const runtime::RequestPlanSummary& RequestBasePlan::summary() const noexcept {
 }
 
 const models::frontend::PreparedContextCache& RequestBasePlan::context_cache() const noexcept {
-    return plan_->prompt.context_cache;
+    return plan_->prompt->context_cache;
 }
 
 std::optional<PrefixKey> RequestBasePlan::prefix_key(std::uint32_t f) const {
@@ -47,12 +47,17 @@ std::optional<PrefixKey> RequestBasePlan::prefix_key(std::uint32_t f) const {
     return plan_->query.key(f);
 }
 
-RequestBasePlan Session::plan_request(qwen::PreparedPrompt&& prompt,
+std::uint32_t Session::prefix_domain() const noexcept {
+    return (static_cast<std::uint32_t>(impl_->shape.kv_storage) << 16U) |
+           (static_cast<std::uint32_t>(impl_->shape.linear_state_dtype) << 24U);
+}
+
+RequestBasePlan Session::plan_request(qwen::PreparedPrompt prompt,
                                       const runtime::ResolvedExecutionOptions& options) {
     auto& p           = *impl_;
     auto plan         = std::make_shared<detail::RequestPlan>();
-    plan->prompt      = qwen::PreparedPromptAccess::take(std::move(prompt));
-    const auto& input = plan->prompt;
+    plan->prompt      = qwen::PreparedPromptAccess::shared(prompt);
+    const auto& input = *plan->prompt;
     const auto count  = input.token_ids.size();
     if (!count || count > p.shape.max_context || input.token_types.size() != count ||
         input.positions.size() != 3 * count)

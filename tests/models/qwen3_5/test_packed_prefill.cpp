@@ -1,5 +1,5 @@
-#include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/session/internal.h"
+#include "models/qwen3_5/work.h"
 #include "runtime/executor/execution_pool.h"
 
 #include <algorithm>
@@ -15,6 +15,7 @@ namespace q35 = models::qwen3_5;
 namespace rt  = runtime;
 
 constexpr std::uint32_t kBatch = 4, kChunk = 12;
+constexpr std::uint32_t kPublicTokens = 64;
 
 void require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
@@ -43,17 +44,17 @@ void validate_work_and_commit() {
     work.rows[2].main_frontier = 13;
     work.inputs                = {{.tokens = {1, 2}}, {.tokens = {3, 4, 5}}, {}};
     work.sampling              = {{.constrained = true, .sample = true}, {}, {.sample = true}};
-    q35::detail::validate_prefill_work(work, 5);
+    q35::validate_forward_work(work, 5, 0, kPublicTokens);
 
     auto shared_read                         = work;
     shared_read.rows[1].source_state         = shared_read.rows[0].source_state;
     shared_read.rows[1].state_offsets.source = shared_read.rows[0].state_offsets.source;
-    q35::detail::validate_prefill_work(shared_read, 5);
+    q35::validate_forward_work(shared_read, 5, 0, kPublicTokens);
 
     const auto invalid_work = [&](auto mutate, const char* message) {
         auto bad = work;
         mutate(bad);
-        rejects([&] { q35::detail::validate_prefill_work(bad, 5); }, message);
+        rejects([&] { q35::validate_forward_work(bad, 5, 0, kPublicTokens); }, message);
     };
     invalid_work([](auto& w) { w.inputs[1].tokens.push_back(6); }, "accepted excess packed tokens");
     invalid_work([](auto& w) { w.inputs[0].visual.emplace(); }, "batched a visual window");
@@ -82,28 +83,26 @@ void validate_work_and_commit() {
         hits.inputs[i].tokens.clear();
         hits.sampling[i].sample = true;
     }
-    q35::detail::validate_prefill_work(hits, 5);
+    q35::validate_forward_work(hits, 5, 0, kPublicTokens);
 
-    const std::array commit{
-        q35::CommitRow{1, false, false},
-        q35::CommitRow{3, false, false},
-        q35::CommitRow{0, true, true},
+    const q35::Work forward{.operation = std::move(work)};
+    const auto validate_commit = [&](const q35::Commit& value) {
+        q35::validate_commit_rows(forward, value, std::span<const std::int32_t>{});
     };
-    q35::detail::validate_prefill_commit(work, commit);
-    auto changed = commit;
-    changed[1]   = {0, true, true};
-    q35::detail::validate_prefill_commit(work, changed);
-    changed[1].terminal = false;
-    rejects([&] { q35::detail::validate_prefill_commit(work, changed); },
+    const q35::Commit commit{.rows = {{1, false, false}, {3, false, false}, {0, true, true}}};
+    validate_commit(commit);
+    auto changed    = commit;
+    changed.rows[1] = {0, true, true};
+    validate_commit(changed);
+    changed.rows[1].terminal = false;
+    rejects([&] { validate_commit(changed); },
             "accepted a nonterminal discard on an unsampled row");
-    changed                    = commit;
-    changed[1].accepted_tokens = 1;
-    rejects([&] { q35::detail::validate_prefill_commit(work, changed); },
-            "accepted a partial prompt on an unsampled row");
-    changed                    = commit;
-    changed[0].accepted_tokens = 2;
-    rejects([&] { q35::detail::validate_prefill_commit(work, changed); },
-            "accepted more than one first token");
+    changed                         = commit;
+    changed.rows[1].accepted_tokens = 1;
+    rejects([&] { validate_commit(changed); }, "accepted a partial prompt on an unsampled row");
+    changed                         = commit;
+    changed.rows[0].accepted_tokens = 2;
+    rejects([&] { validate_commit(changed); }, "accepted more than one first token");
 }
 
 // Model the executor's result, commit receipt and retirement boundaries without model weights.
@@ -132,7 +131,7 @@ public:
             return ticket;
         }
         forward = std::get<q35::ForwardWork>(std::move(work.operation));
-        q35::detail::validate_prefill_work(forward, kChunk);
+        q35::validate_forward_work(forward, kChunk, 0, kPublicTokens);
         q35::ForwardResult result;
         if (forward.sample == q35::SamplePurpose::FirstToken) {
             auto& generated = result.generated.emplace();
@@ -156,8 +155,10 @@ public:
     }
 
     rt::CommitReceipt commit(rt::ExecutionTicket ticket, q35::Commit value) override {
-        if (forward.sample == q35::SamplePurpose::FirstToken)
-            q35::detail::validate_prefill_commit(forward, value.rows);
+        if (forward.sample == q35::SamplePurpose::FirstToken) {
+            q35::validate_commit_rows(q35::Work{.operation = forward}, value,
+                                      std::span<const std::int32_t>{});
+        }
         committed = std::move(value.rows);
         queue_retire(ticket);
         return {ticket, {command_}};
@@ -208,7 +209,7 @@ private:
 
 q35::SessionPlan session_plan() {
     auto profile           = std::make_shared<q35::execution::ModelProfile>();
-    profile->public_tokens = 64;
+    profile->public_tokens = kPublicTokens;
     q35::SessionPlan plan;
     plan.profile         = profile;
     plan.batch_execution = std::make_shared<models::BatchExecutionPlan>(

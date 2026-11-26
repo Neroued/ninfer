@@ -26,7 +26,9 @@ const models::frontend::PreparedContextCache& RequestBasePlan::context_cache() c
 }
 
 std::optional<PrefixKey> RequestBasePlan::prefix_key(std::uint32_t frontier) const {
-    if (!impl_ || !frontier || frontier > impl_->summary.prompt_tokens) return {};
+    if (!impl_ || !impl_->allow_prefix_reuse || !frontier ||
+        frontier > impl_->summary.prompt_tokens)
+        return {};
     return impl_->query.key(frontier);
 }
 
@@ -66,9 +68,16 @@ Session::Session(PreparedSession&& prepared, runtime::Executor<ExecutionTypes>& 
 
 Session::~Session() noexcept = default;
 
-RequestBasePlan Session::plan_request(qwen::PreparedPrompt&& prompt,
+std::uint32_t Session::prefix_domain() const noexcept {
+    return static_cast<std::uint32_t>(impl_->speculative_backend) |
+           (static_cast<std::uint32_t>(impl_->plan.proposal_head) << 8U) |
+           (static_cast<std::uint32_t>(impl_->plan.kv_storage) << 16U) |
+           (static_cast<std::uint32_t>(impl_->plan.linear_state_dtype) << 24U);
+}
+
+RequestBasePlan Session::plan_request(qwen::PreparedPrompt prompt,
                                       const runtime::ResolvedExecutionOptions& options) {
-    return impl_->plan_request(qwen::PreparedPromptAccess::take(std::move(prompt)), options);
+    return impl_->plan_request(qwen::PreparedPromptAccess::shared(prompt), options);
 }
 
 std::optional<SourceCandidate>
@@ -184,6 +193,10 @@ std::size_t Session::checkpoint_extent() const noexcept { return impl_->checkpoi
 
 std::uint64_t Session::checkpoint_catalog_revision() const noexcept {
     return impl_->checkpoints.revision();
+}
+
+std::uint64_t Session::checkpoint_lease_revision() const noexcept {
+    return impl_->checkpoints.lease_revision();
 }
 
 std::vector<runtime::ContextTransferRequirement>

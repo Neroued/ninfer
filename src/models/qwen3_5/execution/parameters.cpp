@@ -56,7 +56,6 @@ public:
 
     moe::Parameters moe(const MoeWeights& w) const {
         return with_context(model_.weight(w.router).name, [&] {
-            const auto& source = model_.expert_banks()[w.bank.index];
             ops::ExpertInputUsage gate_up, down;
             for (const auto& expert : w.experts) {
                 gate_up.include(model_.input(expert.gate));
@@ -69,17 +68,25 @@ public:
             out.shared  = {ops::prepare_linear_swiglu_weight(model_.input(w.shared.gate),
                                                              model_.input(w.shared.up)),
                            linear(w.shared.down)};
-            out.profile = {
-                ops::routed_swiglu_profile(
-                    source.gate_up, source.down,
-                    dimension(std::get<MoeConfig>(profile_.config.text.ffn).num_experts_per_tok),
-                    gate_up.policy(), down.policy()),
-                ops::swiglu_profile(out.shared)};
-            out.bank                   = w.bank;
-            out.activation_calibration = {gate_up.calibration(source.gate_up.layout.format),
-                                          down.calibration(source.down.layout.format)};
-            if (source.gate_up.parent->device.type() == DeviceType::CUDA) {
-                out.resident = device_expert_bank(source.gate_up, source.down);
+            const auto top_k =
+                dimension(std::get<MoeConfig>(profile_.config.text.ffn).num_experts_per_tok);
+            out.bank           = w.bank;
+            out.profile.shared = ops::swiglu_profile(out.shared);
+            if (const auto* resident = model_.resident_experts(w.bank)) {
+                const auto& bank = model_.expert_description(w.bank);
+                out.profile.routed =
+                    moe::describe_experts(bank, top_k, gate_up.policy(), down.policy());
+                out.activation_calibration = {gate_up.calibration(bank.gate_up.format),
+                                              down.calibration(bank.down.format)};
+                out.resident               = resident->view();
+            } else {
+                const auto& source = model_.expert_banks()[w.bank.index];
+                out.profile.routed = ops::routed_swiglu_profile(source.gate_up, source.down, top_k,
+                                                                gate_up.policy(), down.policy());
+                out.activation_calibration = {gate_up.calibration(source.gate_up.layout.format),
+                                              down.calibration(source.down.layout.format)};
+                if (source.gate_up.parent->device.type() == DeviceType::CUDA)
+                    out.resident = device_expert_bank(source.gate_up, source.down);
             }
             return out;
         });

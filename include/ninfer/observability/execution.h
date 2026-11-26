@@ -37,7 +37,8 @@ struct ExecutionWork {
 struct ExecutionProgress {
     std::uint64_t id = 0, started_ns = 0;
     ExecutionWork work;
-    ExecutionStage stage = ExecutionStage::Submitted;
+    ExecutionStage stage     = ExecutionStage::Submitted;
+    std::uint32_t replica_id = 0;
 };
 
 enum class GpuInterval : std::uint8_t { Result, Commit, Prefill, Vision, Draft, Target, Count };

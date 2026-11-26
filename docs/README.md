@@ -55,5 +55,6 @@ Published artifact downloads are listed in the [project README](../README.md).
 
 [未完成事项](issue-checklist.md)保留待处理问题与 MLA 性能工作。
 Qwen4-27B 的[架构与量化](designs/qwen4-27b-rtx5090.md)保留独立预研的几何假设与表示选择。
+[多卡引擎架构设计](designs/multi-gpu-engine-architecture.md)记录面向 1 → 8 → 16 卡（含 DP/TP/EP/ADP/PP）的平台无关多卡架构、第一性原理边界、核心合同与 Stage 1–3 演进路线。
 
 Qwen3.8-Flash-Next 使用 Qwen4Exp；Qwen3.8-27B 使用 Qwen3.5。

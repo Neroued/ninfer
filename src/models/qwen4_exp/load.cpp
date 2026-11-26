@@ -48,12 +48,15 @@ ResolvedLoadPlan resolve_load(const artifact::Reader& reader,
 ResolvedLoadPlan resolve_rank_load(const artifact::Reader& reader,
                                    std::shared_ptr<const ModelDefinition> definition, RankPlan rank,
                                    Device device) {
-    if (rank.size == 1) return resolve_load(reader, std::move(definition), device);
     if (!definition || definition->artifact_id() != reader.artifact_id())
         throw artifact::ArtifactError("rank definition belongs to another artifact");
     auto selection = select_weights(reader, *definition, rank, device);
     auto storage   = artifact::plan_materialization(reader, selection.weights.requests);
-    ResolvedLoadPlan out(reader, std::move(definition), std::move(storage), {}, {}, {});
+    std::shared_ptr<const ple::disk::Table> table;
+    if (rank.ple_placement == ple::Placement::Disk)
+        table = std::make_shared<const ple::disk::Table>(reader, definition->ple_parameters());
+    ResolvedLoadPlan out(reader, std::move(definition), std::move(storage), {}, {},
+                         std::move(table));
     out.rank_      = std::move(rank);
     out.selection_ = std::move(selection);
     out.parents_.reserve(out.materialization_.tensors.size());
@@ -74,8 +77,8 @@ std::unique_ptr<ModelShard> materialize_model(ResolvedLoadPlan&& plan, DeviceCon
     auto backing            = artifact::materialize(*plan.reader_, std::move(plan.materialization_),
                                                     device.transfer_view(), observer);
     if (plan.selection_) {
-        auto out =
-            std::unique_ptr<ModelShard>(new ModelShard(definition, std::move(backing), {}, {}, {}));
+        auto out = std::unique_ptr<ModelShard>(
+            new ModelShard(definition, std::move(backing), {}, {}, std::move(plan.ple_)));
         out->rank_ = std::move(plan.rank_);
         out->local_parents_.reserve(parent_count);
         for (std::size_t i = 0; i < parent_count; ++i)
@@ -88,21 +91,24 @@ std::unique_ptr<ModelShard> materialize_model(ResolvedLoadPlan&& plan, DeviceCon
         out->local_banks_         = bind_selected_experts(plan.selection_->weights, requests,
                                                           out->local_parents_, device.device());
         out->expert_descriptions_ = std::move(plan.selection_->weights.expert_descriptions);
-        auto& table               = out->ple_.emplace<DevicePleTable>();
-        table.decode =
-            DeviceBuffer(device.device(), plan.selection_->ple.size() * sizeof(Nf4Bf16Lut));
-        for (std::size_t i = 0; i < plan.selection_->ple.size(); ++i) {
-            const auto shard_id = out->rank_.ple_shards.begin + i;
-            const auto& shard   = definition->ple_parameters().shards.at(shard_id);
-            const auto& p       = parent(plan.selection_->ple[i]);
-            const auto lut      = make_nf4_bf16_lut(shard.divisor);
-            const auto offset   = i * sizeof(lut);
-            table.decode.copy_from_host(&lut, sizeof(lut), offset);
-            table.shards.push_back(
-                {{p.data, p.geometry.matrix_scale_offset, device.device()},
-                 Tensor(table.decode.span().subspan(offset, sizeof(lut)), DType::BF16, {16, 128}),
-                 static_cast<std::uint32_t>(shard.row_end - shard.geometry.shape[0]),
-                 static_cast<std::uint32_t>(shard.geometry.shape[0])});
+        if (out->rank_.ple_placement == ple::Placement::Device) {
+            auto& table = out->ple_.emplace<DevicePleTable>();
+            table.decode =
+                DeviceBuffer(device.device(), plan.selection_->ple.size() * sizeof(Nf4Bf16Lut));
+            for (std::size_t i = 0; i < plan.selection_->ple.size(); ++i) {
+                const auto shard_id = out->rank_.ple_shards.begin + i;
+                const auto& shard   = definition->ple_parameters().shards.at(shard_id);
+                const auto& p       = parent(plan.selection_->ple[i]);
+                const auto lut      = make_nf4_bf16_lut(shard.divisor);
+                const auto offset   = i * sizeof(lut);
+                table.decode.copy_from_host(&lut, sizeof(lut), offset);
+                table.shards.push_back(
+                    {{p.data, p.geometry.matrix_scale_offset, device.device()},
+                     Tensor(table.decode.span().subspan(offset, sizeof(lut)), DType::BF16,
+                            {16, 128}),
+                     static_cast<std::uint32_t>(shard.row_end - shard.geometry.shape[0]),
+                     static_cast<std::uint32_t>(shard.geometry.shape[0])});
+            }
         }
         return out;
     }

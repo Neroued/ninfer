@@ -87,9 +87,9 @@ struct Fixture {
         parallel.ranks[1].rank = 1;
         const std::array offers{
             runtime::RankCapacityOffer{glm::describe_execution_capacity(plans[0]), 1ULL << 30,
-                                       2ULL << 30, NINFER_SHARED_PHYSICAL_MEMORY != 0},
+                                       2ULL << 30, plans[0].shared_physical_memory},
             runtime::RankCapacityOffer{glm::describe_execution_capacity(plans[1]), 2ULL << 30,
-                                       2ULL << 30, NINFER_SHARED_PHYSICAL_MEMORY != 0}};
+                                       2ULL << 30, plans[1].shared_physical_memory}};
         const auto capacities =
             runtime::resolve_group_context_capacity(ContextCapacityPolicy::automatic(), offers, 0);
         for (unsigned rank = 0; rank < 2; ++rank) {
@@ -108,7 +108,7 @@ struct Fixture {
                                                                       p.mtp->cache.page.geometry}
                                         : std::vector<KVPageGeometry>{p.main.cache.page.geometry}});
         }
-        context = glm::plan_group_context(parallel, descriptions);
+        context = glm::plan_replica_context(parallel.ranks, descriptions);
     }
 };
 
@@ -157,7 +157,7 @@ void host() {
                         copied == 11ULL * (latent_bytes * tail + index_bytes * (tail / 4)),
                         "partial MLA migration includes invalid latent or pooled-index columns");
                 }
-                auto prepared   = glm::prepare_context(f.parallel, f.descriptions);
+                auto prepared   = glm::prepare_replica_context(f.parallel.ranks, f.descriptions);
                 auto& directory = *prepared.directory;
                 ctx::ContextDemand demand;
                 const auto state0 = demand.add_state({.count = 1, .variant = 0});

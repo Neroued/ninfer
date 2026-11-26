@@ -22,11 +22,18 @@ void read_system_memory(DeviceMemorySnapshot& snapshot) {
 } // namespace
 
 DeviceMemorySnapshot device_memory_snapshot(Device device) {
-    CudaDeviceScope scope(device);
     DeviceMemorySnapshot snapshot;
-    CUDA_CHECK(cudaMemGetInfo(&snapshot.cuda_free_bytes, &snapshot.total_bytes));
     read_system_memory(snapshot);
     snapshot.shared_physical_memory = NINFER_SHARED_PHYSICAL_MEMORY != 0;
+    if (device.type() == DeviceType::CPU) {
+        if (snapshot.shared_physical_memory) {
+            snapshot.cuda_free_bytes = snapshot.system_available_bytes;
+            snapshot.total_bytes     = snapshot.system_total_bytes;
+        }
+        return snapshot;
+    }
+    CudaDeviceScope scope(device);
+    CUDA_CHECK(cudaMemGetInfo(&snapshot.cuda_free_bytes, &snapshot.total_bytes));
     return snapshot;
 }
 

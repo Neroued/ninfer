@@ -177,4 +177,39 @@ ContextDirectorySpec decode_directory(distributed::wire::Decoder& in) {
     return c;
 }
 
+void encode_transfers(Encoder& out,
+                      std::span<const runtime::ContextTransferObservation> transfers) {
+    out.u64(transfers.size());
+    for (const auto& t : transfers) {
+        resource(out, t.resource);
+        out.u8(static_cast<std::uint8_t>(t.direction));
+        out.u32(t.image_count);
+        out.u32(t.page_groups);
+        out.u64(t.work.payload_bytes);
+        out.u32(t.work.copy_operations);
+        out.u64(t.elapsed_ns);
+        out.u32(t.rank);
+        out.boolean(t.peer.has_value());
+        if (t.peer) {
+            out.u32(t.peer->source_rank);
+            out.u32(t.peer->destination_rank);
+        }
+    }
+}
+
+std::vector<runtime::ContextTransferObservation> decode_transfers(Decoder& in) {
+    std::vector<runtime::ContextTransferObservation> transfers(in.count(35));
+    for (auto& t : transfers) {
+        t.resource    = resource(in);
+        t.direction   = static_cast<runtime::ContextTransferDirection>(in.u8());
+        t.image_count = in.u32();
+        t.page_groups = in.u32();
+        t.work        = {in.u64(), in.u32()};
+        t.elapsed_ns  = in.u64();
+        t.rank        = in.u32();
+        if (in.boolean()) t.peer = runtime::ContextPeerTransfer{in.u32(), in.u32()};
+    }
+    return transfers;
+}
+
 } // namespace ninfer::models::context

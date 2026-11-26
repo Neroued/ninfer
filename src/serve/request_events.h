@@ -3,8 +3,10 @@
 #include "serve/generation_service.h"
 #include "serve/request.h"
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 
@@ -33,6 +35,7 @@ struct RequestLogContext {
     ninfer::ResolvedSamplingParameters sampling;
     double acquisition_seconds = 0.0;
     ninfer::PromptPreparationStats preparation;
+    std::shared_ptr<const std::atomic<std::optional<std::uint32_t>>> error_replica;
 };
 
 struct RequestLogMetadata {

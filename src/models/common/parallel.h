@@ -19,6 +19,11 @@ struct ExpertPartition {
 
 [[nodiscard]] IndexRange partition_range(std::uint32_t total, std::uint32_t parts,
                                          std::uint32_t rank);
+[[nodiscard]] IndexRange partition_vocabulary_range(std::uint32_t vocabulary, std::uint32_t parts,
+                                                    std::uint32_t rank);
+
+// Vocab shards must keep output rows aligned to the source representation.
+void validate_vocabulary_partition(const BoundWeight&, IndexRange);
 
 // Matrix coordinates use the parameter's logical Binding, independent of its source parents.
 struct ParameterSlice {

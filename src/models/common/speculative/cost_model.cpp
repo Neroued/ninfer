@@ -231,7 +231,13 @@ void SpeculativeCostModel::observe_retired_step(const CostQuery& q, double total
     if (!usable_time(total_ms)) return;
     constexpr double decay  = 0.85;
     const auto sample_ratio = std::clamp(total_ms / base_predict_ms(q), 0.35, 3.0);
-    auto& cell              = online_[cell_key(q)];
+    const auto key          = cell_key(q);
+    auto found              = online_.find(key);
+    if (found == online_.end()) {
+        if (online_.size() == kMaxOnlineSpeculativeCostCells) return;
+        found = online_.try_emplace(key).first;
+    }
+    auto& cell              = found->second;
     cell.weighted_sum       = decay * cell.weighted_sum + sample_ratio;
     cell.weighted_count     = decay * cell.weighted_count + 1.0;
 }

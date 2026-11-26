@@ -368,23 +368,7 @@ void encode_result(Encoder& out, const Result& result) {
 
             } else if constexpr (std::is_same_v<T, ContextResult>) {
                 out.u8(2);
-                out.u64(v.transfers.size());
-                for (const auto& t : v.transfers) {
-                    out.boolean(t.resource.pool.has_value());
-                    if (t.resource.pool) out.u16(t.resource.pool->index);
-                    out.u8(static_cast<std::uint8_t>(t.direction));
-                    out.u32(t.image_count);
-                    out.u32(t.page_groups);
-                    out.u64(t.work.payload_bytes);
-                    out.u32(t.work.copy_operations);
-                    out.u64(t.elapsed_ns);
-                    out.u32(t.rank);
-                    out.boolean(t.peer.has_value());
-                    if (t.peer) {
-                        out.u32(t.peer->source_rank);
-                        out.u32(t.peer->destination_rank);
-                    }
-                }
+                context::encode_transfers(out, v.transfers);
             } else {
                 out.u8(3);
                 out.u32(v.processed);
@@ -414,19 +398,7 @@ Result decode_result(Decoder& in) {
         return v;
     }
     case 2: {
-        ContextResult v;
-        v.transfers.resize(in.count(35));
-        for (auto& t : v.transfers) {
-            if (in.boolean()) t.resource.pool = runtime::KvPoolId{in.u16()};
-            t.direction   = static_cast<runtime::ContextTransferDirection>(in.u8());
-            t.image_count = in.u32();
-            t.page_groups = in.u32();
-            t.work        = {in.u64(), in.u32()};
-            t.elapsed_ns  = in.u64();
-            t.rank        = in.u32();
-            if (in.boolean()) t.peer = runtime::ContextPeerTransfer{in.u32(), in.u32()};
-        }
-        return v;
+        return ContextResult{context::decode_transfers(in)};
     }
     case 3: {
         ScoreResult v;

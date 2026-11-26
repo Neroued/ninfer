@@ -467,6 +467,72 @@ device = 0
         require(error.find(file.string() + ":") != std::string::npos,
                 "deployment diagnostic lost its source location");
     }
+
+    const auto pure_dp_shared = files.write(R"(
+model.path = 'model.ninfer'
+cli.prompt = 'hello'
+engine.device = 2
+context_cache.max_cached_checkpoints_per_replica = 128
+[distributed]
+coordinator_node = 0
+control_host = '127.0.0.1'
+allow_shared_device = true
+[distributed.parallel]
+dp = 2
+[[distributed.nodes]]
+id = 0
+worker = '/home/neroued/ninfer/build/apps/ninfer-worker'
+artifact = '/home/neroued/ninfer/out/model.ninfer'
+)");
+    const auto dp_cli = parse({"ninfer", "--config", pure_dp_shared.string()});
+    require(dp_cli.launch.engine.deployment.has_value() &&
+                dp_cli.launch.engine.deployment->allow_shared_device &&
+                dp_cli.launch.engine.deployment->ranks.size() == 2 &&
+                dp_cli.launch.engine.deployment->ranks[0].device == 2 &&
+                dp_cli.launch.engine.deployment->ranks[1].device == 2 &&
+                dp_cli.launch.engine.context_cache.max_cached_checkpoints_per_replica == 128U,
+            "single-node shared-device pure DP expansion or checkpoint cap failed");
+    const auto& shared_sources = dp_cli.launch.provenance.fields;
+    require(shared_sources.at("distributed.ranks[1].rank").line ==
+                    shared_sources.at("distributed.parallel.dp").line &&
+                shared_sources.at("distributed.ranks[1].node").line ==
+                    shared_sources.at("distributed.nodes[0].id").line &&
+                shared_sources.at("distributed.ranks[1].device").line ==
+                    shared_sources.at("distributed.allow_shared_device").line,
+            "shared pure DP expansion lost the configuration sources that generated placement");
+    const auto dp_cli_override = parse(
+        {"ninfer", "--config", pure_dp_shared.string(), "--device", "1",
+         "--max-cached-checkpoints-per-replica", "none"});
+    require(dp_cli_override.launch.engine.deployment->ranks[0].device == 1 &&
+                dp_cli_override.launch.engine.deployment->ranks[1].device == 1 &&
+                !dp_cli_override.launch.engine.context_cache.max_cached_checkpoints_per_replica
+                     .has_value(),
+            "CLI device override or checkpoint cap reset failed");
+
+    const auto pure_dp_distinct = files.write(R"(
+model.path = 'model.ninfer'
+cli.prompt = 'hello'
+[distributed]
+coordinator_node = 0
+control_host = '127.0.0.1'
+[distributed.parallel]
+dp = 3
+[[distributed.nodes]]
+id = 0
+worker = '/home/neroued/ninfer/build/apps/ninfer-worker'
+artifact = '/home/neroued/ninfer/out/model.ninfer'
+)");
+    const auto dp3 = parse({"ninfer", "--config", pure_dp_distinct.string()});
+    require(dp3.launch.engine.deployment->ranks.size() == 3 &&
+                dp3.launch.engine.deployment->ranks[0].device == 0 &&
+                dp3.launch.engine.deployment->ranks[1].device == 1 &&
+                dp3.launch.engine.deployment->ranks[2].device == 2,
+            "single-node multi-GPU pure DP rank expansion failed");
+    const auto& distinct_sources = dp3.launch.provenance.fields;
+    require(distinct_sources.at("distributed.ranks[2].device").line ==
+                    distinct_sources.at("distributed.parallel.dp").line &&
+                distinct_sources.at("distributed.ranks[2].device").line > 0,
+            "distinct device expansion lost its DP configuration source");
 }
 
 void test_context_display() {

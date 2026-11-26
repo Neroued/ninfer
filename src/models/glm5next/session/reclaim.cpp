@@ -328,7 +328,7 @@ runtime::PauseCostQuote Session::pause_cost(SequenceHandle h, const PauseOption&
         s.phase == detail::Phase::Replay ? s.replay_target : s.continuation.metadata.main_frontier;
     const auto work = [&](std::uint32_t begin) {
         return models::vision::recovery_work(
-            s.request->prompt.identity.media,
+            s.request->prompt->identity.media,
             [](const auto& media) -> const auto& { return media.item; }, begin, end,
             p.shape.prefill_chunk, p.plan.vision_max_features);
     };

@@ -6,6 +6,12 @@ ninfer_add_test(ninfer_qwen3_5_loading_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_loading.cpp"
   LIBRARIES ninfer_model_loading)
 
+if(NINFER_ENABLE_DISTRIBUTED)
+  ninfer_add_test(ninfer_qwen3_5_parallel_wire_test
+    SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_parallel_wire.cpp"
+    LIBRARIES ninfer_model_execution ninfer_model_control ninfer_runtime_distributed)
+endif()
+
 ninfer_add_test(ninfer_qwen3_5_runtime_mechanisms_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_runtime_mechanisms.cpp"
   LIBRARIES ninfer_engine ninfer_core)

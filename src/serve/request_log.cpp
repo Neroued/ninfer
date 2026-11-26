@@ -541,8 +541,7 @@ std::string format_server_start_json(const std::string& server_instance_id, std:
                                       {"prefill_chunk", engine_options.prefill_chunk},
                                       {"log_stats_interval_ms", options.launch.logging.stats_interval_ms},
                                       {"kv_cache", kv_cache_name(engine_options.kv_cache)},
-                                      {"linear_state_dtype",
-                                       ninfer::linear_state_dtype_name(engine_options.linear_state_dtype)},
+                                      {"linear_state_dtype", ninfer::linear_state_dtype_name(engine_options.linear_state_dtype)},
                                       {"vision", engine_options.enable_vision},
                                       {"cuda_graph", engine_options.use_cuda_graph},
                                       {"prefix_reuse", options.launch.engine.context_cache.enabled},
@@ -666,18 +665,22 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
             ? first_output_timing_json(*outcome.stats.first_output_timing)
             : Json(nullptr);
     record["speculative"] = speculative_json(outcome.stats);
-    record["generation"]  = Json{{"engine_request_id", outcome.stats.engine_request_id},
-                                 {"scheduling", scheduling_json(outcome.stats.scheduling)},
-                                 {"admission", admission_json(outcome.stats.admission)}};
+    record["generation"]  = Json{
+         {"engine_request_id", outcome.stats.engine_request_id},
+         {"replica_id", outcome.stats.replica_id ? Json(*outcome.stats.replica_id) : Json(nullptr)},
+         {"scheduling", scheduling_json(outcome.stats.scheduling)},
+         {"admission", admission_json(outcome.stats.admission)}};
     return record.dump();
 }
 
 std::string format_request_error_json(const std::string& server_instance_id,
                                       std::uint64_t timestamp, const RequestLogContext& context,
-                                      const std::string& message) {
+                                      const std::string& message,
+                                      std::optional<std::uint32_t> replica_id) {
     Json record       = event_base(server_instance_id, timestamp, "request_error");
     record["request"] = request_json(context);
-    record["error"]   = Json{{"message", message}};
+    record["error"] =
+        Json{{"message", message}, {"replica_id", replica_id ? Json(*replica_id) : Json(nullptr)}};
     return record.dump();
 }
 
@@ -923,7 +926,11 @@ void JsonlRequestLog::write_request_done(const RequestLogContext& context,
 void JsonlRequestLog::write_request_error(const RequestLogContext& context,
                                           const std::string& message) {
     if (!enabled()) { return; }
-    append(format_request_error_json(server_instance_id_, unix_time_ms(), context, message));
+    const auto replica_id = context.error_replica
+                                ? context.error_replica->load(std::memory_order_relaxed)
+                                : std::nullopt;
+    append(format_request_error_json(server_instance_id_, unix_time_ms(), context, message,
+                                     replica_id));
 }
 
 void JsonlRequestLog::write_throughput(const ThroughputReport& report) {

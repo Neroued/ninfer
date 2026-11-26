@@ -1,19 +1,29 @@
+#include "distributed/bootstrap.h"
+#include "distributed/launch.h"
 #include "distributed/transport.h"
 #include "distributed/startup.h"
 #include "distributed/communication/preparation.h"
 #include "distributed/communication/selection.h"
 #include "models/common/qwen/vision/control.h"
+#include "models/common/vision/input.h"
 #include "models/qwen4_exp/wire.h"
 #include "models/qwen4_exp/parallel/wire.h"
 #include "models/glm5next/parallel/wire.h"
+#include "runtime/executor/distributed_executor.h"
+#include "runtime/executor/local_executor.h"
 #include "runtime/executor/protocol.h"
 #include "runtime/executor/preparation.h"
 #include "runtime/executor/input.h"
+#include "runtime/executor/worker_loop.h"
 #include "models/common/parallel_wire.h"
 
 #include <sys/socket.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
+#include <cstring>
 #include <iostream>
 #include <thread>
 
@@ -237,8 +247,8 @@ void cache_profiles_roundtrip() {
         execution.session.shape.kv_storage         = storage;
         execution.session.shape.linear_state_dtype = LinearStateDType::BFloat16;
         execution.session.shape.max_concurrency    = request.options.max_concurrency;
-        execution.session.shape.cuda_graph      = request.options.use_cuda_graph;
-        execution.session.shape.length_policy   = request.options.speculative.length_policy;
+        execution.session.shape.cuda_graph         = request.options.use_cuda_graph;
+        execution.session.shape.length_policy      = request.options.speculative.length_policy;
         execution.session.batches =
             std::make_shared<const models::BatchExecutionPlan>(request.batches);
         wire::Encoder execution_out;
@@ -267,12 +277,10 @@ void topology_identity() {
     deployment.parallel     = {.tp = 2, .ep = 2, .adp = 2};
     deployment.nodes        = {{.id = 0, .worker = "/worker", .artifact = "/model"}};
     deployment.ranks        = {{0, 0, 0}, {1, 0, 1}};
-    dist::ExecutionTopology topology;
-    topology.plan   = 7;
-    topology.ranks  = {{0, 0, 0, 0, {0, 2}, {0, 2}, {}, {}, {0, 2}},
-                       {1, 0, 1, 1, {1, 2}, {1, 2}, {}, {}, {1, 2}}};
-    topology.groups = {{0, {0, 1}}};
-    topology.roles  = {{"tensor", 0}, {"expert", 0}};
+    auto topology           = dist::build_cluster_topology(deployment);
+    topology.plan           = 7;
+    topology.groups         = {{0, {0, 1}}};
+    topology.roles          = {{"tensor", 0}, {"expert", 0}};
     topology.validate(deployment);
 
     wire::Encoder out;
@@ -296,8 +304,15 @@ void topology_identity() {
 void model_preparation() {
     namespace glm = models::glm5next;
     runtime::RankPreparationReport report;
-    report.capacity.plan.reference  = {1048576, 2, 9ULL << 30};
-    report.capacity.available_bytes = 30ULL << 30;
+    report.capacity.plan.reference         = {1048576, 2, 9ULL << 30};
+    report.capacity.available_bytes        = 30ULL << 30;
+    report.capacity.node                   = 1;
+    report.capacity.device                 = 3;
+    report.capacity.physical_placement_set = true;
+    report.raw_available_bytes             = 32ULL << 30;
+    report.graph_reserve_bytes             = 2ULL << 30;
+    report.maximum_runtime_bytes           = 28ULL << 30;
+    report.failure                         = "probe shortfall";
     wire::Encoder capacity_out;
     runtime::encode_preparation_report(capacity_out, report);
     const auto capacity_bytes = std::move(capacity_out).take();
@@ -305,8 +320,14 @@ void model_preparation() {
     const auto reported = runtime::decode_preparation_report(capacity_in);
     capacity_in.finish();
     require(reported.capacity.plan.reference == report.capacity.plan.reference &&
-                reported.capacity.available_bytes == report.capacity.available_bytes,
-            "preparation report lost the model's capacity reference");
+                reported.capacity.available_bytes == report.capacity.available_bytes &&
+                reported.capacity.node == 1 && reported.capacity.device == 3 &&
+                reported.capacity.physical_placement_set &&
+                reported.raw_available_bytes == (32ULL << 30) &&
+                reported.graph_reserve_bytes == (2ULL << 30) &&
+                reported.maximum_runtime_bytes == (28ULL << 30) &&
+                reported.failure == "probe shortfall",
+            "preparation report lost the model's capacity reference or cluster fields");
 
     glm::RankLoadRequest request;
     request.artifact[3]              = std::byte{17};
@@ -434,6 +455,41 @@ void model_preparation() {
             "GLM resource description lost ADP layouts, capacity or observations");
 }
 
+void materialization_host_waves() {
+    const auto topology = dist::build_cluster_topology(DeploymentOptions{
+        .control_host = "127.0.0.1",
+        .parallel     = {.tp = 1, .ep = 1, .dp = 4, .pp = 1, .adp = 1},
+        .nodes        = {{.id = 0, .worker = "/worker", .artifact = "/model"},
+                         {.id = 1, .ssh = "test-node", .worker = "/worker", .artifact = "/model"}},
+        .ranks        = {{0, 0, 0}, {1, 0, 1}, {2, 0, 2}, {3, 1, 0}},
+    });
+    std::vector<runtime::RankPreparationReport> reports(4);
+    for (auto& report : reports) {
+        report.capacity.available_host_bytes = 160;
+        report.host_weight_bytes             = 20;
+        report.staging_bytes                 = 20;
+    }
+    const runtime::ClusterHostReservations reserves{.by_node = {{0, 10}, {1, 10}}};
+    require(runtime::build_materialization_waves(topology, reports, reserves) ==
+                std::vector<std::vector<dist::RankId>>{{0, 1, 2, 3}},
+            "sufficient node RAM separated independent GPUs");
+
+    // Take the lowest sample on a shared node. Initial headroom fits two ranks exactly.
+    reports[1].capacity.available_host_bytes = 90;
+    require(runtime::build_materialization_waves(topology, reports, reserves) ==
+                std::vector<std::vector<dist::RankId>>{{0, 1, 3}, {2}},
+            "co-node startup exceeded its Host budget or blocked another node");
+
+    // Two ranks would fit in the second wave if the first rank's retained weights were ignored.
+    for (auto& report : reports) report.host_weight_bytes = 10;
+    reports[0].staging_bytes = 50;
+    reports[1].staging_bytes = 25;
+    reports[2].staging_bytes = 35;
+    require(runtime::build_materialization_waves(topology, reports, reserves) ==
+                std::vector<std::vector<dist::RankId>>{{0, 3}, {1}, {2}},
+            "later waves ignored retained Host weights from earlier waves");
+}
+
 q::WorkRow row() {
     q::WorkRow r;
     r.member            = {{41, 7}, {{1}, 9}};
@@ -546,10 +602,10 @@ void native_work() {
     require(std::get<q::ForwardWork>(produced.operation).visual->input == input_owner,
             "producing ticket must retain its raw input owner");
     bindings.release_payload(91);
-    const auto continuation = bindings.get(91, false);
+    const auto continuation = bindings.get(91, false, original.member);
     require(!continuation.input && continuation.window.plan == window,
             "input retirement must retain the frozen output mapping");
-    rejects([&] { (void)bindings.get(91, true); });
+    rejects([&] { (void)bindings.get(91, true, original.member); });
 
     auto prefill_row           = original;
     prefill_row.ids            = {23, 24};
@@ -932,7 +988,104 @@ void inputs() {
     require(control_received && !transfers.ready(keys), "input bypassed receiver readiness");
     transfers.complete(1, 7);
     require(transfers.ready(keys) && owner.expired(), "ready input retained its source payload");
-    transfers.release(7);
+    transfers.release(keys);
+}
+
+void input_slot_and_fences() {
+    // Hold the first ticket ready while a lower-ID ticket waits on the same peer.
+    runtime::InputTransfers transfers;
+    const auto first  = transfers.begin({{1, 99, {}, {}, {}}});
+    const auto second = transfers.begin({{1, 7, {}, {}, {}}});
+
+    struct StagingSender {
+        models::vision::InputReceiver receiver;
+        std::vector<wire::Kind> kinds;
+
+        bool try_send(std::span<const dist::OutgoingMessage> messages, dist::Traffic traffic) {
+            for (const auto& item : messages) {
+                const auto& message = *item.message;
+                require(traffic == dist::Traffic::Input, "unexpected pre-release traffic");
+                kinds.push_back(message.kind);
+                wire::Decoder input(message.payload);
+                const auto id = input.u64();
+                if (message.kind == wire::Kind::InputBegin) {
+                    (void)input.bytes();
+                    receiver.begin(id, {});
+                } else {
+                    require(message.kind == wire::Kind::InputEnd, "unexpected media frame");
+                    (void)receiver.finish(id);
+                }
+                input.finish();
+            }
+            return true;
+        }
+    } staging;
+
+    std::array<std::byte, 1> storage{};
+    staging.receiver.bind({storage.data(), storage.size(), Device::cpu(), true});
+    transfers.progress(staging, 42);
+    transfers.complete(1, 99);
+    transfers.progress(staging, 42);
+    require(staging.kinds == std::vector{wire::Kind::InputBegin, wire::Kind::InputEnd} &&
+                transfers.ready(first) && !transfers.ready(second),
+            "media transfers entered a busy slot or bypassed FIFO registration order");
+
+    int sockets[2];
+    require(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0, sockets) == 0,
+            "input fence socketpair failed");
+    dist::Transport source, target;
+    source.add(1, dist::Socket(sockets[0]));
+    target.add(0, dist::Socket(sockets[1]));
+
+    transfers.release(first);
+    transfers.progress(source, 42);
+    require(!transfers.has_pending_releases(), "InputRelease failed to enter control queue");
+    for (auto kind : {wire::Kind::Measurement, wire::Kind::Shutdown}) {
+        const dist::OutgoingMessage fence{
+            1, std::make_shared<wire::Message>(wire::Message{kind, 42, {}})};
+        require(source.try_send({&fence, 1}, dist::Traffic::Continuation),
+                "input fence did not enqueue");
+    }
+    source.start();
+    target.start();
+    const auto release = std::get<dist::IncomingMessage>(next_event(target));
+    require(release.message.kind == wire::Kind::InputRelease && release.message.payload.size() == 8,
+            "control fence overtook InputRelease");
+    wire::Decoder input(release.message.payload);
+    staging.receiver.release(input.u64());
+    input.finish();
+    for (auto kind : {wire::Kind::Measurement, wire::Kind::Shutdown})
+        require(std::get<dist::IncomingMessage>(next_event(target)).message.kind == kind,
+                "input fence order changed");
+    transfers.progress(staging, 42);
+    transfers.complete(1, 7);
+    require(transfers.ready(second) && staging.kinds.size() == 4,
+            "second ticket could not acquire the released media slot");
+}
+
+void oversized_input_begin() {
+    // The same input is inadmissible under the payload limit or the empty Input queue limit.
+    for (const auto [message_limit, input_limit] : {std::pair{64U, 1024U}, std::pair{1024U, 64U}}) {
+        int pair[2];
+        require(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0, pair) == 0,
+                "oversized input socketpair failed");
+        dist::Transport source({.message_bytes = message_limit, .input_bytes = input_limit});
+        source.add(1, dist::Socket(pair[0]));
+        dist::Socket peer(pair[1]);
+        runtime::InputTransfers input;
+        (void)input.begin({{1, 15, wire::Bytes(128), {}, {}}});
+        try {
+            input.progress(source, 1);
+        } catch (const std::invalid_argument& e) {
+            const std::string message = e.what();
+            const auto bytes          = 144 + (message_limit == 64 ? 0 : wire::kHeaderBytes);
+            require(message.find(std::to_string(bytes) + " bytes") != std::string::npos &&
+                        message.find("limit is 64") != std::string::npos && !source.sending(),
+                    "oversized frame diagnostic lost the frame size or capacity");
+            continue;
+        }
+        throw std::runtime_error("oversized InputBegin returned backpressure");
+    }
 }
 
 void startup_diagnostics() {
@@ -1017,6 +1170,43 @@ void terminal_messages() {
     }
 }
 
+void terminal_error_drains_blocked_frames() {
+    dist::Endpoint endpoint{dist::Endpoint::Kind::Tcp, "127.0.0.1", 0};
+    auto listener    = dist::listen(endpoint);
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    auto sender      = dist::connect(endpoint, until);
+    dist::Transport target({.received_messages = 1});
+    target.add(2, dist::accept(listener, until));
+    target.start();
+
+    send_message(sender, {wire::Kind::Event, 11, {}}, until);
+    auto retained     = next_event(target);
+    const auto reason = "worker error before socket reset";
+    send_message(sender, {wire::Kind::Failed, 11, dist::encode_failure({reason, {}})}, until);
+    while (!target.receiving()) {
+        require(std::chrono::steady_clock::now() < until,
+                "reset fixture did not block on RX credit");
+        std::this_thread::yield();
+    }
+    const linger reset{1, 0};
+    require(::setsockopt(sender.fd(), SOL_SOCKET, SO_LINGER, &reset, sizeof(reset)) == 0,
+            "could not configure TCP reset");
+    sender.close();
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    require(!target.failure_signal()->load(),
+            "socket error dropped a credit-blocked failure frame");
+
+    retained              = dist::PeerStatus{};
+    const auto diagnostic = std::get<dist::IncomingMessage>(next_event(target));
+    require(diagnostic.message.kind == wire::Kind::Failed &&
+                dist::decode_failure(diagnostic.message.payload).reason == reason,
+            "socket reset lost the complete diagnostic");
+    const auto status = std::get<dist::PeerStatus>(next_event(target));
+    require(status.receive_closed &&
+                status.error.find(std::strerror(ECONNRESET)) != std::string::npos,
+            "transport lost SO_ERROR while draining the reset socket");
+}
+
 void diagnostic_backpressure() {
     int sockets[2];
     require(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0, sockets) == 0,
@@ -1042,26 +1232,1196 @@ void diagnostic_backpressure() {
             "normal shutdown was reported as transport failure");
 }
 
+void telemetry_and_lease() {
+    // 1. Telemetry in-place coalescing never exhausts quota or drops latest sequence.
+    {
+        int sockets[2];
+        require(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0, sockets) == 0,
+                "telemetry socketpair failed");
+        dist::TransportLimits limits;
+        limits.telemetry_messages = 2;
+        limits.telemetry_bytes    = 4096;
+        dist::Transport source(limits), target(limits);
+        source.add(1, dist::Socket(sockets[0]));
+        target.add(0, dist::Socket(sockets[1]));
+        for (std::uint64_t seq = 1; seq <= 20; ++seq) {
+            wire::Encoder out;
+            out.u64(seq);
+            out.u64(seq - 1);
+            const auto msg = std::make_shared<wire::Message>(
+                wire::Message{wire::Kind::Progress, 7, std::move(out).take()});
+            const dist::OutgoingMessage item{1, msg};
+            require(source.try_send({&item, 1}, dist::Traffic::Telemetry),
+                    "telemetry overwrite failed under bounded quota");
+        }
+        source.start();
+        target.start();
+        const auto ev = next_event(target);
+        const auto& m = std::get<dist::IncomingMessage>(ev);
+        wire::Decoder in(m.message.payload);
+        require(m.message.kind == wire::Kind::Progress && in.u64() == 20 && in.u64() == 19,
+                "coalesced telemetry did not preserve latest progress");
+        in.finish();
+        source.close();
+        target.close();
+    }
+    // 2. Heartbeat lease expiration detects silent peer stall without subsequent sends.
+    {
+        int sockets[2];
+        require(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0, sockets) == 0,
+                "lease socketpair failed");
+        dist::Socket silent_peer(sockets[0]);
+        dist::TransportLimits limits;
+        limits.heartbeat_interval_ms = 30;
+        limits.lease_timeout_ms      = 120;
+        dist::Transport target(limits);
+        target.add(1, dist::Socket(sockets[1]));
+        target.start();
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        bool lease_failed   = false;
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (auto ev = target.poll()) {
+                if (const auto* status = std::get_if<dist::PeerStatus>(&*ev)) {
+                    require(status->error.find("lease") != std::string::npos,
+                            "silent peer did not report lease timeout");
+                    lease_failed = true;
+                    break;
+                }
+            } else {
+                target.wait(std::chrono::milliseconds(10));
+            }
+        }
+        require(lease_failed && target.failure_signal()->load(),
+                "lease watchdog did not trip failure signal while idle");
+        target.close();
+        silent_peer.close();
+    }
+}
+
+void rx_backpressure_lease() {
+    int pair[2];
+    require(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0, pair) == 0,
+            "backpressure lease socketpair failed");
+    dist::TransportLimits limits;
+    limits.received_messages     = 1;
+    limits.heartbeat_interval_ms = 20;
+    limits.lease_timeout_ms      = 150;
+    dist::Transport source(limits), target(limits);
+    source.add(1, dist::Socket(pair[0]));
+    target.add(0, dist::Socket(pair[1]));
+    const auto first  = std::make_shared<wire::Message>(wire::Message{wire::Kind::Submit, 1, {}});
+    const auto second = std::make_shared<wire::Message>(wire::Message{wire::Kind::Supply, 1, {}});
+    const std::array frames{dist::OutgoingMessage{1, first}, dist::OutgoingMessage{1, second}};
+    require(source.try_send(frames), "lease test traffic could not enqueue");
+    target.start();
+    source.start();
+    auto retained = std::get<dist::IncomingMessage>(next_event(target));
+    require(retained.message.kind == wire::Kind::Submit, "unexpected first blocked message");
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (!target.receiving()) {
+        require(std::chrono::steady_clock::now() < until, "RX credit did not hold the next frame");
+        std::this_thread::yield();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(400));
+    require(!source.failure_signal()->load() && !target.failure_signal()->load(),
+            "RX credit backpressure expired a healthy heartbeat lease");
+    retained = {};
+    require(std::get<dist::IncomingMessage>(next_event(target)).message.kind == wire::Kind::Supply,
+            "pending frame was lost while receive credits were full");
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    require(!target.failure_signal()->load(), "unblocking retained a stale lease deadline");
+}
+
+void latest_telemetry_at_capacity() {
+    int pair[2];
+    require(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0, pair) == 0,
+            "telemetry RX socketpair failed");
+    dist::Socket sender(pair[0]);
+    dist::Transport target({.telemetry_bytes = 8, .telemetry_messages = 1});
+    target.add(1, dist::Socket(pair[1]));
+    target.start();
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    for (std::uint64_t sequence : {1, 2, 3}) {
+        wire::Encoder out;
+        out.u64(sequence);
+        send_message(sender, {wire::Kind::Progress, 9, std::move(out).take()}, until);
+    }
+    sender.close();
+    while (!target.failure_signal()->load()) {
+        require(std::chrono::steady_clock::now() < until, "telemetry stream did not close");
+        std::this_thread::yield();
+    }
+    const auto latest = std::get<dist::IncomingMessage>(next_event(target));
+    wire::Decoder in(latest.message.payload);
+    require(latest.peer == 1 && latest.message.kind == wire::Kind::Progress && in.u64() == 3,
+            "full telemetry queue kept a stale snapshot");
+    in.finish();
+    require(std::get<dist::PeerStatus>(next_event(target)).receive_closed,
+            "telemetry EOF did not follow its last complete frame");
+    const auto start = std::chrono::steady_clock::now();
+    target.wait(std::chrono::milliseconds(30));
+    target.wait(std::chrono::milliseconds(30));
+    require(std::chrono::steady_clock::now() - start >= std::chrono::milliseconds(15),
+            "drained failure signal made Transport::wait return immediately");
+}
+
+void atomic_cross_replica_send() {
+    int first[2], second[2];
+    require(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0, first) == 0 &&
+                ::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0, second) == 0,
+            "cross-replica send socketpair failed");
+    dist::Socket first_peer(first[1]), second_peer(second[1]);
+    dist::Transport zero({.queued_messages = 1}), one({.queued_messages = 1});
+    zero.add(0, dist::Socket(first[0]));
+    one.add(2, dist::Socket(second[0]));
+    const auto message = std::make_shared<wire::Message>(wire::Message{wire::Kind::Submit, 1, {}});
+    const dist::OutgoingMessage item0{0, message}, item2{2, message};
+    require(one.try_send({&item2, 1}), "could not fill non-zero replica send queue");
+    const std::array only_one{dist::Transport::SendBatch{&one, {&item2, 1}}};
+    require(!dist::Transport::try_send_all(only_one, dist::Traffic::Work),
+            "saturated non-zero replica batch did not return backpressure");
+    const std::array both{dist::Transport::SendBatch{&zero, {&item0, 1}}, only_one.front()};
+    require(!dist::Transport::try_send_all(both, dist::Traffic::Work) && !zero.sending(),
+            "cross-replica backpressure partially enqueued the batch");
+}
+
+void replica_worker(bool report_failure) {
+    const auto boot  = dist::read_worker_bootstrap();
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    auto socket      = dist::connect(boot.control, until);
+    wire::Encoder join;
+    join.u32(boot.identity.rank);
+    join.u32(boot.identity.node);
+    join.i32(boot.identity.device);
+    join.u64(::getpid());
+    send_message(socket, {wire::Kind::Join, boot.epoch, std::move(join).take()}, until);
+    const auto receive = [&] {
+        for (;;) {
+            auto message = receive_message(socket, until);
+            if (message.kind != wire::Kind::Heartbeat) return message;
+        }
+    };
+    require(receive().kind == wire::Kind::Topology, "missing mock worker topology");
+    wire::Encoder prepared;
+    prepared.bytes(std::span<const std::byte>{});
+    send_message(socket, {wire::Kind::Prepared, boot.epoch, std::move(prepared).take()}, until);
+    require(receive().kind == wire::Kind::Connected, "missing mock worker connection");
+    for (;;) {
+        const auto command = receive().kind;
+        if (command == wire::Kind::Failed) return;
+        if (command == wire::Kind::Shutdown) {
+            send_message(socket, {wire::Kind::Stopped, boot.epoch, {}}, until);
+            return;
+        }
+        require(command == wire::Kind::Enter, "unexpected mock coordinator command");
+        if (boot.identity.rank == 2) {
+            if (report_failure)
+                send_message(socket,
+                             {wire::Kind::Failed, boot.epoch,
+                              dist::encode_failure({"replica one diagnostic", {}, false})},
+                             until);
+            return;
+        }
+        send_message(socket, {wire::Kind::Event, boot.epoch, {}}, until);
+    }
+}
+
+void replica_handoff_fault_isolation() {
+    for (const bool report_failure : {true, false}) {
+        DeploymentOptions deployment;
+        deployment.control_host = "127.0.0.1";
+        deployment.parallel     = {.tp = 2, .ep = 2, .dp = 2, .pp = 1, .adp = 1};
+        deployment.nodes        = {{.id = 0, .worker = "/proc/self/exe", .artifact = "/model"}};
+        deployment.ranks        = {{0, 0, 0}, {1, 0, 1}, {2, 0, 2}, {3, 0, 3}};
+        deployment.connect_timeout_ms  = 5000;
+        deployment.shutdown_timeout_ms = 2000;
+        auto topology                  = dist::build_cluster_topology(deployment);
+        const std::array<std::string, 2> args{"--replica-worker",
+                                              report_failure ? "failed" : "eof"};
+        dist::ExecutionGroup group(deployment, topology, {}, {}, args);
+        const auto enter =
+            std::make_shared<wire::Message>(wire::Message{wire::Kind::Enter, group.epoch(), {}});
+        const std::array healthy_work{dist::OutgoingMessage{0, enter}};
+        require(group.try_send(healthy_work), "healthy mock could not receive work");
+        const std::array failing_work{dist::OutgoingMessage{2, enter}};
+        require(group.try_send(failing_work), "non-zero replica mock could not receive work");
+        const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        std::string error;
+        while (error.empty()) {
+            require(std::chrono::steady_clock::now() < until, "replica fault was not observed");
+            try {
+                group.progress();
+            } catch (const std::runtime_error& e) { error = e.what(); }
+            std::this_thread::yield();
+        }
+        require(error.find("rank 2 (replica 1") != std::string::npos &&
+                    (!report_failure || error.find("replica one diagnostic") != std::string::npos),
+                "registration fault had the wrong identity or superseded a Failed diagnostic");
+
+        auto healthy = group.take_replica(0);
+        auto failed  = group.take_replica(1);
+        require(failed->replica().ranks == std::vector<dist::RankId>{2, 3},
+                "failed replica lost global rank mapping");
+        healthy->progress();
+        const auto start = std::chrono::steady_clock::now();
+        healthy->wait(std::chrono::milliseconds(500));
+        require(std::chrono::steady_clock::now() - start < std::chrono::milliseconds(300),
+                "ReplicaGroup::wait ignored its buffered inbox");
+        const auto response = healthy->poll();
+        require(response && response->peer == 0 && response->message.kind == wire::Kind::Event,
+                "healthy replica lost buffered work at handoff");
+        try {
+            failed->progress();
+            throw std::logic_error("faulty replica discarded its pending fault during handoff");
+        } catch (const std::runtime_error& e) {
+            require(e.what() == error, "handed-off replica changed the primary error");
+        }
+        failed->fail(error);
+        failed->wait_for_workers();
+        require(group.supervisor()->domain_exits(1).size() == 2 &&
+                    group.supervisor()->domain_exits(0).empty(),
+                "replica failure drain did not reap exactly its own domain");
+        group.fail("startup owner released after handoff");
+        healthy->shutdown();
+    }
+}
+
+void supervisor_domain_isolation() {
+    std::mutex log_mu;
+    std::vector<std::pair<dist::RankId, std::string>> logs;
+    auto supervisor = std::make_shared<dist::NodeProcessSupervisor>(
+        [&](dist::RankId rank, std::string_view line) {
+            std::lock_guard lock(log_mu);
+            logs.emplace_back(rank, std::string(line));
+        });
+    DeploymentNode node{.id = 0, .worker = "/bin/sh", .artifact = "/unused"};
+    dist::WorkerBootstrap b0;
+    b0.identity = {.rank = 0, .node = 0};
+    dist::WorkerBootstrap b1;
+    b1.identity = {.rank = 1, .node = 0};
+    const std::array<std::string, 2> args{"-c",
+                                          "echo supervisor_ready; exec 1>&- 2>&-; exec sleep 30"};
+    supervisor->launch_all({{node, b0, 0, true}, {node, b1, 1, true}}, args);
+
+    auto cancelled          = b1;
+    cancelled.identity.rank = 2;
+    auto unspawnable        = node;
+    unspawnable.worker      = "/nonexistent/ninfer-supervisor-fixture";
+    supervisor->terminate_domain(2);
+    supervisor->launch_all({{unspawnable, cancelled, 2, true}}, args);
+    supervisor->wait_domain_exit(2, std::chrono::steady_clock::now() + std::chrono::seconds(2));
+    require(supervisor->exit_report(2).has_value(), "cancelled rank was not accounted for");
+
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (std::chrono::steady_clock::now() < until) {
+        {
+            std::lock_guard lock(log_mu);
+            if (logs.size() >= 2) break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    {
+        std::lock_guard lock(log_mu);
+        require(logs.size() >= 2, "supervisor did not drain worker stdout pipes");
+    }
+    supervisor->terminate_domain(1);
+    supervisor->wait_domain_exit(1, std::chrono::steady_clock::now() + std::chrono::seconds(2));
+    require(supervisor->exit_report(1).has_value() && !supervisor->exit_report(0).has_value(),
+            "terminating domain 1 killed healthy domain 0 or failed to reap domain 1");
+    supervisor.reset();
+    int status = 0;
+    require(::waitpid(-1, &status, WNOHANG) == -1 && errno == ECHILD,
+            "supervisor left an unreaped child process");
+}
+
+struct LoopWork {
+    bool context       = false;
+    bool constrained   = false;
+    bool slow_rank1    = false;
+    std::int32_t only  = -1;
+    std::uint64_t blob = 0;
+    std::shared_ptr<wire::Bytes> payload;
+    std::size_t input_metadata_bytes = 0;
+};
+
+struct LoopResult {
+    std::uint64_t value = 0;
+};
+
+struct LoopCommit {
+    std::uint64_t delta = 1;
+};
+
+struct LoopTypes {
+    using Work   = LoopWork;
+    using Result = LoopResult;
+    using Commit = LoopCommit;
+
+    static ExecutionWork describe_work(const Work&) { return {ExecutionKind::Decode, 1, 1, 1}; }
+};
+
+class LoopCodec {
+public:
+    LoopCodec() = default;
+
+    explicit LoopCodec(std::size_t staging_bytes) : staging_(staging_bytes) {
+        receiver_.bind(MemorySpan{staging_.data(), staging_.size(), Device::cpu(), true});
+    }
+
+    runtime::protocol::ControlBudget control_budget() const noexcept {
+        return {4096, 4096, 4096, 1024, 4096, 8192};
+    }
+
+    void bind_input_storage(MemorySpan s) {
+        if (s.data) receiver_.bind(s);
+    }
+
+    bool has_inputs(const LoopWork& w) const noexcept { return w.blob && w.payload; }
+
+    std::vector<runtime::InputResource> prepare_inputs(const LoopWork& w,
+                                                       const dist::ReplicaTopology& replica) {
+        if (!has_inputs(w)) return {};
+        require(!coordinator_input_, "codec installed a second coordinator media binding");
+        std::vector<runtime::InputResource> out;
+        for (auto rank : replica.ranks) {
+            wire::Encoder meta;
+            meta.u64(w.payload->size());
+            auto metadata = std::move(meta).take();
+            if (rank == replica.ranks.back() && w.input_metadata_bytes)
+                metadata.resize(w.input_metadata_bytes);
+            out.push_back({rank, w.blob, std::move(metadata), {*w.payload}, w.payload});
+        }
+        coordinator_input_   = w.blob;
+        coordinator_payload_ = w.payload;
+        return out;
+    }
+
+    void retire_inputs(const LoopWork& w) {
+        require(w.blob && coordinator_input_ == w.blob,
+                "codec retired media without its coordinator binding");
+        coordinator_input_.reset();
+        coordinator_payload_.reset();
+    }
+
+    std::optional<std::uint64_t> receive_input(wire::Kind kind, std::span<const std::byte> bytes) {
+        wire::Decoder in(bytes);
+        const auto id = in.u64();
+        if (kind == wire::Kind::InputRelease) {
+            in.finish();
+            active_input_.reset();
+            receiver_.release(id);
+            return {};
+        }
+        if (kind == wire::Kind::InputBegin) {
+            require(!active_input_.has_value(), "InputBegin arrived before InputRelease(old)");
+            wire::Decoder meta(in.bytes());
+            in.finish();
+            const auto total = meta.u64();
+            meta.finish();
+            const std::array<std::size_t, 1> parts{total};
+            receiver_.begin(id, parts);
+            active_input_ = id;
+            return {};
+        }
+        if (kind == wire::Kind::InputChunk) {
+            const auto part = in.u64(), offset = in.u64();
+            const auto chunk = in.bytes();
+            in.finish();
+            receiver_.append(id, part, offset, chunk);
+            return {};
+        }
+        require(kind == wire::Kind::InputEnd, "unexpected input wire kind");
+        in.finish();
+        const auto spans = receiver_.finish(id);
+        require(spans.size() == 1 && spans[0].bytes > 0, "incomplete streamed input");
+        return id;
+    }
+
+    void validate_work(const LoopWork& w, runtime::FrameKind kind) const {
+        require(w.context == (kind == runtime::FrameKind::Context), "frame kind mismatch");
+    }
+
+    void validate_decision(const LoopWork&, const runtime::DecisionRequest& req,
+                           const runtime::DecisionInput& in) const {
+        require(req.stage == in.stage, "decision stage mismatch");
+    }
+
+    void validate_commit(const LoopWork&, const LoopResult&, const LoopCommit&) const {}
+
+    runtime::protocol::Scope scope(const LoopWork& w, const dist::ExecutionTopology& topo) const {
+        const auto& rep = topo.replica(0);
+        if (w.only >= 0) {
+            const auto r = static_cast<dist::RankId>(w.only);
+            return {{r}, {}, r};
+        }
+        return {rep.ranks, rep.ranks, rep.result_owner};
+    }
+
+    void encode_work(wire::Encoder& out, const LoopWork& w, dist::RankId) const {
+        if (w.blob)
+            require(coordinator_input_ == w.blob, "codec encoded media under another binding");
+        out.boolean(w.context);
+        out.boolean(w.constrained);
+        out.boolean(w.slow_rank1);
+        out.i32(w.only);
+        out.u64(w.blob);
+    }
+
+    LoopWork decode_work(wire::Decoder& in) const {
+        return {in.boolean(), in.boolean(), in.boolean(), in.i32(), in.u64(), {}};
+    }
+
+    void encode_commit(wire::Encoder& out, const LoopCommit& c, dist::RankId) const {
+        out.u64(c.delta);
+    }
+
+    LoopCommit decode_commit(wire::Decoder& in) const { return {in.u64()}; }
+
+    void encode_result(wire::Encoder& out, const LoopResult& r) const { out.u64(r.value); }
+
+    LoopResult decode_result(wire::Decoder& in) const { return {in.u64()}; }
+
+    LoopResult merge_context_results(const runtime::protocol::Scope& s,
+                                     const dist::ReplicaTopology& rep,
+                                     const std::vector<std::optional<LoopResult>>& res) const {
+        LoopResult out{0};
+        for (auto r : s.participants) out.value += res.at(rep.local_index(r))->value;
+        return out;
+    }
+
+private:
+    std::vector<std::byte> staging_;
+    models::vision::InputReceiver receiver_;
+    std::optional<std::uint64_t> coordinator_input_;
+    std::shared_ptr<wire::Bytes> coordinator_payload_;
+    std::optional<std::uint64_t> active_input_;
+};
+
+class SocketWorkerConnection {
+public:
+    SocketWorkerConnection(dist::RankIdentity id, std::uint64_t epoch,
+                           dist::ExecutionTopology topology, dist::Socket socket)
+        : identity_(std::move(id)), epoch_(epoch), topology_(std::move(topology)),
+          transport_(std::make_unique<dist::Transport>()) {
+        transport_->add(0, std::move(socket));
+        transport_->start();
+    }
+
+    ~SocketWorkerConnection() { transport_->close(); }
+
+    const dist::RankIdentity& identity() const noexcept { return identity_; }
+
+    std::uint64_t epoch() const noexcept { return epoch_; }
+
+    std::string hardware_name() const { return "CPU-Mock"; }
+
+    const dist::ExecutionTopology& topology() const noexcept { return topology_; }
+
+    void reserve_control_capacity(const dist::TransportLimits& l) {
+        transport_->reserve_capacity(l);
+    }
+
+    std::vector<CommunicationStatistics> communication_statistics() const { return {}; }
+
+    void reset_communication_statistics() {}
+
+    void observe_communication_totals(CommunicationWork&, CommunicationWork&) const {}
+
+    void set_communication_active(bool) {}
+
+    void check_communication() {}
+
+    std::optional<PhysicalMemorySample> sample_idle_physical_memory() const { return std::nullopt; }
+
+    void send(wire::Kind kind, wire::Bytes payload = {}, bool continuation = true) {
+        const auto msg =
+            std::make_shared<const wire::Message>(wire::Message{kind, epoch_, std::move(payload)});
+        const dist::OutgoingMessage item{0, msg};
+        const auto traffic = continuation ? dist::Traffic::Continuation : dist::Traffic::Work;
+        const auto until   = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!transport_->try_send({&item, 1}, traffic)) {
+            require(std::chrono::steady_clock::now() < until, "worker mock send timed out");
+            std::this_thread::yield();
+        }
+    }
+
+    bool try_send_traffic(wire::Kind kind, wire::Bytes payload, dist::Traffic traffic) {
+        const auto msg =
+            std::make_shared<const wire::Message>(wire::Message{kind, epoch_, std::move(payload)});
+        const dist::OutgoingMessage item{0, msg};
+        return transport_->try_send({&item, 1}, traffic);
+    }
+
+    std::optional<wire::Message> poll() {
+        while (auto ev = transport_->poll()) {
+            if (auto* m = std::get_if<dist::IncomingMessage>(&*ev)) return std::move(m->message);
+            const auto& s = std::get<dist::PeerStatus>(*ev);
+            if (!s.error.empty()) throw std::runtime_error(s.error);
+        }
+        return {};
+    }
+
+    void wait(std::chrono::milliseconds timeout) const { transport_->wait(timeout); }
+
+    void fail(std::string_view reason) {
+        wire::Message msg{wire::Kind::Failed, epoch_,
+                          dist::encode_failure({std::string(reason), {}, false})};
+        const dist::OutgoingMessage item{0, std::make_shared<const wire::Message>(std::move(msg))};
+        (void)transport_->try_send({&item, 1}, dist::Traffic::Continuation);
+        transport_->close();
+    }
+
+    void shutdown() {
+        send(wire::Kind::Stopped, {}, true);
+        const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (transport_->sending() && std::chrono::steady_clock::now() < until)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        transport_->close();
+    }
+
+private:
+    dist::RankIdentity identity_;
+    std::uint64_t epoch_;
+    dist::ExecutionTopology topology_;
+    std::unique_ptr<dist::Transport> transport_;
+};
+
+class LoopProgram {
+public:
+    using CollectiveTrace = std::vector<std::pair<std::uint64_t, wire::Kind>>;
+
+    LoopProgram(dist::RankId rank, std::atomic<std::uint64_t>& forward_collectives,
+                std::atomic<std::uint64_t>& sampling_collectives, CollectiveTrace* trace = nullptr)
+        : rank_(rank), forward_collectives_(forward_collectives),
+          sampling_collectives_(sampling_collectives), trace_(trace), staging_(2ULL << 20) {}
+
+    runtime::ExecutionCapacity capacity() const noexcept { return {2, 1}; }
+
+    MemorySpan input_storage() noexcept {
+        return MemorySpan{staging_.data(), staging_.size(), Device::cpu(), true};
+    }
+
+    void validate_work(const LoopWork&, runtime::FrameKind) const {}
+
+    void validate_decision(runtime::ExecutionTicket, const runtime::DecisionInput&) const {}
+
+    void prepare_commit(runtime::ExecutionTicket, LoopCommit&) const {}
+
+    void start(runtime::ExecutionRequest<LoopTypes>&& req) {
+        auto& slot = get_slot(req.ticket.frame);
+        require(slot.phase == Phase::Empty, "slot still occupied on start");
+        slot.req      = std::move(req);
+        slot.command  = slot.req.command;
+        slot.phase    = Phase::Forward;
+        slot.ready_at = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(slot.req.work.slow_rank1 && rank_ == 1 ? 35 : 0);
+        if (!slot.req.work.context) {
+            ++forward_collectives_;
+            if (trace_) trace_->emplace_back(slot.req.ticket.id, wire::Kind::Submit);
+        }
+    }
+
+    void supply(runtime::ExecutionTicket ticket, runtime::CommandSequence cmd,
+                runtime::DecisionInput&& in) {
+        auto& slot = find_slot(ticket);
+        require(slot.phase == Phase::Decision && !slot.supplied, "supply phase mismatch");
+        slot.command  = cmd;
+        slot.supplied = true;
+        slot.phase    = Phase::PostDecision;
+        slot.ready_at = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(slot.req.work.slow_rank1 && rank_ == 1 ? 25 : 0);
+        ++sampling_collectives_;
+        if (trace_) trace_->emplace_back(ticket.id, wire::Kind::Supply);
+        events_.emplace_back(runtime::DecisionConsumed{ticket, in.stage, {{0, 4}}});
+    }
+
+    void commit(runtime::ExecutionTicket ticket, runtime::CommandSequence cmd, LoopCommit&& c) {
+        auto& slot = find_slot(ticket);
+        require(slot.phase == Phase::PendingCommit, "commit before local PendingCommit");
+        committed_ += c.delta;
+        slot.command = cmd;
+        slot.phase   = Phase::Retiring;
+    }
+
+    bool can_discard(runtime::ExecutionTicket ticket) const {
+        const auto& slot = get_slot(ticket.frame);
+        if (slot.phase == Phase::Empty || slot.req.ticket != ticket) return false;
+        if (ticket.frame.kind == runtime::FrameKind::Context) return false;
+        return slot.phase == Phase::PendingCommit ||
+               (slot.phase == Phase::Decision && !slot.supplied);
+    }
+
+    void discard(runtime::ExecutionTicket ticket, runtime::CommandSequence cmd) {
+        auto& slot = find_slot(ticket);
+        require(can_discard(ticket), "discarded outside collective-safe phase");
+        slot.command = cmd;
+        slot.phase   = Phase::Retiring;
+    }
+
+    std::optional<runtime::ExecutionEvent<LoopTypes>> poll() {
+        const auto now = std::chrono::steady_clock::now();
+        for (auto* vec : {&compute_, &context_}) {
+            for (auto& slot : *vec) {
+                if (slot.phase == Phase::Empty || now < slot.ready_at) continue;
+                if (slot.phase == Phase::Forward) {
+                    if (slot.req.work.context) {
+                        events_.emplace_back(
+                            runtime::ResultReady<LoopTypes>{slot.req.ticket, {committed_ + 1}});
+                        slot.phase = Phase::Retiring;
+                    } else if (slot.req.work.constrained) {
+                        slot.phase = Phase::Decision;
+                        events_.emplace_back(
+                            runtime::DecisionNeeded{slot.req.ticket, {0, 32, {{0, {}}}}});
+                    } else {
+                        ++sampling_collectives_;
+                        slot.phase = Phase::PendingCommit;
+                        events_.emplace_back(
+                            runtime::ResultReady<LoopTypes>{slot.req.ticket, {committed_}});
+                    }
+                } else if (slot.phase == Phase::PostDecision) {
+                    slot.phase = Phase::PendingCommit;
+                    events_.emplace_back(
+                        runtime::ResultReady<LoopTypes>{slot.req.ticket, {committed_}});
+                } else if (slot.phase == Phase::Retiring) {
+                    RankExecutionObservation obs;
+                    obs.workspace_peak_bytes   = 4096;
+                    obs.measurement_peak_bytes = peak_;
+                    events_.emplace_back(
+                        runtime::DeviceRetired{slot.req.ticket, slot.command, obs});
+                    slot = {};
+                }
+            }
+        }
+        if (events_.empty()) return {};
+        auto ev = std::move(events_.front());
+        events_.pop_front();
+        return ev;
+    }
+
+    void drain() {}
+
+    RankMemoryUsage observe_resources() const {
+        RankMemoryUsage m;
+        m.workspace.required_peak_bytes    = 4096;
+        m.workspace.measurement_peak_bytes = peak_;
+        return m;
+    }
+
+    void reset_measurement_peaks() noexcept { peak_ = 0; }
+
+private:
+    enum class Phase { Empty, Forward, Decision, PostDecision, PendingCommit, Retiring };
+
+    struct Slot {
+        runtime::ExecutionRequest<LoopTypes> req;
+        runtime::CommandSequence command;
+        Phase phase   = Phase::Empty;
+        bool supplied = false;
+        std::chrono::steady_clock::time_point ready_at{};
+    };
+
+    Slot& get_slot(runtime::FrameId f) {
+        return (f.kind == runtime::FrameKind::Compute ? compute_ : context_).at(f.index);
+    }
+
+    const Slot& get_slot(runtime::FrameId f) const {
+        return (f.kind == runtime::FrameKind::Compute ? compute_ : context_).at(f.index);
+    }
+
+    Slot& find_slot(runtime::ExecutionTicket t) {
+        auto& s = get_slot(t.frame);
+        require(s.phase != Phase::Empty && s.req.ticket == t, "stale loop ticket");
+        return s;
+    }
+
+    dist::RankId rank_;
+    std::atomic<std::uint64_t>& forward_collectives_;
+    std::atomic<std::uint64_t>& sampling_collectives_;
+    CollectiveTrace* trace_;
+    std::vector<std::byte> staging_;
+    std::vector<Slot> compute_{2};
+    std::vector<Slot> context_{1};
+    std::deque<runtime::ExecutionEvent<LoopTypes>> events_;
+    std::uint64_t committed_ = 10;
+    std::size_t peak_        = 2048;
+};
+
+void collective_order_across_poll_batches() {
+    struct Connection {
+        const dist::ExecutionTopology& topology_;
+        dist::RankId rank;
+        std::deque<wire::Message> inbox;
+        unsigned waits = 0;
+
+        const auto& identity() const { return topology_.rank(rank); }
+
+        std::uint64_t epoch() const { return 5; }
+
+        std::string hardware_name() const { return "CPU-Mock"; }
+
+        const auto& topology() const { return topology_; }
+
+        void reserve_control_capacity(const dist::TransportLimits&) {}
+
+        std::vector<CommunicationStatistics> communication_statistics() const { return {}; }
+
+        void reset_communication_statistics() {}
+
+        void observe_communication_totals(CommunicationWork&, CommunicationWork&) const {}
+
+        void set_communication_active(bool) {}
+
+        void check_communication() {}
+
+        std::optional<PhysicalMemorySample> sample_idle_physical_memory() const { return {}; }
+
+        void send(wire::Kind, wire::Bytes, bool) {}
+
+        bool try_send_traffic(wire::Kind, wire::Bytes, dist::Traffic) { return true; }
+
+        std::optional<wire::Message> poll() {
+            if (inbox.empty()) return {};
+            auto out = std::move(inbox.front());
+            inbox.pop_front();
+            return out;
+        }
+
+        void wait(std::chrono::milliseconds) { ++waits; }
+
+        void fail(std::string_view) {}
+    };
+
+    DeploymentOptions deployment;
+    deployment.control_host = "127.0.0.1";
+    deployment.parallel     = {.tp = 2, .ep = 1, .dp = 1, .pp = 1, .adp = 1};
+    deployment.nodes        = {{.id = 0, .worker = "/worker", .artifact = "/model"}};
+    deployment.ranks        = {{0, 0, 0}, {1, 0, 1}};
+    const auto topology     = dist::build_cluster_topology(deployment);
+    const runtime::ExecutionTicket a{{5}, 1, {runtime::FrameKind::Compute, 0, 1}};
+    const runtime::ExecutionTicket b{{5}, 2, {runtime::FrameKind::Compute, 1, 1}};
+    const runtime::protocol::Scope scope{{0, 1}, {0, 1}, 0};
+    std::array<LoopProgram::CollectiveTrace, 2> traces;
+    for (dist::RankId rank = 0; rank < 2; ++rank) {
+        Connection connection{topology, rank};
+        std::atomic<std::uint64_t> forward{0}, sampling{0};
+        LoopProgram program(rank, forward, sampling, &traces[rank]);
+        LoopCodec codec;
+        runtime::WorkerLoop<LoopTypes, LoopProgram, LoopCodec, Connection> loop(connection, program,
+                                                                                LoopCodec{});
+        const auto queue = [&](auto ticket, std::uint64_t seq, wire::Kind kind) {
+            wire::Encoder out;
+            runtime::protocol::encode(
+                out, runtime::protocol::Envelope{ticket, {seq}, seq, topology.plan, scope});
+            if (kind == wire::Kind::Submit)
+                codec.encode_work(out, {.constrained = true}, rank);
+            else
+                runtime::protocol::encode(out, runtime::DecisionInput{0, {{0, 1, 0, {1}}}});
+            connection.inbox.push_back({kind, 5, std::move(out).take()});
+        };
+        queue(a, 1, wire::Kind::Submit);
+        require(loop.advance() && !connection.waits,
+                "active forward Decision phase slept instead of polling");
+        queue(a, 2, wire::Kind::Supply);
+        if (rank == 0) require(loop.advance(), "worker stopped after Supply");
+        queue(b, 3, wire::Kind::Submit);
+        require(loop.advance(), "worker stopped after overlapping Submit");
+    }
+    require(traces[0] == traces[1] &&
+                traces[0] == LoopProgram::CollectiveTrace{{a.id, wire::Kind::Submit},
+                                                          {a.id, wire::Kind::Supply},
+                                                          {b.id, wire::Kind::Submit}},
+            "rank poll batches changed the ticket/collective order");
+}
+
+void local_discard_waits_for_quiescence() {
+    struct Program : LoopProgram {
+        using LoopProgram::LoopProgram;
+        bool quiescent    = false;
+        unsigned discards = 0;
+
+        bool can_discard(runtime::ExecutionTicket ticket) const {
+            return quiescent && LoopProgram::can_discard(ticket);
+        }
+
+        void discard(runtime::ExecutionTicket ticket, runtime::CommandSequence command) {
+            require(can_discard(ticket), "LocalExecutor discarded before quiescence");
+            ++discards;
+            LoopProgram::discard(ticket, command);
+        }
+    };
+
+    struct Worker {
+        Program model;
+
+        auto& program() { return model; }
+
+        void bind_to_current_thread() {}
+
+        auto device() const { return Device::cpu(); }
+
+        const char* device_name() const { return "CPU-Mock"; }
+    };
+
+    struct LocalTypes {
+        using ExecutionTypes = LoopTypes;
+    };
+
+    std::atomic<std::uint64_t> forward{0}, sampling{0};
+    auto worker   = std::make_unique<Worker>(Worker{Program(0, forward, sampling)});
+    auto* program = &worker->model;
+    runtime::LocalExecutor<LocalTypes, Worker> executor(std::move(worker), {1}, 1);
+    auto reservation    = executor.try_reserve(runtime::FrameKind::Compute);
+    const auto ticket   = executor.submit(std::move(*reservation), {.constrained = true});
+    const auto decision = executor.poll();
+    require(decision && std::holds_alternative<runtime::DecisionNeeded>(*decision),
+            "local program did not enter Decision phase");
+    executor.supply(ticket, {0, {{0, 1, 0, {1}}}});
+    executor.discard(ticket);
+    require(!executor.poll() && !program->discards && !executor.failed() &&
+                executor.has_pending_work(),
+            "local cancellation escaped before quiescence or published a stale decision event");
+    program->quiescent = true;
+    const auto retired = executor.poll();
+    require(retired && std::holds_alternative<runtime::DeviceRetired>(*retired) &&
+                std::get<runtime::DeviceRetired>(*retired).ticket == ticket &&
+                program->discards == 1 && !executor.has_pending_work(),
+            "latched local discard did not retire exactly once at the safe boundary");
+}
+
+void failed_executor_releases_media() {
+    auto topology = dist::build_cluster_topology(DeploymentOptions{
+        .control_host = "127.0.0.1",
+        .parallel     = {.tp = 1, .ep = 1, .dp = 1, .pp = 1, .adp = 1},
+        .nodes        = {{.id = 0, .worker = "/worker", .artifact = "/model"}},
+        .ranks        = {{0, 0, 0}},
+    });
+    topology.plan = 42;
+    int pair[2];
+    require(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0, pair) == 0,
+            "failure test socketpair failed");
+    dist::Socket peer(pair[1]);
+    auto transport = std::make_unique<dist::Transport>();
+    transport->add(0, dist::Socket(pair[0]));
+    transport->start();
+
+    dist::ReplicaTransportHandoff handoff;
+    handoff.transport        = std::move(transport);
+    handoff.epoch            = 5;
+    handoff.topology         = topology;
+    handoff.replica          = topology.replica(0);
+    handoff.shutdown_timeout = std::chrono::seconds(2);
+    runtime::DistributedExecutor<LoopTypes, LoopCodec> executor(
+        std::make_unique<dist::ReplicaGroup>(std::move(handoff)), {2, 1}, LoopCodec(), 1);
+
+    const auto submit_media = [&](std::uint64_t id) {
+        auto payload = std::make_shared<wire::Bytes>(2ULL << 20, std::byte(id));
+        const std::weak_ptr<wire::Bytes> weak = payload;
+        (void)executor.submit(std::move(*executor.try_reserve(runtime::FrameKind::Compute)),
+                              {.blob = id, .payload = std::move(payload)});
+        return weak;
+    };
+    const auto uploading = submit_media(1);
+    const auto queued    = submit_media(2);
+    peer.close();
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!executor.failed() && std::chrono::steady_clock::now() < until) {
+        (void)executor.poll();
+        if (!executor.failed()) executor.wait(std::chrono::milliseconds(5));
+    }
+    require(executor.failed() && !uploading.expired() && !queued.expired(),
+            "peer failure did not leave two media tickets to clean up");
+    executor.drain();
+    require(uploading.expired() && queued.expired() && !executor.has_pending_work(),
+            "failed executor retained media after drain");
+}
+
+void worker_loop_dual_frame_and_discard() {
+    DeploymentOptions deployment;
+    deployment.control_host = "127.0.0.1";
+    deployment.parallel     = {.tp = 2, .ep = 1, .dp = 1, .pp = 1, .adp = 1};
+    deployment.nodes        = {{.id = 0, .worker = "/worker", .artifact = "/model"}};
+    deployment.ranks        = {{0, 0, 0}, {1, 0, 1}};
+    auto topology           = dist::build_cluster_topology(deployment);
+    topology.plan           = 99;
+
+    auto coordinator_transport = std::make_unique<dist::Transport>();
+    std::array<std::unique_ptr<SocketWorkerConnection>, 2> worker_conns;
+    for (dist::RankId r = 0; r < 2; ++r) {
+        int pair[2];
+        require(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0, pair) == 0,
+                "worker_loop socketpair failed");
+        coordinator_transport->add(r, dist::Socket(pair[0]));
+        worker_conns[r] = std::make_unique<SocketWorkerConnection>(topology.rank(r), 5, topology,
+                                                                   dist::Socket(pair[1]));
+    }
+    coordinator_transport->start();
+
+    std::array<std::atomic<std::uint64_t>, 2> forward_counts{0, 0};
+    std::array<std::atomic<std::uint64_t>, 2> sampling_counts{0, 0};
+    std::array<std::thread, 2> workers;
+    for (dist::RankId r = 0; r < 2; ++r) {
+        workers[r] = std::thread([&, r] {
+            LoopProgram program(r, forward_counts[r], sampling_counts[r]);
+            runtime::WorkerLoop<LoopTypes, LoopProgram, LoopCodec, SocketWorkerConnection> loop(
+                *worker_conns[r], program, LoopCodec(2ULL << 20));
+            while (loop.advance()) {}
+            worker_conns[r]->shutdown();
+        });
+    }
+
+    dist::ReplicaTransportHandoff handoff;
+    handoff.transport        = std::move(coordinator_transport);
+    handoff.epoch            = 5;
+    handoff.topology         = topology;
+    handoff.replica          = topology.replica(0);
+    handoff.shutdown_timeout = std::chrono::seconds(5);
+    auto replica_group       = std::make_unique<dist::ReplicaGroup>(std::move(handoff));
+
+    runtime::DistributedExecutor<LoopTypes, LoopCodec> executor(std::move(replica_group), {2, 1},
+                                                                LoopCodec(), 1);
+
+    const auto next_exec_event = [&] {
+        const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        for (;;) {
+            if (auto ev = executor.poll()) {
+                if (const auto* err = std::get_if<runtime::ExecutionFailed>(&*ev))
+                    throw std::runtime_error(err->message);
+                return std::move(*ev);
+            }
+            require(std::chrono::steady_clock::now() < until, "executor event timed out");
+            executor.wait(std::chrono::milliseconds(5));
+        }
+    };
+
+    // 1. The media ticket stays in Decision while a text ticket commits and retires.
+    auto r0 = executor.try_reserve(runtime::FrameKind::Compute);
+    auto r1 = executor.try_reserve(runtime::FrameKind::Compute);
+    require(r0 && r1 && !executor.try_reserve(runtime::FrameKind::Compute),
+            "compute_frames=2 pool bounds broken");
+    const auto t0           = executor.submit(std::move(*r0),
+                                              {.constrained = true,
+                                               .slow_rank1  = true,
+                                               .blob        = 1,
+                                               .payload = std::make_shared<wire::Bytes>(17, std::byte{1})});
+    const auto parked_event = next_exec_event();
+    const auto* parked      = std::get_if<runtime::DecisionNeeded>(&parked_event);
+    require(parked && parked->ticket == t0, "media ticket did not park in Decision");
+    const auto t1 = executor.submit(std::move(*r1), {.constrained = false, .slow_rank1 = false});
+
+    bool t1_result = false, t1_retired = false;
+    while (!t1_retired) {
+        auto ev = next_exec_event();
+        if (auto* rr = std::get_if<runtime::ResultReady<LoopTypes>>(&ev)) {
+            require(rr->ticket == t1 && rr->result.value == 10, "unexpected T1 result");
+            t1_result = true;
+            (void)executor.commit(t1, {5});
+        } else if (auto* dr = std::get_if<runtime::DeviceRetired>(&ev)) {
+            require(dr->ticket == t1 && t1_result, "T1 did not retire ahead of parked T0");
+            t1_retired = true;
+        }
+    }
+    // Now supply and commit T0 while Rank 1 was slower.
+    executor.supply(t0, {0, {{0, 1, 0, {1}}}});
+    bool t0_retired = false;
+    while (!t0_retired) {
+        auto ev = next_exec_event();
+        if (auto* rr = std::get_if<runtime::ResultReady<LoopTypes>>(&ev)) {
+            require(rr->ticket == t0 && rr->result.value == 15, "T0 missed T1 committed state");
+            (void)executor.commit(t0, {2});
+        } else if (auto* dr = std::get_if<runtime::DeviceRetired>(&ev)) {
+            require(dr->ticket == t0, "unexpected retirement");
+            t0_retired = true;
+        }
+    }
+    require(forward_counts[0] == 2 && forward_counts[1] == 2 && sampling_counts[0] == 2 &&
+                sampling_counts[1] == 2,
+            "dual-frame execution desynchronized collective counts");
+
+    // 2. DiscardMode::BeforeSupply skips sampling collectives identically on both ranks.
+    {
+        auto res  = executor.try_reserve(runtime::FrameKind::Compute);
+        auto tick = executor.submit(std::move(*res), {.constrained = true, .slow_rank1 = true});
+        for (;;) {
+            auto ev = next_exec_event();
+            if (auto* dn = std::get_if<runtime::DecisionNeeded>(&ev)) {
+                require(dn->ticket == tick, "expected DecisionNeeded before BeforeSupply discard");
+                executor.discard(tick);
+                break;
+            }
+        }
+        auto retired = next_exec_event();
+        require(std::holds_alternative<runtime::DeviceRetired>(retired) &&
+                    sampling_counts[0] == 2 && sampling_counts[1] == 2,
+                "BeforeSupply discard leaked a ResultReady or ran sampling collectives");
+    }
+
+    // 3. DiscardMode::AfterSupply runs post-decision collective on BOTH ranks before discarding.
+    {
+        auto res  = executor.try_reserve(runtime::FrameKind::Compute);
+        auto tick = executor.submit(std::move(*res), {.constrained = true, .slow_rank1 = true});
+        for (;;) {
+            auto ev = next_exec_event();
+            if (auto* dn = std::get_if<runtime::DecisionNeeded>(&ev)) {
+                require(dn->ticket == tick, "expected DecisionNeeded before AfterSupply discard");
+                executor.supply(tick, {0, {{0, 1, 0, {1}}}});
+                executor.discard(tick);
+                break;
+            }
+        }
+        for (;;) {
+            auto ev = next_exec_event();
+            require(!std::holds_alternative<runtime::ResultReady<LoopTypes>>(ev),
+                    "AfterSupply discard leaked ResultReady");
+            if (std::holds_alternative<runtime::DeviceRetired>(ev)) break;
+        }
+        require(sampling_counts[0] == 3 && sampling_counts[1] == 3,
+                "AfterSupply discard skipped post-decision collective on slow rank");
+    }
+
+    // 4. Subset Context ticket (only rank 1) + multi-MB (>4 chunk) streaming input reuse +
+    // measure().
+    {
+        auto cres    = executor.try_reserve(runtime::FrameKind::Context);
+        auto ctok    = executor.submit(std::move(*cres), {.context = true, .only = 1});
+        bool got_res = false;
+        for (;;) {
+            auto ev = next_exec_event();
+            if (std::holds_alternative<runtime::ResultReady<LoopTypes>>(ev)) got_res = true;
+            if (std::holds_alternative<runtime::DeviceRetired>(ev)) break;
+        }
+        require(got_res, "subset Context work lost its result");
+
+        const auto cancelled =
+            executor.submit(std::move(*executor.try_reserve(runtime::FrameKind::Context)),
+                            {.context = true, .slow_rank1 = true});
+        executor.discard(cancelled);
+        const auto context_event    = next_exec_event();
+        const auto* context_retired = std::get_if<runtime::DeviceRetired>(&context_event);
+        require(context_retired && context_retired->ticket == cancelled &&
+                    context_retired->command.value,
+                "accepted Context discard replaced its natural retirement");
+
+        const auto submit_media = [&](runtime::FrameKind kind, std::uint64_t id) {
+            auto payload = std::make_shared<wire::Bytes>((1536ULL << 10) + 17, std::byte(id));
+            return executor.submit(std::move(*executor.try_reserve(kind)),
+                                   {.context = kind == runtime::FrameKind::Context,
+                                    .blob    = id,
+                                    .payload = std::move(payload)});
+        };
+
+        runtime::ExecutionPool foreign_pool({2, 1});
+        auto foreign = foreign_pool.try_reserve(runtime::FrameKind::Compute);
+        try {
+            (void)executor.submit(std::move(*foreign),
+                                  {.blob = 101, .payload = std::make_shared<wire::Bytes>(1)});
+            throw std::runtime_error("foreign reservation was accepted");
+        } catch (const std::logic_error&) {}
+        require(!executor.has_pending_work() && !foreign_pool.busy(),
+                "rejected registration leaked an execution reservation");
+
+        bool oversized_rejected = false;
+        try {
+            (void)executor.submit(std::move(*executor.try_reserve(runtime::FrameKind::Compute)),
+                                  {.blob                 = 100,
+                                   .payload              = std::make_shared<wire::Bytes>(1),
+                                   .input_metadata_bytes = 9ULL << 20});
+        } catch (const std::invalid_argument& e) {
+            oversized_rejected =
+                std::string_view(e.what()).find("transport limit is") != std::string_view::npos;
+        }
+        require(oversized_rejected && !executor.failed() && !executor.has_pending_work(),
+                "oversized second-rank InputBegin did not roll back synchronously");
+
+        const auto first  = submit_media(runtime::FrameKind::Compute, 101);
+        const auto second = submit_media(runtime::FrameKind::Compute, 102);
+        const auto parked = submit_media(runtime::FrameKind::Context, 103);
+        executor.discard(parked);
+        const auto local_event    = next_exec_event();
+        const auto* local_retired = std::get_if<runtime::DeviceRetired>(&local_event);
+        require(local_retired && local_retired->ticket == parked && !local_retired->command.value,
+                "unsent Context was not cancelled locally");
+        for (const auto ticket : {first, second}) {
+            const auto result = next_exec_event();
+            require(std::holds_alternative<runtime::ResultReady<LoopTypes>>(result) &&
+                        std::get<runtime::ResultReady<LoopTypes>>(result).ticket == ticket,
+                    "concurrent media did not advance in FIFO order");
+            const auto receipt = executor.commit(ticket, {1});
+            const auto done    = next_exec_event();
+            require(std::holds_alternative<runtime::DeviceRetired>(done) &&
+                        std::get<runtime::DeviceRetired>(done).command == receipt.command,
+                    "media execution did not retire");
+        }
+
+        // Discard a Context after InputBegin entered the wire queue but before Submit could
+        // be sent. The following media must wait for that receive slot to finish and release.
+        const auto uploading = submit_media(runtime::FrameKind::Context, 104);
+        executor.discard(uploading);
+        const auto replacement     = submit_media(runtime::FrameKind::Compute, 105);
+        const auto upload_event    = next_exec_event();
+        const auto* upload_retired = std::get_if<runtime::DeviceRetired>(&upload_event);
+        require(upload_retired && upload_retired->ticket == uploading &&
+                    !upload_retired->command.value,
+                "uploading Context did not retire locally before Submit");
+        const auto replacement_result = next_exec_event();
+        require(std::holds_alternative<runtime::ResultReady<LoopTypes>>(replacement_result) &&
+                    std::get<runtime::ResultReady<LoopTypes>>(replacement_result).ticket ==
+                        replacement,
+                "cancelled media upload did not release its worker slot");
+        const auto replacement_receipt  = executor.commit(replacement, {1});
+        const auto replacement_event    = next_exec_event();
+        const auto* replacement_retired = std::get_if<runtime::DeviceRetired>(&replacement_event);
+        require(replacement_retired && replacement_retired->ticket == replacement &&
+                    replacement_retired->command == replacement_receipt.command,
+                "media after a cancelled upload failed to retire");
+
+        executor.measure({runtime::MeasurementAction::Reset});
+        for (const auto& obs : executor.observations())
+            require(obs.memory.workspace.measurement_peak_bytes == 0,
+                    "per-peer measurement fence missed a rank after subset commands");
+    }
+
+    executor.drain();
+    for (auto& w : workers) w.join();
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     try {
+        if (argc == 3 && std::string_view(argv[1]) == "--replica-worker") {
+            replica_worker(std::string_view(argv[2]) == "failed");
+            return 0;
+        }
         batch_plans();
         topology_identity();
         communication_preparation();
         communication_selection();
         model_preparation();
+        materialization_host_waves();
         cache_profiles_roundtrip();
         native_work();
         context_observations();
         queues();
         startup_diagnostics();
         terminal_messages();
+        terminal_error_drains_blocked_frames();
         diagnostic_backpressure();
         retained_payload();
         prepared_control_capacity();
         compact_payloads();
         inputs();
+        input_slot_and_fences();
+        oversized_input_begin();
+        telemetry_and_lease();
+        rx_backpressure_lease();
+        latest_telemetry_at_capacity();
+        atomic_cross_replica_send();
+        replica_handoff_fault_isolation();
+        supervisor_domain_isolation();
+        collective_order_across_poll_batches();
+        local_discard_waits_for_quiescence();
+        failed_executor_releases_media();
+        worker_loop_dual_frame_and_discard();
         RankSnapshot memory;
         memory.rank                                             = 1;
         memory.node                                             = 3;

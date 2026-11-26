@@ -35,8 +35,9 @@ public:
     [[nodiscard]] runtime::protocol::Scope scope(const Work&,
                                                  const distributed::ExecutionTopology&) const;
     [[nodiscard]] std::vector<runtime::InputResource>
-    prepare_inputs(const Work&, const distributed::ExecutionTopology&);
-    [[nodiscard]] std::vector<runtime::InputRelease> retire_inputs(const Work&);
+    prepare_inputs(const Work&, const distributed::ReplicaTopology&);
+    [[nodiscard]] bool has_inputs(const Work&) const noexcept;
+    void retire_inputs(const Work&);
     [[nodiscard]] std::optional<std::uint64_t> receive_input(distributed::wire::Kind,
                                                              std::span<const std::byte>);
 
@@ -48,21 +49,17 @@ public:
     [[nodiscard]] Result decode_result(distributed::wire::Decoder&) const;
 
     [[nodiscard]] Result merge_context_results(const runtime::protocol::Scope&,
+                                               const distributed::ReplicaTopology&,
                                                const std::vector<std::optional<Result>>&) const;
 
 private:
-    struct ReceivingInput {
-        vision::WindowUse window;
-        std::shared_ptr<qwen::VisionWindowInput> input;
-    };
-
     WorkContract contract_;
     runtime::protocol::ControlBudget budget_;
+    distributed::ReplicaTopology replica_;
     runtime::protocol::Scope scope_;
     VisionInputBindings inputs_;
 
-    vision::InputReceiver receiver_;
-    std::optional<ReceivingInput> receiving_;
+    qwen::VisionInputReceiver receiver_;
     std::uint32_t rank_ = 0, ranks_ = 1, max_features_ = 0;
 };
 

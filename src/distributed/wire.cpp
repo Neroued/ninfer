@@ -127,6 +127,7 @@ void encode(Encoder& out, const RankIdentity& r) {
         out.u32(c.rank);
         out.u32(c.size);
     }
+    out.u64(r.shard_digest);
 }
 
 RankIdentity decode_rank_identity(Decoder& in) {
@@ -139,14 +140,44 @@ RankIdentity decode_rank_identity(Decoder& in) {
         c->rank = in.u32();
         c->size = in.u32();
     }
+    r.shard_digest = in.u64();
     return r;
+}
+
+void encode(Encoder& out, const ReplicaTopology& rep) {
+    out.u32(rep.replica_id);
+    out.u32(rep.failure_domain_id);
+    out.u32(rep.result_owner);
+    out.u64(rep.ranks.size());
+    for (auto r : rep.ranks) out.u32(r);
+    out.u64(rep.stage_ranks.size());
+    for (const auto& stage : rep.stage_ranks) {
+        out.u64(stage.size());
+        for (auto r : stage) out.u32(r);
+    }
+}
+
+ReplicaTopology decode_replica_topology(Decoder& in) {
+    ReplicaTopology rep;
+    rep.replica_id        = in.u32();
+    rep.failure_domain_id = in.u32();
+    rep.result_owner      = in.u32();
+    rep.ranks.resize(in.count(4));
+    for (auto& r : rep.ranks) r = in.u32();
+    rep.stage_ranks.resize(in.count(8));
+    for (auto& stage : rep.stage_ranks) {
+        stage.resize(in.count(4));
+        for (auto& r : stage) r = in.u32();
+    }
+    return rep;
 }
 
 void encode(Encoder& out, const ExecutionTopology& t) {
     out.u64(t.plan);
-    out.u32(t.output_rank);
     out.u64(t.ranks.size());
     for (const auto& r : t.ranks) encode(out, r);
+    out.u64(t.replicas.size());
+    for (const auto& rep : t.replicas) encode(out, rep);
     out.u64(t.groups.size());
     for (const auto& g : t.groups) {
         out.u32(g.id);
@@ -163,10 +194,11 @@ void encode(Encoder& out, const ExecutionTopology& t) {
 
 ExecutionTopology decode_topology(Decoder& in) {
     ExecutionTopology out;
-    out.plan        = in.u64();
-    out.output_rank = in.u32();
-    out.ranks.resize(in.count(56));
+    out.plan = in.u64();
+    out.ranks.resize(in.count(64));
     for (auto& r : out.ranks) r = decode_rank_identity(in);
+    out.replicas.resize(in.count(28));
+    for (auto& rep : out.replicas) rep = decode_replica_topology(in);
     out.groups.resize(in.count(13));
     for (auto& g : out.groups) {
         g.id    = in.u32();

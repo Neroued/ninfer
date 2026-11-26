@@ -25,9 +25,10 @@ bool can_narrow_dflash_targets(const EngineOptions& options) noexcept {
 }
 
 RankPreparation::RankPreparation(const artifact::Reader& reader, RankLoadRequest request,
-                                 DeviceContext& device, ContextCommunication peer)
-    : device_(device), options_(std::move(request.options)), peer_(peer),
-      control_owner_(request.control_owner) {
+                                 DeviceContext& device, ContextCommunication peer,
+                                 std::uint32_t global_rank, std::uint32_t global_node)
+    : device_(device), options_(std::move(request.options)), global_rank_(global_rank),
+      global_node_(global_node), peer_(std::move(peer)), control_owner_(request.control_owner) {
     if (request.artifact != reader.artifact_id())
         throw artifact::ArtifactError("GLM5Next worker artifact differs from coordinator");
     auto definition = read_definition(reader, load_options(options_));
@@ -37,8 +38,9 @@ RankPreparation::RankPreparation(const artifact::Reader& reader, RankLoadRequest
                     load_->materialization().host_capacity_bytes, request.host_reservation_bytes};
     auto profile = execution::describe_model(load_->definition(), load_->weight_data(),
                                              load_->expert_data(), load_->rank_plan());
-    plan_        = plan_execution(std::move(profile), options_, request.index_format,
-                                  device.multiprocessor_count(), std::move(request.batches));
+    plan_        = plan_execution(
+        std::move(profile), options_, request.index_format, device.multiprocessor_count(),
+        device_memory_snapshot(device.device()).shared_physical_memory, std::move(request.batches));
     if (request.narrow_dflash_targets) select_narrow_targets(true);
     capacity_ = describe_execution_capacity(plan_);
 }
@@ -120,11 +122,11 @@ void RankPreparation::prepare(runtime::ContextCapacity capacity, std::size_t ava
     if (!instance_ || instance_->program)
         throw std::logic_error(
             "GLM5Next resource allocation requires weights and an empty resource slot");
-    const auto reserve  = graph_memory_.rebuild_estimate_bytes;
-    available           = available > reserve ? available - reserve : 0;
-    const auto reserved = capacity_.reservation_bytes(capacity);
-    const auto control =
-        control_owner_ && NINFER_SHARED_PHYSICAL_MEMORY ? capacity_.control_bytes(capacity) : 0;
+    const bool shared_memory = device_memory_snapshot(device_.device()).shared_physical_memory;
+    const auto reserve       = graph_memory_.rebuild_estimate_bytes;
+    available                = available > reserve ? available - reserve : 0;
+    const auto reserved      = capacity_.reservation_bytes(capacity);
+    const auto control       = control_owner_ && shared_memory ? capacity_.control_bytes(capacity) : 0;
     if (reserved > available || control > available - reserved) {
         const auto required = reserved + control;
         throw std::runtime_error("GLM5Next rank allocation budget exceeded: required " +
@@ -135,13 +137,15 @@ void RankPreparation::prepare(runtime::ContextCapacity capacity, std::size_t ava
     auto plan     = plan_;
     plan.capacity = runtime::resolve_context_capacity(
         ContextCapacityPolicy::explicit_capacity(capacity.device_bytes), capacity_, available,
-        available_host, NINFER_SHARED_PHYSICAL_MEMORY != 0, control_owner_);
+        available_host, shared_memory, control_owner_);
     auto resources     = std::make_unique<Resources>(std::move(plan), device_, peer_);
     instance_->program = std::make_unique<RankProgram>(instance_->parameters, std::move(resources),
                                                        device_, binding_);
 }
 
 void RankPreparation::release_resources() {
+    const bool active = probe_ || (instance_ && instance_->program);
+    probe_.reset();
     if (instance_ && instance_->program) {
         instance_->program->drain();
         if (const auto graph = instance_->program->resource_budget().graphs)
@@ -149,6 +153,7 @@ void RankPreparation::release_resources() {
                 std::max(graph_memory_.rebuild_estimate_bytes, graph->preparation_peak_bytes);
         instance_->program.reset();
     }
+    if (active) device_.synchronize();
 }
 
 void RankPreparation::select_narrow_targets(bool enabled, GraphMemorySummary measured) {
@@ -170,7 +175,8 @@ RankResourceDescription RankPreparation::describe() const {
                                 .batches = p.batches->spec(),
                                 .state   = describe_state(p.state),
                                 .context = describe_context(p)};
-    out.observation.rank     = out.rank;
+    out.observation.rank     = global_rank_;
+    out.observation.node     = global_node_;
     out.observation.hardware = device_.properties().name;
     out.observation.memory   = instance_->program->observe_resources();
 
@@ -216,7 +222,8 @@ Startup::Startup(const artifact::Reader& reader, const artifact::Reader& rank,
         throw artifact::ArtifactError("GLM5Next local artifact differs from coordinator");
     rank_ = options.deployment ? plan_parallel(*definition_, *options.deployment).ranks.at(0)
                                : plan_single_rank(*definition_);
-    if (rank_.size != 1) throw std::invalid_argument("GLM5Next local startup requires one rank");
+    if (rank_.size != 1 || (options.deployment && options.deployment->ranks.size() != 1))
+        throw std::invalid_argument("GLM5Next local startup requires one rank");
 }
 
 Frontend Startup::frontend(const EngineOptions& options) const {
@@ -247,9 +254,7 @@ std::unique_ptr<RankPreparation> Startup::preparation(const artifact::Reader& re
 
 PreparedSession Startup::session(const RankResourceDescription& rank,
                                  std::uint32_t interval) const {
-    ParallelPlan group;
-    group.ranks.push_back(rank_);
-    return prepare_session(definition_, prepare_context(group, {&rank, 1}), interval);
+    return prepare_session(definition_, prepare_replica_context({&rank_, 1}, {&rank, 1}), interval);
 }
 
 std::string prefill_signature(const ModelDefinition& d, std::uint32_t chunk, std::uint32_t ranks,

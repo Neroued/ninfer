@@ -283,12 +283,14 @@ std::span<const std::int32_t> PreparedPromptData::position_axis(int axis) const 
 
 PreparedPrompt::PreparedPrompt() noexcept = default;
 
-PreparedPrompt::PreparedPrompt(std::unique_ptr<PreparedPromptData> data) noexcept
+PreparedPrompt::PreparedPrompt(std::shared_ptr<PreparedPromptData> data) noexcept
     : data_(std::move(data)) {}
 
-PreparedPrompt::~PreparedPrompt()                                    = default;
-PreparedPrompt::PreparedPrompt(PreparedPrompt&&) noexcept            = default;
-PreparedPrompt& PreparedPrompt::operator=(PreparedPrompt&&) noexcept = default;
+PreparedPrompt::~PreparedPrompt()                                          = default;
+PreparedPrompt::PreparedPrompt(const PreparedPrompt&) noexcept             = default;
+PreparedPrompt& PreparedPrompt::operator=(const PreparedPrompt&) noexcept  = default;
+PreparedPrompt::PreparedPrompt(PreparedPrompt&&) noexcept                  = default;
+PreparedPrompt& PreparedPrompt::operator=(PreparedPrompt&&) noexcept       = default;
 
 PromptSummary PreparedPrompt::summary() const {
     if (data_ == nullptr) { throw std::logic_error("prepared prompt is empty"); }
@@ -301,6 +303,8 @@ PromptPreparationStats PreparedPrompt::preparation_stats() const noexcept {
     if (data_ == nullptr) { return {}; }
     return data_->prepare.public_stats();
 }
+
+bool PreparedPrompt::reusable() const noexcept { return data_ && data_->identity.reusable; }
 
 PreparedPrompt::operator bool() const noexcept { return data_ != nullptr; }
 
@@ -334,10 +338,39 @@ const PreparedPromptData& PreparedPromptAccess::view(const PreparedPrompt& promp
     return *prompt.data_;
 }
 
+std::shared_ptr<const PreparedPromptData>
+PreparedPromptAccess::shared(const PreparedPrompt& prompt) {
+    if (prompt.data_ == nullptr) { throw std::invalid_argument("prepared prompt is empty"); }
+    return prompt.data_;
+}
+
 PreparedPromptData PreparedPromptAccess::take(PreparedPrompt&& prompt) {
     if (prompt.data_ == nullptr) { throw std::invalid_argument("prepared prompt is empty"); }
     auto data = std::move(prompt.data_);
-    return std::move(*data);
+    if (data.use_count() == 1) { return std::move(*data); }
+    return *data;
+}
+
+PromptPrefixKeyer::PromptPrefixKeyer(const PreparedPrompt& prompt, std::uint32_t domain)
+    : data_(prompt.data_), domain_(domain),
+      max_frontier_(data_ && data_->identity.reusable ? checked_token_count(data_->token_ids.size())
+                                                      : 0) {
+    if (max_frontier_) {
+        media_.reserve(data_->vision_items.size());
+        for (const auto& item : data_->vision_items) media_.push_back({&item});
+    }
+}
+
+runtime::PrefixKey PromptPrefixKeyer::key_at(std::uint32_t frontier) const {
+    if (!data_ || frontier == 0 || frontier > max_frontier_) {
+        throw std::out_of_range("prompt prefix frontier is out of range");
+    }
+    context::InputIdentityView view{.tokens          = context::TokenView(data_->token_ids),
+                                    .types           = data_->token_types,
+                                    .generated_delta = data_->rope_delta,
+                                    .media           = media_};
+    for (int axis = 0; axis < 3; ++axis) { view.positions[axis] = data_->position_axis(axis); }
+    return fingerprints_.key(domain_, view, frontier);
 }
 
 const PreparedPromptData& FrontendTestAccess::inspect(const PreparedPrompt& prompt) {
@@ -378,7 +411,7 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         throw std::invalid_argument("Vision is disabled for this Engine");
     }
 
-    auto prepared              = std::make_unique<PreparedPromptData>();
+    auto prepared              = std::make_shared<PreparedPromptData>();
     PreparedPromptData& result = *prepared;
     result.output.tools        = tool_call_output;
     result.output.has_tool_history =
@@ -504,7 +537,7 @@ PreparedPrompt Frontend::prepare_tokens(std::vector<TokenId> token_ids,
                                     std::to_string(token));
         }
     }
-    auto prepared              = std::make_unique<PreparedPromptData>();
+    auto prepared              = std::make_shared<PreparedPromptData>();
     PreparedPromptData& result = *prepared;
     result.token_ids           = std::move(token_ids);
     assign_text_positions(result);

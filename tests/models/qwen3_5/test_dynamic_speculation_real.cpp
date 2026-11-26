@@ -1,7 +1,7 @@
 #include "dynamic_speculation/suite.h"
 #include "models/qwen3_5/startup.h"
 #include "ninfer/engine.h"
-#include "runtime/engine/engine_core.h"
+#include "runtime/engine/engine_coordinator.h"
 #include "runtime/engine/startup.h"
 #include "runtime/engine/startup.inl"
 
@@ -44,8 +44,8 @@ void startup_calibration(const char* artifact, bool graph) {
     options.max_context = 4096;
     auto loaded         = runtime::construct_model(options);
     auto& instance      = *std::get<std::unique_ptr<Instance>>(loaded.instance);
-    runtime::EngineCore<Instance> engine(instance, options, {});
-    const auto cost = instance.session->speculative_cost_summary();
+    runtime::EngineCoordinator<Instance> engine(instance, options, {});
+    const auto cost = instance.replicas.front()->session->speculative_cost_summary();
     check(cost.fitted && cost.anchor_count && !cost.online_cell_count,
           "startup calibration did not fit from retired probes");
     const auto snapshot = engine.snapshot();
@@ -102,13 +102,14 @@ void adaptive_rounds(const char* artifact, bool graph, bool startup_fit) {
     auto loaded = runtime::construct_model(options);
     auto& instance =
         *std::get<std::unique_ptr<runtime::InferenceInstance<q::RuntimeTypes>>>(loaded.instance);
-    instance.executor->bind_to_current_thread();
-    auto& session = *instance.session;
+    auto& replica = *instance.replicas.front();
+    replica.executor->bind_to_current_thread();
+    auto& session = *replica.session;
     if (startup_fit) {
-        runtime::calibrate_speculative(instance, {});
+        runtime::calibrate_speculative(replica, {});
         check(session.speculative_cost_summary().fitted, "adaptive startup cost fit is empty");
     }
-    test::qwen3_5::EventDriver driver(session, *instance.executor);
+    test::qwen3_5::EventDriver driver(session, *replica.executor);
     runtime::ResolvedExecutionOptions request;
     request.requested_output_tokens = 200;
     request.allow_prefix_reuse      = false;
@@ -220,7 +221,7 @@ void adaptive_rounds(const char* artifact, bool graph, bool startup_fit) {
           "the measured fit was replaced during adaptive verification");
     for (const auto member : members) (void)driver.abort(member);
     std::cout << "OK "
-              << (instance.executor->observations().front().memory.experts ? "offload" : "resident")
+              << (replica.executor->observations().front().memory.experts ? "offload" : "resident")
               << " adaptive rejection and wake-up ("
               << (startup_fit ? "startup fit" : "fixed costs") << "), ragged extents " << ragged[0]
               << ", " << ragged[1] << '\n';
@@ -235,17 +236,19 @@ void masked_decode(EngineOptions options, bool expect_offload) {
         artifact::Reader file(settings.artifact_path);
         auto baseline = runtime::detail::build_local_model<FullWidthStartup>(
             file, settings, std::chrono::steady_clock::now());
-        const auto catalog =
-            baseline.instance->session->calibration_constraints().routes->at({1, 1});
+        const auto catalog = baseline.instance->replicas.front()
+                                 ->session->calibration_constraints()
+                                 .routes->at({1, 1});
         check(catalog.size() == 2 && catalog.back().width == k + 1,
                   "baseline did not use the full-width target catalog");
         return baseline.instance->context_capacities.front().device_bytes;
     }();
     auto loaded    = runtime::construct_model(options);
     auto& instance = *std::get<std::unique_ptr<Instance>>(loaded.instance);
-    auto& session  = *instance.session;
-    instance.executor->bind_to_current_thread();
-    check(instance.executor->observations().front().memory.experts.has_value() == expect_offload,
+    auto& replica  = *instance.replicas.front();
+    auto& session  = *replica.session;
+    replica.executor->bind_to_current_thread();
+    check(replica.executor->observations().front().memory.experts.has_value() == expect_offload,
           "masked graph startup selected an unexpected weight placement");
     const auto target_cap  = instance.context_capacities.front().device_bytes;
     const auto constraints = session.calibration_constraints();
@@ -262,7 +265,7 @@ void masked_decode(EngineOptions options, bool expect_offload) {
                   << '\n';
     }
 
-    test::qwen3_5::EventDriver driver(session, *instance.executor);
+    test::qwen3_5::EventDriver driver(session, *replica.executor);
     runtime::ResolvedExecutionOptions request;
     request.requested_output_tokens = 96;
     request.allow_prefix_reuse      = false;
@@ -346,7 +349,7 @@ void masked_decode(EngineOptions options, bool expect_offload) {
                 q::ExecutionUnit{member.front(), q::ExecutionUnitKind::Decode, 1}};
             check(bool(session.reserve_units(decode)), "split-narrow decode permit failed");
             const auto draft_intervals = [&] {
-                return instance.executor->observations()
+                return replica.executor->observations()
                     .front()
                     .gpu_intervals[static_cast<std::size_t>(GpuInterval::Draft)]
                     .count;
@@ -411,11 +414,12 @@ void offloaded_graph(const char* artifact, bool graph) {
     auto loaded = runtime::construct_model(options);
     auto& instance =
         *std::get<std::unique_ptr<runtime::InferenceInstance<q::RuntimeTypes>>>(loaded.instance);
-    instance.executor->bind_to_current_thread();
-    check(instance.executor->observations().front().memory.experts.has_value(),
+    auto& replica = *instance.replicas.front();
+    replica.executor->bind_to_current_thread();
+    check(replica.executor->observations().front().memory.experts.has_value(),
           "expected CPU expert offload; set NINFER_VRAM_BUDGET_MIB=16384");
-    auto& session = *instance.session;
-    test::qwen3_5::EventDriver driver(session, *instance.executor);
+    auto& session = *replica.session;
+    test::qwen3_5::EventDriver driver(session, *replica.executor);
     runtime::ResolvedExecutionOptions request;
     request.requested_output_tokens = 32;
     request.allow_prefix_reuse      = false;

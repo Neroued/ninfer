@@ -3,7 +3,7 @@
 namespace ninfer::runtime {
 
 template <class Instance>
-void EngineCore<Instance>::reserve_active_capture(const std::shared_ptr<Request>& request,
+void ReplicaEngine<Instance>::reserve_active_capture(const std::shared_ptr<Request>& request,
                                                   EngineRequestState next) {
     request->model_state        = next;
     request->capture_pending    = true;
@@ -34,7 +34,7 @@ void EngineCore<Instance>::reserve_active_capture(const std::shared_ptr<Request>
 }
 
 template <class Instance>
-bool EngineCore<Instance>::prepare_semantic_capture(const std::shared_ptr<Request>& request,
+bool ReplicaEngine<Instance>::prepare_semantic_capture(const std::shared_ptr<Request>& request,
                                                     bool allow_reclaim) {
     auto& decision = capture_decisions_[request->lane->value];
     if (decision && decision->sequence != *request->sequence) { decision.reset(); }
@@ -161,10 +161,10 @@ bool EngineCore<Instance>::prepare_semantic_capture(const std::shared_ptr<Reques
 }
 
 template <class Instance>
-void EngineCore<Instance>::ensure_base_plan(const std::shared_ptr<Request>& request) {
+void ReplicaEngine<Instance>::ensure_base_plan(const std::shared_ptr<Request>& request) {
     if (!request->base_plan) {
-        request->base_plan.emplace(instance_.session->plan_request(std::move(request->prompt),
-                                                                   request->options.execution));
+        request->base_plan.emplace(
+            instance_.session->plan_request(request->prompt, request->options.execution));
         const auto& summary = request->base_plan->summary();
         request->budget.emplace(summary.effective_output_tokens, summary.effective_limit_reason);
         request->generated.reserve(summary.effective_output_tokens);
@@ -172,7 +172,7 @@ void EngineCore<Instance>::ensure_base_plan(const std::shared_ptr<Request>& requ
 }
 
 template <class Instance>
-[[nodiscard]] std::optional<std::uint32_t> EngineCore<Instance>::free_lane() const noexcept {
+[[nodiscard]] std::optional<std::uint32_t> ReplicaEngine<Instance>::free_lane() const noexcept {
     for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
         if (!slots_[lane] && (!materializing_ || materializing_->destination.value != lane)) {
             return lane;
@@ -182,13 +182,13 @@ template <class Instance>
 }
 
 template <class Instance>
-[[nodiscard]] bool EngineCore<Instance>::resident_empty() const noexcept {
+[[nodiscard]] bool ReplicaEngine<Instance>::resident_empty() const noexcept {
     return !materializing_ &&
            std::all_of(slots_.begin(), slots_.end(), [](const auto& p) { return !p; });
 }
 
 template <class Instance>
-void EngineCore<Instance>::resolve_context_progress(
+void ReplicaEngine<Instance>::resolve_context_progress(
     typename ModelContract::ContextProgress&& progress, HostPhaseMeasurement& boundary) {
     if (!progress.complete) {
         throw std::logic_error("Session emitted an incomplete context result");
@@ -196,6 +196,7 @@ void EngineCore<Instance>::resolve_context_progress(
     const auto owner = materializing_ ? materializing_->request : context_owner_;
     record_context_work(progress, owner);
     if (progress.kind == decltype(progress.kind)::Maintenance) {
+        publish_resource_offer();
         request_admission_check();
         return;
     }
@@ -267,11 +268,13 @@ void EngineCore<Instance>::resolve_context_progress(
             cumulative_stats_.reused_prompt_tokens += control.summary.reused_prompt_tokens;
             cumulative_stats_.prompt_tokens += control.summary.prompt_tokens;
             cumulative_stats_.last_selected_frontier_tokens = control.summary.reused_prompt_tokens;
+            frontier_decision_ = hooks_.next_frontier_decision();
             // Generation start was published when the first binding obtained its resources.
         }
         finish_engine_phase(boundary, EngineHostPhase::Boundary);
-        set_resident(control.destination.value, request);
+        const auto destination = control.destination;
         materializing_.reset();
+        set_resident(destination.value, request);
         boundary = begin_host_phase();
     } else if (context_owner_) {
         const auto request = context_owner_;
@@ -296,6 +299,7 @@ void EngineCore<Instance>::resolve_context_progress(
             request->lane.reset();
             request->residency.reset();
             request->sequence.reset();
+            release_or_handoff_request_residency(request, request.get());
             request_admission_check();
             boundary = begin_host_phase();
         } else {
@@ -317,7 +321,7 @@ void EngineCore<Instance>::resolve_context_progress(
 }
 
 template <class Instance>
-ReclaimProgress EngineCore<Instance>::reclaim(const ContextAssessment& assessment, bool allow_pause,
+ReclaimProgress ReplicaEngine<Instance>::reclaim(const ContextAssessment& assessment, bool allow_pause,
                                               std::span<const Checkpoint> excluded,
                                               typename ResourceManagement::ReclaimCursor* cursor) {
     if (assessment.ready()) return ReclaimProgress::Retry;
@@ -380,7 +384,7 @@ ReclaimProgress EngineCore<Instance>::reclaim(const ContextAssessment& assessmen
 }
 
 template <class Instance>
-bool EngineCore<Instance>::pause_reclaim_victim(
+bool ReplicaEngine<Instance>::pause_reclaim_victim(
     const ContextAssessment& pressure, typename ResourceManagement::ReclaimCursor* cursor) {
     for (const auto victim : scheduler_.preemption_candidates(slots_))
         if (pause_resident(victim, PauseGoal::ReleaseCapacity, &pressure, cursor)) return true;
@@ -388,7 +392,7 @@ bool EngineCore<Instance>::pause_reclaim_victim(
 }
 
 template <class Instance>
-bool EngineCore<Instance>::pause_resident(std::uint32_t lane, PauseGoal goal,
+bool ReplicaEngine<Instance>::pause_resident(std::uint32_t lane, PauseGoal goal,
                                           const ContextAssessment* pressure,
                                           typename ResourceManagement::ReclaimCursor* parent) {
     if (instance_.session->has_context_operation()) { return false; }
@@ -503,7 +507,7 @@ bool EngineCore<Instance>::pause_resident(std::uint32_t lane, PauseGoal goal,
 }
 
 template <class Instance>
-void EngineCore<Instance>::finish_source_wait(const std::shared_ptr<Request>& request,
+void ReplicaEngine<Instance>::finish_source_wait(const std::shared_ptr<Request>& request,
                                               Clock::time_point now) noexcept {
     if (!request->source_wait_started) { return; }
     request->admission.source_wait_seconds +=
@@ -512,7 +516,7 @@ void EngineCore<Instance>::finish_source_wait(const std::shared_ptr<Request>& re
 }
 
 template <class Instance>
-void EngineCore<Instance>::retain_admission_source(
+void ReplicaEngine<Instance>::retain_admission_source(
     const std::shared_ptr<Request>& request,
     const typename ResourceManagement::SourceChoice& choice, bool restoring) {
     resources_.retain_source(*instance_.session, request->id, choice);
@@ -524,7 +528,7 @@ void EngineCore<Instance>::retain_admission_source(
 }
 
 template <class Instance>
-void EngineCore<Instance>::order_binding_sources(
+void ReplicaEngine<Instance>::order_binding_sources(
     const std::shared_ptr<Request>& request, LaneId lane,
     std::vector<typename ResourceManagement::SourceChoice>& sources) {
     const auto placements = instance_.session->placements(*request->base_plan);
@@ -596,7 +600,7 @@ void EngineCore<Instance>::order_binding_sources(
 }
 
 template <class Instance>
-void EngineCore<Instance>::set_placement_load(Request& request,
+void ReplicaEngine<Instance>::set_placement_load(Request& request,
                                               std::optional<PlacementId> placement,
                                               std::uint64_t tokens) {
     if (placement) placement_loads_.try_emplace(placement->value, PlacementLoad{*placement});
@@ -617,18 +621,66 @@ void EngineCore<Instance>::set_placement_load(Request& request,
 }
 
 template <class Instance>
-bool EngineCore<Instance>::try_admit_one(bool restoring) {
+void ReplicaEngine<Instance>::bounce_pending_request(
+    const std::shared_ptr<Request>& request, const std::shared_ptr<Request>& restore_target) {
+    resources_.release_source(*instance_.session, request->id);
+    finish_source_wait(request, Clock::now());
+    request->base_plan.reset();
+    request->budget.reset();
+    request->admission_generation = 0;
+    request->admission_observed = false;
+    request->admission.revoked_checkpoints = 0;
+    set_placement_load(*request, {}, 0);
+    if (admission_decision_ && admission_decision_->request == request)
+        admission_decision_.reset();
+    {
+        std::lock_guard lock(queue_mutex_);
+        std::erase(pending_, request);
+    }
+    release_dispatch_lane(*request);
+    request->replica_id.reset();
+    request->holds_residency_permit = false;
+    try {
+        const auto offer = compute_status_offer(instance_.session->physical_usage());
+        hooks_.bounce_unadmitted(replica_id_, offer, restore_target != nullptr, request);
+    } catch (...) {
+        request->replica_id = replica_id_;
+        request->holds_residency_permit = true;
+        complete_error(request, std::current_exception());
+        throw;
+    }
+    if (restore_target) (void)claim_restore_permit(*restore_target);
+    request_admission_check();
+}
+
+template <class Instance>
+bool ReplicaEngine<Instance>::try_admit_one(bool restoring) {
     if (instance_.session->has_context_operation()) { return false; }
     const auto lane      = free_lane();
     const auto owner     = scheduler_.progress_owner();
     const auto suspended = restoring ? std::find_if(paused_.begin(), paused_.end(),
                                                     [&](const auto& r) { return r->id == owner; })
                                      : paused_.end();
-    if (restoring && suspended == paused_.end()) return false;
-    if (!lane && restoring) {
-        const auto victims = scheduler_.preemption_candidates(slots_);
-        if (!victims.empty()) return pause_resident(victims.front());
-        return false;
+    if (restoring) {
+        if (suspended == paused_.end()) return false;
+        const auto target = *suspended;
+        if (!target->holds_residency_permit && !claim_restore_permit(*target)) {
+            std::shared_ptr<Request> pending;
+            {
+                std::lock_guard lock(queue_mutex_);
+                if (!pending_.empty()) pending = pending_.back();
+            }
+            if (pending) {
+                bounce_pending_request(pending, target);
+                return true;
+            }
+        }
+        if (!lane || !target->holds_residency_permit) {
+            for (const auto victim : scheduler_.preemption_candidates(slots_)) {
+                if (pause_resident(victim, PauseGoal::ReleaseResidency)) return true;
+            }
+            return false;
+        }
     }
     if (admission_decision_ && (admission_decision_->restoring != restoring ||
                                 (restoring && *suspended != admission_decision_->request))) {
@@ -825,18 +877,28 @@ bool EngineCore<Instance>::try_admit_one(bool restoring) {
                                      .prefix_reuse_path    = source.reused_tokens
                                                                  ? PrefixReusePath::Checkpoint
                                                                  : PrefixReusePath::Root};
+            materializing_.emplace(
+                MaterializingRequest{request, LaneId{*lane}, begin, restoring, choice});
             if (restoring) {
+                {
+                    std::lock_guard lock(queue_mutex_);
+                    request->counts_dispatch_lane = true;
+                    ++occupied_lanes_;
+                    ++lane_sequence_;
+                }
                 std::erase(paused_, request);
                 observe_scheduling(request, GenerationSchedulingTransition::RestoreStarted,
                                    binding_started);
             } else {
+                hooks_.commit_admission(request->id);
+                request->prefix_keyer.reset();
+                request->rejected_revisions.clear();
                 std::lock_guard lock(queue_mutex_);
                 scheduler_.admitted(pending_, *request, max_concurrency_);
                 std::erase(pending_, request);
             }
             request->model_state = EngineRequestState::Materializing;
-            materializing_.emplace(
-                MaterializingRequest{request, LaneId{*lane}, begin, restoring, choice});
+            request->prompt      = {};
             admission_decision_.reset();
             if (!restoring) {
                 finish_source_wait(request, binding_started);
@@ -847,6 +909,11 @@ bool EngineCore<Instance>::try_admit_one(bool restoring) {
                 request->queue_wait_recorded = true;
                 publish_generation_start(request, begin);
             }
+            return true;
+        }
+        if (!restoring && lane && hooks_.bounce_enabled() &&
+            (!resident_empty() || !paused_.empty() || instance_.session->has_context_operation())) {
+            bounce_pending_request(request);
             return true;
         }
         if (waiting_choice &&
@@ -871,7 +938,7 @@ bool EngineCore<Instance>::try_admit_one(bool restoring) {
 }
 
 template <class Instance>
-void EngineCore<Instance>::observe_scheduling(const std::shared_ptr<Request>& request,
+void ReplicaEngine<Instance>::observe_scheduling(const std::shared_ptr<Request>& request,
                                               GenerationSchedulingTransition transition,
                                               Clock::time_point now) {
     if (!request->observation.scheduling) { return; }
@@ -900,7 +967,7 @@ void EngineCore<Instance>::observe_scheduling(const std::shared_ptr<Request>& re
 }
 
 template <class Instance>
-void EngineCore<Instance>::update_recovery(const std::shared_ptr<Request>& request, bool released) {
+void ReplicaEngine<Instance>::update_recovery(const std::shared_ptr<Request>& request, bool released) {
     if (!request->recovery_pending) { return; }
     request->recovery_pending =
         !released && request->sequence && instance_.session->recovery_pending(*request->sequence);
@@ -913,8 +980,8 @@ void EngineCore<Instance>::update_recovery(const std::shared_ptr<Request>& reque
 }
 
 template <class Instance>
-typename EngineCore<Instance>::ExecutionUnit
-EngineCore<Instance>::execution_unit(const Request& request) const {
+typename ReplicaEngine<Instance>::ExecutionUnit
+ReplicaEngine<Instance>::execution_unit(const Request& request) const {
     return {*request.sequence,
             request.is_control_ready()  ? UnitKind::Control
             : request.is_decode_ready() ? UnitKind::Decode
@@ -927,7 +994,7 @@ EngineCore<Instance>::execution_unit(const Request& request) const {
 }
 
 template <class Instance>
-[[nodiscard]] bool EngineCore<Instance>::resident_runnable(std::uint32_t lane) const {
+[[nodiscard]] bool ReplicaEngine<Instance>::resident_runnable(std::uint32_t lane) const {
     const auto& request = slots_[lane];
     return request && request->sequence && request->residency && !request->capture_pending &&
            !request->cancelled.load(std::memory_order_acquire) &&
@@ -938,8 +1005,8 @@ template <class Instance>
 }
 
 template <class Instance>
-typename EngineCore<Instance>::ResidentReservation
-EngineCore<Instance>::reserve_resident_unit(std::uint32_t lane, ExecutionUnit unit,
+typename ReplicaEngine<Instance>::ResidentReservation
+ReplicaEngine<Instance>::reserve_resident_unit(std::uint32_t lane, ExecutionUnit unit,
                                             bool allow_reclaim) {
     if (!resident_runnable(lane)) return ResidentReservation::Unavailable;
     const auto& request = slots_[lane];
@@ -992,7 +1059,7 @@ EngineCore<Instance>::reserve_resident_unit(std::uint32_t lane, ExecutionUnit un
 }
 
 template <class Instance>
-void EngineCore<Instance>::build_prefill_membership(const PrefillBudgetPolicy& policy,
+void ReplicaEngine<Instance>::build_prefill_membership(const PrefillBudgetPolicy& policy,
                                                     std::optional<SequenceHandle> primary,
                                                     std::optional<std::uint32_t> primary_cap) {
     scheduler_.build_prefill_membership(
@@ -1008,7 +1075,8 @@ void EngineCore<Instance>::build_prefill_membership(const PrefillBudgetPolicy& p
 }
 
 template <class Instance>
-void EngineCore<Instance>::release_unused_prefill_units(std::optional<std::uint32_t> primary) {
+void ReplicaEngine<Instance>::release_unused_prefill_units(std::optional<std::uint32_t> primary) {
+    bool released = false;
     for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
         auto& permit = reserved_units_[lane];
         if (!permit ||
@@ -1023,12 +1091,14 @@ void EngineCore<Instance>::release_unused_prefill_units(std::optional<std::uint3
                    !instance_.session->execution_pending(*request->sequence)) {
             instance_.session->release_units({&*request->sequence, 1});
             permit.reset();
+            released = true;
         }
     }
+    if (released) publish_resource_offer();
 }
 
 template <class Instance>
-void EngineCore<Instance>::reserve_resident_units() {
+void ReplicaEngine<Instance>::reserve_resident_units() {
     const auto owner = scheduler_.progress_owner();
     std::optional<std::uint32_t> priority;
     auto& candidates = reservation_candidates_;
@@ -1088,7 +1158,7 @@ void EngineCore<Instance>::reserve_resident_units() {
 }
 
 template <class Instance>
-[[nodiscard]] bool EngineCore<Instance>::unit_runnable(std::uint32_t lane) const {
+[[nodiscard]] bool ReplicaEngine<Instance>::unit_runnable(std::uint32_t lane) const {
     const auto& permit = reserved_units_[lane];
     if (!permit || !resident_runnable(lane)) return false;
     const auto& request = slots_[lane];
@@ -1099,7 +1169,7 @@ template <class Instance>
 }
 
 template <class Instance>
-[[nodiscard]] bool EngineCore<Instance>::schedule_prefill() {
+[[nodiscard]] bool ReplicaEngine<Instance>::schedule_prefill() {
     const auto policy = instance_.session->prefill_budget_policy();
     auto& selected    = prefill_membership_;
     std::fill(prefill_excluded_.begin(), prefill_excluded_.end(), 0);
@@ -1176,7 +1246,7 @@ template <class Instance>
 }
 
 template <class Instance>
-void EngineCore<Instance>::begin_cycle(HostPhaseMeasurement& boundary) {
+void ReplicaEngine<Instance>::begin_cycle(HostPhaseMeasurement& boundary) {
     std::fill(control_executed_.begin(), control_executed_.end(), 0);
     CompletionScope completions(*this);
     (void)expire_pending_requests();
@@ -1222,6 +1292,7 @@ void EngineCore<Instance>::begin_cycle(HostPhaseMeasurement& boundary) {
         admission_decision_.reset();
         request_admission_check();
     }
+    synchronize_restore_target(find_unpermitted_paused_restore_target());
     if (!recovering && scheduler_.progress_owner()) {
         (void)try_admit_one(true);
         if (instance_.session->has_context_operation()) (void)poll_execution(boundary);
@@ -1252,7 +1323,7 @@ void EngineCore<Instance>::begin_cycle(HostPhaseMeasurement& boundary) {
 }
 
 template <class Instance>
-[[nodiscard]] bool EngineCore<Instance>::advance_cycle() {
+[[nodiscard]] bool ReplicaEngine<Instance>::advance_cycle() {
     if (compute_pending()) return false;
     set_host_work_class(HostWorkClass::Control);
     bool submitted = false;
@@ -1307,22 +1378,23 @@ template <class Instance>
 }
 
 template <class Instance>
-bool EngineCore<Instance>::process_measurement() {
-    if (!resident_empty() || !paused_.empty() || materializing_ || context_owner_ ||
-        admission_decision_ || execution_outstanding())
-        return false;
+bool ReplicaEngine<Instance>::process_measurement() {
+    if (execution_outstanding()) return false;
     MeasurementCommand command;
     {
         std::lock_guard lock(queue_mutex_);
-        if (!measurement_ || !pending_.empty() || preparing_requests_) return false;
+        if (!measurement_) return false;
         command = measurement_->command;
+        // Rollback closes the window at the next idle executor boundary. Requests may still
+        // own lanes or be queued when End's submission cut is interrupted by a failed replica.
+        if (command.action != MeasurementAction::Cancel &&
+            (!resident_empty() || !paused_.empty() || context_owner_ || admission_decision_ ||
+             !pending_.empty())) return false;
     }
-    EngineSnapshot result;
     std::exception_ptr error;
     try {
         instance_.executor->measure(command);
         publish_runtime_stats();
-        result = snapshot();
     } catch (...) {
         error = std::current_exception();
         if (!instance_.executor->failed()) {
@@ -1342,22 +1414,29 @@ bool EngineCore<Instance>::process_measurement() {
     if (error)
         completed->completion.set_exception(error);
     else
-        completed->completion.set_value(std::move(result));
+        completed->completion.set_value();
     queue_cv_.notify_all();
     return true;
 }
 
 template <class Instance>
-void EngineCore<Instance>::worker_loop() noexcept {
+void ReplicaEngine<Instance>::worker_loop() noexcept {
     std::uint64_t scheduled_revision = 0;
     for (;;) {
+        bool was_idle = false;
+        bool cancelling_measurement = false;
         {
             std::unique_lock lock(queue_mutex_);
             if (!stopping_ && pending_.empty() && resident_empty() && paused_.empty() &&
-                !execution_outstanding()) {
-                queue_cv_.wait(lock,
-                               [&] { return stopping_ || !pending_.empty() || measurement_; });
+                !execution_outstanding() && !measurement_) {
+                was_idle = true;
+                queue_cv_.wait_for(lock, std::chrono::milliseconds(100), [&] {
+                    return stopping_ || !pending_.empty() || measurement_ || wake_requested_;
+                });
             }
+            wake_requested_ = false;
+            cancelling_measurement = measurement_ &&
+                                     measurement_->command.action == MeasurementAction::Cancel;
             if (stopping_) {
                 lock.unlock();
                 fail_all(std::make_exception_ptr(RequestError(
@@ -1378,9 +1457,22 @@ void EngineCore<Instance>::worker_loop() noexcept {
             }
             auto boundary = begin_host_phase();
             progressed    = poll_execution(boundary);
+            if (instance_.executor->failed()) {
+                throw std::runtime_error("replica executor failed");
+            }
             finish_engine_phase(boundary, EngineHostPhase::Boundary);
             const auto revision = schedule_revision_.load(std::memory_order_acquire);
             if (revision != published_revision_) publish_runtime_stats();
+            if (cancelling_measurement) progressed |= process_measurement();
+            if (was_idle && !progressed && revision == scheduled_revision && resident_empty() &&
+                paused_.empty() && !execution_outstanding() && !prefill_coalesce_waits_) {
+                bool still_idle = false;
+                {
+                    std::lock_guard lock(queue_mutex_);
+                    still_idle = !stopping_ && pending_.empty() && !measurement_ && !wake_requested_;
+                }
+                if (still_idle) continue;
+            }
             const bool schedule = progressed || revision != scheduled_revision ||
                                   !execution_outstanding() || Clock::now() >= pending_deadline_ ||
                                   (prefill_coalesce_waits_ && !materializing_);
@@ -1402,10 +1494,10 @@ void EngineCore<Instance>::worker_loop() noexcept {
             }
             outstanding = execution_outstanding();
             if (!outstanding) progressed |= process_measurement();
-            if (outstanding) {
+            if (outstanding && !progressed) {
                 const auto exposed = active_exposure_set();
                 const auto started = Clock::now();
-                std::this_thread::yield();
+                instance_.executor->wait_for_activity(std::chrono::milliseconds(1));
                 record_coordinator_call(CoordinatorCall::Yield, elapsed_ns(started, Clock::now()),
                                         *exposed);
             }
@@ -1414,9 +1506,11 @@ void EngineCore<Instance>::worker_loop() noexcept {
             fail_all(std::current_exception());
             return;
         }
-        if (!outstanding && !progressed) {
+        if (!outstanding && !progressed && !was_idle) {
             std::unique_lock lock(queue_mutex_);
-            queue_cv_.wait_for(lock, std::chrono::milliseconds(1));
+            if (!stopping_ && !wake_requested_) {
+                queue_cv_.wait_for(lock, std::chrono::milliseconds(1));
+            }
         }
     }
 }

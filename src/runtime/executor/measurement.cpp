@@ -2,8 +2,6 @@
 
 #include "core/device.h"
 
-#include <cuda_profiler_api.h>
-
 #include <stdexcept>
 
 namespace ninfer::runtime {
@@ -32,17 +30,17 @@ void RankMeasurement::validate(MeasurementCommand command) const {
 void RankMeasurement::begin(bool profile) {
     active_    = true;
     profiling_ = profile;
-    if (profiling_) CUDA_CHECK(cudaProfilerStart());
+    if (profiling_) start_device_profiler();
 }
 
 void RankMeasurement::end() {
-    if (profiling_) CUDA_CHECK(cudaProfilerStop());
+    if (profiling_) stop_device_profiler();
     profiling_ = false;
     active_    = false;
 }
 
 void RankMeasurement::cancel() noexcept {
-    if (profiling_) (void)cudaProfilerStop();
+    if (profiling_) cancel_device_profiler();
     profiling_ = false;
     active_    = false;
 }

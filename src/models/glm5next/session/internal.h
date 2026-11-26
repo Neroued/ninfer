@@ -21,7 +21,7 @@ struct CapturePoint {
 };
 
 struct RequestPlan {
-    PreparedPromptData prompt;
+    std::shared_ptr<const PreparedPromptData> prompt;
     std::shared_ptr<const vision::ExecutionInput> vision;
     runtime::RequestPlanSummary summary;
     context::PrefixQuery query;
@@ -30,7 +30,7 @@ struct RequestPlan {
     [[nodiscard]] context::InputIdentityView identity_view(context::TokenView tokens) const;
 
     [[nodiscard]] context::InputIdentityView identity_view() const {
-        return identity_view(context::TokenView(prompt.token_ids));
+        return identity_view(context::TokenView(prompt->token_ids));
     }
 
     std::vector<CapturePoint> captures;

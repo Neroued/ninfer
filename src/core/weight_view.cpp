@@ -98,8 +98,9 @@ WeightStorageGeometry weight_storage_geometry(QType format, QuantLayout layout,
     const bool nvfp4_bank = layout == QuantLayout::BatchedBlockScaleK16M128x4;
     const bool fp8_block =
         layout == QuantLayout::BlockScaleM128K128 || layout == QuantLayout::BlockScaleM64K64;
-    const bool matrix_bank =
-        fp8_block || layout == QuantLayout::Csf32 || layout == QuantLayout::RowGroupScale;
+    const bool matrix_bank = fp8_block || layout == QuantLayout::Csf32 ||
+                             layout == QuantLayout::RowGroupScale ||
+                             layout == QuantLayout::RowSplit;
     if ((nvfp4_bank && shape.size() != 3) ||
         (matrix_bank && shape.size() != 2 && shape.size() != 3) ||
         (!nvfp4_bank && !matrix_bank && shape.size() != 2)) {
@@ -185,13 +186,14 @@ WeightStorageGeometry weight_storage_geometry(QType format, QuantLayout layout,
         }
         out.padded_columns     = aligned(k, 128);
         const auto groups      = out.padded_columns / out.group_size;
+        const auto rows        = mul(matrices, n);
         out.code_bytes_per_row = mul(groups, 32);
         out.high_bytes_per_row = mul(groups, high_per_group);
         out.scale_row_bytes    = mul(groups, 2);
         out.scale_word_bytes   = 2;
-        out.code_bytes         = mul(n, out.code_bytes_per_row);
+        out.code_bytes         = mul(rows, out.code_bytes_per_row);
         out.high_offset        = aligned(out.code_bytes, 256);
-        out.high_bytes         = mul(n, out.high_bytes_per_row);
+        out.high_bytes         = mul(rows, out.high_bytes_per_row);
         out.scale_offset       = add(out.high_offset, aligned(out.high_bytes, 256));
     } else if (layout == QuantLayout::RowScale) {
         if (format != QType::FP8_E4M3FN_ROW_BF16) {

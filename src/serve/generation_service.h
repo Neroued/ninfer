@@ -7,6 +7,7 @@
 #include "product/config/options.h"
 #include "serve/request.h"
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -87,6 +88,7 @@ struct PreparedRequest {
     std::optional<ninfer::ReasoningEffort> reasoning_effort;
     std::optional<bool> preserve_thinking;
     std::shared_ptr<RequestLifetime> lifetime;
+    std::shared_ptr<const std::atomic<std::optional<std::uint32_t>>> error_replica;
 };
 
 class GenerationService {

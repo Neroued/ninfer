@@ -197,6 +197,10 @@ struct RequestRecord {
     const std::uint64_t id;
     const std::uint64_t publication_order;
     PreparedPrompt prompt;
+    std::optional<typename ModelContract::PromptPrefixKeyer> prefix_keyer;
+    std::vector<std::optional<std::uint64_t>> rejected_revisions;
+    std::uint64_t ownership_epoch = 0;
+    bool counts_dispatch_lane     = false;
     OutputSession output;
     PromptSummary prompt_summary;
     double prepare_seconds = 0.0;
@@ -214,6 +218,8 @@ struct RequestRecord {
     std::vector<TokenId> generated;
     std::string content;
     std::string reasoning;
+    std::optional< std::uint32_t > replica_id;
+    bool holds_residency_permit = false;
     std::optional<LaneId> lane;
     std::optional<ResidencyId> residency;
     std::optional<SequenceHandle> sequence;

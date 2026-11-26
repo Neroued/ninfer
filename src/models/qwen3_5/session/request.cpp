@@ -52,6 +52,14 @@ CaptureGroup RequestBasePlanImpl::capture_group(std::uint32_t frontier) const {
 
 RequestBasePlan SessionImpl::plan_request(qwen::PreparedPromptData&& prompt,
                                           const runtime::ResolvedExecutionOptions& options) {
+    return plan_request(std::make_shared<const qwen::PreparedPromptData>(std::move(prompt)),
+                        options);
+}
+
+RequestBasePlan SessionImpl::plan_request(std::shared_ptr<const qwen::PreparedPromptData> prompt_ptr,
+                                          const runtime::ResolvedExecutionOptions& options) {
+    if (!prompt_ptr) { throw std::invalid_argument("prepared prompt is empty"); }
+    const auto& prompt = *prompt_ptr;
     if (prompt.token_ids.empty()) { throw std::invalid_argument("prompt must contain tokens"); }
     if (prompt.token_ids.size() > capacity) {
         throw std::invalid_argument("prompt exceeds configured context capacity");
@@ -103,9 +111,9 @@ RequestBasePlan SessionImpl::plan_request(qwen::PreparedPromptData&& prompt,
                                                ? FinishReason::OutputLimit
                                                : FinishReason::ContextCapacity;
     base->sampling                       = options.sampling;
-    base->allow_prefix_reuse             = options.allow_prefix_reuse && prompt.identity.reusable;
-    base->summary.publish_continuation =
+    base->allow_prefix_reuse =
         options.allow_prefix_reuse && prompt.identity.reusable && context_cache.enabled;
+    base->summary.publish_continuation = base->allow_prefix_reuse;
     if (prompt.has_media()) {
         if (!plan.vision_max_features) {
             throw std::logic_error("Vision prompt has no startup workspace plan");
@@ -118,7 +126,7 @@ RequestBasePlan SessionImpl::plan_request(qwen::PreparedPromptData&& prompt,
                                 (static_cast<std::uint32_t>(plan.proposal_head) << 8U) |
                                 (static_cast<std::uint32_t>(plan.kv_storage) << 16U) |
                                 (static_cast<std::uint32_t>(plan.linear_state_dtype) << 24U);
-    base->prompt = std::make_shared<const qwen::PreparedPromptData>(std::move(prompt));
+    base->prompt = std::move(prompt_ptr);
     for (const auto& item : base->prompt->vision_items) base->media.push_back({&item});
     base->query = context::PrefixQuery(prefixes, base->prefix_identity_tag, base->identity_view());
     if (base->summary.publish_continuation) {

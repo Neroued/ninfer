@@ -486,14 +486,15 @@ std::string Metrics::render(const EngineSnapshot& snapshot, const ServiceSnapsho
     header("placement_context_tokens", "gauge",
            "Logical request context lengths by placement, including paused requests.");
     for (const auto& p : stats.placements) {
+        const auto labels = "replica=\"" + std::to_string(p.replica_id) + "\",placement=\"" +
+                            std::to_string(p.id) + "\"";
         for (const auto& [name, count] :
              std::array{std::pair{"resident", p.resident}, std::pair{"prefilling", p.prefilling},
                         std::pair{"decoding", p.decoding}, std::pair{"replaying", p.replaying},
                         std::pair{"paused", p.paused}})
-            out << "ninfer_placement_requests{placement=\"" << p.id << "\",kind=\"" << name
-                << "\"} " << count << '\n';
-        out << "ninfer_placement_context_tokens{placement=\"" << p.id << "\"} " << p.context_tokens
-            << '\n';
+            out << "ninfer_placement_requests{" << labels << ",kind=\"" << name << "\"} " << count
+                << '\n';
+        out << "ninfer_placement_context_tokens{" << labels << "} " << p.context_tokens << '\n';
     }
     header("execution_stage_seconds_total", "counter",
            "Coordinator execution intervals by boundary.");

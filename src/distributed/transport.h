@@ -45,6 +45,8 @@ void send_message(const Socket&, const wire::Message&, Deadline);
 [[nodiscard]] wire::Message receive_message(const Socket&, Deadline,
                                             std::size_t maximum_bytes = 64ULL << 20);
 
+enum class Traffic { Work, Continuation, Input, Diagnostic, Telemetry };
+
 struct TransportLimits {
     std::size_t message_bytes         = 64ULL << 20;
     std::size_t queued_bytes          = 128ULL << 20;
@@ -58,9 +60,14 @@ struct TransportLimits {
     std::size_t received_messages   = 0;
     std::size_t diagnostic_bytes    = 64ULL << 10;
     std::size_t diagnostic_messages = 16;
-};
+    std::size_t telemetry_bytes     = 4ULL << 20;
+    std::size_t telemetry_messages  = 16;
+    std::uint32_t heartbeat_interval_ms = 0;
+    std::uint32_t lease_timeout_ms      = 0;
 
-enum class Traffic { Work, Continuation, Input, Diagnostic };
+    [[nodiscard]] std::size_t outbound_bytes(Traffic) const;
+    void validate_outbound_frame(RankId, wire::Kind, std::size_t payload_bytes, Traffic) const;
+};
 
 struct OutgoingMessage {
     RankId peer;
@@ -93,6 +100,12 @@ public:
     void start();
     // Takes all messages atomically or none. Continuations use dedicated queue headroom.
     [[nodiscard]] bool try_send(std::span<const OutgoingMessage>, Traffic = Traffic::Work);
+    struct SendBatch {
+        Transport* transport;
+        std::span<const OutgoingMessage> messages;
+    };
+    // Atomically enqueues the batches across distinct transports.
+    [[nodiscard]] static bool try_send_all(std::span<const SendBatch>, Traffic);
     // A peer's complete frames precede its end event. Other peers continue receiving.
     [[nodiscard]] std::optional<TransportEvent> poll();
     [[nodiscard]] bool receiving() const noexcept;
@@ -100,6 +113,8 @@ public:
     [[nodiscard]] bool sending() const;
     void reserve_capacity(const TransportLimits&);
     [[nodiscard]] TransportLimits limits() const;
+    [[nodiscard]] int poll_fd() const noexcept;
+    void wait(std::chrono::milliseconds timeout) const;
     [[nodiscard]] std::shared_ptr<std::atomic<bool>> failure_signal() const;
     void close() noexcept;
 private:

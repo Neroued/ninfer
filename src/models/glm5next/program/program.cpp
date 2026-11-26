@@ -138,7 +138,10 @@ void RankProgramImpl::prepare_commit(runtime::ExecutionTicket ticket, const Comm
 }
 
 bool RankProgramImpl::can_discard(runtime::ExecutionTicket ticket) const {
-    return compute && compute->request.ticket == ticket && compute->phase != ComputePhase::Retiring;
+    if (!compute || compute->request.ticket != ticket) return false;
+    return compute->phase == ComputePhase::PendingCommit ||
+           compute->phase == ComputePhase::AwaitResult ||
+           (compute->phase == ComputePhase::Decision && !compute->decision);
 }
 
 void RankProgramImpl::discard(runtime::ExecutionTicket ticket, runtime::CommandSequence command) {

@@ -78,17 +78,18 @@ public:
     DeploymentReader(const std::filesystem::path& path, FileConfiguration& result)
         : path_(path), result_(result) {}
 
-    DeploymentOptions read(const toml::node& node) {
+    DeploymentOptions read(const toml::node& node, int default_device) {
         const auto& t =
             table(node, "distributed",
                   {"coordinator_node", "control_host", "control_port", "connect_timeout",
-                   "shutdown_timeout", "parallel", "nodes", "ranks"});
+                   "shutdown_timeout", "allow_shared_device", "parallel", "nodes", "ranks"});
         DeploymentOptions out;
         out.coordinator_node    = number(t, "coordinator_node", "distributed", 0);
         out.control_host        = string(t, "control_host", "distributed", true);
         out.control_port        = number(t, "control_port", "distributed", 0, UINT16_MAX);
         out.connect_timeout_ms  = duration(t, "connect_timeout", out.connect_timeout_ms);
         out.shutdown_timeout_ms = duration(t, "shutdown_timeout", out.shutdown_timeout_ms);
+        out.allow_shared_device = boolean(t, "allow_shared_device", "distributed", false);
         if (const auto* p = t.get("parallel")) {
             const auto& values = table(*p, "distributed.parallel", {"tp", "ep", "dp", "pp", "adp"});
             out.parallel.tp    = number(values, "tp", "distributed.parallel", 1);
@@ -121,13 +122,36 @@ public:
             }
             out.nodes.push_back(std::move(value));
         }
-        const auto& ranks = array(t, "ranks");
-        for (std::size_t i = 0; i < ranks.size(); ++i) {
-            const auto prefix = "distributed.ranks[" + std::to_string(i) + "]";
-            const auto& r     = table(ranks[i], prefix, {"rank", "node", "device"});
-            out.ranks.push_back({required_number(r, "rank", prefix),
-                                 required_number(r, "node", prefix),
-                                 static_cast<int>(number(r, "device", prefix, 0, INT_MAX))});
+        if (t.contains("ranks") ||
+            !(out.nodes.size() == 1 && out.parallel.tp == 1 && out.parallel.ep == 1 &&
+              out.parallel.pp == 1 && out.parallel.adp == 1 && out.parallel.dp >= 1)) {
+            const auto& ranks = array(t, "ranks");
+            for (std::size_t i = 0; i < ranks.size(); ++i) {
+                const auto prefix = "distributed.ranks[" + std::to_string(i) + "]";
+                const auto& r     = table(ranks[i], prefix, {"rank", "node", "device"});
+                out.ranks.push_back({required_number(r, "rank", prefix),
+                                     required_number(r, "node", prefix),
+                                     static_cast<int>(number(r, "device", prefix, 0, INT_MAX))});
+            }
+        } else {
+            const auto node_id = out.nodes.front().id;
+            const auto* parallel      = t.get_as<toml::table>("parallel");
+            const auto* dp            = parallel ? parallel->get("dp") : nullptr;
+            const auto& rank_source   = dp ? *dp : node;
+            const auto& node_source   = *nodes[0].as_table()->get("id");
+            const auto* shared_device = t.get("allow_shared_device");
+            const auto& device_source =
+                out.allow_shared_device && shared_device ? *shared_device : rank_source;
+            out.ranks.reserve(out.parallel.dp);
+            for (std::uint32_t r = 0; r < out.parallel.dp; ++r) {
+                const int dev = out.allow_shared_device ? default_device : static_cast<int>(r);
+                out.ranks.push_back({r, node_id, dev});
+                const auto prefix = "distributed.ranks[" + std::to_string(r) + "]";
+                remember(rank_source, prefix + ".rank");
+                remember(node_source, prefix + ".node");
+                remember(device_source, prefix + ".device");
+            }
+            result_.auto_expanded_shared_ranks = out.allow_shared_device;
         }
         try {
             validate_deployment(out);
@@ -195,6 +219,16 @@ private:
         return number(t, key, prefix, 0);
     }
 
+    bool boolean(const toml::table& t, std::string_view key, const std::string& prefix,
+                 bool fallback) {
+        const auto* node = t.get(key);
+        if (!node) return fallback;
+        const auto name = prefix + "." + std::string(key);
+        remember(*node, name);
+        if (!node->is_boolean()) error(*node, name, "expected a boolean");
+        return node->as_boolean()->get();
+    }
+
     std::uint32_t duration(const toml::table& t, std::string_view key, std::uint32_t fallback) {
         const auto* node = t.get(key);
         if (!node) return fallback;
@@ -224,8 +258,13 @@ FileConfiguration read_config_file(const std::filesystem::path& path) {
     }
     FileConfiguration result;
     read_table(table, "", path, result.fields);
+    int default_device = 0;
+    if (const auto& dev = assignment(result.fields, Field::Device);
+        dev && std::holds_alternative<std::uint64_t>(dev->value)) {
+        default_device = static_cast<int>(std::get<std::uint64_t>(dev->value));
+    }
     if (const auto* deployment = table.get("distributed"))
-        result.deployment = DeploymentReader(path, result).read(*deployment);
+        result.deployment = DeploymentReader(path, result).read(*deployment, default_device);
     return result;
 }
 

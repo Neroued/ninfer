@@ -9,13 +9,13 @@
 
 namespace ninfer::runtime {
 
-template <class Types>
+template <class Types, class Worker = RankWorker<Types>>
 class LocalExecutor final : public Executor<typename Types::ExecutionTypes> {
 public:
     using Protocol = typename Types::ExecutionTypes;
     using Event    = ExecutionEvent<Protocol>;
 
-    LocalExecutor(std::unique_ptr<RankWorker<Types>> worker, SessionEpoch epoch,
+    LocalExecutor(std::unique_ptr<Worker> worker, SessionEpoch epoch,
                   std::uint32_t max_decode_rows)
         : Executor<Protocol>(max_decode_rows), worker_(std::move(worker)), epoch_(epoch),
           pool_(worker_->program().capacity()), compute_(pool_.capacity().compute_frames),
@@ -110,12 +110,13 @@ public:
         require_available();
         auto& flight = find(ticket);
         if (flight.phase == Phase::Retiring || flight.phase == Phase::Discarding) return;
+        flight.phase = Phase::Discarding;
+        flight.clock.resolve(observation_time_ns());
+        if (ticket.frame.kind == FrameKind::Context) return;
         flight.command = next_command();
-        flight.phase   = Phase::Discarding;
+        flight.discard_pending = true;
         try {
-            observe_host_call(host_.discard_ns,
-                              [&] { worker_->program().discard(ticket, flight.command); });
-            flight.clock.resolve(observation_time_ns());
+            progress_discard(flight);
         } catch (...) { record_failure(ticket); }
     }
 
@@ -126,9 +127,13 @@ public:
         std::optional<Event> event;
         try {
             for (;;) {
+                for (auto& flight : compute_) progress_discard(flight);
                 event =
                     observe_host_call(host_.progress_ns, [&] { return worker_->program().poll(); });
-                if (!event) return {};
+                if (!event) {
+                    for (auto& flight : compute_) progress_discard(flight);
+                    return {};
+                }
                 if (std::holds_alternative<ExecutionFailed>(*event)) {
                     failed_ = true;
                     return event;
@@ -138,6 +143,7 @@ public:
                 const auto& flight = find(ticket);
                 if (flight.phase != Phase::Discarding ||
                     (!std::holds_alternative<DecisionNeeded>(*event) &&
+                     !std::holds_alternative<DecisionConsumed>(*event) &&
                      !std::holds_alternative<ResultReady<Protocol>>(*event)))
                     break;
             }
@@ -266,7 +272,16 @@ private:
         Phase phase                  = Phase::Empty;
         std::uint32_t decision_stage = 0;
         ExecutionClock clock;
+        bool discard_pending = false;
     };
+
+    void progress_discard(Flight& flight) {
+        if (!flight.discard_pending || !worker_->program().can_discard(flight.ticket)) return;
+        observe_host_call(host_.discard_ns, [&] {
+            worker_->program().discard(flight.ticket, flight.command);
+        });
+        flight.discard_pending = false;
+    }
 
     [[nodiscard]] Flight& slot(FrameId frame) {
         return (frame.kind == FrameKind::Compute ? compute_ : context_).at(frame.index);
@@ -298,7 +313,7 @@ private:
         if (!failure_) failure_ = ExecutionFailed{ticket, std::move(message)};
     }
 
-    std::unique_ptr<RankWorker<Types>> worker_;
+    std::unique_ptr<Worker> worker_;
     RankMeasurement measurement_;
     SessionEpoch epoch_;
     ExecutionPool pool_;

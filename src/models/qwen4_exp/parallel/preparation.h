@@ -47,6 +47,7 @@ private:
     bool control_owner_                 = false;
     std::optional<ResolvedLoadPlan> load_;
     std::shared_ptr<const execution::ModelProfile> profile_;
+    ple::disk::TableGeometry ple_geometry_;
     runtime::ContextCapacityPlan capacity_plan_;
     std::unique_ptr<Instance> instance_;
     std::unique_ptr<RankProgram> probe_;

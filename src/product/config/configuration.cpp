@@ -157,6 +157,9 @@ StartupConfigurationView view(const LaunchOptions& launch, EntryPoint entry, con
         case Field::HostCapacity:
             value = optional_value(e.context_cache.host_capacity_bytes, "default (target/model)");
             break;
+        case Field::MaxCachedCheckpointsPerReplica:
+            value = optional_value(e.context_cache.max_cached_checkpoints_per_replica, "none");
+            break;
         case Field::CostPresets:
             value = e.context_cost.preset_path.string();
             break;
@@ -329,6 +332,7 @@ StartupConfigurationView view(const LaunchOptions& launch, EntryPoint entry, con
                ConfigurationUnit::Milliseconds);
         append("distributed.shutdown_timeout", std::uint64_t{d.shutdown_timeout_ms},
                ConfigurationUnit::Milliseconds);
+        append("distributed.allow_shared_device", d.allow_shared_device);
         append("distributed.parallel.tp", std::uint64_t{d.parallel.tp});
         append("distributed.parallel.ep", std::uint64_t{d.parallel.ep});
         append("distributed.parallel.dp", std::uint64_t{d.parallel.dp});

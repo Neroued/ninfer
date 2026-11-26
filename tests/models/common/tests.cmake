@@ -2,6 +2,10 @@ ninfer_add_test(ninfer_batch_execution_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_batch.cpp"
   LIBRARIES ninfer_model_control)
 
+ninfer_add_test(ninfer_parallel_weights_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_parallel_weights.cpp"
+  LIBRARIES ninfer_model_execution ninfer_core ninfer::json)
+
 ninfer_add_test(ninfer_sequence_parallel_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_sequence_parallel.cpp"
   LIBRARIES ninfer_model_execution)

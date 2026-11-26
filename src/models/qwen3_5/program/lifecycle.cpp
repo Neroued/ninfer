@@ -131,11 +131,22 @@ void RankProgramImpl::commit(runtime::ExecutionTicket ticket, runtime::CommandSe
 }
 
 void RankProgramImpl::discard(runtime::ExecutionTicket ticket, runtime::CommandSequence command) {
+    if (!can_discard(ticket)) throw std::logic_error("Qwen3.5 discard has no quiescent execution");
+    std::erase_if(events, [&](const auto& event) {
+        return std::visit([&](const auto& value) { return value.ticket == ticket; }, event);
+    });
     auto& operation = require_compute(ticket);
     gpu_timer.resolve();
     operation.last_command = command;
     operation.cancelled    = true;
     progress();
+}
+
+bool RankProgramImpl::can_discard(runtime::ExecutionTicket ticket) const noexcept {
+    return compute && compute->request.ticket == ticket && !compute->cancelled &&
+           (compute->stage == ComputeStage::AwaitCommit ||
+            (compute->stage == ComputeStage::AwaitDecision && compute->decision_requested &&
+             !compute->decision_supplied));
 }
 
 std::optional<runtime::ExecutionEvent<ExecutionTypes>> RankProgramImpl::poll() {

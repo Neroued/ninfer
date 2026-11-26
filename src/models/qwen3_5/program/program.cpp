@@ -13,7 +13,6 @@ RankProgram::RankProgram(std::unique_ptr<detail::RankProgramImpl> impl) : impl_(
 
 RankProgram::~RankProgram() = default;
 
-runtime::ExecutionCapacity RankProgram::capacity() const noexcept { return {1, 1}; }
 
 void RankProgram::validate_work(const Work& work, runtime::FrameKind required) const {
     impl_->validate_work(work, required);
@@ -46,9 +45,23 @@ void RankProgram::discard(runtime::ExecutionTicket ticket, runtime::CommandSeque
     impl_->discard(ticket, command);
 }
 
+bool RankProgram::can_discard(runtime::ExecutionTicket ticket) const noexcept {
+    return impl_->can_discard(ticket);
+}
+
+MemorySpan RankProgram::input_storage() noexcept {
+    return impl_->resources.vision ? impl_->resources.vision->staging() : MemorySpan{};
+}
+
 std::optional<runtime::ExecutionEvent<ExecutionTypes>> RankProgram::poll() { return impl_->poll(); }
 
 void RankProgram::drain() { impl_->drain(); }
+
+GraphPreparationSample RankProgram::prepare_execution(GraphPreparationMode mode) {
+    return impl_->use_cuda_graph ? impl_->initialize_graphs(mode) : GraphPreparationSample{};
+}
+
+void RankProgram::release_execution() { impl_->release_graphs(); }
 
 std::optional<GraphMemorySummary> RankProgram::graph_memory_observation() const {
     return impl_->graph_memory;
@@ -58,20 +71,29 @@ RankMemoryUsage RankProgram::observe_resources() const { return impl_->observe_r
 
 void RankProgram::reset_measurement_peaks() noexcept { impl_->reset_measurement_peaks(); }
 
+std::unique_ptr<RankProgram> create_uninitialized_rank_program(
+    const execution::Parameters& parameters, SequencePlan&& plan, DeviceContext& device,
+    const StartupObserver& observer) {
+    if (!plan.impl_) throw std::invalid_argument("Qwen3.5 rank requires a sequence plan");
+    auto impl =
+        std::make_unique<detail::RankProgramImpl>(parameters, *plan.impl_, device, observer);
+    plan.impl_.reset();
+    return std::unique_ptr<RankProgram>(new RankProgram(std::move(impl)));
+}
+
 std::unique_ptr<RankProgram> create_rank_program(const execution::Parameters& parameters,
                                                  SequencePlan&& plan, DeviceContext& device,
                                                  const StartupObserver& observer,
                                                  GraphPreparationMode mode) {
     if (!plan.impl_) throw std::invalid_argument("Qwen3.5 rank requires a sequence plan");
-    auto impl =
-        std::make_unique<detail::RankProgramImpl>(parameters, *plan.impl_, device, observer);
-    if (plan.impl_->use_cuda_graph) {
+    const bool use_graphs = plan.impl_->use_cuda_graph;
+    auto program = create_uninitialized_rank_program(parameters, std::move(plan), device, observer);
+    if (use_graphs) {
         StartupPhaseScope phase(observer, StartupPhase::CudaGraphPrepare);
-        impl->initialize_graphs(mode);
+        (void)program->prepare_execution(mode);
         phase.complete();
     }
-    plan.impl_.reset();
-    return std::unique_ptr<RankProgram>(new RankProgram(std::move(impl)));
+    return program;
 }
 
 } // namespace ninfer::models::qwen3_5
@@ -121,47 +143,6 @@ void RankProgramImpl::validate_row(const ExecutionRow& row) const {
         installed.sequence != row.member.sequence) {
         throw std::logic_error("Qwen3.5 work references a retired residency");
     }
-}
-
-void validate_prefill_work(const ForwardWork& op, std::uint32_t prefill_chunk) {
-    if (op.rows.empty() || op.inputs.size() != op.rows.size() ||
-        ((!op.sampling.empty() || op.sample != SamplePurpose::None) &&
-         op.sampling.size() != op.rows.size()))
-        throw std::invalid_argument("Qwen3.5 prefill inputs do not match membership");
-    if (std::ranges::any_of(op.inputs, [](const auto& w) { return w.visual.has_value(); }) &&
-        (op.rows.size() != 1 || op.inputs.front().tokens.empty()))
-        throw std::invalid_argument("Qwen3.5 visual prefill requires one nonempty input window");
-    std::size_t total = 0;
-    bool any_sample   = false;
-    for (std::size_t i = 0; i < op.rows.size(); ++i) {
-        const auto& row = op.rows[i];
-        const auto n    = op.inputs[i].tokens.size();
-        if (n > prefill_chunk - total)
-            throw std::invalid_argument("Qwen3.5 prefill exceeds its packed token budget");
-        total += n;
-        const bool sampled     = !op.sampling.empty() && op.sampling[i].sample;
-        const bool constrained = !op.sampling.empty() && op.sampling[i].constrained;
-        any_sample |= sampled;
-        if ((!n && (!sampled || !row.main_frontier)) || (constrained && !sampled))
-            throw std::invalid_argument("Qwen3.5 prefill row has invalid sampling or extent");
-        for (std::size_t j = 0; j < i; ++j) {
-            const auto& prev        = op.rows[j];
-            const bool prev_updates = !op.inputs[j].tokens.empty();
-            if ((n && prev_updates &&
-                 (row.destination_state == prev.destination_state ||
-                  row.state_offsets.destination == prev.state_offsets.destination)) ||
-                (prev_updates && (row.source_state == prev.destination_state ||
-                                  row.state_offsets.source == prev.state_offsets.destination)) ||
-                (n && (row.destination_state == prev.source_state ||
-                       row.state_offsets.destination == prev.state_offsets.source)) ||
-                row.main_table.index == prev.main_table.index ||
-                (row.backend_table && prev.backend_table &&
-                 row.backend_table->index == prev.backend_table->index))
-                throw std::invalid_argument("Qwen3.5 prefill rows overlap State or KV writes");
-        }
-    }
-    if (op.sample != (any_sample ? SamplePurpose::FirstToken : SamplePurpose::None))
-        throw std::invalid_argument("Qwen3.5 prefill sample purpose differs from its rows");
 }
 
 void RankProgramImpl::validate_work(const Work& work, runtime::FrameKind kind) const {
@@ -237,27 +218,8 @@ void RankProgramImpl::validate_work(const Work& work, runtime::FrameKind kind) c
             } else if constexpr (std::is_same_v<T, ForwardWork>) {
                 validate_members(op.rows,
                                  [](const auto& row) -> const ExecutionRow& { return row; });
-                if (op.inputs.size() != op.rows.size() ||
-                    (op.sample != SamplePurpose::None && op.sampling.size() != op.rows.size()))
-                    throw std::invalid_argument("Qwen3.5 forward inputs do not match membership");
-                if (op.purpose == ForwardPurpose::Prefill) validate_prefill_work(op, prefill_chunk);
-                if (op.purpose == ForwardPurpose::Replay && op.rows.size() != 1)
-                    throw std::invalid_argument("Qwen3.5 Replay requires one sequence");
-                if (op.purpose == ForwardPurpose::Control) {
-                    if (op.control_last_tokens.size() != op.rows.size())
-                        throw std::invalid_argument(
-                            "Qwen3.5 control tokens do not match membership");
-                    for (std::size_t i = 0; i < op.rows.size(); ++i) {
-                        const auto n  = op.inputs[i].tokens.size();
-                        const auto id = op.control_last_tokens[i];
-                        if (!n || n > parameters.profile->control_token_limit)
-                            throw std::invalid_argument("Qwen3.5 control exceeds prepared extent");
-                        if (id < 0 || std::uint32_t(id) >= parameters.profile->public_tokens)
-                            throw std::invalid_argument("Qwen3.5 control token exceeds vocabulary");
-                    }
-                } else if (!op.control_last_tokens.empty()) {
-                    throw std::invalid_argument("Qwen3.5 control output outside control work");
-                }
+                validate_forward_work(op, prefill_chunk, parameters.profile->control_token_limit,
+                                      parameters.profile->public_tokens);
                 for (std::size_t i = 0; i < op.rows.size(); ++i) {
                     validate_input(op.inputs[i], op.purpose == ForwardPurpose::Control
                                                      ? parameters.profile->control_token_limit
@@ -270,6 +232,7 @@ void RankProgramImpl::validate_work(const Work& work, runtime::FrameKind kind) c
             } else if constexpr (std::is_same_v<T, DecodeWork>) {
                 validate_members(
                     op.rows, [](const auto& row) -> const ExecutionRow& { return row.binding; });
+                validate_narrowing(op, capacity);
                 const auto& route = op.plan->route();
                 route.validate(backend, draft_window);
                 if (graphs && !graphs->contains(route))
@@ -322,73 +285,23 @@ void RankProgramImpl::validate_decision(runtime::ExecutionTicket ticket,
     const auto& op = require_compute(ticket);
     if (!op.decision_requested || op.decision_supplied || input.stage != op.decision_stage)
         throw std::logic_error("Qwen3.5 decision input does not match the pending stage");
-    const auto mark       = next_validation_mark();
-    const auto words      = (parameters.profile->public_tokens + 31) / 32;
-    const auto* forward   = std::get_if<ForwardWork>(&op.request.work.operation);
-    const bool prefill    = forward && forward->purpose == ForwardPurpose::Prefill;
-    const auto needs_mask = [&](std::uint32_t member) {
-        const auto& sampling = op.sampling[member];
-        return sampling.constrained && (!prefill || sampling.sample);
-    };
-    for (const auto& row : input.rows) {
-        if (row.member >= op.batch || validation_marks[row.member] == mark ||
-            !needs_mask(row.member) ||
-            row.positions != (prefill
-                                  ? 1U
-                                  : static_cast<std::uint32_t>(
-                                        resources.frame.host_ingress.extents[row.member] + 1)) ||
-            row.words.size() != words * row.positions || (row.dead_positions >> row.positions) != 0)
-            throw std::invalid_argument("Qwen3.5 decision mask has invalid shape or membership");
-        validation_marks[row.member] = mark;
-    }
-    for (std::uint32_t row = 0; row < op.batch; ++row) {
-        if ((validation_marks[row] == mark) != needs_mask(row))
-            throw std::invalid_argument("Qwen3.5 decision omitted a constrained row");
-    }
-}
-
-void validate_prefill_commit(const ForwardWork& work, std::span<const CommitRow> rows) {
-    if (rows.size() != work.rows.size())
-        throw std::invalid_argument("Qwen3.5 prefill commit has invalid membership");
-    for (std::size_t i = 0; i < rows.size(); ++i) {
-        const auto& row     = rows[i];
-        const bool sampled  = work.sampling[i].sample;
-        const auto expected = row.discarded ? 0 : sampled ? 1 : work.inputs[i].tokens.size();
-        if (row.accepted_tokens != expected || (!sampled && row.terminal != row.discarded))
-            throw std::invalid_argument("Qwen3.5 prefill commit has an invalid accepted prefix");
-    }
+    std::span<const std::uint32_t> verify_drafts;
+    if (const auto* decode = std::get_if<DecodeWork>(&op.request.work.operation))
+        verify_drafts = op.narrowed ? std::span<const std::uint32_t>(op.narrowed->verify_drafts)
+                                    : decode->plan->verify_drafts();
+    validate_decision_rows(op.request.work, input, parameters.profile->public_tokens,
+                           verify_drafts);
 }
 
 void RankProgramImpl::prepare_commit(runtime::ExecutionTicket ticket, Commit& value) const {
     const auto& op = require_compute(ticket);
     if (op.stage != ComputeStage::AwaitCommit || !op.result_published)
         throw std::logic_error("Qwen3.5 commit does not match the pending result");
-    const auto* forward  = std::get_if<ForwardWork>(&op.request.work.operation);
-    const bool generated = std::holds_alternative<DecodeWork>(op.request.work.operation) ||
-                           (forward && forward->sample != SamplePurpose::None);
-    if (!generated) {
-        if (!value.rows.empty() && value.rows.size() != op.batch)
-            throw std::invalid_argument("Qwen3.5 non-generating commit has invalid membership");
-        compute_actions->validate(value.context);
-        return;
-    }
-    const auto& output = resources.frame.host_egress;
-    if (value.rows.size() != op.batch)
-        throw std::invalid_argument("Qwen3.5 generating commit has invalid membership");
+    // Packed prefill readback stores compact sampled IDs. Its counts are determined by Work.
+    const auto counts =
+        op.packed_prefill ? std::span<const std::int32_t>{} : resources.frame.host_egress.counts;
+    validate_commit_rows(op.request.work, value, counts);
     compute_actions->validate(value.context);
-    if (forward && forward->purpose == ForwardPurpose::Prefill) {
-        validate_prefill_commit(*forward, value.rows);
-        return;
-    }
-    for (std::uint32_t i = 0; i < op.batch; ++i) {
-        const auto& row = value.rows[i];
-        if (row.accepted_tokens > static_cast<std::uint32_t>(output.counts[i]) ||
-            (row.discarded && row.accepted_tokens != 0) ||
-            (!row.discarded && !row.accepted_tokens) ||
-            (!row.terminal && !row.discarded &&
-             row.accepted_tokens != static_cast<std::uint32_t>(output.counts[i])))
-            throw std::invalid_argument("Qwen3.5 commit contains an invalid accepted prefix");
-    }
 }
 
 } // namespace ninfer::models::qwen3_5::detail

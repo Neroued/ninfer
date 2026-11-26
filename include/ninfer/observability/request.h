@@ -76,6 +76,7 @@ struct RequestCounters {
 struct RequestSnapshot {
     std::uint64_t id   = 0;
     RequestPhase phase = RequestPhase::Waiting;
+    std::optional<std::uint32_t> replica_id;
     std::optional<std::uint32_t> placement;
     std::uint64_t submitted_ns = 0;
     std::optional<std::uint64_t> admitted_ns, first_token_ns;
@@ -99,6 +100,7 @@ struct PlacementUsage {
     std::uint32_t id       = 0;
     std::uint32_t resident = 0, prefilling = 0, decoding = 0, replaying = 0, paused = 0;
     std::uint64_t context_tokens = 0;
+    std::uint32_t replica_id     = 0;
 };
 
 } // namespace ninfer

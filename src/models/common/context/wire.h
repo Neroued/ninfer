@@ -34,6 +34,11 @@ inline std::size_t ragged_write_action_capacity(std::size_t rows, std::size_t po
     return action_capacity(pages + rows, rows * pools, pages);
 }
 
+void encode_transfers(distributed::wire::Encoder&,
+                      std::span<const runtime::ContextTransferObservation>);
+[[nodiscard]] std::vector<runtime::ContextTransferObservation>
+decode_transfers(distributed::wire::Decoder&);
+
 void encode_directory(distributed::wire::Encoder&, const ContextDirectorySpec&);
 [[nodiscard]] ContextDirectorySpec decode_directory(distributed::wire::Decoder&);
 

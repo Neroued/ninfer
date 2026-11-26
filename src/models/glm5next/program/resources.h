@@ -8,7 +8,7 @@ namespace ninfer::models::glm5next {
 
 struct ContextCommunication {
     const distributed::Group* group = nullptr;
-    std::span<const std::uint32_t> members;
+    std::vector<std::uint32_t> members;
 };
 
 // Fixed rank-owned storage; the coordinating ContextDirectory owns record identities,

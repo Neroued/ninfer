@@ -70,6 +70,9 @@ private:
     MaterializationStats stats_;
 };
 
+// Host scratch allowance for wave planning before a CUDA weight load.
+[[nodiscard]] std::size_t cuda_weight_staging_headroom(const Reader&);
+
 [[nodiscard]] MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& plan,
                                                std::optional<CudaExecutionView> execution = {},
                                                const StartupObserver* startup_observer = nullptr);

@@ -61,7 +61,7 @@ Session::inspect_source(const RequestBasePlan& base, std::optional<CheckpointHan
     const auto end    = resume ? resume->frontier() : base.summary().prompt_tokens;
     if (out.reused_tokens > end) return {};
     out.remaining_work = models::vision::recovery_work(
-        base.plan_->prompt.identity.media,
+        base.plan_->prompt->identity.media,
         [](const auto& media) -> const auto& { return media.item; }, out.reused_tokens, end,
         p.shape.prefill_chunk, p.plan.vision_max_features);
     if (h) {
@@ -306,7 +306,7 @@ ResidencyBinding SessionImpl::context_binding(BindOperation& operation) {
         sequence.id           = next_sequence++;
         sequence.epoch        = identity_generation;
         sequence.request      = operation.request;
-        sequence.ledger       = context::RequestLedger(operation.request->prompt.token_ids);
+        sequence.ledger       = context::RequestLedger(operation.request->prompt->token_ids);
         sequence.reused       = operation.frontier;
         sequence.captures     = operation.request->captures;
         sequence.last_saved   = operation.frontier;

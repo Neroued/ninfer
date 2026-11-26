@@ -37,13 +37,14 @@ struct DeploymentOptions {
     std::uint16_t control_port        = 0;
     std::uint32_t connect_timeout_ms  = 60'000;
     std::uint32_t shutdown_timeout_ms = 30'000;
+    bool allow_shared_device          = false;
     ParallelOptions parallel;
     std::vector<DeploymentNode> nodes;
     std::vector<DeploymentRank> ranks;
 };
 
-// Validates deployment identities, paths and references. Model parallel geometry is resolved
-// by the model planner, independently of this process/device mapping.
+// Validates deployment identities, parallel geometry nesting, paths and references.
 void validate_deployment(const DeploymentOptions&);
+[[nodiscard]] DeploymentOptions normalize_deployment(DeploymentOptions);
 
 } // namespace ninfer

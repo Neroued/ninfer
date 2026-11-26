@@ -421,6 +421,9 @@ ParsedOptions parse(int argc, char** argv, EntryPoint entry,
         case Field::HostCapacity:
             engine.context_cache.host_capacity_bytes = u64();
             break;
+        case Field::MaxCachedCheckpointsPerReplica:
+            engine.context_cache.max_cached_checkpoints_per_replica = u32();
+            break;
         case Field::CostPresets:
             engine.context_cost.preset_path = path();
             break;
@@ -566,6 +569,9 @@ ParsedOptions parse(int argc, char** argv, EntryPoint entry,
     };
     if (engine.artifact_path.empty())
         throw std::invalid_argument("model.path or a model artifact argument is required");
+    if (file.auto_expanded_shared_ranks && engine.deployment) {
+        for (auto& r : engine.deployment->ranks) r.device = engine.device;
+    }
     if (applies_to(field_spec(Field::SpecBackend), entry)) {
         try {
             validate_speculative_cli_options(engine.speculative);

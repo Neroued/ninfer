@@ -75,7 +75,7 @@ Session::prepare_capture(SequenceHandle h, std::span<const CheckpointHandle> vic
            s.captures[s.next_capture].frontier <= s.continuation.metadata.main_frontier)
         ++s.next_capture;
     const auto begin   = s.continuation.metadata.main_frontier;
-    const auto& advice = s.request->prompt.context_cache;
+    const auto& advice = s.request->prompt->context_cache;
     if (!s.capture_pending && s.phase == detail::Phase::Prefill && advice.automatic_checkpoints &&
         s.permitted_frontier > s.last_intermediate_attempt) {
         const auto next = s.next_capture < s.captures.size()

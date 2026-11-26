@@ -51,15 +51,30 @@ bool StartupMemoryBudget::fits(DeviceMemorySnapshot current) const noexcept {
     return shortfall(current) == 0;
 }
 
+std::size_t host_memory_shortfall(DeviceMemorySnapshot current, std::size_t reservation) {
+    return reservation > current.system_available_bytes
+               ? reservation - current.system_available_bytes
+               : 0;
+}
+
+std::size_t
+StartupMemoryBudget::device_shortfall(DeviceMemorySnapshot current, std::size_t node_reservation,
+                                      std::size_t additional_device_bytes) const noexcept {
+    const auto reserve  = initial_.shared_physical_memory ? node_reservation : 0;
+    const auto required = reserve + std::min(additional_device_bytes, SIZE_MAX - reserve);
+    const auto consumed = static_cast<std::size_t>(
+        std::max<std::int64_t>(0, device_memory_growth(initial_, current)));
+    if (consumed > limit_) {
+        const auto excess = consumed - limit_;
+        return excess + std::min(required, SIZE_MAX - excess);
+    }
+    const auto remaining = std::min(limit_ - consumed, current.available_bytes());
+    return required > remaining ? required - remaining : 0;
+}
+
 std::size_t StartupMemoryBudget::shortfall(DeviceMemorySnapshot current) const noexcept {
-    const auto consumed       = device_memory_growth(initial_, current);
-    const auto device_reserve = initial_.shared_physical_memory ? host_reservation_ : 0;
-    const auto device_shortfall =
-        std::max<std::int64_t>(0, consumed - static_cast<std::int64_t>(limit_ - device_reserve));
-    const auto host_shortfall = current.system_available_bytes < host_reservation_
-                                    ? host_reservation_ - current.system_available_bytes
-                                    : 0;
-    return std::max(static_cast<std::size_t>(device_shortfall), host_shortfall);
+    return std::max(device_shortfall(current, host_reservation_),
+                    host_memory_shortfall(current, host_reservation_));
 }
 
 std::size_t StartupMemoryBudget::available_host(DeviceMemorySnapshot current) const noexcept {
@@ -81,7 +96,12 @@ std::size_t StartupMemoryBudget::corrected_runtime_limit(DeviceMemorySnapshot cu
 
 std::int64_t StartupMemoryBudget::retained(DeviceMemorySnapshot current,
                                            std::size_t owned_bytes) const {
-    return device_memory_growth(initial_, current) - static_cast<std::int64_t>(owned_bytes);
+    return retained_startup_bytes(initial_, current, owned_bytes);
+}
+
+std::int64_t retained_startup_bytes(DeviceMemorySnapshot before, DeviceMemorySnapshot after,
+                                    std::size_t owned_bytes) {
+    return device_memory_growth(before, after) - static_cast<std::int64_t>(owned_bytes);
 }
 
 } // namespace ninfer::runtime

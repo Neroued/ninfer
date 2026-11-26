@@ -115,10 +115,18 @@ private:
     friend class SequencePlanner;
     friend class RankProgram;
     friend SessionPlan plan_session(const SequencePlan&);
+    friend SequencePlan make_graph_probe_sequence_plan(std::shared_ptr<const execution::ModelProfile>,
+                                                       DeviceContext&, const EngineOptions&,
+                                                       std::shared_ptr<const moe::Plan>,
+                                                       std::span<const std::uint32_t>,
+                                                       GraphProbeBacking);
     friend std::unique_ptr<RankProgram> create_rank_program(const execution::Parameters&,
                                                             SequencePlan&&, DeviceContext&,
                                                             const StartupObserver&,
                                                             GraphPreparationMode);
+    friend std::unique_ptr<RankProgram>
+    create_uninitialized_rank_program(const execution::Parameters&, SequencePlan&&, DeviceContext&,
+                                      const StartupObserver&);
 };
 
 class SequencePlanner {
@@ -144,6 +152,11 @@ private:
 };
 
 [[nodiscard]] SessionPlan plan_session(const SequencePlan&);
+[[nodiscard]] SequencePlan
+make_graph_probe_sequence_plan(std::shared_ptr<const execution::ModelProfile>, DeviceContext&,
+                               const EngineOptions&, std::shared_ptr<const moe::Plan> = {},
+                               std::span<const std::uint32_t> = {},
+                               GraphProbeBacking              = GraphProbeBacking::Inputs);
 [[nodiscard]] SequencePlanner make_sequence_planner(std::shared_ptr<const execution::ModelProfile>,
                                                     DeviceContext&, const EngineOptions&,
                                                     std::shared_ptr<const moe::Plan> = {},
@@ -153,5 +166,8 @@ private:
 [[nodiscard]] std::unique_ptr<RankProgram>
 create_rank_program(const execution::Parameters&, SequencePlan&&, DeviceContext&,
                     const StartupObserver&, GraphPreparationMode = GraphPreparationMode::Complete);
+[[nodiscard]] std::unique_ptr<RankProgram>
+create_uninitialized_rank_program(const execution::Parameters&, SequencePlan&&, DeviceContext&,
+                                  const StartupObserver&);
 
 } // namespace ninfer::models::qwen3_5

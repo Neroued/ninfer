@@ -38,6 +38,9 @@ struct DeviceMemorySnapshot {
                                                 DeviceMemorySnapshot after);
 
 void cuda_check(cudaError_t err, const char* expr, const char* file, int line);
+void start_device_profiler();
+void stop_device_profiler();
+void cancel_device_profiler() noexcept;
 
 #define CUDA_CHECK(expr) ::ninfer::cuda_check((expr), #expr, __FILE__, __LINE__)
 

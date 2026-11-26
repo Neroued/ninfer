@@ -11,6 +11,8 @@ namespace ninfer::models::vision {
 class InputReceiver {
 public:
     void bind(MemorySpan);
+
+    [[nodiscard]] bool occupied() const noexcept { return id_ != 0; }
     void begin(std::uint64_t id, std::span<const std::size_t> parts);
     void append(std::uint64_t id, std::size_t part, std::size_t offset, std::span<const std::byte>);
     [[nodiscard]] std::vector<ConstMemorySpan> finish(std::uint64_t id) const;

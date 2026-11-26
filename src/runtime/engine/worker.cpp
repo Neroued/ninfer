@@ -1,6 +1,8 @@
 #include "runtime/engine/worker.h"
 #include "distributed/bootstrap.h"
 
+#include "models/qwen3_5/parallel/codec.h"
+#include "models/qwen3_5/parallel/preparation.h"
 #include "models/qwen4_exp/parallel/preparation.h"
 #include "models/glm5next/startup.h"
 #include "models/glm5next/parallel/codec.h"
@@ -38,7 +40,7 @@ void run_rank(distributed::WorkerConnection& connection, std::unique_ptr<artifac
             ready.u32(*attempt);
             phase.complete();
             connection.send(wire::Kind::Ready, std::move(ready).take());
-            while (loop.advance()) std::this_thread::yield();
+            while (loop.advance()) {}
         }
         preparing.reset();
         instance.reset();
@@ -75,9 +77,18 @@ void run_worker(distributed::WorkerBootstrap bootstrap) {
         {
             StartupPhaseScope phase(observer, StartupPhase::ArtifactInspect);
             reader = std::make_unique<artifact::Reader>(connection.bootstrap().artifact);
+            if (distributed::compute_topology_plan_digest(reader->artifact_id(),
+                                                          connection.topology()) !=
+                connection.topology().plan)
+                throw artifact::ArtifactError(
+                    "worker local artifact or shard digest differs from installed topology plan");
             phase.complete();
         }
         switch (models::resolve_architecture(reader->directory())) {
+        case models::Architecture::Qwen3_5:
+        case models::Architecture::Qwen3_5Moe:
+            run_rank<models::qwen3_5::RankPreparation>(connection, std::move(reader), request);
+            break;
         case models::Architecture::Qwen4Exp:
             run_rank<models::qwen4_exp::RankPreparation>(connection, std::move(reader), request);
             break;

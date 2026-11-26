@@ -3,7 +3,7 @@
 namespace ninfer::runtime {
 
 template <class Instance>
-void EngineCore<Instance>::commit_pending(PendingBatch&& pending, ComputeFlight flight) {
+void ReplicaEngine<Instance>::commit_pending(PendingBatch&& pending, ComputeFlight flight) {
     if (retiring_) throw std::logic_error("another model commit is still retiring");
     EnginePhaseScope phase(*this, EngineHostPhase::CommitOutput);
     const auto lane_indices     = std::span<const std::uint32_t>(flight.lanes);
@@ -270,7 +270,7 @@ void EngineCore<Instance>::commit_pending(PendingBatch&& pending, ComputeFlight 
 }
 
 template <class Instance>
-void EngineCore<Instance>::resolve_prefill_progress(
+void ReplicaEngine<Instance>::resolve_prefill_progress(
     typename ModelContract::PrefillProgress&& progress, ComputeFlight flight) {
     EnginePhaseScope phase(*this, EngineHostPhase::CommitOutput);
     if (progress.rows.size() != flight.requests.size() ||
@@ -334,8 +334,8 @@ void EngineCore<Instance>::resolve_prefill_progress(
 }
 
 template <class Instance>
-[[nodiscard]] typename EngineCore<Instance>::ComputeFlight
-EngineCore<Instance>::freeze_members(std::span<const std::uint32_t> lanes, UnitKind kind) const {
+[[nodiscard]] typename ReplicaEngine<Instance>::ComputeFlight
+ReplicaEngine<Instance>::freeze_members(std::span<const std::uint32_t> lanes, UnitKind kind) const {
     ComputeFlight flight;
     flight.kind = kind;
     flight.requests.reserve(lanes.size());
@@ -359,7 +359,7 @@ EngineCore<Instance>::freeze_members(std::span<const std::uint32_t> lanes, UnitK
 }
 
 template <class Instance>
-[[nodiscard]] bool EngineCore<Instance>::start_prefill(const PrefillMembership& membership) {
+[[nodiscard]] bool ReplicaEngine<Instance>::start_prefill(const PrefillMembership& membership) {
     auto flight = freeze_members(membership.lanes,
                                  membership.is_replay ? UnitKind::Replay : UnitKind::Prefill);
     ExecutionCallScope call(*this);
@@ -379,7 +379,7 @@ template <class Instance>
 }
 
 template <class Instance>
-[[nodiscard]] bool EngineCore<Instance>::start_decode(const RoundMembership& membership) {
+[[nodiscard]] bool ReplicaEngine<Instance>::start_decode(const RoundMembership& membership) {
     auto flight      = freeze_members(membership.lane_span(), UnitKind::Decode);
     auto constrained = std::span(row_flags_).first(flight.requests.size());
     for (std::size_t row = 0; row < flight.requests.size(); ++row) {
@@ -398,7 +398,7 @@ template <class Instance>
 }
 
 template <class Instance>
-void EngineCore<Instance>::discard_control_preview(const ComputeFlight& flight) noexcept {
+void ReplicaEngine<Instance>::discard_control_preview(const ComputeFlight& flight) noexcept {
     for (std::size_t row = 0; row < flight.requests.size(); ++row) {
         const auto& request = flight.requests[row];
         request->output.discard_preview();
@@ -409,7 +409,7 @@ void EngineCore<Instance>::discard_control_preview(const ComputeFlight& flight) 
 }
 
 template <class Instance>
-[[nodiscard]] bool EngineCore<Instance>::start_control(const ControlMembership& membership) {
+[[nodiscard]] bool ReplicaEngine<Instance>::start_control(const ControlMembership& membership) {
     if (membership.empty() || membership.row_stride == 0 ||
         membership.tokens.size() != membership.size() * membership.row_stride) {
         throw std::logic_error("thinking control membership is invalid");
@@ -462,7 +462,7 @@ template <class Instance>
 }
 
 template <class Instance>
-void EngineCore<Instance>::resolve_control(ComputeFlight& flight) {
+void ReplicaEngine<Instance>::resolve_control(ComputeFlight& flight) {
     EnginePhaseScope phase(*this, EngineHostPhase::CommitOutput);
     cumulative_stats_.committed_decode_tokens += flight.requests.size() * flight.control_stride;
     cumulative_stats_.injected_control_tokens += flight.requests.size() * flight.control_stride;
@@ -485,7 +485,7 @@ void EngineCore<Instance>::resolve_control(ComputeFlight& flight) {
 }
 
 template <class Instance>
-void EngineCore<Instance>::supply_decision(ExecutionTicket ticket,
+void ReplicaEngine<Instance>::supply_decision(ExecutionTicket ticket,
                                            const DecisionRequest& decision) {
     if (!compute_ || compute_->ticket != ticket || decision.vocabulary == 0) {
         throw std::logic_error("decision input does not belong to an active execution");
@@ -517,7 +517,7 @@ void EngineCore<Instance>::supply_decision(ExecutionTicket ticket,
 }
 
 template <class Instance>
-void EngineCore<Instance>::record_decision_upload(const DecisionConsumed& consumed) {
+void ReplicaEngine<Instance>::record_decision_upload(const DecisionConsumed& consumed) {
     if (!compute_ || compute_->ticket != consumed.ticket) {
         throw std::logic_error("decision upload does not belong to an active execution");
     }
@@ -530,7 +530,7 @@ void EngineCore<Instance>::record_decision_upload(const DecisionConsumed& consum
 }
 
 template <class Instance>
-[[nodiscard]] bool EngineCore<Instance>::poll_execution(HostPhaseMeasurement& boundary) {
+[[nodiscard]] bool ReplicaEngine<Instance>::poll_execution(HostPhaseMeasurement& boundary) {
     const bool context_was_pending = instance_.session->has_context_operation();
     const auto owner               = materializing_ ? materializing_->request : context_owner_;
     if (owner && owner->cancelled.load(std::memory_order_acquire) &&
@@ -631,13 +631,13 @@ template <class Instance>
 }
 
 template <class Instance>
-[[nodiscard]] bool EngineCore<Instance>::execution_outstanding() const noexcept {
+[[nodiscard]] bool ReplicaEngine<Instance>::execution_outstanding() const noexcept {
     return compute_ || retiring_ || instance_.session->has_context_operation() ||
            instance_.executor->has_pending_work();
 }
 
 template <class Instance>
-bool EngineCore<Instance>::compute_pending() const noexcept {
+bool ReplicaEngine<Instance>::compute_pending() const noexcept {
     if (compute_ || retiring_) return true;
     return std::any_of(slots_.begin(), slots_.end(), [&](const auto& request) {
         return request && request->sequence &&
@@ -646,7 +646,7 @@ bool EngineCore<Instance>::compute_pending() const noexcept {
 }
 
 template <class Instance>
-void EngineCore<Instance>::record_service(ComputeFlight& flight) noexcept {
+void ReplicaEngine<Instance>::record_service(ComputeFlight& flight) noexcept {
     if (!flight.retired_ns || flight.service_accounted) return;
     if (flight.kind == UnitKind::Replay) {
         for (const auto& request : flight.requests)
@@ -664,7 +664,7 @@ void EngineCore<Instance>::record_service(ComputeFlight& flight) noexcept {
 }
 
 template <class Instance>
-void EngineCore<Instance>::log_worker_failure(std::exception_ptr error) const noexcept {
+void ReplicaEngine<Instance>::log_worker_failure(std::exception_ptr error) const noexcept {
     // Preserve the first cause before cleanup mutates membership or drains the executor.
     // Do not depend on a product-specific logger, or throw from the failure handler.
     const auto report = [&](const char* reason) {
@@ -692,17 +692,37 @@ void EngineCore<Instance>::log_worker_failure(std::exception_ptr error) const no
 }
 
 template <class Instance>
-void EngineCore<Instance>::fail_all(std::exception_ptr error) noexcept {
+void ReplicaEngine<Instance>::fail_all(std::exception_ptr error) noexcept {
+    // Step 1 of two-step failure isolation: atomically mark this replica domain unroutable
+    // in DpRouter (invalidating epoch hints and slot offers, waking waiters).
+    bool is_shutdown = false;
+    {
+        std::lock_guard lock(queue_mutex_);
+        is_shutdown = stopping_;
+    }
     std::deque<std::shared_ptr<Request>> pending;
     std::unique_ptr<MeasurementRequest> measurement;
     {
         std::lock_guard lock(queue_mutex_);
-        failed_ = true;
+        if (!is_shutdown) { failed_ = true; }
         pending.swap(pending_);
+        occupied_lanes_ = 0;
+        ++lane_sequence_;
         measurement = std::move(measurement_);
     }
+    if (!is_shutdown) {
+        hooks_.on_replica_failing(replica_id_);
+        std::string reason = "replica engine failed";
+        try {
+            if (error) std::rethrow_exception(error);
+        } catch (const std::exception& cause) { reason = cause.what(); } catch (...) {}
+        try {
+            instance_.executor->fail(reason);
+        } catch (...) {}
+    }
     finish_completion_exposure();
-    scheduler_ = Scheduling{};
+    scheduler_            = Scheduling{};
+    waiting_restore_target_.reset();
     const std::shared_ptr<Request> materializing_request =
         materializing_ ? materializing_->request : nullptr;
     // Native retires all transfer readers before any external checkpoint owner is destroyed.
@@ -723,10 +743,33 @@ void EngineCore<Instance>::fail_all(std::exception_ptr error) noexcept {
     std::vector<std::shared_ptr<Request>> paused;
     paused.swap(paused_);
     const auto residents = slots_;
-    const auto release   = [&](const std::shared_ptr<Request>& request) {
+
+    std::uint32_t held_residency_permits = 0;
+    const auto count_and_clear_permit    = [&](const std::shared_ptr<Request>& request) {
+        if (request && request->holds_residency_permit) {
+            request->holds_residency_permit = false;
+            ++held_residency_permits;
+        }
+    };
+    for (const auto& request : paused) count_and_clear_permit(request);
+    for (const auto& request : residents) count_and_clear_permit(request);
+    count_and_clear_permit(materializing_request);
+    for (const auto& request : pending) count_and_clear_permit(request);
+    for (const auto& entry : pending_completions_) count_and_clear_permit(entry.request);
+
+    const auto release = [&](const std::shared_ptr<Request>& request) {
         if (!request) return;
         auto& completed = retain_completion(request);
         if (completed.ready) return;
+        {
+            std::lock_guard lock(request->mutex);
+            if (request->response_done) {
+                completed.ready = true;
+                return;
+            }
+        }
+        // Temporarily unhook release_or_handoff inside prepare_completion so we release all
+        // held permits in one atomic batch after cleanup.
         if (prepare_completion(request)) {
             record_completion(request, FinishReason::None, true);
             release_request(request);
@@ -748,6 +791,9 @@ void EngineCore<Instance>::fail_all(std::exception_ptr error) noexcept {
         completed.request->completion_index.reset();
     }
     pending_completions_.clear();
+    if (held_residency_permits > 0) {
+        hooks_.on_replica_failed_release_residencies(held_residency_permits);
+    }
     if (measurement) measurement->completion.set_exception(error);
     queue_cv_.notify_all();
 }

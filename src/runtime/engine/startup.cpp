@@ -7,6 +7,7 @@
 #include "runtime/engine/prepared_startup.inl"
 #if NINFER_ENABLE_DISTRIBUTED
 #    include "runtime/engine/distributed_startup.inl"
+#    include "models/qwen3_5/parallel/startup.h"
 #    include "models/qwen4_exp/parallel/startup.h"
 #    include "models/glm5next/parallel/startup.h"
 #endif
@@ -17,6 +18,11 @@
 namespace ninfer::runtime {
 namespace {
 using Clock = std::chrono::steady_clock;
+
+bool requires_distributed_execution(const DeploymentOptions& deployment) {
+    return deployment.ranks.size() > 1 ||
+           deployment.ranks.front().node != deployment.coordinator_node;
+}
 
 void validate_options(const EngineOptions& options) {
     if (options.artifact_path.empty()) {
@@ -55,7 +61,11 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         options.speculative          = {};
         options.enable_vision        = false;
         options.use_cuda_graph       = false;
-        options.context_cache = ContextCacheOptions{.enabled = false, .host_capacity_bytes = 0};
+        options.grammar_cache_bytes  = 0;
+        options.context_cache        = ContextCacheOptions{
+                   .enabled             = false,
+                   .host_capacity_bytes = options.deployment ? options.context_cache.host_capacity_bytes
+                                                             : std::optional<std::size_t>{0}};
         break;
     default:
         throw std::invalid_argument("Engine purpose is invalid");
@@ -76,11 +86,19 @@ SessionEpoch next_session_epoch() noexcept {
 
 ConstructedModel construct_model(EngineOptions& options) {
     validate_options(options);
+    bool distributed_execution = false;
     if (options.deployment) {
         validate_deployment(*options.deployment);
-        if (options.deployment->ranks.size() == 1)
-            options.device = options.deployment->ranks.front().device;
+        distributed_execution = requires_distributed_execution(*options.deployment);
+        if (!distributed_execution) options.device = options.deployment->ranks.front().device;
     }
+#if !NINFER_ENABLE_DISTRIBUTED
+    if (distributed_execution)
+        throw std::invalid_argument(
+            "deployment requires a build with distributed execution enabled");
+#endif
+    if (!distributed_execution && options.purpose == EnginePurpose::CausalScoring)
+        options.context_cache.host_capacity_bytes = 0;
     const auto start = Clock::now();
     StartupPhaseScope inspect(options.startup_observer, StartupPhase::ArtifactInspect);
     artifact::Reader reader(options.artifact_path);
@@ -88,7 +106,7 @@ ConstructedModel construct_model(EngineOptions& options) {
     switch (models::resolve_architecture(reader.directory())) {
     case models::Architecture::Glm5Next: {
 #if NINFER_ENABLE_DISTRIBUTED
-        if (options.deployment && options.deployment->ranks.size() > 1) {
+        if (distributed_execution) {
             auto built = detail::build_distributed_model<models::glm5next::ParallelStartup>(
                 reader, options, start);
             return {std::move(built.instance), std::move(built.load),
@@ -101,7 +119,7 @@ ConstructedModel construct_model(EngineOptions& options) {
     }
     case models::Architecture::Qwen4Exp: {
 #if NINFER_ENABLE_DISTRIBUTED
-        if (options.deployment && options.deployment->ranks.size() > 1) {
+        if (distributed_execution) {
             auto built = detail::build_distributed_model<models::qwen4_exp::ParallelStartup>(
                 reader, options, start);
             return {std::move(built.instance), std::move(built.load),
@@ -113,6 +131,14 @@ ConstructedModel construct_model(EngineOptions& options) {
     }
     case models::Architecture::Qwen3_5:
     case models::Architecture::Qwen3_5Moe: {
+#if NINFER_ENABLE_DISTRIBUTED
+        if (distributed_execution) {
+            auto built = detail::build_distributed_model<models::qwen3_5::ParallelStartup>(
+                reader, options, start);
+            return {std::move(built.instance), std::move(built.load),
+                    std::move(built.context_cost)};
+        }
+#endif
         auto built = detail::build_local_model<models::qwen3_5::Startup>(reader, options, start);
         return {std::move(built.instance), std::move(built.load), std::move(built.context_cost)};
     }

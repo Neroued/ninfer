@@ -25,6 +25,14 @@ public:
 
     [[nodiscard]] std::span<const ExpertBankSource> expert_banks() const { return banks_; }
 
+    [[nodiscard]] const moe::ResidentExpertBank* resident_experts(ExpertBankId id) const {
+        return local_banks_.empty() ? nullptr : &local_banks_.at(id.index);
+    }
+
+    [[nodiscard]] const moe::ExpertDescription& expert_description(ExpertBankId id) const {
+        return expert_descriptions_.at(id.index);
+    }
+
     [[nodiscard]] const artifact::MaterializationStats& storage_stats() const {
         return backing_.stats();
     }
@@ -37,8 +45,11 @@ private:
 
     std::shared_ptr<const ModelDefinition> definition_;
     artifact::MaterializedArtifact backing_;
+    std::vector<WeightParent> local_parents_;
     std::vector<BoundWeight> bound_;
     std::vector<ExpertBankSource> banks_;
+    std::vector<moe::ResidentExpertBank> local_banks_;
+    std::vector<moe::ExpertDescription> expert_descriptions_;
 };
 
 } // namespace ninfer::models::qwen3_5

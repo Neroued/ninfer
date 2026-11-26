@@ -3,135 +3,9 @@
 namespace ninfer::runtime {
 
 template <class Instance>
-void EngineCore<Instance>::wait_for_admission(const std::shared_ptr<Request>& request,
-                                              const CancellationView& cancellation) {
-    try {
-        for (;;) {
-            const bool cancelled = cancellation.requested();
-            std::unique_lock lock(request->mutex);
-            if (request->error) { std::rethrow_exception(request->error); }
-            if (cancelled || request->cancelled.load(std::memory_order_acquire) ||
-                (request->response_done &&
-                 request->result.finish_reason == FinishReason::Cancelled)) {
-                throw RequestError(RequestErrorKind::Cancelled,
-                                   "inference request cancelled while waiting for admission");
-            }
-            if (request->generation_start || request->response_done) { return; }
-            request->cv.wait_for(lock, std::chrono::milliseconds(10), [&] {
-                return request->generation_start.has_value() || request->response_done;
-            });
-        }
-    } catch (...) {
-        request->cancelled.store(true, std::memory_order_release);
-        pending_scan_requested_.store(true, std::memory_order_release);
-        request_admission_check();
-        queue_cv_.notify_one();
-        throw;
-    }
-}
-
-template <class Instance>
-GenerationResult EngineCore<Instance>::wait_for_request(std::shared_ptr<Request> request,
-                                                        OutputSink* sink,
-                                                        const CancellationView& cancellation) {
-    struct ConsumerGuard {
-        EngineCore* owner;
-        std::shared_ptr<Request> request;
-
-        ~ConsumerGuard() { owner->release_consumer(request); }
-    } guard{this, request};
-
-    std::exception_ptr caller_error;
-    bool scheduling_failed   = false;
-    const auto fail_consumer = [&] {
-        if (caller_error == nullptr) { caller_error = std::current_exception(); }
-        request->cancelled.store(true, std::memory_order_release);
-        pending_scan_requested_.store(true, std::memory_order_release);
-        request_admission_check();
-        queue_cv_.notify_one();
-    };
-    std::optional<GenerationStart> start;
-    bool start_delivered = false;
-    std::optional<PromptProgress> progress;
-    std::vector<typename Request::StreamEvent> events;
-    for (;;) {
-        start.reset();
-        progress.reset();
-        events.clear();
-        bool done = false;
-        {
-            std::unique_lock lock(request->mutex);
-            request->cv.wait_for(lock, std::chrono::milliseconds(10), [&] {
-                return request->response_done || (!start_delivered && request->generation_start) ||
-                       request->stream_progress.has_value() || !request->events.empty();
-            });
-            if (!start_delivered && request->generation_start) {
-                start           = request->generation_start;
-                start_delivered = true;
-            }
-            progress = std::move(request->stream_progress);
-            request->stream_progress.reset();
-            events.swap(request->events);
-            done = request->response_done;
-        }
-
-        if (caller_error == nullptr && sink != nullptr) {
-            try {
-                if (start) { sink->start(std::move(*start)); }
-                if (progress) { sink->progress(std::move(*progress)); }
-            } catch (...) { fail_consumer(); }
-        }
-        for (auto& event : events) {
-            if (const auto* scheduling =
-                    std::get_if<std::unique_ptr<GenerationSchedulingObservation>>(&event)) {
-                if (scheduling_failed) { continue; }
-                try {
-                    request->observation.scheduling(**scheduling);
-                } catch (...) {
-                    scheduling_failed = true;
-                    fail_consumer();
-                }
-            } else if (const auto* first_token =
-                           std::get_if<GenerationFirstTokenObservation>(&event)) {
-                if (caller_error == nullptr) {
-                    try {
-                        request->observation.first_token(*first_token);
-                    } catch (...) { fail_consumer(); }
-                }
-            } else if (caller_error == nullptr && sink != nullptr) {
-                try {
-                    if (auto* timing = std::get_if<GenerationTimingObservation>(&event)) {
-                        sink->timing(std::move(*timing));
-                    } else {
-                        sink->publish(std::move(std::get<OutputEvent>(event)));
-                    }
-                } catch (...) { fail_consumer(); }
-            }
-        }
-
-        if (caller_error == nullptr) {
-            try {
-                if (cancellation.requested()) {
-                    request->cancelled.store(true, std::memory_order_release);
-                    pending_scan_requested_.store(true, std::memory_order_release);
-                    request_admission_check();
-                    queue_cv_.notify_one();
-                }
-            } catch (...) { fail_consumer(); }
-        }
-        if (!done) { continue; }
-
-        if (caller_error != nullptr) { std::rethrow_exception(caller_error); }
-        std::lock_guard lock(request->mutex);
-        if (request->error != nullptr) { std::rethrow_exception(request->error); }
-        return std::move(request->result);
-    }
-}
-
-template <class Instance>
 [[nodiscard]] std::optional<GenerationTimingObservation>
-EngineCore<Instance>::record_committed_output(const std::shared_ptr<Request>& request,
-                                              std::uint32_t accepted_tokens) {
+ReplicaEngine<Instance>::record_committed_output(const std::shared_ptr<Request>& request,
+                                                 std::uint32_t accepted_tokens) {
     if (accepted_tokens == 0) { return std::nullopt; }
     cumulative_stats_.generated_tokens += accepted_tokens;
     const Clock::time_point now = Clock::now();
@@ -172,7 +46,7 @@ EngineCore<Instance>::record_committed_output(const std::shared_ptr<Request>& re
 }
 
 template <class Instance>
-void EngineCore<Instance>::append_output(const std::shared_ptr<Request>& request,
+void ReplicaEngine<Instance>::append_output(const std::shared_ptr<Request>& request,
                                          PublishedOutput output,
                                          std::optional<GenerationTimingObservation> timing,
                                          EnginePhaseScope* phase) {
@@ -204,7 +78,7 @@ void EngineCore<Instance>::append_output(const std::shared_ptr<Request>& request
 }
 
 template <class Instance>
-bool EngineCore<Instance>::fail_output(const std::shared_ptr<Request>& request,
+bool ReplicaEngine<Instance>::fail_output(const std::shared_ptr<Request>& request,
                                        std::uint32_t lane) {
     const auto error = request->output.output_error();
     if (!error) return false;
@@ -217,7 +91,7 @@ bool EngineCore<Instance>::fail_output(const std::shared_ptr<Request>& request,
 }
 
 template <class Instance>
-void EngineCore<Instance>::publish_prompt_progress(const std::shared_ptr<Request>& request) {
+void ReplicaEngine<Instance>::publish_prompt_progress(const std::shared_ptr<Request>& request) {
     if (!request->observation.prompt_progress) { return; }
     if (!request->admitted_begin || !request->admitted_at) {
         throw std::logic_error("prompt progress has no admitted request boundary");
@@ -242,7 +116,7 @@ void EngineCore<Instance>::publish_prompt_progress(const std::shared_ptr<Request
 }
 
 template <class Instance>
-void EngineCore<Instance>::publish_generation_start(const std::shared_ptr<Request>& request,
+void ReplicaEngine<Instance>::publish_generation_start(const std::shared_ptr<Request>& request,
                                                     BeginSummary begin) {
     if (request->admitted_begin) {
         throw std::logic_error("request admission published generation start twice");
@@ -268,36 +142,7 @@ void EngineCore<Instance>::publish_generation_start(const std::shared_ptr<Reques
 }
 
 template <class Instance>
-void EngineCore<Instance>::release_reserved_capacity() noexcept {
-    std::lock_guard lock(queue_mutex_);
-    if (outstanding_ != 0) { --outstanding_; }
-}
-
-template <class Instance>
-void EngineCore<Instance>::release_consumer(const std::shared_ptr<Request>& request) noexcept {
-    bool release = false;
-    {
-        std::lock_guard lock(request->mutex);
-        request->consumer_released = true;
-        if (request->response_done && !request->capacity_released) {
-            request->capacity_released = true;
-            release                    = true;
-        }
-    }
-    if (release) { release_reserved_capacity(); }
-}
-
-template <class Instance>
-void EngineCore<Instance>::abandon_request(std::shared_ptr<Request> request) noexcept {
-    request->cancelled.store(true, std::memory_order_release);
-    pending_scan_requested_.store(true, std::memory_order_release);
-    request_admission_check();
-    queue_cv_.notify_one();
-    release_consumer(request);
-}
-
-template <class Instance>
-bool EngineCore<Instance>::completion_prepared(const std::shared_ptr<Request>& request) const {
+bool ReplicaEngine<Instance>::completion_prepared(const std::shared_ptr<Request>& request) const {
     if (request->completion_index && pending_completions_[*request->completion_index].ready)
         return true;
     std::lock_guard lock(request->mutex);
@@ -305,8 +150,8 @@ bool EngineCore<Instance>::completion_prepared(const std::shared_ptr<Request>& r
 }
 
 template <class Instance>
-typename EngineCore<Instance>::PendingCompletion&
-EngineCore<Instance>::retain_completion(const std::shared_ptr<Request>& request) {
+typename ReplicaEngine<Instance>::PendingCompletion&
+ReplicaEngine<Instance>::retain_completion(const std::shared_ptr<Request>& request) {
     if (completion_scope_depth_ && !completion_exposure_) {
         completion_exposure_.emplace(active_exposure_set(), exposure_clock());
         const auto& rows = completion_exposure_->exposed->entries;
@@ -320,7 +165,7 @@ EngineCore<Instance>::retain_completion(const std::shared_ptr<Request>& request)
 }
 
 template <class Instance>
-void EngineCore<Instance>::publish_completions() {
+void ReplicaEngine<Instance>::publish_completions() {
     if (pending_completions_.empty()) return;
     std::vector<std::uint64_t> finished;
     finished.reserve(pending_completions_.size());
@@ -340,7 +185,7 @@ void EngineCore<Instance>::publish_completions() {
 }
 
 template <class Instance>
-bool EngineCore<Instance>::prepare_completion(const std::shared_ptr<Request>& request) {
+bool ReplicaEngine<Instance>::prepare_completion(const std::shared_ptr<Request>& request) {
     {
         std::lock_guard lock(request->mutex);
         if (request->response_done) { return false; }
@@ -354,6 +199,7 @@ bool EngineCore<Instance>::prepare_completion(const std::shared_ptr<Request>& re
         admission_decision_.reset();
     }
     if (!request->admitted_at) {
+        hooks_.cancel_admission(request->id);
         request->admission.revoked_checkpoints = resources_.source_revocations(request->id);
         finish_source_wait(request, Clock::now());
     }
@@ -366,12 +212,14 @@ bool EngineCore<Instance>::prepare_completion(const std::shared_ptr<Request>& re
     request->base_plan.reset();
     set_placement_load(*request, {}, 0);
     request->prompt      = {};
+    request->prefix_keyer.reset();
     request->model_state = EngineRequestState::ModelFinished;
+    release_or_handoff_request_residency(request);
     return true;
 }
 
 template <class Instance>
-void EngineCore<Instance>::release_request(const std::shared_ptr<Request>& request) noexcept {
+void ReplicaEngine<Instance>::release_request(const std::shared_ptr<Request>& request) noexcept {
     if (request->lane) {
         const auto lane = request->lane->value;
         capture_decisions_[lane].reset();
@@ -388,7 +236,7 @@ void EngineCore<Instance>::release_request(const std::shared_ptr<Request>& reque
 }
 
 template <class Instance>
-void EngineCore<Instance>::publish_completion(const std::shared_ptr<Request>& request,
+void ReplicaEngine<Instance>::publish_completion(const std::shared_ptr<Request>& request,
                                               GenerationResult result, std::exception_ptr error) {
     bool release = false;
     {
@@ -397,17 +245,19 @@ void EngineCore<Instance>::publish_completion(const std::shared_ptr<Request>& re
         request->result        = std::move(result);
         request->error         = std::move(error);
         request->response_done = true;
+        hooks_.on_request_terminal(request->id, request->result.finish_reason,
+                                   request->error != nullptr);
         if (request->consumer_released && !request->capacity_released) {
             request->capacity_released = true;
             release                    = true;
         }
     }
-    if (release) { release_reserved_capacity(); }
+    if (release) { hooks_.release_outstanding_permit(); }
     request->cv.notify_one();
 }
 
 template <class Instance>
-void EngineCore<Instance>::complete_error(const std::shared_ptr<Request>& request,
+void ReplicaEngine<Instance>::complete_error(const std::shared_ptr<Request>& request,
                                           std::exception_ptr error) {
     if (completion_prepared(request)) return;
     CompletionScope batch(*this);
@@ -427,7 +277,7 @@ void EngineCore<Instance>::complete_error(const std::shared_ptr<Request>& reques
 }
 
 template <class Instance>
-void EngineCore<Instance>::complete_success(const std::shared_ptr<Request>& request,
+void ReplicaEngine<Instance>::complete_success(const std::shared_ptr<Request>& request,
                                             FinishReason reason) {
     if (completion_prepared(request)) return;
     CompletionScope batch(*this);
@@ -453,6 +303,8 @@ void EngineCore<Instance>::complete_success(const std::shared_ptr<Request>& requ
         request->queue_wait_recorded       = true;
     }
     GenerationResult result;
+    result.replica_id                         = replica_id_;
+    result.stats.replica_id                   = replica_id_;
     result.stats.engine_request_id            = request->id;
     result.stats.admission                    = request->admission;
     result.stats.computed_prefill_tokens      = request->computed_prompt_tokens;
@@ -522,7 +374,7 @@ void EngineCore<Instance>::complete_success(const std::shared_ptr<Request>& requ
 }
 
 template <class Instance>
-void EngineCore<Instance>::complete_cancelled(const std::shared_ptr<Request>& request) {
+void ReplicaEngine<Instance>::complete_cancelled(const std::shared_ptr<Request>& request) {
     if (completion_prepared(request)) return;
     CompletionScope batch(*this);
     (void)retain_completion(request);
@@ -540,7 +392,7 @@ void EngineCore<Instance>::complete_cancelled(const std::shared_ptr<Request>& re
 
 template <class Instance>
 [[nodiscard]] std::span<const std::uint64_t>
-EngineCore<Instance>::snapshot_cancellations() noexcept {
+ReplicaEngine<Instance>::snapshot_cancellations() noexcept {
     for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
         const auto& request = slots_[lane];
         cancellation_snapshot_[lane] =
@@ -550,7 +402,7 @@ EngineCore<Instance>::snapshot_cancellations() noexcept {
 }
 
 template <class Instance>
-bool EngineCore<Instance>::settle_terminal_requests(HostPhaseMeasurement& boundary) {
+bool ReplicaEngine<Instance>::settle_terminal_requests(HostPhaseMeasurement& boundary) {
     if (instance_.session->has_context_operation()) { return false; }
 
     std::vector<std::uint32_t> terminal;
@@ -618,7 +470,7 @@ bool EngineCore<Instance>::settle_terminal_requests(HostPhaseMeasurement& bounda
 }
 
 template <class Instance>
-void EngineCore<Instance>::cancel_active_requests(
+void ReplicaEngine<Instance>::cancel_active_requests(
     std::span<const std::uint64_t> cancelled_at_boundary, HostPhaseMeasurement& boundary) {
     if (instance_.session->has_context_operation()) { return; }
     for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
@@ -645,7 +497,7 @@ void EngineCore<Instance>::cancel_active_requests(
 }
 
 template <class Instance>
-[[nodiscard]] bool EngineCore<Instance>::expire_pending_requests() {
+[[nodiscard]] bool ReplicaEngine<Instance>::expire_pending_requests() {
     std::vector<std::shared_ptr<Request>> cancelled;
     std::vector<std::shared_ptr<Request>> expired;
     bool have_pending = false;

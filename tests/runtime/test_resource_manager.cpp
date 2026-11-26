@@ -1,5 +1,6 @@
 #include "runtime/engine/context_cache/resource_manager.h"
 #include "models/common/context/recovery.h"
+#include "models/common/context/checkpoint_store.h"
 #include "models/common/context/prefix.h"
 #include "models/common/context/release_inventory.h"
 
@@ -3524,8 +3525,93 @@ void test_host_chain_uses_lazy_bounded_source_search() {
     }
 }
 
+void test_prefix_index_observer_and_checkpoint_cap() {
+    Program program{.host_capacity = 4096};
+    program.device_capacity = 65536;
+    using Manager           = ninfer::runtime::ResourceManager<Model>;
+    using Delta             = ninfer::runtime::PrefixIndexDelta<Key>;
+    Manager manager(true, {.prefill = {.token_ns_q32 = ninfer::runtime::kContextCostQ32One}}, 2);
+
+    std::vector<Delta> deltas;
+    manager.set_prefix_observer([&](const Delta& d) { deltas.push_back(d); });
+
+    const auto make_shared = [&](Key tokens, bool leased = false) {
+        const Handle h{static_cast<std::uint32_t>(program.contents.size())};
+        program.contents.push_back(
+            {.tokens = std::move(tokens), .leased = leased, .role = Role::SharedPrefix});
+        ++program.checkpoint_revision;
+        return h;
+    };
+
+    const Base b1{.tokens = {1, 2, 3, 4}};
+    const auto o1 = manager.adopt(program, {}, b1, 1, false);
+    const auto h0 = make_shared({1, 2});
+    const auto h1 = make_shared({1, 2, 3}, /*leased=*/true);
+    const auto h2 = make_shared({1, 2, 3, 4});
+
+    manager.publish(program, o1, h0);
+    manager.publish(program, o1, h1);
+    require(manager.cached_checkpoint_count() == 2, "expected 2 cached checkpoints");
+    require(deltas.size() == 2 && deltas[0].kind == Delta::Kind::Insert &&
+                deltas[1].kind == Delta::Kind::Insert,
+            "expected two Insert deltas");
+
+    // Publishing h2 exceeds cap=2; h0 is oldest unleased so h0 is evicted while leased h1 stays.
+    manager.publish(program, o1, h2);
+    require(manager.cached_checkpoint_count() == 2, "checkpoint cap must evict down to 2");
+    require(!program.contents[h0.index].alive && program.contents[h1.index].alive &&
+                program.contents[h2.index].alive,
+            "unleased oldest checkpoint h0 should be evicted, leased h1 preserved");
+    require(deltas.size() == 4 && deltas[2].kind == Delta::Kind::Insert &&
+                deltas[3].kind == Delta::Kind::Erase && deltas[3].frontier == 2,
+            "expected Insert(h2) followed by Erase(h0) even after Native released h0");
+
+    // If all 2 surviving checkpoints become leased and a 3rd leased checkpoint arrives, eviction
+    // defers until a lease ends and prune() revisits.
+    program.contents[h2.index].leased = true;
+    const auto h3                     = make_shared({5, 6}, /*leased=*/true);
+    manager.publish(program, o1, h3);
+    require(manager.cached_checkpoint_count() == 3, "leased checkpoints must not be evicted");
+
+    manager.refresh(program);
+    program.contents[h1.index].leased = false;
+    manager.refresh(program);
+    require(manager.cached_checkpoint_count() == 2 && !program.contents[h1.index].alive,
+            "ending lease must revisit cap and evict newly unleased checkpoint");
+
+    manager.release_all(program);
+    require(!deltas.empty() && deltas.back().kind == Delta::Kind::Clear,
+            "release_all must emit Clear delta");
+}
+
+void test_native_revisions_on_final_unpin() {
+    namespace ctx = ninfer::models::context;
+    ctx::MetadataBudget budget{1 << 20};
+    ctx::CheckpointStore<int> store(2, budget);
+    auto reservation = store.reserve_owned();
+    require(reservation.valid(), "could not reserve test checkpoint");
+    const auto checkpoint       = reservation.publish(1);
+    const auto catalog_revision = store.revision();
+    const auto lease_revision   = store.lease_revision();
+    auto first                  = store.lease(checkpoint);
+    auto last                   = store.lease(checkpoint);
+    require(store.revision() == catalog_revision && store.lease_revision() == lease_revision,
+            "acquiring a lease changed the checkpoint revisions");
+    first.reset();
+    require(!store.erasable(checkpoint) && store.revision() == catalog_revision &&
+                store.lease_revision() == lease_revision,
+            "intermediate lease release advertised pinned checkpoint as evictable");
+    last.reset();
+    require(store.erasable(checkpoint) && store.revision() == catalog_revision &&
+                store.lease_revision() == lease_revision + 1,
+            "final native unpin must advertise eviction without invalidating the catalog");
+    require(store.erase(checkpoint), "unpinned checkpoint could not be released");
+}
+
 int main() {
     try {
+        test_prefix_index_observer_and_checkpoint_cap();
+        test_native_revisions_on_final_unpin();
         test_replay_preparation_is_priced_only_for_later_targets();
         test_host_chain_uses_lazy_bounded_source_search();
         test_lazy_cursor_survives_external_retirement();

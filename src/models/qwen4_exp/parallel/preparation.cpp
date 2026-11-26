@@ -12,12 +12,15 @@ RankPreparation::RankPreparation(const artifact::Reader& reader, std::span<const
                                  distributed::CommunicationContext& communication,
                                  const StartupObserver& observer)
     : device_(device) {
-    const auto role = std::find_if(topology.roles.begin(), topology.roles.end(),
-                                   [](const auto& r) { return r.role == "tensor"; });
-    if (role == topology.roles.end())
-        throw std::invalid_argument("Qwen4Exp tensor group is absent");
-    const auto& group = topology.group(role->group);
-    binding_          = {&communication.group(group.id), group.index(topology.output_rank)};
+    if (identity.tp.size > 1) {
+        const auto role = std::find_if(topology.roles.begin(), topology.roles.end(),
+                                       [](const auto& r) { return r.role == "tensor"; });
+        if (role == topology.roles.end())
+            throw std::invalid_argument("Qwen4Exp tensor group is absent");
+        const auto& group    = topology.group(role->group);
+        const auto result_id = topology.replica_for_rank(identity.rank).result_owner;
+        binding_             = {&communication.group(group.id), group.index(result_id)};
+    }
     distributed::wire::Decoder in(payload);
     auto request = decode_rank_load(in);
     in.finish();
@@ -28,17 +31,22 @@ RankPreparation::RankPreparation(const artifact::Reader& reader, std::span<const
         throw std::invalid_argument("Qwen4Exp rank plan differs from worker identity");
     if (request.artifact != reader.artifact_id())
         throw artifact::ArtifactError("Qwen4Exp worker artifact differs from coordinator");
+    if (compute_rank_shard_digest(reader.artifact_id(), models::load_options(request.options),
+                                  request.rank) != identity.shard_digest)
+        throw std::invalid_argument("Qwen4Exp rank shard digest differs from topology plan");
     batches_ = std::make_shared<const BatchExecutionPlan>(std::move(request.batches));
     options_ = std::move(request.options);
     options_.startup_observer = observer;
-    host_reservation_bytes_   = request.host_reservation_bytes;
     control_owner_            = request.control_owner;
     auto definition           = read_definition(reader, models::load_options(options_));
     load_.emplace(resolve_rank_load(reader, std::move(definition), std::move(request.rank),
                                     device_.device()));
+    if (load_->rank_plan().ple_placement == ple::Placement::Disk)
+        ple_geometry_ = load_->ple_table().geometry();
     profile_       = execution::describe_model(load_->definition(), load_->weight_data(),
                                                load_->expert_data(), load_->rank_plan());
-    capacity_plan_ = describe_execution_capacity(profile_, options_, batches_, device_);
+    capacity_plan_ =
+        describe_execution_capacity(profile_, options_, batches_, device_, ple_geometry_);
     const WorkContract contract{describe_execution_shape(*profile_, options_),
                                 profile_->config.text.vocabulary,
                                 profile_->public_tokens,
@@ -46,9 +54,9 @@ RankPreparation::RankPreparation(const artifact::Reader& reader, std::span<const
                                 bool(profile_->vision),
                                 profile_->control_token_limit,
                                 batches_};
-    host_reservation_bytes_ +=
-        runtime::protocol::work_payload_memory(contract.payload_capacity(topology.ranks.size()),
-                                               {1, 1}, topology.ranks.size(), control_owner_);
+    host_reservation_bytes_ =
+        runtime::protocol::work_payload_memory(contract.payload_capacity(identity.tp.size),
+                                               RankProgram::capacity(), identity.tp.size, false);
 }
 
 runtime::PreparationMemory RankPreparation::memory() const {
@@ -64,9 +72,10 @@ void RankPreparation::materialize() {
 }
 
 std::vector<distributed::GroupRequirements> RankPreparation::communication_requirements() const {
+    if (!binding_.group) return {};
     using distributed::Collective;
     using distributed::Reduction;
-    const auto plan   = plan_graph_probe(profile_, {}, options_, batches_, device_, {});
+    const auto plan   = plan_graph_probe(profile_, ple_geometry_, options_, batches_, device_, {});
     const auto& shape = plan.shape;
     const auto hidden = std::size_t(profile_->config.text.hidden);
     const auto batch  = std::size_t(shape.max_concurrency);
@@ -142,7 +151,7 @@ void RankPreparation::prepare_rebuild_probe() {
 }
 
 void RankPreparation::create_probe(GraphProbeBacking backing) {
-    auto plan = plan_graph_probe(profile_, {}, options_, batches_, device_, {}, backing);
+    auto plan = plan_graph_probe(profile_, ple_geometry_, options_, batches_, device_, {}, backing);
     probe_    = std::make_unique<RankProgram>(instance_->parameters, std::move(plan), device_,
                                               options_.startup_observer, binding_);
 }
@@ -176,13 +185,13 @@ void RankPreparation::prepare(runtime::ContextCapacity capacity, std::size_t ava
     auto options             = options_;
     options.context_capacity = ContextCapacityPolicy::explicit_capacity(capacity.device_bytes);
     const auto reserve       = graph_memory_.rebuild_estimate_bytes;
-    auto plan                = plan_execution(profile_, {}, options, batches_, device_,
+    auto plan                = plan_execution(profile_, ple_geometry_, options, batches_, device_,
                                available > reserve ? available - reserve : 0, {}, control_owner_,
                                               available_host_bytes);
     if (!plan) {
-        const auto control   = control_owner_ && NINFER_SHARED_PHYSICAL_MEMORY
-                                   ? capacity_plan_.control_bytes(capacity)
-                                   : 0;
+        const bool shared_memory = device_memory_snapshot(device_.device()).shared_physical_memory;
+        const auto control =
+            control_owner_ && shared_memory ? capacity_plan_.control_bytes(capacity) : 0;
         const auto required  = capacity_plan_.reservation_bytes(capacity) + control;
         const auto remaining = available > reserve ? available - reserve : 0;
         throw std::runtime_error("Qwen4Exp rank allocation budget exceeded: required " +
@@ -195,12 +204,14 @@ void RankPreparation::prepare(runtime::ContextCapacity capacity, std::size_t ava
 }
 
 void RankPreparation::release_resources() {
-    if (instance_->program)
+    const bool active = probe_ || (instance_ && instance_->program);
+    probe_.reset();
+    if (instance_ && instance_->program)
         if (const auto graph = instance_->program->graph_memory_observation())
             graph_memory_.rebuild_estimate_bytes =
                 std::max(graph_memory_.rebuild_estimate_bytes, graph->preparation_peak_bytes);
-    instance_->program.reset();
-    device_.synchronize();
+    if (instance_) instance_->program.reset();
+    if (active) device_.synchronize();
 }
 
 RankExecutionDescription RankPreparation::describe() const {

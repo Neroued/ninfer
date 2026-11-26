@@ -50,9 +50,6 @@ struct PackedPrefill {
     std::int32_t sampled_count = 0;
 };
 
-void validate_prefill_work(const ForwardWork&, std::uint32_t prefill_chunk);
-void validate_prefill_commit(const ForwardWork&, std::span<const CommitRow>);
-
 struct ComputeOperation {
     runtime::ExecutionRequest<ExecutionTypes> request;
     runtime::CommandSequence last_command;
@@ -131,6 +128,7 @@ public:
     void supply(runtime::ExecutionTicket, runtime::CommandSequence, runtime::DecisionInput&&);
     void commit(runtime::ExecutionTicket, runtime::CommandSequence, Commit&&);
     void discard(runtime::ExecutionTicket, runtime::CommandSequence);
+    [[nodiscard]] bool can_discard(runtime::ExecutionTicket) const noexcept;
     [[nodiscard]] std::optional<runtime::ExecutionEvent<ExecutionTypes>> poll();
     void drain();
     [[nodiscard]] RankMemoryUsage observe_resources() const;

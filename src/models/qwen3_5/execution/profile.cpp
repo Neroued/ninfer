@@ -16,7 +16,8 @@ std::int32_t dimension(std::uint64_t n) {
 
 class Describe {
 public:
-    explicit Describe(const ModelDefinition& plan) : plan_(plan) {}
+    Describe(const ModelDefinition& plan, std::span<const moe::ExpertDescription> experts)
+        : plan_(plan), experts_(experts) {}
 
     template <class Id>
     ops::LinearProfile linear(Id id) const {
@@ -40,13 +41,15 @@ public:
             dn.include(plan_.input(e.down));
         }
         const auto shared = dense(moe.shared);
-        return MoeLayerProfile{
-            {ops::routed_swiglu_profile(
-                 bank.gate_up.layout, bank.down.layout,
-                 dimension(std::get<MoeConfig>(plan_.config().text.ffn).num_experts_per_tok),
-                 gu.policy(), dn.policy()),
-             ops::swiglu_profile(shared.gate_up, shared.down)},
-            moe.bank};
+        const auto top_k =
+            dimension(std::get<MoeConfig>(plan_.config().text.ffn).num_experts_per_tok);
+        const auto routed = experts_.empty()
+                                ? ops::routed_swiglu_profile(bank.gate_up.layout, bank.down.layout,
+                                                             top_k, gu.policy(), dn.policy())
+                                : models::moe::describe_experts(experts_[moe.bank.index], top_k,
+                                                                gu.policy(), dn.policy());
+        return MoeLayerProfile{{routed, ops::swiglu_profile(shared.gate_up, shared.down)},
+                               moe.bank};
     }
 
     BlockProfile block(const BlockWeights& w) const {
@@ -123,15 +126,17 @@ public:
 
 private:
     const ModelDefinition& plan_;
+    std::span<const moe::ExpertDescription> experts_;
 };
 
-std::shared_ptr<const ModelProfile> describe_model_impl(const ModelDefinition& plan) {
+std::shared_ptr<const ModelProfile>
+describe_model_impl(const ModelDefinition& plan, std::span<const moe::ExpertDescription> experts) {
     auto out                 = std::make_shared<ModelProfile>();
     out->config              = plan.config();
     out->options             = plan.options();
     out->public_tokens       = plan.resources().text.public_token_count;
     out->control_token_limit = plan.resources().text.control_tokens->size();
-    const Describe describe(plan);
+    const Describe describe(plan, experts);
     const auto& w         = plan.weights();
     out->text.output_head = describe.linear(w.text.output_head_use);
     for (const auto& layer : w.text.layers) out->text.layers.push_back(describe.block(layer));
@@ -145,8 +150,11 @@ std::shared_ptr<const ModelProfile> describe_model_impl(const ModelDefinition& p
 
 } // namespace
 
-std::shared_ptr<const ModelProfile> describe_model(const ModelDefinition& source) {
-    return describe_model_impl(source);
+std::shared_ptr<const ModelProfile>
+describe_model(const ModelDefinition& source, std::span<const moe::ExpertDescription> experts) {
+    if (!experts.empty() && experts.size() != source.expert_banks().size())
+        throw std::invalid_argument("Qwen3.5 local expert descriptions are incomplete");
+    return describe_model_impl(source, experts);
 }
 
 

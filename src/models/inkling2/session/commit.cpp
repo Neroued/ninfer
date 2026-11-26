@@ -43,7 +43,9 @@ void SessionImpl::finish_result(ComputeResult result) {
                 .capture_ready           = s.capture && s.captures[s.next_capture].frontier == end,
             });
         }
-        if (row.processed != tx.rows[b].ids.size())
+        const auto expected =
+            tx.kind == Kind::Speculative ? tx.round->verify_drafts()[b] + 1 : tx.rows[b].ids.size();
+        if (row.processed != expected)
             throw std::logic_error("Inkling2 result changed its input extent");
     }
     if (generated) {
@@ -159,6 +161,10 @@ void SessionImpl::retire_compute(const runtime::DeviceRetired& event) {
         events.push_back({tx.ticket, tx.members,
                           runtime::ExecutionComplete{event.execution, tx.members.size()}});
     }
+    if (tx.cost_query && tx.record_online_cost && !tx.discarded &&
+        std::ranges::none_of(tx.decisions, [](const auto& d) { return d.cancelled || d.failed; }))
+        cost_model.observe_retired_step(*tx.cost_query,
+                                        double(event.execution.latency.total_ns) * 1.0e-6);
     for (std::size_t b = 0; b < tx.members.size(); ++b) {
         if (!tx.discarded &&
             (tx.decisions.empty() || (!tx.decisions[b].cancelled && !tx.decisions[b].failed)))
@@ -214,6 +220,10 @@ CommitResult Session::commit(PendingBatch&& batch,
         for (std::size_t b = 0; b < decisions.size(); ++b) {
             auto& s              = p.sequence(tx.members[b]);
             const auto& decision = decisions[b];
+            result.rows[b].speculative.attempted_per_position.reserve(
+                s.speculative.attempted_per_position.size());
+            result.rows[b].speculative.accepted_per_position.reserve(
+                s.speculative.accepted_per_position.size());
             const auto physical_count = batch.row_sampled(b) || decision.cancelled
                                             ? decision.accepted_tokens
                                             : static_cast<std::uint32_t>(tx.rows[b].ids.size());
@@ -221,8 +231,10 @@ CommitResult Session::commit(PendingBatch&& batch,
                                      decision.terminal, decision.cancelled, decision.failed});
             if (decision.cancelled || decision.failed) continue;
             s.ledger.prepare_append(decision.accepted_tokens);
-            completed[b] =
-                p.prepare_commit(s, tx.rows[b], tx.rows[b].ids.size(), false, *tx.completion);
+            const auto inputs = tx.kind == detail::ComputeTransaction::Kind::Speculative
+                                    ? decision.accepted_tokens
+                                    : tx.rows[b].ids.size();
+            completed[b]      = p.prepare_commit(s, tx.rows[b], inputs, false, *tx.completion);
         }
         for (std::size_t b = 0; b < decisions.size(); ++b) {
             if (decisions[b].cancelled || decisions[b].failed) continue;
@@ -246,7 +258,17 @@ CommitResult Session::commit(PendingBatch&& batch,
         auto& s              = p.sequence(tx.members[b]);
         const auto& decision = decisions[b];
         auto& row            = result.rows[b];
-        row.speculative      = s.speculative;
+        if (batch.decode_ && p.shape.draft_tokens) {
+            const auto& output = tx.result->rows[b];
+            auto* feedback     = p.shape.length_policy == SpeculativeLengthPolicy::Adaptive
+                                     ? &s.speculative_state
+                                     : nullptr;
+            speculative::record_speculative_commit(
+                s.speculative, feedback, decision, tx.could_speculate[b], output.drafts,
+                output.drafts, output.accepted_drafts, output.draft_confidences,
+                output.target_top1_probability);
+        }
+        row.speculative = s.speculative;
         if (decision.cancelled || decision.failed) {
             row.disposition = decision.cancelled ? runtime::CommitDisposition::CancelledReleased
                                                  : runtime::CommitDisposition::FailedReleased;

@@ -30,7 +30,8 @@ Tensor RankProgramImpl::target_hidden(const execution::BatchView& main) {
 
 void RankProgramImpl::target_forward(const execution::BatchView& main, Tensor hidden,
                                      const execution::FullAttentionSubmit& submit) {
-    main_forward(main, execution::StepUpdate{}, hidden, submit);
+    main_forward(main, target_update(main), hidden, submit);
+    if (main.tokens > 1) return;
     ops::scatter(hidden.view({hidden.ne[0], main.rows}),
                  resources.states.hidden(main.destination_offsets), main.live_rows, cuda);
 }
@@ -38,6 +39,10 @@ void RankProgramImpl::target_forward(const execution::BatchView& main, Tensor hi
 void RankProgramImpl::forward() {
     auto& f             = *compute;
     const auto& work    = f.request.work;
+    if (const auto* spec = std::get_if<SpeculativeWork>(&work.operation)) {
+        prepare_speculative(*spec);
+        return;
+    }
     auto rows           = work_rows(work);
     const auto* forward = std::get_if<ForwardWork>(&work.operation);
     if (forward && forward->kind == ForwardKind::Prefill && !forward->visual) {
@@ -154,15 +159,31 @@ void RankProgramImpl::forward_packed_prefill(const ForwardWork& work) {
 execution::TextRun RankProgramImpl::text_run(const execution::BatchView& call,
                                              execution::StateUpdate update) {
     return execution::TextRun(parameters, {resources.workspace, {resources.states, resources.main}},
-                              call, update, cuda);
+                              call, std::move(update), cuda);
 }
 
 void RankProgramImpl::main_forward(const execution::BatchView& call, execution::StateUpdate update,
                                    Tensor hidden, const execution::FullAttentionSubmit& submit,
                                    std::optional<models::vision::EmbeddingView> visual) {
-    auto run = text_run(call, update);
-    run.stem(std::move(visual));
-    run.forward(hidden, submit);
+    const auto* packed = std::get_if<execution::PackedPrefillUpdate>(&update);
+    const auto ragged  = packed ? std::optional(packed->ragged) : std::nullopt;
+    const auto aux     = target_aux(call, ragged.has_value());
+    {
+        auto run = text_run(call, std::move(update));
+        run.stem(std::move(visual));
+        run.forward(hidden, submit, aux);
+    }
+    if (ragged && parameters.dspark) {
+        const auto meta = prepare_dspark_ragged(*ragged);
+        execution::dspark_append_context(parameters, dspark_execution(), call, aux, meta, cuda);
+    } else if (parameters.dspark && call.tokens == 1) {
+        const auto e = dspark_execution();
+        execution::dspark_append_context(parameters, e, call, aux, call.valid_columns, cuda);
+        auto scope = e.arena.scope();
+        auto frnn  = e.arena.alloc(DType::BF16, {aux.ne[0], call.rows});
+        execution::dspark_mix_frnn(parameters, aux, frnn, cuda);
+        ops::scatter(frnn, e.states.dspark_f_rnn(call.destination_offsets), call.live_rows, cuda);
+    }
 }
 
 void RankProgramImpl::project_head(Tensor hidden) {
@@ -216,11 +237,16 @@ void RankProgramImpl::finish_forward() {
 
 void RankProgramImpl::decide() {
     auto& f = *compute;
+    const auto* spec = std::get_if<SpeculativeWork>(&f.request.work.operation);
+    if (spec && !f.decision) request_decision();
     if (!f.decision) return;
     upload_sampling();
     const int b = f.packed ? extent(f.sampling_members().size()) : f.batch.rows;
     if (f.graph_route) {
         graphs->decide(*f.graph_route);
+    } else if (spec) {
+        accept_dspark(b, f.batch.tokens, dimension(spec->speculative->head_columns));
+        copy_result(b, f.batch.tokens);
     } else {
         if (!f.head_ready) {
             const auto hidden = f.packed     ? f.sampled_hidden
@@ -230,7 +256,7 @@ void RankProgramImpl::decide() {
         }
         const auto kind = std::get<ForwardWork>(f.request.work.operation).sample;
         sample(b, kind);
-        copy_result(b);
+        copy_result(b, 1, kind);
     }
     timer.record_result();
     compute_done.record(cuda.stream());
@@ -249,13 +275,38 @@ void RankProgramImpl::result() {
         const auto* ids    = static_cast<const TokenId*>(resources.egress().data);
         const auto members = f.sampling_members();
         for (std::size_t b = 0; b < members.size(); ++b) {
-            f.result.rows[members[b]].tokens = {ids[b]};
+            auto& row  = f.result.rows[members[b]];
+            row.tokens = {ids[b]};
+            if (parameters.dspark && forward->sample == SampleKind::NextToken)
+                row.target_top1_probability =
+                    static_cast<const float*>(host_output(frame.top1_probabilities).data)[b];
+        }
+    }
+    const auto* spec = std::get_if<SpeculativeWork>(&f.request.work.operation);
+    if (spec) {
+        const auto* ids    = static_cast<const TokenId*>(host_output(*frame.sampled_ids).data);
+        const auto* counts = static_cast<const int*>(host_output(*frame.output_counts).data);
+        const auto* probabilities =
+            static_cast<const float*>(host_output(frame.dspark->draft_probabilities).data);
+        for (std::size_t b = 0; b < f.physical.members.size(); ++b) {
+            const auto logical = f.physical.members[b];
+            auto& r            = f.result.rows[logical];
+            r.drafts           = spec->draft_extents[logical];
+            if (counts[b] < 1 || std::uint32_t(counts[b]) > r.drafts + 1)
+                throw std::logic_error("Inkling2 DSpark acceptance returned an invalid prefix");
+            r.processed       = r.drafts + 1;
+            r.accepted_drafts = counts[b] - 1;
+            for (std::uint32_t step = 0; step < r.drafts; ++step)
+                r.draft_confidences.push_back(
+                    probabilities[step * draft_batch_stride(f.batch.rows) + b]);
+            const auto* begin = ids + b * f.batch.tokens;
+            r.tokens.assign(begin, begin + counts[b]);
         }
     }
     collect_vision_timing();
     timer.observe_result(f.gpu);
     if (ExecutionTypes::describe_work(f.request.work).kind == ExecutionKind::Decode)
-        timer.observe_decode(f.gpu, false);
+        timer.observe_decode(f.gpu, spec != nullptr);
     if (resources.compute_actions->occupied()) resources.compute_actions->finish();
     events.emplace_back(runtime::ResultReady<ExecutionTypes>{f.request.ticket, Result(f.result)});
     f.phase = ComputePhase::PendingCommit;

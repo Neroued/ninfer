@@ -165,10 +165,46 @@ void WorkContract::validate(const Work& work, runtime::FrameKind kind) const {
     require(work_batch(work) == plan_batch(rows, *batches, decode),
             "physical row plan differs from membership");
     const auto* verification = std::get_if<SpeculativeWork>(&work.operation);
-    require(!verification, "Inkling2 DSpark speculative execution not yet enabled");
+    const auto geometry =
+        verification ? verification->speculative : (forward ? forward->speculative : nullptr);
+    require(bool(geometry) == (decode && shape.draft_tokens),
+            "missing or unexpected decode geometry");
+    if (geometry) {
+        const auto& g     = *geometry;
+        const auto& batch = work_batch(work);
+        const speculative::RoundRoute route{batch.shape, g.verify_width, g.mtp_steps,
+                                            g.head_columns, g.graph_entry};
+        route.validate(shape.speculative, shape.draft_tokens);
+        require(!verification || verification->draft_extents.size() == rows.size(),
+                "draft extents");
+        std::vector<std::uint64_t> counts(ranks);
+        std::uint64_t total = 0;
+        std::uint32_t depth = 0;
+        for (std::size_t i = 0; i < rows.size(); ++i) {
+            const auto v = verification ? verification->draft_extents[i] : 0U;
+            counts[rows[i].attention_rank] += 1ULL + v;
+            total += 1ULL + v;
+            depth = std::max(v, depth);
+        }
+        require(route.covers(shape.speculative, depth) && bool(verification) == bool(depth) &&
+                    g.physical_rows == batch.shape.rows &&
+                    g.owner_rows == batch.shape.attention_rows && g.valid_target_tokens == total &&
+                    g.owner_target_tokens == counts,
+                "decode route differs from its members");
+        const bool graph = !batches->graph_rows().empty();
+        require(graph == g.graph_entry.has_value() &&
+                    g.path == (graph ? ExecutionPath::Graph : ExecutionPath::Eager),
+                "decode route differs from execution mode");
+        if (graph) {
+            require(bool(decode_routes), "decode graph catalog missing");
+            const auto ready = decode_routes->at(batch.shape);
+            require(std::ranges::find(ready, route) != ready.end(),
+                    "decode graph route unavailable");
+        }
+    }
 
     std::set<std::pair<std::uint64_t, std::uint64_t>> sequences;
-    std::unordered_set<std::uint32_t> lanes, main_tables;
+    std::unordered_set<std::uint32_t> lanes, main_tables, dspark_tables;
     std::vector<std::unordered_set<std::int64_t>> state_reads(ranks), state_writes(ranks);
     for (std::size_t i = 0; i < rows.size(); ++i) {
         const auto& r = rows[i];
@@ -176,6 +212,11 @@ void WorkContract::validate(const Work& work, runtime::FrameKind kind) const {
         validate_member(r.member, shape.max_concurrency);
         require(r.states.size() == ranks && r.main_table.valid() && r.main_table.pool_id == 0,
                 "incomplete context binding");
+        require(shape.speculative == SpeculativeBackend::DSpark
+                    ? (r.dspark_table.valid() && r.dspark_table.pool_id == 1 &&
+                       r.dspark_frontier == r.main_frontier)
+                    : !r.dspark_table.valid() && !r.dspark_frontier,
+                "DSpark history binding");
         for (std::uint32_t rank = 0; rank < ranks; ++rank) {
             const auto found = r.states.find(rank);
             require(found != r.states.end() && found->second.source >= 0 &&
@@ -191,7 +232,8 @@ void WorkContract::validate(const Work& work, runtime::FrameKind kind) const {
         if (r.control_last_token) validate_tokens({&*r.control_last_token, 1}, public_tokens);
         require(sequences.emplace(r.member.sequence.value, r.member.sequence.generation).second &&
                     lanes.insert(r.member.residency.lane.value).second &&
-                    main_tables.insert(r.main_table.index).second,
+                    main_tables.insert(r.main_table.index).second &&
+                    (!r.dspark_frontier || dspark_tables.insert(r.dspark_table.index).second),
                 "overlapping batch owners");
         for (const auto& [rank, offsets] : r.states) {
             auto& reads        = state_reads[rank];
@@ -253,6 +295,22 @@ void WorkContract::validate(const Work& work, runtime::FrameKind kind) const {
         default:
             require(false, "unknown forward kind");
         }
+    } else if (const auto* m = std::get_if<SpeculativeWork>(&work.operation)) {
+        require(shape.purpose == EnginePurpose::Generation && shape.draft_tokens &&
+                    m->draft_extents.size() == rows.size(),
+                "speculative extent");
+        const auto& g = *geometry;
+        bool live = false;
+        for (std::size_t b = 0; b < rows.size(); ++b) {
+            const auto k = m->draft_extents[b];
+            const auto context_remaining = shape.max_context - rows[b].main_frontier;
+            require(rows[b].ids.size() == 1 && k <= shape.draft_tokens &&
+                        (!k || g.path == ExecutionPath::Eager || g.head_columns < context_remaining) &&
+                        k < context_remaining,
+                    "speculative verify window");
+            live |= k != 0;
+        }
+        require(live, "speculative round has no proposals");
     } else {
         const auto& s = std::get<ScoreWork>(work.operation);
         require(shape.purpose == EnginePurpose::CausalScoring && !s.row.constrained &&
@@ -277,14 +335,23 @@ void WorkContract::validate(const Work& work, const runtime::DecisionRequest& re
     std::vector<std::uint8_t> requested(rows.size()), seen(rows.size());
     for (const auto& r : request.rows) {
         require(r.member < rows.size() && needs_mask(r.member) && !requested[r.member] &&
-                    r.drafts.empty(),
+                    r.drafts.size() ==
+                        (std::holds_alternative<SpeculativeWork>(work.operation)
+                             ? std::get<SpeculativeWork>(work.operation).draft_extents.at(r.member)
+                             : 0),
                 "decision member");
+        validate_tokens(r.drafts, public_tokens);
         requested[r.member] = true;
     }
     for (const auto& r : input.rows) {
+        const auto positions =
+            std::holds_alternative<SpeculativeWork>(work.operation) && r.member < rows.size()
+                ? std::get<SpeculativeWork>(work.operation).draft_extents[r.member] + 1
+                : 1;
         require(r.member < rows.size() && requested[r.member] && !seen[r.member] &&
-                    r.positions == 1 && r.words.size() == ((std::size_t(public_tokens) + 31) / 32) &&
-                    (std::uint64_t(r.dead_positions) >> 1) == 0,
+                    r.positions == positions &&
+                    r.words.size() == positions * ((std::size_t(public_tokens) + 31) / 32) &&
+                    (std::uint64_t(r.dead_positions) >> positions) == 0,
                 "decision mask extent");
         seen[r.member] = true;
     }
@@ -307,19 +374,33 @@ void WorkContract::validate_commit(const Work& work, std::span<const RowResult> 
                                    const Commit& commit) const {
     const auto rows    = work_rows(work);
     const auto* f      = std::get_if<ForwardWork>(&work.operation);
+    const auto* m      = std::get_if<SpeculativeWork>(&work.operation);
     const bool prefill = f && f->kind == ForwardKind::Prefill;
     require(commit.rows.size() == rows.size() &&
                 (std::holds_alternative<ScoreWork>(work.operation) || result.size() == rows.size()),
             "commit membership");
     for (std::size_t i = 0; i < rows.size(); ++i) {
         const auto& c      = commit.rows[i];
-        const bool sampled = prefill ? rows[i].sample : (f && f->sample != SampleKind::None);
+        const bool sampled = prefill ? rows[i].sample : m || (f && f->sample != SampleKind::None);
         require(same_member(c.member, rows[i].member) && c.states.size() == rows[i].states.size(),
                 "commit identity");
         for (const auto& [rank, s] : c.states) {
             const auto before = rows[i].states.at(rank);
             require(s.source == before.source && s.destination == before.destination,
                     "commit changes State binding");
+        }
+        if (!std::holds_alternative<ScoreWork>(work.operation)) {
+            const auto& output = result[i];
+            const auto drafts  = m ? m->draft_extents[i] : 0U;
+            const bool top1    = f && f->sample == SampleKind::NextToken && shape.draft_tokens;
+            const auto valid   = [](float p) { return p >= 0.0f && p <= 1.0f; };
+            require(output.drafts == drafts && output.accepted_drafts <= drafts &&
+                        (!m || output.tokens.size() == std::size_t(output.accepted_drafts) + 1) &&
+                        output.draft_confidences.size() == drafts &&
+                        std::ranges::all_of(output.draft_confidences, valid) &&
+                        output.target_top1_probability.has_value() == top1 &&
+                        (!top1 || valid(*output.target_top1_probability)),
+                    "result probabilities differ from work");
         }
         require(!(c.cancelled && c.failed), "conflicting terminal disposition");
         if (prefill && !sampled)
@@ -331,15 +412,13 @@ void WorkContract::validate_commit(const Work& work, std::span<const RowResult> 
         } else if (sampled) {
             const auto produced = result[i].tokens.size();
             const auto reached  = produced >= 32 ? UINT32_MAX : (std::uint32_t{1} << produced) - 1;
-            require(produced == 1 && c.accepted && c.accepted <= produced &&
-                        (c.terminal || c.accepted == produced) &&
+            require(produced && produced <= (m ? m->draft_extents[i] + 1 : 1) && c.accepted &&
+                        c.accepted <= produced && (c.terminal || c.accepted == produced) &&
                         !(result[i].dead_positions & reached),
                     "invalid sampled commit");
-        } else {
+        } else
             require(!c.failed && c.accepted == rows[i].ids.size(),
                     "invalid processed-input commit");
-        }
     }
 }
-
 } // namespace ninfer::models::inkling2

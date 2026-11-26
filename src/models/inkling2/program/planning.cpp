@@ -21,9 +21,15 @@ ExecutionShape make_shape(const execution::ModelProfile& p, const EngineOptions&
     if (!o.max_context || o.max_context > p.config.text.max_context || !o.max_concurrency)
         throw std::invalid_argument(
             "Inkling2 execution bounds differ from its model or batch contract");
-    if (o.speculative.backend != SpeculativeBackend::None || o.speculative.draft_tokens != 0)
-        throw std::invalid_argument("Inkling2 DSpark speculative execution is not yet implemented");
-    if (o.purpose == EnginePurpose::CausalScoring && (o.max_concurrency != 1 || p.vision))
+    if (p.dspark && o.max_context > p.config.dspark->max_context)
+        throw std::invalid_argument("Inkling2 execution context exceeds the DSpark position range");
+    if (p.dspark ? (o.speculative.draft_tokens < 1 ||
+                    o.speculative.draft_tokens > p.config.dspark->max_draft_tokens() ||
+                    o.speculative.draft_tokens > 7)
+                 : o.speculative.draft_tokens != 0)
+        throw std::invalid_argument("Inkling2 draft window differs from its selected backend");
+    if (o.purpose == EnginePurpose::CausalScoring &&
+        (o.max_concurrency != 1 || p.vision || p.dspark))
         throw std::invalid_argument(
             "Inkling2 causal scoring requires single-request Text resources");
     if (o.context_cache.host_capacity_bytes.value_or(0))
@@ -32,13 +38,13 @@ ExecutionShape make_shape(const execution::ModelProfile& p, const EngineOptions&
         .max_context     = o.max_context,
         .max_concurrency = o.max_concurrency,
         .prefill_chunk   = std::min(o.prefill_chunk ? o.prefill_chunk : 4096U, o.max_context),
-        .draft_tokens    = 0,
+        .draft_tokens    = o.speculative.draft_tokens,
         .kv_storage      = o.kv_cache,
         .swa_kv_storage  = o.swa_kv_cache,
         .purpose         = o.purpose,
         .context_cache   = o.context_cache.enabled,
         .gpu_timing      = o.observability.gpu_timing,
-        .speculative     = SpeculativeBackend::None,
+        .speculative     = o.speculative.backend,
         .length_policy   = o.speculative.length_policy,
     };
 }
@@ -52,16 +58,20 @@ context::ContextDirectorySpec schema(const ExecutionPlan& p, std::size_t capacit
     spec.state.layouts.push_back(
         {0, {{rank, p.state.image.image_bytes, p.state.image.alignment}}});
 
-    const auto& cache = p.main;
-    context::KVDirectorySpec pool{
-        .pool_id       = 0,
-        .logical_pages = count32(capacity / cache.page.page_bytes + 2ULL * p.shape.max_concurrency),
-        .histories     = count32(std::uint64_t(spec.state.logical_capacity) +
-                                 3ULL * p.shape.max_concurrency + 2ULL),
-        .page_capacity = cache.tables.spec.logical_page_capacity,
-        .table_rows    = static_cast<std::uint32_t>(cache.tables.spec.table_rows)};
-    pool.parts.push_back({rank, {cache.page.page_bytes, cache.page.alignment}});
-    spec.pools.push_back(std::move(pool));
+    const auto add_pool = [&](const CacheLayout& cache, std::uint16_t id) {
+        context::KVDirectorySpec pool{
+            .pool_id = id,
+            .logical_pages =
+                count32(capacity / cache.page.page_bytes + 2ULL * p.shape.max_concurrency),
+            .histories     = count32(std::uint64_t(spec.state.logical_capacity) +
+                                     3ULL * p.shape.max_concurrency + 2ULL),
+            .page_capacity = cache.tables.spec.logical_page_capacity,
+            .table_rows    = static_cast<std::uint32_t>(cache.tables.spec.table_rows)};
+        pool.parts.push_back({rank, {cache.page.page_bytes, cache.page.alignment}});
+        spec.pools.push_back(std::move(pool));
+    };
+    add_pool(p.main, 0);
+    if (p.dspark) add_pool(*p.dspark, 1);
     return spec;
 }
 
@@ -111,12 +121,19 @@ ExecutionPlan plan_execution(std::shared_ptr<const execution::ModelProfile> prof
     LayoutBuilder b;
     out.main = plan_cache(b, c.full_attention, c.full_layers, out.shape.max_context,
                           out.shape.max_concurrency, out.shape.kv_storage);
+    if (out.profile->dspark) {
+        const auto& d = *out.profile->config.dspark;
+        out.dspark    = plan_cache(b, d.attention(), d.full_layers, out.shape.max_context,
+                                   out.shape.max_concurrency, KvCacheStorage::BFloat16);
+    }
     out.frame            = plan_frame(b, *out.profile, out.shape);
     out.fixed_bytes      = b.finish(256);
     out.mapping_elements = out.main.tables.page_offsets.region.bytes / sizeof(std::int64_t);
+    if (out.dspark)
+        out.mapping_elements += out.dspark->tables.page_offsets.region.bytes / sizeof(std::int64_t);
     out.pinned_output_bytes = out.shape.purpose == EnginePurpose::CausalScoring
                                   ? std::min(out.shape.prefill_chunk, 1024U) * sizeof(float)
-                                  : out.frame.egress.bytes;
+                                  : out.frame.egress.bytes + out.frame.draft_egress.bytes;
     return out;
 }
 
@@ -124,30 +141,35 @@ runtime::ContextCapacityPlan describe_execution_capacity(const ExecutionPlan& p)
     runtime::ContextCapacityPlan out;
     out.records.push_back({p.state.image.image_bytes, p.state.image.alignment});
     out.records.push_back({p.main.page.page_bytes, p.main.page.alignment});
+    if (p.dspark) out.records.push_back({p.dspark->page.page_bytes, p.dspark->page.alignment});
     const auto geometry = describe_context_pool(out.records);
-    const auto pages    = [&](std::uint64_t tokens) {
-        const auto span = p.main.page.geometry.page_tokens;
+    const auto pages    = [&](const CacheLayout& cache, std::uint64_t tokens) {
+        const auto span = cache.page.geometry.page_tokens;
         return count32(tokens / span + (tokens % span != 0));
     };
-    const auto working_set = [&](std::string name, std::uint32_t states, std::uint32_t main) {
+    const auto working_set = [&](std::string name, std::uint32_t states, std::uint64_t tokens,
+                                 std::uint32_t rows) {
         runtime::ContextStartupWorkingSet set{std::move(name)};
         set.records.push_back({geometry.spec_classes[0], states});
-        set.records.push_back({geometry.spec_classes[1], main});
+        set.records.push_back(
+            {geometry.spec_classes[1], count32(std::uint64_t(rows) * (pages(p.main, tokens) + 1))});
+        if (p.dspark)
+            set.records.push_back({geometry.spec_classes[2],
+                                   count32(std::uint64_t(rows) * (pages(*p.dspark, tokens) + 1))});
         return set;
     };
 
     constexpr auto state_copies = 2U;
-    auto maximum =
-        working_set("maximum owner context", state_copies, pages(p.shape.max_context) + 1U);
+    auto maximum  = working_set("maximum owner context", state_copies, p.shape.max_context, 1);
     out.reference = {p.shape.max_context, 1, geometry.required_bytes(maximum.records)};
     out.working_sets.push_back(std::move(maximum));
 
     const auto concurrent   = p.shape.max_concurrency;
     const auto short_tokens = std::min<std::uint64_t>(
-        p.shape.max_context, std::uint64_t(p.shape.prefill_chunk) + 1ULL);
-    out.working_sets.push_back(
-        working_set("concurrent owner requests", count32(std::uint64_t(state_copies) * concurrent),
-                    count32(std::uint64_t(concurrent) * (pages(short_tokens) + 1U))));
+        p.shape.max_context, std::uint64_t(p.shape.prefill_chunk) + p.shape.draft_tokens + 1);
+    out.working_sets.push_back(working_set("concurrent owner requests",
+                                           count32(std::uint64_t(state_copies) * concurrent),
+                                           short_tokens, concurrent));
 
     out.fixed_device_bytes =
         p.fixed_device_bytes() + (NINFER_SHARED_PHYSICAL_MEMORY ? p.pinned_bytes() : 0);

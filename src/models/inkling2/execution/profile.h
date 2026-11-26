@@ -69,6 +69,17 @@ struct LocalGeometry {
     IndexRange vocabulary;
 };
 
+struct DSparkLayerProfile {
+    ops::ProjectionProfile kvq, context_kv;
+    ops::LinearProfile output, gate_up, down;
+};
+
+struct DSparkProfile {
+    ops::AttentionHeadGeometry geometry;
+    ops::LinearProfile output_head;
+    std::vector<DSparkLayerProfile> layers;
+};
+
 struct ModelProfile {
     Config config;
     LoadOptions options;
@@ -77,6 +88,7 @@ struct ModelProfile {
     std::uint32_t control_token_limit = 0;
     TextProfile text;
     std::optional<VisionProfile> vision;
+    std::optional<DSparkProfile> dspark;
 };
 
 [[nodiscard]] std::shared_ptr<const ModelProfile>

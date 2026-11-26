@@ -26,8 +26,8 @@ std::int32_t text_columns(const BatchView& batch, const StateUpdate& update) {
 
 TextRun::TextRun(const Parameters& parameters, TextExecution execution, BatchView batch,
                  StateUpdate update, CudaExecutionView cuda)
-    : parameters_(parameters), execution_(execution), batch_(batch), update_(update), cuda_(cuda),
-      columns_(text_columns(batch_, update_)), scope_(execution_.workspace.scope()),
+    : parameters_(parameters), execution_(execution), batch_(batch), update_(std::move(update)),
+      cuda_(cuda), columns_(text_columns(batch_, update_)), scope_(execution_.workspace.scope()),
       roots_(workspace::main_roots(execution_.workspace, *parameters_.profile, columns_)) {}
 
 void TextRun::stem(std::optional<models::vision::EmbeddingView> visual) {
@@ -50,7 +50,8 @@ void TextRun::stem(std::optional<models::vision::EmbeddingView> visual) {
 
 RelativeAttentionRun TextRun::attention_run(const LogicalLayerConfig& logical) const {
     return RelativeAttentionRun(parameters_, logical, batch_, execution_.attention,
-                                roots_.attn_in_bf16, roots_.attn_proj, execution_.workspace, cuda_);
+                                roots_.attn_in_bf16, roots_.attn_proj, execution_.workspace, cuda_,
+                                std::get_if<RecordWindow>(&update_));
 }
 
 std::vector<FullAttentionReadout>
@@ -69,7 +70,7 @@ TextRun::plan_full_readouts(ops::ContextBucketRange buckets) const {
     return readouts;
 }
 
-void TextRun::forward(Tensor& final_hidden, const FullAttentionSubmit& submit) {
+void TextRun::forward(Tensor& final_hidden, const FullAttentionSubmit& submit, Tensor aux) {
     const auto* packed = std::get_if<PackedPrefillUpdate>(&update_);
     const auto* ragged = packed ? &packed->ragged : nullptr;
     const auto& config = parameters_.profile->config.text;
@@ -79,6 +80,9 @@ void TextRun::forward(Tensor& final_hidden, const FullAttentionSubmit& submit) {
         ragged ? ops::MoeTokenValidity{}
                : ops::MoeTokenValidity{batch_.valid_columns, batch_.tokens};
     LoopResidualRun residual(parameters_, roots_, batch_, execution_.attention.states, ragged,
+                             std::get_if<RecordWindow>(&update_), aux,
+                             parameters_.dspark ? parameters_.profile->config.dspark->final_aux_slot
+                                                : std::nullopt,
                              arena, cuda_);
 
     for (std::size_t v = 0; v < config.logical_layers.size(); ++v) {

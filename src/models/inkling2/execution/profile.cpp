@@ -42,6 +42,18 @@ public:
         return ops::describe_projection_weights(inputs);
     }
 
+    DSparkProfile dspark(const DSparkConfig& c, const DSparkWeights& w) const {
+        DSparkProfile out{{dimension(c.head_dim), dimension(c.heads), dimension(c.kv_heads)},
+                          linear(w.output_head),
+                          {}};
+        for (const auto& l : w.layers)
+            out.layers.push_back({projection({{l.key, 0}, {l.value, 0}, {l.query, 0}}),
+                                  projection({{l.context_key, 0}, {l.context_value, 0}}),
+                                  linear(l.output), linear({l.mlp.gate, l.mlp.up}),
+                                  linear(l.mlp.down)});
+        return out;
+    }
+
     PhysicalLayerProfile layer(const PhysicalLayerConfig& cfg,
                                const PhysicalLayerWeights& w) const {
         const auto& c    = definition_.config().text;
@@ -124,11 +136,7 @@ std::shared_ptr<const ModelProfile> describe_model(const ModelDefinition& defini
     out->local               = {rank.rank, rank.size, rank.vocabulary};
     const auto& res          = definition.resources();
     out->public_tokens       = res.text.public_token_count;
-    out->control_token_limit = static_cast<std::uint32_t>(std::max({
-        res.text.control_tokens ? res.text.control_tokens->size() : std::size_t{0},
-        res.control_to_text ? res.control_to_text->size() : std::size_t{0},
-        res.control_to_header ? res.control_to_header->size() : std::size_t{0},
-    }));
+    out->control_token_limit = res.control_token_limit();
 
     const auto& c = out->config.text;
     const auto& w = definition.weights();
@@ -147,6 +155,7 @@ std::shared_ptr<const ModelProfile> describe_model(const ModelDefinition& defini
     for (std::size_t i = 0; i < c.physical_layers.size(); ++i) {
         out->text.layers.push_back(d.layer(c.physical_layers[i], w.text.layers[i]));
     }
+    if (w.dspark) out->dspark = d.dspark(*out->config.dspark, *w.dspark);
     if (w.vision) out->vision = d.vision(*w.vision);
     return out;
 }

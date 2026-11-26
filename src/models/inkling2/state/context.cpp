@@ -29,11 +29,19 @@ StateLayout plan_state(const execution::ModelProfile& profile, KvCacheStorage sw
     out.mlp_sconv =
         b.add(DType::BF16, {dimension(c.hidden), conv_hist}, logical, "MLP ShortConv state");
     out.hidden = b.add(DType::BF16, {dimension(c.hidden)}, 1, "Main final hidden");
+    if (profile.dspark)
+        out.dspark_f_rnn = b.add(DType::BF16, {dimension(c.hidden)}, 1, "DSpark f_rnn");
     if (c.swa_layers) {
         out.swa = plan_cyclic_kv_cache(b, c.swa_layers, c.sliding_window,
                                        dimension(c.swa_attention.kv_heads),
                                        dimension(c.swa_attention.head_dim), swa_storage);
         out.persistent_copy = out.swa->group;
+    }
+    if (profile.dspark) {
+        const auto& d       = *profile.config.dspark;
+        out.dspark_swa      = plan_cyclic_kv_cache(b, d.swa_layers, d.sliding_window,
+                                                   dimension(d.kv_heads), dimension(d.head_dim));
+        out.persistent_copy = b.group(*out.dspark_f_rnn, out.dspark_swa->v);
     }
     out.image = b.finish();
     return out;
@@ -77,6 +85,7 @@ CacheLayout plan_cache(LayoutBuilder& builder, const AttentionGeometry& attn, st
 StateViews::StateViews(MemorySpan backing, const StateLayout& layout)
     : layout_(layout), image_(backing, layout.image) {
     if (layout_.swa) swa_.emplace(image_, *layout_.swa);
+    if (layout_.dspark_swa) dspark_swa_.emplace(image_, *layout_.dspark_swa);
 }
 
 StateFieldView StateViews::k_conv(bool is_swa, std::uint32_t slot, const Tensor& offsets) const {
@@ -107,6 +116,22 @@ Tensor StateViews::hidden(std::int64_t offset) const {
 
 CyclicKVCacheLayerView StateViews::swa_layer(std::uint32_t slot, const Tensor& offsets) const {
     return swa_.value().layer_view(slot, offsets);
+}
+
+StateFieldView StateViews::dspark_f_rnn(const Tensor& offsets) const {
+    return image_.field(layout_.dspark_f_rnn.value(), offsets);
+}
+
+CyclicKVCacheLayerView StateViews::dspark_swa_layer(std::uint32_t slot,
+                                                    const Tensor& offsets) const {
+    return dspark_swa_.value().layer_view(slot, offsets);
+}
+
+StateFieldView StateViews::flatten_short_conv(StateFieldView view) {
+    auto tensor  = view.field.tensor;
+    tensor.shape = {tensor.shape[0] * tensor.shape[1], 1, 1, 1};
+    view.field   = StateFieldLayout(tensor, 1, view.field.layer_stride);
+    return view;
 }
 
 CacheViews::CacheViews(MemorySpan context, MemorySpan fixed, const CacheLayout& layout)

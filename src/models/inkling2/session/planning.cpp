@@ -1,5 +1,6 @@
 #include "models/inkling2/session/internal.h"
 
+#include "models/inkling2/definition.h"
 #include "models/inkling2/frontend/resources.h"
 #include "models/inkling2/parallel/preparation.h"
 
@@ -58,17 +59,17 @@ session_metadata_plan(const context::ContextDirectorySpec& schema,
                 ranks;
         }
     }
-    const auto main =
-        std::find_if(schema.pools.front().parts.begin(), schema.pools.front().parts.end(),
-                     [&](const auto& part) { return part.rank == rank; });
-    if (main != schema.pools.front().parts.end()) {
-        for (std::size_t i = 0; i < geometry.classes.size(); ++i) {
-            if (geometry.classes[i].spec.bytes == main->record.bytes &&
-                geometry.classes[i].spec.alignment == main->record.alignment) {
-                metadata.bytes_per_record.at(i) +=
-                    context::PrefixStore::metadata_bytes(kPagedKVPageSize, 0, prefix_layout) -
-                    context::PrefixStore::metadata_bytes(0, 0, prefix_layout);
-            }
+    if (!schema.pools.empty()) {
+        const auto& pool = schema.pools.front();
+        const auto part  = std::find_if(pool.parts.begin(), pool.parts.end(),
+                                        [&](const auto& p) { return p.rank == rank; });
+        if (part != pool.parts.end()) {
+            const auto token_charge =
+                context::PrefixStore::metadata_bytes(kPagedKVPageSize, 0, prefix_layout) -
+                context::PrefixStore::metadata_bytes(0, 0, prefix_layout);
+            for (std::size_t i = 0; i < geometry.classes.size(); ++i)
+                if (geometry.classes[i].spec == part->record)
+                    metadata.bytes_per_record.at(i) += token_charge;
         }
     }
     if (rank == schema.ranks.front().rank && vision) {
@@ -83,7 +84,12 @@ session_metadata_plan(const context::ContextDirectorySpec& schema,
 PreparedSession prepare_session(std::shared_ptr<const ModelDefinition> definition,
                                 PreparedContext prepared, std::uint32_t interval,
                                 std::uint32_t vision_max_features) {
+    if (!definition) throw std::invalid_argument("invalid Inkling2 session definition");
+    const auto& config    = definition->config();
+    const auto& resources = definition->resources();
     SessionPlan plan;
+    plan.model               = {resources.text.public_token_count, resources.control_token_limit(),
+                                config.text.moe.experts, config.text.moe.top_k, config.vision};
     plan.shape               = prepared.shape;
     plan.batches             = std::move(prepared.batches);
     plan.context             = std::move(prepared.spec);
@@ -92,7 +98,7 @@ PreparedSession prepare_session(std::shared_ptr<const ModelDefinition> definitio
     plan.vision_max_features = vision_max_features;
     for (const auto& geometry : prepared.caches)
         plan.caches.push_back(plan_kv_page_layout(geometry));
-    return prepare_session(std::move(definition), std::move(plan), std::move(prepared.directory));
+    return prepare_session(std::move(plan), std::move(prepared.directory));
 }
 
 } // namespace ninfer::models::inkling2

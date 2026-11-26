@@ -38,7 +38,7 @@ class RelativeAttentionRun {
 public:
     RelativeAttentionRun(const Parameters&, const LogicalLayerConfig&, const BatchView&,
                          AttentionExecution, const Tensor& input, Tensor output, MemoryArena&,
-                         CudaExecutionView);
+                         CudaExecutionView, const RecordWindow* = nullptr);
 
     [[nodiscard]] FullAttentionReadout readout(ops::ContextBucketRange buckets);
     void execute(const FullAttentionSubmit& submit = {});
@@ -65,6 +65,7 @@ private:
     workspace::AttentionBuffers buffers_;
     ops::RelativeAttentionQueryInputs query_;
     Tensor attended_;
+    const RecordWindow* records_;
 };
 
 void relative_attention_ragged(const Parameters&, const LogicalLayerConfig&, const BatchView&,

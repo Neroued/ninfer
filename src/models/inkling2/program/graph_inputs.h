@@ -21,7 +21,7 @@ public:
     GraphInputs& operator=(const GraphInputs&) = delete;
 
     void prepare();
-    void set(std::int32_t rows, std::int32_t width);
+    void set(std::int32_t rows, std::int32_t width, std::int32_t steps);
 
 private:
     RankProgramImpl& owner_;

@@ -44,13 +44,13 @@ RequestBasePlan Session::plan_request(PreparedPrompt&& prompt,
     if (input.media_payloads.size() != input.identity.media.size())
         throw std::invalid_argument("prepared prompt media payload is incomplete");
     if (!input.identity.media.empty()) {
-        if (!p.plan.vision_max_features || !p.definition->config().vision)
+        if (!p.plan.vision_max_features || !p.plan.model.vision)
             throw std::invalid_argument("Inkling2 Vision was not prepared for this instance");
-        plan->vision = vision::prepare_input(input, *p.definition->config().vision,
+        plan->vision = vision::prepare_input(input, *p.plan.model.vision,
                                              p.plan.vision_max_features);
     }
     for (const auto id : input.token_ids)
-        if (id < 0 || std::uint32_t(id) >= p.definition->resources().text.public_token_count)
+        if (id < 0 || std::uint32_t(id) >= p.plan.model.public_tokens)
             throw std::invalid_argument("prompt token is outside the public vocabulary");
     if (const auto& r = input.identity.rewrite_checkpoint;
         r && (!r->recovery_frontier || r->recovery_frontier > r->frontier || r->frontier > count))

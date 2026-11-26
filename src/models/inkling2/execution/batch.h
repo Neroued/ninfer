@@ -2,6 +2,8 @@
 
 #include "core/tensor.h"
 #include "ninfer/ops/ragged.h"
+#include "ninfer/ops/relative_attention.h"
+#include <vector>
 
 #include <cstdint>
 #include <variant>
@@ -18,6 +20,7 @@ struct BatchView {
     Tensor destination_offsets;
     Tensor live_rows;
     Tensor main_tables;
+    Tensor dspark_tables;
     std::uint32_t max_visible_tokens = 0;
 };
 
@@ -32,6 +35,16 @@ struct PackedPrefillUpdate {
 
 struct StepUpdate {};
 
-using StateUpdate = std::variant<SequenceUpdate, StepUpdate, PackedPrefillUpdate>;
+struct VerifyLayerRecords {
+    Tensor k_conv, v_conv, attn_conv, mlp_conv;
+    ops::RelativeAttentionChunkKV swa_chunk;
+};
+
+struct RecordWindow {
+    Tensor base_slots;
+    std::vector<VerifyLayerRecords> layers;
+};
+
+using StateUpdate = std::variant<SequenceUpdate, StepUpdate, PackedPrefillUpdate, RecordWindow>;
 
 } // namespace ninfer::models::inkling2::execution

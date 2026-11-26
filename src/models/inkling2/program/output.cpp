@@ -9,9 +9,19 @@
 
 namespace ninfer::models::inkling2::detail {
 
-void RankProgramImpl::copy_result(std::int32_t rows) {
+MemorySpan RankProgramImpl::host_output(const TensorRegion& r) {
+    const auto& backing = resources.plan.frame;
+    if (r.region.offset >= backing.draft_egress.offset && backing.draft_egress.bytes)
+        return resources.egress().subspan(
+            backing.egress.bytes + r.region.offset - backing.draft_egress.offset, r.region.bytes);
+    return resources.egress().subspan(r.region.offset - frame.egress.offset, r.region.bytes);
+}
+
+void RankProgramImpl::copy_result(std::int32_t rows, int width, SampleKind kind) {
     const auto begin = frame.sampled_ids->region.offset;
-    const auto bytes = std::size_t(rows) * sizeof(TokenId);
+    const auto bytes = width > 1 || (parameters.dspark && kind == SampleKind::NextToken)
+                           ? frame.egress.bytes
+                           : std::size_t(rows) * sizeof(TokenId);
     copy_bytes_async(resources.egress().subspan(0, bytes), resources.fixed().subspan(begin, bytes),
                      cuda);
 }
@@ -27,8 +37,14 @@ void RankProgramImpl::sample(std::int32_t b, SampleKind kind) {
     const int purpose =
         kind == SampleKind::FirstToken ? ops::kSamplePurposePrefill : ops::kSamplePurposeDecode;
     const auto live = row(io.rows.live_rows, b);
-    ops::sample(logits, ids, parameters.profile->public_tokens, configs, positions, purpose, live,
-                resources.workspace, cuda);
+    if (parameters.dspark && kind == SampleKind::NextToken) {
+        auto probabilities = row(io.top1_probabilities, b);
+        ops::sample(logits, ids, probabilities, parameters.profile->public_tokens, configs,
+                    positions, purpose, live, resources.workspace, cuda);
+    } else {
+        ops::sample(logits, ids, parameters.profile->public_tokens, configs, positions, purpose,
+                    live, resources.workspace, cuda);
+    }
 }
 
 void RankProgramImpl::score() {

@@ -7,6 +7,7 @@ target_sources(ninfer_model_execution PRIVATE
   inkling2/execution/loop_residual.cpp
   inkling2/execution/moe.cpp
   inkling2/execution/text.cpp
+  inkling2/execution/dspark.cpp
   inkling2/program/frame.cpp
   inkling2/program/planning.cpp
   inkling2/program/resources.cpp
@@ -14,6 +15,7 @@ target_sources(ninfer_model_execution PRIVATE
   inkling2/vision/execution.cpp
   inkling2/program/vision.cpp
   inkling2/program/execution.cpp
+  inkling2/program/dspark.cpp
   inkling2/program/inputs.cpp
   inkling2/program/commit.cpp
   inkling2/program/output.cpp

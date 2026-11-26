@@ -357,6 +357,8 @@ runtime::PauseCostQuote Session::pause_cost(SequenceHandle h, const PauseOption&
     } else {
         if (option.action.kind == runtime::PauseKind::Relocate) {
             std::vector<std::uint32_t> frontiers{s.continuation.metadata.main_frontier};
+            if (s.continuation.metadata.dspark_frontier)
+                frontiers.push_back(*s.continuation.metadata.dspark_frontier);
             auto copies =
                 detail::conversion_requirements(p.plan, s.continuation.metadata.placement.value,
                                                 option.action.placement.value, frontiers);

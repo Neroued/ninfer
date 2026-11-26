@@ -18,7 +18,7 @@ public:
     TextRun(const Parameters&, TextExecution, BatchView, StateUpdate, CudaExecutionView);
 
     void stem(std::optional<models::vision::EmbeddingView> visual = {});
-    void forward(Tensor& final_hidden, const FullAttentionSubmit& submit = {});
+    void forward(Tensor& final_hidden, const FullAttentionSubmit& submit = {}, Tensor aux = {});
 
     // Computes the exact FullAttentionReadout bindings for batched CUDA Graph capture.
     [[nodiscard]] std::vector<FullAttentionReadout>

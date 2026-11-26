@@ -277,11 +277,11 @@ private:
     explicit PreparedSession(std::unique_ptr<detail::SessionImpl>);
     std::unique_ptr<detail::SessionImpl> impl_;
     friend class Session;
-    friend PreparedSession prepare_session(std::shared_ptr<const ModelDefinition>, SessionPlan,
+    friend PreparedSession prepare_session(SessionPlan,
                                            std::unique_ptr<context::ContextDirectory>);
 };
 
-[[nodiscard]] PreparedSession prepare_session(std::shared_ptr<const ModelDefinition>, SessionPlan,
+[[nodiscard]] PreparedSession prepare_session(SessionPlan,
                                               std::unique_ptr<context::ContextDirectory>);
 [[nodiscard]] PreparedSession prepare_session(std::shared_ptr<const ModelDefinition>,
                                               PreparedContext, std::uint32_t checkpoint_interval,

@@ -331,7 +331,15 @@ ResidencyBinding SessionImpl::context_binding(BindOperation& operation) {
         sequence.continuation.metadata =
             checkpoints.at(*operation.source).snapshot.continuation().metadata;
     }
+    if (!operation.source && pool_count() > 1) sequence.continuation.metadata.dspark_frontier = 0;
     sequence.continuation.metadata.placement = operation.placement;
+    if (shape.draft_tokens) {
+        sequence.speculative.backend      = shape.speculative;
+        sequence.speculative.enabled      = true;
+        sequence.speculative.draft_window = shape.draft_tokens;
+        sequence.speculative.attempted_per_position.resize(shape.draft_tokens);
+        sequence.speculative.accepted_per_position.resize(shape.draft_tokens);
+    }
     while (sequence.next_capture < sequence.captures.size() &&
            sequence.captures[sequence.next_capture].frontier <= operation.frontier)
         ++sequence.next_capture;
@@ -341,7 +349,7 @@ ResidencyBinding SessionImpl::context_binding(BindOperation& operation) {
     const auto& sampling = sequence.request->sampling;
     if (sampling.presence_penalty || sampling.frequency_penalty)
         result.counts =
-            count_builder.build(generated, definition->resources().text.public_token_count);
+            count_builder.build(generated, plan.model.public_tokens);
     operation.binding = std::move(binding);
     return result;
 }

@@ -12,7 +12,7 @@ ResidentTargetCapture bind_target(RankProgramImpl& p, ops::ContextBucketRange bu
     const auto hidden = p.target_hidden(main);
     const auto sms    = p.device.execution_view().multiprocessor_count();
     ResidentTargetCapture capture;
-    auto run      = p.text_run(main, execution::StepUpdate{});
+    auto run      = p.text_run(main, p.target_update(main));
     auto expected = run.plan_full_readouts(buckets);
     capture.readouts.reserve(expected.size());
     for (const auto& call : expected) {
@@ -46,6 +46,48 @@ ResidentTargetCapture bind_target(RankProgramImpl& p, ops::ContextBucketRange bu
     return capture;
 }
 
+ProposalCapture bind_proposal(RankProgramImpl& p, ops::ContextBucketRange buckets,
+                              const execution::BatchView& main, int steps) {
+    ProposalCapture capture;
+    const auto inputs = p.proposal(main, steps);
+    auto expected     = execution::plan_dspark_readouts(p.parameters, p.dspark_execution(), main,
+                                                        inputs, buckets, p.cuda);
+    ReadoutCapture forward;
+    for (const auto& call : expected)
+        forward.readouts.push_back({
+            buckets,
+            [call](ops::ContextBucket b) { return call.profile(b); },
+            [call](ops::ContextBucket b, CudaExecutionView cuda) { call.execute(b, cuda); },
+        });
+    forward.body = [&p, main, inputs, buckets,
+                    expected = std::move(expected)](const ReadoutRecorder& record) {
+        std::size_t next = 0;
+        execution::propose_dspark(
+            p.parameters, p.dspark_execution(), main, inputs, buckets, buckets.first, p.cuda,
+            [&](const execution::DSparkReadout& actual) {
+                const auto& exp = expected.at(next++);
+                if (exp.q.data != actual.q.data || exp.k.data != actual.k.data ||
+                    exp.v.data != actual.v.data ||
+                    exp.out.data != actual.out.data || exp.scratch.data != actual.scratch.data)
+                    throw std::logic_error(
+                        "Inkling2 DSpark Graph readout binding differs from execution");
+                record([actual](ops::ContextBucket b, CudaExecutionView cuda) {
+                    actual.execute(b, cuda);
+                });
+            });
+    };
+    capture.steps.push_back({.forward = std::move(forward)});
+    capture.prefix = [&p] {
+        p.upload_region(p.frame.ingress, p.frame.ingress.bytes);
+        p.timer.begin_draft(true);
+    };
+    capture.before_readback = [&p] { p.timer.end_draft(true); };
+    capture.readback        = [&p, main, steps] { p.readback_proposal(main.rows, steps, true); };
+    capture.drafts_ready    = [&p] { p.drafts_done.record_external(p.cuda.stream()); };
+    capture.verify_ids      = [&p, main, steps] { p.prepare_verify(main, steps); };
+    return capture;
+}
+
 } // namespace
 
 GraphPreparationSample RankProgramImpl::prepare_graphs(GraphPreparationMode mode) {
@@ -66,18 +108,33 @@ GraphPreparationSample RankProgramImpl::prepare_graphs(GraphPreparationMode mode
     bindings.stage = [&](const speculative::RoundRoute& route) {
         const int rows  = dimension(route.shape.rows);
         const int width = dimension(route.width);
-        graph_inputs->set(rows, width);
+        graph_inputs->set(rows, width, extent(route.head_columns));
         main = decode_batch(width, rows, shape.max_context);
-        return TargetReplay{.bucket = buckets.last};
+        return TargetReplay{.bucket = buckets.last, .proposal = {.buckets = {&buckets.last, 1}}};
     };
     bindings.warmup_target = [&](const speculative::RoundRoute&) { execute_target(main, true); };
     bindings.target        = [&](const speculative::RoundRoute&) -> TargetCapture {
         return bind_target(*this, buckets, main);
     };
-    bindings.decision = [&](const speculative::RoundRoute&) {
-        sample(main.rows, SampleKind::NextToken);
-        copy_result(main.rows);
+    bindings.warmup_proposal = [&](const speculative::RoundRoute& route) {
+        execute_proposal(main, extent(route.head_columns), buckets.last, false);
     };
+    bindings.proposal = [&](const speculative::RoundRoute& route) {
+        return bind_proposal(*this, buckets, main, extent(route.head_columns));
+    };
+    bindings.decision = [&](const speculative::RoundRoute& route) {
+        if (route.width > 1)
+            accept_dspark(main.rows, main.tokens, extent(route.head_columns));
+        else
+            sample(main.rows, SampleKind::NextToken);
+        copy_result(main.rows, main.tokens);
+    };
+    if (parameters.dspark) {
+        bindings.commit = [&](const speculative::RoundRoute&, const SectionRecorder&,
+                              const SectionRecorder& counts) {
+            execute_speculative_commit(main, true, counts);
+        };
+    }
 
     graphs->prepare(*resources.plan.batches, *resources.plan.decode_routes, observation, bindings);
     observation.checkpoint();

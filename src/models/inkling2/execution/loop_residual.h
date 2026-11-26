@@ -10,7 +10,8 @@ namespace ninfer::models::inkling2::execution {
 class LoopResidualRun {
 public:
     LoopResidualRun(const Parameters&, workspace::MainRoots&, const BatchView&, const StateViews&,
-                    const ops::RaggedSequenceView*, MemoryArena&, CudaExecutionView);
+                    const ops::RaggedSequenceView*, const RecordWindow*, Tensor aux,
+                    std::optional<std::uint32_t> final_aux_slot, MemoryArena&, CudaExecutionView);
 
     void begin_visit(const LogicalLayerConfig& logical, std::size_t visit_index);
     void after_attention(const LogicalLayerConfig& logical, const Tensor& attn_proj,
@@ -23,6 +24,7 @@ private:
     [[nodiscard]] bool starts_block(const LogicalLayerConfig&) const;
     [[nodiscard]] Tensor stack_slot(std::uint32_t slot) const;
     [[nodiscard]] Tensor view_tokens(const Tensor&) const;
+    void capture_aux(std::uint32_t, const Tensor&);
     void restart(const PhysicalLayerParameters&);
     void blend_attention(const LogicalLayerConfig&, const PhysicalLayerParameters&);
     void initial_attention_norm(const LogicalLayerConfig&, const PhysicalLayerParameters&);
@@ -34,6 +36,9 @@ private:
     const BatchView& batch_;
     const StateViews& states_;
     const ops::RaggedSequenceView* ragged_;
+    const RecordWindow* records_;
+    Tensor aux_;
+    std::optional<std::uint32_t> final_aux_slot_;
     MemoryArena& arena_;
     CudaExecutionView cuda_;
     std::uint32_t num_blocks_     = 0;

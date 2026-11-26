@@ -40,6 +40,7 @@ public:
     MemoryArena workspace;
     StateViews states;
     CacheViews main;
+    std::optional<CacheViews> dspark;
     std::optional<models::vision::Storage> vision;
     std::unique_ptr<context::ContextStorage> context;
     std::unique_ptr<context::ContextMigration> compute_actions, context_actions;

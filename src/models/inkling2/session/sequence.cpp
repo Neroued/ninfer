@@ -78,6 +78,11 @@ WorkRow SessionImpl::work_row(const Sequence& s, std::uint32_t tokens) const {
     row.main_table        = directory.pool(0).histories().execution_row(s.histories[0].handle()).handle();
     const auto& m         = s.continuation.metadata;
     row.main_frontier     = m.main_frontier;
+    if (pool_count() > 1) {
+        row.dspark_table =
+            directory.pool(1).histories().execution_row(s.histories[1].handle()).handle();
+        row.dspark_frontier = m.dspark_frontier;
+    }
     row.attention_rank    = m.placement.value;
     row.sampling          = s.request->sampling;
     row.sampling_position = m.main_frontier;
@@ -101,7 +106,10 @@ ContinuationMetadata SessionImpl::prepare_commit(Sequence& s, const WorkRow& row
                                                  std::uint32_t input_columns, bool retain_recovery,
                                                  context::ContextTransaction& transaction) {
     auto metadata = s.continuation.metadata;
-    if (input_columns) metadata.main_frontier = row.main_frontier + input_columns;
+    if (input_columns) {
+        metadata.main_frontier = row.main_frontier + input_columns;
+        if (metadata.dspark_frontier) metadata.dspark_frontier = metadata.main_frontier;
+    }
     const auto peak = retain_recovery ? s.recovery_peak : 0;
     for (std::uint32_t i = 0; i < pool_count(); ++i)
         directory.pool(i).histories().prepare_commit(s.histories[i], metadata.main_frontier, peak,

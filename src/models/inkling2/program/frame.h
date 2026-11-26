@@ -19,6 +19,8 @@ struct RowLayout {
     TensorRegion source_offsets;
     TensorRegion destination_offsets;
     TensorRegion main_tables;
+    TensorRegion dspark_tables;
+    TensorRegion base_positions, proposal_rows, proposal_columns, draft_extents, snapshot_slots;
     TensorRegion count_slots;
     TensorRegion sampling_positions;
     TensorRegion count_columns;
@@ -35,11 +37,34 @@ struct PackedPrefillLayout {
     RaggedLayout ragged;
     TensorRegion source_offsets;
     TensorRegion destination_offsets;
-    TensorRegion tables;
+    TensorRegion tables, dspark_tables;
     TensorRegion sampled_offsets;
 };
 
+struct VerifyLayerLayout {
+    TensorRegion k_conv, v_conv, attn_conv, mlp_conv;
+    TensorRegion k, v, k_scales, v_scales;
+};
+
+// Each recurrent step consumes an independent, 16-byte-aligned I32 token vector.
+[[nodiscard]] constexpr int draft_batch_stride(int rows) { return (rows + 3) & ~3; }
+
+struct DSparkFrameLayout {
+    TensorRegion prefill_aux, pending_aux;
+    RaggedLayout swa_ragged;
+    TensorRegion swa_source_indices, last_aux_indices;
+    TensorRegion draft_ids, draft_probabilities, target_ids;
+    TensorRegion accepted_columns, last_columns;
+    LayoutRegion commit_ingress;
+    std::vector<VerifyLayerLayout> layers;
+    // Indexed by (physical rows - 1) * max_drafts + (proposal columns - 1).
+    std::vector<TensorRegion> stem_indices, tail_indices;
+};
+
 struct FrameLayout {
+    std::optional<DSparkFrameLayout> dspark;
+    TensorRegion top1_probabilities;
+    LayoutRegion draft_egress;
     BatchLayout main;
     BatchLayout decode;
     RowLayout rows;

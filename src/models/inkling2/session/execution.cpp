@@ -1,4 +1,5 @@
 #include "models/inkling2/session/internal.h"
+#include "models/common/speculative/growth.h"
 
 #include <algorithm>
 #include <stdexcept>
@@ -176,7 +177,19 @@ Session::start_decode_round(std::span<const SequenceHandle> members,
     bool prepared = false;
     try {
         tx.members.assign(members.begin(), members.end());
+        const bool adaptive_length =
+            p.shape.draft_tokens && selection.uses_adaptive_length(p.shape.length_policy);
+        const bool measure_cost =
+            p.shape.draft_tokens && (adaptive_length || selection.budgets.empty());
+        std::vector<speculative::RoundMember> limits;
+        std::vector<speculative::AdaptiveRowInput> adaptive;
+        std::vector<std::uint32_t> frontiers;
+        limits.reserve(members.size());
+        if (adaptive_length) adaptive.reserve(members.size());
+        if (measure_cost) frontiers.reserve(members.size());
+        std::vector<speculative::RowGrowth> growth(members.size());
         const auto mark = p.next_membership_mark();
+        const auto path = p.plan.decode_routes ? ExecutionPath::Graph : ExecutionPath::Eager;
         for (std::size_t b = 0; b < members.size(); ++b) {
             auto& s      = p.sequence(members[b]);
             const auto f = s.continuation.metadata.main_frontier;
@@ -185,20 +198,67 @@ Session::start_decode_round(std::span<const SequenceHandle> members,
                 s.permitted_frontier < f + 1 || s.ledger.size() != f + 1 ||
                 s.membership_mark == mark)
                 throw std::logic_error("decode row is not executable");
-            s.membership_mark = mark;
-            auto row          = p.work_row(s, 1);
-            row.constrained   = !constrained.empty() && constrained[b];
+            s.membership_mark      = mark;
+            const auto room        = p.shape.max_context - f - 1;
+            const bool can_propose = path == ExecutionPath::Eager || p.shape.draft_tokens <= room;
+            const auto hard =
+                can_propose ? std::min({p.shape.draft_tokens, room, selection.draft_budget(b)})
+                            : 0U;
+            limits.push_back({s.continuation.metadata.placement.value, hard, hard});
+            if (measure_cost) frontiers.push_back(f);
+            if (adaptive_length) adaptive.push_back({limits.back(), f, &s.speculative_state});
+            if (hard) {
+                growth[b].text.emplace(p.directory.pool(0).histories(), s.histories[0].handle(), f,
+                                       f + 1);
+                if (p.pool_count() > 1)
+                    growth[b].backend.emplace(p.directory.pool(1).histories(),
+                                              s.histories[1].handle(),
+                                              *s.continuation.metadata.dspark_frontier, f + 1);
+            }
+        }
+        speculative::grant_windows(p.directory, growth, limits);
+        for (std::size_t b = 0; b < adaptive.size(); ++b) adaptive[b].member = limits[b];
+        for (std::size_t b = 0; b < members.size(); ++b) {
+            auto& s         = p.sequence(members[b]);
+            auto row        = p.work_row(s, 1);
+            row.constrained = !constrained.empty() && constrained[b];
             tx.rows.push_back(std::move(row));
         }
         auto batch = plan_batch(tx.rows, *p.plan.batches, true);
-        prepared   = true;
+        tx.round =
+            selection.select(p.shape.length_policy, batch.shape, path, p.plan.decode_routes.get(),
+                             p.cost_model, limits, adaptive, p.shape.max_context);
+        if (!tx.round) return {};
+        if (p.shape.draft_tokens) {
+            tx.could_speculate.reserve(limits.size());
+            for (const auto& row : limits) tx.could_speculate.push_back(row.granted_limit > 0);
+        }
+        if (measure_cost)
+            tx.cost_query = speculative::CostQuery::from_plan(p.shape.speculative, *tx.round,
+                                                              frontiers, p.shape.max_context);
+        tx.record_online_cost = selection.record_online_cost;
+        prepared              = true;
+        const auto extents    = tx.round->verify_drafts();
+        for (std::size_t b = 0; b < members.size(); ++b) growth[b].prepare(extents[b]);
+        for (auto& row : growth) row.adopt();
         for (std::size_t b = 0; b < members.size(); ++b) {
             auto& s = p.sequence(members[b]);
-            p.prepare_write(s, s.continuation.metadata.main_frontier + 1U, tx.context);
+            p.prepare_write(s, s.continuation.metadata.main_frontier + 1 + extents[b], tx.context);
         }
+        auto geometry =
+            p.shape.draft_tokens
+                ? std::make_shared<const SpeculativeExecutionGeometry>(tx.round->geometry(path))
+                : nullptr;
         Work work;
-        work.operation =
-            ForwardWork{ForwardKind::Ordinary, SampleKind::NextToken, tx.rows, std::move(batch)};
+        if (tx.round->route().width > 1) {
+            tx.kind        = Kind::Speculative;
+            work.operation = SpeculativeWork{
+                tx.rows, {extents.begin(), extents.end()}, std::move(batch), std::move(geometry)};
+        } else {
+            work.operation = ForwardWork{
+                ForwardKind::Ordinary, SampleKind::NextToken, tx.rows, std::move(batch), {},
+                std::move(geometry)};
+        }
         p.compute = std::move(pending);
         submit(p, std::move(*reservation), std::move(work));
         return tx.ticket;
@@ -213,16 +273,7 @@ Session::start_control(std::span<const SequenceHandle> members, std::span<const 
                        std::uint32_t stride) {
     auto& p = *impl_;
     if (p.compute) return {};
-    const auto limit = std::max({
-        p.definition->resources().text.control_tokens
-            ? p.definition->resources().text.control_tokens->size()
-            : std::size_t{0},
-        p.definition->resources().control_to_text ? p.definition->resources().control_to_text->size()
-                                                  : std::size_t{0},
-        p.definition->resources().control_to_header
-            ? p.definition->resources().control_to_header->size()
-            : std::size_t{0},
-    });
+    const auto limit = p.plan.model.control_token_limit;
     if (members.empty() || members.size() > p.shape.max_concurrency || !stride || stride > limit ||
         tokens.size() != members.size() * stride)
         throw std::logic_error("invalid forced control window");
@@ -238,7 +289,7 @@ Session::start_control(std::span<const SequenceHandle> members, std::span<const 
             throw std::logic_error("forced control row is not executable");
     }
     for (const auto id : tokens)
-        if (id < 0 || std::uint32_t(id) >= p.definition->resources().text.public_token_count)
+        if (id < 0 || std::uint32_t(id) >= p.plan.model.public_tokens)
             throw std::invalid_argument("forced token is outside vocabulary");
     auto reservation = p.executor->try_reserve(runtime::FrameKind::Compute);
     if (!reservation) return {};

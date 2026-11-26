@@ -20,10 +20,19 @@ int attention_streams(const LogicalLayerConfig& logical) { return logical.is_swa
 
 LoopResidualRun::LoopResidualRun(const Parameters& p, workspace::MainRoots& roots,
                                  const BatchView& batch, const StateViews& states,
-                                 const ops::RaggedSequenceView* ragged, MemoryArena& arena,
-                                 CudaExecutionView cuda)
+                                 const ops::RaggedSequenceView* ragged, const RecordWindow* records,
+                                 Tensor aux, std::optional<std::uint32_t> final_aux_slot,
+                                 MemoryArena& arena, CudaExecutionView cuda)
     : parameters_(p.text), config_(p.profile->config.text), profile_(p.profile->text),
-      roots_(roots), batch_(batch), states_(states), ragged_(ragged), arena_(arena), cuda_(cuda) {}
+      roots_(roots), batch_(batch), states_(states), ragged_(ragged), records_(records), aux_(aux),
+      final_aux_slot_(final_aux_slot), arena_(arena), cuda_(cuda) {}
+
+void LoopResidualRun::capture_aux(std::uint32_t slot, const Tensor& source) {
+    const auto width = std::size_t(source.ne[0]) * sizeof(std::uint16_t);
+    CUDA_CHECK(cudaMemcpy2DAsync(aux_.slice(1, extent(slot), 1).data, aux_.nb[2], source.data,
+                                 width, width, roots_.stack.ne[1], cudaMemcpyDeviceToDevice,
+                                 cuda_.stream()));
+}
 
 bool LoopResidualRun::at_core_start(const LogicalLayerConfig& logical) const {
     return config_.loop && logical.physical_layer == config_.loop->core_start;
@@ -95,6 +104,8 @@ void LoopResidualRun::begin_visit(const LogicalLayerConfig& logical, std::size_t
             copy_tensor_async(roots_.prelude_partial, stack_slot(num_blocks_), cuda_);
         }
     }
+    if (aux_.data && logical.capture_aux_slot)
+        capture_aux(*logical.capture_aux_slot, stack_slot(num_blocks_));
     if (looped)
         blend_attention(logical, layer);
     else if (visit_index == 0)
@@ -117,7 +128,13 @@ void LoopResidualRun::after_attention(const LogicalLayerConfig& logical, const T
     auto mixed =
         looped ? arena_.alloc(DType::FP32, {mlp_in_bf16.ne[0], mlp_in_bf16.ne[1], 1}) : mlp_in_bf16;
 
-    if (ragged_) {
+    if (records_) {
+        auto snapshot = records_->layers.at(logical.logical_index).attn_conv;
+        ops::short_conv_block_attn_res_snapshot(
+            input, layer.attn_short_conv, src, snapshot, batch_.valid_columns, records_->base_slots,
+            Tensor{}, Tensor{}, stack, addend, layer.mlp_attn_res_query, norm, profile_.attn_res,
+            output, mixed, cuda_);
+    } else if (ragged_) {
         ops::short_conv_block_attn_res(input, layer.attn_short_conv, *ragged_, src, dst, Tensor{},
                                        Tensor{}, stack, addend, layer.mlp_attn_res_query, norm,
                                        profile_.attn_res, output, mixed, cuda_);
@@ -148,7 +165,12 @@ void LoopResidualRun::after_mlp(const LogicalLayerConfig& logical, std::size_t v
     const auto next    = visit_index + 1 < visits.size() ? &visits[visit_index + 1] : nullptr;
     if (next && at_core_start(*next) && next->pass_index > 0) {
         // The restart computes its mix from the preserved prelude.
-        if (ragged_)
+        if (records_) {
+            auto snapshot = records_->layers.at(logical.logical_index).mlp_conv;
+            ops::short_conv_residual_snapshot(input, layer.mlp_short_conv, src, snapshot,
+                                              batch_.valid_columns, records_->base_slots, residual,
+                                              addend, conv_out, cuda_);
+        } else if (ragged_)
             ops::short_conv_residual(input, layer.mlp_short_conv, *ragged_, src, dst, residual,
                                      addend, conv_out, cuda_);
         else
@@ -172,7 +194,13 @@ void LoopResidualRun::after_mlp(const LogicalLayerConfig& logical, std::size_t v
     }
 
     const auto stack = roots_.stack.slice(2, 0, dimension(num_blocks_));
-    if (ragged_) {
+    if (records_) {
+        auto snapshot = records_->layers.at(logical.logical_index).mlp_conv;
+        ops::short_conv_block_attn_res_snapshot(input, layer.mlp_short_conv, src, snapshot,
+                                                batch_.valid_columns, records_->base_slots,
+                                                residual, addend, stack, Tensor{}, query, norm,
+                                                profile_.attn_res, conv_out, mixed, cuda_);
+    } else if (ragged_) {
         ops::short_conv_block_attn_res(input, layer.mlp_short_conv, *ragged_, src, dst, residual,
                                        addend, stack, Tensor{}, query, norm, profile_.attn_res,
                                        conv_out, mixed, cuda_);
@@ -181,6 +209,7 @@ void LoopResidualRun::after_mlp(const LogicalLayerConfig& logical, std::size_t v
                                        residual, addend, stack, Tensor{}, query, norm,
                                        profile_.attn_res, conv_out, mixed, cuda_);
     }
+    if (!next && aux_.data && final_aux_slot_) capture_aux(*final_aux_slot_, final_hidden);
 }
 
 } // namespace ninfer::models::inkling2::execution

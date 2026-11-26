@@ -19,6 +19,7 @@ struct ExecutionPlan {
     std::shared_ptr<const speculative::DecodeGraphRoutes> decode_routes;
     StateLayout state;
     CacheLayout main;
+    std::optional<CacheLayout> dspark;
     FrameLayout frame;
     execution::WorkspacePlan workspace;
     std::size_t fixed_bytes         = 0;

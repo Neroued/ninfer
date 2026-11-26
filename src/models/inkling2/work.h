@@ -29,6 +29,7 @@ struct WorkRow {
     context::TableRow main_table;
     context::TableRow dspark_table;
     std::uint32_t main_frontier = 0;
+    std::optional<std::uint32_t> dspark_frontier;
     std::vector<TokenId> ids;
     std::optional<TokenId> control_last_token;
     ResolvedSamplingParameters sampling;

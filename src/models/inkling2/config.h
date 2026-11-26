@@ -170,6 +170,10 @@ struct DSparkConfig {
         return std::uint64_t(kv_heads) * head_dim;
     }
 
+    [[nodiscard]] AttentionGeometry attention() const noexcept {
+        return {heads, kv_heads, head_dim};
+    }
+
     [[nodiscard]] std::uint32_t max_draft_tokens() const noexcept { return block_size - 1U; }
 };
 

@@ -133,7 +133,7 @@ void FullAttentionReadout::execute(ops::ContextBucket bucket, CudaExecutionView 
 RelativeAttentionRun::RelativeAttentionRun(const Parameters& p, const LogicalLayerConfig& logical,
                                            const BatchView& batch, AttentionExecution execution,
                                            const Tensor& input, Tensor output, MemoryArena& arena,
-                                           CudaExecutionView cuda)
+                                           CudaExecutionView cuda, const RecordWindow* records)
     : config_(p.profile->config.text), logical_(logical),
       layer_(p.text.layers.at(logical.physical_layer)),
       pass_(layer_.attention_passes.at(logical.pass_index)),
@@ -147,11 +147,15 @@ RelativeAttentionRun::RelativeAttentionRun(const Parameters& p, const LogicalLay
       arena_(arena), cuda_(cuda), scope_(arena.scope()),
       buffers_(workspace::attention(arena, config_, logical.is_swa, swa_cache_.storage,
                                     batch.tokens, batch.rows, /*ragged=*/false,
-                                    /*need_chunk_kv=*/batch.tokens > 1)),
+                                    /*need_chunk_kv=*/batch.tokens > 1 && !records)),
       query_(query_inputs(config_, layer_, geometry_, {batch.tokens, batch.rows}, batch.positions,
                           buffers_)),
-      attended_(buffers_.out.view(
-          {geometry_.head_dim, geometry_.query_heads, batch.tokens, batch.rows})) {}
+      attended_(
+          buffers_.out.view({geometry_.head_dim, geometry_.query_heads, batch.tokens, batch.rows})),
+      records_(records) {
+    if (records_ && logical_.is_swa)
+        buffers_.chunk_kv = records_->layers.at(logical_.logical_index).swa_chunk;
+}
 
 void RelativeAttentionRun::project() { project_attention(input_, pass_, buffers_, arena_, cuda_); }
 
@@ -167,7 +171,19 @@ void RelativeAttentionRun::prepare() {
     const auto v_in   = states_.v_conv(swa, slot, batch_.source_offsets);
     const auto v_out  = states_.v_conv(swa, slot, batch_.destination_offsets);
 
-    if (!swa) {
+    if (records_) {
+        auto record = records_->layers.at(logical_.logical_index);
+        if (swa)
+            ops::relative_attention_prepare_snapshot(
+                inputs, batch_.valid_columns, records_->base_slots, k_in, record.k_conv, v_in,
+                record.v_conv, record.swa_chunk, params, outputs, cuda_);
+        else
+            // Full attention writes a provisional paged suffix. The Session publishes only
+            // the adopted history frontier, so the rejected suffix is never read as history.
+            ops::relative_attention_prepare_snapshot(
+                inputs, batch_.valid_columns, batch_.main_tables, records_->base_slots, k_in,
+                record.k_conv, v_in, record.v_conv, full_cache_, params, outputs, cuda_);
+    } else if (!swa) {
         ops::relative_attention_prepare(inputs, batch_.valid_columns, batch_.main_tables, k_in,
                                         k_out, v_in, v_out, full_cache_, params, outputs, cuda_);
     } else if (batch_.tokens == 1) {
@@ -211,7 +227,7 @@ void RelativeAttentionRun::execute(const FullAttentionSubmit& submit) {
     prepare();
     if (logical_.is_swa) {
         attend_swa();
-        if (batch_.tokens > 1)
+        if (batch_.tokens > 1 && !records_)
             ops::relative_attention_commit_cyclic_kv(buffers_.chunk_kv, batch_.positions,
                                                      batch_.valid_columns, swa_cache_, cuda_);
     } else if (submit) {

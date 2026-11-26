@@ -26,7 +26,9 @@ struct StateLayout {
     StateField attn_sconv, mlp_sconv;
     StateField hidden;
     std::optional<CyclicKVCacheLayout> swa;
-    // Persistent ring-buffer fields copied on Fork/Capture (SWA cyclic KV, plus DSpark in S6).
+    std::optional<StateField> dspark_f_rnn;
+    std::optional<CyclicKVCacheLayout> dspark_swa;
+    // Fields whose entire image must be copied together on Fork/Capture.
     std::optional<LayoutRegion> persistent_copy;
 };
 
@@ -72,10 +74,15 @@ public:
     [[nodiscard]] CyclicKVCacheLayerView swa_layer(std::uint32_t slot,
                                                    const Tensor& offsets) const;
 
+    [[nodiscard]] StateFieldView dspark_f_rnn(const Tensor& offsets) const;
+    [[nodiscard]] CyclicKVCacheLayerView dspark_swa_layer(std::uint32_t slot,
+                                                          const Tensor& offsets) const;
+    [[nodiscard]] static StateFieldView flatten_short_conv(StateFieldView);
+
 private:
     StateLayout layout_;
     StateImageStorage image_;
-    std::optional<CyclicKVCacheView> swa_;
+    std::optional<CyclicKVCacheView> swa_, dspark_swa_;
 };
 
 class CacheViews {

@@ -8,11 +8,21 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace ninfer::models::inkling2 {
 
+struct SessionModelInfo {
+    std::uint32_t public_tokens       = 0;
+    std::uint32_t control_token_limit = 0;
+    std::uint32_t experts             = 0;
+    std::uint32_t experts_per_token   = 0;
+    std::optional<VisionConfig> vision;
+};
+
 struct SessionPlan {
+    SessionModelInfo model;
     ExecutionShape shape;
     std::shared_ptr<const BatchExecutionPlan> batches;
     context::ContextDirectorySpec context;

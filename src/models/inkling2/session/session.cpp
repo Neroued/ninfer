@@ -7,11 +7,11 @@
 
 namespace ninfer::models::inkling2::detail {
 
-SessionImpl::SessionImpl(std::shared_ptr<const ModelDefinition> model, SessionPlan prepared,
+SessionImpl::SessionImpl(SessionPlan prepared,
                          std::unique_ptr<context::ContextDirectory> prepared_directory)
-    : definition(std::move(model)), plan(std::move(prepared)),
+    : plan(std::move(prepared)),
       cost_model({plan.shape.speculative, plan.shape.draft_tokens, plan.batches->attention_owners(),
-                  definition->config().text.moe.experts, definition->config().text.moe.top_k, 0}),
+                  plan.model.experts, plan.model.experts_per_token, 0}),
       shape(plan.shape), directory_owner(std::move(prepared_directory)),
       directory(*directory_owner),
       recovery_metadata(directory.metadata_budget(),
@@ -23,9 +23,8 @@ SessionImpl::SessionImpl(std::shared_ptr<const ModelDefinition> model, SessionPl
     resident_sequences.reserve(shape.max_concurrency);
     epochs.resize(shape.max_concurrency);
     if (shape.purpose == EnginePurpose::Generation) {
-        count_storage.acquire(
-            TokenCountBuilder::capacity_bytes(definition->resources().text.public_token_count));
-        count_builder.prepare(definition->resources().text.public_token_count);
+        count_storage.acquire(TokenCountBuilder::capacity_bytes(plan.model.public_tokens));
+        count_builder.prepare(plan.model.public_tokens);
     }
     releases.reserve(shape.max_concurrency);
     for (std::uint32_t i = 0; i < plan.states.size(); ++i) placements.push_back({i});
@@ -183,16 +182,17 @@ PreparedSession::~PreparedSession()                                     = defaul
 PreparedSession::PreparedSession(PreparedSession&&) noexcept            = default;
 PreparedSession& PreparedSession::operator=(PreparedSession&&) noexcept = default;
 
-PreparedSession prepare_session(std::shared_ptr<const ModelDefinition> definition, SessionPlan plan,
+PreparedSession prepare_session(SessionPlan plan,
                                 std::unique_ptr<context::ContextDirectory> directory) {
-    if (!definition) throw std::invalid_argument("invalid Inkling2 session definition");
+    if (!plan.model.public_tokens)
+        throw std::invalid_argument("invalid Inkling2 session vocabulary");
     if (!directory) throw std::invalid_argument("Inkling2 Session requires its prepared directory");
     if (!plan.batches || plan.batches->resident_capacity() != plan.shape.max_concurrency ||
         plan.batches->attention_owners() != plan.states.size())
         throw std::invalid_argument("Inkling2 Session batch plan differs from prepared state");
     plan.decode_routes = make_decode_routes(plan.shape, *plan.batches);
-    return PreparedSession(std::make_unique<detail::SessionImpl>(
-        std::move(definition), std::move(plan), std::move(directory)));
+    return PreparedSession(
+        std::make_unique<detail::SessionImpl>(std::move(plan), std::move(directory)));
 }
 
 Session::Session(PreparedSession&& prepared, runtime::Executor<ExecutionTypes>& executor)
@@ -251,8 +251,9 @@ speculative::CalibrationConstraints Session::calibration_constraints() const {
 }
 
 std::optional<speculative::CostQuery>
-Session::decode_cost_query(runtime::ExecutionTicket) const noexcept {
-    return {};
+Session::decode_cost_query(runtime::ExecutionTicket ticket) const noexcept {
+    const auto& active = impl_->compute;
+    return active && active->ticket == ticket ? active->cost_query : std::nullopt;
 }
 
 void Session::fit_speculative_cost_model(std::span<const speculative::TimedCostAnchor> anchors,

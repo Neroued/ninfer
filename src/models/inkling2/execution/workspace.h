@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/arena.h"
+#include "core/paged_kv_storage.h"
 #include "models/common/vision/resources.h"
 #include "models/inkling2/execution/profile.h"
 #include "models/inkling2/execution_shape.h"
@@ -88,15 +89,13 @@ ops::RelativeAttentionChunkKV chunk_kv(Allocator& a, KvCacheStorage storage, std
         if (ragged) return a.alloc(dtype, {d0, kv_heads, width});
         return a.alloc(dtype, {d0, kv_heads, width, batch});
     };
-    if (storage == KvCacheStorage::BFloat16) {
-        out.k = alloc_kv(DType::BF16, head_dim);
-        out.v = alloc_kv(DType::FP16, head_dim);
-    } else {
-        out.k        = alloc_kv(DType::FP8_E4M3FN, head_dim);
-        out.v        = alloc_kv(DType::FP8_E4M3FN, head_dim);
-        out.k_scales = alloc_kv(DType::U8, head_dim / 128);
-        out.v_scales = alloc_kv(DType::U8, head_dim / 128);
-    }
+    const auto schema = cyclic_kv_storage_layout(storage, head_dim);
+    out.k = alloc_kv(schema.key.data_dtype, schema.key.data_leading_extent);
+    out.v = alloc_kv(schema.value.data_dtype, schema.value.data_leading_extent);
+    if (schema.key.has_scale())
+        out.k_scales = alloc_kv(schema.key.scale_dtype, schema.key.scale_leading_extent);
+    if (schema.value.has_scale())
+        out.v_scales = alloc_kv(schema.value.scale_dtype, schema.value.scale_leading_extent);
     return out;
 }
 

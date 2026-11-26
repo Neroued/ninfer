@@ -28,6 +28,10 @@ Resources::Resources(ExecutionPlan input, DeviceContext& device)
       states(context_.span(), plan.state), main(context_.span(), fixed_.span(), plan.main) {
     if (plan.workspace.vision) vision.emplace(device, *plan.workspace.vision);
     std::vector<context::ContextTableStorage> tables{{0, &main.tables()}};
+    if (plan.dspark) {
+        dspark.emplace(context_.span(), fixed_.span(), *plan.dspark);
+        tables.push_back({1, &dspark->tables()});
+    }
     context = std::make_unique<context::ContextStorage>(context_.span(), MemorySpan{}, tables,
                                                         plan.profile->local.rank);
     compute_actions = std::make_unique<context::ContextMigration>(
@@ -44,7 +48,31 @@ Resources::Resources(ExecutionPlan input, DeviceContext& device)
         CUDA_CHECK(cudaMemsetAsync(region.data, value, region.bytes, device.stream()));
     };
     clear(plan.main.tables.page_offsets, 255);
+    if (plan.dspark) clear(plan.dspark->tables.page_offsets, 255);
     if (plan.frame.token_counts) clear(*plan.frame.token_counts, 0);
+    if (plan.frame.dspark) {
+        const auto& d = *plan.frame.dspark;
+        for (std::uint32_t b = 1; b <= plan.shape.max_concurrency; ++b) {
+            for (std::uint32_t steps = 1; steps <= plan.shape.draft_tokens; ++steps) {
+                const auto index = (b - 1) * plan.shape.draft_tokens + steps - 1;
+                std::vector<int> stem(b * (steps + 1), dimension(b));
+                std::vector<int> tail(b * steps);
+                for (std::uint32_t i = 0; i < b; ++i) {
+                    stem[i * (steps + 1)] = extent(i);
+                    for (std::uint32_t j = 0; j < steps; ++j)
+                        tail[j * b + i] = extent(i * steps + j);
+                }
+                const auto upload = [&](const TensorRegion& region,
+                                        const std::vector<int>& values) {
+                    const auto dest = tensor(region);
+                    CUDA_CHECK(
+                        cudaMemcpy(dest.data, values.data(), dest.bytes(), cudaMemcpyHostToDevice));
+                };
+                upload(d.stem_indices[index], stem);
+                upload(d.tail_indices[index], tail);
+            }
+        }
+    }
     device.synchronize();
 }
 

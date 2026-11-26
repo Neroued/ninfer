@@ -84,13 +84,43 @@ struct VisionParameters {
     std::vector<VisionLayerParameters> layers;
 };
 
+struct DSparkLayerParameters {
+    ops::ProjectionWeights kvq, context_kv;
+    LinearParameters output, gate_up, down;
+    Tensor dflare_norm, input_norm, post_attention_norm;
+    Tensor query_norm, key_norm, context_key_norm;
+};
+
+struct DSparkMarkovParameters {
+    Tensor dflare_norm, w1_embed, rnn_bias, fold_bias;
+    Weight w_recurrent, w_hidden, w_frnn, fold_weight;
+};
+
+struct DSparkParameters {
+    Weight embedding;
+    Tensor embed_norm, fuse_alpha, mask_embed, final_norm;
+    LinearParameters output_head;
+    std::vector<DSparkLayerParameters> layers;
+    DSparkMarkovParameters markov;
+
+    [[nodiscard]] Tensor alpha(int layer) const {
+        return fuse_alpha.slice(1, layer, 1).view({fuse_alpha.ne[0]});
+    }
+};
+
+// Prepared views borrow their weight backing, which must outlive execution.
 struct Parameters {
     Parameters(const ModelShard&, std::shared_ptr<const ModelProfile>);
 
-    const ModelShard& model;
+    Parameters(std::shared_ptr<const ModelProfile>, TextParameters, std::optional<VisionParameters>,
+               std::optional<DSparkParameters>);
+
     std::shared_ptr<const ModelProfile> profile;
+    std::size_t device_weight_bytes = 0;
+    std::size_t host_weight_bytes   = 0;
     TextParameters text;
     std::optional<VisionParameters> vision;
+    std::optional<DSparkParameters> dspark;
 };
 
 } // namespace ninfer::models::inkling2::execution

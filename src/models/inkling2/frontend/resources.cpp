@@ -9,6 +9,15 @@
 #include <stdexcept>
 
 namespace ninfer::models::inkling2 {
+
+std::uint32_t FrontendResources::control_token_limit() const {
+    return static_cast<std::uint32_t>(std::max({
+        text.control_tokens ? text.control_tokens->size() : std::size_t{0},
+        control_to_text ? control_to_text->size() : std::size_t{0},
+        control_to_header ? control_to_header->size() : std::size_t{0},
+    }));
+}
+
 namespace {
 
 TokenId require_single_token(const text::Tokenizer& tokenizer, std::string_view piece) {

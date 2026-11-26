@@ -19,7 +19,7 @@ RankProgramImpl::RankProgramImpl(const execution::Parameters& p, std::unique_ptr
                                  DeviceContext& d)
     : parameters(p), device(d), cuda(d.execution_view()), owner(std::move(r)), resources(*owner),
       shape(resources.plan.shape), frame(resources.plan.frame), timer(d, shape.gpu_timing),
-      compute_done(d), context_done(d) {
+      compute_done(d), context_done(d), drafts_done(d) {
     bindings.resize(shape.max_concurrency);
     if (p.profile != resources.plan.profile)
         throw std::invalid_argument("Inkling2 resources have another profile");
@@ -61,6 +61,9 @@ void RankProgramImpl::validate_work(const Work& work, runtime::FrameKind kind) c
         (void)resources.states.image().image(offsets.destination);
         if (row.main_table.index >= std::uint32_t(resources.main.tables().matrix().ne[1]))
             throw std::invalid_argument("Inkling2 table row exceeds rank storage");
+        if (resources.dspark &&
+            row.dspark_table.index >= std::uint32_t(resources.dspark->tables().matrix().ne[1]))
+            throw std::invalid_argument("Inkling2 DSpark table row exceeds rank storage");
     }
     if (const auto* c = std::get_if<ContextWork>(&work.operation)) {
         std::vector<std::uint8_t> released(bindings.size());
@@ -226,11 +229,9 @@ RankExecutionObservation RankProgramImpl::observation() const {
 }
 
 RankMemoryUsage RankProgramImpl::memory() const {
-    auto out      = resources.observe();
-    const auto& w = parameters.model.storage_stats();
-    out.allocations.device_weights_bytes =
-        w.device_capacity_bytes + parameters.model.metadata_bytes();
-    out.allocations.host_weights_bytes   = w.host_capacity_bytes;
+    auto out = resources.observe();
+    out.allocations.device_weights_bytes = parameters.device_weight_bytes;
+    out.allocations.host_weights_bytes = parameters.host_weight_bytes;
     const auto execution                 = observation();
     out.workspace.required_peak_bytes    = execution.workspace_peak_bytes;
     out.workspace.measurement_peak_bytes = execution.measurement_peak_bytes;

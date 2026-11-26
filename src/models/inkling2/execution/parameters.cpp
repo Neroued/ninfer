@@ -67,6 +67,30 @@ public:
 
     Tensor tensor(WeightId id) const { return parameter_tensor(model_.weight(id)); }
 
+    DSparkParameters dspark(const DSparkWeights& w) const {
+        const auto& m = w.markov;
+        DSparkParameters out{
+            native_weight(model_.weight(w.embedding).view),
+            tensor(w.embed_norm),
+            tensor(w.fuse_alpha),
+            tensor(w.mask_embed),
+            tensor(w.final_norm),
+            linear(w.output_head),
+            {},
+            {tensor(m.dflare_norm), tensor(m.w1_embed), tensor(m.rnn_bias), tensor(m.fold_bias),
+             linear(m.w_recurrent).weight, linear(m.w_hidden).weight, linear(m.w_frnn).weight,
+             linear(m.fold_weight).weight},
+        };
+        for (const auto& l : w.layers)
+            out.layers.push_back({projection({{l.key, 0}, {l.value, 0}, {l.query, 0}}),
+                                  projection({{l.context_key, 0}, {l.context_value, 0}}),
+                                  linear(l.output), linear({l.mlp.gate, l.mlp.up}),
+                                  linear(l.mlp.down), tensor(l.dflare_norm), tensor(l.input_norm),
+                                  tensor(l.post_attention_norm), tensor(l.query_norm),
+                                  tensor(l.key_norm), tensor(l.context_key_norm)});
+        return out;
+    }
+
     PhysicalLayerParameters layer(const PhysicalLayerConfig& cfg,
                                   const PhysicalLayerWeights& w) const {
         PhysicalLayerParameters out;
@@ -143,7 +167,9 @@ private:
 } // namespace
 
 Parameters::Parameters(const ModelShard& model, std::shared_ptr<const ModelProfile> profile)
-    : model(model), profile(std::move(profile)) {
+    : profile(std::move(profile)),
+      device_weight_bytes(model.storage_stats().device_capacity_bytes + model.metadata_bytes()),
+      host_weight_bytes(model.storage_stats().host_capacity_bytes) {
     if (!this->profile || this->profile->local.rank != model.rank_plan().rank ||
         this->profile->local.size != model.rank_plan().size ||
         this->profile->options != model.definition().options()) {
@@ -161,7 +187,18 @@ Parameters::Parameters(const ModelShard& model, std::shared_ptr<const ModelProfi
     for (std::size_t i = 0; i < c.physical_layers.size(); ++i) {
         text.layers.push_back(p.layer(c.physical_layers[i], w.text.layers[i]));
     }
+    if (w.dspark) dspark = p.dspark(*w.dspark);
     if (w.vision) vision = p.vision(*w.vision);
+}
+
+Parameters::Parameters(std::shared_ptr<const ModelProfile> selected, TextParameters text,
+                       std::optional<VisionParameters> vision,
+                       std::optional<DSparkParameters> dspark)
+    : profile(std::move(selected)), text(std::move(text)), vision(std::move(vision)),
+      dspark(std::move(dspark)) {
+    if (!profile || bool(this->vision) != bool(profile->vision) ||
+        bool(this->dspark) != bool(profile->dspark))
+        throw std::invalid_argument("Inkling2 Parameters differ from their execution profile");
 }
 
 } // namespace ninfer::models::inkling2::execution

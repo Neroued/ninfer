@@ -1,6 +1,8 @@
 #include "models/inkling2/execution/workspace.h"
 
 #include "models/inkling2/vision/execution.h"
+#include "models/inkling2/execution/dspark.h"
+#include "ninfer/ops/speculative_accept.h"
 
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_pair.h"
@@ -55,7 +57,7 @@ std::size_t main_body_bytes(const ModelProfile& p, const ExecutionShape& s, int 
             }
             {
                 auto attn_scope      = a.scope();
-                const bool use_chunk = lp.is_swa && (ragged || max_width > 1);
+                const bool use_chunk = lp.is_swa && ragged;
                 (void)workspace::attention(a, c, lp.is_swa, s.swa_kv_storage, max_width, batch,
                                            ragged, use_chunk);
                 if (ap.qkv_split) {
@@ -145,6 +147,25 @@ WorkspacePlan plan_workspace(const ModelProfile& p, const ExecutionShape& s,
     }
 
     out.general_bytes = std::max({out.prefill, out.ordinary, out.finish});
+    if (p.dspark) {
+        const int k = dimension(s.draft_tokens), batch = dimension(s.max_concurrency);
+        const auto buckets = ops::ContextBucketRange::through(s.max_context);
+        out.general_bytes  = std::max({
+            out.general_bytes,
+            dspark_context_bytes(p, chunk, std::min(chunk, batch)),
+            ops::sampling_with_probability_workspace_capacity_bytes(p.public_tokens, 1, batch),
+            dspark_context_bytes(p, (k + 1) * batch, 0),
+            ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(p.public_tokens, 1, k, 1,
+                                                                            batch),
+        });
+        for (int b = 1; b <= batch; ++b) {
+            out.general_bytes =
+                std::max(out.general_bytes, main_body_bytes(p, s, 2, k + 1, b, sm_count, false));
+            for (int steps = 1; steps <= k; ++steps)
+                out.general_bytes =
+                    std::max(out.general_bytes, dspark_proposal_bytes(p, b, steps, buckets));
+        }
+    }
     out.bytes         = out.general_bytes;
     if (p.vision) {
         out.vision =

@@ -2,7 +2,6 @@
 
 #include "models/common/context/prefix.h"
 #include "models/common/context/snapshot.h"
-#include "models/inkling2/definition.h"
 #include "models/inkling2/session/session.h"
 #include "models/inkling2/state/continuation.h"
 
@@ -196,7 +195,7 @@ struct ContextOperation {
 };
 
 struct ComputeTransaction {
-    enum class Kind { Prefill, Replay, Ordinary, Control, Score };
+    enum class Kind { Prefill, Replay, Ordinary, Speculative, Control, Score };
 
     Kind kind;
     context::ContextTransaction context;
@@ -204,6 +203,10 @@ struct ComputeTransaction {
     std::vector<SequenceHandle> members;
     std::vector<WorkRow> rows;
     std::optional<ComputeResult> result;
+    std::optional<speculative::DecodeRoundPlan> round;
+    std::vector<std::uint8_t> could_speculate;
+    std::optional<speculative::CostQuery> cost_query;
+    bool record_online_cost = false;
     ExecutionSample observed_result;
     std::vector<runtime::CommitDecision> decisions;
     std::unique_ptr<context::ContextTransaction> completion;
@@ -235,7 +238,7 @@ public:
         PreparedCheckpoint checkpoint;
     };
 
-    SessionImpl(std::shared_ptr<const ModelDefinition>, SessionPlan,
+    SessionImpl(SessionPlan,
                 std::unique_ptr<context::ContextDirectory>);
     ~SessionImpl();
 
@@ -303,7 +306,6 @@ public:
                   const ContextDemand&) const;
     [[nodiscard]] PhysicalUsageSnapshot usage() const noexcept;
 
-    std::shared_ptr<const ModelDefinition> definition;
     const SessionPlan plan;
     speculative::SpeculativeCostModel cost_model;
     const ExecutionShape& shape;

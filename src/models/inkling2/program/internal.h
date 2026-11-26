@@ -2,6 +2,7 @@
 
 #include "models/common/graph/suite.h"
 #include "models/inkling2/execution/text.h"
+#include "models/inkling2/execution/dspark.h"
 #include "models/inkling2/program/program.h"
 #include "ninfer/ops/sampling.h"
 #include "runtime/observability/gpu_timing.h"
@@ -102,7 +103,24 @@ public:
                       std::optional<models::vision::EmbeddingView> = {});
     void project_head(Tensor hidden);
 
-    void copy_result(std::int32_t rows);
+    [[nodiscard]] execution::StateUpdate target_update(const execution::BatchView&);
+    [[nodiscard]] Tensor target_aux(const execution::BatchView&, bool prefill);
+    [[nodiscard]] execution::DSparkExecution dspark_execution();
+    [[nodiscard]] execution::DSparkProposal proposal(const execution::BatchView&, int steps);
+    [[nodiscard]] execution::DSparkRaggedContext
+    prepare_dspark_ragged(const ops::RaggedSequenceView&);
+    void prepare_speculative(const SpeculativeWork&);
+    void prepare_verify(const execution::BatchView&, int steps);
+    void execute_proposal(const execution::BatchView&, int steps, ops::ContextBucket,
+                          bool readback);
+    void readback_proposal(int rows, int steps, bool ids);
+    void accept_dspark(int rows, int width, int steps);
+    void commit_speculative(const Commit&);
+    void execute_speculative_commit(const execution::BatchView&, bool count_tokens,
+                                    const SectionRecorder& record_counts = {});
+
+    void copy_result(std::int32_t rows, int width, SampleKind kind = SampleKind::NextToken);
+    [[nodiscard]] MemorySpan host_output(const TensorRegion&);
     void finish_forward();
     void request_decision();
     void decide();
@@ -111,7 +129,8 @@ public:
     void result();
     void control_counts();
 
-    void prepare_inputs(std::span<const WorkRow>, const BatchPlan&, std::uint32_t tokens);
+    void prepare_inputs(std::span<const WorkRow>, const BatchPlan&, std::uint32_t tokens,
+                        std::span<const std::uint32_t> drafts = {}, int steps = 0);
     void prepare_packed_inputs(const ForwardWork&);
     [[nodiscard]] ops::RaggedSequenceView upload_ragged(const RaggedLayout&, std::int32_t segments);
     void set_sampling_config(const WorkRow&, std::int32_t slot);
@@ -146,7 +165,7 @@ public:
     std::deque<runtime::ExecutionEvent<ExecutionTypes>> events;
     runtime::ExecutionGpuTimer timer;
     std::optional<CudaEventTimer> prefill_timer;
-    CudaCompletionEvent compute_done, context_done;
+    CudaCompletionEvent compute_done, context_done, drafts_done;
     std::size_t lifetime_peak = 0;
     bool drained              = false;
 };

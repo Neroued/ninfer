@@ -52,6 +52,8 @@ struct FrontendResources {
     std::shared_ptr<const std::vector<TokenId>> control_to_text;
     std::shared_ptr<const std::vector<TokenId>> control_to_header;
     std::optional<ProcessorConfig> processor;
+
+    [[nodiscard]] std::uint32_t control_token_limit() const;
 };
 
 void parse_resources(FrontendResources& resources, std::uint32_t embedding_rows);

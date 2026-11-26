@@ -168,6 +168,7 @@ PreparedRankDescription RankPreparation::describe() const {
         }
     }
     out.caches.push_back(p.main.page.geometry);
+    if (p.dspark) out.caches.push_back(p.dspark->page.geometry);
     if (p.workspace.vision) out.vision_max_features = p.workspace.vision->max_features;
     return out;
 }

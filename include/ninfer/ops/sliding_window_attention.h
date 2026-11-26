@@ -25,7 +25,8 @@ namespace ninfer::ops {
  * Symmetric non-causal sliding-window grouped-query attention.
  *
  * Registered profiles are D=128, (Hq,Hkv)=(32,8) with window/cyclic capacity 2048 or 4096,
- * and (16,4) with capacity 2048; both use group 4, scale=1/sqrt(128), T=1..16, B>0.
+ * (16,4) with capacity 2048, and (24,8) with capacity 1024. All use
+ * scale=1/sqrt(128), T=1..16, B>0.
  * q/out are contiguous BF16 [128,Hq,T,B], query_k/query_v are contiguous BF16 [128,Hkv,T,B],
  * positions is contiguous Device I32 [T,B], and Context K/V select dense
  * [128,padded_capacity,Hkv] fields with contiguous Device I64 [B]
@@ -41,7 +42,7 @@ namespace ninfer::ops {
  * temporary key at p_j is visible
  * exactly when abs(p_j-p_i)<window. Thus distance window-1 is included and distance window is
  * excluded; every live query also sees every live temporary query row in its batch row. Query
- * head h reads KV head floor(h/4).
+ * head h reads KV head floor(h/(Hq/Hkv)).
  *
  * Over the visible set J, score[j]=scale*dot(q,K[j]) and out=BF16(sum_j softmax(score)[j]*V[j]).
  * Inputs are interpreted in their represented dtype, including BF16 temporary V and FP16 cached V.

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ninfer/ops/sliding_window_attention.h"
+#include "ops/softmax_attention/kernels/context_query/group3_schedule.h"
 
 namespace ninfer::ops::detail {
 
@@ -13,6 +14,7 @@ struct SlidingWindowAttentionPlan {
     std::int32_t split_capacity;
     std::int32_t max_context;
     std::int32_t window;
+    Group3Schedule group3_schedule;
 };
 
 [[nodiscard]] SlidingWindowAttentionPlan

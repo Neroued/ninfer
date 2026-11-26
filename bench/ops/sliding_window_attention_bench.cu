@@ -21,6 +21,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -44,6 +45,7 @@ struct Options {
     std::vector<std::int32_t> tokens{1, 2, 4, 8, 12, 16};
     std::vector<std::int32_t> contexts{0, 128, 2048, 4095, 4096, 8192, 262144};
     std::vector<std::int32_t> batches{1};
+    std::int32_t query_heads = 0;
     std::int32_t kv_heads = 8;
     workload::ContextQueryOptions workload;
     std::int32_t window = 4096;
@@ -52,12 +54,14 @@ struct Options {
     int warmup          = 5;
     int repeat          = 50;
     int graph_calls     = 1;
+    bool body_timer     = false;
     bool profile        = false;
     std::string csv_out;
 };
 
 struct Result {
     std::int32_t window;
+    std::int32_t query_heads;
     std::int32_t kv_heads;
     std::string_view valid, lengths;
     std::int64_t live_columns;
@@ -67,6 +71,7 @@ struct Result {
     std::int32_t envelope_max;
     ops::ContextBucket bucket;
     std::size_t graph_nodes;
+    const char* timer_scope;
     int graph_calls;
     Execution execution;
     CacheState cache;
@@ -77,20 +82,22 @@ struct Result {
 };
 
 [[noreturn]] void usage(const char* message) {
-    std::fprintf(stderr,
-                 "error: %s\n"
-                 "usage: ninfer_sliding_window_attention_bench "
-                 "[--kv-heads 4|8] [--window 2048|4096] [--tokens 1,...,16] [--batches B,...] "
-                 "[--context 0,...,1048576] [--envelope-max N] "
-                 "[--bucket auto|2k|8k|16k|32k|64k|128k|256k|512k|1m] "
-                 "[--length-dist uniform|skewed-1long|staggered|shared-prefix] "
-                 "[--valid-dist full|ragged|with-inert] [--valid full|half|mixed|zero] "
-                 "[--lengths uniform|mixed] "
-                 "[--execution eager|graph|both] [--cache cold|warm|both] "
-                 "[--warmup N] [--repeat N] [--graph-calls N] [--profile] [--csv-out PATH]\n"
-                 "--context is committed history. Buckets cover history plus live queries.\n"
-                 "--envelope-max sets the auto bucket input when supplied.\n",
-                 message);
+    std::fprintf(
+        stderr,
+        "error: %s\n"
+        "usage: ninfer_sliding_window_attention_bench "
+        "[--query-heads 16|24|32] [--kv-heads 4|8] [--window 1024|2048|4096] [--tokens 1,...,16] "
+        "[--batches B,...] "
+        "[--context 0,...,1048576] [--envelope-max N] "
+        "[--bucket auto|2k|8k|16k|32k|64k|128k|256k|512k|1m] "
+        "[--length-dist uniform|skewed-1long|staggered|shared-prefix] "
+        "[--valid-dist full|ragged|with-inert] [--valid full|half|mixed|zero] "
+        "[--lengths uniform|mixed] "
+        "[--execution eager|graph|both] [--graph-timer launch|body] [--cache cold|warm|both] "
+        "[--warmup N] [--repeat N] [--graph-calls N] [--profile] [--csv-out PATH]\n"
+        "--context is committed history. Buckets cover history plus live queries.\n"
+        "--envelope-max sets the auto bucket input when supplied.\n",
+        message);
     std::exit(2);
 }
 
@@ -107,6 +114,9 @@ Options parse_options(int argc, char** argv) {
         } else if (argument == "--batches" || argument == "--batch") {
             options.batches =
                 bench::measurement::integers(next("--batches requires a value"), 1, INT32_MAX);
+        } else if (argument == "--query-heads") {
+            options.query_heads =
+                bench::measurement::integer(next("--query-heads requires a value"), 16, 32);
         } else if (argument == "--kv-heads") {
             options.kv_heads =
                 bench::measurement::integer(next("--kv-heads requires a value"), 4, 8);
@@ -131,9 +141,9 @@ Options parse_options(int argc, char** argv) {
                 workload::parse_bucket_override(next("--bucket requires a value"));
         } else if (argument == "--window") {
             options.window =
-                bench::measurement::integer(next("--window requires a value"), 2048, 4096);
-            if (options.window != 2048 && options.window != 4096) {
-                usage("--window expects 2048 or 4096");
+                bench::measurement::integer(next("--window requires a value"), 1024, 4096);
+            if (options.window != 1024 && options.window != 2048 && options.window != 4096) {
+                usage("--window expects 1024, 2048 or 4096");
             }
         } else if (argument == "--context") {
             options.contexts = bench::measurement::integers(next("--context requires a value"), 0,
@@ -151,6 +161,10 @@ Options parse_options(int argc, char** argv) {
                 options.execution = Execution::Both;
             else
                 usage("--execution expects eager, graph, or both");
+        } else if (argument == "--graph-timer") {
+            const std::string_view value(next("--graph-timer requires a value"));
+            if (value != "body" && value != "launch") usage("--graph-timer expects launch or body");
+            options.body_timer = value == "body";
         } else if (argument == "--cache") {
             const std::string_view value(next("--cache requires a value"));
             if (value == "cold")
@@ -187,6 +201,7 @@ Options parse_options(int argc, char** argv) {
     }
     if (options.graph_calls > 1 && (options.execution != Execution::Graph || options.profile))
         usage("graph bundles require --execution graph and no --profile");
+    if (options.query_heads == 0) options.query_heads = options.kv_heads * 4;
     return options;
 }
 
@@ -217,9 +232,9 @@ class Case {
 public:
     Case(std::int32_t window, std::int32_t tokens, std::int32_t batch, std::int32_t context,
          const Options& options)
-        : geometry_{128, options.kv_heads * 4, options.kv_heads}, window_(window), tokens_(tokens),
-          batch_(batch), workload_(workload::generate_context_query_workload(context, tokens, batch,
-                                                                             options.workload)),
+        : geometry_{kHeadDim, options.query_heads, options.kv_heads}, window_(window),
+          tokens_(tokens), batch_(batch), workload_(workload::generate_context_query_workload(
+                                              context, tokens, batch, options.workload)),
           bucket_(options.workload.select_bucket(workload_.max_visible_tokens)),
           workspace_bytes_(ops::sliding_window_attention_workspace_capacity_bytes(
               geometry_, window, bucket_, batch, tokens, tokens)),
@@ -348,9 +363,10 @@ const char* cache_name(CacheState cache, int graph_calls = 1) {
     return graph_calls == 1 ? "cold" : "cold-before-graph-bundle";
 }
 
-bench::ColdTiming measure(Case& data, Execution execution, CacheState cache,
-                          bench::TimedGraph* graph, bench::L2FlushBuffer& flush,
-                          CudaExecutionView cuda, int warmup, int repeat) {
+template <class Graph>
+bench::ColdTiming measure(Case& data, Execution execution, CacheState cache, const Graph* graph,
+                          bench::L2FlushBuffer& flush, CudaExecutionView cuda, int warmup,
+                          int repeat) {
     if (execution == Execution::Eager) {
         const auto launch = [&](CudaExecutionView cuda) { data.launch(cuda); };
         return cache == CacheState::Cold
@@ -366,16 +382,17 @@ void report(const Result& result) {
     const double seconds = result.timing.median_us * 1.0e-6;
     const double gbps    = result.useful_bytes / seconds / 1.0e9;
     const double tflops  = result.useful_flops / seconds / 1.0e12;
-    std::printf("entry=sliding_window execution=%-5s cache=%-4s W=%d Hkv=%d T=%2d B=%d L=%6d "
-                "bucket=%s lengths=%s valid=%s graph_nodes=%zu "
+    std::printf("entry=sliding_window execution=%-5s cache=%-4s W=%d Hq=%d Hkv=%d T=%2d B=%d L=%6d "
+                "bucket=%s lengths=%s valid=%s graph_nodes=%zu timer=%s "
                 "graph_calls=%d workspace=%8zu "
                 "median=%9.3f us min=%9.3f us p95=%9.3f us "
                 "useful=%8.1f GB/s ",
                 execution_name(result.execution), cache_name(result.cache, result.graph_calls),
-                result.window, result.kv_heads, result.tokens, result.batch, result.context,
-                ops::context_bucket_name(result.bucket).data(), result.lengths.data(),
-                result.valid.data(), result.graph_nodes, result.graph_calls, result.workspace_bytes,
-                result.timing.median_us, result.timing.min_us, result.timing.p95_us, gbps);
+                result.window, result.query_heads, result.kv_heads, result.tokens, result.batch,
+                result.context, ops::context_bucket_name(result.bucket).data(),
+                result.lengths.data(), result.valid.data(), result.graph_nodes, result.timer_scope,
+                result.graph_calls, result.workspace_bytes, result.timing.median_us,
+                result.timing.min_us, result.timing.p95_us, gbps);
     if (result.cache == CacheState::Cold && result.graph_calls == 1) {
         std::printf("logical/DRAM-roof=%5.1f%% of %.0f GB/s ",
                     gbps / bench::kRoofline.memory_gbs * 100.0, bench::kRoofline.memory_gbs);
@@ -396,7 +413,8 @@ void write_csv(const Options& options, const std::vector<Result>& results) {
     output << "entry,execution,cache,window,kv_heads,valid,lengths,live_columns,T,B,context,"
               "envelope_max,"
               "graph_nodes,graph_calls,"
-              "workspace_bytes,useful_bytes,useful_flops,median_us,min_us,p95_us,bucket\n";
+              "workspace_bytes,useful_bytes,useful_flops,median_us,min_us,p95_us,bucket,query_"
+              "heads,timer_scope\n";
     for (const Result& result : results) {
         output << "sliding_window," << execution_name(result.execution) << ','
                << cache_name(result.cache, result.graph_calls) << ',' << result.window << ','
@@ -406,7 +424,8 @@ void write_csv(const Options& options, const std::vector<Result>& results) {
                << result.graph_calls << ',' << result.workspace_bytes << ',' << result.useful_bytes
                << ',' << result.useful_flops << ',' << result.timing.median_us << ','
                << result.timing.min_us << ',' << result.timing.p95_us << ','
-               << ops::context_bucket_name(result.bucket) << '\n';
+               << ops::context_bucket_name(result.bucket) << ',' << result.query_heads << ','
+               << result.timer_scope << '\n';
     }
 }
 
@@ -473,13 +492,20 @@ int main(int argc, char** argv) {
                 for (const std::int32_t batch : options.batches) {
                     Case data(options.window, tokens, batch, context, options);
                     bench::TimedGraph graph;
+                    std::optional<bench::measurement::BodyTimedGraph> body_graph;
                     if (options.execution != Execution::Eager) {
                         data.launch(cuda);
                         CUDA_CHECK(cudaStreamSynchronize(stream));
-                        graph.capture(cuda, [&](CudaExecutionView cuda) {
+                        const auto launch = [&](CudaExecutionView cuda) {
                             for (int call = 0; call < options.graph_calls; ++call)
                                 data.launch(cuda);
-                        });
+                        };
+                        if (options.body_timer) {
+                            body_graph.emplace();
+                            body_graph->capture(cuda, launch);
+                        } else {
+                            graph.capture(cuda, launch);
+                        }
                     }
                     for (const Execution execution : {Execution::Eager, Execution::Graph}) {
                         if ((options.execution == Execution::Eager &&
@@ -493,8 +519,22 @@ int main(int argc, char** argv) {
                                 (options.cache == CacheMode::Warm && cache != CacheState::Warm)) {
                                 continue;
                             }
+                            const bool is_graph     = execution == Execution::Graph;
+                            const auto nodes        = !is_graph    ? 0
+                                                      : body_graph ? body_graph->body_nodes()
+                                                                   : graph.nodes();
+                            const char* timer_scope = !is_graph    ? "eager-launch"
+                                                      : body_graph ? "gpu-body"
+                                                                   : "graph-launch";
+                            const auto timing =
+                                is_graph && body_graph
+                                    ? measure(data, execution, cache, &*body_graph, flush, cuda,
+                                              options.warmup, options.repeat)
+                                    : measure(data, execution, cache, &graph, flush, cuda,
+                                              options.warmup, options.repeat);
                             Result result{
                                 options.window,
+                                options.query_heads,
                                 options.kv_heads,
                                 options.workload.valid_name(),
                                 options.workload.length_name(),
@@ -504,15 +544,15 @@ int main(int argc, char** argv) {
                                 context,
                                 options.workload.envelope_max,
                                 data.bucket(),
-                                execution == Execution::Graph ? graph.nodes() : 0,
+                                nodes,
+                                timer_scope,
                                 options.graph_calls,
                                 execution,
                                 cache,
                                 data.workspace_bytes(),
                                 data.useful_bytes(),
                                 data.useful_flops(),
-                                measure(data, execution, cache, &graph, flush, cuda, options.warmup,
-                                        options.repeat),
+                                timing,
                             };
                             result.timing.median_us /= options.graph_calls;
                             result.timing.min_us /= options.graph_calls;

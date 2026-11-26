@@ -23,8 +23,9 @@ void require_profile(AttentionHeadGeometry geometry, std::uint32_t window, const
     const bool full =
         geometry.query_heads == 32 && geometry.kv_heads == 8 && (window == 2048 || window == 4096);
     const bool half = geometry.query_heads == 16 && geometry.kv_heads == 4 && window == 2048;
+    const bool group3 = geometry.query_heads == 24 && geometry.kv_heads == 8 && window == 1024;
     if (!valid_attention_head_geometry(geometry) || geometry.head_dim != kHeadDim ||
-        (!full && !half)) {
+        (!full && !half && !group3)) {
         throw std::invalid_argument(std::string(op) + ": unsupported head/window profile");
     }
 }
@@ -32,9 +33,10 @@ void require_profile(AttentionHeadGeometry geometry, std::uint32_t window, const
 void validate_context(const ConstCyclicKVCacheLayerView& context, AttentionHeadGeometry geometry,
                       std::uint32_t window, const char* op, Device device) {
     common::operand::device(context.device(), device, op, "cache");
-    if (context.num_kv_heads != geometry.kv_heads || context.head_dim != kHeadDim ||
-        context.capacity != window || context.padded_capacity < context.capacity ||
-        context.k.field.layers != 1 || context.v.field.layers != 1) {
+    if (context.storage != KvCacheStorage::BFloat16 || context.num_kv_heads != geometry.kv_heads ||
+        context.head_dim != kHeadDim || context.capacity != window ||
+        context.padded_capacity < context.capacity || context.k.field.layers != 1 ||
+        context.v.field.layers != 1) {
         throw std::invalid_argument(std::string(op) + ": invalid cyclic context");
     }
     if (context.padded_capacity >
@@ -59,8 +61,10 @@ PartialWorkspace allocate_workspace(Allocator& workspace, AttentionHeadGeometry 
                                     std::int32_t tokens, std::int32_t splits,
                                     std::int32_t batch_size) {
     if (splits == 1) return {};
+    const auto partial_dtype = geometry.query_heads == 24 ? DType::FP16 : DType::FP32;
     return {
-        workspace.alloc(DType::FP32, {kHeadDim, geometry.query_heads, tokens, splits * batch_size}),
+        workspace.alloc(partial_dtype,
+                        {kHeadDim, geometry.query_heads, tokens, splits * batch_size}),
         workspace.alloc(DType::FP32, {geometry.query_heads, tokens, splits * batch_size}),
         workspace.alloc(DType::FP32, {geometry.query_heads, tokens, splits * batch_size}),
     };
@@ -80,7 +84,7 @@ OpGraphProfile sliding_window_attention_graph_profile(AttentionHeadGeometry geom
         std::uint64_t(geometry.kv_heads), std::uint64_t(batch_size),
         std::uint64_t(plan.tokens),       std::uint64_t(plan.window),
         std::uint64_t(plan.reduce_warps), std::uint64_t(plan.split_capacity),
-        std::uint64_t(plan.max_context)};
+        std::uint64_t(plan.max_context),  std::uint64_t(plan.group3_schedule)};
     return detail::make_op_graph_profile(words);
 }
 

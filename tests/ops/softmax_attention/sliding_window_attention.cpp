@@ -33,7 +33,7 @@ constexpr int D = 128, Lanes = 8;
 constexpr float Scale = 0.08838834764831844055f;
 // BF16 RNE alone permits up to 2^-8 relative error. A constant vector can reach
 // that bound in L2 as well; allow 0.45% for final rounding and attention arithmetic.
-// Both geometries and every input recipe use the same unrounded FP64 oracle and criterion.
+// All geometries and every input recipe use the same unrounded FP64 oracle and criterion.
 constexpr ReductionCriterion Criterion{4.5e-3, 3e-4, 4.5e-3};
 constexpr std::array<int, 8> LaneOrder{7, 0, 4, 2, 6, 1, 5, 3};
 
@@ -57,6 +57,8 @@ std::vector<std::uint16_t> fp16_bits(std::vector<float>& v) {
 struct Cache {
     int window, padded, kv_heads;
     bool boundary;
+
+    int query_heads() const { return kv_heads * (window == 1024 ? 3 : 4); }
     std::vector<float> k, v;
     std::vector<std::uint16_t> k_bits, v_bits;
     GuardedDeviceBuffer device_k, device_v;
@@ -119,13 +121,13 @@ struct Cache {
     }
 };
 
-// One naive FP64 oracle for both cache windows, every route, and every execution mode. The
+// One naive FP64 oracle for all cache windows, every route, and every execution mode. The
 // cached interval and |key_position-query_position| predicate come from the public formula.
 std::vector<double> oracle(const Cache& cache, int width, int batch, const std::vector<float>& q,
                            const std::vector<float>& qk, const std::vector<float>& qv,
                            const std::vector<int>& positions, const std::vector<int>& valid,
                            const std::vector<int>& lanes) {
-    const int Hkv = cache.kv_heads, Hq = Hkv * 4;
+    const int Hkv = cache.kv_heads, Hq = cache.query_heads();
     const ops::AttentionHeadGeometry geometry{D, Hq, Hkv};
     std::vector<double> out(static_cast<std::size_t>(D) * Hq * width * batch, 0.0);
     parallel_rows(
@@ -188,7 +190,7 @@ enum class Prefix { Full, Mixed, Zero };
 
 int run_case(Cache& cache, int width, int batch, int base_context, ContextBucket initial_bucket,
              Prefix prefix, bool replay, bool cross_bucket = false) {
-    const int Hkv = cache.kv_heads, Hq = Hkv * 4;
+    const int Hkv = cache.kv_heads, Hq = cache.query_heads();
     const ops::AttentionHeadGeometry geometry{D, Hq, Hkv};
     const std::size_t q_count  = static_cast<std::size_t>(D) * Hq * width * batch;
     const std::size_t kv_count = static_cast<std::size_t>(D) * Hkv * width * batch;
@@ -258,11 +260,11 @@ int run_case(Cache& cache, int width, int batch, int base_context, ContextBucket
         };
         const auto first  = profile(ContextBucket::K2);
         const auto second = profile(ContextBucket::K8);
-        failures += (first == second) != (cache.window == 2048);
+        failures += (first == second) != (cache.window <= 2048);
         for (const auto bucket : ops::kAllContextBuckets) {
             const std::size_t index = captures.size();
             captures.emplace_back(execution, [&](auto cuda) { launch(bucket, cuda); });
-            const std::size_t representative = cache.window == 2048 || index == 0 ? 0 : 1;
+            const std::size_t representative = cache.window <= 2048 || index == 0 ? 0 : 1;
             if (captures.back().params().size() != 2 ||
                 profile(bucket) != (representative == 0 ? first : second) ||
                 !same_kernel_launches(captures[representative], captures.back())) {
@@ -476,6 +478,18 @@ int main(int argc, char** argv) {
         add(recipe, 1, 129, 2048, Prefix::Zero, false);
     }
 
+    const Recipe group3{1024};
+    for (int width = 1; width <= 16; ++width) add(group3, width, 4, -1, Prefix::Mixed, false);
+    for (int width : {1, 2, 4, 8, 12, 16}) {
+        add(group3, width, 1, 0, Prefix::Full, true);
+        add(group3, width, 4, 1031, Prefix::Mixed, true);
+    }
+    for (int width : {2, 8, 16}) add({1024, true}, width, 1, 1024, Prefix::Full, true);
+    add(group3, 8, 8, 1023, Prefix::Mixed, true);
+    add(group3, 16, 16, 128, Prefix::Mixed, true);
+    add(group3, 8, 1, 1031, Prefix::Zero, true);
+    add(group3, 8, 128, 65, Prefix::Mixed, true);
+
     for (const auto& [recipe, cases] : groups) {
         const auto [window, boundary, heads] = recipe;
         std::vector<OpCase> catalogue;
@@ -499,7 +513,15 @@ int main(int argc, char** argv) {
             return failures + cache.verify();
         });
     }
-    for (const auto& [window, heads] : {std::pair{2048, 4}, {2048, 8}, {4096, 8}})
+    suite.add("swa/window1024/large-fp16-values", [] {
+        Cache cache(1024);
+        std::fill(cache.v.begin(), cache.v.end(), 65504.F);
+        cache.v_bits = fp16_bits(cache.v);
+        cache.device_v.copy_from_host(cache.v_bits.data(), cache.v_bits.size() * 2);
+        const auto failures = run_case(cache, 8, 1, 1031, ContextBucket::K2, Prefix::Full, false);
+        return failures + cache.verify();
+    });
+    for (const auto& [window, heads] : {std::pair{1024, 8}, {2048, 4}, {2048, 8}, {4096, 8}})
         suite.add("swa/cross-bucket/window" + std::to_string(window) + "/h" + std::to_string(heads),
                   [=] {
                       Cache cache(window, false, heads);
@@ -511,19 +533,20 @@ int main(int argc, char** argv) {
     suite.add("swa/capacity", [] {
         int failures = 0;
         constexpr ContextBucketRange buckets{ContextBucket::K2, ContextBucket::M1};
-        for (int heads : {4, 8})
+        for (auto [query_heads, heads, window] :
+             {std::tuple{16, 4, 2048}, {32, 8, 2048}, {24, 8, 1024}})
             for (int batch = 1; batch <= 8; ++batch) {
-                const ops::AttentionHeadGeometry geometry{D, heads * 4, heads};
+                const ops::AttentionHeadGeometry geometry{D, query_heads, heads};
                 for (auto [lo, hi] : {std::pair{1, 16}, {4, 5}, {8, 9}}) {
                     std::size_t peak = 0;
                     buckets.for_each([&](ContextBucket bucket) {
                         for (int width = lo; width <= hi; ++width)
                             peak = std::max(peak,
                                             ops::sliding_window_attention_workspace_capacity_bytes(
-                                                geometry, 2048, bucket, batch, width, width));
+                                                geometry, window, bucket, batch, width, width));
                     });
                     failures += peak != ops::sliding_window_attention_workspace_capacity_bytes(
-                                            geometry, 2048, buckets, batch, lo, hi);
+                                            geometry, window, buckets, batch, lo, hi);
                 }
             }
         const auto reject = [&](auto&& fn) {

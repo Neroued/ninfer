@@ -57,7 +57,7 @@ struct BpeMergeEntry {
     int result        = -1;
 };
 
-enum class BpeSplit : std::uint8_t { LetterMarkDigit1, LetterDigit3 };
+enum class BpeSplit : std::uint8_t { LetterMarkDigit1, LetterDigit3, O200k };
 
 struct BpePipeline {
     bool normalize_nfc = false;

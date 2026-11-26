@@ -16,6 +16,7 @@ from tokenizers import Tokenizer
 ROOT = Path(__file__).resolve().parents[2]
 QWEN_SPLIT = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
 GLM_SPLIT = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+O200K_SPLIT = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+"
 
 
 def byte_alphabet():
@@ -248,6 +249,9 @@ def cases(source):
         " \x85a",
         "👨‍👩‍👧‍👦👍🏽",
         "I'm WE'RE we'd can't 'S 'ſ",
+        "FooBar FOOBar fooBar HTTPServer getHTTPResponse200",
+        "don't DON'T A's a'S 're 't X\u0301Y \u0301A \u0301Ab ǅa ǅA",
+        "https://example.com/a/b\n//comment\r\n///",
         "给主人留下些什么吧",
         "straße Verhältnis",
         "hältnis",
@@ -400,9 +404,13 @@ def main():
     temp_root = ROOT / ".agent-tmp" / "tokenizer-oracle"
     temp_root.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=temp_root) as directory:
-        for nfc, pattern in ((True, QWEN_SPLIT), (False, GLM_SPLIT)):
+        for label, nfc, pattern in (
+            ("qwen", True, QWEN_SPLIT),
+            ("glm", False, GLM_SPLIT),
+            ("o200k", False, O200K_SPLIT),
+        ):
             for ignore in (False, True):
-                root = Path(directory) / f"{'nfc' if nfc else 'none'}-ignore-{ignore}"
+                root = Path(directory) / f"{label}-ignore-{ignore}"
                 root.mkdir()
                 source = synthetic_resource(nfc, pattern, ignore)
                 stored = dict(source)

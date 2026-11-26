@@ -32,6 +32,9 @@ constexpr std::string_view kQwenSplitPattern =
 constexpr std::string_view kLetterDigit3Pattern =
     R"glm((?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+)glm";
 
+constexpr std::string_view kO200kSplitPattern =
+    R"o200k([^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+)o200k";
+
 BpePipeline parse_pipeline(const Json& root, const Json& model) {
     const auto require = [](bool valid, const char* field) {
         if (!valid) {
@@ -60,10 +63,16 @@ BpePipeline parse_pipeline(const Json& root, const Json& model) {
                     split.value("invert", Json(false)) == false,
                 "pre_tokenizer.Split");
         const auto pattern = split["pattern"].value("Regex", std::string{});
-        require(pattern == kQwenSplitPattern || pattern == kLetterDigit3Pattern,
+        require(pattern == kQwenSplitPattern || pattern == kLetterDigit3Pattern ||
+                    pattern == kO200kSplitPattern,
                 "pre_tokenizer.Split.pattern");
-        pipeline.split =
-            pattern == kQwenSplitPattern ? BpeSplit::LetterMarkDigit1 : BpeSplit::LetterDigit3;
+        if (pattern == kQwenSplitPattern) {
+            pipeline.split = BpeSplit::LetterMarkDigit1;
+        } else if (pattern == kLetterDigit3Pattern) {
+            pipeline.split = BpeSplit::LetterDigit3;
+        } else {
+            pipeline.split = BpeSplit::O200k;
+        }
         require(type(bytes, "ByteLevel") && bytes.value("add_prefix_space", Json(true)) == false &&
                     bytes.value("use_regex", Json(true)) == false,
                 "pre_tokenizer.ByteLevel");
@@ -555,6 +564,172 @@ std::size_t word_end(std::string_view text, std::size_t begin) {
     return after_first;
 }
 
+bool is_o200k_upper_like(std::int32_t codepoint) noexcept {
+    // [\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]
+    return (uni::is_letter(codepoint) && !uni::is_lowercase_letter(codepoint)) ||
+           uni::is_mark(codepoint);
+}
+
+bool is_o200k_lower_like(std::int32_t codepoint) noexcept {
+    // [\p{Ll}\p{Lm}\p{Lo}\p{M}]
+    return (uni::is_letter(codepoint) && !uni::is_uppercase_or_titlecase_letter(codepoint)) ||
+           uni::is_mark(codepoint);
+}
+
+bool is_o200k_both(std::int32_t codepoint) noexcept {
+    // [\p{Lm}\p{Lo}\p{M}]
+    return is_o200k_upper_like(codepoint) && is_o200k_lower_like(codepoint);
+}
+
+std::size_t match_contraction_end(std::string_view text, std::size_t offset) {
+    if (offset >= text.size() || text[offset] != '\'') { return offset; }
+    const std::size_t after = offset + 1;
+    // The regex's Unicode case-insensitive 's also matches LONG S (U+017F).
+    if (text.substr(after).starts_with("\xC5\xBF")) return after + 2;
+    constexpr std::string_view suffixes[] = {"s", "t", "re", "ve", "m", "ll", "d"};
+    for (std::string_view suffix : suffixes) {
+        if (ascii_ci_matches(text, after, suffix)) { return after + suffix.size(); }
+    }
+    return offset;
+}
+
+// Match [\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+ starting at `start`.
+// Returns 0 on failure; otherwise the byte offset after the greedy match.
+std::size_t match_o200k_lower_word_body(std::string_view text, std::size_t start) {
+    std::size_t end        = start;
+    std::size_t last_b_end = 0;
+    while (end < text.size()) {
+        const auto cp = input_codepoint_at(text, end);
+        if (!is_o200k_upper_like(cp.value)) { break; }
+        end += cp.length;
+        if (is_o200k_both(cp.value)) { last_b_end = end; }
+    }
+    if (end < text.size()) {
+        const auto next = input_codepoint_at(text, end);
+        if (uni::is_lowercase_letter(next.value)) {
+            end += next.length;
+            while (end < text.size()) {
+                const auto cp = input_codepoint_at(text, end);
+                if (!is_o200k_lower_like(cp.value)) { break; }
+                end += cp.length;
+            }
+            return end;
+        }
+    }
+    return last_b_end;
+}
+
+// Match [\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]* starting at `start`.
+// Returns 0 on failure; otherwise the byte offset after the greedy match.
+std::size_t match_o200k_upper_word_body(std::string_view text, std::size_t start) {
+    if (start >= text.size()) { return 0; }
+    const auto first = input_codepoint_at(text, start);
+    if (!is_o200k_upper_like(first.value)) { return 0; }
+    std::size_t end = start + first.length;
+    while (end < text.size()) {
+        const auto cp = input_codepoint_at(text, end);
+        if (!is_o200k_upper_like(cp.value)) { break; }
+        end += cp.length;
+    }
+    while (end < text.size()) {
+        const auto cp = input_codepoint_at(text, end);
+        if (!is_o200k_lower_like(cp.value)) { break; }
+        end += cp.length;
+    }
+    return end;
+}
+
+std::size_t word_end_o200k(std::string_view text, std::size_t begin) {
+    const uni::CodepointSpan first = input_codepoint_at(text, begin);
+    const std::size_t after_first  = begin + first.length;
+    const std::int32_t cp          = first.value;
+    const bool is_prefix           = is_non_newline_non_letter_non_number(cp);
+
+    // Branch 1: [^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|...)?
+    if (is_prefix) {
+        if (const std::size_t body = match_o200k_lower_word_body(text, after_first)) {
+            return match_contraction_end(text, body);
+        }
+    }
+    if (const std::size_t body = match_o200k_lower_word_body(text, begin)) {
+        return match_contraction_end(text, body);
+    }
+
+    // Branch 2: [^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|...)?
+    if (is_prefix) {
+        if (const std::size_t body = match_o200k_upper_word_body(text, after_first)) {
+            return match_contraction_end(text, body);
+        }
+    }
+    if (const std::size_t body = match_o200k_upper_word_body(text, begin)) {
+        return match_contraction_end(text, body);
+    }
+
+    // Branch 3: \p{N}{1,3}
+    if (uni::is_number(cp)) {
+        std::size_t end = after_first;
+        for (int count = 1; count < 3 && end < text.size(); ++count) {
+            const auto value = input_codepoint_at(text, end);
+            if (!uni::is_number(value.value)) break;
+            end += value.length;
+        }
+        return end;
+    }
+
+    // Branch 4:  ?[^\s\p{L}\p{N}]+[\r\n/]*
+    const auto is_sym   = [](std::int32_t c) noexcept {
+        return !uni::is_whitespace(c) && !uni::is_letter(c) && !uni::is_number(c);
+    };
+    const bool has_next     = after_first < text.size();
+    const std::int32_t next = has_next ? input_codepoint_at(text, after_first).value : 0;
+    if ((cp == ' ' && has_next && is_sym(next)) || is_sym(cp)) {
+        std::size_t end = cp == ' ' ? after_first : begin;
+        while (end < text.size()) {
+            const auto value = input_codepoint_at(text, end);
+            if (!is_sym(value.value)) { break; }
+            end += value.length;
+        }
+        while (end < text.size()) {
+            const auto value = input_codepoint_at(text, end);
+            if (!is_newline(value.value) && value.value != '/') { break; }
+            end += value.length;
+        }
+        return end;
+    }
+
+    // Branches 5, 6, 7: \s*[\r\n]+|\s+(?!\S)|\s+
+    if (uni::is_whitespace(cp)) {
+        std::size_t end              = begin;
+        std::size_t last_begin       = begin;
+        std::size_t last_newline_end = std::string_view::npos;
+        std::size_t count            = 0;
+        while (end < text.size()) {
+            const auto value = input_codepoint_at(text, end);
+            if (!uni::is_whitespace(value.value)) { break; }
+            last_begin = end;
+            end += value.length;
+            ++count;
+            if (is_newline(value.value)) { last_newline_end = end; }
+        }
+        if (last_newline_end != std::string_view::npos) { return last_newline_end; }
+        if (end == text.size()) { return end; }
+        return count >= 2 ? last_begin : end;
+    }
+
+    return after_first;
+}
+
+std::size_t next_word_end(BpeSplit split, std::string_view text, std::size_t begin) {
+    switch (split) {
+    case BpeSplit::LetterMarkDigit1:
+        return word_end<BpeSplit::LetterMarkDigit1>(text, begin);
+    case BpeSplit::LetterDigit3:
+        return word_end<BpeSplit::LetterDigit3>(text, begin);
+    case BpeSplit::O200k:
+        return word_end_o200k(text, begin);
+    }
+    return begin + 1;
+}
 bool is_stop_token_id(std::span<const int> stop_token_ids, int id) {
     return std::find(stop_token_ids.begin(), stop_token_ids.end(), id) != stop_token_ids.end();
 }
@@ -616,9 +791,7 @@ bool append_normalized_bpe_ids(std::vector<int>& ids, std::string_view normalize
     if (ids.size() == max_tokens) { return false; }
 
     for (std::size_t begin = 0; begin < normalized.size();) {
-        const std::size_t end = pipeline.split == BpeSplit::LetterMarkDigit1
-                                    ? word_end<BpeSplit::LetterMarkDigit1>(normalized, begin)
-                                    : word_end<BpeSplit::LetterDigit3>(normalized, begin);
+        const std::size_t end = next_word_end(pipeline.split, normalized, begin);
         const std::string_view word(normalized.data() + begin, end - begin);
         if (pipeline.ignore_merges) {
             if (const auto found = whole_tokens.find(word); found != whole_tokens.end()) {

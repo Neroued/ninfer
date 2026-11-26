@@ -96,6 +96,21 @@ bool is_letter(std::int32_t codepoint) noexcept {
     }
 }
 
+bool is_uppercase_or_titlecase_letter(std::int32_t codepoint) noexcept {
+    if (static_cast<std::uint32_t>(codepoint) < 0x80U) {
+        return codepoint >= 'A' && codepoint <= 'Z';
+    }
+    const auto category = utf8proc_category(codepoint);
+    return category == UTF8PROC_CATEGORY_LU || category == UTF8PROC_CATEGORY_LT;
+}
+
+bool is_lowercase_letter(std::int32_t codepoint) noexcept {
+    if (static_cast<std::uint32_t>(codepoint) < 0x80U) {
+        return codepoint >= 'a' && codepoint <= 'z';
+    }
+    return utf8proc_category(codepoint) == UTF8PROC_CATEGORY_LL;
+}
+
 bool is_mark(std::int32_t codepoint) noexcept {
     if (static_cast<std::uint32_t>(codepoint) < 0x80U) { return false; }
     switch (utf8proc_category(codepoint)) {

@@ -862,6 +862,15 @@ void add_mxfp8_cases(OpSuite& suite) {
                           .graph        = true,
                           .indexed      = indexed},
                          a8});
+    cases.push_back({{.tokens          = 2048,
+                      .distribution    = "tail",
+                      .policy          = a8,
+                      .output          = DType::FP32,
+                      .subset          = ExpertSubsetKind::MaskZeros,
+                      .graph           = true,
+                      .missing_routes  = true,
+                      .missing_experts = true},
+                     a8});
 
     std::vector<OpCase> catalog;
     for (std::size_t j = 0; j < cases.size(); ++j) {
@@ -1009,6 +1018,12 @@ int main(int argc, char** argv) {
                      .subset         = ExpertSubsetKind::MaskZeros,
                      .graph          = true,
                      .missing_routes = true});
+    for (int tokens : {383, 384})
+        cases.push_back({.tokens       = tokens,
+                         .distribution = "pool",
+                         .policy       = a4,
+                         .graph        = true,
+                         .per_expert   = true});
     for (auto policy : {a16, a4})
         for (int tokens : {8, 129, 1024})
             cases.push_back({.tokens         = tokens,
@@ -1052,6 +1067,50 @@ int main(int argc, char** argv) {
                     .graph        = true,
                     .per_expert   = true},
                    "custom-caps/mixed");
+    });
+    suite.add("softcap/a16-prefill-product-graph", [] {
+        const Fixture f;
+        int failures = 0;
+        for (float gate_cap : {4.F, 8.F}) {
+            auto p                  = profile(a16);
+            p.ffn.softcap->gate_cap = gate_cap;
+            const Oracle oracle(f, *p.ffn.softcap);
+            failures += run(f, oracle, p,
+                            {.tokens          = 192,
+                             .distribution    = "tail",
+                             .policy          = a16,
+                             .output          = DType::FP32,
+                             .subset          = ExpertSubsetKind::MaskZeros,
+                             .graph           = true,
+                             .missing_routes  = true,
+                             .indexed         = true,
+                             .missing_experts = true},
+                            "a16-prefill-product/graph");
+        }
+        return failures;
+    });
+    suite.add("softcap/a16-prefill-product-dynamic-range", [] {
+        Fixture f(true);
+        // Move the positive gate to a feature present in only one input pattern.
+        // Down observes the tiny negative-gate product in every pattern and never
+        // observes the large positive-gate product that sets the FP16 scale.
+        f.gate.codes[0] = 0x70;
+        f.gate.device_codes.copy_from_host(f.gate.codes.data(), f.gate.codes.size());
+        f.down.codes[0] = 0;
+        f.down.device_codes.copy_from_host(f.down.codes.data(), f.down.codes.size());
+        f.down.multipliers[0] = 1e20F;
+        f.down.device_multipliers.copy_from_host(f.down.multipliers.data(), sizeof(float));
+        f.input[1]   = f32_to_bf16(1.F);
+        f.special    = false;
+        const auto p = profile(a16);
+        const Oracle oracle(f, *p.ffn.softcap);
+        return run(f, oracle, p,
+                   {.tokens       = 192,
+                    .distribution = "reuse",
+                    .policy       = a16,
+                    .output       = DType::FP32,
+                    .graph        = true},
+                   "a16-prefill-product/dynamic-range");
     });
     return suite.main(argc, argv);
 }

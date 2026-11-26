@@ -224,11 +224,11 @@ __device__ __forceinline__ float dot_bf16_group(float sum, EncodedGroupPair weig
 #endif
 }
 
-__global__ void vector_gate(const __nv_bfloat16* x, ExpertMatrixDeviceView bank, const int* ids,
-                            ExpertSubsetKind subset, const int* mask, float* activation,
-                            SoftcappedActivation swiglu, const int* use_grouped = nullptr) {
-    if (use_grouped && *use_grouped) return;
-    const int assignment = blockIdx.y, expert = ids[assignment];
+__device__ __forceinline__ void
+vector_gate_assignment(const __nv_bfloat16* x, ExpertMatrixDeviceView bank, const int* ids,
+                       ExpertSubsetKind subset, const int* mask, float* activation,
+                       SoftcappedActivation swiglu, int assignment) {
+    const int expert = ids[assignment];
     if (!expert_in_subset(subset, mask, expert)) return;
     const auto weight = common::nvfp4_mul_expert_matrix(bank, expert);
     if (!weight.valid) return;
@@ -265,6 +265,22 @@ __global__ void vector_gate(const __nv_bfloat16* x, ExpertMatrixDeviceView bank,
                                (in_partition % 16 / 4 * groups + in_partition / 16) * 4 +
                                in_partition % 4;
         activation[assignment * intermediate + output_row] = swiglu(gate, up);
+    }
+}
+
+template <bool ReuseDispatch = false>
+__global__ void vector_gate(const __nv_bfloat16* x, ExpertMatrixDeviceView bank, const int* ids,
+                            ExpertSubsetKind subset, const int* mask, float* activation,
+                            SoftcappedActivation swiglu, const int* use_grouped = nullptr,
+                            int assignments = 0) {
+    if constexpr (ReuseDispatch) {
+        if (*use_grouped) return;
+        for (int a = blockIdx.y; a < assignments; a += gridDim.y) {
+            vector_gate_assignment(x, bank, ids, subset, mask, activation, swiglu, a);
+            if (a + gridDim.y < assignments) __syncthreads();
+        }
+    } else {
+        vector_gate_assignment(x, bank, ids, subset, mask, activation, swiglu, blockIdx.y);
     }
 }
 
@@ -371,22 +387,210 @@ __global__ void store_partitions(const float* partitions, Output output, int ele
 
 template <class Output>
 __global__ void store_sum(const float* sum, Output output, int elements) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < elements) output.store(i, output.initial(i, true) + sum[i], true);
+    const int i = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    if (i >= elements) return;
+    auto values = common::load_vec<float4>(sum + i);
+    if constexpr (std::is_same_v<Output, moe_cuda::BfloatResult>) {
+        if (output.add_residual) {
+            const auto residual = common::load_state_float4(output.data + i);
+            values.x += residual.x;
+            values.y += residual.y;
+            values.z += residual.z;
+            values.w += residual.w;
+        }
+    }
+    common::store_state_float4(output.data + i, values);
 }
 
-template <bool Gate, int Columns>
-void launch_bf16(const Tensor& x, const CudaSwiGLUExperts& w, const ExpertRoutes& routes,
-                 const clamped::Storage& s, SoftcappedActivation activation, int jobs,
-                 CudaExecutionView execution, int job_columns = Columns, int minimum = 0,
-                 int maximum = INT_MAX) {
+constexpr unsigned bf16_product_bit = 1U << 30;
+static_assert(top_k * slice_tokens <= bf16_product_bit);
+
+__global__ __launch_bounds__(128) void normalize_product(clamped::A16Product product, Groups groups,
+                                                         ExpertMatrixDeviceView gate_up,
+                                                         const int* ids) {
+    constexpr int threads = 128, vectors = intermediate / 4;
+    constexpr int batches = (vectors + threads - 1) / threads;
+    const int packed      = blockIdx.x;
+    if (packed >= groups.offsets[experts]) return;
+
+    const int expert   = ids[groups.assignments[packed]];
+    const bool present = common::nvfp4_mul_expert_matrix(gate_up, expert).valid;
+    const int tid = threadIdx.x, lane = tid % 32;
+    auto* row          = product.values + packed * (2 * intermediate);
+    const auto* source = reinterpret_cast<const float*>(row);
+    float4 values[batches]{};
+    float maximum = 0, negative_minimum = -CUDART_INF_F;
+    const auto include = [&](float value) {
+        const float magnitude = fabsf(value);
+        maximum               = fmaxf(maximum, magnitude);
+        if (value != 0)
+            negative_minimum = fmaxf(negative_minimum, isfinite(value) ? -magnitude : 0.F);
+    };
+#pragma unroll
+    for (int batch = 0; batch < batches; ++batch) {
+        const int index = tid + batch * threads;
+        if (present && index < vectors)
+            values[batch] = common::load_vec<float4>(source + index * 4);
+        const auto v = values[batch];
+        include(v.x);
+        include(v.y);
+        include(v.z);
+        include(v.w);
+    }
+    __shared__ float maxima[threads / 32], negative_minima[threads / 32];
+    maximum          = common::warp_max(maximum);
+    negative_minimum = common::warp_max(negative_minimum);
+    if (!lane) {
+        maxima[tid / 32]          = maximum;
+        negative_minima[tid / 32] = negative_minimum;
+    }
+    __syncthreads();
+    maximum = common::warp_max(lane < threads / 32 ? maxima[lane] : 0.F);
+    maximum = __shfl_sync(0xffffffff, maximum, 0);
+    negative_minimum =
+        common::warp_max(lane < threads / 32 ? negative_minima[lane] : -CUDART_INF_F);
+    negative_minimum = __shfl_sync(0xffffffff, negative_minimum, 0);
+
+    // The selected caps bound the maximum. An exponent shift brings it near 2^14.
+    const int power    = int((__float_as_uint(maximum) >> 23) & 255) - 127;
+    const int exponent = max(8, min(126, 14 - power));
+    const float scale  = __uint_as_float(unsigned(127 + exponent) << 23);
+    // At 2^-17 the FP16 subnormal rounding error is within BF16 relative precision.
+    // Keep both BF16 components for rows containing smaller nonzero values.
+    const bool split = -negative_minimum * scale < 0x1p-17F;
+
+    // All source components are private registers after the reduction. The FP32
+    // row can hold either two BF16 planes or FP16 codes followed by the exponent.
+#pragma unroll
+    for (int batch = 0; batch < batches; ++batch) {
+        const int index = tid + batch * threads;
+        if (index >= vectors) continue;
+        const auto v = values[batch];
+        if (split) {
+            const clamped::A16Product pair{row, row + intermediate};
+            nvfp4::a16::store_product<false>(pair, index * 4, v.x);
+            nvfp4::a16::store_product<false>(pair, index * 4 + 1, v.y);
+            nvfp4::a16::store_product<false>(pair, index * 4 + 2, v.z);
+            nvfp4::a16::store_product<false>(pair, index * 4 + 3, v.w);
+        } else {
+            common::store_vec(row + index * 4,
+                              make_uint2(common::pack_f16x2(v.x * scale, v.y * scale),
+                                         common::pack_f16x2(v.z * scale, v.w * scale)));
+        }
+    }
+    if (!tid) {
+        // The packed IDs remain below this bit for every possible token slice.
+        if (split)
+            groups.assignments[packed] |= bf16_product_bit;
+        else
+            *reinterpret_cast<std::uint8_t*>(row + intermediate) = exponent;
+    }
+}
+
+template <bool Fp16>
+using ScaledDown = nvfp4::a16::Schedule<intermediate, false, 128, 32, 64, 2, Fp16, false, hidden>;
+
+template <bool Fp16>
+__device__ __forceinline__ void
+down_product_tile(nvfp4::a16::Tile<ScaledDown<Fp16>>& tile, clamped::A16Product product,
+                  common::Nvfp4MultiplierMatrix weight, int row_begin, int packed, int columns,
+                  unsigned selected, const int* assignments, const float* coefficients,
+                  float* sum) {
+    using S = ScaledDown<Fp16>;
+    if (threadIdx.x < S::columns) {
+        const int column     = threadIdx.x;
+        const int row        = packed + column;
+        tile.sources[column] = selected & (1U << column) ? (Fp16 ? row : 2 * row) : -1;
+    }
+    __syncthreads();
+    if constexpr (!Fp16) product.residual = product.values + intermediate;
+    float acc[2][S::mma_tokens][4]{};
+    nvfp4::a16::contract<S, false>(tile, row_begin, weight, nullptr, product, columns, acc);
+
+    const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+#pragma unroll
+    for (int n = 0; n < S::mma_tokens; ++n) {
+#pragma unroll
+        for (int t = 0; t < 2; ++t) {
+            const int column = n * 8 + (lane & 3) * 2 + t;
+            if (!(selected & (1U << column))) continue;
+            const int index         = packed + column;
+            const int assignment    = assignments[index] & ~bf16_product_bit;
+            const float coefficient = coefficients[assignment];
+            const float factor      = weight.multiplier * coefficient;
+            const float inverse = nvfp4::a16::product_inverse<intermediate, Fp16>(product, index);
+            auto* output        = sum + (assignment / top_k) * hidden + row_begin;
+#pragma unroll
+            for (int m = 0; m < 2; ++m)
+#pragma unroll
+                for (int half = 0; half < 2; ++half) {
+                    const int row   = warp * 32 + m * 16 + (lane >> 2) + half * 8;
+                    const float dot = acc[m][n][t + half * 2] * inverse;
+                    const float value =
+                        isfinite(factor)
+                            ? dot * factor
+                            : scale_accumulator_wide(dot, weight.multiplier, coefficient);
+                    atomicAdd(output + row, value);
+                }
+        }
+    }
+    __syncthreads();
+}
+
+__global__ __launch_bounds__(128) void down_scaled_product(ExpertMatrixDeviceView bank,
+                                                           Groups groups,
+                                                           clamped::A16Product product,
+                                                           const float* coefficients, float* sum,
+                                                           int job_columns) {
+    using HalfTile     = nvfp4::a16::Tile<ScaledDown<true>>;
+    using WideTile     = nvfp4::a16::Tile<ScaledDown<false>>;
+    constexpr int rows = ScaledDown<true>::rows, columns = ScaledDown<true>::columns;
+    constexpr int row_tiles = hidden / rows;
+    static_assert(sizeof(HalfTile) <= sizeof(WideTile));
+    auto* shared       = common::shared_storage<sizeof(WideTile)>();
+    const int lane     = threadIdx.x % 32;
+    const int subtiles = job_columns / columns;
+    const int tasks    = *groups.jobs * subtiles * row_tiles;
+    for (int task = blockIdx.x; task < tasks; task += gridDim.x) {
+        const int job    = task / (subtiles * row_tiles);
+        const int expert = groups.job_experts[job];
+        const int packed = groups.offsets[expert] + groups.job_columns[job] +
+                           (task / row_tiles % subtiles) * columns;
+        const int live = min(columns, groups.offsets[expert + 1] - packed);
+        if (live <= 0) continue;
+        const auto weight = common::nvfp4_mul_expert_matrix(bank, expert);
+        if (!weight.valid) continue;
+
+        // Each warp sees the same column mask. A mixed tile reuses the shared
+        // pipeline for its FP16 and BF16 columns in turn.
+        const bool wide = lane < live && (groups.assignments[packed + lane] & bf16_product_bit);
+        const unsigned half_lanes = __ballot_sync(0xffffffff, lane < live && !wide);
+        const unsigned wide_lanes = __ballot_sync(0xffffffff, wide);
+        const int row_begin       = task % row_tiles * rows;
+        if (half_lanes)
+            down_product_tile<true>(*reinterpret_cast<HalfTile*>(shared), product, weight,
+                                    row_begin, packed, live, half_lanes, groups.assignments,
+                                    coefficients, sum);
+        if (wide_lanes)
+            down_product_tile<false>(*reinterpret_cast<WideTile*>(shared), product, weight,
+                                     row_begin, packed, live, wide_lanes, groups.assignments,
+                                     coefficients, sum);
+    }
+}
+
+template <bool Gate, int Columns, bool ScaledProduct = false>
+void launch_a16(const Tensor& x, const CudaSwiGLUExperts& w, const ExpertRoutes& routes,
+                const clamped::Storage& s, SoftcappedActivation activation, int jobs,
+                CudaExecutionView execution, int job_columns = Columns, int minimum = 0,
+                int maximum = INT_MAX) {
     constexpr int rows = 128, step = 64, stages = 2;
-    using S =
-        nvfp4::a16::Schedule<intermediate, Gate, rows, Columns, step, stages, false, false, hidden>;
-    constexpr auto kernel = nvfp4::a16::grouped<intermediate, Gate, rows, Columns, step, stages,
-                                                false, false, false, hidden, SoftcappedActivation>;
-    const int bytes       = common::prepare_shared<sizeof(nvfp4::a16::Tile<S>), kernel>();
-    const int subtiles    = (std::min(job_columns, maximum) + Columns - 1) / Columns;
+    using S = nvfp4::a16::Schedule<intermediate, Gate, rows, Columns, step, stages, ScaledProduct,
+                                   false, hidden>;
+    constexpr auto kernel =
+        nvfp4::a16::grouped<intermediate, Gate, rows, Columns, step, stages, false, ScaledProduct,
+                            false, hidden, SoftcappedActivation>;
+    const int bytes    = common::prepare_shared<sizeof(nvfp4::a16::Tile<S>), kernel>();
+    const int subtiles = (std::min(job_columns, maximum) + Columns - 1) / Columns;
     const int blocks =
         std::min(jobs * subtiles * ((Gate ? intermediate : hidden) / S::feature_rows),
                  execution.multiprocessor_count() * 4);
@@ -436,7 +640,7 @@ void launch(const Tensor& x, const SwiGLUProfile& profile, const CudaSwiGLUExper
     const int tokens = x.ne[1], assignments = top_k * tokens;
 
     if (direct_vector(plan.schedule)) {
-        vector_gate<<<dim3(intermediate / 8, assignments), 256, 0, stream>>>(
+        vector_gate<><<<dim3(intermediate / 8, assignments), 256, 0, stream>>>(
             input, w.bank.gate_up, ids, subset.kind, mask, storage.activation, activation);
         moe_cuda::with_output(destination, mode, [&](auto output) {
             if (plan.schedule == Schedule::VectorComplete) {
@@ -480,11 +684,15 @@ void launch(const Tensor& x, const SwiGLUProfile& profile, const CudaSwiGLUExper
     if (!native_tma(plan.schedule) && !storage.use_grouped) clear_sum();
     switch (plan.schedule) {
     case Schedule::DecodeA4Reuse: {
-        constexpr int rows      = 8;
+        constexpr int rows = 8, vector_token_blocks = 3;
         const auto* use_grouped = storage.use_grouped;
-        vector_gate<<<dim3(intermediate / rows, assignments), rows * 32, 0, stream>>>(
-            input, w.bank.gate_up, ids, subset.kind, mask, storage.activation, activation,
-            use_grouped);
+        // A fixed graph can replay either route. Bound how many CTAs return
+        // immediately when the device selects the grouped route.
+        const int vector_tokens = std::min(tokens, vector_token_blocks);
+        vector_gate<true>
+            <<<dim3(intermediate / rows, vector_tokens * top_k), rows * 32, 0, stream>>>(
+                input, w.bank.gate_up, ids, subset.kind, mask, storage.activation, activation,
+                use_grouped, assignments);
         vector_down_partitioned<rows>
             <<<dim3(hidden / rows, tokens, down_k_partitions), top_k * 32, 0, stream>>>(
                 storage.activation, w.bank.down, ids, coefficients, subset.kind, mask,
@@ -492,33 +700,46 @@ void launch(const Tensor& x, const SwiGLUProfile& profile, const CudaSwiGLUExper
         quantize_input<<<assignments, hidden / 16, 0, stream>>>(
             input, ids, g, calibration(w.activation_calibration.gate_up), s.input_codes,
             static_cast<std::uint8_t*>(s.input_scales), 0, use_grouped, s.routed_sum);
-        launch_fp4<true, 32>(w, routes, s, activation, jobs, execution);
-        launch_fp4<false, 32>(w, routes, s, activation, jobs, execution);
+        // Here an expert fits in one 32-column job. The reuse cutoff bounds
+        // how many experts the grouped branch can activate.
+        const int grouped_jobs = assignments * 2 / minimum_a4_reuse_twice;
+        launch_fp4<true, 32>(w, routes, s, activation, grouped_jobs, execution);
+        launch_fp4<false, 32>(w, routes, s, activation, grouped_jobs, execution);
         break;
     }
     case Schedule::Bf16Short16:
-        launch_bf16<true, 16>(x, w, routes, s, activation, jobs, execution);
-        launch_bf16<false, 16>(x, w, routes, s, activation, jobs, execution);
+        launch_a16<true, 16>(x, w, routes, s, activation, jobs, execution);
+        launch_a16<false, 16>(x, w, routes, s, activation, jobs, execution);
         break;
     case Schedule::Bf16Mma:
-        launch_bf16<true, 32>(x, w, routes, s, activation, jobs, execution);
-        launch_bf16<false, 32>(x, w, routes, s, activation, jobs, execution);
+        launch_a16<true, 32>(x, w, routes, s, activation, jobs, execution);
+        launch_a16<false, 32>(x, w, routes, s, activation, jobs, execution);
         break;
+    case Schedule::A16ScaledProduct: {
+        launch_a16<true, 32, true>(x, w, routes, s, activation, jobs, execution, plan.columns);
+        normalize_product<<<assignments, 128, 0, stream>>>(s.a16_product, g, w.bank.gate_up, ids);
+        using Down       = ScaledDown<true>;
+        const int blocks = std::min(jobs * (plan.columns / Down::columns) * (hidden / Down::rows),
+                                    execution.multiprocessor_count() * 4);
+        down_scaled_product<<<blocks, Down::threads, 0, stream>>>(
+            w.bank.down, g, s.a16_product, coefficients, s.routed_sum, plan.columns);
+        break;
+    }
     case Schedule::Bf16Bucketed: {
         const int bound = 2, medium = 128;
         const int blocks = execution.multiprocessor_count() * 6;
         nvfp4::a16::vector_gate<intermediate, 2, false, hidden, SoftcappedActivation>
             <<<blocks, 128, 0, stream>>>(input, w.bank.gate_up, g, s.a16_product, activation, bound,
                                          clamped::Nvfp4A16Dispatch{});
-        launch_bf16<true, 32>(x, w, routes, s, activation, jobs, execution, plan.columns, bound,
-                              medium);
-        launch_bf16<true, 64>(x, w, routes, s, activation, jobs, execution, plan.columns, medium);
+        launch_a16<true, 32>(x, w, routes, s, activation, jobs, execution, plan.columns, bound,
+                             medium);
+        launch_a16<true, 64>(x, w, routes, s, activation, jobs, execution, plan.columns, medium);
         nvfp4::a16::vector_down<intermediate, 2, false, hidden, SoftcappedActivation>
             <<<blocks, 128, 0, stream>>>(w.bank.down, g, s.a16_product, nullptr, coefficients,
                                          s.routed_sum, bound, clamped::Nvfp4A16Dispatch{});
-        launch_bf16<false, 32>(x, w, routes, s, activation, jobs, execution, plan.columns, bound,
-                               medium);
-        launch_bf16<false, 64>(x, w, routes, s, activation, jobs, execution, plan.columns, medium);
+        launch_a16<false, 32>(x, w, routes, s, activation, jobs, execution, plan.columns, bound,
+                              medium);
+        launch_a16<false, 64>(x, w, routes, s, activation, jobs, execution, plan.columns, medium);
         break;
     }
     case Schedule::Fp4Short:
@@ -566,7 +787,8 @@ void launch(const Tensor& x, const SwiGLUProfile& profile, const CudaSwiGLUExper
             store_partitions<<<(elements + 255) / 256, 256, 0, stream>>>(
                 s.contributions, output, elements, storage.use_grouped, s.routed_sum);
         else
-            store_sum<<<(elements + 255) / 256, 256, 0, stream>>>(s.routed_sum, output, elements);
+            store_sum<<<(elements / 4 + 255) / 256, 256, 0, stream>>>(s.routed_sum, output,
+                                                                      elements);
     });
     CUDA_CHECK(cudaGetLastError());
 }

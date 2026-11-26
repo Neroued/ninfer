@@ -83,7 +83,7 @@ Storage allocate(Arena& arena, Plan plan, int tokens, bool routed) {
     g.job_experts = integers(job_capacity(plan, assignments));
     g.job_columns = integers(job_capacity(plan, assignments));
     g.jobs        = integers(1);
-    if (plan.gate_a8) g.load_range = integers(3);
+    if (plan.gate_a8 && plan.columns() == 128) g.load_range = integers(3);
     // The input scratch becomes the routed FP32 sum after Gate/Up.
     const int input_rows     = plan.gate_a8 ? tokens : 0;
     const auto input_codes   = std::size_t(input_rows) * hidden;

@@ -86,8 +86,8 @@ __global__ void group_small(Routes routes, Addressing gate, Addressing down, Gro
     for (int a = expert; a < assignments; a += experts)
         if (ranks[a] >= 0) {
             const int e = routes.ids[a];
-            const int rank =
-                groups.load_range && counts[e] == assignments / top_k ? a / top_k : ranks[a];
+            // Distinct route IDs give a fully covered expert one row per token.
+            const int rank = counts[e] == assignments / top_k ? a / top_k : ranks[a];
             groups.assignments[groups.offsets[e] + rank] = a;
         }
 }
@@ -118,9 +118,9 @@ __global__ void pack_routes(Routes routes, Addressing gate, Addressing down, Gro
     if (a >= assignments) return;
     const int expert = routes.ids[a];
     if (active(routes, gate, down, expert)) {
-        const int packed = groups.load_range && groups.counts[expert] == assignments / top_k
-                               ? groups.offsets[expert] + a / top_k
-                               : atomicAdd(groups.cursors + expert, 1);
+        const int packed           = groups.counts[expert] == assignments / top_k
+                                         ? groups.offsets[expert] + a / top_k
+                                         : atomicAdd(groups.cursors + expert, 1);
         groups.assignments[packed] = a;
     }
 }
@@ -349,7 +349,7 @@ void launch(const Tensor& input, const SwiGLUProfile& profile, const CudaSwiGLUE
             quantize_input<<<common::div_up(tokens * (hidden / 4), 256), 256, 0, stream>>>(
                 x, storage.input, tokens);
         CUDA_CHECK(cudaGetLastError());
-        launch_mma(x, bank, r.coefficients, activation, plan, storage, tokens, stream);
+        launch_mma(x, bank, r.coefficients, activation, plan, storage, tokens, execution);
     }
     moe_cuda::with_output(output, epilogue, [&](auto destination) {
         if (plan.grouped()) {

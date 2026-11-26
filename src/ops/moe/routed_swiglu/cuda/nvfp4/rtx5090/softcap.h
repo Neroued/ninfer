@@ -22,7 +22,8 @@ enum class Schedule {
     Fp4Short,
     Fp4Mma,
     Sm120Tma64,
-    Sm120TmaDense
+    Sm120TmaDense,
+    A16ScaledProduct
 };
 
 constexpr bool native_tma(Schedule schedule) {
@@ -111,7 +112,10 @@ Storage allocate(Arena& arena, Plan plan, int tokens, bool routed) {
         return storage;
     }
     s.routed_sum = static_cast<float*>(arena.alloc(DType::FP32, {hidden, tokens}).data);
-    if (!quantized(plan.schedule)) {
+    if (plan.schedule == Schedule::A16ScaledProduct) {
+        s.a16_product.values =
+            static_cast<std::uint16_t*>(arena.alloc(DType::FP32, {intermediate, assignments}).data);
+    } else if (!quantized(plan.schedule)) {
         s.a16_product.values =
             static_cast<std::uint16_t*>(arena.alloc(DType::BF16, {intermediate, assignments}).data);
         s.a16_product.residual =

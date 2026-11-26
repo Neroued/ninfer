@@ -27,6 +27,6 @@ __device__ __forceinline__ Matrix resolve(const ExpertMatrixDeviceView& bank, in
 }
 
 void launch_mma(const __nv_bfloat16* x, const ExpertBankDeviceView&, const float* coefficients,
-                SoftcappedActivation, Plan, const Storage&, int tokens, cudaStream_t);
+                SoftcappedActivation, Plan, const Storage&, int tokens, CudaExecutionView);
 
 } // namespace ninfer::ops::detail::moe_routed::mxfp8_softcap

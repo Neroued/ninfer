@@ -201,17 +201,28 @@ __device__ void produce(Shared<S>& tile, const Maps& maps, const Matrix& weight,
     }
 }
 
-template <class S>
+template <class S, bool Persistent = false>
 __device__ __forceinline__ void
 consume(Shared<S>& tile, int lane, int warp, int columns,
-        float (&acc)[S::mmas_tokens][S::branches][S::mmas_rows][4]) {
+        float (&acc)[S::mmas_tokens][S::branches][S::mmas_rows][4], int epoch = 0) {
     const int first_token      = warp / S::row_warps * S::warp_columns;
     const int first_row        = warp % S::row_warps * S::warp_features;
     const int a_row            = (lane & 7) + (lane & 8);
     constexpr int scale_tile   = S::k_tile / 32;
     constexpr int scale_stride = S::gate ? input_scale_stride : product_scale_stride;
     constexpr int steps        = S::k / S::k_tile;
-    int stage = 0, phase = 0;
+    const int start = Persistent ? epoch * steps : 0;
+    int stage = start % S::stages, phase = start / S::stages & 1;
+    if constexpr (Persistent) {
+        if (first_token >= columns) {
+            for (int kt = 0; kt < steps; ++kt) {
+                const int step = start + kt;
+                common::cta_mbarrier_wait(&tile.full[step % S::stages], step / S::stages & 1);
+                if (!lane) common::cta_mbarrier_arrive(&tile.empty[step % S::stages]);
+            }
+            return;
+        }
+    }
 #pragma unroll 1
     for (int kt = 0; kt < steps; ++kt) {
         common::cta_mbarrier_wait(&tile.full[stage], phase);
@@ -397,28 +408,23 @@ template <class S>
 __device__ __forceinline__ void
 emit_transposed(const float (&acc)[S::mmas_tokens][S::branches][S::mmas_rows][4],
                 const Shared<S>& tile, const Storage& storage, int columns, int first_token,
-                int first_row, int lane) {
+                int first_row, int lane, const int* assignments, const float* coefficients) {
 #pragma unroll
     for (int m = 0; m < S::mmas_tokens; ++m) {
+        const int offset = (lane & 1) * 2 + ((lane >> 1) & 1) * 4 + ((lane >> 2) & 1);
+        const int col = first_token + m * 8 + offset;
+        const bool live = col < columns;
+        const int a = live && assignments ? assignments[col] : 0;
+        const float coeff = live ? (assignments ? coefficients[a] : tile.coefficients[col]) : 0;
+        const int token = live ? (assignments ? a / top_k : tile.tokens[col]) : 0;
 #pragma unroll
-        for (int p = 0; p < 2; ++p) {
-            const int col     = first_token + m * 8 + (lane & 3) * 2 + p;
-            const bool live   = col < columns;
-            const float coeff = live ? tile.coefficients[col] : 0;
-            const int token   = live ? tile.tokens[col] : 0;
-#pragma unroll
-            for (int n = 0; n < S::mmas_rows; ++n) {
-#pragma unroll
-                for (int high = 0; high < 2; ++high) {
-                    const float x0 = acc[m][0][n][p + 2 * high] * coeff;
-                    const float x1 = __shfl_down_sync(0xffffffff, x0, 4);
-                    const float x2 = __shfl_down_sync(0xffffffff, x0, 8);
-                    const float x3 = __shfl_down_sync(0xffffffff, x0, 12);
-                    if (live && !(lane & 12))
-                        add_output(storage.sum + token * hidden + first_row + n * 16 + high * 8 +
-                                       lane / 4,
-                                   x0, x1, x2, x3);
-                }
+        for (int n = 0; n < S::mmas_rows; ++n) {
+            const auto& f = acc[m][0][n];
+            const auto quad = common::mma_row_quad(make_float4(f[0], f[1], f[2], f[3]));
+            if (live) {
+                const auto v = quad.values;
+                add_output(storage.sum + token * hidden + first_row + n * 16 + quad.row,
+                           v.x * coeff, v.y * coeff, v.z * coeff, v.w * coeff);
             }
         }
     }
@@ -439,10 +445,18 @@ __global__ __launch_bounds__(Threads, 1) void grouped(const __grid_constant__ Ma
     const int packed        = g.offsets[expert] + local;
     const int columns       = min(S::columns, g.counts[expert] - local);
     const auto weight       = resolve(bank, expert);
-    const bool shared_input = S::gate && S::a8 && g.load_range[0] == tokens;
-    const bool tma_input    = Tma && S::a8 && (!S::gate || shared_input);
-    const bool async_lanes  = !S::bulk || !Tma || !tma_input || S::stage_input_scales;
-    const int input_begin   = shared_input ? local : packed;
+    const bool shared_input = [&] {
+        if constexpr (S::gate && S::a8) {
+            // Narrow tiles can use contiguous input for each full-coverage expert.
+            // Wide tiles use the same staging path for every CTA in the batch.
+            if constexpr (S::columns == 128) return g.load_range[0] == tokens;
+            return g.counts[expert] == tokens;
+        }
+        return false;
+    }();
+    const bool tma_input   = Tma && S::a8 && (!S::gate || shared_input);
+    const bool async_lanes = !S::bulk || !Tma || !tma_input || S::stage_input_scales;
+    const int input_begin  = shared_input ? local : packed;
     extern __shared__ __align__(128) std::uint8_t shared[];
     auto& tile                 = *reinterpret_cast<Shared<S>*>(shared);
     const int active_consumers = ((columns + S::warp_columns - 1) / S::warp_columns) * S::row_warps;
@@ -481,39 +495,114 @@ __global__ __launch_bounds__(Threads, 1) void grouped(const __grid_constant__ Ma
     const int row = row_begin + warp % S::row_warps * S::warp_features + (lane & 3) * 2;
     float acc[S::mmas_tokens][S::branches][S::mmas_rows][4]{};
     consume<S>(tile, lane, warp, columns, acc);
-    if constexpr (S::swapped) {
-        emit_transposed<S>(acc, tile, storage, columns, first_token,
-                           row_begin + warp % S::row_warps * S::warp_features, lane);
-    } else {
+    static_assert(!S::swapped);
 #pragma unroll
-        for (int m = 0; m < S::mmas_tokens; ++m) {
-            if (first_token + m * 16 >= columns) break;
+    for (int m = 0; m < S::mmas_tokens; ++m) {
+        if (first_token + m * 16 >= columns) break;
 #pragma unroll
-            for (int p = 0; p < 2; ++p) {
-                const int col   = first_token + m * 16 + p * 8 + lane / 4;
-                const bool live = col < columns;
-                if constexpr (S::gate) {
-                    float2 product[S::mmas_rows];
+        for (int p = 0; p < 2; ++p) {
+            const int col   = first_token + m * 16 + p * 8 + lane / 4;
+            const bool live = col < columns;
+            if constexpr (S::gate) {
+                float2 product[S::mmas_rows];
 #pragma unroll
-                    for (int n = 0; n < S::mmas_rows; ++n)
-                        product[n] = make_float2(
-                            activation(acc[m][0][n][2 * p], acc[m][1][n][2 * p]),
-                            activation(acc[m][0][n][2 * p + 1], acc[m][1][n][2 * p + 1]));
-                    emit_product(product, storage, row, packed + col, live, lane);
-                } else {
-                    const float coeff = live ? tile.coefficients[col] : 0;
-                    const int token   = live ? tile.tokens[col] : 0;
+                for (int n = 0; n < S::mmas_rows; ++n)
+                    product[n] = make_float2(
+                        activation(acc[m][0][n][2 * p], acc[m][1][n][2 * p]),
+                        activation(acc[m][0][n][2 * p + 1], acc[m][1][n][2 * p + 1]));
+                emit_product(product, storage, row, packed + col, live, lane);
+            } else {
+                const float coeff = live ? tile.coefficients[col] : 0;
+                const int token   = live ? tile.tokens[col] : 0;
 #pragma unroll
-                    for (int n = 0; n < S::mmas_rows; ++n) {
-                        const float x0 = acc[m][0][n][p * 2] * coeff;
-                        const float x1 = acc[m][0][n][p * 2 + 1] * coeff;
-                        const float x2 = __shfl_xor_sync(0xffffffff, x0, 1);
-                        const float x3 = __shfl_xor_sync(0xffffffff, x1, 1);
-                        if (live && !(lane & 1))
-                            add_output(storage.sum + token * hidden + row + n * 8, x0, x1, x2, x3);
-                    }
+                for (int n = 0; n < S::mmas_rows; ++n) {
+                    const float x0 = acc[m][0][n][p * 2] * coeff;
+                    const float x1 = acc[m][0][n][p * 2 + 1] * coeff;
+                    const float x2 = __shfl_xor_sync(0xffffffff, x0, 1);
+                    const float x3 = __shfl_xor_sync(0xffffffff, x1, 1);
+                    if (live && !(lane & 1))
+                        add_output(storage.sum + token * hidden + row + n * 8, x0, x1, x2, x3);
                 }
             }
+        }
+    }
+}
+
+template <class S>
+__device__ __forceinline__ void produce_down(Shared<S>& tile, const Maps& maps, Matrix weight,
+                                             int weight_row, int row, int packed, int epoch) {
+    constexpr int steps = S::k / S::k_tile;
+    constexpr int wt_bytes = S::features * (S::k / 32);
+    constexpr int scales = wt_bytes + S::columns * product_scale_stride;
+    constexpr int data = (S::features + S::columns) * S::k_tile;
+#pragma unroll 1
+    for (int kt = 0; kt < steps; ++kt) {
+        const int step = epoch * steps + kt;
+        const int stage = step % S::stages;
+        const int phase = (step / S::stages) & 1;
+        common::cta_mbarrier_wait(&tile.empty[stage], 1 ^ phase);
+        auto* full = &tile.full[stage];
+        common::cta_mbarrier_arrive_expect_tx(full, data + (kt == 0 ? scales : 0));
+        common::tma_load_2d(tile.weights[stage][0], &maps.weights, kt * S::k_tile,
+                            weight_row + row, full);
+        common::tma_load_2d(tile.input[stage], &maps.input, kt * S::k_tile, packed, full);
+        if (kt == 0) {
+            // Codes are already moving. The shared bulk scales can be replaced
+            // once the previous job's last contraction releases the scale readers.
+            if (epoch)
+                common::cta_mbarrier_wait(&tile.empty[(step - 1) % S::stages],
+                                           (step - 1) / S::stages & 1);
+            bulk_load(tile.weight_scales[0][0], weight.scales + row * (S::k / 32), wt_bytes, full);
+            common::tma_load_2d(tile.input_scales, &maps.scales, 0, packed, full);
+        }
+    }
+}
+
+template <class S, int Threads = S::template threads<true>>
+__global__ __launch_bounds__(Threads, 1) void persistent_down(
+    const __grid_constant__ Maps maps, ExpertMatrixDeviceView bank, const float* coefficients,
+    const __grid_constant__ Storage storage) {
+    static_assert(!S::gate && S::a8 && S::bulk && S::swapped && !S::redistribute_registers);
+    constexpr int row_tiles = S::rows / S::features;
+    const auto& g = storage.groups;
+    const int tasks = *g.jobs * row_tiles;
+    const auto work_at = [=](int i) { return (blockIdx.x + i / 2 * gridDim.x) * 2 + i % 2; };
+    if (work_at(0) >= tasks) return;
+    extern __shared__ __align__(128) std::uint8_t shared[];
+    auto& tile = *reinterpret_cast<Shared<S>*>(shared);
+    if (!threadIdx.x) {
+#pragma unroll
+        for (int s = 0; s < S::stages; ++s) {
+            common::cta_mbarrier_init(&tile.full[s], 1);
+            common::cta_mbarrier_init(&tile.empty[s], S::warps);
+        }
+        common::cta_mbarrier_fence_init();
+    }
+    __syncthreads();
+    if (threadIdx.x < S::template producers<true> && threadIdx.x != 0) return;
+    const int lane = threadIdx.x % 32;
+    const int warp = (int(threadIdx.x) - S::template producers<true>) / 32;
+    for (int i = 0, task; (task = work_at(i)) < tasks; ++i) {
+        const int j = task / row_tiles;
+        const int expert = g.job_experts[j], count = g.counts[expert];
+        const int count_tiles = (count + S::columns - 1) / S::columns;
+        // Adjacent tasks of a heavy expert contract against the same weight rows.
+        const int local = g.job_columns[j] / S::columns * row_tiles + task % row_tiles;
+        const int first = local % count_tiles * S::columns;
+        const int row = local / count_tiles * S::features;
+        const int packed = g.offsets[expert] + first;
+        const int columns = min(S::columns, count - first);
+        if (!threadIdx.x) {
+            const auto w = resolve(bank, expert);
+            produce_down<S>(tile, maps, w, w.physical * (bank.code_stride / S::k), row, packed, i);
+        } else {
+            const int first_col = warp / S::row_warps * S::warp_columns;
+            float acc[S::mmas_tokens][S::branches][S::mmas_rows][4]{};
+            consume<S, true>(tile, lane, warp, columns, acc, i);
+            if (first_col < columns)
+                emit_transposed<S>(acc, tile, storage, columns, first_col,
+                                   row + warp % S::row_warps * S::warp_features, lane,
+                                   g.assignments + packed, coefficients);
         }
     }
 }
@@ -542,15 +631,22 @@ CUtensorMap activation_map(const std::uint8_t* pointer, int rows, int stride, in
 template <class S, class Indexed = S>
 void launch_stage(const ExpertMatrixDeviceView& bank, const __nv_bfloat16* x,
                   const float* coefficients, SoftcappedActivation activation, Plan plan,
-                  const Storage& storage, int tokens, cudaStream_t stream) {
+                  const Storage& storage, int tokens, CudaExecutionView execution) {
     constexpr int rows   = S::rows * S::branches;
+    const auto stream    = execution.stream();
     const int jobs       = job_capacity(plan, tokens * top_k);
     const auto* codes    = reinterpret_cast<const std::uint8_t*>(bank.codes);
     const auto code_rows = bank.offsets ? 0 : (bank.physical_count - 1) * (bank.code_stride / S::k);
     if (!bank.offsets && bank.code_stride % S::k == 0 && code_rows <= INT_MAX - rows) {
         Maps maps{};
-        maps.weights =
-            fp8_tma_map(codes, static_cast<int>(code_rows) + rows, S::k, S::features, S::k_tile);
+        if constexpr (S::a8) {
+            maps.weights = activation_map(codes, static_cast<int>(code_rows) + rows, S::k,
+                                           S::k_tile, S::features, CU_TENSOR_MAP_SWIZZLE_128B,
+                                           CU_TENSOR_MAP_L2_PROMOTION_L2_128B);
+        } else {
+            maps.weights =
+                fp8_tma_map(codes, static_cast<int>(code_rows) + rows, S::k, S::features, S::k_tile);
+        }
         if constexpr (S::a8) {
             const auto data          = S::gate ? storage.input : storage.product;
             const int input_rows     = S::gate ? tokens : tokens * top_k;
@@ -563,10 +659,18 @@ void launch_stage(const ExpertMatrixDeviceView& bank, const __nv_bfloat16* x,
                                              CU_TENSOR_MAP_SWIZZLE_NONE, promotion);
             }
         }
-        const int shared = common::prepare_shared<sizeof(Shared<S>), grouped<S, true>, true>();
-        grouped<S, true>
-            <<<jobs*(S::rows / S::features), S::template threads<true>, shared, stream>>>(
-                maps, bank, x, coefficients, activation, tokens, storage);
+        if constexpr (S::swapped) {
+            const int shared = common::prepare_shared<sizeof(Shared<S>), persistent_down<S>, true>();
+            const int tasks = jobs * (S::rows / S::features);
+            const int blocks = std::min(common::div_up(tasks, 2), 2 * execution.multiprocessor_count());
+            persistent_down<S><<<blocks, S::template threads<true>, shared, stream>>>(
+                maps, bank, coefficients, storage);
+        } else {
+            const int shared = common::prepare_shared<sizeof(Shared<S>), grouped<S, true>, true>();
+            grouped<S, true>
+                <<<jobs*(S::rows / S::features), S::template threads<true>, shared, stream>>>(
+                    maps, bank, x, coefficients, activation, tokens, storage);
+        }
     } else {
         const int shared =
             common::prepare_shared<sizeof(Shared<Indexed>), grouped<Indexed, false>, true>();
@@ -581,17 +685,18 @@ void launch_stage(const ExpertMatrixDeviceView& bank, const __nv_bfloat16* x,
 
 void launch_mma(const __nv_bfloat16* x, const ExpertBankDeviceView& bank, const float* coefficients,
                 SoftcappedActivation activation, Plan plan, const Storage& storage, int tokens,
-                cudaStream_t stream) {
+                CudaExecutionView execution) {
+    const auto stream = execution.stream();
     const auto gate = [&]<bool A8, int C, int F, int R, int T, bool Bulk, bool Prefetch = false,
                           bool StageInputScales = false, bool ExtraProducers = false>() {
         using S =
             Tile<true, A8, C, F, R, T, Bulk, Prefetch, StageInputScales, false, ExtraProducers>;
-        launch_stage<S>(bank.gate_up, x, coefficients, activation, plan, storage, tokens, stream);
+        launch_stage<S>(bank.gate_up, x, coefficients, activation, plan, storage, tokens, execution);
     };
     const auto down = [&]<bool A8, int C, int F, int R, int T, bool Bulk, bool Prefetch = false>() {
         using S = Tile<false, A8, C, F, R, T, Bulk, Prefetch>;
         launch_stage<S>(bank.down, reinterpret_cast<const __nv_bfloat16*>(storage.bf16_product),
-                        coefficients, activation, plan, storage, tokens, stream);
+                        coefficients, activation, plan, storage, tokens, execution);
     };
     const auto clear_sum = [&] {
         CUDA_CHECK(
@@ -631,7 +736,7 @@ void launch_mma(const __nv_bfloat16* x, const ExpertBankDeviceView& bank, const 
             using Down        = Tile<false, true, 128, 192, 3, 4, true, true, false, true>;
             using IndexedDown = Tile<false, true, 128, 128, 2, 4, true, true>;
             launch_stage<Down, IndexedDown>(bank.down, nullptr, coefficients, activation, plan,
-                                            storage, tokens, stream);
+                                            storage, tokens, execution);
         } else {
             down.template operator()<true, 128, 128, 2, 4, true, true>();
         }

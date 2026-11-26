@@ -36,6 +36,8 @@ const char* schedule_name(Schedule schedule) {
         return "sm120-tma-red64";
     case Schedule::Sm120TmaDense:
         return "sm120-tma-dense";
+    case Schedule::A16ScaledProduct:
+        return "a16-scaled-product";
     }
     throw std::logic_error("invalid softcap schedule");
 }

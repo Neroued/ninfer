@@ -24,8 +24,10 @@ struct TokenChoice {
 // At T=17, FP4 MMA beat short FP4, 146.7 vs 148.3 us.
 // At T=20, 64-column TMA beat FP4 MMA, 154.3 vs 156.0 us, and led through T=128.
 // At T=43, BF16 short16 overtook bucketing, 303.2 vs 304.6 us.
-// At T=192, BF16 MMA beat short16 (472.1 vs 478.8 us), and dense TMA beat 64-column
-//        TMA (202.2 vs 208.9 us). Dense TMA reached 457.5 us at Uniform T=1024.
+// At T=192, BF16 MMA beat short16 (472.1 vs 478.8 us). With independent scale
+// slots, 64-column TMA beat dense TMA by 8.6% cold and 5.5% warm at T=192.
+// They were within 0.4% at T=384 and T=512. Dense TMA led by 2.4% cold and
+// 1.9% warm at T=768.
 // At T=4096, BF16 bucketing recovered the lead over BF16 MMA, 3715.8 vs 3782.9 us.
 constexpr std::array choices{
     TokenChoice{1, Schedule::VectorComplete, Schedule::VectorComplete},
@@ -35,7 +37,8 @@ constexpr std::array choices{
     TokenChoice{17, Schedule::Bf16Bucketed, Schedule::Fp4Mma},
     TokenChoice{20, Schedule::Bf16Bucketed, Schedule::Sm120Tma64},
     TokenChoice{43, Schedule::Bf16Short16, Schedule::Sm120Tma64},
-    TokenChoice{192, Schedule::Bf16Mma, Schedule::Sm120TmaDense},
+    TokenChoice{192, Schedule::Bf16Mma, Schedule::Sm120Tma64},
+    TokenChoice{384, Schedule::Bf16Mma, Schedule::Sm120TmaDense},
     TokenChoice{4096, Schedule::Bf16Bucketed, Schedule::Sm120TmaDense},
 };
 
@@ -54,7 +57,7 @@ Schedule measured_schedule(int tokens, bool allow_a4) {
 
 Plan select_plan(const SwiGLUProfile& profile, int tokens, int) {
     const bool allow_a4 = allows_a4(profile.gate_up_policy) && allows_a4(profile.down_policy);
-    const auto schedule = measured_schedule(tokens, allow_a4);
+    auto schedule       = measured_schedule(tokens, allow_a4);
     int columns         = 32;
     switch (schedule) {
     case Schedule::Fp4Short:
@@ -73,6 +76,10 @@ Plan select_plan(const SwiGLUProfile& profile, int tokens, int) {
     default:
         break;
     }
+    // Keep the BF16 pair for cap ranges outside the FP16 normalization envelope.
+    const auto caps = *profile.softcap;
+    if (!allow_a4 && tokens >= 192 && double(caps.gate_cap) * caps.up_cap <= 128.0)
+        schedule = Schedule::A16ScaledProduct;
     Plan plan;
     plan.implementation = Implementation::SoftcapNvfp4;
     plan.softcap        = {.schedule              = schedule,

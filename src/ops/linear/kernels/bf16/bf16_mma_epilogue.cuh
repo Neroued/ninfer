@@ -87,6 +87,45 @@ struct Bf16BiasWarpStoreEpilogue : Bf16MmaWarpStoreEpilogue {
     }
 };
 
+// Complete row atoms over a contiguous residual. Both variants add in FP32 and
+// round once at the final store.
+struct Bf16ResidualAddWarpStoreEpilogue {
+    __device__ __forceinline__ void store_fragment(const LinearBf16Output& output, int row,
+                                                   int token, float4 value, int, int tokens) const {
+        const int row_group = (threadIdx.x & 31) >> 2;
+        const bool upper    = (row_group & 1) != 0;
+        const int first_row = row - row_group + (row_group & ~1) + (upper ? 8 : 0);
+        // Exchange one accumulator with the adjacent row group for each token.
+        // The even group owns the lower row pair and the odd group the upper pair.
+        const float peer_even = __shfl_xor_sync(0xffffffffU, upper ? value.x : value.z, 4);
+        const float peer_odd  = __shfl_xor_sync(0xffffffffU, upper ? value.y : value.w, 4);
+        const auto add_pair   = [&](int t, float local, float peer) {
+            if (t >= tokens) return;
+            auto* dst             = output.at(first_row, t);
+            const float2 residual = __bfloat1622float2(common::load_vec<__nv_bfloat162>(dst));
+            common::store_vec(dst, __floats2bfloat162_rn(residual.x + (upper ? peer : local),
+                                                           residual.y + (upper ? local : peer)));
+        };
+        add_pair(token, upper ? value.z : value.x, peer_even);
+        add_pair(token + 1, upper ? value.w : value.y, peer_odd);
+    }
+};
+
+struct Bf16ScalarResidualAddWarpStoreEpilogue : Bf16MmaWarpStoreEpilogue {
+    __device__ __forceinline__ void store_fragment(const LinearBf16Output& output, int row,
+                                                   int token, float4 value, int, int tokens) const {
+        if (token < tokens) {
+            value.x += __bfloat162float(*output.at(row, token));
+            value.z += __bfloat162float(*output.at(row + 8, token));
+        }
+        if (token + 1 < tokens) {
+            value.y += __bfloat162float(*output.at(row, token + 1));
+            value.w += __bfloat162float(*output.at(row + 8, token + 1));
+        }
+        store_fragment_impl<false>(output, row, token, value, tokens);
+    }
+};
+
 // A CTA made entirely of compute warps, with complete 16-row output atoms.
 template <bool Streaming = false>
 struct Bf16MmaCtaWarpStoreEpilogue : Bf16MmaWarpStoreEpilogue {

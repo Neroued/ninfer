@@ -2,6 +2,7 @@
 #include "core/platform.h"
 #include "cuda_fixture.h"
 #include "core/buffer.h"
+#include "core/decode_graph.h"
 #include "ninfer/ops/linear.h"
 
 #include "ops/direct_bf16_weight.h"
@@ -65,9 +66,9 @@ bf16_fixture(std::int32_t n, std::int32_t k, std::uint32_t seed,
              ninfer::test::linear::Comparison comparison,
              std::span<const ninfer::test::linear::Invocation> calls) {
     ninfer::test::linear::ShapeCase shape{n, k, seed, comparison, true, calls};
-    shape.activation_generator   = make_bf16_activation;
-    shape.row_sampler            = sampled_rows;
-    shape.column_sampler         = sampled_tokens;
+    shape.activation_generator = make_bf16_activation;
+    shape.row_sampler          = sampled_rows;
+    shape.column_sampler       = sampled_tokens;
     return shape;
 }
 
@@ -342,6 +343,148 @@ void run_new_bf16_geometry(Suite& suite, const Geometry& shape) {
     }
 }
 
+#if NINFER_TARGET_RTX5090
+void run_inkling_patch_tail(Suite& suite, std::initializer_list<int> boundaries) {
+    using namespace ninfer::test::linear;
+    namespace linear_suite = ninfer::test::linear_suite;
+    constexpr int n = 1024, k = 1200;
+    constexpr std::uint32_t seed = n + k + 505;
+    constexpr auto policy        = ops::LinearPolicy::A16Only;
+    std::set<int> tokens{1, 4, 8, 128, 1024, 4097};
+    for (const int end : boundaries) tokens.insert(end + 1);
+    std::vector<Invocation> tail;
+    std::vector<linear_suite::Case> exact;
+    for (const int t : tokens) {
+        tail.push_back({t});
+        tail.push_back({t, CallForm::Policy, policy, true});
+        exact.push_back(linear_suite::make_case("bf16", n, k, t, policy,
+                                                linear_suite::Execution::Graph, "exact-k-tail"));
+    }
+    add_shape(suite, QType::BF16, ActivationRecipe::Hashed, make_bf16_weight,
+              {n, k, seed, Comparison::Sampled, true, tail, ActivationPattern::KTail});
+
+    suite.add(std::move(exact),
+              [](std::span<const std::size_t> selected, std::span<const linear_suite::Case> cases) {
+                  const DeviceWeight weight(make_patterned(n, k, seed));
+                  DeviceContext context;
+                  const auto execution = context.execution_view();
+                  constexpr int period = 3;
+                  std::array<std::array<std::uint16_t, k>, period> input_rows{};
+                  std::array<std::array<std::uint16_t, n>, period> expected{};
+                  for (int i = 0; i < period; ++i) {
+                      // Exercise all 48 residual K values. Each sum is an exact multiple of 2^-12
+                      // and fits in the FP32 mantissa before the final BF16 rounding.
+                      std::array<float, k> activation{};
+                      for (int col = k - k % 64; col < k; ++col) {
+                          activation[col]    = ((col + i) % period - 1) * 0.25F;
+                          input_rows[i][col] = f32_to_bf16(activation[col]);
+                      }
+                      for (int row = 0; row < n; ++row) {
+                          const double reference = dot_fp64(weight.host, row, activation);
+                          expected[i][row]       = f32_to_bf16(static_cast<float>(reference));
+                      }
+                  }
+                  int failures = 0;
+                  for (auto index : selected) {
+                      const auto& call = cases[index];
+                      std::vector<std::uint16_t> input(std::size_t(k) * call.t);
+                      for (int t = 0; t < call.t; ++t)
+                          std::copy(input_rows[t % period].begin(), input_rows[t % period].end(),
+                                    input.begin() + std::size_t(t) * k);
+                      DeviceBuffer dx(execution.device(), input.size() * sizeof(std::uint16_t));
+                      std::vector<std::uint16_t> actual(std::size_t(n) * call.t);
+                      DeviceBuffer dy(execution.device(), actual.size() * sizeof(std::uint16_t));
+                      dx.copy_from_host(input.data(), dx.size());
+                      cuda_synchronize();
+                      const Tensor x(dx.span(), DType::BF16, {k, call.t});
+                      Tensor y(dy.span(), DType::BF16, {n, call.t});
+                      DecodeGraphDefinition definition;
+                      definition.capture(execution.stream(),
+                                         [&] { ops::linear(x, weight.view(), y, execution); });
+                      DecodeGraphExecutable graph;
+                      graph.instantiate(definition);
+                      graph.launch(execution.stream());
+                      cuda_synchronize(execution.stream());
+                      dy.copy_to_host(actual.data(), dy.size());
+                      for (std::size_t i = 0; i < actual.size(); ++i) {
+                          const auto reference = expected[(i / n) % period][i % n];
+                          // Product sums that cancel to zero may have either signed zero.
+                          if (bf16_to_f32(actual[i]) == bf16_to_f32(reference)) continue;
+                          std::cerr << call.id << ": rounded FP64 mismatch at token " << i / n
+                                    << ", row " << i % n << '\n';
+                          ++failures;
+                          break;
+                      }
+                  }
+                  return failures;
+              });
+}
+
+void run_inkling_bf16_projection(Suite& suite, int n, int k,
+                                 std::initializer_list<int> boundaries) {
+    using namespace ninfer::test::linear;
+    namespace linear_suite = ninfer::test::linear_suite;
+    const auto seed        = std::uint32_t(n + k + 503);
+    constexpr auto policy  = ops::LinearPolicy::A16Only;
+    const std::array full{Invocation{1}, Invocation{1, CallForm::Policy, policy, true}};
+    add_shape(suite, QType::BF16, ActivationRecipe::Hashed, make_bf16_weight,
+              {n, k, seed, Comparison::Full, true, full});
+
+    std::set<int> tokens{4, 8, 17, 128, 256, 512, 1023, 1024, 1025, 2048, 4096, 4097};
+    for (int boundary : boundaries)
+        for (int t : {boundary - 1, boundary, boundary + 1})
+            if (t > 1) tokens.insert(t);
+    std::vector<Invocation> calls;
+    for (int t : tokens) {
+        calls.push_back({t});
+        calls.push_back({t, CallForm::Policy, policy, true});
+    }
+    calls.push_back({8, CallForm::A16Convenience});
+    add_shape(suite, QType::BF16, ActivationRecipe::Hashed, make_bf16_weight,
+              {n, k, seed, Comparison::Sampled, true, calls});
+
+    suite.add(linear_suite::make_case("bf16", n, k, 0, policy, linear_suite::Execution::Eager,
+                                      "zero-workspace-and-invalid-operands"),
+              [=] {
+                  int failures = 0;
+                  if (ops::linear_workspace_capacity_bytes(QType::BF16, n, k, policy, 1,
+                                                           std::numeric_limits<int>::max()) != 0) {
+                      std::cerr << "BF16: expected zero workspace for N=" << n << '\n';
+                      ++failures;
+                  }
+                  const auto rejects = [&](const auto& operation) {
+                      try {
+                          operation();
+                          std::cerr << "BF16: accepted invalid operands for N=" << n << '\n';
+                          ++failures;
+                      } catch (const std::invalid_argument&) {}
+                  };
+                  rejects([&] {
+                      (void)ops::linear_workspace_capacity_bytes(QType::BF16, n, k, policy, 0, 1);
+                  });
+                  rejects([&] {
+                      (void)ops::linear_workspace_capacity_bytes(QType::BF16, n, k, policy, 2, 1);
+                  });
+                  const auto& env = cuda_environment();
+                  DeviceWeight weight(make_patterned(n, k, seed));
+                  DeviceBuffer input(env.context.device(), k * 2);
+                  DeviceBuffer output(env.context.device(), n * 2);
+                  const Tensor x(input.span(), DType::BF16, {k, 1});
+                  Tensor y(output.span(), DType::BF16, {n, 1});
+                  auto invalid  = x;
+                  invalid.dtype = DType::FP16;
+                  rejects([&] { ops::linear(invalid, weight.view(), y, env.default_execution); });
+                  invalid       = x;
+                  invalid.ne[1] = 0;
+                  rejects([&] { ops::linear(invalid, weight.view(), y, env.default_execution); });
+                  invalid = x;
+                  invalid.ne[0] -= 8;
+                  rejects([&] { ops::linear(invalid, weight.view(), y, env.default_execution); });
+                  return failures;
+              });
+}
+#endif
+
 #if NINFER_TARGET_SPARK
 void run_dflash_bf16_projections(Suite& suite) {
     using namespace ninfer::test::linear;
@@ -505,6 +648,48 @@ void run_bf16(Suite& suite) {
     }
     { run_selector_linear(suite); }
     for (const auto& shape : kNewGeometries) { run_new_bf16_geometry(suite, shape); }
+#if NINFER_TARGET_RTX5090
+    run_inkling_bf16_projection(suite, 3072, 1024,
+                                {2, 17, 49, 81, 145, 193, 337, 449, 561, 673, 785, 897, 1121, 1345,
+                                 1569, 1793, 1921, 2017, 2241});
+    run_inkling_bf16_projection(
+        suite, 1024, 1024,
+        {2, 113, 321, 641, 801, 1009, 1177, 1345, 1681, 2017, 2353, 2689, 3361, 4033});
+    run_inkling_bf16_projection(
+        suite, 4096, 1024,
+        {2, 48, 64, 97, 161, 241, 321, 401, 481, 561, 641, 801, 961, 1041, 1457, 1601});
+    run_inkling_bf16_projection(
+        suite, 1024, 4096,
+        {2, 35, 73, 129, 257, 481, 641, 801, 1009, 1177, 1345, 1601, 2017, 2353, 2689, 3361, 4033});
+    run_inkling_bf16_projection(
+        suite, 1024, 2304,
+        {2, 25, 81, 145, 321, 481, 641, 913, 1281, 1681, 1921, 2353, 2561, 3361, 3841});
+    run_inkling_bf16_projection(
+        suite, 768, 2304,
+        {2, 25, 49, 81, 225, 385, 641, 897, 1121, 1345, 1793, 2241, 2689, 3137, 3585});
+    run_inkling_bf16_projection(suite, 8576, 2304,
+                                {1, 16, 64, 96, 128, 160, 240, 320, 336, 400, 512});
+    run_inkling_bf16_projection(suite, 6528, 2304, {16, 48, 96, 144, 192, 240, 288, 336, 432, 512});
+    run_inkling_bf16_projection(suite, 5120, 2304, {16, 32, 64, 128, 192, 256, 384});
+    run_inkling_bf16_projection(suite, 2048, 2304,
+                                {16, 48, 72, 160, 320, 480, 640, 800, 1040, 2112});
+    run_inkling_bf16_projection(suite, 18432, 2304, {16, 64, 96, 128, 144, 160, 384});
+    run_inkling_bf16_projection(suite, 2304, 3072,
+                                {1, 8, 16, 24, 64, 72, 128, 192, 256, 384, 576, 768, 1152, 1280});
+    run_inkling_bf16_projection(suite, 200064, 2304, {1, 8, 16, 32, 64, 128, 640});
+    run_inkling_bf16_projection(
+        suite, 2304, 9216,
+        {1, 16, 32, 64, 72, 80, 96, 192, 256, 384, 576, 768, 1152, 1280, 1728, 3072});
+    const std::initializer_list<int> patch_boundaries{1,   24,  128,  320,  480,
+                                                      640, 800, 1344, 1600, 2352};
+    run_inkling_bf16_projection(suite, 1024, 1200, patch_boundaries);
+    run_inkling_patch_tail(suite, patch_boundaries);
+    run_inkling_bf16_projection(
+        suite, 4096, 4096,
+        {1, 32, 64, 96, 128, 160, 240, 280, 320, 400, 560, 640, 800, 1040, 1344, 1600, 3920});
+    run_inkling_bf16_projection(suite, 2304, 4096,
+                                {1, 24, 48, 64, 128, 192, 256, 320, 448, 576, 896, 1152, 2632});
+#endif
 #if NINFER_TARGET_SPARK
     run_dflash_bf16_projections(suite);
     run_bf16_extensions(suite);

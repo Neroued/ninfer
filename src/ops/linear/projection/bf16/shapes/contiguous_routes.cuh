@@ -20,9 +20,9 @@ struct Bf16ContiguousRoutes {
         return launch_bf16_mma<S>;
     }
 
-    template <class S>
+    template <class S, class Epilogue = LinearIdentityEpilogue>
     static Bf16Launch tma() {
-        return launch_bf16_tma_mma<S>;
+        return launch_bf16_tma_mma<S, Epilogue>;
     }
 };
 

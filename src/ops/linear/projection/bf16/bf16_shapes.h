@@ -16,6 +16,8 @@ namespace ninfer::ops::detail {
 [[nodiscard]] Bf16Launch select_bf16_n1024_k1024(std::int32_t tokens);
 [[nodiscard]] Bf16Launch select_bf16_n3072_k1024(std::int32_t tokens);
 [[nodiscard]] Bf16Launch select_bf16_n1024_k1176(std::int32_t tokens);
+[[nodiscard]] Bf16Launch select_bf16_n1024_k1200(std::int32_t tokens);
+[[nodiscard]] Bf16Launch select_bf16_n2304_k4096(std::int32_t tokens);
 [[nodiscard]] Bf16Launch select_bf16_n4096_k8192(std::int32_t tokens);
 [[nodiscard]] Bf16Launch select_bf16_n16384_k1536(std::int32_t tokens);
 [[nodiscard]] Bf16Launch select_bf16_n20480_k1536(std::int32_t tokens);
@@ -54,6 +56,16 @@ namespace ninfer::ops::detail {
 [[nodiscard]] Bf16Launch select_bf16_n248320_k2560(std::int32_t tokens);
 
 [[nodiscard]] Bf16Launch select_bf16_n13952_k2560(std::int32_t tokens);
+[[nodiscard]] Bf16Launch select_bf16_n1024_k2304(std::int32_t tokens);
+[[nodiscard]] Bf16Launch select_bf16_n768_k2304(std::int32_t tokens);
+[[nodiscard]] Bf16Launch select_bf16_n8576_k2304(std::int32_t tokens);
+[[nodiscard]] Bf16Launch select_bf16_n6528_k2304(std::int32_t tokens);
+[[nodiscard]] Bf16Launch select_bf16_n5120_k2304(std::int32_t tokens);
+[[nodiscard]] Bf16Launch select_bf16_n2048_k2304(std::int32_t tokens);
+[[nodiscard]] Bf16Launch select_bf16_n18432_k2304(std::int32_t tokens);
+[[nodiscard]] Bf16Launch select_bf16_n2304_k3072(std::int32_t tokens);
+[[nodiscard]] Bf16Launch select_bf16_n200064_k2304(std::int32_t tokens);
+[[nodiscard]] Bf16Launch select_bf16_n2304_k9216(std::int32_t tokens);
 
 [[nodiscard]] Bf16Launch select_bf16_n2560_k6144(std::int32_t tokens);
 

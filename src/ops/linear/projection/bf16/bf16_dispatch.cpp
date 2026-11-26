@@ -12,6 +12,25 @@ struct ShapeEntry {
 };
 
 constexpr std::array kShapes{
+#if NINFER_TARGET_RTX5090
+    ShapeEntry{1024, 2304, select_bf16_n1024_k2304},
+    ShapeEntry{768, 2304, select_bf16_n768_k2304},
+    ShapeEntry{8576, 2304, select_bf16_n8576_k2304},
+    ShapeEntry{6528, 2304, select_bf16_n6528_k2304},
+    ShapeEntry{5120, 2304, select_bf16_n5120_k2304},
+    ShapeEntry{2048, 2304, select_bf16_n2048_k2304},
+    ShapeEntry{18432, 2304, select_bf16_n18432_k2304},
+    ShapeEntry{2304, 3072, select_bf16_n2304_k3072},
+    ShapeEntry{200064, 2304, select_bf16_n200064_k2304},
+    ShapeEntry{2304, 9216, select_bf16_n2304_k9216},
+    ShapeEntry{3072, 1024, select_bf16_n3072_k1024},
+    ShapeEntry{1024, 1024, select_bf16_n1024_k1024},
+    ShapeEntry{4096, 1024, select_bf16_n4096_k1024},
+    ShapeEntry{1024, 4096, select_bf16_n1024_k4096},
+    ShapeEntry{1024, 1200, select_bf16_n1024_k1200},
+    ShapeEntry{4096, 4096, select_bf16_n4096_k4096},
+    ShapeEntry{2304, 4096, select_bf16_n2304_k4096},
+#endif
 #if NINFER_TARGET_SPARK
     ShapeEntry{2048, 20480, select_bf16_n2048_k20480},
     ShapeEntry{3072, 4096, select_bf16_n3072_k4096},

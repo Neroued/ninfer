@@ -106,8 +106,9 @@ void validate_cache(const CyclicKVCacheLayerView& cache, std::int32_t batch,
     if (cache.padded_capacity > std::uint32_t(std::numeric_limits<std::int32_t>::max()))
         throw std::overflow_error("context_kv_materialize: padded capacity exceeds int32");
     const int padded = int(cache.padded_capacity);
-    if (cache.capacity != kCapacity || cache.num_kv_heads != profile.kv_heads ||
-        cache.head_dim != kHeadDim || padded < kCapacity) {
+    if (cache.storage != KvCacheStorage::BFloat16 || cache.capacity != kCapacity ||
+        cache.num_kv_heads != profile.kv_heads || cache.head_dim != kHeadDim ||
+        padded < kCapacity) {
         throw std::invalid_argument("context_kv_materialize: invalid cyclic cache geometry");
     }
     common::operand::state_field(cache.k, DType::BF16, {kHeadDim, padded, profile.kv_heads}, 16,

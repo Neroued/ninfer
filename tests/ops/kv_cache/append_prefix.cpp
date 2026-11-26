@@ -161,12 +161,12 @@ public:
           capacity_(capacity), padded_(padded ? padded : capacity) {}
 
     CyclicKVCacheLayerView view() const {
-        return {packed_.field(0, table_),
-                packed_.field(1, table_),
-                static_cast<std::uint32_t>(capacity_),
-                static_cast<std::uint32_t>(padded_),
-                kKVHeads,
-                kHeadDim};
+        return {.k               = packed_.field(0, table_),
+                .v               = packed_.field(1, table_),
+                .capacity        = static_cast<std::uint32_t>(capacity_),
+                .padded_capacity = static_cast<std::uint32_t>(padded_),
+                .num_kv_heads    = kKVHeads,
+                .head_dim        = kHeadDim};
     }
 
     void upload() const { packed_.upload(); }

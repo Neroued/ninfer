@@ -91,12 +91,12 @@ struct Bf16ContextFixture {
     }
 
     void bind(int l, const Tensor& offsets) {
-        layers[l].cache = {records->field(2 * l, offsets),
-                           records->field(2 * l + 1, offsets),
-                           Capacity,
-                           Padded,
-                           Heads,
-                           128};
+        layers[l].cache = {.k               = records->field(2 * l, offsets),
+                           .v               = records->field(2 * l + 1, offsets),
+                           .capacity        = Capacity,
+                           .padded_capacity = Padded,
+                           .num_kv_heads    = Heads,
+                           .head_dim        = 128};
     }
 
     void reset() {

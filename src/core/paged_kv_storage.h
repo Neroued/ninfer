@@ -9,6 +9,7 @@
 
 namespace ninfer {
 
+inline constexpr std::int32_t kD128KVCacheHeadDim = 128;
 inline constexpr std::int32_t kD256KVCacheHeadDim = 256;
 
 /** Physical data/scale planes for one K or V vector. */
@@ -88,10 +89,21 @@ struct PagedKVStorageLayout {
 [[nodiscard]] inline PagedKVStorageLayout paged_kv_storage_layout(KvCacheStorage storage,
                                                                   std::int32_t head_dim) {
     const auto profile = kv_cache_profile_info(storage);
-    if (head_dim <= 0 || (storage != KvCacheStorage::BFloat16 && head_dim != kD256KVCacheHeadDim))
+    const bool supported_fp8_d128 =
+        storage == KvCacheStorage::Fp8E4m3fnGroup128Ue8m0 && head_dim == kD128KVCacheHeadDim;
+    if (head_dim <= 0 || (storage != KvCacheStorage::BFloat16 && head_dim != kD256KVCacheHeadDim &&
+                          !supported_fp8_d128))
         throw std::invalid_argument("unsupported paged KV-cache storage geometry");
     return {storage, head_dim, paged_kv_vector_layout(profile.key, head_dim),
             paged_kv_vector_layout(profile.value, head_dim)};
+}
+
+[[nodiscard]] inline PagedKVStorageLayout cyclic_kv_storage_layout(KvCacheStorage storage,
+                                                                   std::int32_t head_dim) {
+    if (storage != KvCacheStorage::BFloat16 &&
+        storage != KvCacheStorage::Fp8E4m3fnGroup128Ue8m0)
+        throw std::invalid_argument("Unsupported cyclic KV storage format");
+    return paged_kv_storage_layout(storage, head_dim);
 }
 
 } // namespace ninfer

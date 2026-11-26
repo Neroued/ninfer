@@ -1,6 +1,8 @@
 #include "core/buffer.h"
+#include "core/cyclic_kv_cache.h"
 #include "core/device.h"
 #include "core/linear_attention_state.h"
+#include "core/paged_kv_storage.h"
 
 #include <cuda_runtime.h>
 
@@ -258,6 +260,155 @@ int bf16_recurrent_case(ninfer::DeviceContext& device) {
     }
     return failures;
 }
+
+int kv_cache_fp8_d128_case(ninfer::DeviceContext& device) {
+    int failures = 0;
+
+    // 1) Paged KV storage layout: D=128 Fp8E4m3fnGroup128Ue8m0 allowed, others (e.g. INT8 D=128) rejected.
+    const auto paged_fp8 =
+        ninfer::paged_kv_storage_layout(ninfer::KvCacheStorage::Fp8E4m3fnGroup128Ue8m0, 128);
+    if (paged_fp8.head_dim != 128 || paged_fp8.key.data_dtype != ninfer::DType::FP8_E4M3FN ||
+        paged_fp8.key.data_leading_extent != 128 || paged_fp8.key.scale_dtype != ninfer::DType::U8 ||
+        paged_fp8.key.scale_leading_extent != 1 ||
+        paged_fp8.value.data_dtype != ninfer::DType::FP8_E4M3FN ||
+        paged_fp8.value.data_leading_extent != 128 ||
+        paged_fp8.value.scale_dtype != ninfer::DType::U8 ||
+        paged_fp8.value.scale_leading_extent != 1 || paged_fp8.planes_per_layer() != 4 ||
+        paged_fp8.physical_bytes_per_token_head() != 258) {
+        failures += fail("paged D128 FP8 layout mismatch");
+    }
+    bool rejected = false;
+    try {
+        (void)ninfer::paged_kv_storage_layout(ninfer::KvCacheStorage::Int8Group64, 128);
+    } catch (const std::invalid_argument&) { rejected = true; }
+    if (!rejected) failures += fail("paged D128 INT8 should be rejected");
+
+    // 2) Cyclic KV storage: BF16 default + FP8 (capacity=1024, Hkv=8, D=128) + invalid rejections.
+    ninfer::StateImageBuilder bf16_builder;
+    const auto bf16_layout = ninfer::plan_cyclic_kv_cache(bf16_builder, 2, 1024, 8, 128);
+    const auto bf16_image  = bf16_builder.finish();
+    if (bf16_layout.storage != ninfer::KvCacheStorage::BFloat16 || bf16_layout.has_scales()) {
+        failures += fail("default cyclic KV layout must be BFloat16 without scales");
+    }
+    ninfer::DeviceBuffer bf16_buf(device.device(), bf16_image.image_bytes);
+    ninfer::StateImageStorage bf16_store(bf16_buf.span(), bf16_image);
+    ninfer::CyclicKVCacheView bf16_view(bf16_store, bf16_layout);
+    if (bf16_view.storage() != ninfer::KvCacheStorage::BFloat16 || bf16_view.capacity() != 1024) {
+        failures += fail("BF16 cyclic view metadata mismatch");
+    }
+
+    ninfer::StateImageBuilder fp8_builder;
+    const auto fp8_layout = ninfer::plan_cyclic_kv_cache(
+        fp8_builder, 2, 1024, 8, 128, ninfer::KvCacheStorage::Fp8E4m3fnGroup128Ue8m0);
+    const auto fp8_image = fp8_builder.finish();
+    if (fp8_layout.storage != ninfer::KvCacheStorage::Fp8E4m3fnGroup128Ue8m0 ||
+        !fp8_layout.has_scales() || fp8_layout.padded_capacity != 1024) {
+        failures += fail("FP8 cyclic KV layout metadata mismatch");
+    }
+    ninfer::DeviceBuffer fp8_buf(device.device(), 2 * fp8_image.image_bytes);
+    ninfer::StateImageStorage fp8_store(fp8_buf.span(), fp8_image);
+    ninfer::CyclicKVCacheView fp8_view(fp8_store, fp8_layout);
+    if (fp8_view.storage() != ninfer::KvCacheStorage::Fp8E4m3fnGroup128Ue8m0) {
+        failures += fail("FP8 cyclic view storage mismatch");
+    }
+    const std::int64_t dst_off = static_cast<std::int64_t>(fp8_image.image_bytes);
+    fp8_store.clear(0, device.execution_view());
+    fp8_store.clear(dst_off, device.execution_view());
+    CUDA_CHECK(cudaMemsetAsync(fp8_store.tensor(fp8_layout.k, 0, 1).data, 0x2a,
+                               fp8_store.tensor(fp8_layout.k, 0, 1).bytes(), device.stream()));
+    CUDA_CHECK(cudaMemsetAsync(fp8_store.tensor(fp8_layout.v, 0, 1).data, 0x3b,
+                               fp8_store.tensor(fp8_layout.v, 0, 1).bytes(), device.stream()));
+    CUDA_CHECK(cudaMemsetAsync(fp8_store.tensor(fp8_layout.k_scales, 0, 1).data, 0x7f,
+                               fp8_store.tensor(fp8_layout.k_scales, 0, 1).bytes(),
+                               device.stream()));
+    CUDA_CHECK(cudaMemsetAsync(fp8_store.tensor(fp8_layout.v_scales, 0, 1).data, 0x80,
+                               fp8_store.tensor(fp8_layout.v_scales, 0, 1).bytes(),
+                               device.stream()));
+    fp8_store.copy_group(fp8_layout.group, 0, dst_off, device.execution_view());
+    device.synchronize();
+    failures += expect_device_byte(fp8_store.tensor(fp8_layout.k, dst_off, 1), 0x2a, "fp8 cyclic k");
+    failures += expect_device_byte(fp8_store.tensor(fp8_layout.v, dst_off, 1), 0x3b, "fp8 cyclic v");
+    failures += expect_device_byte(fp8_store.tensor(fp8_layout.k_scales, dst_off, 1), 0x7f,
+                                   "fp8 cyclic k_scales");
+    failures += expect_device_byte(fp8_store.tensor(fp8_layout.v_scales, dst_off, 1), 0x80,
+                                   "fp8 cyclic v_scales");
+
+    ninfer::DeviceBuffer offsets_buf(device.device(), sizeof(std::int64_t));
+    ninfer::Tensor offsets(offsets_buf.span(), ninfer::DType::I64, {1});
+    const auto layer_view = fp8_view.layer_view(1, offsets);
+    const ninfer::ConstCyclicKVCacheLayerView const_view(layer_view);
+    if (const_view.device() != device.device() ||
+        const_view.storage != ninfer::KvCacheStorage::Fp8E4m3fnGroup128Ue8m0 ||
+        const_view.k.field.tensor.dtype != ninfer::DType::FP8_E4M3FN ||
+        const_view.v.field.tensor.dtype != ninfer::DType::FP8_E4M3FN ||
+        const_view.k_scales.field.tensor.dtype != ninfer::DType::U8 ||
+        const_view.v_scales.field.tensor.dtype != ninfer::DType::U8 ||
+        const_view.k_scales.records.byte_offsets.data != offsets.data ||
+        const_view.v_scales.records.byte_offsets.data != offsets.data) {
+        failures += fail("FP8 cyclic layer_view binding mismatch");
+    }
+
+    rejected = false;
+    try {
+        ninfer::StateImageBuilder bad;
+        (void)ninfer::plan_cyclic_kv_cache(bad, 1, 1024, 8, 64,
+                                           ninfer::KvCacheStorage::Fp8E4m3fnGroup128Ue8m0);
+    } catch (const std::invalid_argument&) { rejected = true; }
+    if (!rejected) failures += fail("FP8 cyclic KV with head_dim=64 should be rejected");
+
+    rejected = false;
+    try {
+        ninfer::StateImageBuilder bad;
+        (void)ninfer::plan_cyclic_kv_cache(bad, 1, 1024, 8, 384,
+                                           ninfer::KvCacheStorage::Fp8E4m3fnGroup128Ue8m0);
+    } catch (const std::invalid_argument&) { rejected = true; }
+    if (!rejected) failures += fail("FP8 cyclic KV with head_dim=384 should match paged rejection");
+
+    {
+        ninfer::StateImageBuilder d256_builder;
+        const auto d256_layout = ninfer::plan_cyclic_kv_cache(
+            d256_builder, 1, 1024, 8, 256, ninfer::KvCacheStorage::Fp8E4m3fnGroup128Ue8m0);
+        const auto d256_image = d256_builder.finish();
+        if (d256_image.fields[d256_layout.k_scales.index].tensor.shape[0] != 2 ||
+            d256_image.fields[d256_layout.v_scales.index].tensor.shape[0] != 2) {
+            failures += fail("FP8 cyclic KV head_dim=256 scale extent mismatch");
+        }
+    }
+
+    rejected = false;
+    try {
+        ninfer::StateImageBuilder bad;
+        (void)ninfer::plan_cyclic_kv_cache(bad, 1, 1024, 8, 128,
+                                           ninfer::KvCacheStorage::Nvfp4Group16);
+    } catch (const std::invalid_argument&) { rejected = true; }
+    if (!rejected) failures += fail("NVFP4 cyclic KV should be rejected");
+
+    rejected = false;
+    try {
+        auto bad_bf16    = bf16_view.layer_view(0, offsets);
+        bad_bf16.k_scales = layer_view.k_scales;
+        (void)bad_bf16.device();
+    } catch (const std::invalid_argument&) { rejected = true; }
+    if (!rejected) failures += fail("BF16 cyclic KV carrying scale fields should be rejected");
+
+    rejected = false;
+    try {
+        auto bad_fp8     = layer_view;
+        bad_fp8.k_scales = {};
+        (void)bad_fp8.device();
+    } catch (const std::invalid_argument&) { rejected = true; }
+    if (!rejected) failures += fail("FP8 cyclic KV missing scale fields should be rejected");
+
+    rejected = false;
+    try {
+        auto bad_storage    = layer_view;
+        bad_storage.storage = ninfer::KvCacheStorage::Int8Group64;
+        (void)bad_storage.device();
+    } catch (const std::invalid_argument&) { rejected = true; }
+    if (!rejected) failures += fail("Unsupported cyclic KV storage enum should be rejected");
+
+    return failures;
+}
 } // namespace
 
 int main() {
@@ -269,7 +420,8 @@ int main() {
         CUDA_CHECK(error);
         ninfer::DeviceContext device(0);
         const auto failures = mixed_image_case(device) + recurrent_image_case(device) +
-                              scattered_records(device) + bf16_recurrent_case(device);
+                              scattered_records(device) + bf16_recurrent_case(device) +
+                              kv_cache_fp8_d128_case(device);
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

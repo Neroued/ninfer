@@ -176,12 +176,12 @@ struct Fixture {
 
     void bind(const Tensor& offsets) {
         for (int layer = 0; layer < kLayers; ++layer)
-            views[layer].cache = {records->field(2 * layer, offsets),
-                                  records->field(2 * layer + 1, offsets),
-                                  kCapacity,
-                                  kPaddedCapacity,
-                                  kHeads,
-                                  kHeadDim};
+            views[layer].cache = {.k               = records->field(2 * layer, offsets),
+                                  .v               = records->field(2 * layer + 1, offsets),
+                                  .capacity        = kCapacity,
+                                  .padded_capacity = kPaddedCapacity,
+                                  .num_kv_heads    = kHeads,
+                                  .head_dim        = kHeadDim};
     }
 
     void reset_cache() {

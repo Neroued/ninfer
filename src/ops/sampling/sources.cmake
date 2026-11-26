@@ -13,3 +13,5 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/candidate_path/launch.cu"
   "${CMAKE_CURRENT_LIST_DIR}/token_counts.cu"
 )
+
+include("${CMAKE_CURRENT_LIST_DIR}/markov_head/sources.cmake")

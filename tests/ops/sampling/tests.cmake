@@ -9,3 +9,8 @@ ninfer_add_op_test(ninfer_sampling_test
           "${CMAKE_CURRENT_LIST_DIR}/accept_greedy.cpp"
           "${CMAKE_CURRENT_LIST_DIR}/accept_sparse.cpp"
   LIBRARIES ninfer_ops)
+
+ninfer_add_op_test(ninfer_markov_head_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/markov_head.cpp"
+          "${CMAKE_CURRENT_LIST_DIR}/markov_head_fixture.cu"
+  LIBRARIES ninfer_ops)

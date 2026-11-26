@@ -21,11 +21,9 @@ ExecutionShape make_shape(const execution::ModelProfile& p, const EngineOptions&
     if (!o.max_context || o.max_context > p.config.text.max_context || !o.max_concurrency)
         throw std::invalid_argument(
             "Inkling2 execution bounds differ from its model or batch contract");
-    if (o.enable_vision)
-        throw std::invalid_argument("Inkling2 Vision execution is not yet implemented");
     if (o.speculative.backend != SpeculativeBackend::None || o.speculative.draft_tokens != 0)
         throw std::invalid_argument("Inkling2 DSpark speculative execution is not yet implemented");
-    if (o.purpose == EnginePurpose::CausalScoring && o.max_concurrency != 1)
+    if (o.purpose == EnginePurpose::CausalScoring && (o.max_concurrency != 1 || p.vision))
         throw std::invalid_argument(
             "Inkling2 causal scoring requires single-request Text resources");
     if (o.context_cache.host_capacity_bytes.value_or(0))
@@ -71,15 +69,20 @@ context::ContextDirectorySpec schema(const ExecutionPlan& p, std::size_t capacit
 
 std::size_t ExecutionPlan::pinned_bytes() const {
     return frame.host_ingress.bytes + frame.sampling_ingress.bytes + pinned_output_bytes +
-           2 * mapping_elements * sizeof(std::int64_t) + pinned_context_counts_bytes();
+           2 * mapping_elements * sizeof(std::int64_t) + pinned_context_counts_bytes() +
+           (workspace.vision ? workspace.vision->encoder.host_staging_bytes : 0);
 }
 
 std::size_t ExecutionPlan::pinned_context_counts_bytes() const {
     return frame.token_counts ? std::size_t(profile->public_tokens) * sizeof(std::int32_t) : 0;
 }
 
+std::size_t ExecutionPlan::fixed_device_bytes() const {
+    return fixed_bytes + workspace.bytes + (workspace.vision ? workspace.vision->output_bytes : 0);
+}
+
 std::size_t ExecutionPlan::device_bytes() const {
-    return capacity.device_bytes + fixed_bytes + workspace.bytes;
+    return capacity.device_bytes + fixed_device_bytes();
 }
 
 std::size_t ExecutionPlan::reservation_bytes() const {
@@ -101,7 +104,8 @@ ExecutionPlan plan_execution(std::shared_ptr<const execution::ModelProfile> prof
     out.decode_routes  = make_decode_routes(out.shape, *out.batches);
     out.use_cuda_graph = !out.batches->graph_rows().empty();
     out.state          = plan_state(*out.profile, out.shape.swa_kv_storage);
-    out.workspace      = execution::plan_workspace(*out.profile, out.shape, sm_count);
+    out.workspace =
+        execution::plan_workspace(*out.profile, out.shape, sm_count, o.vision_memory_budget_bytes);
 
     const auto& c = out.profile->config.text;
     LayoutBuilder b;
@@ -146,7 +150,7 @@ runtime::ContextCapacityPlan describe_execution_capacity(const ExecutionPlan& p)
                     count32(std::uint64_t(concurrent) * (pages(short_tokens) + 1U))));
 
     out.fixed_device_bytes =
-        p.fixed_bytes + p.workspace.bytes + (NINFER_SHARED_PHYSICAL_MEMORY ? p.pinned_bytes() : 0);
+        p.fixed_device_bytes() + (NINFER_SHARED_PHYSICAL_MEMORY ? p.pinned_bytes() : 0);
     out.fixed_host_bytes = p.pinned_bytes();
 
     auto description = schema(p, 0);
@@ -154,7 +158,7 @@ runtime::ContextCapacityPlan describe_execution_capacity(const ExecutionPlan& p)
         description, geometry, 0,
         p.shape.purpose == EnginePurpose::Generation ? p.profile->public_tokens : 0,
         p.shape.purpose == EnginePurpose::Generation ? p.shape.max_concurrency : 0,
-        p.shape.max_context, p.shape.prefill_chunk, /*vision=*/false);
+        p.shape.max_context, p.shape.prefill_chunk, p.workspace.vision.has_value());
     return out;
 }
 

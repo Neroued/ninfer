@@ -41,6 +41,7 @@ WorkContract RankProgramImpl::contract() const {
             parameters.profile->config.text.vocabulary,
             parameters.profile->public_tokens,
             parameters.profile->local.size,
+            resources.vision ? resources.vision->capacity().max_features : 0,
             parameters.profile->control_token_limit,
             resources.plan.decode_routes};
 }
@@ -145,6 +146,7 @@ void RankProgramImpl::discard(runtime::ExecutionTicket ticket, runtime::CommandS
     timer.resolve();
     timer.record_retirement();
     compute_done.record(cuda.stream());
+    compute->release_vision = true;
     compute->phase      = ComputePhase::Retiring;
     compute->retirement = command;
 }
@@ -155,6 +157,8 @@ void RankProgramImpl::drain() {
     try {
         resources.synchronize();
     } catch (...) { error = std::current_exception(); }
+    if (resources.vision)
+        if (const auto* active = resources.vision->current()) resources.vision->release(active->id);
     compute.reset();
     context.reset();
     events.clear();
@@ -179,7 +183,10 @@ void RankProgramImpl::advance_context() {
     if (!f.submitted) {
         const auto transfer   = device.transfer_view();
         const auto vocabulary = parameters.profile->public_tokens;
-        for (auto r : work.releases) bindings[r.lane.value].reset();
+        for (auto r : work.releases) {
+            retire_vision(r);
+            bindings[r.lane.value].reset();
+        }
         for (const auto& b : work.bindings) {
             const auto lane = b.member.residency.lane.value;
             bindings[lane]  = b.member;
@@ -210,8 +217,9 @@ void RankProgramImpl::advance_context() {
 
 RankExecutionObservation RankProgramImpl::observation() const {
     RankExecutionObservation out;
-    const auto peak =
-        std::max(resources.workspace.peak_used(), graphs ? graphs->workspace_peak() : 0);
+    const auto peak = std::max({resources.workspace.peak_used(),
+                                resources.vision ? resources.vision->workspace_peak_bytes() : 0,
+                                graphs ? graphs->workspace_peak() : 0});
     out.workspace_peak_bytes   = std::max(lifetime_peak, peak);
     out.measurement_peak_bytes = peak;
     return out;
@@ -243,6 +251,7 @@ RankMemoryBudget RankProgramImpl::budget() const {
 void RankProgramImpl::reset_peaks() {
     lifetime_peak = observation().workspace_peak_bytes;
     resources.workspace.reset_peak();
+    if (resources.vision) resources.vision->reset_peaks();
     if (graphs) graphs->reset_workspace_peak();
 }
 
@@ -294,7 +303,9 @@ void RankProgram::drain() { impl_->drain(); }
 
 const ExecutionPlan& RankProgram::plan() const { return impl_->resources.plan; }
 
-MemorySpan RankProgram::input_storage() { return {}; }
+MemorySpan RankProgram::input_storage() {
+    return impl_->resources.vision ? impl_->resources.vision->staging() : MemorySpan{};
+}
 
 RankMemoryUsage RankProgram::observe_resources() const { return impl_->memory(); }
 

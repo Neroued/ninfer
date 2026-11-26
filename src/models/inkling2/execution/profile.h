@@ -54,6 +54,15 @@ struct TextProfile {
     std::vector<PhysicalLayerProfile> layers;
 };
 
+struct VisionLayerProfile {
+    ops::LinearProfile qkv, output, fc1, fc2;
+};
+
+struct VisionProfile {
+    ops::LinearProfile patch, projector_in, projector_out;
+    std::vector<VisionLayerProfile> layers;
+};
+
 struct LocalGeometry {
     std::uint32_t rank = 0;
     std::uint32_t size = 1;
@@ -67,6 +76,7 @@ struct ModelProfile {
     std::uint32_t public_tokens       = 0;
     std::uint32_t control_token_limit = 0;
     TextProfile text;
+    std::optional<VisionProfile> vision;
 };
 
 [[nodiscard]] std::shared_ptr<const ModelProfile>

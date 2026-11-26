@@ -66,7 +66,7 @@ Session::inspect_source(const RequestBasePlan& base, std::optional<CheckpointHan
     out.remaining_work = models::vision::recovery_work(
         base.plan_->prompt.identity.media,
         [](const auto& media) -> const auto& { return media.item; }, out.reused_tokens, end,
-        p.shape.prefill_chunk, 0);
+        p.shape.prefill_chunk, p.plan.vision_max_features);
     if (h) {
         const auto& c           = p.checkpoints.at(*h);
         const auto image        = c.snapshot.continuation().image;

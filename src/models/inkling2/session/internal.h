@@ -27,6 +27,7 @@ struct CapturePoint {
 
 struct RequestPlan {
     PreparedPromptData prompt;
+    std::shared_ptr<const vision::ExecutionInput> vision;
     runtime::RequestPlanSummary summary;
     context::PrefixQuery query;
     std::uint32_t domain = 0;
@@ -206,6 +207,7 @@ struct ComputeTransaction {
     ExecutionSample observed_result;
     std::vector<runtime::CommitDecision> decisions;
     std::unique_ptr<context::ContextTransaction> completion;
+    std::uint64_t vision_id = 0;
     bool committed = false;
     bool discarded = false;
     std::optional<SessionEvent> event;
@@ -245,6 +247,8 @@ public:
     [[nodiscard]] std::uint32_t pool_count() const noexcept;
     [[nodiscard]] std::uint32_t window_end(const Sequence&, std::uint32_t begin,
                                            std::uint32_t end) const;
+    [[nodiscard]] std::optional<vision::Work> prepare_visual(const Sequence&, std::uint32_t begin,
+                                                            std::uint32_t end);
     [[nodiscard]] std::uint32_t unit_end(const Sequence&, ExecutionUnitKind, std::uint32_t) const;
     [[nodiscard]] BindingPlan plan_binding(const RequestBasePlan&, runtime::LaneId,
                                            const SourceCandidate&, const ResumeState*,
@@ -333,6 +337,7 @@ public:
     std::optional<ContextAssessment> pending_maintenance;
     std::optional<PauseReservation> pause_reservation;
     std::unique_ptr<ComputeTransaction> compute;
+    models::vision::Window vision_window;
     std::unique_ptr<Scoring> scoring;
     std::deque<SessionEvent> events;
     std::vector<runtime::ResidencyId> releases;

@@ -16,6 +16,7 @@ void submit(detail::SessionImpl& session, runtime::ExecutionReservation reservat
     tx.ticket    = session.executor->submit(std::move(reservation), std::move(work));
     for (auto h : tx.members) session.sequence(h).computing = true;
     tx.context.mark_submitted();
+    if (tx.vision_id) session.vision_window.submitted(tx.vision_id, tx.ticket);
 }
 
 } // namespace
@@ -37,10 +38,15 @@ runtime::PrefillCandidateInfo Session::prefill_candidate(SequenceHandle handle) 
     const auto prompt  = s.request->summary.prompt_tokens;
     const auto end     = p.unit_end(s, ExecutionUnitKind::Prefill, 0);
     const bool capture = s.capture && s.captures[s.next_capture].frontier == begin;
+    const bool exclusive =
+        s.request->vision && begin < end &&
+        std::ranges::any_of(s.request->vision->units, [&](const models::vision::Unit& unit) {
+            return unit.token_begin < end && begin < unit.end();
+        });
     return {.placement         = s.continuation.metadata.placement,
             .remaining_tokens  = prompt - begin,
             .unit_max_tokens   = end - begin,
-            .exclusive         = false,
+            .exclusive         = exclusive,
             .zero_token_sample = begin == prompt && !capture};
 }
 
@@ -74,7 +80,7 @@ Session::start_prefill(std::span<const SequenceHandle> members,
         const auto begin  = s.continuation.metadata.main_frontier;
         const auto tokens = std::min(grants[b].max_tokens, info.unit_max_tokens);
         const auto end    = std::min(s.permitted_frontier, begin + tokens);
-        if (end == begin && !info.zero_token_sample)
+        if ((info.exclusive && members.size() > 1) || (end == begin && !info.zero_token_sample))
             throw std::logic_error("prefill grant has no executable window");
         if (end - begin > remaining)
             throw std::logic_error("prefill grants exceed the token budget");
@@ -102,6 +108,10 @@ Session::start_prefill(std::span<const SequenceHandle> members,
             row.sampling_position = end;
             if (row.sample) forward.sample = SampleKind::FirstToken;
             tx.rows.push_back(std::move(row));
+            if (auto visual = p.prepare_visual(s, begin, end)) {
+                tx.vision_id   = visual->window.id;
+                forward.visual = std::move(visual);
+            }
         }
         forward.rows = tx.rows;
         submit(p, std::move(*reservation), {{}, std::move(forward)});
@@ -130,8 +140,10 @@ std::optional<runtime::ExecutionTicket> Session::start_replay(SequenceHandle han
         if (end > begin) p.prepare_write(s, end, tx.context);
         tx.rows.push_back(p.work_row(s, end - begin));
         ForwardWork forward;
-        forward.kind = ForwardKind::Replay;
-        forward.rows = tx.rows;
+        forward.kind   = ForwardKind::Replay;
+        forward.rows   = tx.rows;
+        forward.visual = p.prepare_visual(s, begin, end);
+        if (forward.visual) tx.vision_id = forward.visual->window.id;
         submit(p, std::move(*reservation), {{}, std::move(forward)});
         return tx.ticket;
     } catch (const std::exception& error) {

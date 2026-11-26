@@ -284,7 +284,8 @@ private:
 [[nodiscard]] PreparedSession prepare_session(std::shared_ptr<const ModelDefinition>, SessionPlan,
                                               std::unique_ptr<context::ContextDirectory>);
 [[nodiscard]] PreparedSession prepare_session(std::shared_ptr<const ModelDefinition>,
-                                              PreparedContext, std::uint32_t checkpoint_interval);
+                                              PreparedContext, std::uint32_t checkpoint_interval,
+                                              std::uint32_t vision_max_features);
 
 class Session {
 public:
@@ -317,8 +318,8 @@ public:
     demotion_work(const ContextDemotion&, std::span<const CheckpointHandle> victims = {}) const;
     [[nodiscard]] runtime::PrefillBudgetPolicy prefill_budget_policy() const noexcept;
     [[nodiscard]] runtime::PrefillCandidateInfo prefill_candidate(SequenceHandle) const;
-    [[nodiscard]] std::optional<SequenceHandle> prefill_continuation() const { return {}; }
-    void yield_prefill(SequenceHandle) {}
+    [[nodiscard]] std::optional<SequenceHandle> prefill_continuation() const;
+    void yield_prefill(SequenceHandle);
 
     [[nodiscard]] ContextAssessment assess(const ContextDemand&,
                                            const ContextReleaseSet& = {}) const;

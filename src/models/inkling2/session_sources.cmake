@@ -1,5 +1,6 @@
 target_sources(ninfer_model_control PRIVATE
   inkling2/work.cpp
+  inkling2/vision/control.cpp
   inkling2/parallel/preparation.cpp
   inkling2/session/planning.cpp
   inkling2/session/session.cpp

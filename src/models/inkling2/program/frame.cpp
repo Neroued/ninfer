@@ -93,6 +93,8 @@ FrameLayout plan_frame(LayoutBuilder& b, const execution::ModelProfile& p,
     out.packed.tables              = rows();
     out.packed.sampled_offsets     = tensor(DType::I64, {batch}, "packed sampled offsets");
 
+    if (p.vision) out.visual_indices = tensor(DType::I32, {chunk}, "visual embedding indices");
+
     const auto host_end = b.finish(256);
     out.host_ingress    = {out.ingress.offset, host_end - out.ingress.offset, 256};
 

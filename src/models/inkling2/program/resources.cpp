@@ -2,6 +2,7 @@
 
 #include "core/transfer.h"
 
+#include <algorithm>
 #include <cstring>
 #include <stdexcept>
 
@@ -25,6 +26,7 @@ Resources::Resources(ExecutionPlan input, DeviceContext& device)
       egress_(plan.pinned_output_bytes), context_counts_(plan.pinned_context_counts_bytes()),
       workspace(workspace_.span().subspan(0, plan.workspace.general_bytes)),
       states(context_.span(), plan.state), main(context_.span(), fixed_.span(), plan.main) {
+    if (plan.workspace.vision) vision.emplace(device, *plan.workspace.vision);
     std::vector<context::ContextTableStorage> tables{{0, &main.tables()}};
     context = std::make_unique<context::ContextStorage>(context_.span(), MemorySpan{}, tables,
                                                         plan.profile->local.rank);
@@ -85,7 +87,12 @@ RankMemoryUsage Resources::observe() const {
     out.allocations.io_pinned_bytes         = ingress_.size() + sampling_.size() + egress_.size() +
                                       context_counts_.size() + compute_actions->pinned_bytes() +
                                       context_actions->pinned_bytes();
-    const auto peak = workspace.peak_used();
+    if (vision) {
+        out.vision = vision->observe();
+        out.allocations.persistent_device_bytes += vision->capacity().output_bytes;
+        out.allocations.io_pinned_bytes += vision->capacity().encoder.host_staging_bytes;
+    }
+    const auto peak = std::max(workspace.peak_used(), vision ? vision->workspace_peak_bytes() : 0);
     out.workspace   = {workspace.used(), peak, peak};
     return out;
 }

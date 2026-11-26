@@ -29,6 +29,7 @@ struct ExecutionPlan {
 
     [[nodiscard]] std::size_t pinned_bytes() const;
     [[nodiscard]] std::size_t pinned_context_counts_bytes() const;
+    [[nodiscard]] std::size_t fixed_device_bytes() const;
     [[nodiscard]] std::size_t device_bytes() const;
     [[nodiscard]] std::size_t reservation_bytes() const;
 };

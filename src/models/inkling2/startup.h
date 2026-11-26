@@ -12,6 +12,10 @@
 
 namespace ninfer::models::inkling2 {
 
+struct PreparedRankDescription : RankResourceDescription {
+    std::uint32_t vision_max_features = 0;
+};
+
 class RankPreparation {
 public:
     using Types    = RuntimeTypes;
@@ -36,7 +40,7 @@ public:
     void select_narrow_targets(bool enabled, GraphMemorySummary measured = {});
 
     [[nodiscard]] GraphMemorySummary graph_memory() const noexcept { return graph_memory_; }
-    [[nodiscard]] RankResourceDescription describe() const;
+    [[nodiscard]] PreparedRankDescription describe() const;
     [[nodiscard]] std::unique_ptr<Instance> finish() &&;
 
 private:
@@ -67,7 +71,7 @@ public:
                                                            const EngineOptions&,
                                                            DeviceContext&) const;
     [[nodiscard]] bool narrow_targets(const EngineOptions&) const noexcept { return false; }
-    [[nodiscard]] PreparedSession session(const RankResourceDescription&,
+    [[nodiscard]] PreparedSession session(const PreparedRankDescription&,
                                           std::uint32_t checkpoint_interval) const;
     [[nodiscard]] Architecture architecture() const noexcept { return Architecture::Inkling2; }
     [[nodiscard]] std::string prefill_signature(std::uint32_t chunk) const;

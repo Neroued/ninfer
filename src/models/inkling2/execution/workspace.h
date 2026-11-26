@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/arena.h"
+#include "models/common/vision/resources.h"
 #include "models/inkling2/execution/profile.h"
 #include "models/inkling2/execution_shape.h"
 #include "ninfer/ops/relative_attention.h"
@@ -16,10 +17,11 @@ struct WorkspacePlan {
     std::size_t finish        = 0;
     std::size_t general_bytes = 0;
     std::size_t bytes         = 0;
+    std::optional<models::vision::Capacity> vision;
 };
 
 [[nodiscard]] WorkspacePlan plan_workspace(const ModelProfile&, const ExecutionShape&,
-                                           std::int32_t sm_count);
+                                           std::int32_t sm_count, std::size_t vision_memory_budget);
 
 namespace workspace {
 

@@ -81,13 +81,15 @@ session_metadata_plan(const context::ContextDirectorySpec& schema,
 }
 
 PreparedSession prepare_session(std::shared_ptr<const ModelDefinition> definition,
-                                PreparedContext prepared, std::uint32_t interval) {
+                                PreparedContext prepared, std::uint32_t interval,
+                                std::uint32_t vision_max_features) {
     SessionPlan plan;
     plan.shape               = prepared.shape;
     plan.batches             = std::move(prepared.batches);
     plan.context             = std::move(prepared.spec);
     plan.states              = std::move(prepared.states);
     plan.checkpoint_interval = interval;
+    plan.vision_max_features = vision_max_features;
     for (const auto& geometry : prepared.caches)
         plan.caches.push_back(plan_kv_page_layout(geometry));
     return prepare_session(std::move(definition), std::move(plan), std::move(prepared.directory));

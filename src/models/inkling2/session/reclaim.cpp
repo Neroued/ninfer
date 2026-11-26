@@ -259,7 +259,7 @@ Session::recovery_points(const ContextReleaseSet& removed_device,
         value.work      = record.recovery_work_cache.lock();
         if (!value.work) {
             value.work = context::recovery_work(recovery_budget(), p.prefixes, value.prefix,
-                                                p.shape.prefill_chunk, 0);
+                                                p.shape.prefill_chunk, p.plan.vision_max_features);
             record.recovery_work_cache = value.work;
         }
         for (auto target : p.placements) {
@@ -301,7 +301,8 @@ Session::recovery_target(const RequestBasePlan& base, std::uint32_t f, runtime::
     value.frontier  = f;
     value.prefix    = base.plan_->query.endpoint(f);
     value.work      = context::recovery_work(recovery_budget(), f, base.plan_->media,
-                                             impl_->shape.prefill_chunk, 0);
+                                             impl_->shape.prefill_chunk,
+                                             impl_->plan.vision_max_features);
     value.restores.push_back({target, {}});
     for (std::uint32_t rank = 0; rank < impl_->plan.states.size(); ++rank) {
         if (const auto& field = impl_->plan.states[rank].persistent_copy) {
@@ -327,7 +328,7 @@ runtime::PauseCostQuote Session::pause_cost(SequenceHandle h, const PauseOption&
         return models::vision::recovery_work(
             s.request->prompt.identity.media,
             [](const auto& media) -> const auto& { return media.item; }, begin, end,
-            p.shape.prefill_chunk, 0);
+            p.shape.prefill_chunk, p.plan.vision_max_features);
     };
     runtime::PauseCostQuote quote;
     quote.work =

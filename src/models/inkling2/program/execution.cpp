@@ -40,14 +40,14 @@ void RankProgramImpl::forward() {
     const auto& work    = f.request.work;
     auto rows           = work_rows(work);
     const auto* forward = std::get_if<ForwardWork>(&work.operation);
-    if (forward && forward->kind == ForwardKind::Prefill) {
+    if (forward && forward->kind == ForwardKind::Prefill && !forward->visual) {
         forward_packed_prefill(*forward);
         return;
     }
     const bool control =
         forward && forward->kind == ForwardKind::Control && rows.front().ids.size() > 1;
     f.sequence = std::holds_alternative<ScoreWork>(work.operation) || control ||
-                 (forward && forward->kind == ForwardKind::Replay);
+                 (forward && (forward->kind == ForwardKind::Replay || forward->visual));
     if (control) {
         const auto& original = rows[f.control_row];
         auto end =
@@ -97,10 +97,12 @@ void RankProgramImpl::forward() {
         return;
     }
 
-    // Sequence ragged execution (Replay, Score, or multi-token Control)
+    auto visual = forward ? prepare_vision(forward->visual, rows.front().main_frontier, f.tokens)
+                          : std::nullopt;
     f.timed_prefill = f.sequence && prefill_timer.has_value();
     if (f.timed_prefill) prefill_timer->start();
-    main_forward(f.batch, execution::PackedPrefillUpdate{f.sequence_ragged}, f.hidden);
+    main_forward(f.batch, execution::PackedPrefillUpdate{f.sequence_ragged}, f.hidden, {},
+                 std::move(visual));
     {
         auto last         = f.hidden.slice(1, static_cast<std::int32_t>(f.tokens) - 1, 1);
         const auto offset = rows[0].states.at(parameters.profile->local.rank).destination;
@@ -156,9 +158,10 @@ execution::TextRun RankProgramImpl::text_run(const execution::BatchView& call,
 }
 
 void RankProgramImpl::main_forward(const execution::BatchView& call, execution::StateUpdate update,
-                                   Tensor hidden, const execution::FullAttentionSubmit& submit) {
+                                   Tensor hidden, const execution::FullAttentionSubmit& submit,
+                                   std::optional<models::vision::EmbeddingView> visual) {
     auto run = text_run(call, update);
-    run.stem();
+    run.stem(std::move(visual));
     run.forward(hidden, submit);
 }
 
@@ -249,6 +252,7 @@ void RankProgramImpl::result() {
             f.result.rows[members[b]].tokens = {ids[b]};
         }
     }
+    collect_vision_timing();
     timer.observe_result(f.gpu);
     if (ExecutionTypes::describe_work(f.request.work).kind == ExecutionKind::Decode)
         timer.observe_decode(f.gpu, false);
@@ -294,6 +298,14 @@ void RankProgramImpl::advance_compute() {
     case ComputePhase::Retiring:
         if (compute_done.ready()) {
             if (resources.compute_actions->occupied()) resources.compute_actions->finish();
+            collect_vision_timing();
+            if (const auto* forward = std::get_if<ForwardWork>(&f.request.work.operation);
+                forward && forward->visual) {
+                const auto& use = forward->visual->window;
+                const auto& row = forward->rows.front();
+                if (f.release_vision || row.main_frontier + row.ids.size() >= use.plan->consume_end)
+                    resources.vision->release(use.id);
+            }
             auto observed = observation();
             observed.path = f.graph_route ? ExecutionPath::Graph : ExecutionPath::Eager;
             timer.observe_retirement(f.gpu);

@@ -11,6 +11,8 @@ target_sources(ninfer_model_execution PRIVATE
   inkling2/program/planning.cpp
   inkling2/program/resources.cpp
   inkling2/program/program.cpp
+  inkling2/vision/execution.cpp
+  inkling2/program/vision.cpp
   inkling2/program/execution.cpp
   inkling2/program/inputs.cpp
   inkling2/program/commit.cpp

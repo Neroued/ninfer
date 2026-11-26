@@ -122,6 +122,7 @@ void SessionImpl::clear(Sequence& s) noexcept {
         found != resident_sequences.end() && found->second == &s)
         resident_sequences.erase(found);
     try {
+        vision_window.revoke(member(s));
         release_residency(member(s).residency);
         s.capture.reset();
         s.prefix = {};
@@ -161,6 +162,7 @@ void SessionImpl::cleanup() noexcept {
             if (s) clear(*s);
             s.reset();
         }
+        vision_window = {};
         checkpoints.clear();
         events.clear();
         releases.clear();
@@ -419,6 +421,16 @@ bool Session::recovery_precedes(runtime::PrefixId a, std::uint32_t af, runtime::
                                 std::uint32_t bf) const {
     return af <= bf && impl_->prefixes.valid(a) && impl_->prefixes.valid(b) &&
            impl_->prefixes.is_prefix(a, b);
+}
+
+std::optional<SequenceHandle> Session::prefill_continuation() const {
+    const auto owner = impl_->vision_window.owner();
+    if (owner && impl_->valid(owner->sequence)) return owner->sequence;
+    return {};
+}
+
+void Session::yield_prefill(SequenceHandle h) {
+    impl_->vision_window.revoke(impl_->member(impl_->sequence(h)));
 }
 
 } // namespace ninfer::models::inkling2

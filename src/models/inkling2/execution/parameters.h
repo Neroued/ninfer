@@ -69,12 +69,28 @@ struct TextParameters {
     std::vector<PhysicalLayerParameters> layers;
 };
 
+struct VisionLayerParameters {
+    Tensor ln_1_weight, ln_1_bias, ln_2_weight, ln_2_bias;
+    Tensor ls_1_gamma, ls_2_gamma;
+    LinearParameters qkv, output, fc1, fc2;
+    Tensor qkv_bias, output_bias, fc1_bias, fc2_bias;
+};
+
+struct VisionParameters {
+    LinearParameters patch, projector_in, projector_out;
+    Tensor position_embedding, class_embedding, cls_position_embedding;
+    Tensor pre_norm_weight, pre_norm_bias;
+    std::optional<Tensor> projector_in_bias, projector_out_bias;
+    std::vector<VisionLayerParameters> layers;
+};
+
 struct Parameters {
     Parameters(const ModelShard&, std::shared_ptr<const ModelProfile>);
 
     const ModelShard& model;
     std::shared_ptr<const ModelProfile> profile;
     TextParameters text;
+    std::optional<VisionParameters> vision;
 };
 
 } // namespace ninfer::models::inkling2::execution

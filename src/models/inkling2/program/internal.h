@@ -52,6 +52,7 @@ struct ComputeFrame {
     AttentionWorkCounters attention;
     bool sequence = false, timed_prefill = false, counts_pending = false;
     bool head_ready = false;
+    bool release_vision = false;
 
     [[nodiscard]] std::span<const std::uint32_t> sampling_members() const noexcept {
         return packed ? packed->sampled_members : physical.members;
@@ -83,6 +84,10 @@ public:
     void advance_context();
     void forward();
     void forward_packed_prefill(const ForwardWork&);
+    [[nodiscard]] std::optional<models::vision::EmbeddingView>
+    prepare_vision(const std::optional<vision::Work>&, std::uint32_t begin, std::uint32_t tokens);
+    void collect_vision_timing();
+    void retire_vision(runtime::ResidencyId) noexcept;
     GraphPreparationSample prepare_graphs(GraphPreparationMode);
     void release_graphs();
 
@@ -93,7 +98,8 @@ public:
                         const execution::FullAttentionSubmit& = {});
     [[nodiscard]] execution::TextRun text_run(const execution::BatchView&, execution::StateUpdate);
     void main_forward(const execution::BatchView&, execution::StateUpdate, Tensor hidden,
-                      const execution::FullAttentionSubmit& = {});
+                      const execution::FullAttentionSubmit& = {},
+                      std::optional<models::vision::EmbeddingView> = {});
     void project_head(Tensor hidden);
 
     void copy_result(std::int32_t rows);

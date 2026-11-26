@@ -1,5 +1,7 @@
 #include "models/inkling2/execution/workspace.h"
 
+#include "models/inkling2/vision/execution.h"
+
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_pair.h"
 #include "ninfer/ops/linear_split.h"
@@ -113,7 +115,7 @@ std::size_t main_body_bytes(const ModelProfile& p, const ExecutionShape& s, int 
 } // namespace
 
 WorkspacePlan plan_workspace(const ModelProfile& p, const ExecutionShape& s,
-                             std::int32_t sm_count) {
+                             std::int32_t sm_count, std::size_t vision_memory_budget) {
     WorkspacePlan out;
     const int chunk = dimension(s.prefill_chunk);
     out.prefill     = main_body_bytes(p, s, 1, chunk, 1, sm_count, /*ragged=*/true);
@@ -144,6 +146,11 @@ WorkspacePlan plan_workspace(const ModelProfile& p, const ExecutionShape& s,
 
     out.general_bytes = std::max({out.prefill, out.ordinary, out.finish});
     out.bytes         = out.general_bytes;
+    if (p.vision) {
+        out.vision =
+            vision::plan_resources(*p.config.vision, *p.vision, s.max_context, vision_memory_budget);
+        out.bytes = std::max(out.bytes, out.vision->encoder.workspace_bytes);
+    }
     return out;
 }
 

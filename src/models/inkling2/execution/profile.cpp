@@ -18,6 +18,23 @@ public:
         return ops::describe_linear_weight({&input, 1});
     }
 
+    ops::LinearProfile linear(std::initializer_list<WeightId> ids) const {
+        std::vector<ops::WeightInput> inputs;
+        inputs.reserve(ids.size());
+        for (const auto id : ids) inputs.push_back(weight_input(weights_, id));
+        return ops::describe_linear_weight(inputs);
+    }
+
+    VisionProfile vision(const VisionWeights& w) const {
+        VisionProfile out{linear(w.patch_embedding), linear(w.projector_in),
+                          linear(w.projector_out), {}};
+        out.layers.reserve(w.layers.size());
+        for (const auto& layer : w.layers)
+            out.layers.push_back({linear({layer.query, layer.key, layer.value}),
+                                  linear(layer.output), linear(layer.fc1), linear(layer.fc2)});
+        return out;
+    }
+
     ops::ProjectionProfile projection(std::initializer_list<WeightUseId> ids) const {
         std::vector<ops::WeightInput> inputs;
         inputs.reserve(ids.size());
@@ -130,6 +147,7 @@ std::shared_ptr<const ModelProfile> describe_model(const ModelDefinition& defini
     for (std::size_t i = 0; i < c.physical_layers.size(); ++i) {
         out->text.layers.push_back(d.layer(c.physical_layers[i], w.text.layers[i]));
     }
+    if (w.vision) out->vision = d.vision(*w.vision);
     return out;
 }
 

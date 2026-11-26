@@ -12,6 +12,7 @@ void RankProgramImpl::commit(runtime::ExecutionTicket ticket, runtime::CommandSe
     auto& f = *compute;
     timer.resolve();
     const auto* forward = std::get_if<ForwardWork>(&f.request.work.operation);
+    f.release_vision = std::ranges::any_of(commit.rows, [](const auto& row) { return row.terminal; });
     if (forward && forward->sample != SampleKind::None) {
         const auto& io     = frame;
         const auto members = f.sampling_members();

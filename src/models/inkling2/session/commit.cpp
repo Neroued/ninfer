@@ -138,6 +138,17 @@ void SessionImpl::finish_result(ComputeResult result) {
 void SessionImpl::retire_compute(const runtime::DeviceRetired& event) {
     auto& tx = *compute;
     for (auto h : tx.members) sequence(h).computing = false;
+    if (tx.vision_id) {
+        const auto* window = vision_window.current();
+        bool complete      = tx.discarded;
+        if (window && valid(window->owner.sequence))
+            complete |= sequence(window->owner.sequence).continuation.metadata.main_frontier >=
+                        window->plan->consume_end;
+        else
+            complete = true;
+        vision_window.consumed(tx.vision_id, complete);
+        vision_window.retired(event.ticket);
+    }
     tx.context.mark_completed();
     tx.context.publish();
     if (tx.completion) {

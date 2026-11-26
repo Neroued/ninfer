@@ -43,8 +43,12 @@ RequestBasePlan Session::plan_request(PreparedPrompt&& prompt,
         throw std::invalid_argument("Inkling2 requires a nonempty prepared prompt within capacity");
     if (input.media_payloads.size() != input.identity.media.size())
         throw std::invalid_argument("prepared prompt media payload is incomplete");
-    if (!input.identity.media.empty())
-        throw std::invalid_argument("Inkling2 Vision execution is not yet implemented");
+    if (!input.identity.media.empty()) {
+        if (!p.plan.vision_max_features || !p.definition->config().vision)
+            throw std::invalid_argument("Inkling2 Vision was not prepared for this instance");
+        plan->vision = vision::prepare_input(input, *p.definition->config().vision,
+                                             p.plan.vision_max_features);
+    }
     for (const auto id : input.token_ids)
         if (id < 0 || std::uint32_t(id) >= p.definition->resources().text.public_token_count)
             throw std::invalid_argument("prompt token is outside the public vocabulary");

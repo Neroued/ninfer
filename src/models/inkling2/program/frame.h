@@ -50,6 +50,7 @@ struct FrameLayout {
     TensorRegion prefill_hidden;
     TensorRegion pending_hidden;
     PackedPrefillLayout packed;
+    std::optional<TensorRegion> visual_indices;
     std::optional<TensorRegion> logits;
     std::optional<TensorRegion> token_counts;
     std::optional<TensorRegion> sampling;

@@ -138,16 +138,16 @@ void RankPreparation::select_narrow_targets(bool enabled, GraphMemorySummary) {
     if (enabled) throw std::logic_error("Inkling2 does not support narrow target catalog");
 }
 
-RankResourceDescription RankPreparation::describe() const {
+PreparedRankDescription RankPreparation::describe() const {
     if (!instance_ || !instance_->program)
         throw std::logic_error("Inkling2 resources have not been prepared");
     const auto& p = instance_->program->plan();
     const auto& c = p.capacity;
-    RankResourceDescription out{.rank    = p.profile->local.rank,
-                                .shape   = p.shape,
-                                .batches = p.batches->spec(),
-                                .state   = describe_state(p.state),
-                                .context = describe_context(p)};
+    PreparedRankDescription out{{.rank    = p.profile->local.rank,
+                                 .shape   = p.shape,
+                                 .batches = p.batches->spec(),
+                                 .state   = describe_state(p.state),
+                                 .context = describe_context(p)}};
     out.observation.rank     = out.rank;
     out.observation.hardware = device_.properties().name;
     out.observation.memory   = instance_->program->observe_resources();
@@ -168,6 +168,7 @@ RankResourceDescription RankPreparation::describe() const {
         }
     }
     out.caches.push_back(p.main.page.geometry);
+    if (p.workspace.vision) out.vision_max_features = p.workspace.vision->max_features;
     return out;
 }
 
@@ -209,16 +210,19 @@ std::unique_ptr<RankPreparation> Startup::preparation(const artifact::Reader& re
                         .batches  = make_batch_execution_spec(
                             options.max_concurrency, 1,
                             options.use_cuda_graph && options.purpose == EnginePurpose::Generation),
-                        .host_reservation_bytes = 0,
-                        .control_owner          = true},
+                        .host_reservation_bytes =
+                            options.enable_vision ? options.media_live_bytes : 0,
+                        .control_owner = true},
         device);
 }
 
-PreparedSession Startup::session(const RankResourceDescription& rank,
+PreparedSession Startup::session(const PreparedRankDescription& rank,
                                  std::uint32_t interval) const {
     ParallelPlan group;
     group.ranks.push_back(rank_);
-    return prepare_session(definition_, prepare_context(group, {&rank, 1}), interval);
+    const RankResourceDescription& context = rank;
+    return prepare_session(definition_, prepare_context(group, {&context, 1}), interval,
+                           rank.vision_max_features);
 }
 
 std::string Startup::prefill_signature(std::uint32_t chunk) const {

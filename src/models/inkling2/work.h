@@ -8,6 +8,7 @@
 #include "models/common/speculative/round_plan.h"
 #include "models/common/token_input.h"
 #include "models/inkling2/execution_shape.h"
+#include "models/inkling2/vision/control.h"
 #include "runtime/executor/contract.h"
 
 #include <map>
@@ -57,6 +58,7 @@ struct ForwardWork {
     SampleKind sample = SampleKind::None;
     std::vector<WorkRow> rows;
     BatchPlan batch;
+    std::optional<vision::Work> visual;
     std::shared_ptr<const SpeculativeExecutionGeometry> speculative;
 };
 
@@ -135,6 +137,7 @@ struct WorkContract {
     ExecutionShape shape;
     std::shared_ptr<const BatchExecutionPlan> batches;
     std::uint32_t vocabulary = 0, public_tokens = 0, ranks = 1;
+    std::uint32_t vision_max_features  = 0;
     std::uint32_t control_token_limit = 0;
     std::shared_ptr<const speculative::DecodeGraphRoutes> decode_routes;
     void validate(const Work&, runtime::FrameKind) const;

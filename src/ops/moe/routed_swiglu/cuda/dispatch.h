@@ -3,6 +3,11 @@
 #include "ops/moe/kernels/cuda/groupwise_int/launch.h"
 #include "ops/moe/kernels/cuda/block_scaled/launch.h"
 #include "ops/moe/kernels/cuda/block_scaled/clamped/launch.h"
+#include "core/platform.h"
+#if NINFER_TARGET_RTX5090
+#    include "ops/moe/routed_swiglu/cuda/nvfp4/rtx5090/softcap.h"
+#    include "ops/moe/routed_swiglu/cuda/fp8/rtx5090/softcap.h"
+#endif
 
 #include <span>
 
@@ -10,13 +15,23 @@ namespace ninfer::ops::detail::moe_routed {
 
 namespace kernel = moe_cuda;
 
-enum class Implementation { GroupwiseInt, BlockScaled, ClampedBlockScaled };
+enum class Implementation {
+    GroupwiseInt,
+    BlockScaled,
+    ClampedBlockScaled,
+    SoftcapNvfp4,
+    SoftcapMxfp8
+};
 
 struct Plan {
     Implementation implementation = Implementation::GroupwiseInt;
     kernel::groupwise_int::Plan integer;
     kernel::block_scaled::Plan block_scaled;
     kernel::block_scaled::clamped::Plan clamped;
+#if NINFER_TARGET_RTX5090
+    softcap::Plan softcap;
+    mxfp8_softcap::Plan mxfp8;
+#endif
 };
 
 struct ShapePolicy {
@@ -41,6 +56,8 @@ const ShapePolicy& q4_q5_h2048_i512_e256_k8();
 const ShapePolicy& q4_q6_h2048_i512_e256_k8();
 const ShapePolicy& q8_q8_h2048_i512_e256_k8();
 const ShapePolicy& nvfp4_h2560_i640_e512_k10();
+const ShapePolicy& nvfp4_mul_h2304_i1152_e128_k8();
+const ShapePolicy& mxfp8_h2304_i1152_e128_k8();
 const ShapePolicy& nvfp4_h2560_i320_e512_k10();
 const ShapePolicy& fp8_h2560_i640_e512_k10();
 const ShapePolicy& fp8_h2560_i320_e512_k10();

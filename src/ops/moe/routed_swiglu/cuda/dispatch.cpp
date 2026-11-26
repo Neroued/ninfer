@@ -6,6 +6,11 @@ namespace ninfer::ops::detail::moe_routed {
 
 const ShapePolicy& shape_dispatch(const RoutedSwiGLUProfile& profile) {
     validate_expert_profile(profile);
+#if NINFER_TARGET_RTX5090
+    if (profile.ffn.softcap)
+        return profile.ffn.down_type == QType::MXFP8 ? mxfp8_h2304_i1152_e128_k8()
+                                                     : nvfp4_mul_h2304_i1152_e128_k8();
+#endif
 #if NINFER_TARGET_SPARK
     if (profile.ffn.hidden == 4096) {
         switch (profile.ffn.down_type) {

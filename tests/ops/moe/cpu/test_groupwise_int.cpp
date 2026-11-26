@@ -557,7 +557,7 @@ void validation(Fixture& f, CpuExecutor& executor) {
     ids[0] = -2;
     rejects([&] { call(); });
     ids[0] = -1;
-    rejects([&] { call(); });
+    call();
     ids[0]          = 0;
     coefficients[0] = std::numeric_limits<float>::infinity();
     rejects([&] { call(); });
@@ -606,7 +606,7 @@ void validation(Fixture& f, CpuExecutor& executor) {
     std::fill(mask.begin(), mask.end(), 1);
     call({ExpertSubsetKind::MaskZeros, mask_view});
     ids.fill(-1);
-    coefficients.fill(0);
+    coefficients.fill(std::numeric_limits<float>::quiet_NaN());
     std::fill_n(static_cast<float*>(out.data), H, -123.5F);
     call();
     check(std::all_of(static_cast<float*>(out.data), static_cast<float*>(out.data) + H,

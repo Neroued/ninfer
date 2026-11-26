@@ -15,14 +15,23 @@ namespace ninfer::ops {
 // region from the caller arena and restore its cursor on return; the caller accounts for
 // any leading alignment gap when composing allocations. Zero scratch performs no allocation.
 
+struct SwiGLUSoftcap {
+    float gate_cap                                       = 0.0f;
+    float up_cap                                         = 0.0f;
+    friend bool operator==(SwiGLUSoftcap, SwiGLUSoftcap) = default;
+};
+
 // Every SwiGLU uses gate_up [2I,H] with gate rows first, then up rows; down is [H,I].
 struct SwiGLUProfile {
     std::int32_t hidden = 0, intermediate = 0;
     QType gate_up_type = QType::BF16, down_type = QType::BF16;
     QuantLayout gate_up_layout = QuantLayout::Contiguous, down_layout = QuantLayout::Contiguous;
     LinearPolicy gate_up_policy = LinearPolicy::A16Only, down_policy = LinearPolicy::A16Only;
-    // Absent: SiLU(gate)*up. Present: SiLU(min(gate,L))*clamp(up,-L,L), L finite and positive.
+    // Set at most one. Caps and clamp limits are finite and positive.
+    // Neither set: SiLU(gate)*up. Clamp: SiLU(min(gate,L))*clamp(up,-L,L).
+    // Softcap: gate_cap*tanh(gate/gate_cap)*sigmoid(gate)*up_cap*tanh(up/up_cap).
     std::optional<float> clamp_limit;
+    std::optional<SwiGLUSoftcap> softcap                               = std::nullopt;
     friend bool operator==(const SwiGLUProfile&, const SwiGLUProfile&) = default;
 };
 
@@ -204,7 +213,7 @@ void topk_sigmoid_swiglu_moe(const Tensor&, const SigmoidMoeProfile&, const Sigm
                              ExpertSubset, Tensor& destination, MoeTokenValidity, MemoryArena&,
                              CudaExecutionView);
 
-// F_e(x)=down_e*(activation(gate_e*x,up_e*x)), with the explicit profile clamp when present.
+// F_e(x)=down_e*(activation(gate_e*x,up_e*x)), with activation specified by the profile.
 // Sum coefficient[j,t]*F_ids[j,t](x[:,t]) over subset. Registered clamped block-scaled
 // geometries support Write to BF16 or FP32, without a scaled shared term.
 // The shared overload adds coefficients[t]*F_shared(x[:,t]) exactly once, including for None.
@@ -212,14 +221,14 @@ void topk_sigmoid_swiglu_moe(const Tensor&, const SigmoidMoeProfile&, const Sigm
 // and routes are 16-byte aligned; encoded planes follow their layout alignment, and
 // mask/shared coefficients are 4-byte aligned.
 // Write reads no old destination; AddResidual requires BF16 and adds its old value before
-// final rounding. None writes zero without accessing routed weights/routes (or computes shared).
-// Route IDs are in {-1} union [0,E); -1 has coefficient zero and no assignment. Unselected
-// weights and index entries are never read. Callers publish
-// and retain every selected weight through execution. All views belong to the execution GPU.
-// Destination and live scratch are mutually disjoint and overlap no input. Intermediate precision
-// is private; there is no semantic staging cast. No hidden allocation, transfer or host readback
-// is performed.
-// Fixed-profile Graph replay may change route/mask/index contents after prior consumers finish.
+// final rounding. None writes zero or preserves the residual without accessing routed
+// weights/routes (the shared overload still computes its shared term).
+// Route IDs are in {-1} union [0,E); -1 has no assignment and its coefficient is ignored.
+// Unselected weights and index entries are never read. Callers publish and retain every selected
+// weight through execution. All views belong to the execution GPU. Destination and live scratch are
+// mutually disjoint and overlap no input. Intermediate precision is private; there is no semantic
+// staging cast. No hidden allocation, transfer or host readback is performed. Fixed-profile Graph
+// replay may change route/mask/index contents after prior consumers finish.
 [[nodiscard]] std::size_t
 routed_swiglu_workspace_capacity_bytes(const RoutedSwiGLUProfile& profile, ExpertSubsetKind subset,
                                        DType output_type, MoeEpilogue epilogue,

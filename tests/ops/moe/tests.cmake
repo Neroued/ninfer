@@ -8,6 +8,11 @@ ninfer_add_op_test(ninfer_moe_test
   LIBRARIES ninfer_ops)
 
 if(NINFER_TARGET STREQUAL "rtx5090")
+  ninfer_add_op_test(ninfer_moe_softcap_test
+    PROCESSORS 2 COST 100
+    SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_softcap.cpp"
+    LIBRARIES ninfer_ops)
+
   ninfer_add_op_test(ninfer_moe_mixed_test
     SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_mixed.cpp"
             "${CMAKE_CURRENT_LIST_DIR}/fixture.cpp"

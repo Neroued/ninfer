@@ -31,9 +31,31 @@ void validate_route_profile(const RouteProfile& p) {
 }
 
 void validate_expert_profile(const RoutedSwiGLUProfile& p) {
+    const auto& f = p.ffn;
+#if NINFER_TARGET_RTX5090
+    if (f.hidden == 2304) {
+        const bool nvfp4 = f.gate_up_type == QType::NVFP4_MUL &&
+                           f.gate_up_layout == QuantLayout::BlockScaleK16M128x4;
+        const bool mxfp8 =
+            f.gate_up_type == QType::MXFP8 && f.gate_up_layout == QuantLayout::RowGroupScale;
+        const auto policy = [&](LinearPolicy value) {
+            return value == LinearPolicy::A16Only || (nvfp4 && value == LinearPolicy::AllowA4) ||
+                   (mxfp8 && value == LinearPolicy::AllowA8);
+        };
+        require(f.intermediate == 1152 && p.experts == 128 && p.top_k == 8 && (nvfp4 || mxfp8) &&
+                    f.down_type == f.gate_up_type && f.down_layout == f.gate_up_layout &&
+                    policy(f.gate_up_policy) && policy(f.down_policy),
+                "routed SwiGLU: unsupported softcap geometry, format, layout or policy");
+        require(!f.clamp_limit && f.softcap && std::isfinite(f.softcap->gate_cap) &&
+                    std::isfinite(f.softcap->up_cap) && f.softcap->gate_cap > 0 &&
+                    f.softcap->up_cap > 0,
+                "routed SwiGLU: softcap requires positive finite caps and no clamp limit");
+        return;
+    }
+#endif
+    require(!f.softcap, "routed SwiGLU: softcap is not registered for this profile");
     if (p.ffn.hidden == 4096) {
 #if NINFER_TARGET_SPARK
-        const auto& f    = p.ffn;
         const bool nvfp4 = f.gate_up_type == QType::NVFP4 &&
                            f.gate_up_layout == QuantLayout::BlockScaleK16M128x4 &&
                            f.gate_up_policy == LinearPolicy::AllowA4;
@@ -58,7 +80,6 @@ void validate_expert_profile(const RoutedSwiGLUProfile& p) {
 
     require(!p.ffn.clamp_limit, "routed SwiGLU: clamped profile is not registered");
     validate_route_profile({p.ffn.hidden, p.experts, p.top_k});
-    const auto& f = p.ffn;
     if (f.hidden == 2560) {
         const bool nvfp4 = f.gate_up_type == QType::NVFP4 &&
                            f.gate_up_layout == QuantLayout::BlockScaleK16M128x4 &&
@@ -89,6 +110,7 @@ void validate_expert_profile(const RoutedSwiGLUProfile& p) {
 }
 
 void validate_shared_profile(const SwiGLUProfile& p, int hidden) {
+    require(!p.softcap, "shared SwiGLU: softcap is not registered");
     require(!p.clamp_limit, "shared SwiGLU: clamped profile is not registered");
     if (hidden == 2560) {
         require(p.hidden == hidden && (p.intermediate == 320 || p.intermediate == 640) &&
@@ -229,27 +251,29 @@ void MoeOperands::experts(const CudaSwiGLUExperts& w, const RoutedSwiGLUProfile&
         (void)w.activation_calibration.gate_up.scalar_divisor();
         (void)w.activation_calibration.down.scalar_divisor();
     } else if (p.ffn.gate_up_type == QType::NVFP4_MUL) {
-        for (const auto* calibration :
-             {&w.activation_calibration.gate_up, &w.activation_calibration.down}) {
-            const auto count = calibration->values().size();
-            require(count || !allows_a4(p.ffn.gate_up_policy),
-                    "MoE: native A4 requires per-expert calibration");
-            if (!count) continue;
-            require(calibration->operation == ActivationScaleOperation::Multiply &&
+        const auto validate = [&](const ActivationCalibrationView& calibration,
+                                  LinearPolicy policy) {
+            const auto count = calibration.values().size();
+            require(count || !allows_a4(policy), "MoE: native A4 requires activation calibration");
+            if (!count) return;
+            require(calibration.operation == ActivationScaleOperation::Multiply &&
                         (count == 1 || count == std::size_t(p.experts)),
                     "MoE: native calibration differs from the logical expert domain");
             if (count > 1) {
-                operand::device(calibration->device_values.device, device_, op_, "calibration");
-                require(operand::aligned(calibration->device_values.data, alignof(float)) &&
-                            calibration->device_values.bytes == count * sizeof(float),
+                operand::device(calibration.device_values.device, device_, op_, "calibration");
+                require(operand::aligned(calibration.device_values.data, alignof(float)) &&
+                            calibration.device_values.bytes == count * sizeof(float),
                         "MoE: invalid device calibration table");
-                read(calibration->device_values.data, calibration->device_values.bytes);
+                read(calibration.device_values.data, calibration.device_values.bytes);
             }
-        }
-    } else if (p.ffn.gate_up_type == QType::FP8_E4M3FN_BLOCK128X128_BF16 ||
+        };
+        validate(w.activation_calibration.gate_up, p.ffn.gate_up_policy);
+        validate(w.activation_calibration.down, p.ffn.down_policy);
+    } else if (p.ffn.gate_up_type == QType::MXFP8 ||
+               p.ffn.gate_up_type == QType::FP8_E4M3FN_BLOCK128X128_BF16 ||
                p.ffn.gate_up_type == QType::FP8_E4M3FN_BLOCK64X64_BF16) {
         require(w.activation_calibration.gate_up.empty() && w.activation_calibration.down.empty(),
-                "MoE: block FP8 has no activation divisors");
+                "MoE: this FP8 format has no activation calibration");
     }
     const auto matrix = [&](const ExpertMatrixDeviceView& view, QType type, QuantLayout layout,
                             int n, int k) {
@@ -324,6 +348,19 @@ void MoeOperands::experts(const CudaSwiGLUExperts& w, const RoutedSwiGLUProfile&
             return;
         }
         const auto bytes = matrix_bytes(type, layout, n, k);
+        const bool mxfp8 = type == QType::MXFP8;
+        const auto count = mxfp8 && !view.offsets ? view.physical_count : std::uint32_t(p.experts);
+        if (mxfp8) {
+            require(view.format == type && view.layout == layout && count &&
+                        count <= std::uint32_t(p.experts) &&
+                        !(view.offsets && view.expert_indices) &&
+                        (view.expert_indices || count == std::uint32_t(p.experts)),
+                    "MoE: invalid MXFP8 bank representation or addressing");
+            if (view.expert_indices) {
+                require(operand::aligned(view.expert_indices, 4), "MoE: invalid expert index map");
+                read(view.expert_indices, std::size_t(p.experts) * 4);
+            }
+        }
         if (type == QType::NVFP4) {
             require(operand::aligned(view.matrix_scales, alignof(float)) &&
                         view.matrix_scale_stride <=
@@ -358,9 +395,9 @@ void MoeOperands::experts(const CudaSwiGLUExperts& w, const RoutedSwiGLUProfile&
                         "MoE: indexed plane lies outside its storage");
             } else {
                 require(stride >= size && stride % alignment == 0 &&
-                            stride <= (SIZE_MAX - size) / std::size_t(p.experts - 1),
+                            stride <= (SIZE_MAX - size) / std::max(1U, count - 1),
                         "MoE: invalid expert stride");
-                read(base, (p.experts - 1) * stride + size);
+                read(base, (count - 1) * stride + size);
             }
         };
         plane(view.codes, bytes.codes, view.code_stride);

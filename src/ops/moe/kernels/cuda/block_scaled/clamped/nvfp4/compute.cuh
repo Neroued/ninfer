@@ -1,9 +1,12 @@
 #pragma once
 
 #include <bit>
+#include <type_traits>
 
 #include "ops/moe/kernels/cuda/block_scaled/clamped/nvfp4/launch.h"
+#include "ops/moe/kernels/cuda/block_scaled/clamped/nvfp4/activation_quant.cuh"
 #include "ops/moe/kernels/cuda/block_scaled/clamped/output.cuh"
+#include "ops/moe/kernels/cuda/block_scaled/swiglu_activation.cuh"
 #include "ops/common/cuda/mma.cuh"
 #include "ops/common/cuda/reduce.cuh"
 #include "ops/common/cuda/pipeline.cuh"
@@ -41,7 +44,7 @@ __device__ __forceinline__ int balanced_group_load(const Groups& groups) {
 
 template <int Columns, bool Gate, int Stages = 2, int KStep = 128, int Eviction = 0,
           int Intermediate = kIntermediate, bool Native = false, bool KnownCsf = false,
-          int WeightRows = 128>
+          int WeightRows = 128, int Hidden = kHidden>
 struct Schedule {
     static constexpr bool native      = Native;
     static constexpr bool known_csf   = KnownCsf;
@@ -54,9 +57,9 @@ struct Schedule {
     static constexpr int warp_columns = Columns >= 64 ? Columns / 2 : Columns;
     static constexpr int mma_columns  = warp_columns / 8;
     static constexpr int rows         = Gate ? WeightRows / 2 : WeightRows;
-    static constexpr int intermediate = Intermediate;
-    static constexpr int k            = Gate ? kHidden : Intermediate;
-    static constexpr int min_blocks   = Columns == 128 ? 2 : Columns == 64 ? 3 : 1;
+    static constexpr int intermediate = Intermediate, hidden = Hidden;
+    static constexpr int k          = Gate ? Hidden : Intermediate;
+    static constexpr int min_blocks = Columns == 128 ? 2 : Columns == 64 ? 3 : 1;
 };
 
 template <class S, bool Native = S::native>
@@ -166,8 +169,8 @@ __device__ __forceinline__ void stage_weights(TileStorage<S>& tile, int stage, i
             const int warp  = threadIdx.x / 32;
             const auto rows = scale_origins<S, Gate>(row0);
             for (int group = warp * 4; group < S::k_step / 16; group += (S::threads / 32) * 4)
-                common::csf32_copy_tile128x4_async<Gate ? 2 * S::intermediate : kHidden, S::k / 16,
-                                                   S::weight_rows / 32>(
+                common::csf32_copy_tile128x4_async<Gate ? 2 * S::intermediate : S::hidden,
+                                                   S::k / 16, S::weight_rows / 32>(
                     weight.csf, rows, kt * (S::k_step / 16) + group,
                     tile.encoded[stage][group / 4]);
             return;
@@ -279,7 +282,7 @@ contract_tile(TileStorage<S>& tile, int row0, Matrix weight, const std::uint8_t*
                     const int row_part = block / (S::k_step / 32);
                     const int group2   = block % (S::k_step / 32) * 2;
                     const int group4   = group2 & ~3;
-                    common::csf32_decode_block<S::k_step, Gate ? 2 * S::intermediate : kHidden,
+                    common::csf32_decode_block<S::k_step, Gate ? 2 * S::intermediate : S::hidden,
                                                S::k / 16, true>(
                         weight.csf, rows, physical(kt) * (S::k_step / 16) + group4, tile.bases,
                         tile.encoded[stage][group4 / 4], row_part, (group2 & 2) / 2,
@@ -337,7 +340,7 @@ contract_tile(TileStorage<S>& tile, int row0, Matrix weight, const std::uint8_t*
     cp_wait<0>();
 }
 
-template <int Intermediate, bool Native = false>
+template <int Intermediate, bool Native = false, bool FastQuantize = false>
 __device__ __forceinline__ void store_product(float lo, float hi, float calibration_value,
                                               std::uint8_t* codes, std::uint8_t* scales,
                                               int assignment, int feature) {
@@ -347,12 +350,20 @@ __device__ __forceinline__ void store_product(float lo, float hi, float calibrat
     for (int delta = 4; delta <= 16; delta *= 2) {
         maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, delta));
     }
-    const auto scale = Native ? common::nvfp4_mul_activation_scale(maximum, calibration_value)
-                              : nvfp4_activation_scale(maximum, calibration_value);
-    const unsigned packed =
-        Native ? common::quantize_nvfp4_mul_activation_pair(make_float2(lo, hi), calibration_value,
-                                                            scale)
-               : quantize_nvfp4_activation_pair(make_float2(lo, hi), calibration_value, scale);
+    std::uint8_t scale;
+    unsigned packed;
+    if constexpr (FastQuantize) {
+        const ActivationQuantizer quantizer(calibration_value);
+        scale  = quantizer.scale(maximum);
+        packed = quantizer.pair(make_float2(lo, hi), scale);
+    } else if constexpr (Native) {
+        scale  = common::nvfp4_mul_activation_scale(maximum, calibration_value);
+        packed = common::quantize_nvfp4_mul_activation_pair(make_float2(lo, hi), calibration_value,
+                                                            scale);
+    } else {
+        scale  = nvfp4_activation_scale(maximum, calibration_value);
+        packed = quantize_nvfp4_activation_pair(make_float2(lo, hi), calibration_value, scale);
+    }
     unsigned low = (packed & 15) << (r * 4), high = (packed >> 4) << (r * 4);
 #pragma unroll
     for (int delta = 4; delta <= 16; delta *= 2) {
@@ -369,7 +380,8 @@ __device__ __forceinline__ void store_product(float lo, float hi, float calibrat
 template <int Columns, bool Gate, bool Atomic = false, int Stages = 2, int KStep = 128,
           int Eviction = 0, bool CachedExpertMajor = true, bool FilterLoads = false,
           int Intermediate = kIntermediate, bool Native = false, bool KnownCsf = false,
-          int WeightRows = 128>
+          int WeightRows = 128, int Hidden = kHidden, class Activation = ClampedActivation,
+          bool FastQuantize = false>
 __global__ __launch_bounds__(
     Schedule<Columns, Gate, Stages, KStep, Eviction, Intermediate, Native, KnownCsf,
              WeightRows>::threads,
@@ -384,7 +396,7 @@ __global__ __launch_bounds__(
                                                    float* __restrict__ contributions,
                                                    const float* __restrict__ coefficients,
                                                    float* __restrict__ routed_sum, int subtile_bits,
-                                                   float limit, int feature_rows = 0,
+                                                   Activation activation, int feature_rows = 0,
                                                    int cache_policy         = 0,
                                                    int minimum_expert_count = 0,
                                                    int maximum_expert_count = 0x7fffffff,
@@ -396,7 +408,7 @@ __global__ __launch_bounds__(
                                                    int pool_min_experts  = 0,
                                                    bool grouped_input    = false) {
     using S = Schedule<Columns, Gate, Stages, KStep, Eviction, Intermediate, Native, KnownCsf,
-                       WeightRows>;
+                       WeightRows, Hidden>;
     static_assert(Native || !CachedExpertMajor || (Stages == 2 && KStep == 128 && Eviction == 0));
     static_assert(S::stages <= (S::k + S::k_step - 1) / S::k_step);
     if constexpr (!Gate) {
@@ -430,14 +442,8 @@ __global__ __launch_bounds__(
     const auto retained = (S::eviction & 8) ? common::l2_retained_policy() : 0;
     auto& tile =
         *reinterpret_cast<TileStorage<S>*>(common::shared_storage<sizeof(TileStorage<S>)>());
-    constexpr int row_tiles = (Gate ? Intermediate : kHidden) / S::rows;
-    static_assert((row_tiles & (row_tiles - 1)) == 0);
-    constexpr int row_bits = [] {
-        int bits = 0;
-        for (int rows = row_tiles; rows > 1; rows >>= 1) ++bits;
-        return bits;
-    }();
-    const int subtiles = 1 << subtile_bits;
+    constexpr int row_tiles = (Gate ? Intermediate : Hidden) / S::rows;
+    const int subtiles      = 1 << subtile_bits;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int warp_m = warp % (S::weight_rows / 32), warp_n = warp / (S::weight_rows / 32);
     const int window =
@@ -447,9 +453,9 @@ __global__ __launch_bounds__(
     for (int task = blockIdx.x; task < count; task += gridDim.x) {
         int job, row0, subtile;
         if constexpr (Gate || CachedExpertMajor) {
-            job     = task >> (row_bits + subtile_bits);
-            row0    = (task & (row_tiles - 1)) * S::rows;
-            subtile = (task >> row_bits) & (subtiles - 1);
+            job     = (task / row_tiles) >> subtile_bits;
+            row0    = (task % row_tiles) * S::rows;
+            subtile = (task / row_tiles) & (subtiles - 1);
         } else {
             const int jobs = *groups.jobs;
             job            = (task / (window * subtiles)) % jobs;
@@ -484,26 +490,48 @@ __global__ __launch_bounds__(
         contract_tile<S, Gate, CachedExpertMajor && !Native>(tile, row0, weight, input,
                                                              input_scales, begin, end, cache_policy,
                                                              stream, retained, acc);
-        const float factor             = Native ? activation_scale.get(expert) * weight.scale
-                                                : 1.0F / (activation_scale.scalar * weight.scale);
-        const float product_multiplier = Native ? product_scale.get(expert) : product_scale.scalar;
+        constexpr bool softcap = std::is_same_v<Activation, SoftcappedActivation>;
+        const float input_multiplier =
+            Native ? activation_scale.get(expert) : activation_scale.scalar;
+        const float factor =
+            Native ? input_multiplier * weight.scale : 1.0F / (input_multiplier * weight.scale);
+        if constexpr (Gate) {
+            const float product_multiplier =
+                Native ? product_scale.get(expert) : product_scale.scalar;
+            const auto emit_products = [&]<bool Wide>() {
+                const auto rescale = [&](float value) {
+                    if constexpr (Wide)
+                        return scale_accumulator_wide(value, input_multiplier, weight.scale);
+                    return value * factor;
+                };
 #pragma unroll
-        for (int n = 0; n < S::mma_columns; ++n) {
-            if (begin + warp_n * S::warp_columns + n * 8 >= end) { continue; }
-            const int column = begin + warp_n * S::warp_columns + n * 8 + 2 * (lane & 3);
-            if constexpr (Gate) {
+                for (int n = 0; n < S::mma_columns; ++n) {
+                    if (begin + warp_n * S::warp_columns + n * 8 >= end) continue;
+                    const int column = begin + warp_n * S::warp_columns + n * 8 + 2 * (lane & 3);
 #pragma unroll
-                for (int t = 0; t < 2; ++t) {
-                    const float g0 = acc[0][n][t] * factor, g1 = acc[0][n][t + 2] * factor;
-                    const float h0 =
-                        silu(fminf(g0, limit)) * fmaxf(-limit, fminf(acc[1][n][t] * factor, limit));
-                    const float h1 = silu(fminf(g1, limit)) *
-                                     fmaxf(-limit, fminf(acc[1][n][t + 2] * factor, limit));
-                    store_product<Intermediate, Native>(
-                        h0, h1, product_multiplier, product, product_scales,
-                        column + t < end ? column + t : -1, row0 + warp_m * 16);
+                    for (int t = 0; t < 2; ++t) {
+                        const float g0 = rescale(acc[0][n][t]), g1 = rescale(acc[0][n][t + 2]);
+                        const float h0 = activation(g0, rescale(acc[1][n][t]));
+                        const float h1 = activation(g1, rescale(acc[1][n][t + 2]));
+                        store_product<Intermediate, Native, FastQuantize>(
+                            h0, h1, product_multiplier, product, product_scales,
+                            column + t < end ? column + t : -1, row0 + warp_m * 16);
+                    }
                 }
+            };
+            if constexpr (softcap) {
+                if (__builtin_expect(isfinite(factor), true))
+                    emit_products.template operator()<false>();
+                else
+                    emit_products.template operator()<true>();
             } else {
+                emit_products.template operator()<false>();
+            }
+        } else {
+#pragma unroll
+            for (int n = 0; n < S::mma_columns; ++n) {
+                if (begin + warp_n * S::warp_columns + n * 8 >= end) continue;
+                const int column = begin + warp_n * S::warp_columns + n * 8 + 2 * (lane & 3);
 #pragma unroll
                 for (int t = 0; t < 2; ++t) {
                     const int c = column + t;
@@ -515,22 +543,41 @@ __global__ __launch_bounds__(
                     float coefficient = 1;
                     if constexpr (Atomic) {
                         const int assignment = groups.assignments[c];
-                        target      = routed_sum + std::int64_t(assignment / kTopK) * kHidden;
+                        target      = routed_sum + std::int64_t(assignment / kTopK) * Hidden;
                         coefficient = coefficients[assignment];
                     } else {
-                        target = contributions + std::int64_t(c) * kHidden;
+                        target = contributions + std::int64_t(c) * Hidden;
                     }
+                    const bool finite_weighted = !softcap || isfinite(factor * coefficient);
+                    const auto emit_rows       = [&]<bool Wide>() {
 #pragma unroll
-                    for (int m = 0; m < 2; ++m) {
+                        for (int m = 0; m < 2; ++m) {
 #pragma unroll
-                        for (int half = 0; half < 2; ++half) {
-                            const int v   = t + 2 * half;
-                            const int row = row0 + warp_m * 32 + m * 16 + (lane >> 2) + half * 8;
-                            if constexpr (Atomic)
-                                atomicAdd(target + row, acc[m][n][v] * factor * coefficient);
-                            else
-                                target[row] = acc[m][n][v] * factor;
+                            for (int half = 0; half < 2; ++half) {
+                                const int v = t + 2 * half;
+                                const int row =
+                                    row0 + warp_m * 32 + m * 16 + (lane >> 2) + half * 8;
+                                const float dot = acc[m][n][v];
+                                if constexpr (Atomic) {
+                                    float value = dot * factor * coefficient;
+                                    if constexpr (Wide)
+                                        if (!finite_weighted)
+                                            value = scale_accumulator_wide(
+                                                dot, input_multiplier, weight.scale, coefficient);
+                                    atomicAdd(target + row, value);
+                                } else {
+                                    target[row] = dot * factor;
+                                }
+                            }
                         }
+                    };
+                    if constexpr (softcap && Atomic) {
+                        if (__builtin_expect(finite_weighted, true))
+                            emit_rows.template operator()<false>();
+                        else
+                            emit_rows.template operator()<true>();
+                    } else {
+                        emit_rows.template operator()<false>();
                     }
                 }
             }

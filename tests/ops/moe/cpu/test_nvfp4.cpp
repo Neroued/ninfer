@@ -344,9 +344,9 @@ void validation(Fixture& f, CpuExecutor& executor) {
     ids[0] = -2;
     rejects(call);
     ids[0] = -1;
-    rejects(call);
+    call();
     ids.fill(-1);
-    coefficients.fill(0);
+    coefficients.fill(std::numeric_limits<float>::quiet_NaN());
     weights = {};
     std::fill_n(static_cast<float*>(out.data), H, -123.5F);
     call();

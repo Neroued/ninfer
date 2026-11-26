@@ -21,6 +21,10 @@ struct CallStorage {
     integer::ExpertStorage integer;
     block_scaled::Storage block_scaled;
     clamped::Storage clamped;
+#if NINFER_TARGET_RTX5090
+    impl::softcap::Storage softcap;
+    impl::mxfp8_softcap::Storage mxfp8;
+#endif
 };
 
 template <class Arena>
@@ -32,6 +36,14 @@ CallStorage allocate(Arena& arena, const impl::Plan& plan, int tokens, ExpertSub
                                              subset != ExpertSubsetKind::None, partial_output)};
     if (partial_output)
         throw std::invalid_argument("routed contribution requires a clamped native profile");
+#if NINFER_TARGET_RTX5090
+    if (plan.implementation == impl::Implementation::SoftcapNvfp4)
+        return {.softcap = impl::softcap::allocate(arena, plan.softcap, tokens,
+                                                   subset != ExpertSubsetKind::None)};
+    if (plan.implementation == impl::Implementation::SoftcapMxfp8)
+        return {.mxfp8 = impl::mxfp8_softcap::allocate(arena, plan.mxfp8, tokens,
+                                                       subset != ExpertSubsetKind::None)};
+#endif
     if (plan.implementation == impl::Implementation::BlockScaled) {
         CallStorage out;
         out.block_scaled =
@@ -62,14 +74,29 @@ std::size_t capacity(const RoutedSwiGLUProfile& profile, const SwiGLUProfile* sh
         throw std::invalid_argument("routed_swiglu: this geometry requires Write");
     if (shared) { detail::validate_shared_profile(*shared, profile.ffn.hidden); }
     const int shared_intermediate = shared ? shared->intermediate : 0;
-    return detail::interval_capacity(
-        first, last, shape.allocation_boundaries, shape.slice_tokens(subset), [&](int tokens) {
-            WorkspaceLayoutBuilder layout;
-            (void)allocate(layout, shape.select(profile.ffn, tokens, shared_intermediate), tokens,
-                           subset, shared_intermediate,
-                           profile.ffn.gate_up_type == QType::Q8_G32_FP16, partial_output);
-            return layout.peak_bytes(1);
-        });
+    const auto bytes              = [&](int tokens) {
+        WorkspaceLayoutBuilder layout;
+        const auto plan = shape.select(profile.ffn, tokens, shared_intermediate);
+        (void)allocate(layout, plan, tokens, subset, shared_intermediate,
+                                    profile.ffn.gate_up_type == QType::Q8_G32_FP16, partial_output);
+        return layout.peak_bytes(1);
+    };
+    const int slice  = shape.slice_tokens(subset);
+    const auto range = [&](int begin, int end) {
+        return detail::interval_capacity(begin, end, shape.allocation_boundaries, slice, bytes);
+    };
+#if NINFER_TARGET_RTX5090
+    if (profile.ffn.softcap && last > slice) {
+        // All complete slices share scratch with the final slice. Remainders
+        // wrap across consecutive calls and can use a different family.
+        const int first_slice = (first - 1) / slice, last_slice = (last - 1) / slice;
+        const int low = (first - 1) % slice + 1, high = (last - 1) % slice + 1;
+        if (first_slice == last_slice) return std::max(bytes(slice), range(low, high));
+        if (last_slice - first_slice > 1) return range(1, slice);
+        return std::max(range(low, slice), range(1, high));
+    }
+#endif
+    return range(first, last);
 }
 
 void execute(const Tensor& x, const RoutedSwiGLUProfile& profile, const CudaSwiGLUExperts& experts,
@@ -77,6 +104,8 @@ void execute(const Tensor& x, const RoutedSwiGLUProfile& profile, const CudaSwiG
              MoeEpilogue mode, Tensor& destination, MemoryArena& workspace,
              CudaExecutionView execution, int* valid_tokens) {
     const auto& shape = impl::shape_dispatch(profile);
+    if (shared && !shape.scaled_shared)
+        throw std::invalid_argument("routed_swiglu: this geometry has no scaled shared term");
     detail::MoeOperands operands("routed_swiglu", execution);
     const int tokens = operands.input(x, profile.ffn.hidden);
     operands.output(destination, profile.ffn.hidden, tokens, mode);
@@ -125,6 +154,18 @@ void execute(const Tensor& x, const RoutedSwiGLUProfile& profile, const CudaSwiG
             allocate(scratch, plan, count, subset.kind, shared_intermediate,
                      profile.ffn.gate_up_type == QType::Q8_G32_FP16, valid_tokens != nullptr);
         if (valid_tokens) buffers.clamped.active_tokens = valid_tokens + offset;
+#if NINFER_TARGET_RTX5090
+        if (plan.implementation == impl::Implementation::SoftcapNvfp4) {
+            impl::softcap::launch(input, profile.ffn, experts, selection, subset, mode, output,
+                                  plan.softcap, buffers.softcap, execution);
+            continue;
+        }
+        if (plan.implementation == impl::Implementation::SoftcapMxfp8) {
+            impl::mxfp8_softcap::launch(input, profile.ffn, experts, selection, subset, mode,
+                                        output, plan.mxfp8, buffers.mxfp8, execution);
+            continue;
+        }
+#endif
 #if NINFER_TARGET_SPARK
         if (plan.implementation == impl::Implementation::ClampedBlockScaled) {
             clamped::launch(input, experts, selection, subset, mode, output, plan.clamped,

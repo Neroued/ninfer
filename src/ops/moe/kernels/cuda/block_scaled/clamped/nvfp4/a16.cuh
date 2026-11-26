@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ops/moe/kernels/cuda/block_scaled/clamped/nvfp4/a16.h"
+#include "ops/moe/kernels/cuda/block_scaled/swiglu_activation.cuh"
 #include "ops/common/cuda/memory.cuh"
 #include "ops/common/cuda/mma.cuh"
 #include "ops/common/cuda/pipeline.cuh"
@@ -8,21 +9,23 @@
 #include "ops/common/numeric/math.cuh"
 #include "ops/common/quant/csf32.cuh"
 
+#include <type_traits>
+
 namespace ninfer::ops::detail::moe_cuda::block_scaled::clamped::nvfp4::a16 {
 
 template <int Intermediate, bool Gate, int Rows, int Columns, int KStep, int Stages,
-          bool Fp16 = false, bool RegisterPipeline = false>
+          bool Fp16 = false, bool RegisterPipeline = false, int Hidden = kHidden>
 struct Schedule {
-    static constexpr int intermediate = Intermediate;
-    static constexpr bool gate        = Gate;
+    static constexpr int intermediate = Intermediate, hidden = Hidden;
+    static constexpr bool gate = Gate;
     static constexpr int rows = Rows, columns = Columns, k_step = KStep, stages = Stages;
-    static constexpr int k             = Gate ? kHidden : Intermediate;
-    static constexpr int feature_rows  = Gate ? Rows / 2 : Rows;
-    static constexpr int threads       = Rows;
-    static constexpr int mma_tokens    = Columns / 8;
-    static constexpr bool fp16_product = Fp16;
-    static constexpr bool bf16_weights = Gate || !Fp16;
-    static constexpr int planes        = Gate || Fp16 ? 1 : 2;
+    static constexpr int k                  = Gate ? Hidden : Intermediate;
+    static constexpr int feature_rows       = Gate ? Rows / 2 : Rows;
+    static constexpr int threads            = Rows;
+    static constexpr int mma_tokens         = Columns / 8;
+    static constexpr bool fp16_product      = Fp16;
+    static constexpr bool bf16_weights      = Gate || !Fp16;
+    static constexpr int planes             = Gate || Fp16 ? 1 : 2;
     static constexpr bool register_pipeline = RegisterPipeline;
 };
 
@@ -59,14 +62,14 @@ __device__ __forceinline__ float product_inverse(A16Product product, int column)
 
 template <int Intermediate>
 __global__ __launch_bounds__(256) void normalize_product(A16Product product, Groups groups,
-                                                          const int* ids, int vector_limit,
-                                                          Nvfp4A16Dispatch dispatch) {
+                                                         const int* ids, int vector_limit,
+                                                         Nvfp4A16Dispatch dispatch) {
     static_assert(Intermediate % 1024 == 0);
     constexpr int parts = Intermediate / 1024;
     __shared__ float maxima[8];
     const int tid = threadIdx.x, lane = tid % 32, warp = tid / 32;
     if (groups.load_range[1] <= vector_limit) return;
-    const int cohort = dispatch.cohort_load(groups.load_range[0], groups.load_range[1]);
+    const int cohort  = dispatch.cohort_load(groups.load_range[0], groups.load_range[1]);
     const int columns = groups.offsets[kExperts];
     for (int column = blockIdx.x; column < columns; column += gridDim.x) {
         if (!cohort) {
@@ -173,9 +176,10 @@ __device__ __forceinline__ void stage(Tile<S>& tile, int slot, int kt, int row0,
             for (int b = warp; b < (S::rows / 32) * (S::k_step / 32); b += S::threads / 32) {
                 const int row   = b / (S::k_step / 32) * 32;
                 const int group = b % (S::k_step / 32) * 2;
-                common::csf32_stage_block<S::k_step, S::gate ? 2 * S::intermediate : kHidden,
+                common::csf32_stage_block<S::k_step, S::gate ? 2 * S::intermediate : S::hidden,
                                           S::k / 16>(weight.csf, weight_row<S>(row0, row),
-                                                     k0 / 16 + group, tile.scales[slot], row, group);
+                                                     k0 / 16 + group, tile.scales[slot], row,
+                                                     group);
             }
         } else if constexpr (!S::register_pipeline) {
             for (int v = tid; v < S::rows * (S::k_step / 64); v += S::threads) {
@@ -194,13 +198,15 @@ __device__ __forceinline__ void stage(Tile<S>& tile, int slot, int kt, int row0,
             const int destination = column * S::k_step + common::swizzle_xor_64(column, k);
             if constexpr (S::gate) {
                 common::cp_async_zfill<16>(tile.inputs[slot][0] + destination,
-                                           x + std::int64_t(source >= 0 ? source : 0) * S::k + k0 + k,
+                                           x + std::int64_t(source >= 0 ? source : 0) * S::k + k0 +
+                                               k,
                                            source >= 0 ? 16 : 0);
             } else {
                 const auto offset =
-                    std::int64_t(source >= 0 ? source : 0) * S::k * (S::fp16_product ? 2 : 1) + k0 + k;
-                common::cp_async_zfill<16>(tile.inputs[slot][0] + destination, product.values + offset,
-                                           source >= 0 ? 16 : 0);
+                    std::int64_t(source >= 0 ? source : 0) * S::k * (S::fp16_product ? 2 : 1) + k0 +
+                    k;
+                common::cp_async_zfill<16>(tile.inputs[slot][0] + destination,
+                                           product.values + offset, source >= 0 ? 16 : 0);
                 if constexpr (!S::fp16_product)
                     common::cp_async_zfill<16>(tile.inputs[slot][1] + destination,
                                                product.residual + offset, source >= 0 ? 16 : 0);
@@ -219,17 +225,16 @@ contract(Tile<S>& tile, int row0, common::Nvfp4MultiplierMatrix weight, const __
     for (int i = 0; i < S::stages; ++i) {
         if constexpr (S::register_pipeline) {
             stage<S, Compressed, true, false>(tile, i, i, row0, weight, x, product,
-                                               (valid_columns + 7) / 8 * 8);
+                                              (valid_columns + 7) / 8 * 8);
             stage<S, Compressed, false, true>(tile, i, i, row0, weight, x, product,
-                                               (valid_columns + 7) / 8 * 8);
+                                              (valid_columns + 7) / 8 * 8);
         } else {
-            stage<S, Compressed>(tile, i, i, row0, weight, x, product,
-                                 (valid_columns + 7) / 8 * 8);
+            stage<S, Compressed>(tile, i, i, row0, weight, x, product, (valid_columns + 7) / 8 * 8);
         }
     }
 #pragma unroll 1
     for (int kt = 0; kt < S::k / S::k_step; ++kt) {
-        const int slot = kt % S::stages;
+        const int slot      = kt % S::stages;
         const int owned_row = S::gate ? wm * 16 + (lane & 15) + (lane >> 4) * (S::rows / 2)
                                       : wm * 32 + (lane & 15) + (lane >> 4) * 16;
         unsigned scale_words[S::k_step / 64];
@@ -237,9 +242,9 @@ contract(Tile<S>& tile, int row0, common::Nvfp4MultiplierMatrix weight, const __
 #pragma unroll
             for (int word = 0; word < S::k_step / 64; ++word)
                 scale_words[word] = common::load_vec<unsigned>(
-                    weight.scales + common::nvfp4_scale_byte_offset(
-                                        weight_row<S>(row0, owned_row),
-                                        kt * (S::k_step / 16) + word * 4, S::k));
+                    weight.scales +
+                    common::nvfp4_scale_byte_offset(weight_row<S>(row0, owned_row),
+                                                    kt * (S::k_step / 16) + word * 4, S::k));
         }
         // The register pipeline commits codes and inputs as separate groups.
         common::cp_wait<(S::register_pipeline ? 2 : 1) * (S::stages - 1)>();
@@ -249,8 +254,8 @@ contract(Tile<S>& tile, int row0, common::Nvfp4MultiplierMatrix weight, const __
         if constexpr (S::register_pipeline) {
 #pragma unroll
             for (int part = 0; part < S::k_step / 32; ++part) {
-                const auto v = common::load_vec<uint4>(tile.codes[slot] +
-                                                       code_offset<S>(owned_row, part * 16));
+                const auto v             = common::load_vec<uint4>(tile.codes[slot] +
+                                                                   code_offset<S>(owned_row, part * 16));
                 code_words[part * 4]     = v.x;
                 code_words[part * 4 + 1] = v.y;
                 code_words[part * 4 + 2] = v.z;
@@ -262,7 +267,7 @@ contract(Tile<S>& tile, int row0, common::Nvfp4MultiplierMatrix weight, const __
             asm volatile("" ::: "memory");
             if (next < S::k / S::k_step)
                 stage<S, Compressed, true, false>(tile, slot, next, row0, weight, x, product,
-                                                   (valid_columns + 7) / 8 * 8);
+                                                  (valid_columns + 7) / 8 * 8);
             else
                 common::cp_commit();
         }
@@ -304,10 +309,10 @@ contract(Tile<S>& tile, int row0, common::Nvfp4MultiplierMatrix weight, const __
                 } else {
                     const auto* low  = tile.codes[slot] + row * (S::k_step / 2) + column / 2;
                     const auto* high = tile.codes[slot] + (row + 8) * (S::k_step / 2) + column / 2;
-                    a[m][0] = weight_pair<S::bf16_weights>(low[0], low_factor);
-                    a[m][1] = weight_pair<S::bf16_weights>(high[0], high_factor);
-                    a[m][2] = weight_pair<S::bf16_weights>(low[4], low_factor);
-                    a[m][3] = weight_pair<S::bf16_weights>(high[4], high_factor);
+                    a[m][0]          = weight_pair<S::bf16_weights>(low[0], low_factor);
+                    a[m][1]          = weight_pair<S::bf16_weights>(high[0], high_factor);
+                    a[m][2]          = weight_pair<S::bf16_weights>(low[4], low_factor);
+                    a[m][3]          = weight_pair<S::bf16_weights>(high[4], high_factor);
                 }
             }
             // High and low input contractions share one FP32 accumulator.
@@ -338,19 +343,19 @@ contract(Tile<S>& tile, int row0, common::Nvfp4MultiplierMatrix weight, const __
         if (next < S::k / S::k_step) {
             if constexpr (S::register_pipeline)
                 stage<S, Compressed, false, true>(tile, slot, next, row0, weight, x, product,
-                                                   (valid_columns + 7) / 8 * 8);
+                                                  (valid_columns + 7) / 8 * 8);
             else
                 stage<S, Compressed>(tile, slot, next, row0, weight, x, product,
                                      (valid_columns + 7) / 8 * 8);
-        }
-        else
+        } else
             common::cp_commit();
     }
     common::cp_wait<0>();
 }
 
 template <int Intermediate, bool Gate, int Rows, int Columns, int KStep, int Stages,
-          bool Compressed, bool Fp16 = false, bool RegisterPipeline = false>
+          bool Compressed, bool Fp16 = false, bool RegisterPipeline = false, int Hidden = kHidden,
+          class Activation = ClampedActivation>
 __global__ __launch_bounds__(
     Schedule<Intermediate, Gate, Rows, Columns, KStep, Stages, Fp16>::threads,
     Fp16&& Rows == 128 && Columns == 64 && KStep == 128 && Stages == 1
@@ -358,9 +363,10 @@ __global__ __launch_bounds__(
         : 0) void grouped(const __nv_bfloat16* __restrict__ x, ExpertMatrixDeviceView bank,
                           Groups groups, A16Product product, float* __restrict__ contributions,
                           const float* __restrict__ coefficients, float* __restrict__ sum,
-                          int job_columns, float limit, int minimum_load, int maximum_load,
-                          int row_window, Nvfp4A16Dispatch dispatch) {
-    using S = Schedule<Intermediate, Gate, Rows, Columns, KStep, Stages, Fp16, RegisterPipeline>;
+                          int job_columns, Activation activation, int minimum_load,
+                          int maximum_load, int row_window, Nvfp4A16Dispatch dispatch) {
+    using S =
+        Schedule<Intermediate, Gate, Rows, Columns, KStep, Stages, Fp16, RegisterPipeline, Hidden>;
     static_assert(Rows == 64 || Rows == 128);
     static_assert(KStep == 64 || KStep == 128);
     static_assert(S::k % KStep == 0 && S::k / KStep >= Stages);
@@ -372,13 +378,14 @@ __global__ __launch_bounds__(
         return;
     }
     const int subtiles      = (min(job_columns, maximum_load) + Columns - 1) / Columns;
-    constexpr int row_tiles = (Gate ? Intermediate : kHidden) / S::feature_rows;
+    constexpr int row_tiles = (Gate ? Intermediate : Hidden) / S::feature_rows;
     auto& tile     = *reinterpret_cast<Tile<S>*>(common::shared_storage<sizeof(Tile<S>)>());
     const int lane = threadIdx.x % 32, wm = threadIdx.x / 32;
-    const int jobs    = *groups.jobs;
-    const bool full_rows = dispatch.full_rows_when_mixed &&
-                           groups.load_range[1] - groups.load_range[0] > 1;
-    const int window = Gate || full_rows || row_window <= 0 ? row_tiles : min(row_tiles, row_window);
+    const int jobs = *groups.jobs;
+    const bool full_rows =
+        dispatch.full_rows_when_mixed && groups.load_range[1] - groups.load_range[0] > 1;
+    const int window =
+        Gate || full_rows || row_window <= 0 ? row_tiles : min(row_tiles, row_window);
     const int windows = (row_tiles + window - 1) / window;
     const int tasks   = jobs * windows * window * subtiles;
     for (int task = blockIdx.x; task < tasks; task += gridDim.x) {
@@ -412,11 +419,10 @@ __global__ __launch_bounds__(
                     if (column + t >= end) continue;
 #pragma unroll
                     for (int half = 0; half < 2; ++half) {
-                        const int r      = row0 + wm * 16 + (lane >> 2) + half * 8;
-                        const float gate = acc[0][n][t + 2 * half] * weight.multiplier;
-                        const float up   = acc[1][n][t + 2 * half] * weight.multiplier;
-                        const float value =
-                            common::silu(fminf(gate, limit)) * fmaxf(-limit, fminf(up, limit));
+                        const int r       = row0 + wm * 16 + (lane >> 2) + half * 8;
+                        const float gate  = acc[0][n][t + 2 * half] * weight.multiplier;
+                        const float up    = acc[1][n][t + 2 * half] * weight.multiplier;
+                        const float value = activation(gate, up);
                         store_product<Fp16>(product, std::int64_t(column + t) * Intermediate + r,
                                             value);
                     }
@@ -427,20 +433,38 @@ __global__ __launch_bounds__(
                     if (column + t >= end) continue;
                     const int assignment = groups.assignments[column + t];
                     const float inverse  = product_inverse<Intermediate, Fp16>(product, column + t);
-                    const float factor = weight.multiplier * (sum ? coefficients[assignment] : 1.F);
-                    float* destination = sum ? sum + std::int64_t(assignment / kTopK) * kHidden
-                                             : contributions + std::int64_t(column + t) * kHidden;
+                    const float coefficient  = sum ? coefficients[assignment] : 1.F;
+                    const float factor       = weight.multiplier * coefficient;
+                    float* destination       = sum ? sum + std::int64_t(assignment / kTopK) * Hidden
+                                                   : contributions + std::int64_t(column + t) * Hidden;
+                    constexpr bool softcap   = std::is_same_v<Activation, SoftcappedActivation>;
+                    const bool finite_factor = !softcap || isfinite(factor);
+                    const auto emit_rows     = [&]<bool Wide>() {
 #pragma unroll
-                    for (int m = 0; m < 2; ++m)
+                        for (int m = 0; m < 2; ++m)
 #pragma unroll
-                        for (int half = 0; half < 2; ++half) {
-                            const int r       = row0 + wm * 32 + m * 16 + (lane >> 2) + half * 8;
-                            const float value = (acc[m][n][t + half * 2] * inverse) * factor;
-                            if (sum)
-                                atomicAdd(destination + r, value);
-                            else
-                                destination[r] = value;
-                        }
+                            for (int half = 0; half < 2; ++half) {
+                                const int r     = row0 + wm * 32 + m * 16 + (lane >> 2) + half * 8;
+                                const float dot = acc[m][n][t + half * 2] * inverse;
+                                float value     = dot * factor;
+                                if constexpr (Wide)
+                                    if (!finite_factor)
+                                        value = scale_accumulator_wide(dot, weight.multiplier,
+                                                                       coefficient);
+                                if (sum)
+                                    atomicAdd(destination + r, value);
+                                else
+                                    destination[r] = value;
+                            }
+                    };
+                    if constexpr (softcap) {
+                        if (__builtin_expect(finite_factor, true))
+                            emit_rows.template operator()<false>();
+                        else
+                            emit_rows.template operator()<true>();
+                    } else {
+                        emit_rows.template operator()<false>();
+                    }
                 }
             }
         }
@@ -466,10 +490,12 @@ __device__ __forceinline__ void decode_group(common::Nvfp4MultiplierMatrix matri
     }
 }
 
-template <int Intermediate, int MaxColumns, bool Fp16 = false>
+template <int Intermediate, int MaxColumns, bool Fp16 = false, int Hidden = kHidden,
+          class Activation = ClampedActivation>
 __global__ __launch_bounds__(128) void vector_gate(const __nv_bfloat16* __restrict__ x,
                                                    ExpertMatrixDeviceView bank, Groups groups,
-                                                   A16Product product, float limit,
+                                                   A16Product product,
+                                                   std::type_identity_t<Activation> activation,
                                                    int maximum_load, Nvfp4A16Dispatch dispatch) {
     const int cohort = Fp16 ? dispatch.cohort_load(groups.load_range[0], groups.load_range[1]) : 0;
     if (cohort > maximum_load) return;
@@ -484,18 +510,18 @@ __global__ __launch_bounds__(128) void vector_gate(const __nv_bfloat16* __restri
         const auto weight = common::nvfp4_mul_expert_matrix(bank, expert);
         if (!weight.valid) continue;
         float gate[MaxColumns]{}, up[MaxColumns]{};
-        for (int group = lane; group < kHidden / 16; group += 32) {
+        for (int group = lane; group < Hidden / 16; group += 32) {
             float g[16], u[16];
-            decode_group(weight, row, group, kHidden, g);
-            decode_group(weight, row + Intermediate, group, kHidden, u);
+            decode_group(weight, row, group, Hidden, g);
+            decode_group(weight, row + Intermediate, group, Hidden, u);
 #pragma unroll
             for (int col = 0; col < MaxColumns; ++col) {
                 if (begin + col >= end) continue;
                 const int token = groups.assignments[begin + col] / kTopK;
                 const auto first =
-                    common::load_vec<uint4>(x + std::int64_t(token) * kHidden + group * 16);
+                    common::load_vec<uint4>(x + std::int64_t(token) * Hidden + group * 16);
                 const auto second =
-                    common::load_vec<uint4>(x + std::int64_t(token) * kHidden + group * 16 + 8);
+                    common::load_vec<uint4>(x + std::int64_t(token) * Hidden + group * 16 + 8);
                 const unsigned words[8]{first.x,  first.y,  first.z,  first.w,
                                         second.x, second.y, second.z, second.w};
 #pragma unroll
@@ -514,12 +540,13 @@ __global__ __launch_bounds__(128) void vector_gate(const __nv_bfloat16* __restri
             const float u = common::warp_reduce_sum(up[col]) * weight.multiplier;
             if (!lane && begin + col < end)
                 store_product<Fp16>(product, std::int64_t(begin + col) * Intermediate + row,
-                                    common::silu(fminf(g, limit)) * fmaxf(-limit, fminf(u, limit)));
+                                    activation(g, u));
         }
     }
 }
 
-template <int Intermediate, int MaxColumns, bool Fp16 = false>
+template <int Intermediate, int MaxColumns, bool Fp16 = false, int Hidden = kHidden,
+          class Activation = ClampedActivation>
 __global__ __launch_bounds__(128) void vector_down(ExpertMatrixDeviceView bank, Groups groups,
                                                    A16Product product,
                                                    float* __restrict__ contributions,
@@ -531,8 +558,8 @@ __global__ __launch_bounds__(128) void vector_down(ExpertMatrixDeviceView bank, 
     if (groups.load_range && groups.load_range[0] > maximum_load) return;
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
     const int jobs = *groups.jobs;
-    for (int task = blockIdx.x; task < jobs * (kHidden / 8); task += gridDim.x) {
-        const int job = task / (kHidden / 8), flat = task % (kHidden / 8) * 8 + warp * 2;
+    for (int task = blockIdx.x; task < jobs * (Hidden / 8); task += gridDim.x) {
+        const int job = task / (Hidden / 8), flat = task % (Hidden / 8) * 8 + warp * 2;
         const int expert = groups.job_experts[job];
         const int begin = groups.offsets[expert], end = groups.offsets[expert + 1];
         if (end - begin > maximum_load) continue;
@@ -616,7 +643,7 @@ __global__ __launch_bounds__(128) void vector_down(ExpertMatrixDeviceView bank, 
                         const float y = __uint_as_float(high[col][2 * pair + 1]);
 #pragma unroll
                         for (int r = 0; r < 2; ++r) {
-                            const auto w = common::bf16x2_bits_to_float2(values[r]);
+                            const auto w  = common::bf16x2_bits_to_float2(values[r]);
                             accum[r][col] = fmaf(w.x, x, accum[r][col]);
                             accum[r][col] = fmaf(w.y, y, accum[r][col]);
                         }
@@ -641,11 +668,17 @@ __global__ __launch_bounds__(128) void vector_down(ExpertMatrixDeviceView bank, 
                 if (!lane && begin + col < end) {
                     const float value = dot * weight.multiplier;
                     if (sum) {
-                        const int assignment = groups.assignments[begin + col];
-                        atomicAdd(sum + std::int64_t(assignment / kTopK) * kHidden + rows[r],
-                                  value * coefficients[assignment]);
+                        const int assignment    = groups.assignments[begin + col];
+                        const float coefficient = coefficients[assignment];
+                        float weighted          = value * coefficient;
+                        if constexpr (std::is_same_v<Activation, SoftcappedActivation>)
+                            if (!isfinite(weight.multiplier * coefficient))
+                                weighted =
+                                    scale_accumulator_wide(dot, weight.multiplier, coefficient);
+                        atomicAdd(sum + std::int64_t(assignment / kTopK) * Hidden + rows[r],
+                                  weighted);
                     } else {
-                        contributions[std::int64_t(begin + col) * kHidden + rows[r]] = value;
+                        contributions[std::int64_t(begin + col) * Hidden + rows[r]] = value;
                     }
                 }
             }

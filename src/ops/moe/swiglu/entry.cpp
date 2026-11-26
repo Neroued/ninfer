@@ -20,6 +20,7 @@ void require(bool condition, const char* message) {
 }
 
 void profile(const SwiGLUProfile& p) {
+    require(!p.softcap, "swiglu: softcap is not registered");
 #if NINFER_TARGET_SPARK
     const bool nvfp4 =
         p.hidden == 4096 && p.intermediate == 6144 && p.gate_up_type == QType::NVFP4 &&

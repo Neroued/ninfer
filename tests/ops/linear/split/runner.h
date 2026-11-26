@@ -30,7 +30,10 @@ struct Profile {
     double a4_absolute = 1.0 / 256.0;
     Binding binding    = Binding::Direct;
     std::vector<int> input_slices;
-    bool bias = false;
+    bool bias               = false;
+    // Use a row suffix of a single, directly bound BF16 parent.
+    int weight_suffix_begin = 0;
+    bool zero_workspace     = false;
 };
 
 struct Invocation {

@@ -45,6 +45,12 @@ const SplitShape& select(ProjectionProfile weights, const auto& rows) {
     switch (weights.first.qtype) {
     case QType::BF16: {
         const std::array shapes{
+#if NINFER_TARGET_RTX5090
+            &kBf16SplitN8576K2304,
+            &kBf16SplitN6528K2304,
+            &kBf16SplitN5120K2304,
+            &kBf16SplitN2048K2304,
+#endif
 #if NINFER_TARGET_SPARK
             &kBf16SplitN3072K4096,
             &kBf16SplitN20480K1536,
@@ -94,14 +100,24 @@ const SplitShape& select(ProjectionProfile weights, const auto& rows) {
 const SplitBiasShape& select_bias(QType type, int n, int k, LinearPolicy policy, const auto& rows) {
     if (!valid_linear_policy(policy))
         throw std::invalid_argument("linear_split bias: invalid activation permission");
+    const SplitBiasShape* shape = nullptr;
+    switch (type) {
+#if NINFER_TARGET_SPARK || NINFER_TARGET_RTX5090
+    case QType::BF16:
+        shape = &kBf16SplitBiasN3072K1024;
+        break;
+#endif
 #if NINFER_TARGET_SPARK
-    const auto* shape = type == QType::BF16    ? &kBf16SplitBiasN3072K1024
-                        : type == QType::MXFP8 ? &kMxfp8SplitBiasN3072K1024
-                                               : nullptr;
+    case QType::MXFP8:
+        shape = &kMxfp8SplitBiasN3072K1024;
+        break;
+#endif
+    default:
+        break;
+    }
     if (shape && shape->rows == n && shape->input_rows == k &&
         std::ranges::equal(shape->segments, rows))
         return *shape;
-#endif
     throw std::invalid_argument("linear_split bias: unsupported format, geometry or segmentation");
 }
 } // namespace

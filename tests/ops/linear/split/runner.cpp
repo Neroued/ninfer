@@ -1,6 +1,7 @@
 #include "ops/linear/split/runner.h"
 
 #include "core/decode_graph.h"
+#include "core/weight_view.h"
 #include "cuda_fixture.h"
 #include "ninfer/ops/linear_split.h"
 #include "ninfer/ops/weight_input.h"
@@ -143,7 +144,7 @@ int verify_output(const Profile& profile, const Invocation& call,
             [&](int begin, int end) {
                 std::vector<double> weight(profile.k);
                 for (int r = begin; r < end; ++r) {
-                    int physical_row   = region.first + rows[r];
+                    int physical_row   = profile.weight_suffix_begin + region.first + rows[r];
                     std::size_t parent = 0;
                     while (physical_row >= parents[parent]->host.weight.n)
                         physical_row -= parents[parent++]->host.weight.n;
@@ -171,12 +172,13 @@ int verify_output(const Profile& profile, const Invocation& call,
 }
 
 ops::ProjectionWeights prepare(const Profile& profile, const Invocation& call,
-                               const std::vector<std::unique_ptr<DevicePackedWeight>>& weights) {
+                               const std::vector<std::unique_ptr<DevicePackedWeight>>& weights,
+                               const Weight& first_weight) {
     if (profile.binding == Binding::Direct) {
         if (weights.size() == 2)
-            return ops::PairedProjectionWeights{{weights[0]->view(), call.policy},
+            return ops::PairedProjectionWeights{{first_weight, call.policy},
                                                 {weights[1]->view(), call.policy}};
-        return ops::SingleProjectionWeight{weights[0]->view(), call.policy};
+        return ops::SingleProjectionWeight{first_weight, call.policy};
     }
     std::vector<WeightParent> parents;
     parents.reserve(weights.size());
@@ -344,6 +346,23 @@ int run(const Profile& profile, std::span<const Invocation> calls) {
         }
         weights.push_back(std::make_unique<DevicePackedWeight>(std::move(packed)));
     }
+    auto first_weight = weights.front()->view();
+    if (profile.weight_suffix_begin) {
+        const std::array shape{std::uint64_t(first_weight.n), std::uint64_t(first_weight.k)};
+        const WeightParent parent{weight_geometry(first_weight.qtype, first_weight.layout, shape),
+                                  first_weight.device,
+                                  static_cast<const std::byte*>(first_weight.payload)};
+        const auto begin  = std::uint64_t(profile.weight_suffix_begin);
+        const auto offset = begin * shape[1];
+        auto suffix       = native_weight(
+            WeightView{{shape[0] - begin, shape[1]}, {{&parent, offset, shape[0] * shape[1]}}});
+        if (suffix.payload != first_weight.payload ||
+            suffix.payload_bytes != first_weight.payload_bytes ||
+            suffix.qdata != parent.data + offset * sizeof(std::uint16_t)) {
+            throw std::runtime_error("BF16 suffix lost its zero-copy parent binding");
+        }
+        first_weight = suffix;
+    }
     DeviceContext context;
     std::vector<float> bias_values;
     std::vector<std::uint16_t> bias_bits;
@@ -360,10 +379,10 @@ int run(const Profile& profile, std::span<const Invocation> calls) {
     int failures = 0;
     for (const auto& call : calls) {
         if (call.validate_operands) {
-            failures += validate(profile, weights[0]->view(), context.execution_view());
+            failures += validate(profile, first_weight, context.execution_view());
             continue;
         }
-        const auto prepared           = prepare(profile, call, weights);
+        const auto prepared           = prepare(profile, call, weights, first_weight);
         const auto workspace_capacity = [&](int first, int last) {
             return profile.bias ? ops::linear_split_bias_workspace_capacity_bytes(
                                       profile.weights[0].type, profile.weights[0].rows, profile.k,
@@ -375,6 +394,10 @@ int run(const Profile& profile, std::span<const Invocation> calls) {
             for (auto [first, last] : {std::pair{1, 48}, std::pair{1, 128}, std::pair{33, 129},
                                        std::pair{513, 1025}, std::pair{1, 4097}}) {
                 const auto capacity = workspace_capacity(first, last);
+                if (profile.zero_workspace && capacity != 0) {
+                    std::cerr << call.id << ": expected zero workspace capacity\n";
+                    ++failures;
+                }
                 for (int t = first; t <= last; ++t)
                     if (workspace_capacity(t, t) > capacity) ++failures;
             }
@@ -387,6 +410,10 @@ int run(const Profile& profile, std::span<const Invocation> calls) {
         Tensor x(input.span(), DType::BF16, {profile.k, call.t});
         Outputs output(profile, call.t, call.shared_output);
         const auto capacity = workspace_capacity(call.t, call.t);
+        if (profile.zero_workspace && capacity != 0) {
+            std::cerr << call.id << ": expected zero workspace capacity\n";
+            ++failures;
+        }
         GuardedDeviceBuffer scratch(capacity);
         MemoryArena workspace(scratch.span());
         const auto launch = [&] {
@@ -398,7 +425,7 @@ int run(const Profile& profile, std::span<const Invocation> calls) {
                     ops::linear_split(x, weights[0]->view(), bias, output.views, call.policy,
                                       workspace, context.execution_view());
             } else if (call.convenience)
-                ops::linear_split(x, weights[0]->view(), output.views, context.execution_view());
+                ops::linear_split(x, first_weight, output.views, context.execution_view());
             else
                 ops::linear_split(x, prepared, output.views, workspace, context.execution_view());
         };
@@ -468,6 +495,8 @@ void add_profile(Suite& suite, const Profile& profile, std::vector<Invocation> c
         n += weight.rows;
     }
     if (profile.bias) recipe += "bias/";
+    if (profile.weight_suffix_begin)
+        recipe += "suffix-" + std::to_string(profile.weight_suffix_begin) + "/";
     if (profile.weights.size() == 1)
         n = std::accumulate(profile.outputs.begin(), profile.outputs.end(), 0);
     recipe += "segments";

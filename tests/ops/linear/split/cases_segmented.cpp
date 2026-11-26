@@ -5,7 +5,65 @@
 
 namespace ninfer::test::linear_split {
 
+#if NINFER_TARGET_RTX5090
+namespace {
+
+Profile inkling_split_profile(int parent_rows, int suffix_begin, std::vector<int> outputs) {
+    std::vector<Region> regions;
+    int begin = 0;
+    for (int rows : outputs) {
+        regions.push_back({begin, rows, 128});
+        begin += rows;
+    }
+    return {.k                   = 2304,
+            .weights             = {{QType::BF16, parent_rows, 503U}},
+            .outputs             = std::move(outputs),
+            .regions             = std::move(regions),
+            .a16                 = {1.0 / 256.0, 1.0 / 256.0, 2.0 / 256.0},
+            .weight_suffix_begin = suffix_begin,
+            .zero_workspace      = true};
+}
+
+void add_inkling_split(Suite& suite, const Profile& profile, const std::set<int>& tokens) {
+    std::vector<Invocation> calls{{.t = 0, .validate_operands = true},
+                                  {.t = 0, .workspace_intervals = true}};
+    for (int t : tokens) {
+        for (bool graph : {false, true}) {
+            calls.push_back({.t            = t,
+                             .graph        = graph,
+                             .input_seed   = 317U,
+                             .changed_seed = 348U,
+                             .columns      = Columns::HeadBoundaries,
+                             .full_rows    = t == 1,
+                             .convenience  = profile.weight_suffix_begin != 0});
+        }
+    }
+    add_profile(suite, profile, std::move(calls));
+}
+
+void add_inkling_split(Suite& suite, int rows, std::vector<int> outputs,
+                       std::initializer_list<int> route_ends) {
+    std::set<int> tokens{1, 4, 8, 17, 128, 256, 512, 1023, 1024, 1025, 2048, 4096, 4097};
+    for (int end : route_ends)
+        for (int t : {end - 1, end, end + 1})
+            if (t > 0) tokens.insert(t);
+    add_inkling_split(suite, inkling_split_profile(rows, 0, std::move(outputs)), tokens);
+}
+
+} // namespace
+#endif
+
 void add_segmented_cases(Suite& suite) {
+#if NINFER_TARGET_RTX5090
+    add_inkling_split(suite, 8576, {1024, 1024, 3072, 3072, 384},
+                      {1, 16, 64, 96, 128, 160, 240, 320, 336, 400, 512});
+    add_inkling_split(suite, 6528, {3072, 3072, 384},
+                      {16, 48, 96, 144, 192, 240, 288, 336, 432, 512});
+    add_inkling_split(suite, 5120, {1024, 1024, 3072}, {16, 32, 64, 128, 192, 256, 384});
+    add_inkling_split(suite, 2048, {1024, 1024}, {16, 48, 72, 160, 320, 480, 640, 800, 1040, 2112});
+    add_inkling_split(suite, inkling_split_profile(8576, 2048, {3072, 3072, 384}),
+                      {1, 8, 17, 128, 1024});
+#endif
     constexpr ReductionCriterion a16{1.0 / 256.0, 1.0 / 256.0, 2.0 / 256.0};
     const quantized_weight::PatternedWeightOptions small{
         quantized_weight::RowSplitScalePattern::Small,

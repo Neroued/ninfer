@@ -204,7 +204,9 @@ def build_points(
                             speculative_backend=backend,
                             draft_tokens=draft_tokens,
                             proposal_head=(
-                                args.proposal_head if draft_tokens else "full"
+                                "full"
+                                if (not draft_tokens or backend == "dspark")
+                                else args.proposal_head
                             ),
                             sampling_mode=args.sampling,
                             kv_dtype=args.kv_dtype,
@@ -361,6 +363,8 @@ def validate_server_start(
         "speculative_draft_window": point.draft_tokens,
         "proposal_head": point.proposal_head,
     }
+    if args.swa_kv_dtype is not None:
+        expected["swa_kv_cache"] = args.swa_kv_dtype
     actual = {name: engine.get(name) for name in expected}
     if actual != expected:
         raise corpus.CampaignError(

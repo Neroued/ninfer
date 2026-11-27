@@ -30,10 +30,12 @@ SPECULATIVE_MODES = {
     "mtp5": ("mtp", 5),
     "dflash7": ("dflash", 7),
     "dflash2_7": ("dflash2", 7),
+    "dspark7": ("dspark", 7),
 }
 DEFAULT_MODES = ("mtp0", "mtp3")
 SAMPLING_MODES = ("stochastic", "greedy")
 KV_CACHE_NAMES = ("bf16", "int8", "fp8", "nvfp4", "k8v4")
+SWA_KV_CACHE_NAMES = ("bf16", "fp8")
 
 SEEDS = (
     7632647173703958409,
@@ -293,6 +295,7 @@ def add_launch_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--context-capacity", metavar="SIZE|auto")
     parser.add_argument("--prefill-chunk", type=int)
     parser.add_argument("--kv-dtype", choices=KV_CACHE_NAMES)
+    parser.add_argument("--swa-kv-dtype", choices=SWA_KV_CACHE_NAMES)
     parser.add_argument("--device", type=int)
     parser.add_argument(
         "--engine-concurrency",
@@ -318,6 +321,7 @@ def resolve_launch_arguments(args: argparse.Namespace) -> argparse.Namespace:
         ("context_capacity", "context_capacity", "auto"),
         ("prefill_chunk", "prefill_chunk", 1024),
         ("kv_dtype", "kv_dtype", "int8"),
+        ("swa_kv_dtype", "swa_kv_dtype", None),
         ("device", "device", 0),
         ("engine_concurrency", "max_concurrency", None),
     ):
@@ -349,6 +353,11 @@ def launch_arguments(
             ),
             "--prefill-chunk",
             str(args.prefill_chunk),
+            *(
+                ["--swa-kv-dtype", str(args.swa_kv_dtype)]
+                if args.swa_kv_dtype is not None
+                else []
+            ),
             "--device",
             str(args.device),
             "--stats-interval",
@@ -496,7 +505,7 @@ def block_fixture_names(speculative_backend: str) -> tuple[str, ...]:
     scenarios = tuple(name for names in SCENARIO_FIXTURES.values() for name in names)
     if speculative_backend == "none":
         return NIAH_FIXTURES
-    if speculative_backend in {"mtp", "dflash", "dflash2"}:
+    if speculative_backend in {"mtp", "dflash", "dflash2", "dspark"}:
         return (*LONG_DECODE_FIXTURES, *scenarios)
     raise CampaignError(f"unsupported speculative backend: {speculative_backend}")
 
@@ -629,8 +638,15 @@ def validate_server_start(
         "prefix_reuse": False,
         "speculative_backend": spec.speculative_backend,
         "speculative_draft_window": spec.draft_tokens,
-        "proposal_head": "optimized" if spec.draft_tokens else "full",
+        "proposal_head": (
+            "full"
+            if (not spec.draft_tokens or spec.speculative_backend == "dspark")
+            else "optimized"
+        ),
     }
+    if args.swa_kv_dtype is not None:
+        actual["swa_kv_cache"] = engine.get("swa_kv_cache")
+        expected["swa_kv_cache"] = args.swa_kv_dtype
     if actual != expected:
         raise CampaignError(f"server_start Engine configuration mismatch: {actual!r}")
     context_cache = engine.get("context_cache", {})
@@ -958,8 +974,9 @@ def server_command(
         spec.speculative_backend,
     ]
     if spec.draft_tokens:
+        proposal_head = "full" if spec.speculative_backend == "dspark" else "optimized"
         command.extend(
-            ["--draft-tokens", str(spec.draft_tokens), "--proposal-head", "optimized"]
+            ["--draft-tokens", str(spec.draft_tokens), "--proposal-head", proposal_head]
         )
     return command + sampling_arguments(spec.sampling_mode)
 
@@ -1292,6 +1309,8 @@ def mode_display_name(mode_name: str) -> str:
         return "DFlash block=8 (k=7)"
     if mode_name == "dflash2_7":
         return "DFlash2 block=8 (k=7)"
+    if mode_name == "dspark7":
+        return "DSpark block=8 (k=7)"
     raise CampaignError(f"unsupported summary mode: {mode_name}")
 
 

@@ -1,6 +1,6 @@
 [
   {
     "role": "user",
-    "content": "Output exactly 160 JSONL records and no Markdown. Each line must be an object with fields id (RUN-0001 through RUN-0160), model (alternating qwen3.6-27b and qwen3.6-35b-a3b), prompt_tokens, completion_tokens, decode_tok_s, mtp_acceptance, status, and tags. Use deterministic arithmetic progressions, status values ok/warn in a 4:1 pattern, and two tags per record. Every line must parse independently as strict JSON."
+    "content": "Output exactly 160 synthetic placeholder JSONL records for a JSON parser unit test (dummy fixture values only, not real measurements) and no Markdown. Each line must be an object with fields id (RUN-0001 through RUN-0160), model (alternating synthetic-model-a and synthetic-model-b), prompt_tokens, completion_tokens, decode_tok_s, mtp_acceptance, status, and tags. Use deterministic arithmetic progressions, status values ok/warn in a 4:1 pattern, and tags [\"synthetic\",\"fixture\"] on each record. Every line must parse independently as strict JSON."
   }
 ]

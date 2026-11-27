@@ -595,6 +595,7 @@ private:
 
 struct PromptSummary {
     bool starts_in_reasoning    = false;
+    bool thinking_enabled       = false;
     std::uint32_t prompt_tokens = 0;
     bool has_media              = false;
 };

@@ -464,7 +464,7 @@ void finish_continuation(RenderedChat& result, std::string_view final_content) {
 RenderedChat render_input(const TemplateInput& input,
                           const models::frontend::ChatTemplate& compiled, bool continuation,
                           bool thinking_enabled, text::TemplateRenderOptions execution,
-                          std::string_view image_token) {
+                          std::string_view image_token, std::size_t* generation_begin = nullptr) {
     execution.regions = input.regions;
     RenderedChat result{.output           = compiled.program.render(input.context, execution),
                         .messages         = input.messages,
@@ -472,14 +472,31 @@ RenderedChat render_input(const TemplateInput& input,
                         .thinking_enabled = thinking_enabled};
     rewrite_tool_error_markers(result.output, input.tool_error_tags);
     locate_media(result, input, compiled, execution, image_token);
+    std::size_t prefix_begin = result.output.text.size();
     if (continuation) {
         finish_continuation(
             result, input.context["messages"].back()["content"].get_ref<const std::string&>());
+        prefix_begin = result.output.text.size();
+    } else if (!thinking_enabled && input.tools.empty()) {
+        // Inkling2 treats "Thinking effort level: 0" as a soft hint only. When thinking is
+        // disabled without active tools, prefill <|message_model|><|content_text|> so the model
+        // emits answer text directly without entering a thinking block.
+        if (ends_with_control(result.output, kMessageModel)) {
+            prefix_begin = result.output.text.size() - kMessageModel.size();
+            result.output.text.append(kContentText);
+        } else {
+            prefix_begin = result.output.text.size();
+            result.output.text.append(kMessageModel);
+            result.output.text.append(kContentText);
+        }
+        result.initial_block = InitialBlock::Text;
     } else if (ends_with_control(result.output, kMessageModel)) {
+        prefix_begin         = result.output.text.size() - kMessageModel.size();
         result.initial_block = InitialBlock::MessageHeader;
     } else {
         result.initial_block = InitialBlock::BetweenBlocks;
     }
+    if (generation_begin) *generation_begin = prefix_begin;
     return result;
 }
 
@@ -562,8 +579,9 @@ RenderedChat CompiledChatTemplate::render_impl(std::span<const ChatMessage> mess
             [&] { models::frontend::check_preparation_control(control, "Inkling2 chat template"); },
         .control_variables = control_variables};
 
+    std::size_t generation_begin = 0;
     auto result = render_input(input, compiled_, continuation, params.thinking_enabled, execution,
-                               image_token_);
+                               image_token_, &generation_begin);
 
     if (boundaries) {
         PromptProbes probes;
@@ -606,7 +624,7 @@ RenderedChat CompiledChatTemplate::render_impl(std::span<const ChatMessage> mess
             auto after = compiled_.program.render(probe.context, execution);
             rewrite_tool_error_markers(after, probe.tool_error_tags);
             const bool retains =
-                models::frontend::same_prefix(result.output, after, result.output.text.size());
+                models::frontend::same_prefix(result.output, after, generation_begin);
             return TurnProbe{retains, std::move(after)};
         };
         *boundaries = resolve_prompt_boundaries(result, messages, continuation, markers, probes);

@@ -3,6 +3,7 @@
 #include "models/inkling2/frontend/block_decoder.h"
 #include "models/inkling2/frontend/tool_grammar.h"
 
+#include <algorithm>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -57,8 +58,22 @@ create_output_session(const OutputResources& resources, const PreparedOutput& pr
 
     const bool tool_constraint = tools && tools->constrained;
     const bool tool_required   = tools && !tools->tools.empty() && tools->required;
+    const bool grammar_compatible =
+        stop.strings.empty() && !resources.text.defaults.token_ids.empty() &&
+        stop.token_ids.empty() && stop.include_model_defaults && !stop.publish_stop_token &&
+        !output.raw && !output.preserve_special_tokens;
+    const bool valid_auto_tools =
+        tools && !tools->tools.empty() &&
+        std::all_of(tools->tools.begin(), tools->tools.end(), [&](const auto& tool) {
+            return valid_tool_name(tool.name, output.tool_name_max_length);
+        });
+    // When thinking is disabled with active tools, we cannot prefill <|content_text|> (which
+    // would block immediate tool calls); instead forbid <|content_thinking|> via grammar.
+    const bool suppress_thinking_grammar =
+        !may_think && prompt.initial_block != InitialBlock::Text && !constraint &&
+        !tool_constraint && valid_auto_tools && grammar_compatible;
     std::unique_ptr<text::GrammarSession> matcher;
-    if (constraint || tool_constraint) {
+    if (constraint || tool_constraint || suppress_thinking_grammar) {
         if (!stop.strings.empty()) {
             throw RequestError(RequestErrorKind::UnsupportedOutputCombination,
                                "output constraints require model EOS and cannot use custom stops",
@@ -83,10 +98,11 @@ create_output_session(const OutputResources& resources, const PreparedOutput& pr
                 }
             }
         }
-        matcher = compile_inkling_grammar(resources.text.grammars(), resources.framing,
-                                          prompt.initial_block, prompt.continuation_content,
-                                          constraint, tool_constraint ? tools : nullptr, may_think,
-                                          thinking.budget.has_value());
+        matcher = compile_inkling_grammar(
+            resources.text.grammars(), resources.framing, prompt.initial_block,
+            prompt.continuation_content, constraint,
+            (tool_constraint || suppress_thinking_grammar) ? tools : nullptr, may_think,
+            thinking.budget.has_value());
     }
 
     std::unique_ptr<models::frontend::StructuredOutputDecoder> structured;

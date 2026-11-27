@@ -122,9 +122,13 @@ Layout inspect(const RenderedChat& rendered, std::span<const ChatMessage> messag
         if (msg_span) layout.messages[i] = msg_span;
     }
 
+    const bool trailing_open_assistant =
+        continuation || (rendered.initial_block != InitialBlock::BetweenBlocks &&
+                         !layout.blocks.empty() && layout.blocks.back().role == ChatRole::Assistant &&
+                         !layout.blocks.back().closed_turn);
     for (std::size_t i = 0; i < layout.blocks.size(); ++i) {
         const auto& block = layout.blocks[i];
-        if (continuation && i + 1 == layout.blocks.size()) continue;
+        if (trailing_open_assistant && i + 1 == layout.blocks.size()) continue;
         layout.semantic.push_back(block.bytes.end);
     }
 
@@ -258,7 +262,12 @@ PromptBoundaries resolve_prompt_boundaries(const RenderedChat& rendered,
     }
     if (const auto end = message_end(layout, leading)) result.structural.push_back(*end);
     if (!layout.blocks.empty()) {
-        auto frontier = continuation ? layout.blocks.back().bytes.begin : rendered.output.text.size();
+        const bool trailing_open_assistant =
+            continuation || (rendered.initial_block != InitialBlock::BetweenBlocks &&
+                             layout.blocks.back().role == ChatRole::Assistant &&
+                             !layout.blocks.back().closed_turn);
+        auto frontier = trailing_open_assistant ? layout.blocks.back().bytes.begin
+                                                : rendered.output.text.size();
         auto kind     = models::frontend::RewriteCheckpointKind::ResponseReplay;
         std::optional<TurnProbe> next_turn;
         if (!continuation && probes.next_turn) next_turn = probes.next_turn();

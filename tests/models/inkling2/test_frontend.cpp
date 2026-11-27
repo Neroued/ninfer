@@ -490,6 +490,17 @@ void test_chat_template(const inkling::Frontend& frontend, const text::Tokenizer
                 "effort level mismatch for " + label + ": " + decoded);
         require(data.output.thinking_enabled == (level != ReasoningEffort::None),
                 "thinking_enabled flag mismatch");
+        if (level == ReasoningEffort::None) {
+            require(decoded.ends_with("<|message_model|><|content_text|>"),
+                    "ReasoningEffort::None without tools must prefill text block: " + decoded);
+            require(data.output.initial_block == inkling::InitialBlock::Text,
+                    "ReasoningEffort::None without tools must start in InitialBlock::Text");
+        } else {
+            require(!decoded.ends_with("<|content_text|>"),
+                    "nonzero reasoning effort must not prefill text block: " + decoded);
+            require(data.output.initial_block == inkling::InitialBlock::BetweenBlocks,
+                    "nonzero reasoning effort must end between blocks");
+        }
     }
     {
         PromptInput in;
@@ -497,10 +508,72 @@ void test_chat_template(const inkling::Frontend& frontend, const text::Tokenizer
         in.options.enable_thinking = false;
         const auto prepared        = frontend.prepare(in);
         const auto& data           = inkling::PreparedPromptAccess::view(prepared);
-        require(tokenizer.decode(data.token_ids).find("Thinking effort level: 0<|end_message|>") !=
-                    std::string::npos,
+        const std::string decoded  = tokenizer.decode(data.token_ids);
+        require(decoded.find("Thinking effort level: 0<|end_message|>") != std::string::npos,
                 "enable_thinking=false did not map to effort 0");
-        require(!data.output.thinking_enabled, "enable_thinking=false must disable thinking");
+        require(decoded.ends_with("<|message_model|><|content_text|>"),
+                "enable_thinking=false without tools must prefill text block: " + decoded);
+        require(data.output.initial_block == inkling::InitialBlock::Text,
+                "enable_thinking=false without tools must start in InitialBlock::Text");
+        require(!data.output.thinking_enabled && !prepared.summary().thinking_enabled,
+                "enable_thinking=false must disable thinking");
+        require(frontend.count_tokens(in) == data.token_ids.size(),
+                "count_tokens must match prefilled non-thinking prompt length");
+        require(data.identity.rewrite_checkpoint.has_value() &&
+                    data.identity.rewrite_checkpoint->frontier + 2 == data.token_ids.size(),
+                "non-thinking rewrite checkpoint must sit right before the prefilled text opener");
+        // Verify direct body output streams directly on Content with zero reasoning.
+        auto session = frontend.make_output_session(prepared, {}, {}, {.budget = 2}, {}, {});
+        CollectedOutput out;
+        const auto d = commit_round(
+            session, tokenizer.encode("direct answer<|end_message|><|content_model_end_sampling|>"),
+            out);
+        require(d.finish_reason == FinishReason::StopToken && out.reasoning.empty() &&
+                    out.content == "direct answer",
+                "non-thinking direct output mismatch: r=" + out.reasoning + " c=" + out.content);
+    }
+    {
+        // With tools declared + enable_thinking=false, do NOT prefill <|content_text|> so direct
+        // tool calls remain reachable; suppress <|content_thinking|> via grammar instead.
+        PromptInput in;
+        in.options.tool_jsons      = {weather_tool(false)};
+        in.options.enable_thinking = false;
+        in.messages.push_back({.role = ChatRole::User, .parts = {{.text = "Weather?"}}});
+        const auto prepared       = frontend.prepare(in);
+        const auto& data          = inkling::PreparedPromptAccess::view(prepared);
+        const std::string decoded = tokenizer.decode(data.token_ids);
+        require(!decoded.ends_with("<|content_text|>"),
+                "enable_thinking=false with tools must not prefill <|content_text|>");
+        require(data.output.initial_block == inkling::InitialBlock::BetweenBlocks,
+                "enable_thinking=false with tools must start in BetweenBlocks");
+
+        // Auto tools: grammar forbids <|content_thinking|>, allows both text and direct tool call.
+        {
+            auto session = frontend.make_output_session(
+                prepared, {}, {}, {}, {}, {.constraints = ToolConstraintMode::Automatic});
+            require(session.constrained(),
+                    "enable_thinking=false with auto tools must activate no-thinking grammar");
+            CollectedOutput out;
+            (void)commit_round(session, std::array{framing.message_model}, out);
+            const auto mask = next_mask(session, tokenizer.vocab_size());
+            require(!mask_allows(mask, framing.content_thinking) &&
+                        mask_allows(mask, framing.content_text),
+                    "no-thinking tool mask must forbid thinking and allow text");
+            const auto call = tokenizer.encode(
+                R"(get_weather<|content_invoke_tool_json|>{"name":"get_weather","args":{"city":"LA"}}<|end_message|><|content_model_end_sampling|>)");
+            const auto d = commit_round(session, call, out);
+            require(d.finish_reason == FinishReason::StopToken && out.calls.size() == 1 &&
+                        out.calls[0].name == "get_weather",
+                    "enable_thinking=false with tools must allow direct tool call");
+        }
+        // Custom stop string with auto tools + enable_thinking=false must not throw.
+        {
+            auto session = frontend.make_output_session(
+                prepared, {.strings = {{.text = "STOP"}}}, {}, {}, {},
+                {.constraints = ToolConstraintMode::Automatic});
+            require(!session.constrained(),
+                    "custom stop string must keep auto tools unconstrained");
+        }
     }
     {
         PromptInput in;
@@ -858,6 +931,30 @@ void test_xgrammar_constraints(const inkling::Frontend& frontend, const text::To
             session, tokenizer.encode("42}<|end_message|><|content_model_end_sampling|>"), out);
         require(d.finish_reason == FinishReason::StopToken && out.content == "42}",
                 "continuation JSON schema mismatch: " + out.content);
+    }
+
+    // 6. enable_thinking=false + JSON Schema starts directly inside body without framing prefix.
+    {
+        PromptInput in;
+        in.options.enable_thinking = false;
+        in.messages.push_back({.role = ChatRole::User, .parts = {{.text = "JSON"}}});
+        const auto prompt = frontend.prepare(in);
+        OutputConstraint schema{
+            .kind   = OutputConstraintKind::JsonSchema,
+            .source = R"({"type":"object","properties":{"k":{"type":"integer"}},"required":["k"],"additionalProperties":false})",
+        };
+        auto session = frontend.make_output_session(prompt, {}, {}, {}, schema, {});
+        const auto mask = next_mask(session, vocab);
+        require(!mask_allows(mask, framing.message_model) &&
+                    !mask_allows(mask, framing.content_thinking),
+                "non-thinking JSON schema must start directly in JSON body");
+        CollectedOutput out;
+        const auto d = commit_round(
+            session, tokenizer.encode(R"({"k":7}<|end_message|><|content_model_end_sampling|>)"),
+            out);
+        require(d.finish_reason == FinishReason::StopToken && out.reasoning.empty() &&
+                    out.content == R"({"k":7})",
+                "non-thinking JSON schema output mismatch: " + out.content);
     }
 }
 

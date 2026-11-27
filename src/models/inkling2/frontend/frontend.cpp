@@ -155,6 +155,7 @@ PreparedPrompt::operator bool() const noexcept { return data_ != nullptr; }
 PromptSummary PreparedPrompt::summary() const {
     const auto& data = PreparedPromptAccess::view(*this);
     return {.starts_in_reasoning = data.output.initial_block == InitialBlock::Thinking,
+            .thinking_enabled    = data.output.thinking_enabled,
             .prompt_tokens       = checked_count(data.token_ids.size()),
             .has_media           = !data.identity.media.empty()};
 }

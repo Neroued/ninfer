@@ -440,7 +440,7 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
         };
         ninfer::PreparedPrompt prompt = engine_->prepare(std::move(input), control);
         check_preparation_control(prepared.lifetime->deadline, is_cancelled);
-        prepared.enable_thinking = prompt.summary().starts_in_reasoning;
+        prepared.enable_thinking = prompt.summary().thinking_enabled;
         if (!prepared.enable_thinking) { prepared.thinking_budget.reset(); }
         prepared.prompt_tokens           = static_cast<int>(prompt.summary().prompt_tokens);
         prepared.preparation             = prompt.preparation_stats();

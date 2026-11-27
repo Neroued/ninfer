@@ -31,6 +31,8 @@ public:
         if (result_) observed.result_stream_ns = nanoseconds(*result_);
     }
 
+    void begin_resolution() noexcept { retirement_started_ = retirement_recorded_ = false; }
+
     void resolve() {
         if (retirement_ && !retirement_started_) {
             retirement_->start();

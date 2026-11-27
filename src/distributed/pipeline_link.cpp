@@ -40,12 +40,16 @@ const CudaCompletionEvent& PpStageLink::completion(const Slot& slot) const {
     return group_.rank() == 0 ? slot.transferred : slot.copied;
 }
 
+bool PpStageLink::available() const {
+    const auto& slot = slots_[next_];
+    return !slot.sequence || completion(slot).ready();
+}
+
 PpStageLink::Slot* PpStageLink::reserve(std::uint64_t sequence, std::size_t bytes) {
     if (sequence <= last_) throw std::logic_error("stale pipeline transfer sequence");
     if (!bytes || bytes > backing_.bytes / slots)
         throw std::out_of_range("pipeline payload exceeds the prepared slot");
-    auto& slot = slots_[next_];
-    return !slot.sequence || completion(slot).ready() ? &slot : nullptr;
+    return available() ? &slots_[next_] : nullptr;
 }
 
 PpStageLink::Transfer PpStageLink::submitted(std::uint64_t sequence) {

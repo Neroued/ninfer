@@ -103,12 +103,25 @@ public:
         }
         out.allow_shared_device = boolean(t, "allow_shared_device", "distributed", false);
         if (const auto* p = t.get("parallel")) {
-            const auto& values = table(*p, "distributed.parallel", {"tp", "ep", "dp", "pp", "adp"});
-            out.parallel.tp    = number(values, "tp", "distributed.parallel", 1);
-            out.parallel.ep    = number(values, "ep", "distributed.parallel", 1);
-            out.parallel.dp    = number(values, "dp", "distributed.parallel", 1);
-            out.parallel.pp    = number(values, "pp", "distributed.parallel", 1);
-            out.parallel.adp   = number(values, "adp", "distributed.parallel", 1);
+            const auto& values =
+                table(*p, "distributed.parallel", {"tp", "ep", "dp", "pp", "adp", "stage_layers"});
+            out.parallel.tp  = number(values, "tp", "distributed.parallel", 1);
+            out.parallel.ep  = number(values, "ep", "distributed.parallel", 1);
+            out.parallel.dp  = number(values, "dp", "distributed.parallel", 1);
+            out.parallel.pp  = number(values, "pp", "distributed.parallel", 1);
+            out.parallel.adp = number(values, "adp", "distributed.parallel", 1);
+            if (const auto* layers = values.get("stage_layers")) {
+                constexpr auto key = "distributed.parallel.stage_layers";
+                remember(*layers, key);
+                if (!layers->is_array() || layers->as_array()->empty())
+                    error(*layers, key, "expected a nonempty list of positive layer counts");
+                for (const auto& item : *layers->as_array()) {
+                    const auto count = item.value<std::int64_t>();
+                    if (!item.is_integer() || !count || *count <= 0 || *count > UINT32_MAX)
+                        error(item, key, "expected a positive layer count");
+                    out.parallel.stage_layers.push_back(static_cast<std::uint32_t>(*count));
+                }
+            }
         }
         const auto& nodes = array(t, "nodes");
         for (std::size_t i = 0; i < nodes.size(); ++i) {

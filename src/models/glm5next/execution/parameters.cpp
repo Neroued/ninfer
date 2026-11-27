@@ -152,11 +152,15 @@ Parameters::Parameters(const ModelShard& model, std::shared_ptr<const ModelProfi
         throw std::invalid_argument("GLM5Next Parameters require their selected rank profile");
     const Prepare p(model);
     const auto& w   = model.definition().weights();
-    text.embedding  = native_weight(model.weight(w.text.embedding).view);
-    text.head       = p.linear({w.text.head});
-    text.final_norm = p.tensor(w.text.final_norm);
-    for (std::size_t i = 0; i < w.text.layers.size(); ++i)
-        text.layers.push_back(p.block(w.text.layers[i]));
+    const auto& rank = model.rank_plan();
+    if (!rank.placement.pp.rank)
+        text.embedding = native_weight(model.weight(w.text.embedding).view);
+    if (rank.placement.pp.rank + 1 == rank.placement.pp.size) {
+        text.head       = p.linear({w.text.head});
+        text.final_norm = p.tensor(w.text.final_norm);
+    }
+    for (const auto& layer : std::span(w.text.layers).subspan(rank.layers.begin, rank.layers.size))
+        text.layers.push_back(p.block(layer));
     if (w.mtp) {
         const auto& m = *w.mtp;
         mtp           = {native_weight(model.weight(m.embedding).view),
@@ -199,7 +203,7 @@ Parameters::Parameters(const ModelShard& model, std::shared_ptr<const ModelProfi
                  {p.tensor(l.mlp_conv->base_kernel), p.linear({l.mlp_conv->kernel_projection})}});
         }
     }
-    if (w.vision) vision = p.vision(*w.vision);
+    if (w.vision && !rank.placement.pp.rank) vision = p.vision(*w.vision);
 }
 
 } // namespace ninfer::models::glm5next::execution

@@ -167,7 +167,7 @@ FrameLayout plan_frame(LayoutBuilder& b, const execution::ModelProfile& p,
     if (p.mtp || p.draft) out.speculative.emplace();
     if (p.draft) out.dflash.emplace();
     if (p.mtp) out.mtp.emplace();
-    if (s.purpose == EnginePurpose::Generation) out.sampling.emplace();
+    if (s.purpose == EnginePurpose::Generation && p.output_stage()) out.sampling.emplace();
     control_layout(b, out, {s.max_concurrency, s.max_concurrency}, width);
     auto& local            = out.attention;
     const auto local_batch = [&](BatchLayout& io, int n, TensorRegion tables) {
@@ -226,7 +226,9 @@ FrameLayout plan_frame(LayoutBuilder& b, const execution::ModelProfile& p,
         tensor(DType::BF16, {hidden, sequence.partition(dimension(s.prefill_chunk), 0).padded},
                "prefill hidden");
     out.pending_hidden = tensor(DType::BF16, {hidden, width, batch}, "pending Main hidden");
-    out.main_records = ops::plan_kpool_raw_records(b, index, width, batch, dimension(c.mla_layers));
+    if (c.mla_layers)
+        out.main_records =
+            ops::plan_kpool_raw_records(b, index, width, batch, dimension(c.mla_layers));
     if (out.speculative) {
         const int heads = dimension(p.local.kda_heads.size), d = dimension(c.kda.head_dim);
         out.kda_records =
@@ -251,7 +253,7 @@ FrameLayout plan_frame(LayoutBuilder& b, const execution::ModelProfile& p,
         m.tail_keys  = tensor(DType::BF16, {index, tail, batch, slots}, "MTP raw key tails");
         m.tail_gates = tensor(DType::BF16, {index, tail, batch, slots}, "MTP raw gate tails");
     }
-    if (s.purpose == EnginePurpose::Generation) {
+    if (out.sampling) {
         out.logits =
             tensor(DType::BF16, {dimension(p.local.vocabulary.size), width, batch}, "logits");
         out.token_counts  = tensor(DType::I32, {dimension(p.public_tokens), batch}, "token counts");

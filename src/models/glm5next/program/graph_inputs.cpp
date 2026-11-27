@@ -8,8 +8,9 @@
 namespace ninfer::models::glm5next::detail {
 namespace {
 std::vector<RecordSpec> specs(const ExecutionPlan& p) {
-    std::vector<RecordSpec> out{{p.state.owner.image_bytes, p.state.owner.alignment},
-                                {p.main.cache.page.page_bytes, p.main.cache.page.alignment}};
+    std::vector<RecordSpec> out{{p.state.owner.image_bytes, p.state.owner.alignment}};
+    if (p.main.cache.page.page_bytes)
+        out.push_back({p.main.cache.page.page_bytes, p.main.cache.page.alignment});
     if (p.mtp) out.push_back({p.mtp->cache.page.page_bytes, p.mtp->cache.page.alignment});
     return out;
 }
@@ -51,13 +52,16 @@ void GraphInputs::prepare() {
     };
     for (std::uint32_t row = 0; row < p.shape.max_concurrency; ++row)
         states_.push_back(allocate(0));
+    int record_kind = 0;
     for (int pool = 0; pool < (r.mtp ? 2 : 1); ++pool) {
+        if (!pool && !r.main.has_pages()) continue;
+        ++record_kind;
         auto& tables         = (pool ? *r.mtp : r.main).tables();
         const auto capacity  = tables.logical_page_capacity();
         const auto row_bytes = std::size_t(capacity) * sizeof(std::int64_t);
         mappings_[pool]      = PinnedHostBuffer(p.shape.max_concurrency * row_bytes);
         for (std::uint32_t row = 0; row < p.shape.max_concurrency; ++row) {
-            const auto page_offset = allocate(pool + 1);
+            const auto page_offset = allocate(record_kind);
             const auto staging     = mappings_[pool].span().subspan(row * row_bytes, row_bytes);
             auto* offsets          = static_cast<std::int64_t*>(staging.data);
             std::fill_n(offsets, capacity, page_offset);
@@ -166,8 +170,10 @@ void GraphInputs::set(int g, int c, int width, int depth) {
     p.fill_local_metadata(io.decode, width, c);
     if (io.mtp)
         for (const auto& step : io.mtp->draft_steps) p.fill_local_metadata(step, 1, c);
-    auto* configs = static_cast<ops::SamplingConfig*>(p.host(*io.sampling).data);
-    for (int j = 0; j < g; ++j) configs[j] = {.temperature = 0, .top_k = 1, .top_p = 1};
+    if (io.sampling) {
+        auto* configs = static_cast<ops::SamplingConfig*>(p.host(*io.sampling).data);
+        for (int j = 0; j < g; ++j) configs[j] = {.temperature = 0, .top_k = 1, .top_p = 1};
+    }
     p.upload_region(io.ingress, io.ingress.bytes);
     p.upload_region(io.commit_ingress, io.commit_ingress.bytes);
 }

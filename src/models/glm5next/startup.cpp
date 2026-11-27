@@ -202,7 +202,7 @@ RankResourceDescription RankPreparation::describe() const {
         throw std::logic_error("GLM5Next resources have not been prepared");
     const auto& p = instance_->program->plan();
     const auto& c = p.capacity;
-    RankResourceDescription out{.rank    = p.profile->local.rank,
+    RankResourceDescription out{.rank    = p.profile->replica_rank(),
                                 .shape   = p.shape,
                                 .batches = p.batches->spec(),
                                 .state   = describe_state(p.state),

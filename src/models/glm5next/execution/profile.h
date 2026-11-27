@@ -93,6 +93,19 @@ struct VisionProfile {
 struct ModelProfile {
     Config config;
     LoadOptions options;
+    ParallelCoordinate stage;
+    IndexRange layers;
+
+    [[nodiscard]] bool input_stage() const noexcept { return stage.rank == 0; }
+
+    [[nodiscard]] bool output_stage() const noexcept { return stage.rank + 1 == stage.size; }
+
+    [[nodiscard]] std::uint32_t replica_rank() const noexcept {
+        return stage.rank * local.size + local.rank;
+    }
+
+    [[nodiscard]] std::uint32_t replica_size() const noexcept { return stage.size * local.size; }
+
 
     struct LocalGeometry {
         std::uint32_t rank, size;

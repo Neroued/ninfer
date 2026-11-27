@@ -23,14 +23,20 @@ Resources::Resources(ExecutionPlan input, DeviceContext& device, ContextCommunic
       fixed_(device.device(), plan.fixed_bytes), workspace_(device.device(), plan.workspace.bytes),
       ingress_(plan.frame.host_ingress.bytes), sampling_(plan.frame.sampling_ingress.bytes),
       egress_(plan.pinned_output_bytes), context_counts_(plan.pinned_context_counts_bytes()),
+      pipeline_counts_(plan.pipeline_counts ? plan.pipeline_counts->region.bytes : 0),
       workspace(workspace_.span().subspan(0, plan.workspace.general_bytes)),
       states(context_.span(), plan.state), main(context_.span(), fixed_.span(), plan.main) {
     if (plan.workspace.vision) vision.emplace(device, *plan.workspace.vision);
+    if (plan.graph_input.bytes) {
+        const auto input = plan.graph_input.bind(fixed_.span());
+        CUDA_CHECK(cudaMemsetAsync(input.data, 0, input.bytes, device.stream()));
+    }
     if (plan.mtp) mtp = std::make_unique<CacheViews>(context_.span(), fixed_.span(), *plan.mtp);
-    std::vector<context::ContextTableStorage> tables{{0, &main.tables()}};
+    std::vector<context::ContextTableStorage> tables;
+    if (main.has_pages()) tables.push_back({0, &main.tables()});
     if (mtp) tables.push_back({1, &mtp->tables()});
     context = std::make_unique<context::ContextStorage>(context_.span(), MemorySpan{}, tables,
-                                                        plan.profile->local.rank);
+                                                        plan.profile->replica_rank());
     const auto binding = [&](std::size_t slot) {
         return peer.group ? context::ContextPeerBinding{peer.group, peer.members,
                                                         plan.peer_staging[slot].bind(fixed_.span()),
@@ -89,7 +95,7 @@ Resources::Resources(ExecutionPlan input, DeviceContext& device, ContextCommunic
         const auto region = r.region.bind(fixed_.span());
         CUDA_CHECK(cudaMemsetAsync(region.data, value, region.bytes, device.stream()));
     };
-    clear(plan.main.tables.page_offsets, 255);
+    if (main.has_pages()) clear(plan.main.tables.page_offsets, 255);
     if (plan.mtp) clear(plan.mtp->tables.page_offsets, 255);
     if (plan.frame.token_counts) clear(*plan.frame.token_counts, 0);
     device.synchronize();
@@ -148,9 +154,9 @@ RankMemoryUsage Resources::observe() const {
     out.allocations.persistent_device_bytes = fixed_.size() + plan.profile->exchange_bytes;
     out.allocations.context_device_bytes    = context_.size();
     out.allocations.workspace_device_bytes  = workspace_.size();
-    out.allocations.io_pinned_bytes         = ingress_.size() + sampling_.size() + egress_.size() +
-                                      context_counts_.size() + compute_actions->pinned_bytes() +
-                                      context_actions->pinned_bytes();
+    out.allocations.io_pinned_bytes =
+        ingress_.size() + sampling_.size() + egress_.size() + context_counts_.size() +
+        pipeline_counts_.size() + compute_actions->pinned_bytes() + context_actions->pinned_bytes();
     const auto peak = std::max(workspace.peak_used(), vision ? vision->workspace_peak_bytes() : 0);
     out.workspace   = {workspace.used(), peak, peak};
     if (vision) {

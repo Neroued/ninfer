@@ -90,6 +90,7 @@ struct Work {
     std::variant<ForwardWork, SpeculativeWork, ContextWork, ScoreWork, moe::ExpertServiceWork>
         operation;
     std::optional<moe::ExpertStep> exchange;
+    std::optional<runtime::DecisionInput> initial_decision;
 };
 
 struct RowResult {
@@ -132,6 +133,11 @@ struct ExecutionTypes {
     using Result = glm5next::Result;
     using Commit = glm5next::Commit;
     [[nodiscard]] static ExecutionWork describe_work(const Work&);
+
+    [[nodiscard]] static std::optional<std::uint32_t> submitted_decision_stage(const Work& work) {
+        if (work.initial_decision) return work.initial_decision->stage;
+        return {};
+    }
 };
 
 struct WorkContract {

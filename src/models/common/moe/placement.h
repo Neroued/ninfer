@@ -25,6 +25,7 @@ void bind_expert_domains(const distributed::ExecutionTopology& topology,
     for (const auto& role : topology.roles) {
         if (role.role != "expert") continue;
         const auto& group    = topology.group(role.group);
+        if (ranks.at(group.members.front()).experts.empty()) continue;
         auto domain          = std::make_shared<ExpertDomain>();
         domain->members      = group.members;
         domain->experts      = experts;

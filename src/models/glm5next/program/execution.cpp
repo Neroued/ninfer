@@ -60,7 +60,8 @@ void RankProgramImpl::execute_target(const execution::BatchView& main, bool head
     auto hidden = target_hidden(main);
     begin_target(main, false);
     target_forward(main, hidden, forced_control);
-    if (head) project_head(hidden.view({hidden.ne[0], main.tokens * main.rows}));
+    if (head && parameters.profile->output_stage())
+        project_head(hidden.view({hidden.ne[0], main.tokens * main.rows}));
     timer.end_target();
 }
 
@@ -93,7 +94,7 @@ void RankProgramImpl::target_forward(const execution::BatchView& main, Tensor hi
         main_forward(main, update, hidden, {}, submit);
     } else {
         main_forward(main, update, hidden, {}, submit);
-        if (forced_control || !frame.speculative) {
+        if (parameters.profile->output_stage() && (forced_control || !frame.speculative)) {
             if (parameters.mtp) align_history(main, hidden, 1);
             if (parameters.draft) append_dflash_context(main, main.valid_columns, {0, 1});
             ops::scatter(hidden.view({hidden.ne[0], main.rows}),
@@ -146,13 +147,35 @@ void RankProgramImpl::forward() {
     for (std::size_t i = 0; i < rows.size(); ++i)
         f.result.rows[control ? f.control_row : i].processed += rows[i].ids.size();
     if (!f.sequence && f.tokens == 1) {
-        const bool sample = forward && forward->sample != SampleKind::None;
+        const bool sample =
+            parameters.profile->output_stage() && forward && forward->sample != SampleKind::None;
         if (graphs && forward && forward->kind == ForwardKind::Ordinary) {
             f.graph_route =
                 resources.plan.decode_routes->select_route(f.physical.shape, shape.speculative, 0);
             const auto bucket =
                 ops::select_context_bucket(std::max(1U, f.batch.attention.max_visible_tokens));
+#if NINFER_ENABLE_DISTRIBUTED
+            const auto sequence = ++pipeline_sequence;
+            const auto bytes    = StageBoundaryField::transfer_elements(
+                                   parameters.profile->config.text.residual_width() * f.batch.rows,
+                                   TpLayout::Replicated, parameters.profile->local.size) *
+                               sizeof(std::uint16_t);
+            if (pipeline_input) {
+                const auto input =
+                    resources.plan.graph_input.bind(resources.fixed()).subspan(0, bytes);
+                if (!pipeline_input->try_receive(sequence, {&input, 1}, cuda))
+                    throw std::logic_error("pipeline graph lost its input credit");
+            }
+#endif
             (void)graphs->start_target(*f.graph_route, {.bucket = bucket, .head = sample});
+#if NINFER_ENABLE_DISTRIBUTED
+            if (pipeline_output) {
+                const ConstMemorySpan output =
+                    resources.plan.graph_output.bind(resources.fixed()).subspan(0, bytes);
+                if (!(f.sent = pipeline_output->try_send(sequence, {&output, 1}, cuda)))
+                    throw std::logic_error("pipeline graph lost its output credit");
+            }
+#endif
         } else {
             execute_target(f.batch, sample, forward && forward->kind == ForwardKind::Control);
         }
@@ -170,13 +193,14 @@ void RankProgramImpl::forward() {
     if (!f.sequence) upload_region(io.ingress, io.ingress.bytes);
     if (parameters.mtp && f.tokens) stage_conditioning(f.batch.rows);
     {
-        auto visual     = forward ? prepare_vision(forward->visual, rows[0].main_frontier, f.tokens)
-                                  : std::nullopt;
+        auto visual     = forward && parameters.profile->input_stage()
+                              ? prepare_vision(forward->visual, rows[0].main_frontier, f.tokens)
+                              : std::nullopt;
         f.timed_prefill = f.sequence && prefill_timer.has_value();
         if (f.timed_prefill) prefill_timer->start();
         execution::StateUpdate update = execution::StepUpdate{};
         if (f.sequence) {
-            const auto s = rows[0].states.at(parameters.profile->local.rank);
+            const auto s = rows[0].states.at(parameters.profile->replica_rank());
             update       = execution::SequenceUpdate{s.source, s.destination};
         }
         main_forward(f.batch, update, f.hidden, std::move(visual));
@@ -186,20 +210,20 @@ void RankProgramImpl::forward() {
                 std::max(1U, f.tokens - (rows.size() == 1 && !rows[0].main_frontier ? 1 : 0)));
         if (parameters.draft)
             append_dflash_context(f.batch, f.batch.valid_columns, {f.tokens, f.tokens});
-        if (f.sequence) {
+        if (parameters.profile->output_stage() && f.sequence) {
             auto last         = f.hidden.slice(1, f.tokens - 1, 1);
-            const auto offset = rows[0].states.at(parameters.profile->local.rank).destination;
+            const auto offset = rows[0].states.at(parameters.profile->replica_rank()).destination;
             auto destination =
                 resources.states.image(rows[0].attention_owner == parameters.profile->local.owner())
                     .tensor(resources.plan.state.hidden, offset);
             copy_bytes_async({destination.data, destination.bytes(), cuda.device()},
                              {last.data, last.bytes(), cuda.device()}, cuda);
-        } else
+        } else if (parameters.profile->output_stage())
             ops::scatter(f.hidden, resources.states.hidden(f.batch.destination_offsets),
                          f.batch.live_rows, cuda);
         if (f.timed_prefill) prefill_timer->record_stop();
     }
-    if (forward && forward->sample != SampleKind::None) {
+    if (parameters.profile->output_stage() && forward && forward->sample != SampleKind::None) {
         f.phase = ComputePhase::Decision;
         decide();
     } else {
@@ -224,13 +248,14 @@ void RankProgramImpl::forward_packed_prefill(const ForwardWork& work) {
         if (parameters.mtp) align_packed_history(f.batch, packed, f.hidden);
         if (parameters.draft) append_packed_dflash_context(f.batch, packed.update.ragged);
 
-        ops::scatter_ragged_last_columns(f.hidden, packed.update.ragged,
-                                         resources.states.hidden(f.batch.destination_offsets),
-                                         cuda);
+        if (parameters.profile->output_stage())
+            ops::scatter_ragged_last_columns(f.hidden, packed.update.ragged,
+                                             resources.states.hidden(f.batch.destination_offsets),
+                                             cuda);
         if (f.timed_prefill) prefill_timer->record_stop();
     }
     const int sampled = extent(packed.sampled_members.size());
-    if (sampled) {
+    if (sampled && parameters.profile->output_stage()) {
         f.sampled_hidden = resources.packed(frame.pending_hidden, {h, sampled});
         ops::gather(resources.states.hidden(row(layout.sampled_offsets, sampled)),
                     row(frame.rows.live_rows, sampled), f.sampled_hidden, cuda);
@@ -305,7 +330,28 @@ void RankProgramImpl::main_forward(const execution::BatchView& call, execution::
                                    std::optional<models::vision::EmbeddingView> visual,
                                    const execution::MlaSubmit& submit) {
     auto run = text_run(call, update);
-    run.stem(std::move(visual));
+#if NINFER_ENABLE_DISTRIBUTED
+    const auto sequence = compute ? ++pipeline_sequence : 0;
+    const auto boundary = [&] {
+        return StageBoundaryField::bind(
+            run.boundary_residual(),
+            run.columns().split() ? TpLayout::Sharded : TpLayout::Replicated,
+            parameters.profile->local.rank, parameters.profile->local.size);
+    };
+    if (pipeline_input) {
+        auto field = boundary();
+        const MemorySpan input{field.transfer.data, field.transfer.bytes(), cuda.device()};
+        if (graph_inputs)
+            copy_bytes_async(
+                input, resources.plan.graph_input.bind(resources.fixed()).subspan(0, input.bytes),
+                cuda);
+        else if (!pipeline_input->try_receive(sequence, {&input, 1}, cuda))
+            throw std::logic_error("GLM pipeline input credit was lost after admission");
+        if (field.replica.data) parallel->gather(field.transfer, field.replica, cuda);
+        run.begin_stage();
+    } else
+#endif
+        run.stem(std::move(visual));
     for (std::uint32_t i = 0; i < parameters.text.layers.size(); ++i) {
         nvtx::ScopedRange range(nvtx::Name::TextLayer, nvtx::Category::Runtime, i);
         run.local_mixer(i, submit);
@@ -313,6 +359,20 @@ void RankProgramImpl::main_forward(const execution::BatchView& call, execution::
         run.ffn(i);
         run.finish_layer(i);
     }
+#if NINFER_ENABLE_DISTRIBUTED
+    if (pipeline_output) {
+        run.finish_stage();
+        const auto field = boundary();
+        const ConstMemorySpan output{field.transfer.data, field.transfer.bytes(), cuda.device()};
+        if (graph_inputs)
+            copy_bytes_async(
+                resources.plan.graph_output.bind(resources.fixed()).subspan(0, output.bytes),
+                output, cuda);
+        else if (!(compute->sent = pipeline_output->try_send(sequence, {&output, 1}, cuda)))
+            throw std::logic_error("GLM pipeline output credit was lost after admission");
+        return;
+    }
+#endif
     const auto& p       = *parameters.profile;
     const auto& columns = run.columns();
     auto output         = columns.split()
@@ -347,6 +407,12 @@ void RankProgramImpl::finish_forward() {
             f.phase = ComputePhase::Forward;
             return;
         }
+    }
+    if (!parameters.profile->output_stage()) {
+        timer.record_result();
+        compute_done.record(cuda.stream());
+        f.phase = ComputePhase::AwaitResult;
+        return;
     }
     if (std::holds_alternative<ScoreWork>(f.request.work.operation)) {
         f.phase = ComputePhase::Score;
@@ -407,7 +473,7 @@ void RankProgramImpl::result() {
         f.timed_prefill = false;
     }
     const auto* forward = std::get_if<ForwardWork>(&f.request.work.operation);
-    if (forward && forward->sample != SampleKind::None) {
+    if (parameters.profile->output_stage() && forward && forward->sample != SampleKind::None) {
         const auto* ids    = static_cast<const TokenId*>(resources.egress().data);
         const auto* top1   = forward->sample == SampleKind::NextToken && frame.top1_probabilities
                                  ? static_cast<const float*>(output(*frame.top1_probabilities).data)
@@ -463,6 +529,11 @@ void RankProgramImpl::advance_compute() {
         }
         break;
     case ComputePhase::Forward:
+#if NINFER_ENABLE_DISTRIBUTED
+        if ((pipeline_input && !pipeline_input->available()) ||
+            (pipeline_output && !pipeline_output->available()))
+            return;
+#endif
         if (std::holds_alternative<SpeculativeWork>(f.request.work.operation))
             prepare_speculative();
         else
@@ -496,6 +567,9 @@ void RankProgramImpl::advance_compute() {
     case ComputePhase::PendingCommit:
         break;
     case ComputePhase::Retiring:
+#if NINFER_ENABLE_DISTRIBUTED
+        if (f.sent && !pipeline_output->retired(*f.sent)) break;
+#endif
         if (compute_done.ready()) {
             if (resources.compute_actions->occupied()) resources.compute_actions->finish();
             collect_vision_timing();

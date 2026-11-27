@@ -28,6 +28,20 @@ struct TokenPartition {
     void clear_padding(const Tensor&, int axis, CudaExecutionView) const;
 };
 
+enum class TpLayout { Sharded, Replicated };
+
+// A boundary payload consists of ordered tensor fields. Already sharded fields travel
+// unchanged. An equally divisible replica travels in TP-lane order and is gathered at
+// the receiver. Uneven replicas can still travel intact.
+struct StageBoundaryField {
+    Tensor transfer;
+    Tensor replica;
+    static std::size_t transfer_elements(std::size_t elements, TpLayout layout,
+                                         std::uint32_t tensor_ranks);
+    static StageBoundaryField bind(const Tensor& local, TpLayout layout, std::uint32_t rank,
+                                   std::uint32_t ranks);
+};
+
 struct SequenceParallelPolicy {
     std::uint32_t ranks          = 1;
     std::int32_t minimum_columns = 0;

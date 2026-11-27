@@ -23,15 +23,18 @@ ResolvedLoadPlan resolve_rank_load(const artifact::Reader& reader,
         throw artifact::ArtifactError("GLM5Next definition belongs to another artifact");
     if (device.type() != DeviceType::CUDA)
         throw artifact::ArtifactError("GLM5Next rank weights require a CUDA device");
-    if (rank.experts.size() != definition->expert_banks().size())
+    if (rank.experts.size() != rank.banks.size ||
+        rank.banks.begin > definition->expert_banks().size() ||
+        rank.banks.size > definition->expert_banks().size() - rank.banks.begin)
         throw artifact::ArtifactError("GLM5Next rank expert ownership differs from its definition");
-    std::vector<ExpertWeightPartition> experts(definition->expert_banks().size());
+    std::vector<ExpertWeightPartition> experts(rank.banks.size);
     const auto append = [&](const MoeWeights& w) {
-        experts.at(w.bank.index) = {definition->expert_banks()[w.bank.index],
-                                    {w.gate, w.up, w.down},
-                                    rank.experts[w.bank.index]};
+        const auto index  = rank.local_bank(w.bank).index;
+        experts.at(index) = {
+            definition->expert_banks()[w.bank.index], {w.gate, w.up, w.down}, rank.experts[index]};
     };
-    for (const auto& layer : definition->weights().text.layers)
+    for (const auto& layer :
+         std::span(definition->weights().text.layers).subspan(rank.layers.begin, rank.layers.size))
         if (const auto* m = std::get_if<MoeWeights>(&layer.ffn)) append(*m);
     if (definition->weights().mtp) append(definition->weights().mtp->moe);
     auto selection =

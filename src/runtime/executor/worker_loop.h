@@ -285,6 +285,7 @@ private:
             flight.pending_supply  = std::move(queued.pending_supply);
             flight.pending_commit  = std::move(queued.pending_commit);
             flight.pending_discard = std::move(queued.pending_discard);
+            flight.supply_applied  = submitted_decision_stage<Types>(queued.work).has_value();
             auto work              = std::move(queued.work);
             submit_queue_.pop_front();
 

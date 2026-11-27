@@ -4,6 +4,7 @@
 #include "core/platform.h"
 
 #include <algorithm>
+#include <cstring>
 #include <iostream>
 
 namespace {
@@ -161,7 +162,8 @@ void grouped_owners() {
         report.caches = {native.main.cache.page.geometry, native.mtp->cache.page.geometry};
         reports.push_back(std::move(report));
         if (r == 0) {
-            const auto copies = glm::history_conversion(native.main.cache.page, owners, 0, 1, 63);
+            const auto copies =
+                glm::history_conversion({&native.main.cache.page, 1}, owners, 0, 1, 63);
             require(copies.full_page.size() == 2 && copies.full_page[0].source_rank == 0 &&
                         copies.full_page[0].destination_rank == 2 &&
                         copies.full_page[1].source_rank == 1 &&
@@ -189,6 +191,87 @@ void grouped_owners() {
                 "migration moved a TP-local KDA shard");
 }
 
+void pipeline_layouts() {
+    using models::IndexRange;
+    using models::PipelineLayerDemand;
+    using models::StageBoundaryField;
+    using models::TpLayout;
+    const std::array<PipelineLayerDemand, 5> layers{{{2, 8}, {3, 3}, {8, 4}, {2, 1}, {2, 1}}};
+    ParallelOptions pp;
+    pp.pp = 2;
+    require(models::partition_pipeline_layers(layers, pp) ==
+                std::vector<IndexRange>{{0, 2}, {2, 3}},
+            "pipeline split missed the minimal bottleneck");
+    const std::array<std::uint64_t, 2> budget{10, 12};
+    require(models::partition_pipeline_layers(layers, pp, budget) ==
+                std::vector<IndexRange>{{0, 1}, {1, 4}},
+            "pipeline split ignored a stage's weight capacity");
+    pp.stage_layers = {3, 2};
+    require(models::partition_pipeline_layers(layers, pp) ==
+                std::vector<IndexRange>{{0, 3}, {3, 2}},
+            "explicit layer partition did not reach the requested endpoints");
+    bool rejected = false;
+    try {
+        (void)models::partition_pipeline_layers(layers, pp, budget);
+    } catch (const std::invalid_argument&) { rejected = true; }
+    require(rejected, "explicit partition exceeded the available stage capacity");
+
+    std::array<std::uint16_t, 24> source{}, restored{};
+    for (std::size_t i = 0; i < source.size(); ++i) source[i] = 17 * i + 1;
+    Tensor in(source.data(), Device::cpu(), DType::BF16, {4, 3, 2});
+    Tensor out(restored.data(), Device::cpu(), DType::BF16, {4, 3, 2});
+    for (unsigned lane = 0; lane < 4; ++lane) {
+        auto send = StageBoundaryField::bind(in, TpLayout::Replicated, lane, 4);
+        auto recv = StageBoundaryField::bind(out, TpLayout::Replicated, lane, 4);
+        require(send.transfer.data == source.data() + lane * 6 && send.transfer.bytes() == 12 &&
+                    recv.replica.data == restored.data(),
+                "TP replica did not use its lane's exact byte interval");
+        std::memcpy(recv.transfer.data, send.transfer.data, send.transfer.bytes());
+        auto shard = StageBoundaryField::bind(in, TpLayout::Sharded, lane, 4);
+        require(shard.transfer.data == in.data && shard.transfer.bytes() == in.bytes() &&
+                    !shard.replica.data,
+                "sequence shard was split a second time");
+    }
+    require(restored == source, "restoring replica slices changed the payload");
+
+    glm::AttentionOwners owners(2, 2, 2);
+    const auto members = owners.members(1);
+    require(members.size() == 2 && members[0] == 1 && members[1] == 3,
+            "pipeline changed the attention-owner lane");
+    auto full = storage_plan(0, false, KvCacheStorage::BFloat16, KvCacheVectorFormat::BFloat16);
+    auto p    = *full.profile;
+    p.stage   = {0, 2};
+    auto& c   = p.config.text;
+    LayoutBuilder b;
+    std::vector<KVPageLayout> pages;
+    for (auto count : {0U, 1U, 3U}) {
+        c.mla_layers     = count;
+        c.kda_layers     = count ? 0 : 2;
+        const auto state = glm::plan_state(p);
+        require(bool(state.kda) == !count && bool(state.main) == bool(count),
+                "stage reserved state for an absent mixer");
+        auto cache =
+            glm::plan_cache(b, c.mla, count, 256, 2, glm::latent_storage(KvCacheStorage::BFloat16),
+                            KvCacheVectorFormat::BFloat16);
+        require(bool(cache.cache.page.page_bytes) == bool(count) &&
+                    bool(cache.tables.page_offsets.region.bytes) == bool(count),
+                "stage allocated absent MLA pages or tables");
+        pages.push_back(std::move(cache.cache.page));
+    }
+    auto copies = glm::history_conversion(std::span(pages).subspan(1), owners, 0, 1, 7);
+    require(copies.full_page.size() == 2 && copies.full_page[0].source_rank == 0 &&
+                copies.full_page[1].source_rank == 2 && copies.full_page[1].destination_rank == 3 &&
+                copies.full_page[0].bytes == pages[1].page_bytes &&
+                copies.full_page[1].bytes == pages[2].page_bytes,
+            "KV migration used another stage's page geometry");
+    auto sparse = glm::history_conversion(std::span(pages).first(2), owners, 0, 1, 7);
+    require(sparse.full_page.size() == 1 && sparse.full_page[0].source_rank == 2 &&
+                std::ranges::all_of(
+                    sparse.partial_page,
+                    [](auto p) { return p.source_rank == 2 && p.destination_rank == 3; }),
+            "a stage without MLA incurred a full or partial KV copy");
+}
+
 void host() {
     grouped_owners();
     for (const auto linear_state_dtype :
@@ -205,14 +288,15 @@ void host() {
                     const auto recurrent_bytes = 34ULL * 32 * 128 * 128 * state_elem;
                     const auto conv_bytes      = 34ULL * 3 * 32 * 128 * 3 * 2;
                     const auto tails           = (11ULL + mtp) * 128 * 3 * 2 * 2;
-                    require(p.state.kda.spec.recurrent_dtype == to_dtype(linear_state_dtype) &&
-                                p.state.common.image_bytes ==
-                                    recurrent_bytes + conv_bytes + 4096 * 2 &&
-                                p.state.owner.image_bytes == p.state.common.image_bytes + tails,
-                            "GLM State does not contain the required KDA/hidden/owner-tail payload");
-                for (const auto& plan : f.plans) {
-                    const auto& reference = plan.capacity.reference;
-                    require(reference.tokens_per_request == 129 && reference.request_count == 2 &&
+                    require(
+                        p.state.kda->spec.recurrent_dtype == to_dtype(linear_state_dtype) &&
+                            p.state.common.image_bytes == recurrent_bytes + conv_bytes + 4096 * 2 &&
+                            p.state.owner.image_bytes == p.state.common.image_bytes + tails,
+                        "GLM State does not contain the required KDA/hidden/owner-tail payload");
+                    for (const auto& plan : f.plans) {
+                        const auto& reference = plan.capacity.reference;
+                        require(
+                            reference.tokens_per_request == 129 && reference.request_count == 2 &&
                                 reference.device_bytes == (5ULL + mtp) * p.state.owner.image_bytes,
                             "ADP capacity reference omitted remote-owner State or local KV");
                 }
@@ -229,7 +313,7 @@ void host() {
                         "group preparation discarded rank capacity or optional history");
                 for (const unsigned tail : {3U, 4U, 63U}) {
                     const auto transfer = glm::history_conversion(
-                        p.main.cache.page, glm::AttentionOwners(2, 2), 0, 1, tail);
+                        {&p.main.cache.page, 1}, glm::AttentionOwners(2, 2), 0, 1, tail);
                     std::size_t copied  = 0;
                     for (const auto& field : transfer.partial_page) copied += field.bytes;
                     require(
@@ -416,6 +500,7 @@ int main(int argc, char** argv) {
         require(argc == 2, "usage: glm-resource-test --host|--gpu");
         if (std::string_view(argv[1]) == "--host") {
             host();
+            pipeline_layouts();
             dflash_storage();
             capacity_views();
             sequence_capacity();

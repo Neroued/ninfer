@@ -12,8 +12,8 @@ void encode_rank_load(Encoder& out, const RankLoadRequest& request) {
     out.raw(request.artifact);
     const auto& p = request.rank;
     out.u32(p.placement.global_rank);
-    for (auto r :
-         {p.mla_heads, p.kda_heads, p.vocabulary, p.dense_intermediate, p.shared_intermediate}) {
+    for (auto r : {p.layers, p.banks, p.mla_heads, p.kda_heads, p.vocabulary, p.dense_intermediate,
+                   p.shared_intermediate}) {
         out.u32(r.begin);
         out.u32(r.size);
     }
@@ -48,8 +48,8 @@ RankLoadRequest decode_rank_load(Decoder& in, const distributed::RankIdentity& i
     if (in.u32() != identity.rank)
         throw std::invalid_argument("GLM5Next load request addressed to another global rank");
     p.placement = RankPlacement(identity);
-    for (auto* r :
-         {&p.mla_heads, &p.kda_heads, &p.vocabulary, &p.dense_intermediate, &p.shared_intermediate})
+    for (auto* r : {&p.layers, &p.banks, &p.mla_heads, &p.kda_heads, &p.vocabulary,
+                    &p.dense_intermediate, &p.shared_intermediate})
         *r = {in.u32(), in.u32()};
     if (in.boolean()) {
         p.draft.emplace();
@@ -88,6 +88,7 @@ void encode(Encoder& out, const RankResourceDescription& r) {
     out.boolean(s.narrow_dflash_targets);
     out.u8(static_cast<std::uint8_t>(s.length_policy));
     out.u8(static_cast<std::uint8_t>(s.linear_state_dtype));
+    out.u32(s.pipeline_stages);
     encode_batch_execution_spec(out, r.batches);
     for (auto record : {r.state.common, r.state.owner}) {
         out.u64(record.bytes);
@@ -134,7 +135,8 @@ RankResourceDescription decode_rank_resources(Decoder& in) {
                             static_cast<SpeculativeBackend>(in.u8()),
                             in.boolean(),
                             static_cast<SpeculativeLengthPolicy>(in.u8()),
-                            static_cast<LinearStateDType>(in.u8())};
+                            static_cast<LinearStateDType>(in.u8()),
+                            in.u32()};
     r.batches            = decode_batch_execution_spec(in);
     r.state.common       = {in.u64(), in.u64()};
     r.state.owner        = {in.u64(), in.u64()};

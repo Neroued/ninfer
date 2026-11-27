@@ -22,7 +22,7 @@ ExecutionCodec::ExecutionCodec(const ModelDefinition& definition,
                 {}} {
     contract_.decode_routes = make_decode_routes(rank.shape, *contract_.batches);
     scope_.participants     = replica_.ranks;
-    scope_.decision_owners  = replica_.ranks;
+    scope_.decision_owners  = replica_.stage_ranks.back();
     scope_.result_owner     = replica_.result_owner;
     scope_.validate(topology);
     const std::size_t batch = rank.shape.max_concurrency;
@@ -74,7 +74,9 @@ runtime::protocol::Scope ExecutionCodec::scope(const Work& work,
 }
 
 void ExecutionCodec::encode_work(wire::Encoder& out, const Work& w, distributed::RankId r) const {
-    glm5next::encode_work(out, w, replica_.local_index(r));
+    glm5next::encode_work(out, w, replica_.local_index(r), scope_.is_decision_owner(r),
+                          std::ranges::find(replica_.stage_ranks.front(), r) !=
+                              replica_.stage_ranks.front().end());
 }
 
 Work ExecutionCodec::decode_work(wire::Decoder& in) const {

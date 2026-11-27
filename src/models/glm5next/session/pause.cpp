@@ -19,8 +19,8 @@ PauseResources pause_resources(const detail::SessionImpl& p, const detail::Seque
     if (action.kind == runtime::PauseKind::Relocate) {
         out.relocation.state =
             out.demand.add_state({.count = 1, .variant = action.placement.value});
-        const auto placement = p.plan.attention.members(action.placement.value);
         for (std::uint32_t pool = 0; pool < p.pool_count(); ++pool) {
+            const auto& placement          = p.plan.history_ranks[pool][action.placement.value];
             const auto f                   = pool ? s.continuation.metadata.mtp_frontier.value()
                                                   : s.continuation.metadata.main_frontier;
             out.relocation.histories[pool] = out.demand.add_history(
@@ -223,8 +223,8 @@ void SessionImpl::prepare_pause_resources(context::ContextReservation& targets) 
         migration.convert_state(snapshot.continuation().image, to,
                                 targets.take(pause.relocation.state),
                                 state_conversion(plan.states, plan.attention, from, to));
-        const auto placement = plan.attention.members(to);
         for (std::uint32_t pool = 0; pool < pool_count(); ++pool) {
+            const auto& placement = plan.history_ranks[pool][to];
             const auto& prefix = snapshot.prefix(pool);
             migration.add_binding(
                 pool, directory.pool(pool).histories().prepare_conversion(

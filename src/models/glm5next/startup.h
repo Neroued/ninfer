@@ -59,6 +59,7 @@ private:
     std::uint32_t global_node_ = 0;
     ContextCommunication peer_;
     RankGroups binding_;
+    std::vector<distributed::GroupRequirements> pipeline_requirements_;
     const distributed::Group* expert_group_ = nullptr;
     std::optional<distributed::GroupRequirements> expert_requirements_;
     [[nodiscard]] std::unique_ptr<moe::ResidentExpertExchange> prepare_experts() const;

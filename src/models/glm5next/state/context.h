@@ -16,10 +16,10 @@ struct MlaConfig;
 
 struct StateLayout {
     StateImageLayout common, owner;
-    LinearAttentionStateLayout kda;
+    std::optional<LinearAttentionStateLayout> kda;
     StateField hidden;
     std::optional<CyclicKVCacheLayout> draft;
-    ops::KpoolTailFields main;
+    std::optional<ops::KpoolTailFields> main;
     std::optional<ops::KpoolTailFields> mtp;
     LayoutRegion owner_fields;
 };
@@ -51,7 +51,7 @@ class StateViews {
 public:
     StateViews(MemorySpan, const StateLayout&);
 
-    [[nodiscard]] const LinearAttentionStateView& kda() const noexcept { return kda_; }
+    [[nodiscard]] const LinearAttentionStateView& kda() const { return kda_.value(); }
 
     [[nodiscard]] StateFieldView hidden(const Tensor& offsets) const;
     [[nodiscard]] CyclicKVCacheLayerView draft_layer(std::uint32_t, const Tensor& offsets) const;
@@ -62,7 +62,7 @@ public:
 private:
     StateLayout layout_;
     StateImageStorage common_, owner_;
-    LinearAttentionStateView kda_;
+    std::optional<LinearAttentionStateView> kda_;
     std::optional<CyclicKVCacheView> draft_;
 };
 
@@ -71,14 +71,16 @@ public:
     CacheViews(MemorySpan context, MemorySpan fixed, const CacheLayout&);
     [[nodiscard]] ops::KpoolMlaCacheView layer(std::uint32_t) const;
 
-    [[nodiscard]] context::ExecutionTableStorage& tables() noexcept { return tables_; }
+    [[nodiscard]] context::ExecutionTableStorage& tables() { return tables_.value(); }
 
-    [[nodiscard]] const context::ExecutionTableStorage& tables() const noexcept { return tables_; }
+    [[nodiscard]] const context::ExecutionTableStorage& tables() const { return tables_.value(); }
+
+    bool has_pages() const noexcept { return tables_.has_value(); }
 
 private:
     CacheLayout layout_;
     MemorySpan context_;
-    context::ExecutionTableStorage tables_;
+    std::optional<context::ExecutionTableStorage> tables_;
 };
 
 // Record-relative copies for a change of attention owner. Common KDA/hidden fields stay on
@@ -87,7 +89,7 @@ private:
 state_conversion(std::span<const StatePlacement>, const AttentionOwners&,
                  std::uint32_t source_owner, std::uint32_t destination_owner);
 
-[[nodiscard]] context::HistoryCopyLayout history_conversion(const KVPageLayout&,
+[[nodiscard]] context::HistoryCopyLayout history_conversion(std::span<const KVPageLayout>,
                                                             const AttentionOwners&,
                                                             std::uint32_t from, std::uint32_t to,
                                                             std::uint32_t tail);

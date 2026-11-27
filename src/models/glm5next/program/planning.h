@@ -20,6 +20,8 @@ struct ExecutionPlan {
     FrameLayout frame;
     execution::WorkspacePlan workspace;
     std::array<LayoutRegion, 2> peer_staging;
+    LayoutRegion pipeline_input, pipeline_output, graph_input, graph_output;
+    std::optional<TensorRegion> pipeline_counts;
     std::size_t fixed_bytes         = 0;
     std::size_t mapping_elements    = 0;
     std::size_t pinned_output_bytes = 0;

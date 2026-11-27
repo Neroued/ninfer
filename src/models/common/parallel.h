@@ -12,21 +12,31 @@ struct IndexRange {
     friend bool operator==(IndexRange, IndexRange) = default;
 };
 
+struct PipelineLayerDemand {
+    std::uint64_t work, resident_bytes;
+};
+
+// Partition consecutive layers. Work is a model-supplied cost in common units. Budgets,
+// when available, contain the bytes left for layer weights on each stage.
+[[nodiscard]] std::vector<IndexRange>
+partition_pipeline_layers(std::span<const PipelineLayerDemand>, const ParallelOptions&,
+                          std::span<const std::uint64_t> stage_budgets = {});
+
 // Global expert IDs; intermediate selects matching gate/up rows and down columns.
 struct ExpertPartition {
     std::vector<std::uint32_t> ids;
     IndexRange intermediate;
 };
 
-// Logical PP1 weight placement. Device and process identity stay with the topology.
+// Logical weight placement. Device and process identity stay with the topology.
 struct RankPlacement {
     distributed::RankId global_rank = 0;
-    ParallelCoordinate tp, ep, adp, dp;
+    ParallelCoordinate tp, ep, adp, dp, pp;
 
     RankPlacement() = default;
 
     explicit RankPlacement(const distributed::RankIdentity& id)
-        : global_rank(id.rank), tp(id.tp), ep(id.ep), adp(id.adp), dp(id.dp) {}
+        : global_rank(id.rank), tp(id.tp), ep(id.ep), adp(id.adp), dp(id.dp), pp(id.pp) {}
 
     [[nodiscard]] ParallelCoordinate expert_slice() const {
         const auto lanes = ep.size <= tp.size ? tp.size / ep.size : 1U;

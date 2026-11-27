@@ -9,8 +9,24 @@ namespace {
 using Kind = detail::ComputeTransaction::Kind;
 
 void submit(detail::SessionImpl& session, detail::ComputeTransaction& tx,
-            runtime::ExecutionReservation reservation, Work work) {
+            runtime::ExecutionReservation reservation, Work work,
+            const runtime::ForwardGrammarMask& mask = {}) {
     if (work_batch(work).members.empty()) prepare_batch(work, *session.plan.batches);
+    if (session.shape.pipeline_stages > 1 && mask) {
+        const auto* forward = std::get_if<ForwardWork>(&work.operation);
+        if (forward && forward->sample != SampleKind::None) {
+            const auto vocabulary = session.definition->resources().text.public_token_count;
+            for (const auto index : forward->batch.members) {
+                if (!forward->rows[index].constrained) continue;
+                if (!work.initial_decision) work.initial_decision.emplace();
+                auto& row     = work.initial_decision->rows.emplace_back();
+                row.member    = index;
+                row.positions = 1;
+                row.words.resize((std::size_t(vocabulary) + 31) / 32);
+                row.dead_positions = mask(index, row.words);
+            }
+        }
+    }
     tx.context.prepare_actions();
     work.actions = session.actions(tx.context);
     tx.ticket    = session.executor->submit(std::move(reservation), std::move(work));
@@ -59,7 +75,8 @@ std::optional<runtime::ExecutionTicket> Session::start_prefill(SequenceHandle ha
 
 std::optional<runtime::ExecutionTicket>
 Session::start_prefill(std::span<const SequenceHandle> members,
-                       std::span<const runtime::PrefillGrant> grants) {
+                       std::span<const runtime::PrefillGrant> grants,
+                       const runtime::ForwardGrammarMask& mask) {
     auto& p = *impl_;
     if (p.compute_full() ||
         std::ranges::any_of(members, [&](auto h) { return execution_pending(h); }))
@@ -117,7 +134,7 @@ Session::start_prefill(std::span<const SequenceHandle> members,
             }
         }
         forward.rows = tx.rows;
-        submit(p, tx, std::move(*reservation), {{}, std::move(forward)});
+        submit(p, tx, std::move(*reservation), {{}, std::move(forward)}, mask);
         return tx.ticket;
     } catch (const std::exception& error) {
         p.executor->fail(error.what());
@@ -156,17 +173,15 @@ std::optional<runtime::ExecutionTicket> Session::start_replay(SequenceHandle han
     }
 }
 
-std::optional<runtime::ExecutionTicket>
-Session::start_decode(std::span<const SequenceHandle> members,
-                      std::span<const runtime::RoundBudget> budgets,
-                      std::span<const std::uint8_t> constrained) {
-    return start_decode_round(members, {.budgets = budgets}, constrained);
+std::optional<runtime::ExecutionTicket> Session::start_decode(
+    std::span<const SequenceHandle> members, std::span<const runtime::RoundBudget> budgets,
+    std::span<const std::uint8_t> constrained, const runtime::ForwardGrammarMask& mask) {
+    return start_decode_round(members, {.budgets = budgets}, constrained, mask);
 }
 
-std::optional<runtime::ExecutionTicket>
-Session::start_decode_round(std::span<const SequenceHandle> members,
-                            speculative::DecodeRoundRequest selection,
-                            std::span<const std::uint8_t> constrained) {
+std::optional<runtime::ExecutionTicket> Session::start_decode_round(
+    std::span<const SequenceHandle> members, speculative::DecodeRoundRequest selection,
+    std::span<const std::uint8_t> constrained, const runtime::ForwardGrammarMask& mask) {
     auto& p = *impl_;
     if (p.compute_full() ||
         std::ranges::any_of(members, [&](auto h) { return execution_pending(h); }))
@@ -265,7 +280,7 @@ Session::start_decode_round(std::span<const SequenceHandle> members,
                                          std::move(batch),      std::move(geometry)};
         }
         p.vacant_compute(reservation->frame()) = std::move(pending);
-        submit(p, tx, std::move(*reservation), std::move(work));
+        submit(p, tx, std::move(*reservation), std::move(work), mask);
         return tx.ticket;
     } catch (const std::exception& error) {
         if (prepared) p.executor->fail(error.what());

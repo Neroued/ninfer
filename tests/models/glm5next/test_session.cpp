@@ -360,13 +360,14 @@ glm::SessionPlan plan(const glm::ModelDefinition& definition, bool pressure = fa
     }
     const auto state = glm::describe_state(glm::plan_state(*profile));
     p.states.assign(rank_count, state);
-    p.caches.push_back(
-        ops::plan_kpool_mla_cache_layout(
-            {ops::KpoolMlaStorage::BFloat16, p.shape.index_format, glm::dimension(c.mla.latent_dim),
-             glm::dimension(c.mla.index_dim), glm::dimension(c.mla_layers)})
-            .page);
+    p.caches.push_back({ops::plan_kpool_mla_cache_layout(
+                            {ops::KpoolMlaStorage::BFloat16, p.shape.index_format,
+                             glm::dimension(c.mla.latent_dim), glm::dimension(c.mla.index_dim),
+                             glm::dimension(c.mla_layers)})
+                            .page});
     const auto rank_bytes = std::max<std::size_t>(
-        8ULL << 20, (state.owner.bytes + p.caches.front().page_bytes) * (concurrency + 2) * 4);
+        8ULL << 20,
+        (state.owner.bytes + p.caches.front().front().page_bytes) * (concurrency + 2) * 4);
     for (unsigned rank = 0; rank < rank_count; ++rank)
         p.context.ranks.push_back({rank, rank_bytes, 0});
     p.context.state.logical_capacity = 64;
@@ -379,7 +380,7 @@ glm::SessionPlan plan(const glm::ModelDefinition& definition, bool pressure = fa
         }
         p.context.state.layouts.push_back(std::move(layout));
     }
-    const auto& page = p.caches[0];
+    const auto& page = p.caches[0].front();
     p.context.pools.push_back({.pool_id       = 0,
                                .logical_pages = 512,
                                .histories     = 256,
@@ -390,13 +391,14 @@ glm::SessionPlan plan(const glm::ModelDefinition& definition, bool pressure = fa
         p.context.pools[0].parts.push_back({rank, {page.page_bytes, page.alignment}});
     if (definition.options().mtp()) {
         p.caches.push_back(
-            ops::plan_kpool_mla_cache_layout({ops::KpoolMlaStorage::BFloat16, p.shape.index_format,
-                                              glm::dimension(c.mla.latent_dim),
-                                              glm::dimension(c.mla.index_dim), 1})
-                .page);
+            {ops::plan_kpool_mla_cache_layout({ops::KpoolMlaStorage::BFloat16, p.shape.index_format,
+                                               glm::dimension(c.mla.latent_dim),
+                                               glm::dimension(c.mla.index_dim), 1})
+                 .page});
         auto pool    = p.context.pools[0];
         pool.pool_id = 1;
-        for (auto& part : pool.parts) part.record = {p.caches[1].page_bytes, p.caches[1].alignment};
+        for (auto& part : pool.parts)
+            part.record = {p.caches[1].front().page_bytes, p.caches[1].front().alignment};
         p.context.pools.push_back(std::move(pool));
     }
     if (pressure)
@@ -590,7 +592,7 @@ void schedule_experts(const artifact::Reader& reader, const DeploymentOptions& d
         }
         glm::RankResourceDescription report{r, layout.shape, layout.batches->spec(),
                                             layout.states.at(r), std::move(spec)};
-        for (const auto& cache : layout.caches) report.caches.push_back(cache.geometry);
+        for (const auto& cache : layout.caches) report.caches.push_back(cache.front().geometry);
         report.observation.rank = identity.rank;
         distributed::wire::Encoder out;
         glm::encode(out, report);
@@ -1869,8 +1871,9 @@ public:
     using glm::Session::start_prefill;
 
     std::optional<rt::ExecutionTicket> start_prefill(std::span<const glm::SequenceHandle> members,
-                                                     std::span<const rt::PrefillGrant> grants) {
-        auto ticket = glm::Session::start_prefill(members, grants);
+                                                     std::span<const rt::PrefillGrant> grants,
+                                                     const rt::ForwardGrammarMask& mask = {}) {
+        auto ticket = glm::Session::start_prefill(members, grants, mask);
         if (ticket) prefill_members.assign(members.begin(), members.end());
         return ticket;
     }

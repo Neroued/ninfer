@@ -46,6 +46,27 @@ std::int32_t SequenceParallelPolicy::local_capacity(std::int32_t maximum) const 
     return std::max(minimum_columns - 1, partition(maximum, 0).segment);
 }
 
+std::size_t StageBoundaryField::transfer_elements(std::size_t elements, TpLayout layout,
+                                                  std::uint32_t tensor_ranks) {
+    if (!tensor_ranks) throw std::invalid_argument("empty pipeline tensor group");
+    return layout == TpLayout::Replicated && elements % tensor_ranks == 0 ? elements / tensor_ranks
+                                                                          : elements;
+}
+
+StageBoundaryField StageBoundaryField::bind(const Tensor& local, TpLayout layout,
+                                            std::uint32_t rank, std::uint32_t ranks) {
+    if (rank >= ranks || !local.is_contiguous())
+        throw std::invalid_argument("invalid pipeline boundary field");
+    const auto elements = static_cast<std::size_t>(local.numel());
+    const auto count    = transfer_elements(elements, layout, ranks);
+    if (count == elements) return {local, {}};
+    if (elements > INT32_MAX) throw std::overflow_error("pipeline boundary exceeds tensor extent");
+    auto flat = local.view({static_cast<std::int32_t>(elements)});
+    return {
+        flat.slice(0, static_cast<std::int32_t>(rank * count), static_cast<std::int32_t>(count)),
+        flat};
+}
+
 ParallelExecution::ParallelExecution(ParallelBinding binding)
     : binding_(binding), graph_groups_{binding.group} {
     if (!binding.group) throw std::invalid_argument("parallel execution has no group");

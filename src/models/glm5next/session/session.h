@@ -432,13 +432,15 @@ public:
 
     [[nodiscard]] std::optional<runtime::ExecutionTicket>
     start_prefill(std::span<const SequenceHandle> members,
-                  std::span<const runtime::PrefillGrant> grants);
+                  std::span<const runtime::PrefillGrant> grants,
+                  const runtime::ForwardGrammarMask& mask = {});
     [[nodiscard]] std::optional<runtime::ExecutionTicket> start_prefill(SequenceHandle,
                                                                         bool constrained = false);
     [[nodiscard]] std::optional<runtime::ExecutionTicket> start_replay(SequenceHandle);
     [[nodiscard]] std::optional<runtime::ExecutionTicket>
     start_decode(std::span<const SequenceHandle>, std::span<const runtime::RoundBudget>,
-                 std::span<const std::uint8_t> constrained = {});
+                 std::span<const std::uint8_t> constrained = {},
+                 const runtime::ForwardGrammarMask& mask   = {});
     [[nodiscard]] std::optional<runtime::ExecutionTicket>
     start_decode_probe(std::span<const SequenceHandle>, const speculative::RoundRoute&,
                        std::span<const std::uint32_t> verify_drafts,
@@ -472,7 +474,8 @@ public:
 private:
     [[nodiscard]] std::optional<runtime::ExecutionTicket>
     start_decode_round(std::span<const SequenceHandle>, speculative::DecodeRoundRequest,
-                       std::span<const std::uint8_t> constrained);
+                       std::span<const std::uint8_t> constrained,
+                       const runtime::ForwardGrammarMask& mask = {});
     std::unique_ptr<detail::SessionImpl> impl_;
 };
 

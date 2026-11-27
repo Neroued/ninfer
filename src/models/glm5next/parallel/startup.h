@@ -36,7 +36,7 @@ public:
 
     [[nodiscard]] runtime::ExecutionCapacity capacity(std::uint32_t replica_id = 0) const {
         (void)parallel_.topology.replica(replica_id);
-        return RankProgram::capacity();
+        return frames_;
     }
 
     [[nodiscard]] std::string prefill_signature(std::uint32_t chunk,
@@ -47,6 +47,7 @@ public:
 private:
     std::shared_ptr<const ModelDefinition> definition_;
     ParallelPlan parallel_;
+    runtime::ExecutionCapacity frames_;
 
     struct Membership {
         std::shared_ptr<runtime::CollectiveStepDomain> domain;

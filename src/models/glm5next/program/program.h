@@ -12,6 +12,8 @@ class RankProgramImpl;
 
 struct RankGroups {
     ParallelBinding tensor, heads, owners;
+    const distributed::Group* pipeline_input  = nullptr;
+    const distributed::Group* pipeline_output = nullptr;
 };
 
 class RankProgram {
@@ -22,7 +24,14 @@ public:
     RankProgram(const RankProgram&)            = delete;
     RankProgram& operator=(const RankProgram&) = delete;
 
-    [[nodiscard]] static constexpr runtime::ExecutionCapacity capacity() noexcept { return {1, 1}; }
+    [[nodiscard]] static runtime::ExecutionCapacity
+    frame_capacity(std::uint32_t stages, std::uint32_t lanes, EnginePurpose purpose) noexcept {
+        return {stages == 1 || purpose != EnginePurpose::Generation ? 1U
+                                                                    : std::min(stages + 1, lanes),
+                1};
+    }
+
+    [[nodiscard]] runtime::ExecutionCapacity capacity() const noexcept;
 
     void validate_work(const Work&, runtime::FrameKind) const;
     void start(runtime::ExecutionRequest<ExecutionTypes>&&);

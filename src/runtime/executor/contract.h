@@ -4,6 +4,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
+#include <optional>
+#include <span>
 #include <string>
 #include <variant>
 #include <vector>
@@ -81,6 +84,17 @@ struct DecisionRequest {
     std::uint32_t vocabulary = 0;
     std::vector<Row> rows;
 };
+
+// W=1 masks can be frozen while the host still owns the submitted membership.
+using ForwardGrammarMask =
+    std::function<std::uint32_t(std::uint32_t member, std::span<std::uint32_t> words)>;
+
+template <class Types>
+std::optional<std::uint32_t> submitted_decision_stage(const typename Types::Work& work) {
+    if constexpr (requires { Types::submitted_decision_stage(work); })
+        return Types::submitted_decision_stage(work);
+    return {};
+}
 
 struct DecisionInput {
     struct Row {

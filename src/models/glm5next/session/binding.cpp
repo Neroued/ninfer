@@ -190,7 +190,7 @@ detail::SessionImpl::plan_binding(const RequestBasePlan& base, runtime::LaneId l
     for (std::uint32_t pool = 0; pool < pool_count(); ++pool) {
         const auto* prefix = checkpoint ? &checkpoint->snapshot.prefix(pool) : nullptr;
         const auto end     = pool == 0 ? peak : mtp_history_frontier(peak);
-        const auto placement         = this->plan.attention.members(candidate.placement.value);
+        const auto& placement        = this->plan.history_ranks[pool][candidate.placement.value];
         const auto& histories        = directory.pool(pool).histories();
         action.history_targets[pool] = plan.demand.add_history(
             pool, convert ? histories.conversion_demand(*prefix, prefix->frontier(), end, placement)
@@ -361,7 +361,7 @@ void SessionImpl::prepare_binding_resources(context::ContextReservation& reserve
     const auto* checkpoint = bind.source ? &checkpoints.at(*bind.source) : nullptr;
     for (std::uint32_t pool = 0; pool < pool_count(); ++pool) {
         const auto* prefix = checkpoint ? &checkpoint->snapshot.prefix(pool) : nullptr;
-        const auto placement = plan.attention.members(bind.placement.value);
+        const auto& placement = plan.history_ranks[pool][bind.placement.value];
         auto& histories = directory.pool(pool).histories();
         const auto peak = pool ? mtp_history_frontier(bind.peak) : bind.peak;
         if (bind.state_action == StateBindingAction::Convert) {
@@ -430,9 +430,9 @@ conversion_requirements(const SessionPlan& plan, std::uint32_t from, std::uint32
     for (std::uint16_t pool = 0; pool < plan.caches.size(); ++pool) {
         const auto f          = frontiers[pool];
         const auto& page      = plan.caches[pool];
-        const auto full_pages = f / page.geometry.page_tokens;
-        const auto ranges =
-            history_conversion(page, plan.attention, from, to, f % page.geometry.page_tokens);
+        const auto full_pages = f / page.front().geometry.page_tokens;
+        const auto ranges     = history_conversion(page, plan.attention, from, to,
+                                                   f % page.front().geometry.page_tokens);
         for (const auto& full : ranges.full_page) {
             auto bytes  = full_pages * full.bytes;
             auto copies = full_pages;

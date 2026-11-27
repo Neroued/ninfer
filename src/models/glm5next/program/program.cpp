@@ -21,6 +21,20 @@ RankProgramImpl::RankProgramImpl(const execution::Parameters& p, std::unique_ptr
     expert_exchange = std::move(exchange);
     if (bool(expert_exchange) != bool(parameters.profile->exchange))
         throw std::logic_error("GLM expert exchange placement differs from Program");
+#if NINFER_ENABLE_DISTRIBUTED
+    if (binding.pipeline_input)
+        pipeline_input.emplace(*binding.pipeline_input, device,
+                               resources.plan.pipeline_input.bind(resources.fixed()));
+    if (binding.pipeline_output)
+        pipeline_output.emplace(*binding.pipeline_output, device,
+                                resources.plan.pipeline_output.bind(resources.fixed()));
+    if (bool(pipeline_input) == p.profile->input_stage() ||
+        bool(pipeline_output) == p.profile->output_stage())
+        throw std::logic_error("GLM5Next pipeline buffers differ from stage ownership");
+#endif
+    retained.resize(
+        RankProgram::frame_capacity(p.profile->stage.size, shape.max_concurrency, shape.purpose)
+            .compute_frames);
     bindings.resize(shape.max_concurrency);
     if (p.profile != resources.plan.profile)
         throw std::invalid_argument("GLM5Next resources have another profile");
@@ -58,7 +72,7 @@ WorkContract RankProgramImpl::contract() const {
             resources.plan.batches,
             parameters.profile->config.text.vocabulary,
             parameters.profile->public_tokens,
-            parameters.profile->local.size,
+            parameters.profile->replica_size(),
             resources.vision ? resources.vision->capacity().max_features : 0,
             parameters.profile->control_token_limit,
             resources.plan.decode_routes};
@@ -76,19 +90,32 @@ void RankProgramImpl::validate_work(const Work& work, runtime::FrameKind kind) c
                 "GLM expert traversal does not match its prepared communication order");
         if (std::holds_alternative<moe::ExpertServiceWork>(work.operation)) return;
     }
-    const auto rank   = parameters.profile->local.rank;
+    const auto rank   = parameters.profile->replica_rank();
     const auto active = [&](const runtime::ExecutionMember& m) {
         const auto& binding = bindings.at(m.residency.lane.value);
         if (!binding || !same(*binding, m)) throw std::logic_error("GLM5Next stale residency");
     };
+    const auto busy = [&](runtime::ResidencyId id) {
+        const auto contains = [&](const auto& request) {
+            return std::ranges::any_of(work_rows(request.work),
+                                       [&](const auto& row) { return row.member.residency == id; });
+        };
+        return (compute && contains(compute->request)) ||
+               std::ranges::any_of(
+                   retained, [&](const auto& slot) { return slot && contains(slot->request); }) ||
+               std::ranges::any_of(waiting, contains);
+    };
     for (const auto& row : work_rows(work)) {
         active(row.member);
+        if (busy(row.member.residency))
+            throw std::logic_error("GLM5Next residency has live compute");
         const auto offsets = row.states.at(rank);
         const auto& image =
             resources.states.image(parameters.profile->local.owner() == row.attention_owner);
         (void)image.image(offsets.source);
         (void)image.image(offsets.destination);
-        if (row.main_table.index >= std::uint32_t(resources.main.tables().matrix().ne[1]))
+        if (resources.main.has_pages() &&
+            row.main_table.index >= std::uint32_t(resources.main.tables().matrix().ne[1]))
             throw std::invalid_argument("GLM5Next table row exceeds rank storage");
         if (resources.mtp &&
             row.mtp_table.index >= std::uint32_t(resources.mtp->tables().matrix().ne[1]))
@@ -99,10 +126,7 @@ void RankProgramImpl::validate_work(const Work& work, runtime::FrameKind kind) c
         for (auto r : c->releases) {
             if (!bindings[r.lane.value] || bindings[r.lane.value]->residency != r)
                 throw std::logic_error("GLM5Next stale residency release");
-            if (compute)
-                for (const auto& row : work_rows(compute->request.work))
-                    if (row.member.residency == r)
-                        throw std::logic_error("GLM5Next residency has live compute");
+            if (busy(r)) throw std::logic_error("GLM5Next residency has live compute");
             released[r.lane.value] = true;
         }
         for (const auto& b : c->bindings) {
@@ -122,7 +146,7 @@ void RankProgramImpl::validate_work(const Work& work, runtime::FrameKind kind) c
 
 void RankProgramImpl::start(runtime::ExecutionRequest<ExecutionTypes>&& request) {
     if (drained) throw std::logic_error("GLM5Next Program is drained");
-    const auto rank = parameters.profile->local.rank;
+    const auto rank = parameters.profile->replica_rank();
     if (request.ticket.frame.kind == runtime::FrameKind::Context) {
         if (context) throw std::logic_error("GLM5Next context frame is occupied");
         context          = std::make_unique<ContextFrame>();
@@ -130,23 +154,71 @@ void RankProgramImpl::start(runtime::ExecutionRequest<ExecutionTypes>&& request)
         resources.context_actions->submit(local_actions(context->request.work.actions, rank));
         advance_context();
     } else {
-        if (compute) throw std::logic_error("GLM5Next compute frame is occupied");
-        compute             = std::make_unique<ComputeFrame>();
-        compute->request    = std::move(request);
-        compute->retirement = compute->request.command;
-        compute->result.rows.resize(work_rows(compute->request.work).size());
-        resources.compute_actions->submit(local_actions(compute->request.work.actions, rank));
-        timer.begin();
-        if (const auto& step = compute->request.work.exchange) {
-            last_expert_step   = step->id;
-            compute->main_pass = step->draft_passes;
-            if (std::holds_alternative<moe::ExpertServiceWork>(compute->request.work.operation)) {
-                serve_experts();
-                return;
-            }
+        const auto idx = request.ticket.frame.index;
+        if (idx >= retained.size() || retained[idx] ||
+            (compute && compute->request.ticket.frame.index == idx) ||
+            std::ranges::any_of(waiting,
+                                [&](const auto& w) { return w.ticket.frame.index == idx; }))
+            throw std::logic_error("GLM5Next compute frame is occupied");
+        waiting.push_back(std::move(request));
+        admit_compute();
+    }
+}
+
+void RankProgramImpl::submit_compute(runtime::ExecutionRequest<ExecutionTypes>&& request) {
+    const auto rank     = parameters.profile->replica_rank();
+    compute             = std::make_unique<ComputeFrame>();
+    compute->request    = std::move(request);
+    compute->retirement = compute->request.command;
+    compute->decision   = std::move(compute->request.work.initial_decision);
+    compute->result.rows.resize(work_rows(compute->request.work).size());
+    resources.compute_actions->submit(local_actions(compute->request.work.actions, rank));
+    timer.begin();
+    if (const auto& step = compute->request.work.exchange) {
+        last_expert_step   = step->id;
+        compute->main_pass = step->draft_passes;
+        if (std::holds_alternative<moe::ExpertServiceWork>(compute->request.work.operation)) {
+            serve_experts();
+            return;
         }
-        request_decision();
-        advance_compute();
+    }
+    request_decision();
+    advance_compute();
+}
+
+const ComputeFrame* RankProgramImpl::find_frame(runtime::ExecutionTicket ticket) const {
+    if (compute && compute->request.ticket == ticket) return compute.get();
+    if (ticket.frame.index < retained.size()) {
+        const auto& saved = retained[ticket.frame.index];
+        if (saved && saved->request.ticket == ticket) return saved.get();
+    }
+    return nullptr;
+}
+
+void RankProgramImpl::admit_compute() {
+    if (compute && retained.size() > 1 && compute->phase == ComputePhase::PendingCommit) {
+        const auto slot = compute->request.ticket.frame.index;
+        retained[slot]  = std::move(compute);
+    }
+    if (compute) return;
+    for (auto& saved : retained) {
+        if (!saved || (!saved->deferred_commit && !saved->deferred_discard)) continue;
+        compute           = std::move(saved);
+        const auto ticket = compute->request.ticket;
+        timer.begin_resolution();
+        if (compute->deferred_discard)
+            apply_discard(ticket, compute->retirement);
+        else {
+            auto command = std::move(*compute->deferred_commit);
+            compute->deferred_commit.reset();
+            apply_commit(ticket, compute->retirement, std::move(command));
+        }
+        return;
+    }
+    if (!waiting.empty()) {
+        auto next = std::move(waiting.front());
+        waiting.pop_front();
+        submit_compute(std::move(next));
     }
 }
 
@@ -166,23 +238,47 @@ void RankProgramImpl::supply(runtime::ExecutionTicket ticket, runtime::CommandSe
 }
 
 void RankProgramImpl::prepare_commit(runtime::ExecutionTicket ticket, const Commit& commit) const {
-    if (!compute || compute->request.ticket != ticket ||
-        compute->phase != ComputePhase::PendingCommit)
+    const auto* slot = find_frame(ticket);
+    if (!slot || slot->deferred_discard || slot->deferred_commit ||
+        slot->phase != ComputePhase::PendingCommit)
         throw std::logic_error("GLM5Next commit has no pending result");
-    contract().validate_commit(compute->request.work, compute->result.rows, commit);
+    if (parameters.profile->output_stage()) {
+        contract().validate_commit(slot->request.work, slot->result.rows, commit);
+    } else {
+        const auto rows = work_rows(slot->request.work);
+        if (rows.size() != commit.rows.size())
+            throw std::logic_error("pipeline commit changed source membership");
+        for (std::size_t i = 0; i < rows.size(); ++i) {
+            const auto& source  = rows[i].member;
+            const auto& adopted = commit.rows[i].member;
+            if (source.sequence != adopted.sequence || source.residency != adopted.residency)
+                throw std::logic_error("pipeline commit refers to a different sequence");
+        }
+    }
     resources.compute_actions->validate(
-        local_actions(commit.actions, parameters.profile->local.rank));
+        local_actions(commit.actions, parameters.profile->replica_rank()));
 }
 
 bool RankProgramImpl::can_discard(runtime::ExecutionTicket ticket) const {
-    if (!compute || compute->request.ticket != ticket) return false;
-    return compute->phase == ComputePhase::PendingCommit ||
-           compute->phase == ComputePhase::AwaitResult ||
-           (compute->phase == ComputePhase::Decision && !compute->decision);
+    const auto* slot = find_frame(ticket);
+    if (!slot || slot->deferred_commit || slot->deferred_discard) return false;
+    return slot->phase == ComputePhase::PendingCommit || slot->phase == ComputePhase::AwaitResult ||
+           (slot->phase == ComputePhase::Decision && !slot->decision);
 }
 
 void RankProgramImpl::discard(runtime::ExecutionTicket ticket, runtime::CommandSequence command) {
     if (!can_discard(ticket)) throw std::logic_error("GLM5Next discard has no active execution");
+    if (!compute || compute->request.ticket != ticket) {
+        auto& saved            = *retained.at(ticket.frame.index);
+        saved.retirement       = command;
+        saved.deferred_discard = true;
+        return;
+    }
+    apply_discard(ticket, command);
+}
+
+void RankProgramImpl::apply_discard(runtime::ExecutionTicket ticket,
+                                    runtime::CommandSequence command) {
     std::erase_if(events, [&](const auto& e) {
         return std::visit([&](const auto& v) { return v.ticket == ticket; }, e);
     });
@@ -199,8 +295,14 @@ void RankProgramImpl::drain() {
     std::exception_ptr error;
     try {
         resources.synchronize();
+#if NINFER_ENABLE_DISTRIBUTED
+        if (pipeline_input) pipeline_input->drain();
+        if (pipeline_output) pipeline_output->drain();
+#endif
     } catch (...) { error = std::current_exception(); }
     compute.reset();
+    waiting.clear();
+    for (auto& saved : retained) saved.reset();
     context.reset();
     events.clear();
     if (resources.vision)
@@ -212,6 +314,7 @@ void RankProgramImpl::drain() {
 
 std::optional<runtime::ExecutionEvent<ExecutionTypes>> RankProgramImpl::poll() {
     advance_context();
+    admit_compute();
     advance_compute();
     if (events.empty()) return {};
     auto out = std::move(events.front());
@@ -313,6 +416,10 @@ RankProgram::~RankProgram() = default;
 
 void RankProgram::validate_work(const Work& w, runtime::FrameKind k) const {
     impl_->validate_work(w, k);
+}
+
+runtime::ExecutionCapacity RankProgram::capacity() const noexcept {
+    return {static_cast<std::uint32_t>(impl_->retained.size()), 1};
 }
 
 void RankProgram::start(runtime::ExecutionRequest<ExecutionTypes>&& r) {

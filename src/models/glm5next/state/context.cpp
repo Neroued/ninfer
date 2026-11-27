@@ -9,9 +9,10 @@ StateLayout plan_state(const execution::ModelProfile& p, LinearStateDType linear
     const auto& c    = p.config.text;
     const auto heads = dimension(p.local.kda_heads.size), d = dimension(c.kda.head_dim);
     StateLayout out;
-    out.kda    = plan_linear_attention_state(b, {c.kda_layers, dimension(3ULL * heads * d),
-                                                 dimension(c.kda.conv_width - 1ULL), heads, d, d,
-                                                 DType::BF16, to_dtype(linear_state_dtype)});
+    if (c.kda_layers)
+        out.kda = plan_linear_attention_state(b, {c.kda_layers, dimension(3ULL * heads * d),
+                                                  dimension(c.kda.conv_width - 1ULL), heads, d, d,
+                                                  DType::BF16, to_dtype(linear_state_dtype)});
     out.hidden = b.add(DType::BF16, {dimension(c.hidden)}, 1, "Main final hidden");
     if (p.draft) {
         const auto& d = p.draft->context;
@@ -19,11 +20,15 @@ StateLayout plan_state(const execution::ModelProfile& p, LinearStateDType linear
                                              d.kv_heads, d.head_dim);
     }
     out.common = b.finish();
-    out.main =
-        ops::append_kpool_tail_fields(b, dimension(c.mla.index_dim), dimension(c.mla_layers));
+    if (c.mla_layers)
+        out.main =
+            ops::append_kpool_tail_fields(b, dimension(c.mla.index_dim), dimension(c.mla_layers));
     if (p.mtp) out.mtp = ops::append_kpool_tail_fields(b, dimension(c.mla.index_dim), 1);
-    out.owner_fields =
-        b.group(out.main.raw_keys, out.mtp ? out.mtp->raw_gates : out.main.raw_gates);
+    if (out.main || out.mtp) {
+        const auto& first = out.main ? *out.main : *out.mtp;
+        const auto& last  = out.mtp ? *out.mtp : *out.main;
+        out.owner_fields  = b.group(first.raw_keys, last.raw_gates);
+    }
     out.owner = b.finish();
     return out;
 }
@@ -49,6 +54,12 @@ ops::KpoolMlaStorage latent_storage(KvCacheStorage storage) {
 CacheLayout plan_cache(LayoutBuilder& b, const MlaConfig& c, std::uint32_t layers,
                        std::uint32_t max_context, std::uint32_t rows, ops::KpoolMlaStorage storage,
                        KvCacheVectorFormat index_format) {
+    if (!layers) {
+        CacheLayout out{};
+        // Logical histories still span the whole model. This stage owns no page part or table.
+        out.tables.spec = {(max_context - 1) / kPagedKVPageSize + 1, dimension(rows)};
+        return out;
+    }
     auto layout = ops::plan_kpool_mla_cache_layout({storage, index_format, dimension(c.latent_dim),
                                                     dimension(c.index_dim), dimension(layers)});
     const auto tokens = layout.page.geometry.page_tokens;
@@ -57,8 +68,8 @@ CacheLayout plan_cache(LayoutBuilder& b, const MlaConfig& c, std::uint32_t layer
 }
 
 StateViews::StateViews(MemorySpan backing, const StateLayout& layout)
-    : layout_(layout), common_(backing, layout.common), owner_(backing, layout.owner),
-      kda_(common_, layout.kda) {
+    : layout_(layout), common_(backing, layout.common), owner_(backing, layout.owner) {
+    if (layout.kda) kda_.emplace(common_, *layout.kda);
     if (layout.draft) draft_.emplace(common_, *layout.draft);
 }
 
@@ -71,8 +82,8 @@ StateFieldView StateViews::hidden(const Tensor& offsets) const {
 }
 
 ops::KpoolTailStateView StateViews::main_tail(const Tensor& offsets) const {
-    return {owner_.field(layout_.main.raw_keys, offsets),
-            owner_.field(layout_.main.raw_gates, offsets)};
+    const auto& fields = layout_.main.value();
+    return {owner_.field(fields.raw_keys, offsets), owner_.field(fields.raw_gates, offsets)};
 }
 
 ops::KpoolTailStateView StateViews::mtp_tail(const Tensor& offsets) const {
@@ -85,12 +96,14 @@ const StateImageStorage& StateViews::image(bool owner) const noexcept {
 }
 
 CacheViews::CacheViews(MemorySpan context, MemorySpan fixed, const CacheLayout& layout)
-    : layout_(layout), context_(context),
-      tables_(fixed, layout.tables, context, layout.cache.page.page_bytes) {}
+    : layout_(layout), context_(context) {
+    if (layout.cache.page.page_bytes)
+        tables_.emplace(fixed, layout.tables, context, layout.cache.page.page_bytes);
+}
 
 ops::KpoolMlaCacheView CacheViews::layer(std::uint32_t layer) const {
     return layout_.cache.layer(
-        PagedRecordView{context_, tables_.matrix(), layout_.cache.page.geometry.page_tokens},
+        PagedRecordView{context_, tables().matrix(), layout_.cache.page.geometry.page_tokens},
         static_cast<std::int32_t>(layer));
 }
 
@@ -106,12 +119,12 @@ std::vector<context::RecordRangeCopy> state_conversion(std::span<const StatePlac
         const auto& s = states[src].owner_fields;
         const auto& d = states[dst].owner_fields;
         if (s.bytes != d.bytes) throw std::invalid_argument("GLM5Next owner tail layouts differ");
-        out.push_back({src, dst, s.offset, d.offset, s.bytes});
+        if (s.bytes) out.push_back({src, dst, s.offset, d.offset, s.bytes});
     }
     return out;
 }
 
-context::HistoryCopyLayout history_conversion(const KVPageLayout& cache,
+context::HistoryCopyLayout history_conversion(std::span<const KVPageLayout> stages,
                                               const AttentionOwners& owners, std::uint32_t from,
                                               std::uint32_t to, std::uint32_t tail) {
     context::HistoryCopyLayout out;
@@ -119,6 +132,8 @@ context::HistoryCopyLayout history_conversion(const KVPageLayout& cache,
     const auto sources = owners.members(from), destinations = owners.members(to);
     for (std::size_t i = 0; i < sources.size(); ++i) {
         const auto src = sources[i], dst = destinations[i];
+        const auto& cache = stages[owners.stage(src)];
+        if (!cache.page_bytes) continue;
         out.full_page.push_back({src, dst, 0, 0, cache.page_bytes});
         for (const auto& plane : cache.planes) {
             const auto bytes = (tail / plane.geometry.tokens_per_row) * plane.row_stride_bytes();

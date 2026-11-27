@@ -217,7 +217,19 @@ PreparedSession prepare_session(std::shared_ptr<const ModelDefinition> definitio
         plan.batches->attention_owners() != plan.context.state.layouts.size() ||
         plan.states.size() != plan.context.ranks.size())
         throw std::invalid_argument("GLM Session batch plan differs from prepared state");
-    plan.attention     = AttentionOwners(plan.states.size(), plan.batches->attention_owners());
+    const auto stages =
+        plan.caches.empty() ? 0 : static_cast<std::uint32_t>(plan.caches.front().size());
+    if (!stages || plan.states.size() % stages ||
+        std::ranges::any_of(plan.caches, [&](const auto& p) { return p.size() != stages; }))
+        throw std::invalid_argument("GLM5Next Session has incomplete stage cache layouts");
+    plan.attention =
+        AttentionOwners(plan.states.size() / stages, plan.batches->attention_owners(), stages);
+    for (const auto& pool : plan.caches) {
+        auto& owners = plan.history_ranks.emplace_back(plan.attention.size());
+        for (std::uint32_t owner = 0; owner < owners.size(); ++owner)
+            for (const auto rank : plan.attention.members(owner))
+                if (pool[plan.attention.stage(rank)].page_bytes) owners[owner].push_back(rank);
+    }
     plan.decode_routes = make_decode_routes(plan.shape, *plan.batches);
     return PreparedSession(std::make_unique<detail::SessionImpl>(
         std::move(definition), std::move(plan), std::move(directory)));

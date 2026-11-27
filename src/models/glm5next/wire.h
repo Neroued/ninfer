@@ -13,7 +13,8 @@ private:
     std::optional<vision::Work> current_;
 };
 
-void encode_work(distributed::wire::Encoder&, const Work&, std::uint32_t rank);
+void encode_work(distributed::wire::Encoder&, const Work&, std::uint32_t rank,
+                 bool decision_owner = true, bool vision_owner = true);
 Work decode_work(distributed::wire::Decoder&, const VisionInputBindings& = {});
 void encode_commit(distributed::wire::Encoder&, const Commit&, std::uint32_t rank);
 Commit decode_commit(distributed::wire::Decoder&);

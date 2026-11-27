@@ -60,9 +60,10 @@ namespace {
 class Describe {
 public:
     Describe(const ModelDefinition& definition, std::span<const BoundWeight> weights,
-             std::span<const moe::ExpertDescription> experts, const MlaConfig& mla, bool selects)
+             std::span<const moe::ExpertDescription> experts, const MlaConfig& mla, bool selects,
+             const RankPlan& rank)
         : definition_(definition), weights_(weights), experts_(experts), mla_(mla),
-          selects_(selects) {}
+          selects_(selects), rank_(rank) {}
 
     ops::LinearProfile linear(std::initializer_list<WeightId> ids) const {
         std::vector<ops::WeightInput> inputs;
@@ -121,7 +122,7 @@ public:
 
     MoeProfile moe(const MoeWeights& w) const {
         const auto& c    = definition_.config().text;
-        const auto& bank = experts_[w.bank.index];
+        const auto& bank = experts_[rank_.local_bank(w.bank).index];
         ops::ExpertInputUsage gate_up, down;
         gate_up.include(weight_input(weights_, w.gate));
         gate_up.include(weight_input(weights_, w.up));
@@ -170,6 +171,7 @@ private:
     std::span<const moe::ExpertDescription> experts_;
     const MlaConfig& mla_;
     bool selects_;
+    const RankPlan& rank_;
 };
 } // namespace
 
@@ -177,10 +179,20 @@ std::shared_ptr<ModelProfile> describe_model(const ModelDefinition& definition,
                                              std::span<const BoundWeight> weights,
                                              std::span<const moe::ExpertDescription> experts,
                                              const RankPlan& rank) {
-    if (experts.size() != definition.expert_banks().size())
+    if (experts.size() != rank.banks.size)
         throw std::invalid_argument("GLM5Next local expert descriptions are incomplete");
     auto out                 = std::make_shared<ModelProfile>();
     out->config              = definition.config();
+    out->stage               = rank.placement.pp;
+    out->layers              = rank.layers;
+    auto& text               = out->config.text;
+    const auto local =
+        std::span(definition.config().text.layers).subspan(rank.layers.begin, rank.layers.size);
+    text.layers.assign(local.begin(), local.end());
+    text.kda_layers = text.mla_layers = 0;
+    for (auto& layer : text.layers)
+        layer.state_index = layer.mixer == MixerKind::Kda ? text.kda_layers++ : text.mla_layers++;
+
     out->config.text.mla.heads = rank.mla_heads.size;
     out->options             = definition.options();
     out->local                 = {rank.placement.tp.rank,
@@ -195,13 +207,14 @@ std::shared_ptr<ModelProfile> describe_model(const ModelDefinition& definition,
     const auto& c            = out->config.text;
     const auto& w            = definition.weights();
     const Describe d(definition, weights, experts, c.mla,
-                     rank.placement.attention_slice().rank == 0);
+                     rank.placement.attention_slice().rank == 0, rank);
     out->text.mhc            = {dimension(c.hidden), dimension(c.mhc.streams)};
     out->text.mhc_parameters = {c.norm_epsilon, c.norm_epsilon,
                                 c.mhc.epsilon,  c.mhc.epsilon,
                                 2.0F,           dimension(c.mhc.sinkhorn_iterations)};
-    out->text.head           = d.linear({w.text.head});
-    for (const auto& layer : w.text.layers) out->text.layers.push_back(d.block(layer));
+    if (out->stage.rank + 1 == out->stage.size) out->text.head = d.linear({w.text.head});
+    for (const auto& layer : std::span(w.text.layers).subspan(rank.layers.begin, rank.layers.size))
+        out->text.layers.push_back(d.block(layer));
     if (w.mtp) {
         const auto& m = *w.mtp;
         out->mtp      = {d.linear({m.fc}), d.linear({m.head}), d.mla(m.attention), d.moe(m.moe)};
@@ -250,7 +263,7 @@ std::shared_ptr<ModelProfile> describe_model(const ModelDefinition& definition,
                 {d.linear({layer.attention.key, layer.attention.value, layer.attention.query}),
                  d.linear({layer.mlp.gate, layer.mlp.up}), d.linear({layer.mlp.down})});
     }
-    if (w.vision) out->vision = d.vision(*w.vision);
+    if (w.vision && !out->stage.rank) out->vision = d.vision(*w.vision);
     return out;
 }
 

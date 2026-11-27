@@ -18,26 +18,36 @@ class AttentionOwners {
 public:
     AttentionOwners() = default;
 
-    AttentionOwners(std::uint32_t ranks, std::uint32_t owners) {
-        if (!owners || !ranks || ranks % owners)
-            throw std::invalid_argument("GLM5Next attention owners must partition replica ranks");
-        width_ = ranks / owners;
-        ranks_.resize(ranks);
-        std::iota(ranks_.begin(), ranks_.end(), 0U);
+    AttentionOwners(std::uint32_t tensor_ranks, std::uint32_t owners, std::uint32_t stages = 1)
+        : tensor_(tensor_ranks), owners_(owners), stages_(stages) {
+        if (!owners || !tensor_ || !stages || tensor_ % owners ||
+            std::uint64_t(tensor_) * stages > UINT32_MAX)
+            throw std::invalid_argument(
+                "GLM5Next attention owners must partition each pipeline stage");
+        width_ = tensor_ / owners;
+        ranks_.clear();
+        for (std::uint32_t owner = 0; owner < owners; ++owner)
+            for (std::uint32_t stage = 0; stage < stages; ++stage)
+                for (std::uint32_t lane = 0; lane < width_; ++lane)
+                    ranks_.push_back(stage * tensor_ + owner * width_ + lane);
     }
 
-    [[nodiscard]] std::uint32_t size() const { return ranks_.size() / width_; }
-
+    [[nodiscard]] std::uint32_t size() const { return owners_; }
     [[nodiscard]] std::uint32_t width() const { return width_; }
 
-    [[nodiscard]] std::uint32_t owner(std::uint32_t rank) const {
+    [[nodiscard]] std::uint32_t stage(std::uint32_t rank) const {
         if (rank >= ranks_.size()) throw std::out_of_range("GLM5Next attention rank");
-        return rank / width_;
+        return rank / tensor_;
     }
 
+    [[nodiscard]] std::uint32_t owner(std::uint32_t rank) const {
+        (void)stage(rank);
+        return (rank % tensor_) / width_;
+    }
     [[nodiscard]] std::span<const std::uint32_t> members(std::uint32_t owner) const {
-        if (owner >= size()) throw std::out_of_range("GLM5Next attention owner");
-        return std::span(ranks_).subspan(owner * width_, width_);
+        if (owner >= owners_) throw std::out_of_range("GLM5Next attention owner");
+        const auto count = stages_ * width_;
+        return std::span(ranks_).subspan(owner * count, count);
     }
 
     // Intersect the real (unpadded) sequence-producer columns with each attention
@@ -64,7 +74,7 @@ public:
     }
 private:
     std::vector<std::uint32_t> ranks_{0};
-    std::uint32_t width_ = 1;
+    std::uint32_t tensor_ = 1, owners_ = 1, stages_ = 1, width_ = 1;
 };
 
 } // namespace ninfer::models::glm5next

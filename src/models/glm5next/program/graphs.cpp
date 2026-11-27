@@ -127,9 +127,10 @@ ResidentTargetCapture bind_target(RankProgramImpl& p, ops::ContextBucketRange bu
         head();
         p.timer.end_target(true);
     };
-    capture.head = [&p, hidden, main] {
-        p.project_head(hidden.view({hidden.ne[0], main.tokens * main.rows}));
-    };
+    if (p.parameters.profile->output_stage())
+        capture.head = [&p, hidden, main] {
+            p.project_head(hidden.view({hidden.ne[0], main.tokens * main.rows}));
+        };
     return capture;
 }
 
@@ -178,14 +179,15 @@ GraphPreparationSample RankProgramImpl::prepare_graphs(GraphPreparationMode mode
     bindings.target = [&](const speculative::RoundRoute& route) -> TargetCapture {
         return bind_target(*this, buckets, main, static_cast<int>(route.head_columns));
     };
-    bindings.decision = [&](const speculative::RoundRoute& route) {
-        const bool verify = route.width > 1;
-        if (verify)
-            accept_speculative(main.rows, main.tokens, static_cast<int>(route.head_columns));
-        else
-            sample(main.rows, SampleKind::NextToken);
-        copy_result(main.rows, verify);
-    };
+    if (parameters.profile->output_stage())
+        bindings.decision = [&](const speculative::RoundRoute& route) {
+            const bool verify = route.width > 1;
+            if (verify)
+                accept_speculative(main.rows, main.tokens, static_cast<int>(route.head_columns));
+            else
+                sample(main.rows, SampleKind::NextToken);
+            copy_result(main.rows, verify);
+        };
     if (shape.draft_tokens) {
         bindings.commit = [&](const speculative::RoundRoute&, const SectionRecorder& repair,
                               const SectionRecorder& counts) {

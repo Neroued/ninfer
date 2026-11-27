@@ -1,4 +1,5 @@
 #include "models/glm5next/load.h"
+#include "models/glm5next/execution/profile.h"
 #include "models/glm5next/parallel/wire.h"
 #include "models/qwen4_exp/load.h"
 #include "models/qwen4_exp/execution/profile.h"
@@ -67,6 +68,14 @@ auto roundtrip(Request request, const dist::ExecutionTopology& topology, Decode 
     auto bytes = encode();
     auto rank  = read(bytes, identity);
     rejected([&] { read(bytes, topology.rank((id + 1) % topology.ranks.size())); }, "global rank");
+    if (!rank.expert_domain) {
+        require(identity.tp.size == 1 || rank.experts.empty(), "missing prepared expert domain");
+        if constexpr (requires { request.rank.layers; }) {
+            ++request.rank.layers.begin;
+            rejected([&] { read(encode(), identity); }, "shard digest");
+        }
+        return rank;
+    }
     const auto& domain = *rank.expert_domain;
     require(domain.members == topology.role_group("expert", id).members,
             "dispatch peer order differs");
@@ -373,13 +382,71 @@ void glm_case(const artifact::Reader& reader, const std::filesystem::path& path,
         }
     }
 }
+
+void glm_pipeline(const artifact::Reader& reader, const std::filesystem::path& path,
+                  EngineOptions options) {
+    options.speculative = {};
+    auto def            = glm::read_definition(reader, models::load_options(options));
+    for (auto [stages, tp] :
+         {std::pair{2U, 1U}, std::pair{4U, 2U}, std::pair{2U, 4U}, std::pair{2U, 8U}}) {
+        auto d                = deployment(stages, tp, tp, 1, path);
+        d.parallel.dp         = 1;
+        d.parallel.pp         = stages;
+        auto plan             = glm::plan_parallel(*def, d);
+        std::uint32_t covered = 0;
+        for (const auto& r : plan.ranks) {
+            const auto local = roundtrip(
+                glm::RankLoadRequest{.artifact = reader.artifact_id(),
+                                     .rank     = r,
+                                     .options  = options,
+                                     .batches  = models::make_batch_execution_spec(2, tp, false)},
+                plan.topology, glm::decode_rank_load);
+            const auto rank = local.placement.tp.rank, stage = local.placement.pp.rank;
+            require(local.layers == r.layers && local.banks == r.banks && local.layers.size,
+                    "lost pipeline ranges");
+            if (rank == 0) {
+                require(local.layers.begin == covered,
+                        "pipeline layer intervals overlap or leave a gap");
+                covered += local.layers.size;
+            }
+            const auto& w    = def->weights().text;
+            auto loaded      = glm::resolve_rank_load(reader, def, local, Device::cuda(0));
+            const auto bound = loaded.weight_data();
+            require(bound[w.embedding.index].view.parts.empty() == (stage != 0) &&
+                        bound[w.head.index].view.parts.empty() == (stage + 1 != stages),
+                    "stage bound another endpoint's embedding or output head");
+            require(loaded.expert_data().size() == local.banks.size,
+                    "stage loaded an unowned expert bank");
+            for (std::size_t i = 0; i < w.layers.size(); ++i) {
+                const bool owns =
+                    i >= local.layers.begin && i < local.layers.begin + local.layers.size;
+                require(!bound[w.layers[i].input_norm.index].view.parts.empty() == owns,
+                        "stage bound a foreign layer or lost an owned layer");
+            }
+            auto profile = glm::execution::describe_model(*def, bound, loaded.expert_data(), local);
+            require(profile->text.layers.size() == local.layers.size &&
+                        profile->stage.rank == stage &&
+                        profile->config.text.kda_layers + profile->config.text.mla_layers ==
+                            local.layers.size,
+                    "rank profile did not localize its layer state indices");
+            require((tp == 1 ||
+                     plan.topology.role_group("tensor", local.placement.global_rank).members ==
+                         plan.topology.replica(0).stage_ranks[stage]),
+                    "tensor role crossed stages");
+        }
+        require(covered == def->weights().text.layers.size(), "pipeline omitted target layers");
+        std::cout << "PP" << stages << "/TP" << tp << " planned and bound " << covered << " layers"
+                  << std::endl;
+    }
+}
 } // namespace
 
 int main(int argc, char** argv) {
     try {
         if (argc != 3 && argc != 4)
-            throw std::invalid_argument("usage: ninfer_model_rank_load_test "
-                                        "qwen-dp2|glm-rank7|glm-mixed ARTIFACT [MATERIALIZE_RANK]");
+            throw std::invalid_argument(
+                "usage: ninfer_model_rank_load_test "
+                "qwen-dp2|glm-rank7|glm-mixed|glm-pipeline ARTIFACT [MATERIALIZE_RANK]");
         const std::string_view name = argv[1];
         const auto path             = std::filesystem::absolute(argv[2]);
         std::optional<std::uint32_t> rank;
@@ -399,6 +466,8 @@ int main(int argc, char** argv) {
         artifact::Reader reader(path);
         if (name == "qwen-dp2")
             qwen_case(reader, path, options, rank);
+        else if (name == "glm-pipeline")
+            glm_pipeline(reader, path, options);
         else if (name == "glm-rank7" || name == "glm-mixed")
             glm_case(reader, path, options, name == "glm-mixed", rank);
         else

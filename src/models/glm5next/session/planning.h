@@ -12,11 +12,12 @@ struct SessionPlan {
     std::shared_ptr<const BatchExecutionPlan> batches;
     context::ContextDirectorySpec context;
     std::vector<StatePlacement> states;
-    std::vector<KVPageLayout> caches;
+    std::vector<std::vector<KVPageLayout>> caches; // [logical pool][pipeline stage]
     std::uint32_t checkpoint_interval = 8192;
     std::uint32_t vision_max_features = 0;
     std::shared_ptr<const speculative::DecodeGraphRoutes> decode_routes;
     AttentionOwners attention;
+    std::vector<std::vector<std::vector<std::uint32_t>>> history_ranks; // [pool][owner]
 };
 
 [[nodiscard]] runtime::ContextMetadataPlan

@@ -11,6 +11,17 @@ namespace ninfer::models::glm5next::detail {
 void RankProgramImpl::commit(runtime::ExecutionTicket ticket, runtime::CommandSequence command,
                              Commit&& commit) {
     prepare_commit(ticket, commit);
+    if (!compute || compute->request.ticket != ticket) {
+        auto& f      = *retained.at(ticket.frame.index);
+        f.retirement = command;
+        f.deferred_commit.emplace(std::move(commit));
+        return;
+    }
+    apply_commit(ticket, command, std::move(commit));
+}
+
+void RankProgramImpl::apply_commit(runtime::ExecutionTicket ticket,
+                                   runtime::CommandSequence command, Commit&& commit) {
     auto& f = *compute;
     timer.resolve();
     f.release_vision    = std::any_of(commit.rows.begin(), commit.rows.end(),
@@ -19,7 +30,9 @@ void RankProgramImpl::commit(runtime::ExecutionTicket ticket, runtime::CommandSe
     if (std::holds_alternative<SpeculativeWork>(f.request.work.operation) ||
         (forward && forward->speculative))
         commit_speculative(commit);
-    else if (forward && forward->sample != SampleKind::None) {
+    else if (resources.plan.pipeline_counts && forward && forward->sample != SampleKind::None)
+        pipeline_commit_counts(commit);
+    else if (parameters.profile->output_stage() && forward && forward->sample != SampleKind::None) {
         const auto& io     = frame;
         const auto members = f.sampling_members();
         const int b        = extent(members.size());
@@ -44,11 +57,38 @@ void RankProgramImpl::commit(runtime::ExecutionTicket ticket, runtime::CommandSe
     }
     if (!std::holds_alternative<moe::ExpertServiceWork>(f.request.work.operation))
         resources.compute_actions->submit(
-            local_actions(commit.actions, parameters.profile->local.rank));
+            local_actions(commit.actions, parameters.profile->replica_rank()));
     timer.record_retirement();
     compute_done.record(cuda.stream());
     f.retirement = command;
     f.phase      = ComputePhase::Retiring;
+}
+
+void RankProgramImpl::pipeline_commit_counts(const Commit& commit) {
+    const auto& f   = *compute;
+    const auto work = work_rows(f.request.work);
+    const auto cap  = shape.max_concurrency;
+    auto host       = resources.pipeline_counts();
+    auto* fields    = static_cast<std::int32_t*>(host.data);
+    int rows        = 0;
+    for (std::size_t i = 0; i < commit.rows.size(); ++i) {
+        const auto& sampling = work[i].sampling;
+        if ((!sampling.presence_penalty && !sampling.frequency_penalty) || !commit.rows[i].accepted)
+            continue;
+        fields[rows]           = f.result.rows[i].tokens.at(0);
+        fields[cap + rows]     = 1;
+        fields[2 * cap + rows] = commit.rows[i].member.residency.lane.value;
+        ++rows;
+    }
+    if (!rows) return;
+    const auto& region = *resources.plan.pipeline_counts;
+    copy_bytes_async(region.region.bind(resources.fixed()), host, cuda);
+    const auto table = resources.tensor(region);
+    const auto field = [&](int column) {
+        return table.slice(1, column, 1).slice(0, 0, rows).view({rows});
+    };
+    auto counts = resources.tensor(*frame.token_counts);
+    ops::increment_token_counts_batch(field(0).view({1, rows}), field(1), field(2), counts, cuda);
 }
 
 void RankProgramImpl::commit_speculative(const Commit& commit) {

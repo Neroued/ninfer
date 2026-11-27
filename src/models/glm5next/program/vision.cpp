@@ -15,7 +15,7 @@ RankProgramImpl::prepare_vision(const std::optional<vision::Work>& work, std::ui
     auto& window = *resources.vision;
     if (window.begin(work->window)) {
         if (!work->input) throw std::logic_error("GLM Vision production has no input batch");
-        const auto rank    = parameters.profile->local.rank;
+        const auto rank    = parameters.profile->replica_rank();
         const auto& batch  = work->input->batches.at(rank);
         const auto& blocks = work->window.plan->outputs;
         const auto output  = std::find_if(blocks.begin(), blocks.end(),

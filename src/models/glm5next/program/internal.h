@@ -1,6 +1,9 @@
 #pragma once
 #include "models/common/graph/suite.h"
 #include "models/common/moe/service_graphs.h"
+#if NINFER_ENABLE_DISTRIBUTED
+#    include "distributed/pipeline_link.h"
+#endif
 #include "models/common/vocabulary.h"
 #include "models/glm5next/execution/mtp.h"
 #include "models/glm5next/execution/dflash.h"
@@ -34,6 +37,11 @@ struct PackedPrefill {
 
 struct ComputeFrame {
     runtime::ExecutionRequest<ExecutionTypes> request;
+    std::optional<Commit> deferred_commit;
+    bool deferred_discard = false;
+#if NINFER_ENABLE_DISTRIBUTED
+    std::optional<distributed::PpStageLink::Transfer> sent;
+#endif
     runtime::CommandSequence retirement;
     ComputePhase phase = ComputePhase::Forward;
     ComputeResult result;
@@ -83,6 +91,12 @@ public:
     std::optional<runtime::ExecutionEvent<ExecutionTypes>> poll();
     void drain();
     void advance_compute();
+    void admit_compute();
+    void submit_compute(runtime::ExecutionRequest<ExecutionTypes>&&);
+    [[nodiscard]] const ComputeFrame* find_frame(runtime::ExecutionTicket) const;
+    void apply_commit(runtime::ExecutionTicket, runtime::CommandSequence, Commit&&);
+    void apply_discard(runtime::ExecutionTicket, runtime::CommandSequence);
+    void pipeline_commit_counts(const Commit&);
     void advance_context();
     [[nodiscard]] std::optional<models::vision::EmbeddingView>
     prepare_vision(const std::optional<vision::Work>&, std::uint32_t begin, std::uint32_t tokens);
@@ -188,8 +202,14 @@ public:
     std::unique_ptr<GraphInputs> graph_inputs;
     std::unique_ptr<models::DecodeGraphSuite> graphs;
     std::optional<moe::ExpertServiceGraphs> service_graphs;
+#if NINFER_ENABLE_DISTRIBUTED
+    std::optional<distributed::PpStageLink> pipeline_input, pipeline_output;
+    std::uint64_t pipeline_sequence = 0;
+#endif
     GraphMemorySummary graph_memory;
     std::unique_ptr<ComputeFrame> compute;
+    std::deque<runtime::ExecutionRequest<ExecutionTypes>> waiting;
+    std::vector<std::unique_ptr<ComputeFrame>> retained;
     std::unique_ptr<ContextFrame> context;
     std::vector<std::optional<runtime::ExecutionMember>> bindings;
     std::deque<runtime::ExecutionEvent<ExecutionTypes>> events;

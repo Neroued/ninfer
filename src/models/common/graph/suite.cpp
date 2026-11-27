@@ -48,6 +48,7 @@ void DecodeGraphSuite::prepare(const BatchExecutionPlan& batch,
     if (!targets_.empty()) throw std::logic_error("decode graph suite is already prepared");
     std::optional<moe::Schedule::Preparation> schedule_preparation;
     if (schedule_) schedule_preparation.emplace(*schedule_);
+    owns_decision_ = bool(bindings.decision);
     std::set<TargetKey> targets;
     std::set<ProposalKey> proposals;
     std::set<DecisionKey> decisions;
@@ -65,7 +66,8 @@ void DecodeGraphSuite::prepare(const BatchExecutionPlan& batch,
             const auto new_target =
                 full_width && targets.emplace(shape, route.width, route.head_columns).second;
             const DecisionKey decision_key{shape.rows, route.width, route.head_columns};
-            const auto new_decision = full_width && decisions.insert(decision_key).second;
+            const auto new_decision =
+                owns_decision_ && full_width && decisions.insert(decision_key).second;
             const CommitKey commit_key{shape, route.width};
             const auto new_commit =
                 full_width && bindings.commit && commits.insert(commit_key).second;
@@ -184,7 +186,8 @@ void DecodeGraphSuite::launch_proposal(const speculative::RoundRoute& route,
 
 bool DecodeGraphSuite::contains(const speculative::RoundRoute& route) const {
     if (!targets_.contains({route.shape, route.width, route.head_columns}) ||
-        !decisions_.contains({route.shape.rows, route.width, route.head_columns}))
+        (owns_decision_ &&
+         !decisions_.contains({route.shape.rows, route.width, route.head_columns})))
         return false;
     return route.width <= 1 || topology_ != ProposalTopology::SplitProposal ||
            proposals_.contains({route.shape, std::max(route.mtp_steps, route.head_columns)});

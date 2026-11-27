@@ -34,6 +34,7 @@ public:
     [[nodiscard]] std::optional<Transfer> try_receive(std::uint64_t sequence,
                                                       std::span<const MemorySpan> fields,
                                                       CudaExecutionView consumer);
+    [[nodiscard]] bool available() const;
     [[nodiscard]] bool retired(Transfer) const;
     void drain() const;
 private:

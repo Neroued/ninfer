@@ -19,6 +19,8 @@ struct ParallelCoordinate {
 struct ParallelOptions {
     // dp counts full-model replicas; adp counts attention DP owners within a replica.
     std::uint32_t tp = 1, ep = 1, dp = 1, pp = 1, adp = 1;
+    // Optional number of consecutive target layers on each pipeline stage.
+    std::vector<std::uint32_t> stage_layers;
 };
 
 struct DeploymentNode {

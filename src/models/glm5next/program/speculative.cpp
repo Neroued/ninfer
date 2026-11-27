@@ -13,7 +13,7 @@ void RankProgramImpl::prepare_speculative() {
     auto& f           = *compute;
     const auto& work  = std::get<SpeculativeWork>(f.request.work.operation);
     const auto& io    = frame;
-    const auto rank   = parameters.profile->local.rank;
+    const auto rank   = parameters.profile->replica_rank();
     const auto& route = *work.speculative;
     const int b = work.rows.size(), d = static_cast<int>(route.mtp_steps),
               width = dimension(route.verify_width);

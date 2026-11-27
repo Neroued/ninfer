@@ -12,6 +12,14 @@ struct DraftPartition {
 
 struct RankPlan {
     RankPlacement placement;
+    IndexRange layers, banks;
+
+    [[nodiscard]] ExpertBankId local_bank(ExpertBankId global) const {
+        if (global.index < banks.begin || global.index - banks.begin >= banks.size)
+            throw std::out_of_range("GLM5Next expert bank belongs to another pipeline stage");
+        return {global.index - banks.begin};
+    }
+
     IndexRange mla_heads;
     IndexRange kda_heads, vocabulary, dense_intermediate, shared_intermediate;
     std::optional<DraftPartition> draft;
@@ -26,6 +34,8 @@ struct ParallelPlan {
     distributed::ExecutionTopology topology;
     std::vector<RankPlan> ranks;
 };
+
+[[nodiscard]] std::vector<PipelineLayerDemand> pipeline_layer_demands(const ModelDefinition&);
 
 [[nodiscard]] std::uint64_t compute_rank_shard_digest(const artifact::ArtifactId&, LoadOptions,
                                                       const RankPlan&);

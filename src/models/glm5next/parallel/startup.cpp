@@ -13,6 +13,9 @@ using ExpertSchedule = moe::ExpertSchedule<ExecutionTypes>;
 ParallelStartup::ParallelStartup(const artifact::Reader& reader, const EngineOptions& options)
     : definition_(read_definition(reader, load_options(options))),
       parallel_(plan_parallel(*definition_, *options.deployment)),
+      frames_(RankProgram::frame_capacity(
+          options.deployment->parallel.pp,
+          (options.max_concurrency - 1) / options.deployment->parallel.dp + 1, options.purpose)),
       index_format_(index_format_from_environment()) {
     if (options.context_cache.host_capacity_bytes.value_or(0) > 0)
         throw std::invalid_argument(
@@ -72,6 +75,7 @@ std::size_t ParallelStartup::coordinator_payload_bytes(const EngineOptions& opti
     shape.max_concurrency = batch;
     shape.prefill_chunk =
         std::min(options.prefill_chunk ? options.prefill_chunk : 4096U, options.max_context);
+    shape.pipeline_stages = options.deployment->parallel.pp;
     shape.draft_tokens = options.speculative.draft_tokens;
     shape.purpose      = options.purpose;
     const auto& text   = definition_->resources().text;

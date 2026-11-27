@@ -40,12 +40,13 @@ ExecutionShape shape(const execution::ModelProfile& p, const EngineOptions& o,
             o.speculative.backend,
             false,
             o.speculative.length_policy,
-            o.linear_state_dtype};
+            o.linear_state_dtype,
+            p.stage.size};
 }
 
 context::ContextDirectorySpec schema(const ExecutionPlan& p, std::size_t capacity, bool global) {
     context::ContextDirectorySpec spec;
-    const auto rank = p.profile->local.rank, size = p.profile->local.size;
+    const auto rank = p.profile->replica_rank(), size = p.profile->replica_size();
     for (std::uint32_t i = 0; i < size; ++i)
         if (global || i == rank) spec.ranks.push_back({i, i == rank ? capacity : 0, 0});
     spec.state.logical_capacity =
@@ -54,7 +55,9 @@ context::ContextDirectorySpec schema(const ExecutionPlan& p, std::size_t capacit
     for (std::uint32_t owner = 0; owner < groups.size(); ++owner) {
         context::StateLayoutSpec layout{owner, {}};
         for (const auto& part : spec.ranks) {
-            const auto& state = groups.owner(part.rank) == owner ? p.state.owner : p.state.common;
+            const auto& state = groups.owner(part.rank % p.profile->local.size) == owner
+                                    ? p.state.owner
+                                    : p.state.common;
             layout.parts.push_back({part.rank, state.image_bytes, state.alignment});
         }
         spec.state.layouts.push_back(std::move(layout));
@@ -63,14 +66,17 @@ context::ContextDirectorySpec schema(const ExecutionPlan& p, std::size_t capacit
         context::KVDirectorySpec pool{
             .pool_id = count(spec.pools.size()),
             .logical_pages =
-                count(capacity / cache.cache.page.page_bytes + 2ULL * p.shape.max_concurrency),
+                cache.cache.page.page_bytes
+                    ? count(capacity / cache.cache.page.page_bytes + 2ULL * p.shape.max_concurrency)
+                    : 0,
             .histories     = count(std::uint64_t(spec.state.logical_capacity) +
                                    3ULL * p.shape.max_concurrency + 2),
             .page_capacity = cache.tables.spec.logical_page_capacity,
             .table_rows    = static_cast<std::uint32_t>(cache.tables.spec.table_rows)};
-        for (const auto& part : spec.ranks)
-            pool.parts.push_back(
-                {part.rank, {cache.cache.page.page_bytes, cache.cache.page.alignment}});
+        if (cache.cache.page.page_bytes)
+            for (const auto& part : spec.ranks)
+                pool.parts.push_back(
+                    {part.rank, {cache.cache.page.page_bytes, cache.cache.page.alignment}});
         spec.pools.push_back(std::move(pool));
     };
     add(p.main);
@@ -81,7 +87,8 @@ context::ContextDirectorySpec schema(const ExecutionPlan& p, std::size_t capacit
 
 std::size_t ExecutionPlan::pinned_bytes() const {
     return (workspace.vision ? workspace.vision->encoder.host_staging_bytes : 0) +
-           frame.host_ingress.bytes + frame.sampling_ingress.bytes + pinned_output_bytes +
+           (pipeline_counts ? pipeline_counts->region.bytes : 0) + frame.host_ingress.bytes +
+           frame.sampling_ingress.bytes + pinned_output_bytes +
            2 * mapping_elements * sizeof(std::int64_t) + pinned_context_counts_bytes();
 }
 
@@ -128,26 +135,59 @@ ExecutionPlan plan_execution(std::shared_ptr<const execution::ModelProfile> prof
     if (out.profile->local.size > 1)
         for (auto& region : out.peer_staging)
             region = b.add(16ULL << 20, 256, "Context peer chunk");
+    if (out.profile->stage.size > 1) {
+        const auto columns = std::max(out.shape.prefill_chunk, out.shape.max_concurrency);
+        if (c.residual_width() > SIZE_MAX / (std::size_t(columns) * 2 * sizeof(std::uint16_t)))
+            throw std::overflow_error("pipeline residual backing exceeds size_t");
+        const auto ranks = out.profile->local.size;
+        const auto width = c.residual_width();
+        const auto lane = StageBoundaryField::transfer_elements(width, TpLayout::Replicated, ranks);
+        const auto policy     = execution::sequence_parallel_policy(ranks);
+        const auto prefill    = policy.partition(dimension(out.shape.prefill_chunk), 0);
+        const auto replicated = prefill.split() ? std::size_t(policy.minimum_columns - 1)
+                                                : std::size_t(out.shape.prefill_chunk);
+        const auto elements =
+            std::max({lane * out.shape.max_concurrency, lane * replicated,
+                      prefill.split() ? width * prefill.segment : std::size_t(0)});
+        const auto packet = elements * 2 * sizeof(std::uint16_t);
+        if (!out.profile->input_stage())
+            out.pipeline_input = b.add(packet, 256, "incoming pipeline buffers");
+        if (!out.profile->output_stage())
+            out.pipeline_output = b.add(packet, 256, "outgoing pipeline buffers");
+        if (out.profile->output_stage() && out.shape.purpose == EnginePurpose::Generation)
+            out.pipeline_counts =
+                b.add_tensor(DType::I32, {dimension(out.shape.max_concurrency), 3}, 256,
+                             "pipeline token count commit");
+        if (out.use_cuda_graph) {
+            const auto bytes = lane * out.shape.max_concurrency * sizeof(std::uint16_t);
+            if (!out.profile->input_stage())
+                out.graph_input = b.add(bytes, 256, "pipeline graph input");
+            if (!out.profile->output_stage())
+                out.graph_output = b.add(bytes, 256, "pipeline graph output");
+        }
+    }
     out.fixed_bytes      = b.finish(256);
     out.mapping_elements = out.main.tables.page_offsets.region.bytes / sizeof(std::int64_t);
     if (out.mtp)
         out.mapping_elements += out.mtp->tables.page_offsets.region.bytes / sizeof(std::int64_t);
-    out.pinned_output_bytes = out.shape.purpose == EnginePurpose::CausalScoring
-                                  ? std::min(out.shape.prefill_chunk, 1024U) * sizeof(float)
-                                  : out.frame.egress.bytes;
+    out.pinned_output_bytes =
+        out.shape.purpose == EnginePurpose::CausalScoring && out.profile->output_stage()
+            ? std::min(out.shape.prefill_chunk, 1024U) * sizeof(float)
+            : out.frame.egress.bytes;
     return out;
 }
 
 runtime::ContextCapacityPlan describe_execution_capacity(const ExecutionPlan& p) {
     runtime::ContextCapacityPlan out;
     const auto& groups  = p.profile->local.attention;
-    const auto rank     = p.profile->local.rank;
-    const auto owner_id = groups.owner(rank), owners = groups.size();
+    const auto rank     = p.profile->replica_rank();
+    const auto owner_id = groups.owner(p.profile->local.rank), owners = groups.size();
     for (std::uint32_t owner = 0; owner < owners; ++owner) {
         const auto& state = owner == owner_id ? p.state.owner : p.state.common;
         out.records.push_back({state.image_bytes, state.alignment});
     }
-    out.records.push_back({p.main.cache.page.page_bytes, p.main.cache.page.alignment});
+    if (p.main.cache.page.page_bytes)
+        out.records.push_back({p.main.cache.page.page_bytes, p.main.cache.page.alignment});
     if (p.mtp) out.records.push_back({p.mtp->cache.page.page_bytes, p.mtp->cache.page.alignment});
     const auto geometry = describe_context_pool(out.records);
     const auto pages    = [&](std::uint64_t tokens) {
@@ -158,8 +198,10 @@ runtime::ContextCapacityPlan describe_execution_capacity(const ExecutionPlan& p)
                                  std::uint32_t mtp) {
         runtime::ContextStartupWorkingSet set{std::move(name)};
         set.records.push_back({geometry.spec_classes[owner_id], states});
-        set.records.push_back({geometry.spec_classes[owners], main});
-        if (p.mtp) set.records.push_back({geometry.spec_classes[owners + 1], mtp});
+        auto next = owners;
+        if (p.main.cache.page.page_bytes)
+            set.records.push_back({geometry.spec_classes[next++], main});
+        if (p.mtp) set.records.push_back({geometry.spec_classes[next], mtp});
         return set;
     };
     // A retained source and a writable destination coexist through publication. COW/provisional

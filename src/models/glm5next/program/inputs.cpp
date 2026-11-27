@@ -52,7 +52,7 @@ void RankProgramImpl::prepare_inputs(std::span<const WorkRow> rows, const BatchP
     select_frame(plan.shape);
     const auto& io     = f.sequence ? frame.main : frame.decode;
     const auto& global = frame.rows;
-    const auto rank    = parameters.profile->local.rank;
+    const auto rank    = parameters.profile->replica_rank();
     const auto i32     = [&](const TensorRegion& r) {
         return static_cast<std::int32_t*>(host(r).data);
     };
@@ -206,7 +206,7 @@ void RankProgramImpl::prepare_packed_inputs(const ForwardWork& work) {
     packed.sampled_members.reserve(work.rows.size());
     const auto& layout = *frame.packed_prefill;
     const auto& global = frame.rows;
-    const auto rank    = parameters.profile->local.rank;
+    const auto rank    = parameters.profile->replica_rank();
     const auto i32     = [&](const TensorRegion& r) {
         return static_cast<std::int32_t*>(host(r).data);
     };
@@ -230,7 +230,7 @@ void RankProgramImpl::prepare_packed_inputs(const ForwardWork& work) {
             const auto offsets              = input.states.at(rank);
             const int len                   = extent(input.ids.size());
             f.result.rows[member].processed = len;
-            if (input.sample) {
+            if (input.sample && frame.sampling) {
                 const int slot = extent(packed.sampled_members.size());
                 packed.sampled_members.push_back(member);
                 i64(layout.sampled_offsets)[slot]    = len ? offsets.destination : offsets.source;
@@ -324,7 +324,7 @@ void RankProgramImpl::prepare_packed_inputs(const ForwardWork& work) {
         const auto& df      = *layout.dflash;
         const int capacity  = extent(parameters.profile->draft->context.capacity);
         const auto own_part = execution::sequence_parallel_policy(parameters.profile->local.size)
-                                  .partition(tokens, rank);
+                                  .partition(tokens, parameters.profile->local.rank);
         auto* src_idx   = i32(df.source_indices);
         auto* local_idx = i32(df.local_indices);
         auto* df_lens   = i32(df.ragged.seq_lengths);
@@ -392,6 +392,7 @@ void RankProgramImpl::fill_local_metadata(const BatchLayout& layout, int t, int 
 }
 
 void RankProgramImpl::request_decision() {
+    if (!parameters.profile->output_stage()) return;
     auto& f = *compute;
     if (f.requested || f.decision) return;
     const auto* forward     = std::get_if<ForwardWork>(&f.request.work.operation);

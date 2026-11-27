@@ -1,4 +1,5 @@
 #include "models/glm5next/wire.h"
+#include "runtime/executor/protocol.h"
 
 #include "models/common/context/wire.h"
 #include "models/common/parallel_wire.h"
@@ -210,9 +211,13 @@ vision::Work VisionInputBindings::get(std::uint64_t id, bool produce) const {
     return out;
 }
 
-void encode_work(Encoder& out, const Work& work, std::uint32_t rank) {
+void encode_work(Encoder& out, const Work& work, std::uint32_t rank, bool decision_owner,
+                 bool vision_owner) {
     out.u32(rank);
     context::encode_actions(out, local_actions(work.actions, rank));
+    out.boolean(decision_owner && work.initial_decision.has_value());
+    if (decision_owner && work.initial_decision)
+        runtime::protocol::encode(out, *work.initial_decision);
     out.boolean(bool(work.exchange));
     if (work.exchange) {
         out.u64(work.exchange->id);
@@ -231,8 +236,8 @@ void encode_work(Encoder& out, const Work& work, std::uint32_t rank) {
                 rows(out, v.rows);
                 out.boolean(bool(v.speculative));
                 if (v.speculative) route(out, *v.speculative);
-                out.boolean(v.visual.has_value());
-                if (v.visual) {
+                out.boolean(vision_owner && v.visual.has_value());
+                if (vision_owner && v.visual) {
                     out.u64(v.visual->window.id);
                     out.boolean(v.visual->window.produce);
                 }
@@ -267,6 +272,7 @@ Work decode_work(Decoder& in, const VisionInputBindings& inputs) {
     Work work;
     const auto rank = in.u32();
     work.actions.emplace(rank, context::decode_actions(in));
+    if (in.boolean()) work.initial_decision = runtime::protocol::decision_input(in);
     if (in.boolean())
         work.exchange =
             moe::ExpertStep{in.u64(), in.u32(), integers<std::uint32_t>(in), in.boolean()};

@@ -28,6 +28,13 @@ public:
     void finish_mixer(std::uint32_t layer);
     void ffn(std::uint32_t layer);
     void finish_layer(std::uint32_t layer);
+
+    // The BF16 mHC residual is the boundary between stages. Within a stage the fused post/pre
+    // consumes the same rounded residual before the next attention mixer.
+    [[nodiscard]] Tensor& boundary_residual() { return roots_.residual; }
+
+    void begin_stage();
+    void finish_stage();
     void finish(Tensor& hidden);
 
     [[nodiscard]] const TokenPartition& columns() const noexcept { return columns_; }

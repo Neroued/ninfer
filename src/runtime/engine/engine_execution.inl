@@ -358,9 +358,19 @@ template <class Instance>
     auto flight = freeze_members(membership.lanes,
                                  membership.is_replay ? UnitKind::Replay : UnitKind::Prefill);
     ExecutionCallScope call(*this);
-    const auto ticket = membership.is_replay
-                            ? instance_.session->start_replay(flight.sequences.front())
-                            : instance_.session->start_prefill(flight.sequences, membership.grants);
+    const auto ticket = [&] {
+        if (membership.is_replay) return instance_.session->start_replay(flight.sequences.front());
+        auto mask = [&](std::uint32_t i, std::span<std::uint32_t> words) {
+            return flight.requests.at(i)->output.grammar_masks({}, words);
+        };
+        if constexpr (requires {
+                          instance_.session->start_prefill(flight.sequences, membership.grants,
+                                                           mask);
+                      })
+            return instance_.session->start_prefill(flight.sequences, membership.grants, mask);
+        else
+            return instance_.session->start_prefill(flight.sequences, membership.grants);
+    }();
     call.finish();
     if (!ticket) return false;
     flight.ticket = *ticket;
@@ -380,8 +390,20 @@ template <class Instance>
         constrained[row] = flight.requests[row]->output.constrained();
     }
     ExecutionCallScope call(*this);
-    const auto ticket =
-        instance_.session->start_decode(flight.sequences, membership.budget_span(), constrained);
+    const auto ticket = [&] {
+        auto mask = [&](std::uint32_t i, std::span<std::uint32_t> words) {
+            return flight.requests.at(i)->output.grammar_masks({}, words);
+        };
+        if constexpr (requires {
+                          instance_.session->start_decode(
+                              flight.sequences, membership.budget_span(), constrained, mask);
+                      })
+            return instance_.session->start_decode(flight.sequences, membership.budget_span(),
+                                                   constrained, mask);
+        else
+            return instance_.session->start_decode(flight.sequences, membership.budget_span(),
+                                                   constrained);
+    }();
     call.finish();
     if (!ticket) return false;
     flight.ticket = *ticket;

@@ -2,23 +2,102 @@
 #include "artifact/reader.h"
 
 #include <stdexcept>
+#include <algorithm>
+#include <optional>
 
 namespace ninfer::models {
+std::vector<IndexRange> partition_pipeline_layers(std::span<const PipelineLayerDemand> layers,
+                                                  const ParallelOptions& parallel,
+                                                  std::span<const std::uint64_t> budgets) {
+    const auto stages = parallel.pp;
+    if (!stages || stages > layers.size() || layers.size() >= UINT32_MAX ||
+        (!budgets.empty() && budgets.size() != stages))
+        throw std::invalid_argument("pipeline requires a nonempty layer interval per stage");
+    std::vector<std::uint64_t> work{0}, bytes{0};
+    for (auto layer : layers) {
+        if (!layer.work || UINT64_MAX - work.back() < layer.work ||
+            UINT64_MAX - bytes.back() < layer.resident_bytes)
+            throw std::invalid_argument("invalid pipeline layer demand");
+        work.push_back(work.back() + layer.work);
+        bytes.push_back(bytes.back() + layer.resident_bytes);
+    }
+    const auto fits = [&](std::uint32_t stage, std::size_t begin, std::size_t end) {
+        return budgets.empty() || bytes[end] - bytes[begin] <= budgets[stage];
+    };
+    std::vector<IndexRange> result(stages);
+    if (!parallel.stage_layers.empty()) {
+        if (parallel.stage_layers.size() != stages)
+            throw std::invalid_argument("stage_layers differs from pipeline stage count");
+        std::uint32_t begin = 0;
+        for (std::uint32_t s = 0; s < stages; ++s) {
+            const auto count = parallel.stage_layers[s];
+            if (!count || count > layers.size() - begin || !fits(s, begin, begin + count))
+                throw std::invalid_argument("explicit pipeline interval exceeds layers or memory");
+            result[s] = {begin, count};
+            begin += count;
+        }
+        if (begin != layers.size())
+            throw std::invalid_argument("stage_layers does not cover the model");
+        return result;
+    }
+    const auto n = static_cast<std::uint32_t>(layers.size());
+    std::vector<std::vector<std::uint32_t>> cuts(stages,
+                                                 std::vector<std::uint32_t>(layers.size() + 1));
+    // A later stage can hide a difference between prefix costs. Minimize peak work first,
+    // then minimize peak bytes among partitions attaining that same work bound.
+    const auto solve = [&](std::optional<std::uint64_t> work_limit) {
+        std::vector<std::optional<std::uint64_t>> previous(layers.size() + 1),
+            current(layers.size() + 1);
+        previous[0] = 0;
+        for (std::uint32_t s = 0; s < stages; ++s) {
+            std::ranges::fill(current, std::nullopt);
+            for (std::uint32_t end = s + 1; end <= n - (stages - s - 1); ++end) {
+                for (std::uint32_t begin = s; begin < end; ++begin) {
+                    const auto demand = work[end] - work[begin];
+                    if (!previous[begin] || !fits(s, begin, end) ||
+                        (work_limit && demand > *work_limit))
+                        continue;
+                    const auto cost =
+                        std::max(*previous[begin], work_limit ? bytes[end] - bytes[begin] : demand);
+                    if (!current[end] || cost < *current[end]) {
+                        current[end] = cost;
+                        cuts[s][end] = begin;
+                    }
+                }
+            }
+            previous.swap(current);
+        }
+        if (!previous[n])
+            throw std::invalid_argument("pipeline layer weights exceed stage capacities");
+        return *previous[n];
+    };
+    const auto peak_work = solve({});
+    (void)solve(peak_work);
+    for (std::uint32_t s = stages, end = n; s > 0; --s) {
+        const auto begin = cuts[s - 1][end];
+        result[s - 1]    = {begin, end - begin};
+        end              = begin;
+    }
+    return result;
+}
+
 void add_expert_roles(distributed::ExecutionTopology& topology) {
     const RankPlacement first(topology.ranks.front());
     const auto lanes = first.expert_slice().size;
     const auto replicas_per_group =
         first.ep.size > first.tp.size ? first.ep.size / first.tp.size : 1U;
-    std::vector<distributed::RankId> domain;
-    for (const auto& replica : topology.replicas) {
-        auto members = std::span(replica.ranks);
-        domain.insert(domain.end(), members.begin(), members.end());
-        if ((replica.replica_id + 1) % replicas_per_group == 0) {
-            topology.add_role("expert", domain);
-            domain.clear();
+    for (std::uint32_t stage = 0; stage < first.pp.size; ++stage) {
+        std::vector<distributed::RankId> domain;
+        for (const auto& replica : topology.replicas) {
+            const auto members = std::span(replica.stage_ranks.at(stage));
+            domain.insert(domain.end(), members.begin(), members.end());
+            if ((replica.replica_id + 1) % replicas_per_group == 0) {
+                topology.add_role("expert", domain);
+                domain.clear();
+            }
+            for (std::size_t i = 0; i < members.size(); i += lanes)
+                topology.add_role("expert_tensor", members.subspan(i, lanes));
         }
-        for (std::size_t i = 0; i < members.size(); i += lanes)
-            topology.add_role("expert_tensor", members.subspan(i, lanes));
     }
 }
 

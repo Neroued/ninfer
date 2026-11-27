@@ -87,6 +87,7 @@ private:
     moe::Schedule* schedule_;
     SpeculativeBackend backend_;
     ProposalTopology topology_;
+    bool owns_decision_ = true;
     std::map<ProposalKey, ProposalGraph> proposals_;
     std::map<TargetKey, TargetGraphBody> targets_;
     std::map<DecisionKey, DecisionGraph> decisions_;

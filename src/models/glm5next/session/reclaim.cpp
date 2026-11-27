@@ -297,7 +297,7 @@ std::shared_ptr<const runtime::RecoveryDescription>
 Session::recovery_target(const RequestBasePlan& base, std::uint32_t f, runtime::PlacementId target,
                          runtime::CaptureStorage storage) const {
     if (!base.plan_ || !f || f > base.summary().prompt_tokens ||
-        target.value >= impl_->plan.states.size() || storage == runtime::CaptureStorage::Host)
+        target.value >= impl_->plan.attention.size() || storage == runtime::CaptureStorage::Host)
         throw std::invalid_argument("invalid GLM recovery target");
     runtime::RecoveryDescription value;
     value.placement = target;

@@ -23,7 +23,7 @@ public:
     [[nodiscard]] ops::WeightInput input(WeightId id) const { return weight_input(weights_, id); }
 
     [[nodiscard]] const moe::ResidentExpertBank& experts(ExpertBankId id) const {
-        return experts_.at(id.index);
+        return experts_.at(rank_.local_bank(id).index);
     }
 
     [[nodiscard]] std::span<const moe::ExpertDescription> expert_data() const {

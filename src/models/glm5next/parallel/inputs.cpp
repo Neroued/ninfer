@@ -31,11 +31,11 @@ ExecutionCodec::prepare_inputs(const Work& work, const distributed::ReplicaTopol
     const auto* production = find_produced_visual(work);
     if (!production) return {};
     const auto& visual = *production;
-    if (!visual.input || visual.input->batches.size() != replica.ranks.size())
+    if (!visual.input || visual.input->batches.size() != replica.stage_ranks.front().size())
         throw std::logic_error("Vision production does not cover the execution ranks");
     std::vector<runtime::InputResource> result;
-    for (std::size_t local_idx = 0; local_idx < replica.ranks.size(); ++local_idx) {
-        const auto global_rank = replica.ranks[local_idx];
+    for (std::size_t local_idx = 0; local_idx < replica.stage_ranks.front().size(); ++local_idx) {
+        const auto global_rank = replica.stage_ranks.front()[local_idx];
         const auto& batch      = visual.input->batches.at(local_idx);
         runtime::InputResource resource{global_rank, visual.window.id, {}, {}, visual.input};
         wire::Encoder out;
@@ -78,7 +78,7 @@ std::optional<std::uint64_t> ExecutionCodec::receive_input(wire::Kind kind,
         if (use.id != id || use.plan->features > contract_.vision_max_features)
             throw std::invalid_argument("Vision input differs from its prepared window capacity");
         auto input = std::make_shared<vision::WindowInput>();
-        input->batches.resize(ranks_);
+        input->batches.resize(replica_.stage_ranks.front().size());
         auto& batch      = input->batches.at(rank_);
         batch.features   = metadata.u32();
         batch.positions  = integers(metadata);

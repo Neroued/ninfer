@@ -280,18 +280,18 @@ glm::SessionPlan make_replica_plan(const glm::ModelDefinition& definition,
     profile->local.kda_heads = {0, c.kda.heads};
     const auto state         = glm::describe_state(glm::plan_state(*profile));
     p.states                 = {state};
-    p.caches.push_back(
-        ops::plan_kpool_mla_cache_layout(
-            {ops::KpoolMlaStorage::BFloat16, p.shape.index_format, glm::dimension(c.mla.latent_dim),
-             glm::dimension(c.mla.index_dim), glm::dimension(c.mla_layers)})
-            .page);
+    p.caches.push_back({ops::plan_kpool_mla_cache_layout(
+                            {ops::KpoolMlaStorage::BFloat16, p.shape.index_format,
+                             glm::dimension(c.mla.latent_dim), glm::dimension(c.mla.index_dim),
+                             glm::dimension(c.mla_layers)})
+                            .page});
     p.context.ranks                  = {{0, 16ULL << 20, 0}};
     p.context.state.logical_capacity = 64;
     ctx::StateLayoutSpec layout{0, {}};
     layout.parts.push_back({0, state.owner.bytes, state.owner.alignment});
     p.context.state.layouts.push_back(std::move(layout));
 
-    const auto& page = p.caches[0];
+    const auto& page = p.caches[0].front();
     p.context.pools.push_back({.pool_id       = 0,
                                .logical_pages = logical_pages,
                                .histories     = 256,

@@ -100,6 +100,13 @@ public:
         Flight prepared;
         prepared.ticket = id;
         prepared.scope  = std::move(scope);
+        if (const auto stage = submitted_decision_stage<Types>(work)) {
+            if (prepared.scope.decision_owners.empty())
+                throw std::logic_error("submitted decision has no consuming rank");
+            prepared.decision.emplace();
+            prepared.decision->stage = *stage;
+            prepared.supplied        = true;
+        }
         prepared.work.emplace(std::move(work));
         prepared.phase = Phase::Inputs;
         prepared.retired.resize(replica_.ranks.size());

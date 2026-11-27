@@ -39,7 +39,7 @@ struct PreparedContext {
     std::uint32_t vision_max_features;
     std::unique_ptr<context::ContextDirectory> directory;
     context::ContextDirectorySpec spec;
-    std::vector<KVPageGeometry> caches;
+    std::vector<std::vector<KVPageGeometry>> caches;
 };
 
 // Combines local record specifications within one replica; capacities remain independent.

@@ -244,6 +244,19 @@ void TextRun::finish_layer(std::uint32_t layer) {
     }
 }
 
+void TextRun::begin_stage() {
+    auto input = columns_.local(roots_.exchange_input, 1);
+    ops::mhc_pre(roots_.residual, parameters_.text.layers.front().attention_hc,
+                 parameters_.profile->text.mhc_parameters,
+                 {input, roots_.coefficients[coefficients_]}, execution_.workspace, cuda_);
+    gather_input(0);
+}
+
+void TextRun::finish_stage() {
+    ops::mhc_post(roots_.residual, columns_.local(roots_.exchange_output, 1),
+                  roots_.coefficients[coefficients_], roots_.residual, cuda_);
+}
+
 void TextRun::finish(Tensor& hidden) {
     auto local = columns_.local(hidden, 1);
     ops::mhc_post_mean_norm(roots_.residual, columns_.local(roots_.exchange_output, 1),

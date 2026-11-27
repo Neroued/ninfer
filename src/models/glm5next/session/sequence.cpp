@@ -22,13 +22,15 @@ std::optional<vision::Work> SessionImpl::prepare_visual(const Sequence& s, std::
         active && vision_window.available(member(s))) {
         if (models::vision::embedding_slices(*active->plan, begin, end - begin).empty()) return {};
         return vision::prepare_work(vision_window.reserve(member(s), active->plan),
-                                    s.request->vision, plan.states.size());
+                                    s.request->vision,
+                                    plan.attention.size() * plan.attention.width());
     }
-    auto window = models::vision::plan_window(s.request->vision->units, begin, end,
-                                              plan.vision_max_features, plan.states.size());
+    auto window =
+        models::vision::plan_window(s.request->vision->units, begin, end, plan.vision_max_features,
+                                    plan.attention.size() * plan.attention.width());
     if (!window) return {};
     return vision::prepare_work(vision_window.reserve(member(s), std::move(window)),
-                                s.request->vision, plan.states.size());
+                                s.request->vision, plan.attention.size() * plan.attention.width());
 }
 
 std::uint32_t SessionImpl::unit_end(const Sequence& s, ExecutionUnitKind kind,

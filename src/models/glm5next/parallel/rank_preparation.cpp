@@ -1,4 +1,5 @@
 #include "models/glm5next/startup.h"
+#include "distributed/pipeline_link.h"
 
 #include "models/glm5next/parallel/codec.h"
 #include "models/glm5next/parallel/wire.h"
@@ -53,14 +54,26 @@ RankPreparation::RankPreparation(const artifact::Reader& reader, std::span<const
                                 plan_.batches,
                                 plan_.profile->config.text.vocabulary,
                                 plan_.profile->public_tokens,
-                                plan_.profile->local.size,
+                                plan_.profile->replica_size(),
                                 0,
                                 plan_.profile->control_token_limit};
     memory_.host_reservation_bytes = runtime::protocol::work_payload_memory(
-        contract.payload_capacity(local_ranks), RankProgram::capacity(), local_ranks, false);
+        contract.payload_capacity(local_ranks),
+        RankProgram::frame_capacity(identity.pp.size, plan_.shape.max_concurrency,
+                                    plan_.shape.purpose),
+        local_ranks, false);
+    const auto link = [&](const distributed::GroupDescription* edge,
+                          const LayoutRegion& region) -> const distributed::Group* {
+        if (!edge) return nullptr;
+        pipeline_requirements_.push_back(distributed::PpStageLink::requirements(
+            *edge, identity.rank, region.bytes / distributed::PpStageLink::slots));
+        return &communication.group(edge->id);
+    };
+    binding_.pipeline_input  = link(topology.pipeline_input(identity.rank), plan_.pipeline_input);
+    binding_.pipeline_output = link(topology.pipeline_output(identity.rank), plan_.pipeline_output);
     if (identity.tp.size > 1) {
         const auto& group    = topology.role_group("tensor", identity.rank);
-        const auto result_id = replica.result_owner;
+        const auto result_id = replica.stage_ranks.at(identity.pp.rank).front();
         binding_.tensor      = {&communication.group(group.id), group.index(result_id)};
         const auto bind      = [&](std::string_view role) -> ParallelBinding {
             const auto& desc = topology.role_group(role, identity.rank);
@@ -77,9 +90,11 @@ ExecutionCodec RankPreparation::codec(const distributed::ExecutionTopology& topo
 }
 
 std::vector<distributed::GroupRequirements> RankPreparation::communication_requirements() const {
-    if (!binding_.tensor.group)
-        return expert_requirements_ ? std::vector{*expert_requirements_}
-                                    : std::vector<distributed::GroupRequirements>{};
+    auto result = pipeline_requirements_;
+    if (!binding_.tensor.group) {
+        if (expert_requirements_) result.push_back(*expert_requirements_);
+        return result;
+    }
     using distributed::Collective;
     using distributed::Reduction;
     const auto& shape = plan_.shape;
@@ -94,6 +109,12 @@ std::vector<distributed::GroupRequirements> RankPreparation::communication_requi
                                              : std::size_t(shape.prefill_chunk);
     const auto columns    = std::max({batch, decode, replicated});
     work.push_back({Collective::AllReduce, DType::BF16, hidden, hidden * columns, hidden});
+    if (plan_.profile->stage.size > 1 && !plan_.profile->input_stage()) {
+        const auto width = plan_.profile->config.text.residual_width();
+        const auto count = StageBoundaryField::transfer_elements(width, TpLayout::Replicated,
+                                                                 plan_.profile->local.size);
+        work.push_back({Collective::AllGather, DType::BF16, 1, count * columns, 1});
+    }
     if (sequence.split()) {
         const auto segment = hidden * std::size_t(sequence.segment);
         work.push_back({Collective::ReduceScatter, DType::BF16, hidden, segment, hidden});
@@ -144,7 +165,6 @@ std::vector<distributed::GroupRequirements> RankPreparation::communication_requi
         work.push_back({Collective::AllGather, DType::FP32, 3,
                         3 * std::size_t(std::min(shape.prefill_chunk, 1024U)), 3});
     }
-    std::vector<distributed::GroupRequirements> result;
     result.push_back(std::move(tensor));
     const auto requirements = [&](const distributed::Group& group) -> auto& {
         auto found = std::ranges::find(result, group.id(), &distributed::GroupRequirements::group);

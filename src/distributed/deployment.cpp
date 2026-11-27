@@ -29,6 +29,9 @@ void validate_deployment(const DeploymentOptions& options) {
         fail("invalid communication policy");
     const auto& p = options.parallel;
     if (!p.tp || !p.ep || !p.dp || !p.pp || !p.adp) fail("parallel sizes must be positive");
+    if (!p.stage_layers.empty() && (p.stage_layers.size() != p.pp ||
+                                    std::ranges::find(p.stage_layers, 0U) != p.stage_layers.end()))
+        fail("stage_layers requires a positive layer count per pipeline stage");
     const auto dp_pp = checked_product(p.dp, p.pp);
     const auto world = dp_pp ? checked_product(*dp_pp, p.tp) : std::nullopt;
     if (!world || *world != options.ranks.size())

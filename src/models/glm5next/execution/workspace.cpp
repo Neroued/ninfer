@@ -278,7 +278,7 @@ WorkspacePlan plan_workspace(const ModelProfile& p, const ExecutionShape& s, int
     const int columns = s.purpose == EnginePurpose::CausalScoring
                             ? dimension(std::min(s.prefill_chunk, 1024U))
                             : dimension(std::uint64_t(s.max_concurrency) * (s.draft_tokens + 1ULL));
-    out.finish        = linear(p.text.head, 1, columns);
+    out.finish        = p.stage.rank + 1 == p.stage.size ? linear(p.text.head, 1, columns) : 0;
     if (p.mtp)
         out.finish = std::max(out.finish, linear(p.mtp->head, 1, dimension(s.max_concurrency)));
     if (s.purpose == EnginePurpose::Generation) {

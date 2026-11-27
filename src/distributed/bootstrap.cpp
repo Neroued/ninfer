@@ -541,7 +541,7 @@ struct ExecutionGroup::Impl {
         return result;
     }
 
-    void start(std::span<const std::string> arguments) {
+    void start(std::span<const std::string> arguments, const SelectShards& select_shards) {
         Endpoint tcp{Endpoint::Kind::Tcp, options.control_host, options.control_port};
         Endpoint unix_endpoint{
             Endpoint::Kind::Unix,
@@ -616,8 +616,22 @@ struct ExecutionGroup::Impl {
         wire::Encoder encoded;
         wire::encode(encoded, topology);
         send(*this, epoch, ranks, wire::Kind::Topology, std::move(encoded).take());
-        await(ranks, wire::Kind::Prepared, deadline(options.connect_timeout_ms));
-        send(*this, epoch, ranks, wire::Kind::Connected);
+        auto prepared = await(ranks, wire::Kind::Prepared, deadline(options.connect_timeout_ms));
+        wire::Encoder connected;
+        if (select_shards) {
+            std::vector<RankMemoryOffer> offers(ranks.size());
+            for (const auto& event : prepared) {
+                wire::Decoder in(event.message.payload);
+                offers.at(event.peer) = {in.u64(), in.boolean()};
+                in.finish();
+            }
+            if (auto final = select_shards(offers)) {
+                final->install(topology);
+                connected.u64(final->plan);
+                for (auto digest : final->digests) connected.u64(digest);
+            }
+        }
+        send(*this, epoch, ranks, wire::Kind::Connected, std::move(connected).take());
     }
 
     std::unique_ptr<ReplicaGroup> take_replica(std::uint32_t replica_id) {
@@ -682,12 +696,19 @@ struct ExecutionGroup::Impl {
     bool closing = false, closed = false;
 };
 
+void ShardAssignment::install(ExecutionTopology& topology) const {
+    if (!plan || digests.size() != topology.ranks.size())
+        throw std::invalid_argument("incomplete finalized model shard assignment");
+    topology.plan = plan;
+    for (auto& rank : topology.ranks) rank.shard_digest = digests.at(rank.rank);
+}
+
 ExecutionGroup::ExecutionGroup(DeploymentOptions options, ExecutionTopology topology,
                                StartupObserver observer, WorkerProcess::LogSink sink,
-                               std::span<const std::string> arguments)
+                               std::span<const std::string> arguments, SelectShards select_shards)
     : impl_(std::make_unique<Impl>(std::move(options), std::move(topology), std::move(observer),
                                    std::move(sink))) {
-    impl_->start(arguments);
+    impl_->start(arguments, select_shards);
 }
 
 ExecutionGroup::~ExecutionGroup() = default;
@@ -765,7 +786,8 @@ void ExecutionGroup::shutdown() {
     }
 }
 
-WorkerConnection::WorkerConnection(WorkerBootstrap bootstrap)
+WorkerConnection::WorkerConnection(WorkerBootstrap bootstrap,
+                                   std::size_t (*device_limit)(std::size_t))
     : bootstrap_(std::move(bootstrap)),
       transport_(std::make_unique<Transport>(
           default_cluster_transport_limits(bootstrap_.shutdown_timeout_ms))),
@@ -861,9 +883,23 @@ WorkerConnection::WorkerConnection(WorkerBootstrap bootstrap)
         }
         communication_ = std::make_unique<CommunicationContext>(*device_, topology_, rank.rank,
                                                                 transport_->failure_signal());
-        send(wire::Kind::Prepared);
-        if (wait_msg().kind != wire::Kind::Connected)
+        wire::Encoder offer;
+        const auto available = memory_origin_.available_bytes();
+        offer.u64(device_limit ? device_limit(available) : available);
+        offer.boolean(memory_origin_.shared_physical_memory);
+        send(wire::Kind::Prepared, std::move(offer).take());
+        auto connected = wait_msg();
+        if (connected.kind != wire::Kind::Connected)
             throw std::runtime_error("expected execution group connection completion");
+        if (connected.payload.size()) {
+            wire::Decoder in(connected.payload);
+            ShardAssignment final{in.u64(), {}};
+            for (std::size_t r = 0; r < topology_.ranks.size(); ++r)
+                final.digests.push_back(in.u64());
+            in.finish();
+            final.install(topology_);
+            bootstrap_.identity = topology_.rank(bootstrap_.identity.rank);
+        }
     } catch (const std::exception& e) {
         fail(e.what());
         throw;

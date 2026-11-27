@@ -202,7 +202,16 @@ void pipeline_layouts() {
     require(models::partition_pipeline_layers(layers, pp) ==
                 std::vector<IndexRange>{{0, 2}, {2, 3}},
             "pipeline split missed the minimal bottleneck");
-    const std::array<std::uint64_t, 2> budget{10, 12};
+    const auto budget = [&](std::span<const IndexRange> prefix) {
+        const std::array<std::uint64_t, 2> available{10, 12};
+        for (std::size_t i = 0; i < prefix.size(); ++i) {
+            std::size_t used = 0;
+            for (const auto& layer : std::span(layers).subspan(prefix[i].begin, prefix[i].size))
+                used += layer.resident_bytes;
+            if (used > available[i]) return false;
+        }
+        return true;
+    };
     require(models::partition_pipeline_layers(layers, pp, budget) ==
                 std::vector<IndexRange>{{0, 1}, {1, 4}},
             "pipeline split ignored a stage's weight capacity");

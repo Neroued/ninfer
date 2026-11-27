@@ -57,7 +57,7 @@ void run_rank(distributed::WorkerConnection& connection, std::unique_ptr<artifac
 } // namespace
 
 void run_worker(distributed::WorkerBootstrap bootstrap) {
-    distributed::WorkerConnection connection(std::move(bootstrap));
+    distributed::WorkerConnection connection(std::move(bootstrap), device_budget);
     try {
         std::cerr << distributed::rank_description(connection.bootstrap().identity) << std::endl;
         auto message = receive_preparation_command(connection);

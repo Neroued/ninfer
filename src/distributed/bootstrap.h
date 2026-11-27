@@ -7,6 +7,7 @@
 
 #include <atomic>
 #include <deque>
+#include <functional>
 #include <map>
 #include <optional>
 #include <string>
@@ -62,13 +63,30 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
+// Placements and communication groups are installed before device discovery completes.
+// Only model shard identities can be finalized against the reported physical pools.
+struct RankMemoryOffer {
+    std::uint64_t available_bytes;
+    bool shared_physical_memory;
+};
+
+struct ShardAssignment {
+    std::uint64_t plan = 0;
+    std::vector<std::uint64_t> digests;
+    void install(ExecutionTopology&) const;
+};
+
+using SelectShards =
+    std::function<std::optional<ShardAssignment>(std::span<const RankMemoryOffer>)>;
+
 // Owns cluster-wide startup orchestration across all replica transports and the single
 // NodeProcessSupervisor. After activation, each replica's Transport + buffered state is handed
 // off atomically via take_replica(replica_id) to its ReplicaEngine's DistributedExecutor.
 class ExecutionGroup {
 public:
     ExecutionGroup(DeploymentOptions, ExecutionTopology, StartupObserver = {},
-                   WorkerProcess::LogSink = {}, std::span<const std::string> worker_arguments = {});
+                   WorkerProcess::LogSink = {}, std::span<const std::string> worker_arguments = {},
+                   SelectShards = {});
     ~ExecutionGroup();
     ExecutionGroup(const ExecutionGroup&)            = delete;
     ExecutionGroup& operator=(const ExecutionGroup&) = delete;
@@ -94,7 +112,7 @@ private:
 
 class WorkerConnection {
 public:
-    explicit WorkerConnection(WorkerBootstrap);
+    explicit WorkerConnection(WorkerBootstrap, std::size_t (*device_limit)(std::size_t) = nullptr);
     ~WorkerConnection();
     WorkerConnection(const WorkerConnection&)            = delete;
     WorkerConnection& operator=(const WorkerConnection&) = delete;

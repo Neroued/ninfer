@@ -7,6 +7,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace ninfer::distributed {
@@ -24,12 +25,18 @@ struct GroupDescription {
     [[nodiscard]] std::uint32_t index(RankId rank) const;
 };
 
+using PhysicalPoolKey = std::pair<std::uint32_t, int>;
+
 struct RankIdentity {
     RankId rank                = 0;
     std::uint32_t node         = 0, local_rank = 0;
     int device                 = 0;
     ParallelCoordinate tp, ep, dp, pp, adp;
     std::uint64_t shard_digest = 0;
+
+    [[nodiscard]] PhysicalPoolKey memory_pool(bool shared_physical_memory) const noexcept {
+        return {node, shared_physical_memory ? -1 : device};
+    }
 };
 
 struct ReplicaTopology {

@@ -41,8 +41,10 @@ void visit_layer_weights(const BlockWeights& l, Visit visit) {
     }
 }
 
-RankPlan rank_plan(const ModelDefinition& definition, const distributed::RankIdentity& id,
-                   IndexRange owned) {
+} // namespace
+
+RankPlan plan_rank_layers(const ModelDefinition& definition, const distributed::RankIdentity& id,
+                          IndexRange owned) {
     const auto [rank, size] = id.tp;
     const auto& c = definition.config().text;
     const auto& w = definition.weights();
@@ -333,8 +335,6 @@ RankPlan rank_plan(const ModelDefinition& definition, const distributed::RankIde
     return p;
 }
 
-} // namespace
-
 std::vector<PipelineLayerDemand> pipeline_layer_demands(const ModelDefinition& definition) {
     std::vector<PipelineLayerDemand> demands;
     const auto& moe = definition.config().text.moe;
@@ -380,7 +380,8 @@ std::uint64_t compute_rank_shard_digest(const artifact::ArtifactId& artifact_id,
 }
 
 RankPlan plan_single_rank(const ModelDefinition& definition) {
-    return rank_plan(definition, {}, {0, rank_dimension(definition.weights().text.layers.size())});
+    return plan_rank_layers(definition, {},
+                            {0, rank_dimension(definition.weights().text.layers.size())});
 }
 
 ParallelPlan plan_parallel(const ModelDefinition& definition, const DeploymentOptions& deployment) {
@@ -396,7 +397,7 @@ ParallelPlan plan_parallel(const ModelDefinition& definition, const DeploymentOp
     out.topology = distributed::build_cluster_topology(normalized);
     out.ranks.reserve(out.topology.ranks.size());
     for (const auto& id : out.topology.ranks)
-        out.ranks.push_back(rank_plan(definition, id, ranges.at(id.pp.rank)));
+        out.ranks.push_back(plan_rank_layers(definition, id, ranges.at(id.pp.rank)));
     for (const auto& rep : out.topology.replicas) {
         for (const auto& ranks : rep.stage_ranks) {
             for (const char* role : {"tensor", "vocabulary", "vision"})

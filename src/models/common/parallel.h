@@ -4,6 +4,7 @@
 #include "artifact/binder.h"
 #include "artifact/encoded_slice.h"
 #include "distributed/topology.h"
+#include <functional>
 
 namespace ninfer::models {
 
@@ -16,11 +17,12 @@ struct PipelineLayerDemand {
     std::uint64_t work, resident_bytes;
 };
 
-// Partition consecutive layers. Work is a model-supplied cost in common units. Budgets,
-// when available, contain the bytes left for layer weights on each stage.
+// Feasibility for the assigned prefix of consecutive stages. Extending a prefix can
+// only increase the total charge to its physical memory pools.
+using PipelineCapacity = std::function<bool(std::span<const IndexRange>)>;
 [[nodiscard]] std::vector<IndexRange>
 partition_pipeline_layers(std::span<const PipelineLayerDemand>, const ParallelOptions&,
-                          std::span<const std::uint64_t> stage_budgets = {});
+                          const PipelineCapacity& = {});
 
 // Global expert IDs; intermediate selects matching gate/up rows and down columns.
 struct ExpertPartition {

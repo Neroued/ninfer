@@ -1450,8 +1450,19 @@ void replica_worker(bool report_failure) {
     require(receive().kind == wire::Kind::Topology, "missing mock worker topology");
     wire::Encoder prepared;
     prepared.bytes(std::span<const std::byte>{});
+    prepared.u64(20 + boot.identity.rank);
+    prepared.boolean(true);
     send_message(socket, {wire::Kind::Prepared, boot.epoch, std::move(prepared).take()}, until);
-    require(receive().kind == wire::Kind::Connected, "missing mock worker connection");
+    auto connected = receive();
+    require(connected.kind == wire::Kind::Connected, "missing mock worker connection");
+    if (report_failure) {
+        wire::Decoder in(connected.payload);
+        require(in.u64() == 79, "worker did not receive the finalized topology identity");
+        for (unsigned r = 0; r < 4; ++r)
+            require(in.u64() == 80 + r, "worker lost a finalized shard");
+        in.finish();
+    } else
+        require(!connected.payload.size(), "unmodified shards were republished");
     for (;;) {
         const auto command = receive().kind;
         if (command == wire::Kind::Failed) return;
@@ -1497,7 +1508,19 @@ void replica_handoff_fault_isolation() {
             if (e.origin && e.origin->rank == 0 && e.phase == StartupPhase::EngineFinalize)
                 buffered = true;
         }};
-        dist::ExecutionGroup group(deployment, topology, observer, {}, args);
+        dist::SelectShards select;
+        if (report_failure)
+            select = [](auto offers) {
+                require(offers.size() == 4, "missing planning memory offer");
+                for (unsigned r = 0; r < 4; ++r)
+                    require(offers[r].available_bytes == 20 + r && offers[r].shared_physical_memory,
+                            "planning offers reordered");
+                return dist::ShardAssignment{79, {80, 81, 82, 83}};
+            };
+        dist::ExecutionGroup group(deployment, topology, observer, {}, args, select);
+        if (report_failure)
+            require(group.topology().plan == 79 && group.topology().rank(2).shard_digest == 82,
+                    "coordinator used a stale shard assignment");
         const auto enter =
             std::make_shared<wire::Message>(wire::Message{wire::Kind::Enter, group.epoch(), {}});
         const std::array healthy_work{dist::OutgoingMessage{0, enter}};

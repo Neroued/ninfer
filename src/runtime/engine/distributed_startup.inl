@@ -26,11 +26,15 @@ build_distributed_model(const artifact::Reader& reader, EngineOptions& options,
     StartupPhaseScope frontend_phase(options.startup_observer, StartupPhase::FrontendInitialize);
     auto frontend = setup.frontend(options);
     frontend_phase.complete();
+    distributed::SelectShards select_shards;
+    if constexpr (requires { setup.select_shards(reader, options); })
+        select_shards = setup.select_shards(reader, options);
     auto group = std::make_shared<distributed::ExecutionGroup>(
         *options.deployment, setup.topology(), options.startup_observer,
         [](auto rank, std::string_view message) {
             std::cerr << "[rank " << rank << "] " << message << '\n';
-        });
+        },
+        std::span<const std::string>{}, std::move(select_shards));
     const bool want_narrow = setup.narrow_targets(options);
     const auto requests = setup.requests(options, want_narrow);
     const std::size_t frontend_host_bytes =

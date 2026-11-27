@@ -1,4 +1,5 @@
 #include "models/glm5next/load.h"
+#include "models/glm5next/parallel/startup.h"
 #include "models/glm5next/execution/profile.h"
 #include "models/glm5next/parallel/wire.h"
 #include "models/qwen4_exp/load.h"
@@ -383,10 +384,54 @@ void glm_case(const artifact::Reader& reader, const std::filesystem::path& path,
     }
 }
 
+void glm_pipeline_capacity(const artifact::Reader& reader, const std::filesystem::path& path,
+                           EngineOptions options) {
+    auto d                        = deployment(2, 1, 1, 1, path);
+    d.parallel.dp                 = 1;
+    d.parallel.pp                 = 2;
+    options.deployment            = d;
+    options.speculative           = {};
+    options.memory_headroom_bytes = 0;
+    options.context_capacity      = ContextCapacityPolicy::automatic();
+    glm::ParallelStartup startup(reader, options);
+    const auto selected = startup.select_shards(reader, options);
+    const auto original = glm::plan_parallel(*startup.definition(), d);
+    std::array<dist::RankMemoryOffer, 2> offers{};
+    std::array<std::uint64_t, 2> bytes{};
+    for (unsigned i = 0; i < 2; ++i) {
+        auto load = glm::resolve_rank_load(reader, startup.definition(), original.ranks.at(i),
+                                           Device::cuda(i));
+        bytes[i]  = load.materialization().device_capacity_bytes;
+        offers[i] = {bytes[i], false};
+    }
+    require(!selected(offers), "fitting pipeline changed its work-optimal partition");
+    const auto old_layers     = original.ranks.front().layers.size;
+    offers[0].available_bytes = bytes[0] - 1;
+    offers[1].available_bytes = bytes[0] + bytes[1];
+    auto replacement          = selected(offers);
+    require(replacement && replacement->plan != original.topology.plan &&
+                replacement->plan == startup.topology().plan,
+            "short first device did not trigger a new model shard assignment");
+    auto payloads = startup.requests(options);
+    wire::Decoder in(payloads.front());
+    const auto req = glm::decode_rank_load(in, startup.topology().rank(0), reader.artifact_id());
+    in.finish();
+    require(req.rank.layers.size < old_layers, "physical allowance did not move a layer");
+    auto load = glm::resolve_rank_load(reader, startup.definition(), req.rank, Device::cuda(0));
+    require(load.materialization().device_capacity_bytes <= offers[0].available_bytes,
+            "selected rank exceeds its advertised physical capacity");
+    const auto half = std::max(bytes[0], bytes[1]);
+    offers          = {dist::RankMemoryOffer{half, true}, dist::RankMemoryOffer{half, true}};
+    rejected([&] { (void)selected(offers); }, "physical memory pools");
+    std::cout << "PP2 capacity moved stage 0 from " << old_layers << " to " << req.rank.layers.size
+              << " layers; shared-pool overcommit rejected" << std::endl;
+}
+
 void glm_pipeline(const artifact::Reader& reader, const std::filesystem::path& path,
                   EngineOptions options) {
     options.speculative = {};
     auto def            = glm::read_definition(reader, models::load_options(options));
+    glm_pipeline_capacity(reader, path, options);
     for (auto [stages, tp] :
          {std::pair{2U, 1U}, std::pair{4U, 2U}, std::pair{2U, 4U}, std::pair{2U, 8U}}) {
         auto d                = deployment(stages, tp, tp, 1, path);

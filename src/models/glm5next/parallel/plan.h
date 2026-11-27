@@ -39,6 +39,8 @@ struct ParallelPlan {
 
 [[nodiscard]] std::uint64_t compute_rank_shard_digest(const artifact::ArtifactId&, LoadOptions,
                                                       const RankPlan&);
+[[nodiscard]] RankPlan plan_rank_layers(const ModelDefinition&, const distributed::RankIdentity&,
+                                        IndexRange);
 [[nodiscard]] RankPlan plan_single_rank(const ModelDefinition&);
 [[nodiscard]] ParallelPlan plan_parallel(const ModelDefinition&, const DeploymentOptions&);
 

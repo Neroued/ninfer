@@ -3,27 +3,25 @@
 
 #include <stdexcept>
 #include <algorithm>
-#include <optional>
 
 namespace ninfer::models {
+// A shared physical pool can contain ranks from several stages. The caller checks whole
+// prefixes, so a later choice cannot borrow bytes already charged to an earlier stage.
 std::vector<IndexRange> partition_pipeline_layers(std::span<const PipelineLayerDemand> layers,
                                                   const ParallelOptions& parallel,
-                                                  std::span<const std::uint64_t> budgets) {
+                                                  const PipelineCapacity& fits) {
     const auto stages = parallel.pp;
-    if (!stages || stages > layers.size() || layers.size() >= UINT32_MAX ||
-        (!budgets.empty() && budgets.size() != stages))
+    if (!stages || stages > layers.size() || layers.size() >= UINT32_MAX)
         throw std::invalid_argument("pipeline requires a nonempty layer interval per stage");
+    const auto n = static_cast<std::uint32_t>(layers.size());
     std::vector<std::uint64_t> work{0}, bytes{0};
-    for (auto layer : layers) {
+    for (const auto& layer : layers) {
         if (!layer.work || UINT64_MAX - work.back() < layer.work ||
             UINT64_MAX - bytes.back() < layer.resident_bytes)
             throw std::invalid_argument("invalid pipeline layer demand");
         work.push_back(work.back() + layer.work);
         bytes.push_back(bytes.back() + layer.resident_bytes);
     }
-    const auto fits = [&](std::uint32_t stage, std::size_t begin, std::size_t end) {
-        return budgets.empty() || bytes[end] - bytes[begin] <= budgets[stage];
-    };
     std::vector<IndexRange> result(stages);
     if (!parallel.stage_layers.empty()) {
         if (parallel.stage_layers.size() != stages)
@@ -31,53 +29,60 @@ std::vector<IndexRange> partition_pipeline_layers(std::span<const PipelineLayerD
         std::uint32_t begin = 0;
         for (std::uint32_t s = 0; s < stages; ++s) {
             const auto count = parallel.stage_layers[s];
-            if (!count || count > layers.size() - begin || !fits(s, begin, begin + count))
-                throw std::invalid_argument("explicit pipeline interval exceeds layers or memory");
+            if (!count || count > n - begin)
+                throw std::invalid_argument("invalid explicit stage interval");
             result[s] = {begin, count};
             begin += count;
         }
-        if (begin != layers.size())
-            throw std::invalid_argument("stage_layers does not cover the model");
+        if (begin != n) throw std::invalid_argument("stage_layers does not cover the model");
+        if (fits && !fits(result))
+            throw std::invalid_argument("explicit pipeline exceeds physical weight capacity");
         return result;
     }
-    const auto n = static_cast<std::uint32_t>(layers.size());
-    std::vector<std::vector<std::uint32_t>> cuts(stages,
-                                                 std::vector<std::uint32_t>(layers.size() + 1));
-    // A later stage can hide a difference between prefix costs. Minimize peak work first,
-    // then minimize peak bytes among partitions attaining that same work bound.
-    const auto solve = [&](std::optional<std::uint64_t> work_limit) {
-        std::vector<std::optional<std::uint64_t>> previous(layers.size() + 1),
-            current(layers.size() + 1);
-        previous[0] = 0;
-        for (std::uint32_t s = 0; s < stages; ++s) {
-            std::ranges::fill(current, std::nullopt);
-            for (std::uint32_t end = s + 1; end <= n - (stages - s - 1); ++end) {
-                for (std::uint32_t begin = s; begin < end; ++begin) {
-                    const auto demand = work[end] - work[begin];
-                    if (!previous[begin] || !fits(s, begin, end) ||
-                        (work_limit && demand > *work_limit))
-                        continue;
-                    const auto cost =
-                        std::max(*previous[begin], work_limit ? bytes[end] - bytes[begin] : demand);
-                    if (!current[end] || cost < *current[end]) {
-                        current[end] = cost;
-                        cuts[s][end] = begin;
-                    }
-                }
-            }
-            previous.swap(current);
-        }
-        if (!previous[n])
-            throw std::invalid_argument("pipeline layer weights exceed stage capacities");
-        return *previous[n];
+
+    // Both objective values are sums over actual intervals. Search these discrete bounds,
+    // first minimizing the bottleneck work, then the peak encoded layer size at that work.
+    const auto choices = [&](const auto& prefix) {
+        std::vector<std::uint64_t> values;
+        for (std::uint32_t begin = 0; begin < n; ++begin)
+            for (std::uint32_t end = begin + 1; end <= n; ++end)
+                values.push_back(prefix[end] - prefix[begin]);
+        std::ranges::sort(values);
+        values.erase(std::unique(values.begin(), values.end()), values.end());
+        return values;
     };
-    const auto peak_work = solve({});
-    (void)solve(peak_work);
-    for (std::uint32_t s = stages, end = n; s > 0; --s) {
-        const auto begin = cuts[s - 1][end];
-        result[s - 1]    = {begin, end - begin};
-        end              = begin;
-    }
+    const auto possible = [&](std::uint64_t limit, std::uint64_t byte_limit) {
+        std::vector<std::vector<bool>> failed;
+        if (!fits) failed.assign(stages, std::vector<bool>(n));
+        const auto visit = [&](const auto& self, unsigned stage, unsigned begin) -> bool {
+            if (!fits && failed[stage][begin]) return false;
+            const auto following = stages - stage - 1;
+            for (unsigned end = following ? begin + 1 : n; end <= n - following; ++end) {
+                if (work[end] - work[begin] > limit || bytes[end] - bytes[begin] > byte_limit)
+                    break;
+                const auto remaining = work[n] - work[end];
+                if (following && remaining / following + (remaining % following != 0) > limit)
+                    continue;
+                result[stage] = {begin, end - begin};
+                if (fits && !fits(std::span(result).first(stage + 1))) continue;
+                if (!following || self(self, stage + 1, end)) return true;
+            }
+            if (!fits) failed[stage][begin] = true;
+            return false;
+        };
+        return visit(visit, 0, 0);
+    };
+    const auto work_limits = choices(work);
+    const auto chosen_work = std::ranges::partition_point(
+        work_limits, [&](auto value) { return !possible(value, UINT64_MAX); });
+    if (chosen_work == work_limits.end())
+        throw std::invalid_argument(
+            "pipeline target layers cannot fit the available physical memory pools");
+    const auto byte_limits  = choices(bytes);
+    const auto chosen_bytes = std::ranges::partition_point(
+        byte_limits, [&](auto value) { return !possible(*chosen_work, value); });
+    if (chosen_bytes == byte_limits.end() || !possible(*chosen_work, *chosen_bytes))
+        throw std::logic_error("pipeline capacity changed during layer planning");
     return result;
 }
 

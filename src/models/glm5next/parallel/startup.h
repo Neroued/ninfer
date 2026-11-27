@@ -1,5 +1,6 @@
 #pragma once
 #include "runtime/executor/collective_step.h"
+#include "distributed/bootstrap.h"
 #include "runtime/executor/executor.h"
 
 #include "models/glm5next/frontend/frontend.h"
@@ -20,6 +21,8 @@ public:
 
     [[nodiscard]] const auto& topology() const { return parallel_.topology; }
 
+    [[nodiscard]] distributed::SelectShards select_shards(const artifact::Reader&,
+                                                          const EngineOptions&);
     [[nodiscard]] Frontend frontend(const EngineOptions&) const;
     [[nodiscard]] std::vector<distributed::wire::Bytes> requests(const EngineOptions&,
                                                                  bool narrow_targets = false) const;

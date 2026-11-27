@@ -70,13 +70,13 @@ std::vector<dist::RankId> all_ranks(const dist::ExecutionTopology& topology) {
     return ranks;
 }
 
-using PhysicalPoolKey = std::pair<std::uint32_t, int>;
+using dist::PhysicalPoolKey;
 
 PhysicalPoolKey pool_key_for(const dist::ExecutionTopology& topology,
                              std::span<const RankPreparationReport> reports, dist::RankId rank) {
     const auto& id    = topology.rank(rank);
     const bool shared = reports[rank].capacity.shared_physical_memory;
-    return {id.node, shared ? -1 : id.device};
+    return id.memory_pool(shared);
 }
 
 } // namespace

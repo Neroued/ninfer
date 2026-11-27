@@ -24,15 +24,18 @@ single-request scenario tables.
 
 ### RTX 5090
 
-| Model / weights | MTP0 context profile | Single-request speculative decode | Corpus makespan | MTP3 decode saturation |
+| Model / weights | Context profile | Single-request speculative decode | Corpus makespan | Decode saturation |
 |---|---|---|---|---|
-| Qwen3.6-27B / `groupwise-int` | [8K–256K](performance/qwen3.6-27b.md#no-speculation-context-profile) | [MTP3](performance/qwen3.6-27b.md#single-request-speculative-decode) | Not published | [C=1, 2, 4, 8](performance/qwen3.6-27b.md#decode-saturation) |
-| Qwen3.6-27B / `nvfp4` | [8K–256K](performance/qwen3.6-27b.md#no-speculation-context-profile) | [MTP3](performance/qwen3.6-27b.md#single-request-speculative-decode) | Not published | [C=1, 2, 4, 8](performance/qwen3.6-27b.md#decode-saturation) |
-| Qwen3.6-35B-A3B / `groupwise-int` | [8K–256K](performance/qwen3.6-35b-a3b.md#no-speculation-context-profile) | [MTP3; DFlash K=7 stochastic/greedy](performance/qwen3.6-35b-a3b.md#single-request-speculative-decode) | [MTP3 C=1, 2, 4, 8; DFlash C=1](performance/qwen3.6-35b-a3b.md#corpus-makespan) | [C=1, 2, 4, 8](performance/qwen3.6-35b-a3b.md#decode-saturation) |
-| Qwen3.8-27B / `groupwise-int` | [8K–256K](performance/qwen3.8-27b.md#no-speculation-context-profile) | [MTP3; DFlash2 K=7](performance/qwen3.8-27b.md#single-request-speculative-decode) | [MTP3 C=1, 2, 4, 8; DFlash2 C=1](performance/qwen3.8-27b.md#corpus-makespan) | [C=1, 2, 4, 8](performance/qwen3.8-27b.md#decode-saturation) |
-| Qwen3.8-27B / `nvfp4` | [8K–256K](performance/qwen3.8-27b.md#no-speculation-context-profile) | [MTP3; DFlash2 K=7](performance/qwen3.8-27b.md#single-request-speculative-decode) | [MTP3 C=1, 2, 4, 8; DFlash2 C=1](performance/qwen3.8-27b.md#corpus-makespan) | [C=1, 2, 4, 8](performance/qwen3.8-27b.md#decode-saturation) |
+| Inkling-2-Mini / `nvfp4 + mxfp8` | [MTP0/DSpark K=7, 8K–256K](performance/inkling2-mini.md#context-profile) | [DSpark K=7](performance/inkling2-mini.md#single-request-speculative-decode) | [DSpark K=7 C=1, 2, 4, 8](performance/inkling2-mini.md#corpus-makespan) | [DSpark K=7 C=1, 2, 4, 8, 16](performance/inkling2-mini.md#decode-saturation) |
+| Qwen3.6-27B / `groupwise-int` | [MTP0, 8K–256K](performance/qwen3.6-27b.md#no-speculation-context-profile) | [MTP3](performance/qwen3.6-27b.md#single-request-speculative-decode) | Not published | [MTP3 C=1, 2, 4, 8](performance/qwen3.6-27b.md#decode-saturation) |
+| Qwen3.6-27B / `nvfp4` | [MTP0, 8K–256K](performance/qwen3.6-27b.md#no-speculation-context-profile) | [MTP3](performance/qwen3.6-27b.md#single-request-speculative-decode) | Not published | [MTP3 C=1, 2, 4, 8](performance/qwen3.6-27b.md#decode-saturation) |
+| Qwen3.6-35B-A3B / `groupwise-int` | [MTP0, 8K–256K](performance/qwen3.6-35b-a3b.md#no-speculation-context-profile) | [MTP3; DFlash K=7 stochastic/greedy](performance/qwen3.6-35b-a3b.md#single-request-speculative-decode) | [MTP3 C=1, 2, 4, 8; DFlash C=1](performance/qwen3.6-35b-a3b.md#corpus-makespan) | [MTP3 C=1, 2, 4, 8](performance/qwen3.6-35b-a3b.md#decode-saturation) |
+| Qwen3.8-27B / `groupwise-int` | [MTP0, 8K–256K](performance/qwen3.8-27b.md#no-speculation-context-profile) | [MTP3; DFlash2 K=7](performance/qwen3.8-27b.md#single-request-speculative-decode) | [MTP3 C=1, 2, 4, 8; DFlash2 C=1](performance/qwen3.8-27b.md#corpus-makespan) | [MTP3 C=1, 2, 4, 8](performance/qwen3.8-27b.md#decode-saturation) |
+| Qwen3.8-27B / `nvfp4` | [MTP0, 8K–256K](performance/qwen3.8-27b.md#no-speculation-context-profile) | [MTP3; DFlash2 K=7](performance/qwen3.8-27b.md#single-request-speculative-decode) | [MTP3 C=1, 2, 4, 8; DFlash2 C=1](performance/qwen3.8-27b.md#corpus-makespan) | [MTP3 C=1, 2, 4, 8](performance/qwen3.8-27b.md#decode-saturation) |
 
-Qwen3.8-27B and Qwen3.6-35B-A3B C=1 corpus points also supply their single-request phase tables.
+Inkling-2-Mini uses FP8 group-128 Full KV, BF16 SWA KV, a 4,096-token prefill chunk, and
+adaptive DSpark K=7 (plus a supplementary C=32 FP8 SWA wave). Inkling-2-Mini, Qwen3.8-27B, and
+Qwen3.6-35B-A3B C=1 corpus points also supply their single-request phase tables.
 The Qwen3.6-27B NVFP4 MTP3 phase table comes from a corpus C=1 point whose full makespan is
 not published here. These Qwen3.8-27B measurements use FP8 E4M3 row-256 KV; the Qwen3.6 measurements
 use INT8 group-64 KV. Each model page records its build and run conditions.

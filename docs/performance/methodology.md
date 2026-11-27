@@ -31,6 +31,8 @@ context/concurrency settings, and any sampling exceptions.
 | MTP3 | `mtp3` | `--spec mtp --draft-tokens 3 --proposal-head optimized` |
 | DFlash, block=8 | `dflash7` | `--spec dflash --draft-tokens 7 --proposal-head optimized` |
 | DFlash2, block=8 | `dflash2_7` | `--spec dflash2 --draft-tokens 7 --proposal-head optimized` |
+| DSpark, block=8 | `dspark7` | `--spec dspark --draft-tokens 7 --proposal-head full` |
+| DSpark, block=8 | `dspark7` | `--spec dspark --draft-tokens 7 --proposal-head full` |
 
 `K` denotes draft tokens; block size is `K+1`. Weight format, backend, draft count, and proposal
 head are separate experimental dimensions.

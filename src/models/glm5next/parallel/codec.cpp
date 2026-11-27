@@ -66,8 +66,10 @@ void ExecutionCodec::validate_commit(const Work& w, const Result& r, const Commi
     contract_.validate(w, r, c);
 }
 
-runtime::protocol::Scope ExecutionCodec::scope(const Work&,
+runtime::protocol::Scope ExecutionCodec::scope(const Work& work,
                                                const distributed::ExecutionTopology&) const {
+    if (std::holds_alternative<moe::ExpertServiceWork>(work.operation))
+        return {replica_.ranks, {}, replica_.result_owner};
     return scope_;
 }
 

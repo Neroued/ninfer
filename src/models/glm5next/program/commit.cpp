@@ -42,8 +42,9 @@ void RankProgramImpl::commit(runtime::ExecutionTicket ticket, runtime::CommandSe
                 resources.tensor(io.rows.count_slots).slice(0, 0, b), counts, cuda);
         }
     }
-    resources.compute_actions->submit(
-        local_actions(commit.actions, parameters.profile->local.rank));
+    if (!std::holds_alternative<moe::ExpertServiceWork>(f.request.work.operation))
+        resources.compute_actions->submit(
+            local_actions(commit.actions, parameters.profile->local.rank));
     timer.record_retirement();
     compute_done.record(cuda.stream());
     f.retirement = command;

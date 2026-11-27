@@ -639,6 +639,13 @@ void schedule_experts(const artifact::Reader& reader, const DeploymentOptions& d
         require(physical[i]->submissions == unsigned(involved) &&
                     physical[i]->service_commits == unsigned(involved && i != source),
                 "expert service touched another replica domain");
+        if (involved && i != source) {
+            auto codec = startup.codec(i);
+            const auto scope = codec.scope(physical[i]->last, topo);
+            require(scope.decision_owners.empty() && scope.participants == topo.replica(i).ranks &&
+                        scope.result_owner == topo.replica(i).result_owner,
+                    "zero-source GLM scope assigned a request decision");
+        }
         if (involved && width > 1)
             require(physical[i]->last.exchange && physical[i]->last.exchange->id == 1,
                     "GLM source and service workers missed their shared expert step");

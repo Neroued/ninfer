@@ -25,11 +25,12 @@ void bind_mla(std::vector<ContextBucketBinding>& bindings, DeviceContext& device
 }
 
 void record_mla(const ReadoutRecorder& record, const execution::MlaReadout& expected,
-                const execution::MlaReadout& actual) {
+                const execution::MlaReadout& actual, CudaExecutionView cuda) {
     if (expected.query.data != actual.query.data || expected.scratch.data != actual.scratch.data ||
         expected.index != actual.index)
         throw std::logic_error("GLM Graph readout binding differs from execution layout");
     if (actual.index) record(capture_readout(actual, &execution::MlaReadout::indexer));
+    actual.share_selection(cuda);
     record(capture_readout(actual, &execution::MlaReadout::attention));
 }
 
@@ -42,7 +43,7 @@ ReadoutCapture bind_mtp_step(RankProgramImpl& p, ops::ContextBucketRange buckets
     bind_mla(capture.readouts, p.device, buckets, call);
     capture.body = [&p, step, batch, call](const ReadoutRecorder& record) {
         p.mtp_forward(step, batch, [&](const execution::MlaReadout& actual) {
-            record_mla(record, call, actual);
+            record_mla(record, call, actual, p.cuda);
         });
     };
     return capture;
@@ -121,7 +122,7 @@ ResidentTargetCapture bind_target(RankProgramImpl& p, ops::ContextBucketRange bu
         }
         std::size_t next = 0;
         p.target_forward(main, hidden, false, [&](const execution::MlaReadout& actual) {
-            record_mla(record, expected.at(next++), actual);
+            record_mla(record, expected.at(next++), actual, p.cuda);
         });
         head();
         p.timer.end_target(true);
@@ -136,6 +137,9 @@ ResidentTargetCapture bind_target(RankProgramImpl& p, ops::ContextBucketRange bu
 
 GraphPreparationSample RankProgramImpl::prepare_graphs(GraphPreparationMode mode) {
     if (!resources.plan.use_cuda_graph || graphs) return {};
+    if (expert_exchange)
+        throw std::invalid_argument(
+            "GLM5Next graph preparation requires a coordinated cross-replica expert route");
     if (mode == GraphPreparationMode::Complete) {
         prepare_graphs(GraphPreparationMode::Warmup);
         return prepare_graphs(GraphPreparationMode::Capture);

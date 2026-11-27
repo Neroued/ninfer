@@ -50,19 +50,34 @@ void MlaReadout::attention(ops::ContextBucket bucket, CudaExecutionView cuda) co
                           bucket, workspace, out, cuda);
 }
 
+namespace {
+void share_blocks(ParallelExecution* group, ops::KpoolBlockSelection blocks,
+                  CudaExecutionView cuda) {
+    if (!group) return;
+    group->broadcast(blocks.pool_ids, 0, cuda);
+    group->broadcast(blocks.pool_counts, 0, cuda);
+    group->broadcast(blocks.selection_end, 0, cuda);
+}
+} // namespace
+
+void MlaReadout::share_selection(CudaExecutionView cuda) const {
+    share_blocks(selection_group, selection, cuda);
+}
+
 MlaRun::MlaRun(const Tensor& input, const TextConfig& c, const MlaParameters& p,
                ops::KpoolMlaBatchView batch, ops::ConstKpoolTailStateView before,
                std::optional<ops::KpoolTailStateView> after, ops::KpoolMlaCacheView cache,
                ops::KpoolRawRecordWriteView records, const Tensor& selection_rows,
                ops::ContextBucket bucket, Tensor output, MemoryArena& arena, CudaExecutionView cuda,
-               std::optional<MlaSelection> selection)
+               std::optional<MlaSelection> selection, ParallelExecution* selection_group)
     : config_(c), parameters_(p), input_(input), output_(output), selection_rows_(selection_rows),
       batch_(batch), before_(before), after_(after), cache_(cache), records_(records),
       bucket_(bucket), arena_(arena), cuda_(cuda), scope_(arena.scope()),
       buffers_(workspace::mla(arena, c, batch.positions.ne[0] * batch.positions.ne[1],
-                              selection && selection->reuse, !selection)),
+                              (!p.query_index || (selection && selection->reuse)), !selection)),
       selection_(selection ? selection->value : buffers_.selection),
-      reuse_(selection && selection->reuse) {}
+      reuse_(!p.query_index || (selection && selection->reuse)),
+      selection_group_(selection && selection->reuse ? nullptr : selection_group) {}
 
 void MlaRun::prepare() {
     const auto& m = config_.mla;
@@ -83,7 +98,7 @@ void MlaRun::prepare() {
                     parameters_.query.policy, arena_, cuda_);
     else {
         const std::array outputs{buffers_.query, buffers_.index_query};
-        ops::linear_split(buffers_.query_lowrank, parameters_.query_index, outputs, arena_, cuda_);
+        ops::linear_split(buffers_.query_lowrank, *parameters_.query_index, outputs, arena_, cuda_);
     }
 }
 
@@ -104,7 +119,8 @@ MlaReadout MlaRun::readout(ops::ContextBucketRange buckets) {
                  {},
                  float(1.0 / std::sqrt(double(m.query_dim))),
                  bucket_,
-                 !reuse_};
+                 !reuse_,
+                 selection_group_};
     auto scope       = arena_.scope();
     const auto bytes = r.scratch_bytes(buckets, cuda_.multiprocessor_count());
     r.scratch = bytes ? arena_.alloc_bytes(bytes, 256) : MemorySpan{nullptr, 0, cuda_.device()};
@@ -121,6 +137,7 @@ void MlaRun::execute(const MlaSubmit& submit) {
     } else {
         const auto call = readout(bucket_);
         if (call.index) call.indexer(bucket_, cuda_);
+        call.share_selection(cuda_);
         call.attention(bucket_, cuda_);
     }
     finish();
@@ -152,19 +169,27 @@ void mla_prefill(const Tensor& input, const TextConfig& config, const MlaParamet
                  const ops::KpoolMlaRaggedBatchView& batch, ops::ConstKpoolTailStateView before,
                  ops::KpoolTailStateView after, ops::KpoolMlaCacheView cache,
                  const Tensor& selection_rows, ops::ContextBucket bucket, Tensor& output,
-                 MemoryArena& arena, CudaExecutionView cuda) {
-    const auto& m       = config.mla;
-    const int n         = batch.ragged.total_tokens();
-    auto scope          = arena.scope();
-    auto buffers        = workspace::mla(arena, config, n, false);
-    const auto& prepare = p.prepare[static_cast<std::size_t>(ops::KpoolMlaPrepareProjection::Full)];
-    ops::kpool_mla_prepare_update(input, prepare, batch, before, cache, after,
-                                  {buffers.query_lowrank, buffers.coefficients}, arena, cuda);
-    const std::array projections{buffers.query, buffers.index_query};
-    ops::linear_split(buffers.query_lowrank, p.query_index, projections, arena, cuda);
-    ops::kpool_indexer(
-        buffers.index_query.view({dimension(m.index_dim), dimension(m.index_heads), n}),
-        buffers.coefficients, cache.index, batch, bucket, arena, buffers.selection, cuda);
+                 MemoryArena& arena, CudaExecutionView cuda, ParallelExecution* selection_group) {
+    const auto& m   = config.mla;
+    const int n     = batch.ragged.total_tokens();
+    auto scope      = arena.scope();
+    auto buffers    = workspace::mla(arena, config, n, !p.query_index);
+    const auto kind = p.query_index ? ops::KpoolMlaPrepareProjection::Full
+                                    : ops::KpoolMlaPrepareProjection::QueryAndHistory;
+    ops::kpool_mla_prepare_update(
+        input, p.prepare[static_cast<std::size_t>(kind)], batch, before, cache, after,
+        {buffers.query_lowrank, p.query_index ? buffers.coefficients : Tensor{}}, arena, cuda);
+    if (p.query_index) {
+        const std::array projections{buffers.query, buffers.index_query};
+        ops::linear_split(buffers.query_lowrank, *p.query_index, projections, arena, cuda);
+        ops::kpool_indexer(
+            buffers.index_query.view({dimension(m.index_dim), dimension(m.index_heads), n}),
+            buffers.coefficients, cache.index, batch, bucket, arena, buffers.selection, cuda);
+    } else {
+        ops::linear(buffers.query_lowrank, p.query.weight, buffers.query, p.query.policy, arena,
+                    cuda);
+    }
+    share_blocks(selection_group, buffers.selection, cuda);
     auto attended     = buffers.output.view({dimension(m.value_dim), dimension(m.heads), n});
     const float scale = float(1.0 / std::sqrt(double(m.query_dim)));
     ops::kpool_sparse_mla(buffers.query.view({dimension(m.query_dim), dimension(m.heads), n}),

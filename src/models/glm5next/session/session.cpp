@@ -14,7 +14,7 @@ SessionImpl::SessionImpl(std::shared_ptr<const ModelDefinition> model, SessionPl
       directory(*directory_owner),
       recovery_metadata(directory.metadata_budget(),
                         shape.purpose == EnginePurpose::Generation ? shape.max_concurrency : 0,
-                        plan.states.size(), plan.states.size()),
+                        plan.states.size(), plan.attention.size()),
       checkpoints(Checkpoints::capacity_for_metadata(directory.metadata_budget().limit()),
                   directory.metadata_budget(), &recovery_index) {
     sequences.resize(shape.max_concurrency);
@@ -26,7 +26,7 @@ SessionImpl::SessionImpl(std::shared_ptr<const ModelDefinition> model, SessionPl
         count_builder.prepare(definition->resources().text.public_token_count);
     }
     releases.reserve(shape.max_concurrency);
-    for (std::uint32_t i = 0; i < plan.states.size(); ++i) placements.push_back({i});
+    for (std::uint32_t i = 0; i < plan.attention.size(); ++i) placements.push_back({i});
     for (std::uint16_t i = 0; i < pool_count(); ++i)
         pools.push_back({{i}, i == 0 ? "main" : "mtp"});
 }
@@ -185,8 +185,10 @@ PreparedSession prepare_session(std::shared_ptr<const ModelDefinition> definitio
     if (!definition) throw std::invalid_argument("invalid GLM5Next session definition");
     if (!directory) throw std::invalid_argument("GLM Session requires its prepared directory");
     if (!plan.batches || plan.batches->resident_capacity() != plan.shape.max_concurrency ||
-        plan.batches->attention_owners() != plan.states.size())
+        plan.batches->attention_owners() != plan.context.state.layouts.size() ||
+        plan.states.size() != plan.context.ranks.size())
         throw std::invalid_argument("GLM Session batch plan differs from prepared state");
+    plan.attention     = AttentionOwners(plan.states.size(), plan.batches->attention_owners());
     plan.decode_routes = make_decode_routes(plan.shape, *plan.batches);
     return PreparedSession(std::make_unique<detail::SessionImpl>(
         std::move(definition), std::move(plan), std::move(directory)));

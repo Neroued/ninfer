@@ -80,12 +80,13 @@ void RankProgramImpl::commit_speculative(const Commit& commit) {
             const bool reuse =
                 n && row.main_frontier && proposal && proposal->draft_extents[logical];
             skip[i] = !row.main_frontier || reuse;
-            repair |= row.attention_rank == parameters.profile->local.rank && m > unsigned(reuse);
+            repair |=
+                row.attention_owner == parameters.profile->local.owner() && m > unsigned(reuse);
         }
     }
     if (!any) return;
     const auto& a      = io.attention;
-    const auto own     = f.physical.owners[parameters.profile->local.rank];
+    const auto own     = f.physical.owners[parameters.profile->local.owner()];
     auto* local_counts = static_cast<std::int32_t*>(host(a.accepted_columns).data);
     auto* local_active = static_cast<std::int32_t*>(host(a.active_columns).data);
     for (std::uint32_t j = 0; j < f.batch.attention.rows; ++j) {

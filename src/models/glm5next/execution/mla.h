@@ -1,4 +1,5 @@
 #pragma once
+#include "models/common/parallel_execution.h"
 #include "models/glm5next/execution/batch.h"
 #include "models/glm5next/execution/parameters.h"
 #include "models/glm5next/execution/workspace.h"
@@ -6,6 +7,11 @@
 #include <functional>
 
 namespace ninfer::models::glm5next::execution {
+struct AttentionExecution {
+    ParallelExecution* heads  = nullptr;
+    ParallelExecution* owners = nullptr;
+};
+
 struct MlaSelection {
     ops::KpoolBlockSelection value;
     bool reuse = false;
@@ -23,6 +29,8 @@ struct MlaReadout {
     float scale;
     ops::ContextBucket bucket;
     bool index;
+    ParallelExecution* selection_group = nullptr;
+    void share_selection(CudaExecutionView) const;
 
     [[nodiscard]] ops::OpGraphProfile index_profile(ops::ContextBucket, int sms) const;
     [[nodiscard]] ops::OpGraphProfile attention_profile(ops::ContextBucket, int sms) const;
@@ -39,7 +47,7 @@ public:
            ops::ConstKpoolTailStateView, std::optional<ops::KpoolTailStateView>,
            ops::KpoolMlaCacheView, ops::KpoolRawRecordWriteView, const Tensor& selection_rows,
            ops::ContextBucket bucket, Tensor output, MemoryArena&, CudaExecutionView,
-           std::optional<MlaSelection> = {});
+           std::optional<MlaSelection> = {}, ParallelExecution* selection_group = nullptr);
     void prepare();
     [[nodiscard]] MlaReadout readout(ops::ContextBucketRange);
     void execute(const MlaSubmit& = {});
@@ -60,6 +68,7 @@ private:
     workspace::MlaBuffers buffers_;
     ops::KpoolBlockSelection selection_;
     bool reuse_;
+    ParallelExecution* selection_group_;
 };
 
 void mla_history(const Tensor&, const MlaParameters&, const ops::KpoolMlaBatchView&,
@@ -72,5 +81,6 @@ void mla_history(const Tensor&, const MlaParameters&, const ops::KpoolMlaRaggedB
 void mla_prefill(const Tensor&, const TextConfig&, const MlaParameters&,
                  const ops::KpoolMlaRaggedBatchView&, ops::ConstKpoolTailStateView,
                  ops::KpoolTailStateView, ops::KpoolMlaCacheView, const Tensor& selection_rows,
-                 ops::ContextBucket, Tensor&, MemoryArena&, CudaExecutionView);
+                 ops::ContextBucket, Tensor&, MemoryArena&, CudaExecutionView,
+                 ParallelExecution* selection_group = nullptr);
 } // namespace ninfer::models::glm5next::execution

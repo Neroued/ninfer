@@ -129,10 +129,10 @@ void RankProgramImpl::forward() {
             for (auto& [rank, s] : w.states) s.source = s.destination;
         rows       = {&w, 1};
         f.physical = {{1, 1}, {0}, {}};
-        f.physical.owners.resize(parameters.profile->local.size);
+        f.physical.owners.resize(parameters.profile->local.attention.size());
         for (std::uint32_t rank = 0; rank < f.physical.owners.size(); ++rank)
-            f.physical.owners[rank] = {rank > w.attention_rank ? 1U : 0U,
-                                       rank == w.attention_rank ? 1U : 0U};
+            f.physical.owners[rank] = {rank > w.attention_owner ? 1U : 0U,
+                                       rank == w.attention_owner ? 1U : 0U};
     } else
         f.physical = work_batch(work);
     f.tokens = rows.front().ids.size();
@@ -190,7 +190,7 @@ void RankProgramImpl::forward() {
             auto last         = f.hidden.slice(1, f.tokens - 1, 1);
             const auto offset = rows[0].states.at(parameters.profile->local.rank).destination;
             auto destination =
-                resources.states.image(rows[0].attention_rank == parameters.profile->local.rank)
+                resources.states.image(rows[0].attention_owner == parameters.profile->local.owner())
                     .tensor(resources.plan.state.hidden, offset);
             copy_bytes_async({destination.data, destination.bytes(), cuda.device()},
                              {last.data, last.bytes(), cuda.device()}, cuda);
@@ -243,6 +243,39 @@ void RankProgramImpl::forward_packed_prefill(const ForwardWork& work) {
     }
 }
 
+moe::SigmoidPass RankProgramImpl::expert_pass(std::size_t traversal) {
+    if (!expert_exchange) return {};
+    const auto& step = compute->request.work.exchange.value();
+    return {expert_exchange.get(), dimension(step.columns.at(traversal)),
+
+            parameters.profile->local.rank == 0};
+}
+
+void RankProgramImpl::serve_experts() {
+    const auto& step = *compute->request.work.exchange;
+    for (std::size_t i = 0; i < step.columns.size(); ++i) {
+        const auto pass = expert_pass(i);
+        if (i < step.draft_passes) {
+            const auto& m = parameters.profile->mtp->moe;
+            pass.run(m.bank, m.math, parameters.mtp->moe.weights, nullptr, nullptr,
+                     resources.workspace, cuda);
+        } else {
+            for (std::size_t l = 0; l < parameters.text.layers.size(); ++l) {
+                const auto* m =
+                    std::get_if<execution::MoeProfile>(&parameters.profile->text.layers[l].ffn);
+                if (m)
+                    pass.run(
+                        m->bank, m->math,
+                        std::get<execution::MoeParameters>(parameters.text.layers[l].ffn).weights,
+                        nullptr, nullptr, resources.workspace, cuda);
+            }
+        }
+    }
+    timer.record_result();
+    compute_done.record(cuda.stream());
+    compute->phase = ComputePhase::AwaitExpertService;
+}
+
 execution::TextRun RankProgramImpl::text_run(const execution::BatchView& call,
                                              execution::StateUpdate update) {
     const auto& io     = frame;
@@ -257,7 +290,9 @@ execution::TextRun RankProgramImpl::text_run(const execution::BatchView& call,
          records(io.main_records.raw_gates), parallel ? &*parallel : nullptr,
          parameters.draft
              ? draft_features(call, std::holds_alternative<execution::PackedPrefillUpdate>(update))
-             : Tensor{}},
+             : Tensor{},
+         attention_groups(),
+         expert_exchange ? expert_pass(compute->main_pass++) : moe::SigmoidPass{}},
         call, update, cuda);
 }
 
@@ -415,6 +450,14 @@ void RankProgramImpl::advance_compute() {
     if (!compute) return;
     auto& f = *compute;
     switch (f.phase) {
+    case ComputePhase::AwaitExpertService:
+        if (compute_done.ready()) {
+            timer.observe_result(f.gpu);
+            events.emplace_back(runtime::ResultReady<ExecutionTypes>{
+                f.request.ticket, moe::ExpertServiceResult{f.request.work.exchange->id}});
+            f.phase = ComputePhase::PendingCommit;
+        }
+        break;
     case ComputePhase::Forward:
         if (std::holds_alternative<SpeculativeWork>(f.request.work.operation))
             prepare_speculative();

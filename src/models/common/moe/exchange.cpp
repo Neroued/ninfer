@@ -282,9 +282,9 @@ struct SourceScratch {
 };
 
 template <class Arena>
-SourceScratch source_scratch(Arena& a, int h, int k, int n) {
+SourceScratch source_scratch(Arena& a, int h, int k, int n, bool gate = true) {
     return {{a.alloc(DType::I32, {k, n}), a.alloc(DType::FP32, {k, n})},
-            a.alloc(DType::FP32, {n}),
+            gate ? a.alloc(DType::FP32, {n}) : Tensor{},
             a.alloc(DType::FP32, {h, n})};
 }
 } // namespace
@@ -326,6 +326,24 @@ std::size_t ExpertExchangeStage::softmax_workspace_bytes(unsigned peer,
     }
     group_scratch(l, slots, m);
     (void)l.alloc_bytes(ops::compact_routed_swiglu_workspace_bytes(p.routed, m));
+    return l.peak_bytes();
+}
+
+std::size_t ExpertExchangeStage::sigmoid_workspace_bytes(unsigned peer,
+                                                         const ops::SigmoidMoeProfile& p) const {
+    WorkspaceLayoutBuilder l;
+    const int b = block_columns, local = slots.at(peer);
+    source_scratch(l, hidden, top_k, b, false);
+    (void)l.alloc(DType::I32, {b});
+    {
+        auto scratch      = l.scope();
+        const auto route  = ops::topk_sigmoid_route_workspace_capacity_bytes(p.routing, 1, b);
+        const auto shared = ops::swiglu_workspace_capacity_bytes(p.shared, 1, b, DType::FP32);
+        (void)l.alloc_bytes(std::max(route, shared));
+    }
+    const auto hits = hit_capacity(b, top_k, local);
+    group_scratch(l, local, hits);
+    (void)l.alloc_bytes(ops::compact_routed_swiglu_workspace_bytes(p.routed, hits));
     return l.peak_bytes();
 }
 
@@ -425,6 +443,41 @@ void ExpertExchange::softmax_layer(const DeviceExpertPlacement& place, const Par
                            exec);
         block(place, p.profile.routed, weights, &src, &scratch.routes, &scratch.shared, arena, exec,
               totals);
+    }
+}
+
+void ExpertExchange::sigmoid_layer(const DeviceExpertPlacement& place,
+                                   const ops::SigmoidMoeProfile& p,
+                                   const ops::SigmoidMoeWeights& weights, int extent,
+                                   const LayerSource* source, bool representative,
+                                   ParallelExecution* tensor, MemoryArena& workspace,
+                                   CudaExecutionView exec) {
+    check(place, p.routed, extent, source, nullptr, exec);
+    auto lease = workspace.scope();
+    MemoryArena arena(workspace.alloc_bytes(source
+                                                ? stage_.sigmoid_workspace_bytes(group_.rank(), p)
+                                                : routed_workspace_bytes(p.routed)));
+    for (int wave = 0; wave < stage_.blocks(extent); ++wave) {
+        const auto base = wave * stage_.block_columns;
+        if (!source || base >= source->hidden.ne[1]) {
+            block(place, p.routed, weights.routed, nullptr, nullptr, nullptr, arena, exec, nullptr);
+            continue;
+        }
+        const auto n = std::min(stage_.block_columns, source->hidden.ne[1] - base);
+        auto scope   = arena.scope();
+        auto scratch = source_scratch(arena, stage_.hidden, stage_.top_k, n, false);
+        LayerSource local{source->hidden.slice(1, base, n), source->output.slice(1, base, n),
+                          block_validity(*source, base, n, arena, exec), source->mode};
+        ops::swiglu(local.hidden, p.shared, weights.shared, scratch.shared, arena, exec);
+        if (tensor) tensor->sum(scratch.shared, exec);
+        if (representative)
+            ops::topk_sigmoid_route(local.hidden, p.routing, weights.control,
+                                    weights.correction_bias, scratch.routes, local.validity, arena,
+                                    exec);
+        block(place, p.routed, weights.routed, representative ? &local : nullptr,
+              representative ? &scratch.routes : nullptr,
+              representative ? &scratch.shared : nullptr, arena, exec, nullptr);
+        if (tensor) tensor->broadcast(local.output, 0, exec);
     }
 }
 

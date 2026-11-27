@@ -95,31 +95,38 @@ ops::KpoolMlaCacheView CacheViews::layer(std::uint32_t layer) const {
 }
 
 std::vector<context::RecordRangeCopy> state_conversion(std::span<const StatePlacement> states,
+                                                       const AttentionOwners& owners,
                                                        std::uint32_t from, std::uint32_t to) {
-    if (from >= states.size() || to >= states.size())
-        throw std::out_of_range("GLM5Next State conversion owner is outside its rank group");
     std::vector<context::RecordRangeCopy> out;
     for (std::uint32_t rank = 0; rank < states.size(); ++rank)
         out.push_back({rank, rank, 0, 0, states[rank].common.bytes});
-    const auto& source      = states[from].owner_fields;
-    const auto& destination = states[to].owner_fields;
-    if (source.bytes != destination.bytes)
-        throw std::invalid_argument("GLM5Next owner tail layouts differ");
-    out.push_back({from, to, source.offset, destination.offset, source.bytes});
+    const auto sources = owners.members(from), destinations = owners.members(to);
+    for (std::size_t i = 0; i < sources.size(); ++i) {
+        const auto src = sources[i], dst = destinations[i];
+        const auto& s = states[src].owner_fields;
+        const auto& d = states[dst].owner_fields;
+        if (s.bytes != d.bytes) throw std::invalid_argument("GLM5Next owner tail layouts differ");
+        out.push_back({src, dst, s.offset, d.offset, s.bytes});
+    }
     return out;
 }
 
-context::HistoryCopyLayout history_conversion(const KVPageLayout& cache, std::uint32_t from,
+context::HistoryCopyLayout history_conversion(const KVPageLayout& cache,
+                                              const AttentionOwners& owners, std::uint32_t from,
                                               std::uint32_t to, std::uint32_t tail) {
     context::HistoryCopyLayout out;
-    out.full_page.push_back({from, to, 0, 0, cache.page_bytes});
     out.partial_columns = tail;
-    for (const auto& plane : cache.planes) {
-        const auto bytes = (tail / plane.geometry.tokens_per_row) * plane.row_stride_bytes();
-        if (!bytes) continue;
-        for (std::int32_t head = 0; head < plane.geometry.head_extent; ++head) {
-            const auto offset = plane.tensor.region.offset + head * plane.head_stride_bytes;
-            out.partial_page.push_back({from, to, offset, offset, bytes});
+    const auto sources = owners.members(from), destinations = owners.members(to);
+    for (std::size_t i = 0; i < sources.size(); ++i) {
+        const auto src = sources[i], dst = destinations[i];
+        out.full_page.push_back({src, dst, 0, 0, cache.page_bytes});
+        for (const auto& plane : cache.planes) {
+            const auto bytes = (tail / plane.geometry.tokens_per_row) * plane.row_stride_bytes();
+            if (!bytes) continue;
+            for (std::int32_t head = 0; head < plane.geometry.head_extent; ++head) {
+                const auto offset = plane.tensor.region.offset + head * plane.head_stride_bytes;
+                out.partial_page.push_back({src, dst, offset, offset, bytes});
+            }
         }
     }
     return out;

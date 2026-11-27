@@ -1,6 +1,7 @@
 #pragma once
 
 #include "models/common/moe/execution.h"
+#include "models/common/parallel_execution.h"
 #include "models/common/moe/placement.h"
 #include "distributed/communication.h"
 #include "distributed/wire.h"
@@ -28,6 +29,8 @@ struct ExpertExchangeStage {
     [[nodiscard]] std::size_t routed_workspace_bytes(unsigned peer,
                                                      const ops::RoutedSwiGLUProfile&) const;
     [[nodiscard]] std::size_t softmax_workspace_bytes(unsigned peer, const ops::MoeProfile&) const;
+    [[nodiscard]] std::size_t sigmoid_workspace_bytes(unsigned peer,
+                                                      const ops::SigmoidMoeProfile&) const;
     // The rank-load digest binds weights to the installed topology. This description lets
     // participants match layer, peer order and physical envelopes before launching any exchange.
     void encode(distributed::wire::Encoder&, int physical_columns) const;
@@ -96,6 +99,12 @@ public:
     void softmax_layer(const DeviceExpertPlacement&, const Parameters&, int physical_columns,
                        const LayerSource*, MemoryArena&, CudaExecutionView,
                        Tensor* observation = nullptr);
+    // A replica's TP ranks share the same activations. Each computes its own shared
+    // intermediate slice; one representative dispatches the unique routed columns.
+    void sigmoid_layer(const DeviceExpertPlacement&, const ops::SigmoidMoeProfile&,
+                       const ops::SigmoidMoeWeights&, int physical_columns, const LayerSource*,
+                       bool representative, ParallelExecution* tensor, MemoryArena&,
+                       CudaExecutionView);
     // For a model with its own router and shared term. Source routes are global and shared is
     // its already scaled FP32 contribution. Both are ignored when the local source is absent.
     void routed_layer(const DeviceExpertPlacement&, const ops::RoutedSwiGLUProfile&,

@@ -15,9 +15,6 @@ std::uint32_t count(std::uint64_t value) {
 
 ExecutionShape shape(const execution::ModelProfile& p, const EngineOptions& o,
                      KvCacheVectorFormat index_format) {
-    if (p.local.size == 1 && (p.draft || (o.speculative.backend == SpeculativeBackend::DFlash2 &&
-                                          o.speculative.draft_tokens > 0)))
-        throw std::invalid_argument("GLM5Next DFlash2 requires TP=2");
     if (load_options(o) != p.options)
         throw std::invalid_argument("GLM5Next execution components differ from selected weights");
     if (!o.max_context || o.max_context > p.config.text.max_context || !o.max_concurrency)
@@ -53,10 +50,11 @@ context::ContextDirectorySpec schema(const ExecutionPlan& p, std::size_t capacit
         if (global || i == rank) spec.ranks.push_back({i, i == rank ? capacity : 0, 0});
     spec.state.logical_capacity =
         count(capacity / p.state.common.image_bytes + 2ULL * p.shape.max_concurrency);
-    for (std::uint32_t owner = 0; owner < size; ++owner) {
+    const auto& groups = p.profile->local.attention;
+    for (std::uint32_t owner = 0; owner < groups.size(); ++owner) {
         context::StateLayoutSpec layout{owner, {}};
         for (const auto& part : spec.ranks) {
-            const auto& state = part.rank == owner ? p.state.owner : p.state.common;
+            const auto& state = groups.owner(part.rank) == owner ? p.state.owner : p.state.common;
             layout.parts.push_back({part.rank, state.image_bytes, state.alignment});
         }
         spec.state.layouts.push_back(std::move(layout));
@@ -111,7 +109,7 @@ ExecutionPlan plan_execution(std::shared_ptr<const execution::ModelProfile> prof
     out.shape   = shape(*out.profile, o, index_format);
     out.batches = std::make_shared<const BatchExecutionPlan>(std::move(batches));
     if (out.batches->resident_capacity() != out.shape.max_concurrency ||
-        out.batches->attention_owners() != out.profile->local.size)
+        out.batches->attention_owners() != out.profile->local.attention.size())
         throw std::invalid_argument("GLM batch plan differs from its execution resources");
     out.decode_routes             = make_decode_routes(out.shape, *out.batches);
     out.use_cuda_graph = !out.batches->graph_rows().empty();
@@ -142,9 +140,11 @@ ExecutionPlan plan_execution(std::shared_ptr<const execution::ModelProfile> prof
 
 runtime::ContextCapacityPlan describe_execution_capacity(const ExecutionPlan& p) {
     runtime::ContextCapacityPlan out;
-    const auto rank = p.profile->local.rank, size = p.profile->local.size;
-    for (std::uint32_t owner = 0; owner < size; ++owner) {
-        const auto& state = owner == rank ? p.state.owner : p.state.common;
+    const auto& groups  = p.profile->local.attention;
+    const auto rank     = p.profile->local.rank;
+    const auto owner_id = groups.owner(rank), owners = groups.size();
+    for (std::uint32_t owner = 0; owner < owners; ++owner) {
+        const auto& state = owner == owner_id ? p.state.owner : p.state.common;
         out.records.push_back({state.image_bytes, state.alignment});
     }
     out.records.push_back({p.main.cache.page.page_bytes, p.main.cache.page.alignment});
@@ -157,9 +157,9 @@ runtime::ContextCapacityPlan describe_execution_capacity(const ExecutionPlan& p)
     const auto working_set = [&](std::string name, std::uint32_t states, std::uint32_t main,
                                  std::uint32_t mtp) {
         runtime::ContextStartupWorkingSet set{std::move(name)};
-        set.records.push_back({geometry.spec_classes[rank], states});
-        set.records.push_back({geometry.spec_classes[size], main});
-        if (p.mtp) set.records.push_back({geometry.spec_classes[size + 1], mtp});
+        set.records.push_back({geometry.spec_classes[owner_id], states});
+        set.records.push_back({geometry.spec_classes[owners], main});
+        if (p.mtp) set.records.push_back({geometry.spec_classes[owners + 1], mtp});
         return set;
     };
     // A retained source and a writable destination coexist through publication. COW/provisional
@@ -171,10 +171,10 @@ runtime::ContextCapacityPlan describe_execution_capacity(const ExecutionPlan& p)
                     pages(p.shape.max_context - 1) + suffix_pages);
     auto reference_records = maximum.records;
     // One full-context request per attention owner: remote owners still need this KDA shard.
-    for (std::uint32_t owner = 0; owner < size; ++owner)
-        if (owner != rank)
+    for (std::uint32_t owner = 0; owner < owners; ++owner)
+        if (owner != owner_id)
             reference_records.push_back({geometry.spec_classes[owner], state_copies});
-    out.reference = {p.shape.max_context, size, geometry.required_bytes(reference_records)};
+    out.reference = {p.shape.max_context, owners, geometry.required_bytes(reference_records)};
     out.working_sets.push_back(std::move(maximum));
     const auto concurrent   = p.shape.max_concurrency;
     const auto short_tokens = std::min<std::uint64_t>(
@@ -183,7 +183,7 @@ runtime::ContextCapacityPlan describe_execution_capacity(const ExecutionPlan& p)
         working_set("concurrent owner requests", count(std::uint64_t(state_copies) * concurrent),
                     count(std::uint64_t(concurrent) * (pages(short_tokens) + 1)),
                     count(std::uint64_t(concurrent) * (pages(short_tokens - 1) + suffix_pages))));
-    out.fixed_device_bytes = p.fixed_bytes + p.workspace.bytes +
+    out.fixed_device_bytes = p.fixed_bytes + p.profile->exchange_bytes + p.workspace.bytes +
                              (p.workspace.vision ? p.workspace.vision->output_bytes : 0) +
                              (p.shared_physical_memory ? p.pinned_bytes() : 0);
     out.fixed_host_bytes = p.pinned_bytes();

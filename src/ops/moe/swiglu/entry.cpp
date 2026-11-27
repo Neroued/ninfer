@@ -74,10 +74,18 @@ std::size_t capacity(const SwiGLUProfile& p, int tokens) {
     }
     return layout.peak_bytes(1);
 }
+
+void output_type(DType type) {
+    // The registered CUDA down projections store their final result in BF16.
+    require(type == DType::BF16,
+            "swiglu: this backend's unscaled down projection requires a BF16 destination");
+}
 } // namespace
 
-std::size_t swiglu_workspace_capacity_bytes(const SwiGLUProfile& p, int first, int last) {
+std::size_t swiglu_workspace_capacity_bytes(const SwiGLUProfile& p, int first, int last,
+                                            DType destination_type) {
     profile(p);
+    output_type(destination_type);
     require(first > 0 && last >= first, "swiglu: invalid token interval");
     if (detail::swiglu_ffn::scaled_fp8_format(p.gate_up_type))
         return detail::swiglu_ffn::scaled_fp8_workspace_capacity_bytes(p, first, last);
@@ -93,6 +101,7 @@ std::size_t swiglu_workspace_capacity_bytes(const SwiGLUProfile& p, int first, i
 void swiglu(const Tensor& x, const SwiGLUProfile& p, const SwiGLUWeights& weights, Tensor& out,
             MemoryArena& ws, CudaExecutionView execution) {
     profile(p);
+    output_type(out.dtype);
     const int tokens = x.ne[1];
     require(tokens > 0, "swiglu: token count must be positive");
     const auto bytes = capacity(p, tokens);
@@ -102,7 +111,6 @@ void swiglu(const Tensor& x, const SwiGLUProfile& p, const SwiGLUWeights& weight
         detail::swiglu_ffn::scaled_fp8_format(p.gate_up_type)) {
         detail::MoeOperands operands(op, execution);
         (void)operands.input(x, p.hidden);
-        require(out.dtype == DType::BF16, "swiglu: destination must be BF16");
         operands.output(out, p.hidden, tokens, MoeEpilogue::Write);
         operands.unscaled_shared(weights, p);
         operands.workspace(work.storage());

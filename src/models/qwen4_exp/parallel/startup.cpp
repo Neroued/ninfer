@@ -1,37 +1,12 @@
 #include "models/qwen4_exp/parallel/startup.h"
 #include "runtime/observability/snapshot.h"
 #include "runtime/executor/collective_executor.h"
+#include "models/common/moe/step_schedule.h"
 
 #include <algorithm>
 
 namespace ninfer::models::qwen4_exp {
-namespace {
-struct ExpertSchedule {
-    std::uint32_t chunk;
-
-    std::optional<runtime::CollectiveShape> shape(const Work& work) const {
-        auto step = plan_expert_step(work, chunk);
-        if (!step) return {};
-        return runtime::CollectiveShape{step->draft_passes, std::move(step->columns)};
-    }
-
-    void bind(Work& work, const runtime::CollectiveDecision& d) const {
-        work.exchange = ExpertStep{d.step, d.shape.route, d.shape.extents};
-    }
-
-    Work service(const runtime::CollectiveDecision& d) const {
-        Work work{{}, ExpertServiceWork{}};
-        bind(work, d);
-        return work;
-    }
-
-    Commit service_commit(const Result& result) const {
-        if (!std::holds_alternative<ExpertServiceResult>(result))
-            throw std::logic_error("Qwen4Exp service worker returned a request result");
-        return {};
-    }
-};
-} // namespace
+using ExpertSchedule = moe::ExpertSchedule<ExecutionTypes>;
 
 ParallelStartup::ParallelStartup(const artifact::Reader& reader, const EngineOptions& options)
     : definition_(read_definition(reader, load_options(options))),

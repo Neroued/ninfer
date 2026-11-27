@@ -186,6 +186,7 @@ struct CommunicationMemory {
 struct BackendCommunicationWork {
     CommunicationBackend backend = CommunicationBackend::Nccl;
     CommunicationWork work;
+    std::uint32_t group = 0;
 };
 
 using CommunicationGraphWork = std::vector<BackendCommunicationWork>;

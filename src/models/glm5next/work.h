@@ -1,4 +1,5 @@
 #pragma once
+#include "models/common/moe/step.h"
 
 #include "models/common/token_input.h"
 #include "models/common/batch.h"
@@ -22,7 +23,7 @@ using ContextActions = std::map<std::uint32_t, context::ContextActions>;
 
 struct WorkRow {
     runtime::ExecutionMember member;
-    std::uint32_t attention_rank = 0;
+    std::uint32_t attention_owner = 0;
     StateBindings states;
     context::TableRow main_table, mtp_table;
     std::uint32_t main_frontier = 0, mtp_frontier = 0;
@@ -86,7 +87,9 @@ struct ScoreWork {
 
 struct Work {
     ContextActions actions;
-    std::variant<ForwardWork, SpeculativeWork, ContextWork, ScoreWork> operation;
+    std::variant<ForwardWork, SpeculativeWork, ContextWork, ScoreWork, moe::ExpertServiceWork>
+        operation;
+    std::optional<moe::ExpertStep> exchange;
 };
 
 struct RowResult {
@@ -110,7 +113,7 @@ struct ScoreResult {
     std::vector<float> logprobs;
 };
 
-using Result = std::variant<ComputeResult, ContextResult, ScoreResult>;
+using Result = std::variant<ComputeResult, ContextResult, ScoreResult, moe::ExpertServiceResult>;
 
 struct CommitRow {
     runtime::ExecutionMember member;
@@ -146,6 +149,7 @@ struct WorkContract {
                   const runtime::DecisionInput&) const;
 };
 
+[[nodiscard]] std::optional<moe::ExpertStep> plan_expert_step(const Work&, std::uint32_t chunk);
 [[nodiscard]] std::span<const WorkRow> work_rows(const Work&);
 [[nodiscard]] const BatchPlan& work_batch(const Work&);
 void prepare_batch(Work&, const BatchExecutionPlan&);

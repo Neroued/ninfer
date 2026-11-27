@@ -7,6 +7,7 @@
 #include "core/platform.h"
 #if NINFER_ENABLE_DISTRIBUTED
 #    include "models/glm5next/wire.h"
+#    include "models/glm5next/parallel/startup.h"
 #endif
 #include <atomic>
 #include <deque>
@@ -40,7 +41,7 @@ void packed_work_contract() {
     for (unsigned i = 0; i < forward.rows.size(); ++i) {
         auto& row          = forward.rows[i];
         row.member         = {{i + 1, 1}, {{i}, 1}};
-        row.attention_rank = i == 0 ? 1 : 0;
+        row.attention_owner = i == 0 ? 1 : 0;
         row.states         = {{0, {32 * i, 32 * i + 16}}, {1, {32 * i, 32 * i + 16}}};
         row.main_table     = {0, i, 1};
     }
@@ -156,11 +157,14 @@ public:
     std::vector<glm::CommitRow> packed_commit;
     std::function<void()> replay_submitted;
     std::vector<std::uint32_t> accept;
+    glm::Commit last_commit;
+    unsigned submissions = 0, service_commits = 0;
     glm::ComputeResult computed;
 
     explicit Executor(glm::WorkContract c)
         : rt::Executor<glm::ExecutionTypes>(c.shape.max_concurrency), contract(std::move(c)) {
-        rank_descriptions_.push_back({});
+        rank_descriptions_.resize(contract.ranks);
+        for (unsigned i = 0; i < contract.ranks; ++i) rank_descriptions_[i].rank = i;
     }
 
     void observe_sample(const ExecutionSample& sample) { observe_execution(sample); }
@@ -195,7 +199,7 @@ public:
                             original_rows[row].ids == decoded_rows[row].ids &&
                             original_rows[row].sample == decoded_rows[row].sample &&
                             original_rows[row].constrained == decoded_rows[row].constrained &&
-                            original_rows[row].attention_rank == decoded_rows[row].attention_rank,
+                            original_rows[row].attention_owner == decoded_rows[row].attention_owner,
                         "wire changed inputs or attention ownership");
         }
 #endif
@@ -203,7 +207,13 @@ public:
         for (const auto& [rank, actions] : work.actions)
             for (const auto& action : actions.operations)
                 peer_copies += std::holds_alternative<ctx::PeerCopy>(action);
+        ++submissions;
         last = std::move(work);
+        if (std::holds_alternative<models::moe::ExpertServiceWork>(last.operation)) {
+            events.emplace_back(rt::ResultReady<glm::ExecutionTypes>{
+                ticket, models::moe::ExpertServiceResult{last.exchange->id}});
+            return ticket;
+        }
         if (const auto* context = std::get_if<glm::ContextWork>(&last.operation)) {
             events.emplace_back(rt::ResultReady<glm::ExecutionTypes>{ticket, glm::ContextResult{}});
             const rt::DeviceRetired retired{ticket, {next}, {}};
@@ -257,6 +267,9 @@ public:
 
     rt::CommitReceipt commit(rt::ExecutionTicket ticket, glm::Commit commit) override {
         contract.validate_commit(last, computed.rows, commit);
+        last_commit = commit;
+        if (std::holds_alternative<models::moe::ExpertServiceWork>(last.operation))
+            ++service_commits;
         const auto* forward = std::get_if<glm::ForwardWork>(&last.operation);
         if (forward && forward->kind == glm::ForwardKind::Prefill && forward->rows.size() > 1)
             packed_commit = commit.rows;
@@ -311,7 +324,8 @@ public:
 };
 
 glm::SessionPlan plan(const glm::ModelDefinition& definition, bool pressure = false,
-                      std::uint32_t concurrency = 3, std::uint32_t drafts = 3) {
+                      std::uint32_t concurrency = 3, std::uint32_t drafts = 3,
+                      unsigned rank_count = 2, unsigned owner_count = 2) {
     glm::SessionPlan p;
     p.shape   = {.max_context     = 256,
                  .max_concurrency = concurrency,
@@ -325,36 +339,42 @@ glm::SessionPlan plan(const glm::ModelDefinition& definition, bool pressure = fa
                  .gpu_timing    = false,
                  .speculative   = definition.options().speculative};
     p.batches = std::make_shared<const models::BatchExecutionPlan>(
-        models::make_batch_execution_spec(p.shape.max_concurrency, 2, true));
+        models::make_batch_execution_spec(p.shape.max_concurrency, owner_count, true));
     const auto& c            = definition.config().text;
     auto profile             = std::make_shared<glm::execution::ModelProfile>();
     profile->config          = definition.config();
-    profile->local.size      = 2;
-    profile->local.kda_heads = {0, c.kda.heads / 2};
+    profile->local.size      = rank_count;
+    profile->local.attention = glm::AttentionOwners(rank_count, owner_count);
+    profile->local.kda_heads = {0, c.kda.heads / rank_count};
     if (definition.options().mtp()) profile->mtp.emplace();
     if (definition.options().masked_draft()) {
         const auto& draft                = *profile->config.draft;
-        profile->draft.emplace().context = {glm::dimension(c.hidden),
-                                            glm::dimension(draft.attention.head_dim),
-                                            glm::dimension(draft.attention.num_key_value_heads / 2),
-                                            draft.sliding_window.value(),
-                                            QType::BF16,
-                                            draft.rms_norm_eps,
-                                            draft.rope_theta};
+        profile->draft.emplace().context = {
+            glm::dimension(c.hidden),
+            glm::dimension(draft.attention.head_dim),
+            glm::dimension(std::max(1U, draft.attention.num_key_value_heads / rank_count)),
+            draft.sliding_window.value(),
+            QType::BF16,
+            draft.rms_norm_eps,
+            draft.rope_theta};
     }
     const auto state = glm::describe_state(glm::plan_state(*profile));
-    p.states         = {state, state};
+    p.states.assign(rank_count, state);
     p.caches.push_back(
         ops::plan_kpool_mla_cache_layout(
             {ops::KpoolMlaStorage::BFloat16, p.shape.index_format, glm::dimension(c.mla.latent_dim),
              glm::dimension(c.mla.index_dim), glm::dimension(c.mla_layers)})
             .page);
-    p.context.ranks                  = {{0, 8ULL << 20, 0}, {1, 8ULL << 20, 0}};
+    const auto rank_bytes = std::max<std::size_t>(
+        8ULL << 20, (state.owner.bytes + p.caches.front().page_bytes) * (concurrency + 2) * 4);
+    for (unsigned rank = 0; rank < rank_count; ++rank)
+        p.context.ranks.push_back({rank, rank_bytes, 0});
     p.context.state.logical_capacity = 64;
-    for (unsigned owner = 0; owner < 2; ++owner) {
+    for (unsigned owner = 0; owner < owner_count; ++owner) {
         ctx::StateLayoutSpec layout{owner, {}};
-        for (unsigned rank = 0; rank < 2; ++rank) {
-            const auto record = rank == owner ? state.owner : state.common;
+        for (unsigned rank = 0; rank < rank_count; ++rank) {
+            const auto record =
+                profile->local.attention.owner(rank) == owner ? state.owner : state.common;
             layout.parts.push_back({rank, record.bytes, record.alignment});
         }
         p.context.state.layouts.push_back(std::move(layout));
@@ -365,8 +385,9 @@ glm::SessionPlan plan(const glm::ModelDefinition& definition, bool pressure = fa
                                .histories     = 256,
                                .page_capacity = 4,
                                .table_rows    = concurrency,
-                               .parts         = {{0, {page.page_bytes, page.alignment}},
-                                                 {1, {page.page_bytes, page.alignment}}}});
+                               .parts         = {}});
+    for (unsigned rank = 0; rank < rank_count; ++rank)
+        p.context.pools[0].parts.push_back({rank, {page.page_bytes, page.alignment}});
     if (definition.options().mtp()) {
         p.caches.push_back(
             ops::plan_kpool_mla_cache_layout({ops::KpoolMlaStorage::BFloat16, p.shape.index_format,
@@ -385,7 +406,8 @@ glm::SessionPlan plan(const glm::ModelDefinition& definition, bool pressure = fa
         ctx::ContextDirectory::metadata_bytes(p.context) +
         glm::detail::Checkpoints::metadata_bytes(records) +
         ctx::RecoveryIndex<>::metadata_bytes(records) +
-        ctx::recovery_value_metadata_bytes(records, p.shape.max_concurrency, 2, 2) +
+        ctx::recovery_value_metadata_bytes(records, p.shape.max_concurrency, rank_count,
+                                           owner_count) +
         ctx::PrefixStore::metadata_bytes(p.shape.max_context * p.shape.max_concurrency, 64);
     return p;
 }
@@ -401,7 +423,7 @@ void batch_geometry() {
             "executor decode counters do not preserve high-concurrency samples");
     const models::BatchExecutionPlan plan(models::make_batch_execution_spec(256, 3, true));
     std::vector<glm::WorkRow> rows(17);
-    for (std::size_t i = 0; i < rows.size(); ++i) rows[i].attention_rank = i % 3;
+    for (std::size_t i = 0; i < rows.size(); ++i) rows[i].attention_owner = i % 3;
     const auto physical = glm::plan_batch(rows, plan, true);
     require(physical.shape == models::PhysicalBatchShape{20, 6} && physical.members.size() == 17 &&
                 physical.owners.size() == 3,
@@ -409,7 +431,7 @@ void batch_geometry() {
     std::vector<std::uint32_t> expected;
     for (std::uint32_t owner = 0; owner < 3; ++owner)
         for (std::uint32_t row = 0; row < rows.size(); ++row)
-            if (rows[row].attention_rank == owner) expected.push_back(row);
+            if (rows[row].attention_owner == owner) expected.push_back(row);
     require(physical.members == expected, "owner grouping changed logical member order");
 #if NINFER_ENABLE_DISTRIBUTED
     glm::ForwardWork operation;
@@ -433,7 +455,7 @@ void batch_geometry() {
         rows.clear();
         for (std::uint32_t owner = 0; owner < owners.size(); ++owner)
             for (std::uint32_t n = 0; n < owners[owner]; ++n)
-                rows.emplace_back().attention_rank = owner;
+                rows.emplace_back().attention_owner = owner;
         require(glm::plan_batch(rows, plan, true).shape == shape,
                 "graph witness cannot reproduce its frozen physical geometry");
     }
@@ -468,7 +490,8 @@ struct Fixture {
     Fixture(std::shared_ptr<const glm::ModelDefinition> d, glm::SessionPlan p)
         : definition(d), frontend(make_frontend()), layout(std::move(p)),
           executor({layout.shape, layout.batches, d->config().text.vocabulary,
-                    d->resources().text.public_token_count, 2, 0, 0,
+                    d->resources().text.public_token_count,
+                    static_cast<unsigned>(layout.context.ranks.size()), 0, 0,
                     glm::make_decode_routes(layout.shape, *layout.batches)}),
           session(glm::prepare_session(d, layout, make_directory()), executor) {}
 
@@ -536,6 +559,162 @@ struct Fixture {
         idle();
     }
 };
+
+#if NINFER_ENABLE_DISTRIBUTED
+void schedule_experts(const artifact::Reader& reader, const DeploymentOptions& deployment,
+                      const glm::SessionPlan& layout, const glm::Work& work,
+                      const glm::Commit& adoption) {
+    EngineOptions options;
+    options.deployment               = deployment;
+    options.max_concurrency          = layout.shape.max_concurrency * deployment.parallel.dp;
+    options.max_context              = layout.shape.max_context;
+    options.prefill_chunk            = layout.shape.prefill_chunk;
+    options.speculative.backend      = SpeculativeBackend::Mtp;
+    options.speculative.draft_tokens = layout.shape.draft_tokens;
+    options.context_cache.host_capacity_bytes = 0;
+    glm::ParallelStartup startup(reader, options);
+    const auto& topo = startup.topology();
+    std::vector<distributed::wire::Payload> layouts;
+    for (const auto& identity : topo.ranks) {
+        const unsigned r = identity.tp.rank;
+        auto spec        = layout.context;
+        const auto local = spec.ranks.at(r);
+        spec.ranks       = {local};
+        for (auto& state : spec.state.layouts) {
+            const auto part = state.parts.at(r);
+            state.parts     = {part};
+        }
+        for (auto& pool : spec.pools) {
+            const auto part = pool.parts.at(r);
+            pool.parts      = {part};
+        }
+        glm::RankResourceDescription report{r, layout.shape, layout.batches->spec(),
+                                            layout.states.at(r), std::move(spec)};
+        for (const auto& cache : layout.caches) report.caches.push_back(cache.geometry);
+        report.observation.rank = identity.rank;
+        distributed::wire::Encoder out;
+        glm::encode(out, report);
+        layouts.emplace_back(std::move(out).take());
+    }
+    startup.resolve(layouts, options);
+    std::vector<Executor*> physical;
+    std::vector<std::unique_ptr<glm::ParallelStartup::Executor>> execution;
+    const auto& definition = *startup.definition();
+    for (const auto& replica : topo.replicas) {
+        glm::WorkContract contract{layout.shape,
+                                   layout.batches,
+                                   definition.config().text.vocabulary,
+                                   definition.resources().text.public_token_count,
+                                   deployment.parallel.tp,
+                                   0,
+                                   0,
+                                   glm::make_decode_routes(layout.shape, *layout.batches)};
+        auto recording    = std::make_unique<Executor>(std::move(contract));
+        recording->accept = {0, 1};
+        physical.push_back(recording.get());
+        execution.push_back(startup.coordinate(replica.replica_id, std::move(recording)));
+    }
+    const auto source = execution.size() - 1;
+    auto reservation  = execution[source]->try_reserve(rt::FrameKind::Compute);
+    require(bool(reservation), "no scaled source frame");
+    auto ticket  = execution[source]->submit(std::move(*reservation), work);
+    bool retired = false;
+    for (unsigned turn = 0; turn < 128; ++turn) {
+        for (unsigned i = 0; i < execution.size(); ++i) {
+            if (auto e = execution[i]->poll()) {
+                require(i == source, "zero-source service surfaced a request event");
+                if (std::holds_alternative<rt::ResultReady<glm::ExecutionTypes>>(*e))
+                    (void)execution[i]->commit(ticket, adoption);
+                else if (std::holds_alternative<rt::DeviceRetired>(*e))
+                    retired = true;
+                else
+                    throw std::runtime_error("unexpected scaled source event");
+            }
+        }
+    }
+    require(retired, "scaled EP source was never retired");
+    const auto width = std::max(1U, deployment.parallel.ep / deployment.parallel.tp);
+    for (unsigned i = 0; i < physical.size(); ++i) {
+        const bool involved = i / width == source / width;
+        require(physical[i]->submissions == unsigned(involved) &&
+                    physical[i]->service_commits == unsigned(involved && i != source),
+                "expert service touched another replica domain");
+        if (involved && width > 1)
+            require(physical[i]->last.exchange && physical[i]->last.exchange->id == 1,
+                    "GLM source and service workers missed their shared expert step");
+    }
+}
+#endif
+
+void scale_sessions(const std::filesystem::path& artifact) {
+    artifact::Reader reader(artifact);
+    auto definition = glm::read_definition(reader, {.speculative = SpeculativeBackend::Mtp});
+    for (const ParallelOptions geometry :
+         {ParallelOptions{2, 8, 4, 1, 2}, {4, 2, 2, 1, 2}, {4, 8, 4, 1, 2}}) {
+        DeploymentOptions deployment;
+        deployment.parallel     = geometry;
+        deployment.control_host = "127.0.0.1";
+        const auto world        = geometry.tp * geometry.dp;
+        const auto nodes        = world / 8;
+        for (unsigned node = 0; node < nodes; ++node)
+            deployment.nodes.push_back({node, node ? "peer" : "", "/worker", artifact, {}});
+        for (unsigned rank = 0; rank < world; ++rank)
+            deployment.ranks.push_back({rank, rank / 8, static_cast<int>(rank % 8)});
+        auto parallel = glm::plan_parallel(*definition, deployment);
+        for (const auto& replica : parallel.topology.replicas) {
+            auto layout = plan(*definition, false, 3, 3, geometry.tp, geometry.adp);
+            Fixture f(definition, std::move(layout));
+            const auto descriptors = f.session.placement_descriptions();
+            require(descriptors.size() == geometry.adp,
+                    "Session reported a TP member as an attention owner");
+            for (unsigned owner = 0; owner < geometry.adp; ++owner) {
+                std::vector<unsigned> local;
+                for (const auto rank : replica.ranks)
+                    if (parallel.ranks[rank].placement.adp.rank == owner)
+                        local.push_back(replica.local_index(rank));
+                if (local.size() > 1)
+                    require(parallel.topology
+                                    .role_group("attention_owner", replica.ranks[local.front()])
+                                    .members.size() == local.size(),
+                            "physical attention group differs from owned head slices");
+                require(descriptors[owner].attention_ranks == local,
+                        "Session placement differs from the model's head group");
+            }
+            const auto input = f.request(71);
+            auto first       = f.bind(input, 0, 1);
+            auto second      = f.bind(input, 1, 0);
+            f.commit(f.prefill(first));
+            f.commit(f.prefill(second));
+            const std::array rows{first, second};
+            const std::array<glm::ExecutionUnit, 2> units{
+                {{first, glm::ExecutionUnitKind::Decode, 1},
+                 {second, glm::ExecutionUnitKind::Decode, 1}}};
+            require(bool(f.session.reserve_units(units)), "scaled decode reservation failed");
+            f.executor.accept = {0, 1};
+            const std::array<unsigned, 2> extents{1, 2};
+            require(f.session.start_decode_extents(rows, extents).has_value(),
+                    "scaled decode did not start");
+            const auto& work   = f.executor.last;
+            const auto& batch  = glm::work_batch(work);
+            const auto logical = glm::work_rows(work);
+            require(batch.members == std::vector<std::uint32_t>{1, 0} &&
+                        logical[0].states.size() == geometry.tp &&
+                        logical[1].states.size() == geometry.tp &&
+                        batch.owners.size() == geometry.adp,
+                    "scaled Work lost logical row order, an owner or a KDA shard");
+            auto submitted = work;
+            auto pending   = f.event<glm::PendingBatch>();
+            f.commit(std::move(pending), true);
+#if NINFER_ENABLE_DISTRIBUTED
+            if (replica.replica_id == geometry.dp - 1)
+                schedule_experts(reader, deployment, f.layout, submitted, f.executor.last_commit);
+#endif
+        }
+        std::cout << "PASS logical ranks=" << world << " dp=" << geometry.dp
+                  << " tp=" << geometry.tp << " adp=" << geometry.adp << " ep=" << geometry.ep
+                  << '\n';
+    }
+}
 
 void expanded_membership(std::shared_ptr<const glm::ModelDefinition> definition) {
     constexpr unsigned k = 5;
@@ -1906,6 +2085,10 @@ void cancelled_prefix_statistics(std::shared_ptr<const glm::ModelDefinition> def
 int main(int argc, char** argv) {
     try {
         batch_geometry();
+        if (argc == 3 && std::string_view(argv[1]) == "--scale") {
+            scale_sessions(argv[2]);
+            return 0;
+        }
         packed_work_contract();
         require(argc >= 2, "missing artifact directory");
         artifact::Reader reader(std::filesystem::path(argv[1]) / "model.ninfer");

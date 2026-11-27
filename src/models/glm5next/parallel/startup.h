@@ -1,4 +1,6 @@
 #pragma once
+#include "runtime/executor/collective_step.h"
+#include "runtime/executor/executor.h"
 
 #include "models/glm5next/frontend/frontend.h"
 #include "models/glm5next/parallel/codec.h"
@@ -26,6 +28,9 @@ public:
     void resolve(std::span<const distributed::wire::Payload>, EngineOptions&);
     [[nodiscard]] std::vector<PreparedSession> sessions() const;
     [[nodiscard]] Codec codec(std::uint32_t replica_id) const;
+    using Executor = runtime::Executor<ExecutionTypes>;
+    [[nodiscard]] std::unique_ptr<Executor> coordinate(std::uint32_t,
+                                                       std::unique_ptr<Executor>) const;
     [[nodiscard]] std::vector<RankSnapshot> observations() const;
     [[nodiscard]] std::vector<RankMemoryBudget> memory_budgets() const;
 
@@ -42,6 +47,13 @@ public:
 private:
     std::shared_ptr<const ModelDefinition> definition_;
     ParallelPlan parallel_;
+
+    struct Membership {
+        std::shared_ptr<runtime::CollectiveStepDomain> domain;
+        std::size_t member;
+    };
+
+    std::vector<Membership> memberships_;
     KvCacheVectorFormat index_format_;
     std::vector<RankResourceDescription> ranks_;
     std::uint32_t checkpoint_interval_ = 0;

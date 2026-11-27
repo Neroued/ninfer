@@ -9,10 +9,11 @@ plan_replica_context(std::span<const RankPlan> expected_ranks,
                      std::span<const RankResourceDescription> ranks) {
     if (ranks.empty() || ranks.size() != expected_ranks.size())
         throw std::invalid_argument("GLM5Next prepared rank count differs from its replica plan");
+    const AttentionOwners groups(ranks.size(), expected_ranks.front().placement.adp.size);
     context::ContextDirectorySpec out;
     out.state.logical_capacity = UINT32_MAX;
-    out.state.layouts.resize(ranks.size());
-    for (std::size_t owner = 0; owner < ranks.size(); ++owner)
+    out.state.layouts.resize(groups.size());
+    for (std::size_t owner = 0; owner < groups.size(); ++owner)
         out.state.layouts[owner].variant = static_cast<std::uint32_t>(owner);
     out.pools.resize(ranks.front().context.pools.size());
     for (std::size_t rank = 0; rank < ranks.size(); ++rank) {
@@ -22,17 +23,20 @@ plan_replica_context(std::span<const RankPlan> expected_ranks,
             r.rank != expected_ranks[rank].placement.tp.rank || r.rank != rank ||
             r.shape != ranks.front().shape || r.batches != ranks.front().batches ||
             c.ranks.size() != 1 || c.ranks.front().rank != rank ||
-            c.state.layouts.size() != ranks.size() || c.pools.size() != out.pools.size() ||
+            expected_ranks[rank].placement.adp.rank != groups.owner(rank) ||
+            expected_ranks[rank].placement.adp.size != groups.size() ||
+            r.batches.attention_owners != groups.size() ||
+            c.state.layouts.size() != groups.size() || c.pools.size() != out.pools.size() ||
             r.caches != ranks.front().caches || r.caches.size() != out.pools.size())
             throw std::invalid_argument("GLM5Next rank resources disagree with the group layout");
         out.ranks.push_back(c.ranks.front());
         out.metadata_budget_bytes += c.metadata_budget_bytes;
         out.state.logical_capacity = std::min(out.state.logical_capacity, c.state.logical_capacity);
-        for (std::size_t owner = 0; owner < ranks.size(); ++owner) {
+        for (std::size_t owner = 0; owner < groups.size(); ++owner) {
             const auto& layout = c.state.layouts[owner];
             if (layout.variant != owner || layout.parts.size() != 1 || layout.parts[0].rank != rank)
                 throw std::invalid_argument("GLM5Next State variant has inconsistent rank parts");
-            const auto& expected = owner == rank ? r.state.owner : r.state.common;
+            const auto& expected = owner == groups.owner(rank) ? r.state.owner : r.state.common;
             if (layout.parts[0].image_bytes != expected.bytes ||
                 layout.parts[0].alignment != expected.alignment)
                 throw std::invalid_argument("GLM5Next State part differs from its field layout");
@@ -51,15 +55,21 @@ plan_replica_context(std::span<const RankPlan> expected_ranks,
                 source.parts[0].rank != rank ||
                 source.parts[0].record != ranks.front().context.pools[pool].parts[0].record)
                 throw std::invalid_argument("GLM5Next history layouts differ between ranks");
-            if (source.logical_pages > UINT32_MAX - target.logical_pages)
-                throw std::overflow_error("GLM5Next logical page capacity exceeds uint32");
-            target.logical_pages += source.logical_pages;
             target.parts.push_back(source.parts[0]);
         }
     }
-    for (auto& pool : out.pools)
+    for (auto& pool : out.pools) {
+        for (std::uint32_t owner = 0; owner < groups.size(); ++owner) {
+            std::uint32_t pages = UINT32_MAX;
+            for (const auto rank : groups.members(owner))
+                pages = std::min(pages, ranks[rank].context.pools[pool.pool_id].logical_pages);
+            if (pages > UINT32_MAX - pool.logical_pages)
+                throw std::overflow_error("GLM5Next logical page capacity exceeds uint32");
+            pool.logical_pages += pages;
+        }
         pool.histories =
             context::HistoryDirectory::capacity_for_metadata(out.metadata_budget_bytes);
+    }
     return out;
 }
 

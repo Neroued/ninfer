@@ -22,7 +22,8 @@ public:
     using Types    = RuntimeTypes;
     using Instance = runtime::RankModelInstance<Types>;
     RankPreparation(const artifact::Reader&, RankLoadRequest, DeviceContext&,
-                    ContextCommunication = {}, std::uint32_t global_node = 0);
+                    ContextCommunication = {}, std::uint32_t global_node = 0,
+                    const distributed::GroupDescription* experts = nullptr);
     RankPreparation(const artifact::Reader&, std::span<const std::byte>,
                     const distributed::RankIdentity&, DeviceContext&,
                     const distributed::ExecutionTopology&, distributed::CommunicationContext&,
@@ -57,7 +58,10 @@ private:
     EngineOptions options_;
     std::uint32_t global_node_ = 0;
     ContextCommunication peer_;
-    ParallelBinding binding_;
+    RankGroups binding_;
+    const distributed::Group* expert_group_ = nullptr;
+    std::optional<distributed::GroupRequirements> expert_requirements_;
+    [[nodiscard]] std::unique_ptr<moe::ResidentExpertExchange> prepare_experts() const;
     runtime::PreparationMemory memory_;
     bool control_owner_;
     std::optional<ResolvedLoadPlan> load_;

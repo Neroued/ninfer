@@ -1,5 +1,8 @@
 #pragma once
 
+#include "models/glm5next/parallel/attention.h"
+#include "models/common/moe/exchange.h"
+
 #include "models/glm5next/definition.h"
 #include "models/glm5next/parallel/plan.h"
 #include "ninfer/ops/kpool_mla.h"
@@ -19,7 +22,7 @@ struct KdaProfile {
 
 struct MlaProfile {
     std::array<ops::KpoolMlaPrepareProfile, 3> prepare;
-    ops::ProjectionProfile query_index;
+    std::optional<ops::ProjectionProfile> query_index;
     ops::LinearProfile query, output;
     std::array<std::int32_t, 2> query_rows;
     ops::KpoolIndexerProfile indexer;
@@ -34,6 +37,7 @@ struct MoeProfile {
     ops::SigmoidMoeProfile math;
     ExpertBankId bank;
     ops::ExpertSubsetKind subset = ops::ExpertSubsetKind::All;
+    std::size_t exchange_workspace = 0;
 };
 
 // Preserve native contiguous parents while mapping MLA's semantic projection roles.
@@ -93,6 +97,9 @@ struct ModelProfile {
     struct LocalGeometry {
         std::uint32_t rank, size;
         IndexRange kda_heads, vocabulary, dense_intermediate, shared_intermediate;
+        AttentionOwners attention;
+
+        [[nodiscard]] std::uint32_t owner() const { return attention.owner(rank); }
     } local;
 
     std::uint32_t public_tokens;
@@ -101,10 +108,13 @@ struct ModelProfile {
     std::optional<MtpProfile> mtp;
     std::optional<DraftProfile> draft;
     std::optional<VisionProfile> vision;
+    std::shared_ptr<const moe::ResidentExchangePlan> exchange;
+    std::size_t exchange_bytes = 0;
 };
 
-[[nodiscard]] std::shared_ptr<const ModelProfile>
-describe_model(const ModelDefinition&, std::span<const BoundWeight>,
-               std::span<const moe::ExpertDescription>, const RankPlan&);
+[[nodiscard]] std::shared_ptr<ModelProfile> describe_model(const ModelDefinition&,
+                                                           std::span<const BoundWeight>,
+                                                           std::span<const moe::ExpertDescription>,
+                                                           const RankPlan&);
 
 } // namespace ninfer::models::glm5next::execution

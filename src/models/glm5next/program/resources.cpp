@@ -145,7 +145,7 @@ ops::KpoolTailStateView Resources::mtp_tail(std::uint32_t slot, int rows) {
 
 RankMemoryUsage Resources::observe() const {
     RankMemoryUsage out;
-    out.allocations.persistent_device_bytes = fixed_.size();
+    out.allocations.persistent_device_bytes = fixed_.size() + plan.profile->exchange_bytes;
     out.allocations.context_device_bytes    = context_.size();
     out.allocations.workspace_device_bytes  = workspace_.size();
     out.allocations.io_pinned_bytes         = ingress_.size() + sampling_.size() + egress_.size() +

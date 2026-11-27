@@ -123,10 +123,15 @@ public:
                  CudaExecutionView) const;
 private:
     friend class CommunicationContext;
+    friend void record_communication_graph(std::span<const Group* const>, CommunicationGraphWork&,
+                                           const std::function<void()>&);
     struct Impl;
     explicit Group(std::unique_ptr<Impl>);
     std::unique_ptr<Impl> impl_;
 };
+
+void record_communication_graph(std::span<const Group* const>, CommunicationGraphWork&,
+                                const std::function<void()>&);
 
 class CommunicationContext {
 public:

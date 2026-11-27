@@ -13,6 +13,8 @@ struct MtpExecution {
     ops::ConstKpoolTailStateView before;
     ops::KpoolTailStateView after;
     ParallelExecution* parallel = nullptr;
+    AttentionExecution attention;
+    moe::SigmoidPass experts;
 };
 
 class MtpRun {

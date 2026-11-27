@@ -71,7 +71,8 @@ struct SwiGLUWeights {
 };
 
 // Complete unscaled FFN y=down*(activation(gate*x,up*x)), coefficient exactly one.
-// x and destination are contiguous 16-byte-aligned BF16 [H,T], T>0. Gate/up is [2I,H],
+// x is contiguous BF16 [H,T], T>0. Destination is BF16 or FP32 as requested for a
+// local output or an unrounded parallel contribution. Both are 16-byte aligned. Gate/up is [2I,H],
 // down [H,I]; inputs and native weight planes are immutable and disjoint from destination
 // and live caller scratch. Profile and prepared weights must agree. No observable product
 // rounding boundary, residual, routes or coefficient tensor. Writes every destination cell.
@@ -79,7 +80,8 @@ struct SwiGLUWeights {
 // No hidden allocation/transfer/readback; enqueues on execution and supports Graph replay.
 [[nodiscard]] std::size_t swiglu_workspace_capacity_bytes(const SwiGLUProfile& profile,
                                                           std::int32_t min_tokens,
-                                                          std::int32_t max_tokens);
+                                                          std::int32_t max_tokens,
+                                                          DType destination_type = DType::BF16);
 void swiglu(const Tensor& x, const SwiGLUProfile& profile, const SwiGLUWeights& weights,
             Tensor& destination, MemoryArena& workspace, CudaExecutionView execution);
 

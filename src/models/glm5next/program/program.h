@@ -10,10 +10,14 @@ namespace detail {
 class RankProgramImpl;
 }
 
+struct RankGroups {
+    ParallelBinding tensor, heads, owners;
+};
+
 class RankProgram {
 public:
     RankProgram(const execution::Parameters&, std::unique_ptr<Resources>, DeviceContext&,
-                ParallelBinding = {});
+                RankGroups = {}, std::unique_ptr<moe::ResidentExpertExchange> = {});
     ~RankProgram();
     RankProgram(const RankProgram&)            = delete;
     RankProgram& operator=(const RankProgram&) = delete;

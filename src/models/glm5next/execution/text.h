@@ -15,6 +15,8 @@ struct TextExecution {
     Tensor raw_keys, raw_gates;
     ParallelExecution* parallel = nullptr;
     Tensor features;
+    AttentionExecution attention;
+    moe::SigmoidPass experts;
 };
 
 class TextRun {
@@ -34,7 +36,7 @@ private:
                   std::optional<std::uint32_t> next_mixer = {});
     void gather_input(std::optional<std::uint32_t> next_mixer);
     void broadcast_mla_columns(Tensor&, int begin, int end, std::uint32_t root);
-    void exchange_packed_mla(const PackedPrefillUpdate&, Tensor& exchange, bool input);
+    void exchange_mla_columns(Tensor& exchange, bool input);
     void reduce_output();
     const Parameters& parameters_;
     TextExecution execution_;

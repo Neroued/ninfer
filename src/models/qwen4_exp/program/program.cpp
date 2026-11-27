@@ -75,13 +75,13 @@ void RankProgramImpl::validate_work(const Work& work, runtime::FrameKind kind) c
         .validate(work, kind);
     if (kind == runtime::FrameKind::Compute) {
         const bool needs_step =
-            exchange && (std::holds_alternative<ExpertServiceWork>(work.operation) ||
+            exchange && (std::holds_alternative<moe::ExpertServiceWork>(work.operation) ||
                          plan_expert_step(work, shape.prefill_chunk).has_value());
         if (needs_step != work.exchange.has_value() ||
             (work.exchange && work.exchange->id != last_expert_step + 1))
             throw std::invalid_argument(
                 "Qwen4Exp expert step differs from the prepared communication order");
-        if (std::holds_alternative<ExpertServiceWork>(work.operation)) return;
+        if (std::holds_alternative<moe::ExpertServiceWork>(work.operation)) return;
     }
     const auto check_resident = [&](const runtime::ExecutionMember& member) {
         const auto& resident = bindings[member.residency.lane.value];
@@ -167,7 +167,7 @@ void RankProgramImpl::prepare_commit(runtime::ExecutionTicket ticket, const Comm
                  resources.plan.batches,
                  resources.plan.decode_routes}
         .validate_commit(frame.request.work, frame.result.rows, commit);
-    if (std::holds_alternative<ExpertServiceWork>(frame.request.work.operation)) return;
+    if (std::holds_alternative<moe::ExpertServiceWork>(frame.request.work.operation)) return;
     for (const auto& row : commit.rows)
         check_selectors(row.states.at(parameters.profile->local.rank), resources.states->storage());
     resources.compute_actions->validate(

@@ -59,9 +59,11 @@ public:
 
     MlaParameters mla(const MlaWeights& w) const {
         const auto& c = model_.definition().config().text;
+        const bool selects = model_.rank_plan().placement.attention_slice().rank == 0;
         MlaParameters out;
         for (std::size_t i = 0; i < out.prepare.size(); ++i) {
             const auto kind   = static_cast<ops::KpoolMlaPrepareProjection>(i);
+            if (!selects && kind == ops::KpoolMlaPrepareProjection::Full) continue;
             const auto inputs = mla_projection_inputs(model_.weight_data(), w, kind);
             out.prepare[i]    = {
                 kind,
@@ -75,7 +77,7 @@ public:
                 c.norm_epsilon,
                 1e-6F};
         }
-        out.query_index = projection({w.query_b, w.index_query});
+        if (selects) out.query_index = projection({w.query_b, w.index_query});
         out.query       = linear({w.query_b});
         out.output      = linear({w.output});
         out.factors     = {factor(w.key_up), factor(w.value_up)};

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/linear_attention_state.h"
+#include "models/glm5next/parallel/attention.h"
 #include "core/cyclic_kv_cache.h"
 #include "models/common/context/directory/history.h"
 #include "models/common/context/directory/records.h"
@@ -83,10 +84,12 @@ private:
 // Record-relative copies for a change of attention owner. Common KDA/hidden fields stay on
 // their original rank; only the raw tails move. History placement is handled separately.
 [[nodiscard]] std::vector<context::RecordRangeCopy>
-state_conversion(std::span<const StatePlacement>, std::uint32_t source_owner,
-                 std::uint32_t destination_owner);
+state_conversion(std::span<const StatePlacement>, const AttentionOwners&,
+                 std::uint32_t source_owner, std::uint32_t destination_owner);
 
-[[nodiscard]] context::HistoryCopyLayout history_conversion(const KVPageLayout&, std::uint32_t from,
-                                                            std::uint32_t to, std::uint32_t tail);
+[[nodiscard]] context::HistoryCopyLayout history_conversion(const KVPageLayout&,
+                                                            const AttentionOwners&,
+                                                            std::uint32_t from, std::uint32_t to,
+                                                            std::uint32_t tail);
 
 } // namespace ninfer::models::glm5next

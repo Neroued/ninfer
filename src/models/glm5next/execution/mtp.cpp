@@ -32,10 +32,10 @@ MtpRun::MtpRun(const Parameters& p, MtpExecution execution, BatchView batch, Cud
       scope_(execution.workspace.scope()),
       roots_(workspace::mtp_roots(execution.workspace, p.profile->config.text,
                                   batch.tokens * batch.rows)) {
-    if (execution.parallel)
-        attention_ =
-            workspace::attention(execution.workspace, dimension(p.profile->config.text.hidden),
-                                 batch.tokens * batch.attention.rows, p.profile->local.size);
+    if (execution.attention.owners)
+        attention_ = workspace::attention(
+            execution.workspace, dimension(p.profile->config.text.hidden),
+            batch.tokens * batch.attention.rows, p.profile->local.attention.size());
 }
 
 void MtpRun::stem(const Tensor& conditioning) {
@@ -52,7 +52,7 @@ MlaRun MtpRun::local_mla(MlaSelection selection) {
                   {local.positions, local.valid_columns, local.table_rows}, execution_.before,
                   execution_.after, execution_.cache.layer(0), {}, local.selection_rows, bucket,
                   attention_.output.data ? attention_.output : roots_.output, execution_.workspace,
-                  cuda_, selection);
+                  cuda_, selection, execution_.attention.heads);
 }
 
 void MtpRun::local_attention(MlaSelection selection, const MlaSubmit& submit) {
@@ -68,12 +68,14 @@ void MtpRun::local_attention(MlaSelection selection, const MlaSubmit& submit) {
 
 void MtpRun::finish_attention() {
     const auto& p = *parameters_.profile;
-    if (execution_.parallel) {
-        execution_.parallel->gather(attention_.output, attention_.gathered, cuda_);
+    auto local    = attention_.output.data ? attention_.output : roots_.output;
+    if (execution_.attention.heads) execution_.attention.heads->sum(local, cuda_);
+    if (execution_.attention.owners) {
+        execution_.attention.owners->gather(local, attention_.gathered, cuda_);
         const int h = p.config.text.hidden, t = batch_.tokens;
         auto output = roots_.output.view({h, t, batch_.rows});
         ops::gather_batch_rows(
-            attention_.gathered.view({h, t, batch_.attention.rows * int(p.local.size)}),
+            attention_.gathered.view({h, t, batch_.attention.rows * int(p.local.attention.size())}),
             batch_.attention.from_gather, output, cuda_);
     }
     ops::residual_add_rmsnorm(roots_.residual, roots_.output, parameters_.mtp->post_attention_norm,
@@ -82,13 +84,22 @@ void MtpRun::finish_attention() {
 
 void MtpRun::ffn() {
     const auto& m = parameters_.mtp->moe;
+    if (execution_.experts.exchange) {
+        const auto& p = parameters_.profile->mtp->moe;
+        const moe::LayerSource local{
+            roots_.input, roots_.output, {batch_.valid_columns, batch_.tokens}};
+        execution_.experts.run(p.bank, p.math, m.weights, &local, execution_.parallel,
+                               execution_.workspace, cuda_);
+        return;
+    }
     ops::topk_sigmoid_swiglu_moe(roots_.input, parameters_.profile->mtp->moe.math, m.weights,
                                  m.subset, roots_.output, {batch_.valid_columns, batch_.tokens},
                                  execution_.workspace, cuda_);
 }
 
 void MtpRun::finish(Tensor& hidden) {
-    if (execution_.parallel) execution_.parallel->sum(roots_.output, cuda_);
+    if (execution_.parallel && !execution_.experts.exchange)
+        execution_.parallel->sum(roots_.output, cuda_);
     ops::residual_add_rmsnorm(roots_.residual, roots_.output, parameters_.mtp->final_norm,
                               parameters_.profile->config.text.norm_epsilon, roots_.residual,
                               hidden, cuda_);

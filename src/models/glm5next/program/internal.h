@@ -20,6 +20,7 @@ enum class ComputePhase {
     AwaitResult,
     Score,
     AwaitScore,
+    AwaitExpertService,
     PendingCommit,
     Retiring
 };
@@ -43,6 +44,7 @@ struct ComputeFrame {
     std::optional<speculative::RoundRoute> graph_route;
     std::vector<std::uint32_t> draft_visible;
     std::uint32_t control_row = 0, control_offset = 0, tokens = 0;
+    std::size_t main_pass  = 0;
     std::uint32_t score_at = 0, score_count = 0;
     std::vector<float> logprobs;
     execution::BatchView batch;
@@ -67,7 +69,7 @@ struct ContextFrame {
 class RankProgramImpl {
 public:
     RankProgramImpl(const execution::Parameters&, std::unique_ptr<Resources>, DeviceContext&,
-                    ParallelBinding);
+                    RankGroups, std::unique_ptr<moe::ResidentExpertExchange>);
     ~RankProgramImpl();
     void validate_work(const Work&, runtime::FrameKind) const;
     void start(runtime::ExecutionRequest<ExecutionTypes>&&);
@@ -100,6 +102,8 @@ public:
     [[nodiscard]] execution::StateUpdate target_update(int width);
     void target_forward(const execution::BatchView&, Tensor hidden, bool forced_control,
                         const execution::MlaSubmit& = {});
+    [[nodiscard]] moe::SigmoidPass expert_pass(std::size_t traversal);
+    void serve_experts();
     [[nodiscard]] execution::TextRun text_run(const execution::BatchView&, execution::StateUpdate);
     [[nodiscard]] execution::MtpRun mtp_run(std::uint32_t step, const execution::BatchView&);
     [[nodiscard]] execution::MlaSelection mtp_selection(std::uint32_t step, int local);
@@ -172,7 +176,13 @@ public:
     Resources& resources;
     const ExecutionShape shape;
     FrameLayout frame;
-    std::optional<ParallelExecution> parallel;
+    std::optional<ParallelExecution> parallel, head_group, owner_group;
+    std::unique_ptr<moe::ResidentExpertExchange> expert_exchange;
+    std::uint64_t last_expert_step = 0;
+
+    [[nodiscard]] execution::AttentionExecution attention_groups() {
+        return {head_group ? &*head_group : nullptr, owner_group ? &*owner_group : nullptr};
+    }
     std::unique_ptr<GraphInputs> graph_inputs;
     std::unique_ptr<models::DecodeGraphSuite> graphs;
     GraphMemorySummary graph_memory;

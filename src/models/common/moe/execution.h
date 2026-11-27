@@ -1,4 +1,5 @@
 #pragma once
+#include "models/common/parallel_execution.h"
 
 #include "ninfer/ops/moe.h"
 
@@ -37,6 +38,14 @@ class ResidentExpertExchange {
 public:
     virtual ~ResidentExpertExchange()                                                  = default;
     [[nodiscard]] virtual ExpertExchangeWork stage(ExpertBankId, int physical_columns) = 0;
+};
+
+struct SigmoidPass {
+    ResidentExpertExchange* exchange = nullptr;
+    int columns                      = 0;
+    bool representative              = false;
+    void run(ExpertBankId, const ops::SigmoidMoeProfile&, const ops::SigmoidMoeWeights&,
+             const LayerSource*, ParallelExecution*, MemoryArena&, CudaExecutionView) const;
 };
 
 void resident_layer(const Parameters&, const LayerSource*, const ExpertExchangeWork*, MemoryArena&,

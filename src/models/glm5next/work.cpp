@@ -42,8 +42,8 @@ BatchPlan plan_batch(std::span<const WorkRow> rows, const BatchExecutionPlan& pl
     BatchPlan result;
     result.owners.resize(plan.attention_owners());
     for (const auto& row : rows) {
-        require(row.attention_rank < result.owners.size(), "attention owner outside rank group");
-        ++result.owners[row.attention_rank].size;
+        require(row.attention_owner < result.owners.size(), "attention owner outside rank group");
+        ++result.owners[row.attention_owner].size;
     }
     std::uint32_t begin = 0, maximum = 0;
     for (auto& owner : result.owners) {
@@ -55,7 +55,7 @@ BatchPlan plan_batch(std::span<const WorkRow> rows, const BatchExecutionPlan& pl
     result.members.resize(rows.size());
     std::vector<std::uint32_t> offsets(result.owners.size());
     for (std::uint32_t row = 0; row < rows.size(); ++row) {
-        const auto owner                                              = rows[row].attention_rank;
+        const auto owner                                              = rows[row].attention_owner;
         result.members[result.owners[owner].begin + offsets[owner]++] = row;
     }
     return result;
@@ -71,10 +71,37 @@ make_decode_routes(const ExecutionShape& shape, const BatchExecutionPlan& batche
                                                                   shape.draft_tokens, widths);
 }
 
+std::optional<moe::ExpertStep> plan_expert_step(const Work& work, std::uint32_t chunk) {
+    moe::ExpertStep step{};
+    const auto rows = work_rows(work);
+    if (rows.empty()) return {};
+    const auto* forward = std::get_if<ForwardWork>(&work.operation);
+    if (const auto* mtp = std::get_if<SpeculativeWork>(&work.operation)) {
+        if (!mtp->speculative) throw std::invalid_argument("missing GLM5Next proposal geometry");
+        step.draft_passes = mtp->speculative->mtp_steps;
+        step.columns.assign(step.draft_passes, mtp->batch.shape.rows);
+        step.columns.push_back(mtp->speculative->verify_width * mtp->batch.shape.rows);
+    } else if (forward && forward->kind == ForwardKind::Control && rows.front().ids.size() > 1) {
+        if (!chunk) throw std::logic_error("GLM5Next control has no traversal capacity");
+        for (const auto& row : rows)
+            for (std::size_t begin = 0; begin < row.ids.size(); begin += chunk)
+                step.columns.push_back(std::min<std::size_t>(chunk, row.ids.size() - begin));
+    } else if (forward &&
+               (forward->kind == ForwardKind::Ordinary || forward->kind == ForwardKind::Control)) {
+        step.columns.push_back(forward->batch.shape.rows);
+    } else {
+        std::size_t columns = 0;
+        for (const auto& row : rows) columns += row.ids.size();
+        if (!columns) return {};
+        step.columns.push_back(dimension(columns));
+    }
+    return step;
+}
+
 const BatchPlan& work_batch(const Work& work) {
     return std::visit(
         [](const auto& operation) -> const BatchPlan& {
-            if constexpr (std::is_same_v<std::decay_t<decltype(operation)>, ContextWork>)
+            if constexpr (!requires { operation.batch; })
                 throw std::logic_error("Context work has no compute batch");
             else
                 return operation.batch;
@@ -86,7 +113,7 @@ void prepare_batch(Work& work, const BatchExecutionPlan& plan) {
     std::visit(
         [&](auto& operation) {
             using T = std::decay_t<decltype(operation)>;
-            if constexpr (!std::is_same_v<T, ContextWork>) {
+            if constexpr (requires { operation.batch; }) {
                 const bool decode = [&] {
                     if constexpr (std::is_same_v<T, ForwardWork>)
                         return operation.kind == ForwardKind::Ordinary;
@@ -106,6 +133,10 @@ const context::ContextActions& local_actions(const ContextActions& actions, std:
 
 ExecutionWork ExecutionTypes::describe_work(const Work& work) {
     ExecutionWork out;
+    if (std::holds_alternative<moe::ExpertServiceWork>(work.operation)) {
+        out.kind = ExecutionKind::ExpertService;
+        return out;
+    }
     if (const auto* f = std::get_if<ForwardWork>(&work.operation)) {
         out.speculative = f->speculative;
         out.kind        = f->kind == ForwardKind::Prefill   ? ExecutionKind::Prefill
@@ -153,7 +184,10 @@ runtime::WorkPayloadCapacity WorkContract::payload_capacity(std::uint32_t rank_c
     const auto context_rows = sizeof(Work) + sizeof(ContextWork) + sizeof(ResidencyBinding) +
                               4ULL * public_tokens + batch * sizeof(runtime::ResidencyId);
     const auto actions_storage = context::action_batch_storage_capacity() + 128;
-    return {work,
+    const auto windows         = std::max<std::size_t>(
+        width, batch * std::max<std::size_t>(1, (control_token_limit + chunk - 1) /
+                                                            std::max<std::size_t>(1, chunk)));
+    return {work + 20 + 4 * windows,
             context,
             decision,
             commit,
@@ -163,6 +197,26 @@ runtime::WorkPayloadCapacity WorkContract::payload_capacity(std::uint32_t rank_c
 }
 
 void WorkContract::validate(const Work& work, runtime::FrameKind kind) const {
+    const bool service = std::holds_alternative<moe::ExpertServiceWork>(work.operation);
+    if (service || work.exchange) {
+        if (kind != runtime::FrameKind::Compute || !work.exchange || !work.exchange->id ||
+            work.exchange->columns.empty() || work.exchange->draft_passes > shape.draft_tokens ||
+            work.exchange->draft_passes >= work.exchange->columns.size() ||
+            std::ranges::count(work.exchange->columns, 0U))
+            throw std::invalid_argument("invalid GLM5Next expert traversal");
+        if (service) {
+            if (std::ranges::any_of(work.actions,
+                                    [](const auto& item) { return !item.second.empty(); }))
+                throw std::invalid_argument("GLM5Next expert service carries request actions");
+            return;
+        }
+        const auto needed = plan_expert_step(work, shape.prefill_chunk);
+        if (!needed || needed->draft_passes != work.exchange->draft_passes ||
+            needed->columns.size() != work.exchange->columns.size() ||
+            !std::equal(needed->columns.begin(), needed->columns.end(),
+                        work.exchange->columns.begin(), std::less_equal<>{}))
+            throw std::invalid_argument("GLM5Next expert traversal differs from its source work");
+    }
     if (const auto* c = std::get_if<ContextWork>(&work.operation)) {
         require(kind == runtime::FrameKind::Context && c->bindings.size() <= 1 &&
                     c->releases.size() <= shape.max_concurrency,
@@ -197,7 +251,7 @@ void WorkContract::validate(const Work& work, runtime::FrameKind kind) const {
                 rows.size() <= shape.max_concurrency,
             "compute frame extent");
     require(batches && batches->resident_capacity() == shape.max_concurrency &&
-                batches->attention_owners() == ranks,
+                batches->attention_owners() && ranks % batches->attention_owners() == 0,
             "batch plan differs from prepared execution");
     const bool decode = std::holds_alternative<SpeculativeWork>(work.operation) ||
                         (forward && forward->kind == ForwardKind::Ordinary);
@@ -216,12 +270,12 @@ void WorkContract::validate(const Work& work, runtime::FrameKind kind) const {
         route.validate(shape.speculative, shape.draft_tokens);
         require(!verification || verification->draft_extents.size() == rows.size(),
                 "draft extents");
-        std::vector<std::uint64_t> counts(ranks);
+        std::vector<std::uint64_t> counts(batches->attention_owners());
         std::uint64_t total = 0;
         std::uint32_t depth = 0;
         for (std::size_t i = 0; i < rows.size(); ++i) {
             const auto v = verification ? verification->draft_extents[i] : 0U;
-            counts[rows[i].attention_rank] += 1ULL + v;
+            counts[rows[i].attention_owner] += 1ULL + v;
             total += 1ULL + v;
             depth = std::max(v, depth);
         }
@@ -401,6 +455,13 @@ void WorkContract::validate(const Work& work, const runtime::DecisionRequest& re
 }
 
 void WorkContract::validate(const Work& work, const Result& result, const Commit& commit) const {
+    if (std::holds_alternative<moe::ExpertServiceWork>(work.operation)) {
+        const auto* service = std::get_if<moe::ExpertServiceResult>(&result);
+        require(service && work.exchange && service->step == work.exchange->id,
+                "expert service result");
+        validate_commit(work, {}, commit);
+        return;
+    }
     const auto* computed = std::get_if<ComputeResult>(&result);
     const bool score     = std::holds_alternative<ScoreWork>(work.operation);
     require(score ? std::holds_alternative<ScoreResult>(result) : computed != nullptr,
@@ -412,6 +473,13 @@ void WorkContract::validate(const Work& work, const Result& result, const Commit
 
 void WorkContract::validate_commit(const Work& work, std::span<const RowResult> result,
                                    const Commit& commit) const {
+    if (std::holds_alternative<moe::ExpertServiceWork>(work.operation)) {
+        require(commit.rows.empty() &&
+                    std::ranges::none_of(commit.actions,
+                                         [](const auto& part) { return !part.second.empty(); }),
+                "expert service received a request commit");
+        return;
+    }
     const auto rows    = work_rows(work);
     const auto* f      = std::get_if<ForwardWork>(&work.operation);
     const auto* m      = std::get_if<SpeculativeWork>(&work.operation);

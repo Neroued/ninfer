@@ -13,14 +13,28 @@ bool same(const runtime::ExecutionMember& a, const runtime::ExecutionMember& b) 
 } // namespace
 
 RankProgramImpl::RankProgramImpl(const execution::Parameters& p, std::unique_ptr<Resources> r,
-                                 DeviceContext& d, ParallelBinding binding)
+                                 DeviceContext& d, RankGroups binding,
+                                 std::unique_ptr<moe::ResidentExpertExchange> exchange)
     : parameters(p), device(d), cuda(d.execution_view()), owner(std::move(r)), resources(*owner),
       shape(resources.plan.shape), frame(resources.plan.frame), timer(d, shape.gpu_timing),
       compute_done(d), context_done(d), drafts_done(d) {
+    expert_exchange = std::move(exchange);
+    if (bool(expert_exchange) != bool(parameters.profile->exchange))
+        throw std::logic_error("GLM expert exchange placement differs from Program");
     bindings.resize(shape.max_concurrency);
     if (p.profile != resources.plan.profile)
         throw std::invalid_argument("GLM5Next resources have another profile");
-    if (binding.group) parallel.emplace(binding);
+    if (binding.tensor.group) {
+        parallel.emplace(binding.tensor);
+        parallel->track_graph_group(binding.heads.group);
+        parallel->track_graph_group(binding.owners.group);
+    }
+    if (binding.heads.group) head_group.emplace(binding.heads);
+    if (binding.owners.group) owner_group.emplace(binding.owners);
+    if ((head_group ? head_group->size() : 1) != p.profile->local.attention.width() ||
+        (owner_group ? owner_group->size() : 1) != p.profile->local.attention.size())
+        throw std::invalid_argument(
+            "GLM5Next attention communication differs from the prepared head slices");
     if (p.profile->local.size != (parallel ? parallel->size() : 1))
         throw std::invalid_argument("GLM5Next communication differs from weight partition");
     if (shape.gpu_timing) prefill_timer.emplace(d);
@@ -48,6 +62,16 @@ WorkContract RankProgramImpl::contract() const {
 
 void RankProgramImpl::validate_work(const Work& work, runtime::FrameKind kind) const {
     contract().validate(work, kind);
+    if (kind == runtime::FrameKind::Compute) {
+        const bool matched =
+            expert_exchange && (std::holds_alternative<moe::ExpertServiceWork>(work.operation) ||
+                                plan_expert_step(work, shape.prefill_chunk).has_value());
+        if (matched != work.exchange.has_value() ||
+            (work.exchange && work.exchange->id != last_expert_step + 1))
+            throw std::invalid_argument(
+                "GLM expert traversal does not match its prepared communication order");
+        if (std::holds_alternative<moe::ExpertServiceWork>(work.operation)) return;
+    }
     const auto rank   = parameters.profile->local.rank;
     const auto active = [&](const runtime::ExecutionMember& m) {
         const auto& binding = bindings.at(m.residency.lane.value);
@@ -56,7 +80,8 @@ void RankProgramImpl::validate_work(const Work& work, runtime::FrameKind kind) c
     for (const auto& row : work_rows(work)) {
         active(row.member);
         const auto offsets = row.states.at(rank);
-        const auto& image  = resources.states.image(rank == row.attention_rank);
+        const auto& image =
+            resources.states.image(parameters.profile->local.owner() == row.attention_owner);
         (void)image.image(offsets.source);
         (void)image.image(offsets.destination);
         if (row.main_table.index >= std::uint32_t(resources.main.tables().matrix().ne[1]))
@@ -108,6 +133,14 @@ void RankProgramImpl::start(runtime::ExecutionRequest<ExecutionTypes>&& request)
         compute->result.rows.resize(work_rows(compute->request.work).size());
         resources.compute_actions->submit(local_actions(compute->request.work.actions, rank));
         timer.begin();
+        if (const auto& step = compute->request.work.exchange) {
+            last_expert_step   = step->id;
+            compute->main_pass = step->draft_passes;
+            if (std::holds_alternative<moe::ExpertServiceWork>(compute->request.work.operation)) {
+                serve_experts();
+                return;
+            }
+        }
         request_decision();
         advance_compute();
     }
@@ -265,8 +298,10 @@ void RankProgramImpl::reset_peaks() {
 
 namespace ninfer::models::glm5next {
 RankProgram::RankProgram(const execution::Parameters& p, std::unique_ptr<Resources> r,
-                         DeviceContext& d, ParallelBinding b)
-    : impl_(std::make_unique<detail::RankProgramImpl>(p, std::move(r), d, b)) {}
+                         DeviceContext& d, RankGroups b,
+                         std::unique_ptr<moe::ResidentExpertExchange> exchange)
+    : impl_(std::make_unique<detail::RankProgramImpl>(p, std::move(r), d, b, std::move(exchange))) {
+}
 
 RankProgram::~RankProgram() = default;
 

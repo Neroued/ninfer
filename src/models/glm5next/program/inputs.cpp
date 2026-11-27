@@ -106,7 +106,7 @@ void RankProgramImpl::prepare_inputs(std::span<const WorkRow> rows, const BatchP
     const int t = width, b = physical_rows;
     const auto c      = plan.shape.attention_rows;
     const auto& local = frame.attention;
-    const auto own    = plan.owners[rank];
+    const auto own    = plan.owners[parameters.profile->local.owner()];
     if (f.tokens && (!f.sequence || own.size)) {
         ++f.attention.forwards;
         f.attention.rows += own.size;
@@ -132,7 +132,7 @@ void RankProgramImpl::prepare_inputs(std::span<const WorkRow> rows, const BatchP
     }
     std::fill_n(i32(local.from_gather), b, -1);
     for (std::size_t j = 0; j < plan.members.size(); ++j) {
-        const auto owner          = rows[plan.members[j]].attention_rank;
+        const auto owner          = rows[plan.members[j]].attention_owner;
         i32(local.from_gather)[j] = owner * c + j - plan.owners[owner].begin;
     }
     fill_local_metadata(io, t, c);
@@ -157,7 +157,7 @@ void RankProgramImpl::prepare_inputs(std::span<const WorkRow> rows, const BatchP
         if (i32(io.valid_columns)[j])
             local_visible = std::max(local_visible, std::uint32_t(i32(global.base_positions)[j] +
                                                                   i32(io.valid_columns)[j]));
-    f.batch = f.sequence ? batch(io, t, b, c, local_visible, rows.front().attention_rank)
+    f.batch = f.sequence ? batch(io, t, b, c, local_visible, rows.front().attention_owner)
                          : decode_batch(t, b, c, local_visible);
 }
 
@@ -218,10 +218,11 @@ void RankProgramImpl::prepare_packed_inputs(const ForwardWork& work) {
     };
     int tokens = 0, segments = 0, local_begin = 0, local_segments = 0, mtp_segments = 0;
     std::uint32_t visible = 0;
+    packed.update.owner_tokens.resize(plan.owners.size());
     for (std::uint32_t owner = 0; owner < plan.owners.size(); ++owner) {
         const auto rows  = plan.owners[owner];
         const int begin  = tokens;
-        const bool local = owner == rank;
+        const bool local = owner == parameters.profile->local.owner();
         if (local) local_begin = segments;
         for (std::uint32_t b = rows.begin; b < rows.begin + rows.size; ++b) {
             const auto member               = plan.members[b];
@@ -297,7 +298,7 @@ void RankProgramImpl::prepare_packed_inputs(const ForwardWork& work) {
     if (local_segments) {
         packed.update.local_mla_ragged = upload_ragged(layout.local, local_segments);
         upload(layout.local_tables, local_segments);
-        const auto own           = packed.update.owner_tokens[rank];
+        const auto own           = packed.update.owner_tokens[parameters.profile->local.owner()];
         auto& attention          = f.batch.attention;
         attention.rows           = local_segments;
         attention.positions      = f.batch.positions.slice(0, own.begin, own.size);

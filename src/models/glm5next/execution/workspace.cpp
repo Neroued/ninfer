@@ -20,8 +20,9 @@
 
 namespace ninfer::models::glm5next::execution {
 SequenceParallelPolicy sequence_parallel_policy(std::uint32_t ranks) {
-    return NINFER_TARGET_SPARK && ranks == 2 ? SequenceParallelPolicy{2, 256}
-                                             : SequenceParallelPolicy{};
+    return NINFER_TARGET_SPARK && ranks > 1
+               ? SequenceParallelPolicy{ranks, std::max(256, dimension(ranks))}
+               : SequenceParallelPolicy{};
 }
 
 namespace {
@@ -34,6 +35,12 @@ void scratch(WorkspaceLayoutBuilder& a, std::size_t bytes) {
     (void)a.alloc_bytes(bytes);
 }
 
+std::size_t experts(const MoeProfile& p, int first, int last) {
+    return p.exchange_workspace ? p.exchange_workspace
+                                : ops::topk_sigmoid_swiglu_moe_workspace_capacity_bytes(
+                                      p.math, p.subset, first, last);
+}
+
 void mla(WorkspaceLayoutBuilder& a, const ModelProfile& p, const MlaProfile& m,
          const ExecutionShape& s, int first, int last, int local, int sm_count, bool record,
          bool frozen) {
@@ -41,7 +48,7 @@ void mla(WorkspaceLayoutBuilder& a, const ModelProfile& p, const MlaProfile& m,
     const auto buckets = ops::ContextBucketRange::through(s.max_context);
     for (int mode = 0; mode < (frozen ? 2 : 1); ++mode) {
         auto scope        = a.scope();
-        const bool reuse  = mode != 0;
+        const bool reuse  = mode != 0 || !m.query_index;
         const int minimum = dimension(std::uint64_t(first) * local);
         const int columns = dimension(std::uint64_t(last) * local);
         (void)workspace::mla(a, p.config.text, columns, reuse, !frozen);
@@ -55,7 +62,7 @@ void mla(WorkspaceLayoutBuilder& a, const ModelProfile& p, const MlaProfile& m,
         if (reuse)
             scratch(a, linear(m.query, minimum, columns));
         else {
-            scratch(a, ops::linear_split_workspace_capacity_bytes(m.query_index, m.query_rows,
+            scratch(a, ops::linear_split_workspace_capacity_bytes(*m.query_index, m.query_rows,
                                                                   minimum, columns));
             scratch(a, ops::kpool_indexer_workspace_capacity_bytes(
                            m.indexer, s.index_format, buckets, local, first, last, sm_count));
@@ -86,16 +93,16 @@ std::size_t body(const ModelProfile& p, const ExecutionShape& s, int first, int 
     const int columns = dimension(std::uint64_t(last) * batch);
     if (mtp) {
         (void)workspace::mtp_roots(a, p.config.text, columns);
-        if (p.local.size > 1)
-            (void)workspace::attention(a, dimension(p.config.text.hidden), columns, p.local.size);
+        if (p.local.attention.size() > 1)
+            (void)workspace::attention(a, dimension(p.config.text.hidden), columns,
+                                       p.local.attention.size());
         {
             auto scope = a.scope();
             (void)workspace::mtp_stem(a, p.config.text, columns);
             scratch(a, linear(p.mtp->stem, minimum, columns));
         }
         scratch(a, attention_bytes);
-        scratch(a, ops::topk_sigmoid_swiglu_moe_workspace_capacity_bytes(
-                       p.mtp->moe.math, p.mtp->moe.subset, minimum, columns));
+        scratch(a, experts(p.mtp->moe, minimum, columns));
         return a.peak_bytes();
     }
     const auto partition =
@@ -103,8 +110,9 @@ std::size_t body(const ModelProfile& p, const ExecutionShape& s, int first, int 
     const int local_minimum =
         partition.split() ? policy.partition(minimum, p.local.rank).count : minimum;
     (void)workspace::roots(a, p.config.text, partition);
-    if (!prefill && p.local.size > 1)
-        (void)workspace::attention(a, dimension(p.config.text.hidden), columns, p.local.size);
+    if (!prefill && p.local.attention.size() > 1)
+        (void)workspace::attention(a, dimension(p.config.text.hidden), columns,
+                                   p.local.attention.size());
     scratch(a, ops::mhc_expand_pre_workspace_capacity_bytes(p.text.mhc, sm_count, local_minimum,
                                                             partition.count));
     scratch(a, ops::mhc_post_pre_workspace_capacity_bytes(p.text.mhc, sm_count, local_minimum,
@@ -141,9 +149,7 @@ std::size_t body(const ModelProfile& p, const ExecutionShape& s, int first, int 
         if (const auto* d = std::get_if<DenseProfile>(&layer.ffn))
             scratch(a, ops::swiglu_workspace_capacity_bytes(d->math, minimum, columns));
         else
-            scratch(a, ops::topk_sigmoid_swiglu_moe_workspace_capacity_bytes(
-                           std::get<MoeProfile>(layer.ffn).math,
-                           std::get<MoeProfile>(layer.ffn).subset, minimum, columns));
+            scratch(a, experts(std::get<MoeProfile>(layer.ffn), minimum, columns));
     }
     scratch(a, attention_bytes);
     return a.peak_bytes();
@@ -200,15 +206,19 @@ std::size_t prefill_attention_workspace(const ModelProfile& p, const ExecutionSh
         const auto* m = std::get_if<MlaProfile>(&layer.mixer);
         if (!m) continue;
         auto scope = a.scope();
-        (void)workspace::mla(a, p.config.text, last, false);
-        const auto& profile =
-            m->prepare.at(static_cast<std::size_t>(ops::KpoolMlaPrepareProjection::Full));
+        (void)workspace::mla(a, p.config.text, last, !m->query_index);
+        const auto& profile = m->prepare.at(static_cast<std::size_t>(
+            m->query_index ? ops::KpoolMlaPrepareProjection::Full
+                           : ops::KpoolMlaPrepareProjection::QueryAndHistory));
         scratch(a, ops::kpool_mla_prepare_update_ragged_workspace_capacity_bytes(
                        profile, storage, s.index_format, 1, last, 1, segments, sm_count));
-        scratch(a,
-                ops::linear_split_workspace_capacity_bytes(m->query_index, m->query_rows, 1, last));
-        scratch(a, ops::kpool_indexer_ragged_workspace_capacity_bytes(
-                       m->indexer, s.index_format, buckets, 1, last, 1, segments, sm_count));
+        if (m->query_index) {
+            scratch(a, ops::linear_split_workspace_capacity_bytes(*m->query_index, m->query_rows, 1,
+                                                                  last));
+            scratch(a, ops::kpool_indexer_ragged_workspace_capacity_bytes(
+                           m->indexer, s.index_format, buckets, 1, last, 1, segments, sm_count));
+        } else
+            scratch(a, linear(m->query, 1, last));
         scratch(a, ops::kpool_sparse_mla_ragged_workspace_capacity_bytes(
                        m->attention, storage, buckets, 1, last, 1, segments, sm_count));
         scratch(a, linear(m->output, 1, last));

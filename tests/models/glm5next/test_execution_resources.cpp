@@ -19,8 +19,9 @@ void require(bool value, const char* message) {
 // contract qualified by Op tests and the real startup check.
 glm::ExecutionPlan storage_plan(unsigned rank, bool mtp, KvCacheStorage storage,
                                 KvCacheVectorFormat index_format, bool dflash = false,
-                                unsigned concurrency = 3,
-                                LinearStateDType linear_state_dtype = LinearStateDType::Float32) {
+                                unsigned concurrency                = 3,
+                                LinearStateDType linear_state_dtype = LinearStateDType::Float32,
+                                unsigned ranks = 2, unsigned owners = 2) {
     auto profile           = std::make_shared<glm::execution::ModelProfile>();
     auto& c                = profile->config.text;
     c.hidden               = 4096;
@@ -32,8 +33,13 @@ glm::ExecutionPlan storage_plan(unsigned rank, bool mtp, KvCacheStorage storage,
     c.kda_layers           = 34;
     c.mla_layers           = 11;
     profile->public_tokens = c.vocabulary;
-    profile->local         = {
-        rank, 2, {rank * 32, 32}, {rank * 77440, 77440}, {rank * 6144, 6144}, {rank * 1024, 1024}};
+    profile->local         = {rank,
+                              ranks,
+                              models::partition_range(c.kda.heads, ranks, rank),
+                              models::partition_vocabulary_range(c.vocabulary, ranks, rank),
+                              models::partition_range(12288, ranks, rank),
+                              models::partition_range(2048, ranks, rank),
+                              glm::AttentionOwners(ranks, owners)};
     profile->config.mtp = mtp;
     if (mtp) profile->mtp.emplace();
     if (dflash) {
@@ -55,7 +61,7 @@ glm::ExecutionPlan storage_plan(unsigned rank, bool mtp, KvCacheStorage storage,
         p.shape.draft_tokens = 7;
     }
     p.batches = std::make_shared<const models::BatchExecutionPlan>(
-        models::make_batch_execution_spec(concurrency, 2, true));
+        models::make_batch_execution_spec(concurrency, owners, true));
     p.state = glm::plan_state(*p.profile, linear_state_dtype);
     LayoutBuilder b;
     p.main =
@@ -88,6 +94,8 @@ struct Fixture {
         parallel.ranks[1].placement.global_rank = 7;
         parallel.ranks[0].placement.tp          = {0, 2};
         parallel.ranks[1].placement.tp          = {1, 2};
+        parallel.ranks[0].placement.adp         = {0, 2};
+        parallel.ranks[1].placement.adp         = {1, 2};
         const std::array offers{
             runtime::RankCapacityOffer{glm::describe_execution_capacity(plans[0]), 1ULL << 30,
                                        2ULL << 30, plans[0].shared_physical_memory},
@@ -115,7 +123,74 @@ struct Fixture {
     }
 };
 
+void grouped_owners() {
+    std::vector<glm::RankPlan> ranks(4);
+    std::vector<glm::RankResourceDescription> reports;
+    std::vector<glm::StatePlacement> states;
+    const glm::AttentionOwners owners(4, 2);
+    // Four TP producers own [0,3), [3,6), [6,9), [9,11). Owner 0 takes
+    // [0,7); owner 1 takes [7,11), crossing producer 2 in mid-segment.
+    using Transfer = std::pair<models::IndexRange, std::uint32_t>;
+    const std::array<models::IndexRange, 2> mixed{{{0, 7}, {7, 4}}};
+    const auto collect = [&](std::span<const models::IndexRange> ranges, bool input) {
+        std::vector<Transfer> result;
+        owners.transfer_columns(models::TokenPartition(11, 4, 0), ranges, {}, input,
+                                [&](auto r, auto root) { result.emplace_back(r, root); });
+        return result;
+    };
+    require(collect(mixed, true) ==
+                    std::vector<Transfer>{
+                        {{0, 3}, 0}, {{3, 3}, 1}, {{6, 1}, 2}, {{7, 2}, 2}, {{9, 2}, 3}} &&
+                collect(mixed, false) == std::vector<Transfer>{{{6, 1}, 0}},
+            "packed MLA producer/owner intersections lost a boundary or sent padding");
+    const std::array<models::IndexRange, 2> empty{{{0, 0}, {0, 11}}};
+    require(collect(empty, false) == std::vector<Transfer>{{{0, 3}, 2}, {{3, 3}, 2}},
+            "empty attention owner generated a transfer");
+    for (unsigned r = 0; r < 4; ++r) {
+        auto native = storage_plan(r, true, KvCacheStorage::BFloat16, KvCacheVectorFormat::BFloat16,
+                                   false, 3, LinearStateDType::Float32, 4, 2);
+        native.capacity.device_bytes = (r + 1) * (256ULL << 20);
+        auto& rank                   = ranks[r].placement;
+        rank.global_rank             = r + 4;
+        rank.tp                      = {r, 4};
+        rank.adp                     = {owners.owner(r), 2};
+        states.push_back(glm::describe_state(native.state));
+        glm::RankResourceDescription report{r, native.shape, native.batches->spec(), states.back(),
+                                            glm::describe_context(native)};
+        report.observation.rank = r + 4;
+        report.caches = {native.main.cache.page.geometry, native.mtp->cache.page.geometry};
+        reports.push_back(std::move(report));
+        if (r == 0) {
+            const auto copies = glm::history_conversion(native.main.cache.page, owners, 0, 1, 63);
+            require(copies.full_page.size() == 2 && copies.full_page[0].source_rank == 0 &&
+                        copies.full_page[0].destination_rank == 2 &&
+                        copies.full_page[1].source_rank == 1 &&
+                        copies.full_page[1].destination_rank == 3,
+                    "history conversion omitted a required physical copy");
+            for (const auto& part : copies.partial_page)
+                require(part.source_rank < 2 && part.destination_rank == part.source_rank + 2,
+                        "partial tail copied to another slice");
+        }
+    }
+    auto spec = glm::plan_replica_context(ranks, reports);
+    require(spec.state.layouts.size() == 2 && spec.state.layouts[1].parts.size() == 4,
+            "logical owner and KDA rank counts were coupled");
+    for (const auto& pool : spec.pools)
+        require(pool.logical_pages == reports[0].context.pools[pool.pool_id].logical_pages +
+                                          reports[2].context.pools[pool.pool_id].logical_pages,
+                "replicated pages were counted twice or beyond the smallest member");
+    const auto copies = glm::state_conversion(states, owners, 0, 1);
+    require(copies.size() == 6 && copies[4].source_rank == 0 && copies[4].destination_rank == 2 &&
+                copies[5].source_rank == 1 && copies[5].destination_rank == 3,
+            "raw tail lost a head slice");
+    for (unsigned r = 0; r < 4; ++r)
+        require(copies[r].source_rank == r && copies[r].destination_rank == r &&
+                    copies[r].bytes == states[r].common.bytes,
+                "migration moved a TP-local KDA shard");
+}
+
 void host() {
+    grouped_owners();
     for (const auto linear_state_dtype :
          {LinearStateDType::Float32, LinearStateDType::BFloat16})
         for (const bool mtp : {false, true})
@@ -153,7 +228,8 @@ void host() {
                             f.context.pools.size() == 1U + mtp,
                         "group preparation discarded rank capacity or optional history");
                 for (const unsigned tail : {3U, 4U, 63U}) {
-                    const auto transfer = glm::history_conversion(p.main.cache.page, 0, 1, tail);
+                    const auto transfer = glm::history_conversion(
+                        p.main.cache.page, glm::AttentionOwners(2, 2), 0, 1, tail);
                     std::size_t copied  = 0;
                     for (const auto& field : transfer.partial_page) copied += field.bytes;
                     require(
@@ -185,7 +261,8 @@ void host() {
                 for (const auto& pool : directory.usage().pools)
                     require(pool.live_bytes == 0 && pool.reserved_bytes == 0,
                             "released GLM records retained physical ownership");
-                const auto copies = glm::state_conversion(prepared.states, 0, 1);
+                const auto copies =
+                    glm::state_conversion(prepared.states, glm::AttentionOwners(2, 2), 0, 1);
                 require(copies.size() == 3 && copies[0].source_rank == copies[0].destination_rank &&
                             copies[1].source_rank == copies[1].destination_rank &&
                             copies[2].source_rank == 0 && copies[2].destination_rank == 1 &&
@@ -227,7 +304,7 @@ void dflash_storage() {
         require(plan.frame.dflash->features.shape[0] == 20480,
                 "conditioning does not preserve all five post-residual features");
     }
-    const auto copy = glm::state_conversion(placement, 0, 1);
+    const auto copy = glm::state_conversion(placement, glm::AttentionOwners(2, 2), 0, 1);
     require(copy.size() == 3, "attention relocation changed rank-local State ownership");
     for (unsigned rank = 0; rank < 2; ++rank)
         require(copy[rank].source_rank == rank && copy[rank].destination_rank == rank &&

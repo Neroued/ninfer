@@ -137,7 +137,7 @@ void ExecutionCodec::validate_commit(const Work& work, const Result& result,
 
 runtime::protocol::Scope ExecutionCodec::scope(const Work& work,
                                                const distributed::ExecutionTopology&) const {
-    if (std::holds_alternative<ExpertServiceWork>(work.operation))
+    if (std::holds_alternative<moe::ExpertServiceWork>(work.operation))
         return {replica_.ranks, {}, replica_.result_owner};
     const auto* context = std::get_if<ContextWork>(&work.operation);
     if (!context || !context->bindings.empty() || !context->releases.empty()) return scope_;

@@ -22,7 +22,7 @@ void RankProgramImpl::start(runtime::ExecutionRequest<ExecutionTypes>&& request)
     if (const auto& step = f.request.work.exchange) {
         last_expert_step = step->id;
         f.main_pass      = step->draft_passes;
-        if (std::holds_alternative<ExpertServiceWork>(f.request.work.operation)) {
+        if (std::holds_alternative<moe::ExpertServiceWork>(f.request.work.operation)) {
             const auto serve = [&](const moe::Parameters& layer, std::uint32_t columns) {
                 const auto stage = exchange->stage(layer.bank, dimension(columns));
                 moe::resident_layer(layer, nullptr, &stage, resources.workspace, cuda);
@@ -199,12 +199,13 @@ void RankProgramImpl::advance_compute() {
             if (!compute_done.ready()) return;
             gpu_timer.observe_result(f.gpu);
             events.emplace_back(runtime::ResultReady<ExecutionTypes>{
-                f.request.ticket, ExpertServiceResult{f.request.work.exchange->id}});
+                f.request.ticket, moe::ExpertServiceResult{f.request.work.exchange->id}});
             f.phase = ComputePhase::PendingCommit;
             return;
         case ComputePhase::Retiring:
             if (!compute_done.ready() ||
-                (host_ple && !std::holds_alternative<ExpertServiceWork>(f.request.work.operation) &&
+                (host_ple &&
+                 !std::holds_alternative<moe::ExpertServiceWork>(f.request.work.operation) &&
                  !host_ple->retired(f.request.ticket)))
                 return;
             retire_compute();
@@ -314,7 +315,7 @@ void RankProgramImpl::commit(runtime::ExecutionTicket ticket, runtime::CommandSe
     }
     for (const auto& row : commit.rows)
         f.release_vision |= row.cancelled || row.failed || row.terminal;
-    if (!std::holds_alternative<ExpertServiceWork>(f.request.work.operation))
+    if (!std::holds_alternative<moe::ExpertServiceWork>(f.request.work.operation))
         resources.compute_actions->submit(
             local_actions(commit.actions, parameters.profile->local.rank));
     gpu_timer.record_retirement();
@@ -353,7 +354,8 @@ void RankProgramImpl::discard(runtime::ExecutionTicket ticket, runtime::CommandS
 void RankProgramImpl::retire_compute() {
     const auto ticket  = compute->request.ticket;
     const auto command = compute->retirement;
-    const bool service = std::holds_alternative<ExpertServiceWork>(compute->request.work.operation);
+    const bool service =
+        std::holds_alternative<moe::ExpertServiceWork>(compute->request.work.operation);
     if (!service && resources.compute_actions->occupied()) resources.compute_actions->finish();
     if (!service && resources.vision) {
         const auto* active  = resources.vision->current();

@@ -79,12 +79,13 @@ void GraphInputs::set(int g, int c, int width, int depth) {
     p.select_frame({std::uint32_t(g), std::uint32_t(c)});
     const auto& io = p.frame;
     const auto& a  = io.attention;
-    const int rank = p.parameters.profile->local.rank, ranks = p.parameters.profile->local.size;
+    const int owner_id = p.parameters.profile->local.owner(),
+              owners   = p.parameters.profile->local.attention.size();
     const auto counts =
         p.resources.plan.batches->representative_owners({std::uint32_t(g), std::uint32_t(c)});
-    std::vector<std::uint32_t> begins(ranks);
+    std::vector<std::uint32_t> begins(owners);
     std::uint32_t real_rows = 0;
-    for (int i = 0; i < ranks; ++i) {
+    for (int i = 0; i < owners; ++i) {
         begins[i] = real_rows;
         real_rows += counts[i];
     }
@@ -124,8 +125,8 @@ void GraphInputs::set(int g, int c, int width, int depth) {
         i32(io.rows.sampling_columns)[j]    = live;
     }
     for (int j = 0; j < c; ++j) {
-        const bool live               = j < counts[rank];
-        const int row                 = begins[rank] + j;
+        const bool live               = j < counts[owner_id];
+        const int row                 = begins[owner_id] + j;
         i32(a.to_global)[j]           = live ? row : -1;
         i32(a.live_rows)[j]           = live;
         i32(a.live_columns)[j]        = live ? 0 : -1;
@@ -139,8 +140,9 @@ void GraphInputs::set(int g, int c, int width, int depth) {
         i32(a.active_columns)[j]      = live ? 0 : -1;
     }
     std::fill_n(i32(a.from_gather), g, -1);
-    for (int rank = 0; rank < ranks; ++rank)
-        for (int j = 0; j < counts[rank]; ++j) i32(a.from_gather)[begins[rank] + j] = rank * c + j;
+    for (int owner = 0; owner < owners; ++owner)
+        for (int j = 0; j < counts[owner]; ++j)
+            i32(a.from_gather)[begins[owner] + j] = owner * c + j;
     if (io.speculative)
         for (int j = 0; j < g; ++j) {
             i32(io.speculative->extents)[j]      = j < int(real_rows) ? extent : 0;

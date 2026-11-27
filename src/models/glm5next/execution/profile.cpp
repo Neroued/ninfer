@@ -60,8 +60,9 @@ namespace {
 class Describe {
 public:
     Describe(const ModelDefinition& definition, std::span<const BoundWeight> weights,
-             std::span<const moe::ExpertDescription> experts)
-        : definition_(definition), weights_(weights), experts_(experts) {}
+             std::span<const moe::ExpertDescription> experts, const MlaConfig& mla, bool selects)
+        : definition_(definition), weights_(weights), experts_(experts), mla_(mla),
+          selects_(selects) {}
 
     ops::LinearProfile linear(std::initializer_list<WeightId> ids) const {
         std::vector<ops::WeightInput> inputs;
@@ -85,16 +86,16 @@ public:
     }
 
     MlaProfile mla(const MlaWeights& w) const {
-        const auto& c = definition_.config().text;
-        const auto& m = c.mla;
+        const auto& m = mla_;
         MlaProfile out;
         for (std::size_t i = 0; i < out.prepare.size(); ++i) {
             const auto kind   = static_cast<ops::KpoolMlaPrepareProjection>(i);
+            if (!selects_ && kind == ops::KpoolMlaPrepareProjection::Full) continue;
             const auto inputs = mla_projection_inputs(weights_, w, kind);
             out.prepare[i] = {kind, ops::describe_projection_weights(inputs.weights), inputs.rows,
                               dimension(m.pool_size)};
         }
-        out.query_index = projection({w.query_b, w.index_query});
+        if (selects_) out.query_index = projection({w.query_b, w.index_query});
         out.query       = linear({w.query_b});
         out.output      = linear({w.output});
         out.query_rows  = {dimension(m.query_width()), dimension(m.index_query_width())};
@@ -167,25 +168,34 @@ private:
     const ModelDefinition& definition_;
     std::span<const BoundWeight> weights_;
     std::span<const moe::ExpertDescription> experts_;
+    const MlaConfig& mla_;
+    bool selects_;
 };
 } // namespace
 
-std::shared_ptr<const ModelProfile> describe_model(const ModelDefinition& definition,
-                                                   std::span<const BoundWeight> weights,
-                                                   std::span<const moe::ExpertDescription> experts,
-                                                   const RankPlan& rank) {
+std::shared_ptr<ModelProfile> describe_model(const ModelDefinition& definition,
+                                             std::span<const BoundWeight> weights,
+                                             std::span<const moe::ExpertDescription> experts,
+                                             const RankPlan& rank) {
     if (experts.size() != definition.expert_banks().size())
         throw std::invalid_argument("GLM5Next local expert descriptions are incomplete");
     auto out                 = std::make_shared<ModelProfile>();
     out->config              = definition.config();
+    out->config.text.mla.heads = rank.mla_heads.size;
     out->options             = definition.options();
-    out->local               = {rank.placement.tp.rank, rank.placement.tp.size,  rank.kda_heads,
-                                rank.vocabulary,        rank.dense_intermediate, rank.shared_intermediate};
+    out->local                 = {rank.placement.tp.rank,
+                                  rank.placement.tp.size,
+                                  rank.kda_heads,
+                                  rank.vocabulary,
+                                  rank.dense_intermediate,
+                                  rank.shared_intermediate,
+                                  AttentionOwners(rank.placement.tp.size, rank.placement.adp.size)};
     out->public_tokens       = definition.resources().text.public_token_count;
     out->control_token_limit = definition.resources().text.control_tokens->size();
     const auto& c            = out->config.text;
     const auto& w            = definition.weights();
-    const Describe d(definition, weights, experts);
+    const Describe d(definition, weights, experts, c.mla,
+                     rank.placement.attention_slice().rank == 0);
     out->text.mhc            = {dimension(c.hidden), dimension(c.mhc.streams)};
     out->text.mhc_parameters = {c.norm_epsilon, c.norm_epsilon,
                                 c.mhc.epsilon,  c.mhc.epsilon,
@@ -213,6 +223,18 @@ std::shared_ptr<const ModelProfile> describe_model(const ModelDefinition& defini
         draft.feature_projection = d.linear({weights.feature_projection});
         draft.head               = d.linear({weights.output_head});
         draft.selector           = d.linear({weights.selector->hidden_projection});
+        const auto q = rank.draft->query_heads, kv = rank.draft->key_value_heads;
+        const auto queries_per_key =
+            config.attention.num_attention_heads / config.attention.num_key_value_heads;
+        // The local DFlash Op consumes equal query groups per KV head. Replication of
+        // a KV head is valid when a TP boundary falls inside that one global group.
+        if (!kv.size || q.size % kv.size)
+            throw std::invalid_argument("GLM5Next DFlash2 local GQA requires equal query groups");
+        for (std::uint32_t i = 0; i < q.size; ++i) {
+            if ((q.begin + i) / queries_per_key != kv.begin + i / (q.size / kv.size))
+                throw std::invalid_argument(
+                    "GLM5Next DFlash2 local GQA cannot express this query-to-KV mapping");
+        }
         draft.attention          = {dimension(config.attention.head_dim),
                                     dimension(rank.draft->query_heads.size),
                                     dimension(rank.draft->key_value_heads.size)};

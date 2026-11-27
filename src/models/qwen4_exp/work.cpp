@@ -29,7 +29,7 @@ ExecutionWork ExecutionTypes::describe_work(const Work& work) {
                 result.kind        = ExecutionKind::Decode;
                 result.rows = result.input_tokens = op.rows.size();
                 for (const auto extent : op.draft_extents) result.scheduled_positions += extent + 1;
-            } else if constexpr (std::is_same_v<T, ExpertServiceWork>) {
+            } else if constexpr (std::is_same_v<T, moe::ExpertServiceWork>) {
                 result.kind = ExecutionKind::ExpertService;
             } else if constexpr (std::is_same_v<T, ScoreWork>) {
                 result.kind         = ExecutionKind::Score;
@@ -77,7 +77,8 @@ const PhysicalBatchShape& work_shape(const Work& work) {
     return std::visit(
         [](const auto& operation) -> const PhysicalBatchShape& {
             using T = std::decay_t<decltype(operation)>;
-            if constexpr (std::is_same_v<T, ContextWork> || std::is_same_v<T, ExpertServiceWork>)
+            if constexpr (std::is_same_v<T, ContextWork> ||
+                          std::is_same_v<T, moe::ExpertServiceWork>)
                 throw std::logic_error("Qwen4Exp work has no source batch shape");
             else
                 return operation.shape;
@@ -93,7 +94,7 @@ void plan_work_batch(Work& work, const BatchExecutionPlan& plan) {
         [&](auto& operation) {
             using T = std::decay_t<decltype(operation)>;
             if constexpr (!std::is_same_v<T, ContextWork> &&
-                          !std::is_same_v<T, ExpertServiceWork>) {
+                          !std::is_same_v<T, moe::ExpertServiceWork>) {
                 bool decode = std::is_same_v<T, MtpWork>;
                 if constexpr (std::is_same_v<T, ForwardWork>)
                     decode = operation.kind == ForwardKind::Ordinary;
@@ -111,8 +112,8 @@ void plan_work_batch(Work& work, const BatchExecutionPlan& plan) {
         work.operation);
 }
 
-std::optional<ExpertStep> plan_expert_step(const Work& work, std::uint32_t chunk) {
-    ExpertStep step{};
+std::optional<moe::ExpertStep> plan_expert_step(const Work& work, std::uint32_t chunk) {
+    moe::ExpertStep step{};
     const auto rows = work_rows(work);
     if (rows.empty()) return {};
     const auto* forward = std::get_if<ForwardWork>(&work.operation);
@@ -183,7 +184,7 @@ runtime::WorkPayloadCapacity WorkContract::payload_capacity(std::uint32_t rank_c
 }
 
 void WorkContract::validate(const Work& work, runtime::FrameKind kind) const {
-    const bool service = std::holds_alternative<ExpertServiceWork>(work.operation);
+    const bool service = std::holds_alternative<moe::ExpertServiceWork>(work.operation);
     if (service || work.exchange) {
         if (kind != runtime::FrameKind::Compute || !work.exchange || !work.exchange->id ||
             work.exchange->columns.empty() || work.exchange->draft_passes > shape.draft_tokens ||
@@ -489,8 +490,8 @@ void WorkContract::validate(const Work& work, const runtime::DecisionRequest& re
 }
 
 void WorkContract::validate(const Work& work, const Result& result, const Commit& commit) const {
-    if (std::holds_alternative<ExpertServiceWork>(work.operation)) {
-        const auto* service = std::get_if<ExpertServiceResult>(&result);
+    if (std::holds_alternative<moe::ExpertServiceWork>(work.operation)) {
+        const auto* service = std::get_if<moe::ExpertServiceResult>(&result);
         if (!service || !work.exchange || service->step != work.exchange->id)
             throw std::invalid_argument("Qwen4Exp expert service returned a different step");
         validate_commit(work, {}, commit);
@@ -507,7 +508,7 @@ void WorkContract::validate(const Work& work, const Result& result, const Commit
 
 void WorkContract::validate_commit(const Work& work, std::span<const RowResult> results,
                                    const Commit& commit) const {
-    if (std::holds_alternative<ExpertServiceWork>(work.operation)) {
+    if (std::holds_alternative<moe::ExpertServiceWork>(work.operation)) {
         if (!results.empty() || !commit.rows.empty() ||
             std::ranges::any_of(commit.actions,
                                 [](const auto& item) { return !item.second.empty(); }))

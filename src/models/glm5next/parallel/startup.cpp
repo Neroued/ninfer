@@ -1,10 +1,14 @@
 #include "models/glm5next/parallel/startup.h"
 
 #include "models/glm5next/startup.h"
+#include "runtime/executor/collective_executor.h"
+#include "models/common/moe/step_schedule.h"
 
 #include <algorithm>
 
 namespace ninfer::models::glm5next {
+
+using ExpertSchedule = moe::ExpertSchedule<ExecutionTypes>;
 
 ParallelStartup::ParallelStartup(const artifact::Reader& reader, const EngineOptions& options)
     : definition_(read_definition(reader, load_options(options))),
@@ -116,6 +120,41 @@ void ParallelStartup::resolve(std::span<const distributed::wire::Payload> descri
     options.prefill_chunk                     = ranks_.front().shape.prefill_chunk;
     options.context_cache.host_capacity_bytes = 0;
     checkpoint_interval_                      = options.context_cache.checkpoint_interval;
+    memberships_.assign(parallel_.topology.replicas.size(), {});
+    for (const auto& role : parallel_.topology.roles) {
+        if (role.role != "expert") continue;
+        const auto& group = parallel_.topology.group(role.group);
+        std::vector<std::uint32_t> replicas;
+        for (auto rank : group.members) {
+            const auto r = parallel_.topology.replica_for_rank(rank).replica_id;
+            if (replicas.empty() || replicas.back() != r) replicas.push_back(r);
+        }
+        if (replicas.size() == 1) continue;
+        const auto& first = parallel_.topology.replica(replicas.front());
+        const auto& shape = ranks_[first.result_owner].shape;
+        const auto chunk = shape.prefill_chunk, batch = shape.max_concurrency,
+                   width       = shape.draft_tokens + 1;
+        const auto max_control = definition_->resources().text.control_tokens->size();
+        const auto windows     = std::max<std::size_t>(1, (max_control + chunk - 1) / chunk);
+        std::vector<runtime::CollectiveRouteLimit> routes{
+            {0, {std::max(chunk, batch * width)}, static_cast<std::uint32_t>(batch * windows)}};
+        if (shape.speculative == SpeculativeBackend::Mtp) {
+            for (unsigned d = 1; d <= shape.draft_tokens; ++d) {
+                std::vector<unsigned> extents(d, batch);
+                extents.push_back(batch * width);
+                routes.push_back({d, std::move(extents)});
+            }
+        }
+        auto domain =
+            std::make_shared<runtime::CollectiveStepDomain>(replicas.size(), std::move(routes));
+        for (std::size_t i = 0; i < replicas.size(); ++i) {
+            const auto r = replicas[i];
+            if (memberships_[r].domain ||
+                ranks_[parallel_.topology.replica(r).result_owner].shape != shape)
+                throw std::invalid_argument("GLM expert domain has incompatible replica capacity");
+            memberships_[r] = {domain, i};
+        }
+    }
 }
 
 std::vector<PreparedSession> ParallelStartup::sessions() const {
@@ -140,6 +179,16 @@ ParallelStartup::Codec ParallelStartup::codec(std::uint32_t replica_id) const {
     const auto& rep        = parallel_.topology.replica(replica_id);
     const auto global_rank = rep.ranks.at(0);
     return {*definition_, ranks_.at(global_rank), parallel_.topology, rep, 0};
+}
+
+std::unique_ptr<ParallelStartup::Executor>
+ParallelStartup::coordinate(std::uint32_t replica, std::unique_ptr<Executor> executor) const {
+    const auto& m = memberships_.at(replica);
+    if (!m.domain) return executor;
+    const auto& shape = ranks_.at(parallel_.topology.replica(replica).result_owner).shape;
+    return std::make_unique<runtime::CollectiveExecutor<ExecutionTypes, ExpertSchedule>>(
+        std::move(executor), m.domain, m.member, ExpertSchedule{shape.prefill_chunk},
+        shape.max_concurrency);
 }
 
 std::vector<RankSnapshot> ParallelStartup::observations() const {

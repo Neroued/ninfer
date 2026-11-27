@@ -6,6 +6,18 @@
 
 namespace ninfer::models::moe {
 
+void SigmoidPass::run(ExpertBankId bank, const ops::SigmoidMoeProfile& p,
+                      const ops::SigmoidMoeWeights& weights, const LayerSource* source,
+                      ParallelExecution* tensor, MemoryArena& arena, CudaExecutionView cuda) const {
+#if NINFER_ENABLE_DISTRIBUTED
+    auto step = exchange->stage(bank, columns);
+    step.frame.sigmoid_layer(step.placement, p, weights, columns, source, representative, tensor,
+                             arena, cuda);
+#else
+    throw std::logic_error("sigmoid expert exchange requires distributed execution");
+#endif
+}
+
 void resident_layer(const Parameters& p, const LayerSource* src, const ExpertExchangeWork* step,
                     MemoryArena& workspace, CudaExecutionView cuda) {
     if (step) {

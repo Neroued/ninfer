@@ -31,7 +31,7 @@ struct SequenceUpdate {
 
 struct PackedPrefillUpdate {
     ops::RaggedSequenceView ragged;
-    std::array<IndexRange, 2> owner_tokens;
+    std::vector<IndexRange> owner_tokens;
     ops::RaggedSequenceView local_mla_ragged;
 };
 

@@ -26,20 +26,12 @@ bool can_narrow_dflash_targets(const EngineOptions& options) noexcept {
 
 RankPreparation::RankPreparation(const artifact::Reader& reader, RankLoadRequest request,
                                  DeviceContext& device, ContextCommunication peer,
-                                 std::uint32_t global_node)
+                                 std::uint32_t global_node,
+                                 const distributed::GroupDescription* experts)
     : device_(device), options_(std::move(request.options)), global_node_(global_node),
       peer_(std::move(peer)), control_owner_(request.control_owner) {
     if (request.artifact != reader.artifact_id())
         throw artifact::ArtifactError("GLM5Next worker artifact differs from coordinator");
-    const auto& placement = request.rank.placement;
-    if (placement.ep.size > placement.tp.size)
-        throw std::invalid_argument(
-            "GLM5Next execution requires cross-replica expert dispatch and return");
-    if (placement.attention_slice().size > 1)
-        throw std::invalid_argument("GLM5Next execution requires intra-owner MLA head reduction");
-    if (placement.adp.size > 2)
-        throw std::invalid_argument(
-            "GLM5Next packed MLA exchange supports at most two attention owners");
     auto definition = read_definition(reader, load_options(options_));
     load_.emplace(
         resolve_rank_load(reader, std::move(definition), std::move(request.rank), device.device()));
@@ -47,6 +39,27 @@ RankPreparation::RankPreparation(const artifact::Reader& reader, RankLoadRequest
                     load_->materialization().host_capacity_bytes, request.host_reservation_bytes};
     auto profile = execution::describe_model(load_->definition(), load_->weight_data(),
                                              load_->expert_data(), load_->rank_plan());
+#if NINFER_ENABLE_DISTRIBUTED
+    if (experts) {
+        const auto& rp  = load_->rank_plan();
+        const auto peer = experts->index(rp.placement.global_rank);
+        const auto& c   = profile->config.text;
+        auto route = std::make_shared<moe::ResidentExchangePlan>(rp.expert_domain, *experts, peer,
+                                                                 c.hidden, c.moe.top_k);
+        const auto bind = [&](execution::MoeProfile& layer) {
+            layer.exchange_workspace =
+                route->stage(layer.bank).sigmoid_workspace_bytes(peer, layer.math);
+        };
+        for (auto& layer : profile->text.layers)
+            if (auto* m = std::get_if<execution::MoeProfile>(&layer.ffn)) bind(*m);
+        if (profile->mtp) bind(profile->mtp->moe);
+        profile->exchange_bytes = route->bytes();
+        profile->exchange       = std::move(route);
+        expert_requirements_ =
+            moe::expert_exchange_requirements(*experts, *rp.expert_domain, peer, c.hidden,
+                                              c.moe.top_k, moe::expert_exchange_block_columns);
+    }
+#endif
     plan_        = plan_execution(
         std::move(profile), options_, request.index_format, device.multiprocessor_count(),
         device_memory_snapshot(device.device()).shared_physical_memory, std::move(request.batches));
@@ -57,6 +70,13 @@ RankPreparation::RankPreparation(const artifact::Reader& reader, RankLoadRequest
 RankPreparation::~RankPreparation() = default;
 
 runtime::PreparationMemory RankPreparation::memory() const { return memory_; }
+
+std::unique_ptr<moe::ResidentExpertExchange> RankPreparation::prepare_experts() const {
+#if NINFER_ENABLE_DISTRIBUTED
+    if (expert_group_) return plan_.profile->exchange->prepare(*expert_group_);
+#endif
+    return {};
+}
 
 void RankPreparation::materialize() {
     if (!load_) throw std::logic_error("GLM5Next rank weights are already materialized");
@@ -100,7 +120,7 @@ void RankPreparation::create_probe(std::size_t context_bytes) {
     plan.capacity.runtime_reservation_bytes = plan.reservation_bytes();
     auto resources                          = std::make_unique<Resources>(std::move(plan), device_);
     probe_ = std::make_unique<RankProgram>(instance_->parameters, std::move(resources), device_,
-                                           binding_);
+                                           binding_, prepare_experts());
 }
 
 void RankPreparation::calibrate() {
@@ -149,7 +169,7 @@ void RankPreparation::prepare(runtime::ContextCapacity capacity, std::size_t ava
         available_host, shared_memory, control_owner_);
     auto resources     = std::make_unique<Resources>(std::move(plan), device_, peer_);
     instance_->program = std::make_unique<RankProgram>(instance_->parameters, std::move(resources),
-                                                       device_, binding_);
+                                                       device_, binding_, prepare_experts());
 }
 
 void RankPreparation::release_resources() {

@@ -14,7 +14,7 @@ struct KdaParameters {
 
 struct MlaParameters {
     std::array<ops::KpoolMlaPrepareParameters, 3> prepare;
-    ops::ProjectionWeights query_index;
+    std::optional<ops::ProjectionWeights> query_index;
     LinearParameters query, output;
     ops::KpoolMlaFactors factors;
 };

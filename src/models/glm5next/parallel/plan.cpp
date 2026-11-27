@@ -28,10 +28,15 @@ RankPlan rank_plan(const ModelDefinition& definition, const distributed::RankIde
     p.dense_intermediate = partition_range(c.dense_intermediate, size, rank);
     p.shared_intermediate = partition_range(dimension(c.moe.shared_intermediate()), size, rank);
     if (const auto& draft = definition.config().draft) {
-        p.draft = {partition_range(c.hidden, size, rank),
-                   partition_range(draft->attention.num_attention_heads, size, rank),
-                   partition_range(draft->attention.num_key_value_heads, size, rank),
-                   partition_range(draft->intermediate_size, size, rank)};
+        const auto& attention = draft->attention;
+        const auto queries    = partition_range(attention.num_attention_heads, size, rank);
+        const auto group      = attention.num_attention_heads / attention.num_key_value_heads;
+        const auto first_kv   = queries.begin / group;
+        const auto end_kv     = (queries.begin + queries.size - 1) / group + 1;
+        p.draft               = {partition_range(c.hidden, size, rank),
+                                 queries,
+                                 {first_kv, end_kv - first_kv},
+                                 partition_range(draft->intermediate_size, size, rank)};
     }
     const auto experts = partition_range(c.moe.experts, id.ep.size, id.ep.rank);
     const auto slice   = p.placement.expert_slice();
@@ -169,20 +174,21 @@ RankPlan rank_plan(const ModelDefinition& definition, const distributed::RankIde
         return p;
     }
 
+    const auto append_rows = [&](ParameterAssembly& assembly, WeightId id, IndexRange rows) {
+        const auto columns = definition.parameter(id).shape.at(1);
+        const auto begin   = assembly.shape[0];
+        assembly.slices.push_back({id, rows.begin, 0, rows.size, columns, begin, 0});
+        assembly.bindings.push_back(
+            {id, {rows.size, columns}, begin * columns, (begin + rows.size) * columns});
+        assembly.shape = {begin + rows.size, columns};
+    };
     const auto rows =
         [&](std::initializer_list<std::pair<WeightId, bool>> weights) -> ParameterAssembly& {
-        ParameterAssembly a;
-        std::uint64_t n = 0, k = 0;
+        ParameterAssembly a{{0, 0}};
         for (const auto& [id, split] : weights) {
-            const auto& shape = definition.parameter(id).shape;
-            k                 = shape.at(1);
-            const auto r =
-                partition_range(dimension(shape.at(0)), split ? size : 1, split ? rank : 0);
-            a.slices.push_back({id, r.begin, 0, r.size, k, n, 0});
-            a.bindings.push_back({id, {r.size, k}, n * k, (n + r.size) * k});
-            n += r.size;
+            const auto count = dimension(definition.parameter(id).shape.at(0));
+            append_rows(a, id, partition_range(count, split ? size : 1, split ? rank : 0));
         }
-        a.shape = {n, k};
         p.assemblies.push_back(std::move(a));
         return p.assemblies.back();
     };
@@ -245,7 +251,17 @@ RankPlan rank_plan(const ModelDefinition& definition, const distributed::RankIde
         rows({{w.draft->feature_projection, true}});
         for (const auto& layer : w.draft->layers) {
             const auto& a    = layer.attention;
-            auto& projection = rows({{a.key, true}, {a.value, true}, {a.query, true}});
+            auto& projection         = p.assemblies.emplace_back();
+            projection.shape         = {0, 0};
+            const auto d             = definition.config().draft->attention.head_dim;
+            const auto project_heads = [&](WeightId weight, IndexRange heads) {
+                append_rows(projection, weight,
+                            {dimension(std::uint64_t(heads.begin) * d),
+                             dimension(std::uint64_t(heads.size) * d)});
+            };
+            project_heads(a.key, p.draft->key_value_heads);
+            project_heads(a.value, p.draft->key_value_heads);
+            project_heads(a.query, p.draft->query_heads);
             auto key         = projection.bindings[0];
             auto value       = projection.bindings[1];
             key.parameter    = a.context_key;
@@ -295,10 +311,16 @@ ParallelPlan plan_parallel(const ModelDefinition& definition, const DeploymentOp
     out.ranks.reserve(out.topology.ranks.size());
     for (const auto& id : out.topology.ranks) out.ranks.push_back(rank_plan(definition, id));
     for (const auto& rep : out.topology.replicas) {
-        for (const char* role : {"tensor", "attention", "vocabulary", "vision"})
+        for (const char* role : {"tensor", "vocabulary", "vision"})
             out.topology.add_role(role, rep.ranks);
         out.topology.add_role("context", rep.ranks, distributed::GroupUsage::PeerExchange);
         const auto lanes = out.ranks[rep.ranks.front()].placement.attention_slice().size;
+        for (std::uint32_t lane = 0; lane < lanes; ++lane) {
+            std::vector<distributed::RankId> members;
+            for (std::size_t rank = lane; rank < rep.ranks.size(); rank += lanes)
+                members.push_back(rep.ranks[rank]);
+            out.topology.add_role("attention_lane", members);
+        }
         for (std::size_t i = 0; i < rep.ranks.size(); i += lanes)
             out.topology.add_role("attention_owner", std::span(rep.ranks).subspan(i, lanes));
     }

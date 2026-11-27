@@ -84,7 +84,7 @@ WorkRow SessionImpl::work_row(const Sequence& s, std::uint32_t tokens) const {
         row.mtp_frontier = m.mtp_frontier.value();
     }
     row.main_frontier     = m.main_frontier;
-    row.attention_rank    = m.placement.value;
+    row.attention_owner   = m.placement.value;
     row.sampling          = s.request->sampling;
     row.sampling_position = m.main_frontier;
     const auto start      = m.main_frontier;

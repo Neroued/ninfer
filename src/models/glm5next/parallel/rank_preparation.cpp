@@ -41,7 +41,12 @@ RankPreparation::RankPreparation(const artifact::Reader& reader, std::span<const
                                  distributed::CommunicationContext& communication,
                                  const StartupObserver& observer)
     : RankPreparation(reader, request(reader, payload, identity, observer), device,
-                      context_group(topology, identity, communication), identity.node) {
+                      context_group(topology, identity, communication), identity.node,
+                      identity.ep.size > identity.tp.size
+                          ? &topology.role_group("expert", identity.rank)
+                          : nullptr) {
+    if (identity.ep.size > identity.tp.size)
+        expert_group_ = &communication.group(topology.role_group("expert", identity.rank).id);
     const auto& replica     = topology.replica_for_rank(identity.rank);
     const auto local_ranks  = static_cast<std::uint32_t>(replica.ranks.size());
     const WorkContract contract{plan_.shape,
@@ -56,7 +61,14 @@ RankPreparation::RankPreparation(const artifact::Reader& reader, std::span<const
     if (identity.tp.size > 1) {
         const auto& group    = topology.role_group("tensor", identity.rank);
         const auto result_id = replica.result_owner;
-        binding_             = {&communication.group(group.id), group.index(result_id)};
+        binding_.tensor      = {&communication.group(group.id), group.index(result_id)};
+        const auto bind      = [&](std::string_view role) -> ParallelBinding {
+            const auto& desc = topology.role_group(role, identity.rank);
+            return desc.members.size() > 1 ? ParallelBinding{&communication.group(desc.id), 0}
+                                                : ParallelBinding{};
+        };
+        if (plan_.profile->local.attention.width() > 1) binding_.heads = bind("attention_owner");
+        if (plan_.profile->local.attention.size() > 1) binding_.owners = bind("attention_lane");
     }
 }
 
@@ -65,14 +77,16 @@ ExecutionCodec RankPreparation::codec(const distributed::ExecutionTopology& topo
 }
 
 std::vector<distributed::GroupRequirements> RankPreparation::communication_requirements() const {
-    if (!binding_.group) return {};
+    if (!binding_.tensor.group)
+        return expert_requirements_ ? std::vector{*expert_requirements_}
+                                    : std::vector<distributed::GroupRequirements>{};
     using distributed::Collective;
     using distributed::Reduction;
     const auto& shape = plan_.shape;
     const auto hidden = std::size_t(plan_.profile->config.text.hidden);
     const auto batch  = std::size_t(shape.max_concurrency);
     const auto decode = batch * (shape.draft_tokens + 1);
-    distributed::GroupRequirements tensor{binding_.group->id(), {}, {}};
+    distributed::GroupRequirements tensor{binding_.tensor.group->id(), {}, {}};
     auto& work            = tensor.collectives;
     const auto policy     = execution::sequence_parallel_policy(plan_.profile->local.size);
     const auto sequence   = policy.partition(dimension(shape.prefill_chunk), 0);
@@ -87,7 +101,7 @@ std::vector<distributed::GroupRequirements> RankPreparation::communication_requi
     }
     const auto broadcast_columns =
         std::size_t(policy.local_capacity(dimension(shape.prefill_chunk)));
-    for (std::uint32_t root = 0; root < binding_.group->size(); ++root) {
+    for (std::uint32_t root = 0; root < binding_.tensor.group->size(); ++root) {
         work.push_back({Collective::Broadcast, DType::BF16, hidden, hidden * broadcast_columns,
                         hidden, Reduction::Sum, root});
         if (plan_.workspace.vision)
@@ -116,7 +130,7 @@ std::vector<distributed::GroupRequirements> RankPreparation::communication_requi
                 const auto feature = hidden * plan_.profile->config.draft->target_layer_ids.size();
                 const auto retained =
                     std::min(std::size_t(shape.prefill_chunk), std::size_t(p.context.capacity));
-                for (std::uint32_t root = 0; root < binding_.group->size(); ++root)
+                for (std::uint32_t root = 0; root < binding_.tensor.group->size(); ++root)
                     work.push_back({Collective::Broadcast, DType::BF16, feature, feature * retained,
                                     feature, Reduction::Sum, root});
             }
@@ -132,6 +146,32 @@ std::vector<distributed::GroupRequirements> RankPreparation::communication_requi
     }
     std::vector<distributed::GroupRequirements> result;
     result.push_back(std::move(tensor));
+    const auto requirements = [&](const distributed::Group& group) -> auto& {
+        auto found = std::ranges::find(result, group.id(), &distributed::GroupRequirements::group);
+        if (found == result.end())
+            return result.emplace_back(distributed::GroupRequirements{group.id(), {}, {}})
+                .collectives;
+        return found->collectives;
+    };
+    if (binding_.heads.group) {
+        auto& heads          = requirements(*binding_.heads.group);
+        const auto positions = std::max<std::size_t>(shape.prefill_chunk, decode);
+        heads.push_back({Collective::AllReduce, DType::BF16, hidden, hidden * positions, hidden});
+        heads.push_back({Collective::Broadcast, DType::I32, 1, positions, 1, Reduction::Sum, 0});
+        heads.push_back(
+            {Collective::Broadcast, DType::I32, 512, 512 * positions, 512, Reduction::Sum, 0});
+    }
+    if (binding_.owners.group && binding_.owners.group != binding_.tensor.group)
+        requirements(*binding_.owners.group)
+            .push_back({Collective::AllGather, DType::BF16, hidden, hidden * decode, hidden});
+    if (expert_requirements_) {
+        const auto block = static_cast<std::size_t>(moe::expert_exchange_block_columns);
+        auto& tp         = requirements(*binding_.tensor.group);
+        tp.push_back({Collective::AllReduce, DType::FP32, hidden, hidden * block, hidden});
+        tp.push_back({Collective::Broadcast, DType::BF16, hidden, hidden * block, hidden,
+                      Reduction::Sum, 0});
+        result.push_back(*expert_requirements_);
+    }
     if (peer_.group)
         result.push_back(context::peer_communication_requirements(
             *peer_.group, plan_.peer_staging.front().bytes));

@@ -29,10 +29,10 @@ TextRun::TextRun(const Parameters& p, TextExecution execution, BatchView batch, 
             "GLM5Next sequence parallel execution requires a sequence owner");
     columns_.clear_padding(roots_.exchange_input, 1, cuda_);
     columns_.clear_padding(roots_.exchange_output, 1, cuda_);
-    if (execution.parallel && !batch.sequence_owner && !packed)
-        attention_ =
-            workspace::attention(execution.workspace, dimension(p.profile->config.text.hidden),
-                                 batch.tokens * batch.attention.rows, p.profile->local.size);
+    if (execution.attention.owners && !batch.sequence_owner && !packed)
+        attention_ = workspace::attention(
+            execution.workspace, dimension(p.profile->config.text.hidden),
+            batch.tokens * batch.attention.rows, p.profile->local.attention.size());
 }
 
 void TextRun::stem(std::optional<models::vision::EmbeddingView> visual) {
@@ -59,7 +59,7 @@ void TextRun::local_mixer(std::uint32_t layer, const MlaSubmit& submit) {
         return;
     }
     if (const auto* packed = std::get_if<PackedPrefillUpdate>(&update_)) {
-        const auto own = packed->owner_tokens[profile.local.rank];
+        const auto own = packed->owner_tokens[profile.local.owner()];
         if (!own.size) return;
         const auto& local = batch_.attention;
         const ops::KpoolMlaRaggedBatchView ragged{packed->local_mla_ragged, local.positions,
@@ -71,10 +71,10 @@ void TextRun::local_mixer(std::uint32_t layer, const MlaSubmit& submit) {
                     execution_.states.main_tail(local.destination_offsets).layer(index),
                     execution_.cache.layer(index), local.selection_rows,
                     ops::select_context_bucket(local.max_visible_tokens), output,
-                    execution_.workspace, cuda_);
+                    execution_.workspace, cuda_, execution_.attention.heads);
         return;
     }
-    if (batch_.sequence_owner && *batch_.sequence_owner != profile.local.rank) return;
+    if (batch_.sequence_owner && *batch_.sequence_owner != profile.local.owner()) return;
     if (attention_.input.data) {
         const int h = dimension(profile.config.text.hidden), t = batch_.tokens;
         auto input = attention_.input.view({h, t, batch_.attention.rows});
@@ -105,7 +105,7 @@ MlaRun TextRun::local_mla(std::uint32_t layer) {
                   {local.positions, local.valid_columns, local.table_rows}, before, after,
                   execution_.cache.layer(index), records, local.selection_rows, bucket,
                   attention_.output.data ? attention_.output : roots_.output, execution_.workspace,
-                  cuda_);
+                  cuda_, {}, execution_.attention.heads);
 }
 
 void TextRun::broadcast_mla_columns(Tensor& value, int begin, int end, std::uint32_t root) {
@@ -119,30 +119,23 @@ void TextRun::broadcast_mla_columns(Tensor& value, int begin, int end, std::uint
     }
 }
 
-void TextRun::exchange_packed_mla(const PackedPrefillUpdate& packed, Tensor& exchange, bool input) {
-    // Only the columns whose sequence-parallel producer and attention owner differ cross ranks.
-    for (std::uint32_t root = 0; root < columns_.ranks; ++root) {
-        const TokenPartition part(columns_.columns, columns_.ranks, input ? root : 1 - root);
-        const auto own  = packed.owner_tokens[input ? 1 - root : root];
-        const int first = std::max(part.begin, extent(own.begin));
-        const int last  = std::min(part.begin + part.count, extent(own.begin + own.size));
-        broadcast_mla_columns(exchange, first, last, root);
-    }
+void TextRun::exchange_mla_columns(Tensor& exchange, bool input) {
+    const auto& owners = parameters_.profile->local.attention;
+    const auto* packed = std::get_if<PackedPrefillUpdate>(&update_);
+    owners.transfer_columns(
+        columns_,
+        packed ? std::span<const IndexRange>(packed->owner_tokens) : std::span<const IndexRange>{},
+        batch_.sequence_owner, input, [&](IndexRange range, std::uint32_t root) {
+            broadcast_mla_columns(exchange, extent(range.begin), extent(range.begin + range.size),
+                                  root);
+        });
 }
 
 void TextRun::gather_input(std::optional<std::uint32_t> next_mixer) {
     if (!columns_.split()) return;
-    const bool mla = next_mixer && parameters_.profile->config.text.layers.at(*next_mixer).mixer ==
-                                       MixerKind::Mla;
-    if (const auto* packed = std::get_if<PackedPrefillUpdate>(&update_); mla && packed) {
-        exchange_packed_mla(*packed, roots_.exchange_input, true);
-        return;
-    }
-    const auto owner = mla ? batch_.sequence_owner : std::nullopt;
-    if (owner) {
-        const TokenPartition peer(columns_.columns, columns_.ranks, 1 - *owner);
-        auto half = peer.exchange(roots_.exchange_input, 1);
-        execution_.parallel->broadcast(half, peer.rank, cuda_);
+    if (next_mixer &&
+        parameters_.profile->config.text.layers.at(*next_mixer).mixer == MixerKind::Mla) {
+        exchange_mla_columns(roots_.exchange_input, true);
     } else {
         execution_.parallel->gather(columns_.exchange(roots_.exchange_input, 1),
                                     roots_.exchange_input, cuda_);
@@ -176,28 +169,36 @@ void TextRun::finish_mixer(std::uint32_t layer) {
     if (execution_.parallel) {
         if (profile.config.text.layers.at(layer).mixer == MixerKind::Kda)
             reduce_output();
-        else if (const auto* packed = std::get_if<PackedPrefillUpdate>(&update_)) {
-            if (columns_.split())
-                exchange_packed_mla(*packed, roots_.exchange_output, false);
-            else
-                for (std::uint32_t owner = 0; owner < profile.local.size; ++owner) {
-                    const auto own = packed->owner_tokens[owner];
-                    broadcast_mla_columns(roots_.output, extent(own.begin),
-                                          extent(own.begin + own.size), owner);
+        else if (const auto* packed = std::get_if<PackedPrefillUpdate>(&update_);
+                 packed || batch_.sequence_owner) {
+            const auto& groups = profile.local.attention;
+            for (std::uint32_t owner = 0; owner < groups.size(); ++owner) {
+                if (!packed && owner != *batch_.sequence_owner) continue;
+                const auto range = packed ? packed->owner_tokens.at(owner)
+                                          : IndexRange{0, std::uint32_t(columns_.columns)};
+                if (!range.size) continue;
+                if (owner == profile.local.owner() && execution_.attention.heads) {
+                    auto local = roots_.output.slice(1, range.begin, range.size);
+                    execution_.attention.heads->sum(local, cuda_);
                 }
-        } else if (batch_.sequence_owner) {
-            auto output = columns_.split() ? TokenPartition(columns_.columns, columns_.ranks,
-                                                            1 - *batch_.sequence_owner)
-                                                 .exchange(roots_.exchange_output, 1)
-                                           : roots_.output;
-            execution_.parallel->broadcast(output, *batch_.sequence_owner, cuda_);
+                if (!columns_.split() && groups.size() > 1)
+                    broadcast_mla_columns(roots_.output, extent(range.begin),
+                                          extent(range.begin + range.size),
+                                          groups.members(owner).front());
+            }
+            if (columns_.split()) exchange_mla_columns(roots_.exchange_output, false);
         } else {
-            execution_.parallel->gather(attention_.output, attention_.gathered, cuda_);
-            const int h = dimension(profile.config.text.hidden), t = batch_.tokens;
-            auto output = roots_.output.view({h, t, batch_.rows});
-            ops::gather_batch_rows(
-                attention_.gathered.view({h, t, batch_.attention.rows * int(profile.local.size)}),
-                batch_.attention.from_gather, output, cuda_);
+            auto local = attention_.output.data ? attention_.output : roots_.output;
+            if (execution_.attention.heads) execution_.attention.heads->sum(local, cuda_);
+            if (execution_.attention.owners) {
+                execution_.attention.owners->gather(local, attention_.gathered, cuda_);
+                const int h = dimension(profile.config.text.hidden), t = batch_.tokens;
+                auto output = roots_.output.view({h, t, batch_.rows});
+                ops::gather_batch_rows(
+                    attention_.gathered.view(
+                        {h, t, batch_.attention.rows * int(profile.local.attention.size())}),
+                    batch_.attention.from_gather, output, cuda_);
+            }
         }
     }
     next_pre(parameters_.text.layers.at(layer).mlp_hc);
@@ -213,6 +214,13 @@ void TextRun::ffn(std::uint32_t layer) {
         const auto& m = std::get<MoeParameters>(p);
         const auto valid =
             std::holds_alternative<PackedPrefillUpdate>(update_) ? Tensor{} : batch_.valid_columns;
+        if (execution_.experts.exchange) {
+            const auto& selected = std::get<MoeProfile>(profile);
+            const moe::LayerSource source{roots_.input, roots_.output, {valid, batch_.tokens}};
+            execution_.experts.run(selected.bank, selected.math, m.weights, &source,
+                                   execution_.parallel, execution_.workspace, cuda_);
+            return;
+        }
         ops::topk_sigmoid_swiglu_moe(roots_.input, std::get<MoeProfile>(profile).math, m.weights,
                                      m.subset, roots_.output, {valid, batch_.tokens},
                                      execution_.workspace, cuda_);
@@ -220,7 +228,9 @@ void TextRun::ffn(std::uint32_t layer) {
 }
 
 void TextRun::finish_layer(std::uint32_t layer) {
-    reduce_output();
+    if (!execution_.experts.exchange ||
+        std::holds_alternative<DenseProfile>(parameters_.profile->text.layers.at(layer).ffn))
+        reduce_output();
     if (layer + 1 < parameters_.text.layers.size()) {
         Tensor feature;
         if (execution_.features.data) {

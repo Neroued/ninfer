@@ -230,7 +230,8 @@ Work decode_work(Decoder& in, const VisionInputBindings& inputs) {
     Work work;
     const auto rank = in.u32();
     work.actions.emplace(rank, context::decode_actions(in));
-    if (in.boolean()) work.exchange = ExpertStep{in.u64(), in.u32(), integers<std::uint32_t>(in)};
+    if (in.boolean())
+        work.exchange = moe::ExpertStep{in.u64(), in.u32(), integers<std::uint32_t>(in)};
     switch (in.u8()) {
     case 1: {
         ForwardWork v;
@@ -287,7 +288,7 @@ Work decode_work(Decoder& in, const VisionInputBindings& inputs) {
         break;
     }
     case 5:
-        work.operation = ExpertServiceWork{};
+        work.operation = moe::ExpertServiceWork{};
         break;
     default:
         throw std::invalid_argument("unknown Qwen4Exp work kind");
@@ -390,7 +391,7 @@ Result decode_result(Decoder& in) {
         return v;
     }
     case 4:
-        return ExpertServiceResult{in.u64()};
+        return moe::ExpertServiceResult{in.u64()};
     default:
         throw std::invalid_argument("unknown Qwen4Exp result kind");
     }

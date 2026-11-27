@@ -1,4 +1,5 @@
 #pragma once
+#include "models/glm5next/parallel/attention.h"
 #include "models/common/batch.h"
 #include "models/common/speculative/round_plan.h"
 #include "models/common/context/directory.h"
@@ -15,6 +16,7 @@ struct SessionPlan {
     std::uint32_t checkpoint_interval = 8192;
     std::uint32_t vision_max_features = 0;
     std::shared_ptr<const speculative::DecodeGraphRoutes> decode_routes;
+    AttentionOwners attention;
 };
 
 [[nodiscard]] runtime::ContextMetadataPlan

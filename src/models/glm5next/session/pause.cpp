@@ -19,7 +19,7 @@ PauseResources pause_resources(const detail::SessionImpl& p, const detail::Seque
     if (action.kind == runtime::PauseKind::Relocate) {
         out.relocation.state =
             out.demand.add_state({.count = 1, .variant = action.placement.value});
-        const std::array placement{action.placement.value};
+        const auto placement = p.plan.attention.members(action.placement.value);
         for (std::uint32_t pool = 0; pool < p.pool_count(); ++pool) {
             const auto f                   = pool ? s.continuation.metadata.mtp_frontier.value()
                                                   : s.continuation.metadata.main_frontier;
@@ -222,16 +222,16 @@ void SessionImpl::prepare_pause_resources(context::ContextReservation& targets) 
         auto& migration      = operation->migration;
         migration.convert_state(snapshot.continuation().image, to,
                                 targets.take(pause.relocation.state),
-                                state_conversion(plan.states, from, to));
-        const std::array placement{to};
+                                state_conversion(plan.states, plan.attention, from, to));
+        const auto placement = plan.attention.members(to);
         for (std::uint32_t pool = 0; pool < pool_count(); ++pool) {
             const auto& prefix = snapshot.prefix(pool);
-            migration.add_binding(pool,
-                                  directory.pool(pool).histories().prepare_conversion(
-                                      prefix, prefix.frontier(), prefix.frontier(), pause.lane,
-                                      targets.take(pause.relocation.histories[pool]), placement,
-                                      history_conversion(plan.caches[pool], from, to,
-                                                         prefix.frontier() % kPagedKVPageSize)));
+            migration.add_binding(
+                pool, directory.pool(pool).histories().prepare_conversion(
+                          prefix, prefix.frontier(), prefix.frontier(), pause.lane,
+                          targets.take(pause.relocation.histories[pool]), placement,
+                          history_conversion(plan.caches[pool], plan.attention, from, to,
+                                             prefix.frontier() % kPagedKVPageSize)));
         }
     }
 }

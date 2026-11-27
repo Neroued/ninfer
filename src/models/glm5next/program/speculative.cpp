@@ -50,7 +50,7 @@ void RankProgramImpl::prepare_speculative() {
                 i32(step.positions)[i] =
                     r.mtp_frontier + std::min<std::uint32_t>(s, work.draft_extents[logical]);
                 i32(step.valid_columns)[i] = active;
-                if (active && r.attention_rank == rank)
+                if (active && r.attention_owner == parameters.profile->local.owner())
                     f.draft_visible[s] = std::max(f.draft_visible[s], r.mtp_frontier + s + 1);
             }
     }

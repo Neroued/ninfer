@@ -10,7 +10,9 @@ session_metadata_plan(const context::ContextDirectorySpec& schema,
                       const ContextPoolGeometry& geometry, std::uint32_t rank,
                       std::uint32_t count_vocabulary, std::uint32_t concurrency,
                       std::uint32_t max_context, std::uint32_t prefill_chunk, bool vision) {
-    auto metadata = context::ContextDirectory::metadata_plan(schema, rank, 1);
+    const auto owners = schema.state.layouts.size();
+    const auto width  = schema.ranks.size() / owners;
+    auto metadata     = context::ContextDirectory::metadata_plan(schema, rank, width);
     const context::PrefixMetadataLayout prefix_layout{false, vision ? kMinimumMediaSpanTokens : 0,
                                                       kMinimumMediaSpanTokens};
     const auto records = std::size_t(schema.state.logical_capacity);
@@ -20,7 +22,7 @@ session_metadata_plan(const context::ContextDirectorySpec& schema,
             detail::Checkpoints::metadata_bytes(records) +
             context::RecoveryIndex<>::metadata_bytes(records) +
             context::recovery_value_metadata_bytes(records, concurrency, schema.ranks.size(),
-                                                   schema.ranks.size()) +
+                                                   owners) +
             context::PrefixStore::metadata_bytes(
                 std::size_t(prefill_chunk + context::PrefixStore::block_tokens) * concurrency,
                 records + 2 * concurrency, prefix_layout);
@@ -28,15 +30,13 @@ session_metadata_plan(const context::ContextDirectorySpec& schema,
         detail::Checkpoints::metadata_bytes(1) - detail::Checkpoints::metadata_bytes(0);
     const auto recovery_cost =
         context::RecoveryIndex<>::metadata_bytes(1) - context::RecoveryIndex<>::metadata_bytes(0) +
-        context::recovery_value_metadata_bytes(1, concurrency, schema.ranks.size(),
-                                               schema.ranks.size()) -
-        context::recovery_value_metadata_bytes(0, concurrency, schema.ranks.size(),
-                                               schema.ranks.size());
+        context::recovery_value_metadata_bytes(1, concurrency, schema.ranks.size(), owners) -
+        context::recovery_value_metadata_bytes(0, concurrency, schema.ranks.size(), owners);
     const auto ranks         = schema.ranks.size();
     std::size_t history_cost = 0;
     for (const auto& pool : schema.pools)
-        history_cost += context::HistoryDirectory::metadata_bytes(1, 0, pool.page_capacity, 1) -
-                        context::HistoryDirectory::metadata_bytes(0, 0, pool.page_capacity, 1);
+        history_cost += context::HistoryDirectory::metadata_bytes(1, 0, pool.page_capacity, width) -
+                        context::HistoryDirectory::metadata_bytes(0, 0, pool.page_capacity, width);
     for (std::size_t i = 0; i < geometry.classes.size(); ++i) {
         const auto state_class = std::any_of(
             schema.state.layouts.begin(), schema.state.layouts.end(), [&](const auto& layout) {

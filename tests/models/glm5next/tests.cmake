@@ -76,6 +76,8 @@ add_test(NAME ninfer_glm5next_session_test
 set_tests_properties(ninfer_glm5next_session_test PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=")
 
 if(NINFER_ENABLE_DISTRIBUTED)
+  target_compile_definitions(ninfer_glm5next_session_test PRIVATE NINFER_ENABLE_DISTRIBUTED=1)
+  target_link_libraries(ninfer_glm5next_session_test PRIVATE ninfer_model_control)
   ninfer_add_test(ninfer_glm5next_dynamic_speculation_real_test
     SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_dynamic_speculation_real.cpp"
     LIBRARIES ninfer_engine ninfer_product_config ninfer_model_execution)

@@ -46,7 +46,8 @@ std::int32_t SequenceParallelPolicy::local_capacity(std::int32_t maximum) const 
     return std::max(minimum_columns - 1, partition(maximum, 0).segment);
 }
 
-ParallelExecution::ParallelExecution(ParallelBinding binding) : binding_(binding) {
+ParallelExecution::ParallelExecution(ParallelBinding binding)
+    : binding_(binding), graph_groups_{binding.group} {
     if (!binding.group) throw std::invalid_argument("parallel execution has no group");
 }
 
@@ -124,9 +125,15 @@ void ParallelExecution::exchange(std::span<const distributed::PeerTransfer> tran
 #endif
 }
 
+void ParallelExecution::track_graph_group(const distributed::Group* group) {
+    if (group && std::ranges::find(graph_groups_, group) == graph_groups_.end())
+        graph_groups_.push_back(group);
+}
+
 bool ParallelExecution::supports_graph_gating() const noexcept {
 #if NINFER_ENABLE_DISTRIBUTED
-    return binding_.group->supports_graph_gating();
+    return std::ranges::all_of(graph_groups_,
+                               [](const auto* group) { return group->supports_graph_gating(); });
 #else
     return true;
 #endif
@@ -143,7 +150,7 @@ CommunicationGraphWork ParallelExecution::captured_work() const {
 void ParallelExecution::record_graph(CommunicationGraphWork& work,
                                      const std::function<void()>& body) {
 #if NINFER_ENABLE_DISTRIBUTED
-    binding_.group->record_graph(work, body);
+    distributed::record_communication_graph(graph_groups_, work, body);
 #else
     body();
 #endif
@@ -151,7 +158,7 @@ void ParallelExecution::record_graph(CommunicationGraphWork& work,
 
 void ParallelExecution::replayed(const CommunicationGraphWork& work) const {
 #if NINFER_ENABLE_DISTRIBUTED
-    binding_.group->replayed(work);
+    for (const auto* group : graph_groups_) group->replayed(work);
 #endif
 }
 

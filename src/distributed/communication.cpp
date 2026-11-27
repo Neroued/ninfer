@@ -145,7 +145,8 @@ struct Group::Impl {
         auto* work = &route.statistics.eager;
         if (capture)
             work = &std::find_if(capture->begin(), capture->end(), [&](const auto& value) {
-                        return value.backend == route.statistics.backend;
+                        return value.group == description.id &&
+                               value.backend == route.statistics.backend;
                     })->work;
         ++work->calls[kind];
         work->payload_bytes[kind] += bytes;
@@ -260,25 +261,35 @@ CommunicationGraphWork Group::captured_work() const {
 }
 
 void Group::record_graph(CommunicationGraphWork& into, const std::function<void()>& body) const {
-    if (impl_->capture) throw std::logic_error("communication capture is already active");
+    const Group* group = this;
+    record_communication_graph({&group, 1}, into, body);
+}
+
+void record_communication_graph(std::span<const Group* const> groups, CommunicationGraphWork& into,
+                                const std::function<void()>& body) {
     into.clear();
-    for (const auto& route : impl_->backends) into.push_back({route.statistics.backend, {}});
-
-    struct Recording {
-        Impl& owner;
-
-        ~Recording() { owner.capture = nullptr; }
-    } recording{*impl_};
-
-    impl_->capture = &into;
-    body();
+    for (const auto* group : groups) {
+        if (group->impl_->capture)
+            throw std::logic_error("communication capture is already active");
+        for (const auto& route : group->impl_->backends)
+            into.push_back({route.statistics.backend, {}, group->id()});
+    }
+    for (const auto* group : groups) group->impl_->capture = &into;
+    try {
+        body();
+    } catch (...) {
+        for (const auto* group : groups) group->impl_->capture = nullptr;
+        throw;
+    }
+    for (const auto* group : groups) group->impl_->capture = nullptr;
 }
 
 void Group::replayed(const CommunicationGraphWork& work) const noexcept {
     for (auto& route : impl_->backends) {
         route.implementation->wake();
         for (const auto& value : work)
-            if (value.backend == route.statistics.backend) route.statistics.graph.add(value.work);
+            if (value.group == id() && value.backend == route.statistics.backend)
+                route.statistics.graph.add(value.work);
     }
 }
 

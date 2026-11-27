@@ -6,7 +6,10 @@ namespace ninfer::models::glm5next {
 
 std::vector<PlacementDescriptor> Session::placement_descriptions() const {
     std::vector<PlacementDescriptor> result;
-    for (const auto id : impl_->placements) result.push_back({id.value, {id.value}});
+    for (const auto id : impl_->placements) {
+        const auto members = impl_->plan.attention.members(id.value);
+        result.push_back({id.value, {members.begin(), members.end()}});
+    }
     return result;
 }
 
@@ -48,7 +51,7 @@ Session::inspect_source(const RequestBasePlan& base, std::optional<CheckpointHan
                         std::span<const CheckpointHandle> retired, runtime::PlacementId target,
                         const ResumeState* resume) const {
     const auto& p = *impl_;
-    if (target.value >= p.plan.states.size())
+    if (target.value >= p.plan.attention.size())
         throw std::invalid_argument("invalid GLM5Next placement");
     if (resume && (!resume->state_ || resume->state_->owner != &p || !resume->state_->sequence ||
                    resume->state_->sequence->request != base.plan_))
@@ -116,7 +119,7 @@ detail::BindingPlan
 detail::SessionImpl::plan_binding(const RequestBasePlan& base, runtime::LaneId lane,
                                   const SourceCandidate& candidate, const ResumeState* resume,
                                   ExecutionUnitKind resume_kind, std::uint32_t tokens) const {
-    if (candidate.placement.value >= this->plan.states.size())
+    if (candidate.placement.value >= this->plan.attention.size())
         throw std::invalid_argument("invalid GLM5Next placement");
     if (lane.value >= shape.max_concurrency || sequences[lane.value])
         throw std::logic_error("binding requires an empty lane");
@@ -187,7 +190,7 @@ detail::SessionImpl::plan_binding(const RequestBasePlan& base, runtime::LaneId l
     for (std::uint32_t pool = 0; pool < pool_count(); ++pool) {
         const auto* prefix = checkpoint ? &checkpoint->snapshot.prefix(pool) : nullptr;
         const auto end     = pool == 0 ? peak : mtp_history_frontier(peak);
-        const std::array placement{candidate.placement.value};
+        const auto placement         = this->plan.attention.members(candidate.placement.value);
         const auto& histories        = directory.pool(pool).histories();
         action.history_targets[pool] = plan.demand.add_history(
             pool, convert ? histories.conversion_demand(*prefix, prefix->frontier(), end, placement)
@@ -357,17 +360,18 @@ void SessionImpl::prepare_binding_resources(context::ContextReservation& reserve
     const auto* checkpoint = bind.source ? &checkpoints.at(*bind.source) : nullptr;
     for (std::uint32_t pool = 0; pool < pool_count(); ++pool) {
         const auto* prefix = checkpoint ? &checkpoint->snapshot.prefix(pool) : nullptr;
-        const std::array placement{bind.placement.value};
+        const auto placement = plan.attention.members(bind.placement.value);
         auto& histories = directory.pool(pool).histories();
         const auto peak = pool ? mtp_history_frontier(bind.peak) : bind.peak;
         if (bind.state_action == StateBindingAction::Convert) {
             const auto from = checkpoint->snapshot.continuation().metadata.placement.value;
-            migration.add_binding(
-                pool, histories.prepare_conversion(
-                          *prefix, prefix->frontier(), peak, bind.lane,
-                          reserved.take(bind.history_targets[pool]), placement,
-                          history_conversion(plan.caches[pool], from, bind.placement.value,
-                                             prefix->frontier() % kPagedKVPageSize)));
+            migration.add_binding(pool,
+                                  histories.prepare_conversion(
+                                      *prefix, prefix->frontier(), peak, bind.lane,
+                                      reserved.take(bind.history_targets[pool]), placement,
+                                      history_conversion(plan.caches[pool], plan.attention, from,
+                                                         bind.placement.value,
+                                                         prefix->frontier() % kPagedKVPageSize)));
         } else {
             migration.add_binding(pool, histories.prepare_binding(
                                             prefix, prefix ? prefix->frontier() : 0, peak,
@@ -377,9 +381,9 @@ void SessionImpl::prepare_binding_resources(context::ContextReservation& reserve
     }
     if (bind.state_action == StateBindingAction::Convert) {
         const auto from = checkpoint->snapshot.continuation().metadata.placement.value;
-        migration.convert_state(bind.source_image, bind.placement.value,
-                                reserved.take(bind.state_target),
-                                state_conversion(plan.states, from, bind.placement.value));
+        migration.convert_state(
+            bind.source_image, bind.placement.value, reserved.take(bind.state_target),
+            state_conversion(plan.states, plan.attention, from, bind.placement.value));
         return;
     }
     if (bind.state_action == StateBindingAction::Move) return;
@@ -411,7 +415,7 @@ std::vector<runtime::ContextTransferRequirement>
 conversion_requirements(const SessionPlan& plan, std::uint32_t from, std::uint32_t to,
                         std::span<const std::uint32_t> frontiers) {
     std::vector<runtime::ContextTransferRequirement> out;
-    for (const auto& field : state_conversion(plan.states, from, to)) {
+    for (const auto& field : state_conversion(plan.states, plan.attention, from, to)) {
         const bool peer = field.source_rank != field.destination_rank;
         runtime::ContextTransferRequirement r;
         r.direction   = peer ? runtime::ContextTransferDirection::PeerDeviceToDevice
@@ -426,17 +430,25 @@ conversion_requirements(const SessionPlan& plan, std::uint32_t from, std::uint32
         const auto f          = frontiers[pool];
         const auto& page      = plan.caches[pool];
         const auto full_pages = f / page.geometry.page_tokens;
-        auto bytes            = full_pages * page.page_bytes;
-        const auto ranges     = history_conversion(page, from, to, f % page.geometry.page_tokens);
-        for (const auto& range : ranges.partial_page) bytes += range.bytes;
-        runtime::ContextTransferRequirement r;
-        r.resource    = {runtime::KvPoolId{pool}};
-        r.direction   = runtime::ContextTransferDirection::PeerDeviceToDevice;
-        r.page_groups = context::kv_pages_for_frontier(f);
-        r.work = {bytes, static_cast<std::uint32_t>(full_pages + ranges.partial_page.size())};
-        r.rank = from;
-        r.peer = runtime::ContextPeerTransfer{from, to};
-        out.push_back(r);
+        const auto ranges =
+            history_conversion(page, plan.attention, from, to, f % page.geometry.page_tokens);
+        for (const auto& full : ranges.full_page) {
+            auto bytes  = full_pages * full.bytes;
+            auto copies = full_pages;
+            for (const auto& part : ranges.partial_page) {
+                if (part.source_rank != full.source_rank) continue;
+                bytes += part.bytes;
+                ++copies;
+            }
+            runtime::ContextTransferRequirement r;
+            r.resource    = {runtime::KvPoolId{pool}};
+            r.direction   = runtime::ContextTransferDirection::PeerDeviceToDevice;
+            r.page_groups = context::kv_pages_for_frontier(f);
+            r.work        = {bytes, static_cast<std::uint32_t>(copies)};
+            r.rank        = full.source_rank;
+            r.peer        = runtime::ContextPeerTransfer{full.source_rank, full.destination_rank};
+            out.push_back(r);
+        }
     }
     return out;
 }

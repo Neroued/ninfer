@@ -114,7 +114,7 @@ void row(Encoder& out, const WorkRow& r) {
     slot(out, r.mtp_table);
     out.u32(r.main_frontier);
     out.u32(r.mtp_frontier);
-    out.u32(r.attention_rank);
+    out.u32(r.attention_owner);
     integers(out, r.ids);
     out.boolean(r.control_last_token.has_value());
     if (r.control_last_token) out.i32(*r.control_last_token);
@@ -135,7 +135,7 @@ WorkRow row(Decoder& in) {
     r.mtp_table      = slot<context::TableRow>(in);
     r.main_frontier  = in.u32();
     r.mtp_frontier   = in.u32();
-    r.attention_rank = in.u32();
+    r.attention_owner = in.u32();
     r.ids            = integers<TokenId>(in);
     if (in.boolean()) r.control_last_token = in.i32();
     r.sampling          = sampling(in);
@@ -182,7 +182,7 @@ route(Decoder& in, const BatchPlan& batch, std::span<const WorkRow> rows,
     for (std::size_t i = 0; i < rows.size(); ++i) {
         const auto n = 1ULL + (extents.empty() ? 0 : extents[i]);
         g->valid_target_tokens += n;
-        g->owner_target_tokens.at(rows[i].attention_rank) += n;
+        g->owner_target_tokens.at(rows[i].attention_owner) += n;
     }
     return g;
 }
@@ -213,6 +213,12 @@ vision::Work VisionInputBindings::get(std::uint64_t id, bool produce) const {
 void encode_work(Encoder& out, const Work& work, std::uint32_t rank) {
     out.u32(rank);
     context::encode_actions(out, local_actions(work.actions, rank));
+    out.boolean(bool(work.exchange));
+    if (work.exchange) {
+        out.u64(work.exchange->id);
+        out.u32(work.exchange->draft_passes);
+        integers(out, work.exchange->columns);
+    }
     std::visit(
         [&](const auto& v) {
             using T = std::decay_t<decltype(v)>;
@@ -244,13 +250,14 @@ void encode_work(Encoder& out, const Work& work, std::uint32_t rank) {
                 }
                 out.u64(v.releases.size());
                 for (auto id : v.releases) residency(out, id);
-            } else {
+            } else if constexpr (std::is_same_v<T, ScoreWork>) {
                 out.u8(4);
                 batch(out, v.batch);
                 row(out, v.row);
                 integers(out, v.targets);
                 out.u32(v.first_target_column);
-            }
+            } else
+                out.u8(5);
         },
         work.operation);
 }
@@ -259,6 +266,8 @@ Work decode_work(Decoder& in, const VisionInputBindings& inputs) {
     Work work;
     const auto rank = in.u32();
     work.actions.emplace(rank, context::decode_actions(in));
+    if (in.boolean())
+        work.exchange = moe::ExpertStep{in.u64(), in.u32(), integers<std::uint32_t>(in)};
     switch (in.u8()) {
     case 1: {
         ForwardWork v;
@@ -304,6 +313,9 @@ Work decode_work(Decoder& in, const VisionInputBindings& inputs) {
         work.operation        = std::move(v);
         break;
     }
+    case 5:
+        work.operation = moe::ExpertServiceWork{};
+        break;
     default:
         throw std::invalid_argument("unknown GLM5Next work kind");
     }
@@ -369,11 +381,14 @@ void encode_result(Encoder& out, const Result& result) {
             } else if constexpr (std::is_same_v<T, ContextResult>) {
                 out.u8(2);
                 context::encode_transfers(out, v.transfers);
-            } else {
+            } else if constexpr (std::is_same_v<T, ScoreResult>) {
                 out.u8(3);
                 out.u32(v.processed);
                 out.u64(v.logprobs.size());
                 for (auto value : v.logprobs) out.f32(value);
+            } else {
+                out.u8(4);
+                out.u64(v.step);
             }
         },
         result);
@@ -408,6 +423,8 @@ Result decode_result(Decoder& in) {
 
         return v;
     }
+    case 4:
+        return moe::ExpertServiceResult{in.u64()};
     default:
         throw std::invalid_argument("unknown GLM5Next result kind");
     }

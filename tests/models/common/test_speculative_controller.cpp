@@ -649,14 +649,98 @@ void unreached_masked_draft_prior() {
     for (int i = 0; i < 32; ++i) state.observe_speculative_round(3, 3);
     std::array<float, 7> mtp, masked;
     state.predict_conditional_survival(Backend::Mtp, 7, mtp);
-    for (const auto backend : {Backend::DFlash, Backend::DFlash2}) {
+    for (const auto backend : {Backend::DFlash, Backend::DFlash2, Backend::DSpark}) {
         state.predict_conditional_survival(backend, 7, masked);
         require(std::ranges::equal(std::span(masked).first(3), std::span(mtp).first(3)),
                 "positive prefix evidence overrode a verified posterior");
         for (std::size_t j = 3; j < masked.size(); ++j)
             require(masked[j] > mtp[j] && masked[j] < masked[j - 1],
-                    "unreached masked draft failed to inherit decaying prefix evidence");
+                    "unreached draft failed to inherit decaying prefix evidence");
     }
+}
+
+void dspark_adaptive_recovery_and_cost() {
+    const std::array widths{2U, 4U, 8U};
+    const Rounds dspark({Backend::DSpark, 7, 1, 128, 8}, 16, widths);
+
+    // 1. DSpark feature 13 tracks head_columns across widths and matches RouteCost.
+    SpeculativeCostModel model(dspark.config);
+    for (const auto extent : {0u, 1u, 3u, 7u}) {
+        const auto q = dspark.query({extent, extent});
+        const auto f = model.features(q);
+        near(f[13], double(q.head_columns), 1e-12, "DSpark feature 13 must track head_columns");
+        const auto dot = std::inner_product(f.begin(), f.end(), model.weights().begin(), 0.0);
+        near(model.base_predict_ms(q), dot, 1e-12, "DSpark RouteCost diverged from features");
+    }
+
+    // 2. Eager DSpark calibration probes intermediate depths {1, 3}.
+    CalibrationConstraints eager_c{
+        dspark.config, &dspark.batches, ExecutionPath::Eager, nullptr, 16, 8192, 64, 64};
+    const auto eager_schedule = build_corner_calibration_schedule(eager_c);
+    bool saw_depth_1 = false, saw_depth_3 = false;
+    for (const auto& probe : eager_schedule) {
+        if (probe.context_tokens != 64) continue;
+        saw_depth_1 |= probe.route.head_columns == 1;
+        saw_depth_3 |= probe.route.head_columns == 3;
+    }
+    require(saw_depth_1 && saw_depth_3, "eager DSpark calibration missed intermediate widths");
+
+    // 3. Fit a realistic B=2 cost curve where w=8 costs ~1.55x w=4 (so fallback to kPriorMean
+    //    at j=3..6 previously locked B=2 at w=4 forever even under 100% prefix acceptance).
+    const auto dspark_latency = [](const CostQuery& q) {
+        const auto experts = distinct_experts(q.max_owner_target_tokens, 128, 8);
+        return 4.5 + 0.06 * experts + 0.08 * q.max_owner_target_tokens + 0.45 * q.head_columns +
+               0.05 * q.max_owner_proposal_rows * q.head_columns;
+    };
+    std::vector<TimedCostAnchor> anchors;
+    for (const auto batch : {1u, 2u, 4u, 16u}) {
+        for (const auto depth : {0u, 1u, 3u, 7u}) {
+            const auto q = dspark.query(Extents(batch, depth));
+            anchors.push_back({q, dspark_latency(q)});
+        }
+    }
+    model.fit(anchors);
+    near(model.predict_ms(dspark.query({7, 7})) / model.predict_ms(dspark.query({3, 3})),
+         dspark_latency(dspark.query({7, 7})) / dspark_latency(dspark.query({3, 3})), 0.08,
+         "DSpark cost fit missed w=8/w=4 latency ratio");
+
+    // 4. Thinking phase (low acceptance at width=8, with real tests at j=3..4 so attempts_[3..4] > 0)
+    //    narrows B=2 to width=4.
+    SequenceSpeculativeState s0, s1;
+    const std::array low_conf{.6f, .5f, .4f, .2f, .2f, .2f, .2f};
+    for (int i = 0; i < 40; ++i) {
+        const std::uint32_t acc = (i % 2 == 0) ? 3u : 1u;
+        s0.observe_speculative_round(7, acc, low_conf);
+        s1.observe_speculative_round(7, acc, low_conf);
+    }
+    require(s0.draft_attempt_weight(3) < 0.7f,
+            "thinking fixture must populate nonzero attempts_[3] before narrowing");
+    auto rows     = dspark.inputs(2);
+    rows[0].state = &s0;
+    rows[1].state = &s1;
+    require(dspark.choose(model, rows).route().width <= 4,
+            "low-acceptance thinking phase failed to narrow DSpark width");
+
+    // 5. Transition to 100% acceptance at width=4 (3/3): even with nonzero historical attempts_[3],
+    //    the stale tail must decay below 0.5 and recover back to width=8.
+    const std::array high_conf{.98f, .98f, .98f};
+    bool promoted = false;
+    for (int step = 0; step < 50; ++step) {
+        s0.observe_speculative_round(3, 3, high_conf);
+        s1.observe_speculative_round(3, 3, high_conf);
+        if (dspark.choose(model, rows).route().width == 8) {
+            promoted = true;
+            break;
+        }
+    }
+    require(promoted, "DSpark stayed locked at width=4 despite sustained 100% prefix acceptance");
+
+    // 6. A single real rejection at j=3 brings attempts_[3] >= 1 and stops upward inheritance.
+    const std::array cliff_conf{.98f, .98f, .98f, .05f, .05f, .05f, .05f};
+    s0.observe_speculative_round(7, 3, cliff_conf);
+    s1.observe_speculative_round(7, 3, cliff_conf);
+    require(dspark.choose(model, rows).route().width == 4,
+            "fresh rejection at j=3 did not immediately pull DSpark back to width=4");
 }
 
 void split_cost_isolation() {
@@ -719,6 +803,7 @@ int main() {
         overconfident_rejection();
         parallel_draft_confidence();
         unreached_masked_draft_prior();
+        dspark_adaptive_recovery_and_cost();
         split_cost_isolation();
         route_score_ties();
         std::cout << "PASS speculative physical cost, calibration and adaptive rounds\n";

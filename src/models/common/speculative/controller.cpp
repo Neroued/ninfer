@@ -23,6 +23,10 @@ float logistic(float x) { return 1.0f / (1.0f + std::exp(-x)); }
 
 float clamp_survival(float p) { return std::clamp(p, 0.02f, 0.98f); }
 
+bool inherits_prefix_survival(SpeculativeBackend backend) noexcept {
+    return is_masked_draft_backend(backend) || backend == SpeculativeBackend::DSpark;
+}
+
 constexpr auto kFreshBonus = [] {
     std::array<double, kMaxSpeculativeDrafts + 1> bonus{};
     double survival = 1.0;
@@ -505,20 +509,26 @@ void SequenceSpeculativeState::predict_conditional_survival(
     SpeculativeBackend backend, std::uint32_t max_drafts,
     std::span<float> out_probs) const noexcept {
     assert(max_drafts <= kMaxSpeculativeDrafts && max_drafts <= out_probs.size());
-    const auto emp0         = (kPriorAlpha + accepts_[0]) / (kPriorMass + attempts_[0]);
-    const auto deeper_alpha = emp0 < kPriorMean ? kPriorMass * emp0 : kPriorAlpha;
-    const bool masked       = is_masked_draft_backend(backend);
-    const auto base_logit   = logit(kPriorMean);
-    auto previous           = emp0;
-    const auto empirical    = [&](std::size_t j) {
+    const auto emp0           = (kPriorAlpha + accepts_[0]) / (kPriorMass + attempts_[0]);
+    const auto deeper_alpha   = emp0 < kPriorMean ? kPriorMass * emp0 : kPriorAlpha;
+    const bool inherit_prefix = inherits_prefix_survival(backend);
+    const auto base_logit     = logit(kPriorMean);
+    auto previous             = emp0;
+    const auto empirical      = [&](std::size_t j) {
         if (!j) return emp0;
-        // An untested tail inherits evidence from the verified prefix, with decay at each
-        // position. A posterior at or below the prior stops the upward inheritance.
-        if (masked && attempts_[j] == 0.0f && previous > kPriorMean)
-            previous =
+        // An untested or stale tail (< 0.5 effective recent attempts, ~9+ untested rounds)
+        // inherits decaying evidence from the verified prefix. Recent observations govern
+        // without upward prefix inflation; a weak prefix stops inheritance.
+        constexpr float kStaleAttemptThreshold = 0.5f;
+        if (inherit_prefix && attempts_[j] < kStaleAttemptThreshold && previous > kPriorMean) {
+            const auto inherited =
                 logistic(base_logit + 0.92f * (logit(clamp_survival(previous)) - base_logit));
-        else
+            const auto blend = 1.0f - attempts_[j] / kStaleAttemptThreshold;
+            const auto alpha = deeper_alpha + blend * (kPriorMass * inherited - deeper_alpha);
+            previous         = (alpha + accepts_[j]) / (kPriorMass + attempts_[j]);
+        } else {
             previous = (deeper_alpha + accepts_[j]) / (kPriorMass + attempts_[j]);
+        }
         return previous;
     };
     if (last_target_top1_prob_) {

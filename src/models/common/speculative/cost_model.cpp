@@ -96,6 +96,7 @@ SpeculativeCostModel::Features SpeculativeCostModel::features(const CostQuery& q
     const double extra_columns  = double(q.width) - 1.0;
     const bool proposal         = q.mtp_steps != 0 || q.head_columns != 0;
     const bool mtp              = config_.backend == SpeculativeBackend::Mtp;
+    const bool dspark           = config_.backend == SpeculativeBackend::DSpark;
     const bool hybrid           = config_.hybrid_max_tokens > 0;
     const bool full             = hybrid && q.active_target_tokens > config_.hybrid_max_tokens;
     const double owner_tokens   = q.max_owner_target_tokens;
@@ -118,7 +119,7 @@ SpeculativeCostModel::Features SpeculativeCostModel::features(const CostQuery& q
                 : 0.0,
             owner_tokens * target_context,
             extra_columns * target_context,
-            mtp ? double(q.mtp_steps) : double(proposal),
+            mtp ? double(q.mtp_steps) : (dspark ? double(q.head_columns) : double(proposal)),
             local_proposal_tokens,
             local_proposal_tokens * detail::log_context(q.proposal_bucket)};
 }

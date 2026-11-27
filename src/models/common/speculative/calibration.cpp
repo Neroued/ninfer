@@ -70,6 +70,9 @@ void add_width_probes(std::vector<CalibrationProbeSpec>& schedule, const Calibra
             if (limit && route.width < full.width) add(route, limit);
         }
         if (max_drafts >= 4) add(full, 3);
+    } else if (backend == SpeculativeBackend::DSpark) {
+        for (const auto depth : {1u, 3u})
+            if (depth < max_drafts) add(probe_route(c, shape, depth), depth);
     }
     if (rows >= 4) {
         add(full, 0);

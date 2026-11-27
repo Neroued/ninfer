@@ -1423,6 +1423,14 @@ void replica_worker(bool report_failure) {
             return;
         }
         send_message(socket, {wire::Kind::Event, boot.epoch, {}}, until);
+        // A later frame on the same socket lets the test observe that the coordinator
+        // buffered Event before it triggers a fault on a different worker.
+        dist::StartupReporter reporter([&](wire::Bytes snapshot) {
+            send_message(socket, {wire::Kind::StartupProgress, boot.epoch, std::move(snapshot)},
+                         until);
+            return true;
+        });
+        reporter.observer().callback({.phase = StartupPhase::EngineFinalize});
     }
 }
 
@@ -1438,14 +1446,25 @@ void replica_handoff_fault_isolation() {
         auto topology                  = dist::build_cluster_topology(deployment);
         const std::array<std::string, 2> args{"--replica-worker",
                                               report_failure ? "failed" : "eof"};
-        dist::ExecutionGroup group(deployment, topology, {}, {}, args);
+        std::atomic<bool> buffered = false;
+        StartupObserver observer{[&](const StartupEvent& e) {
+            if (e.origin && e.origin->rank == 0 && e.phase == StartupPhase::EngineFinalize)
+                buffered = true;
+        }};
+        dist::ExecutionGroup group(deployment, topology, observer, {}, args);
         const auto enter =
             std::make_shared<wire::Message>(wire::Message{wire::Kind::Enter, group.epoch(), {}});
         const std::array healthy_work{dist::OutgoingMessage{0, enter}};
         require(group.try_send(healthy_work), "healthy mock could not receive work");
+        const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        while (!buffered) {
+            require(std::chrono::steady_clock::now() < until,
+                    "healthy mock did not buffer its event");
+            group.progress();
+            std::this_thread::yield();
+        }
         const std::array failing_work{dist::OutgoingMessage{2, enter}};
         require(group.try_send(failing_work), "non-zero replica mock could not receive work");
-        const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(3);
         std::string error;
         while (error.empty()) {
             require(std::chrono::steady_clock::now() < until, "replica fault was not observed");

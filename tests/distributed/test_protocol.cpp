@@ -10,6 +10,7 @@
 #include "models/qwen4_exp/parallel/wire.h"
 #include "models/glm5next/parallel/wire.h"
 #include "runtime/executor/distributed_executor.h"
+#include "runtime/executor/collective_executor.h"
 #include "runtime/executor/local_executor.h"
 #include "runtime/executor/protocol.h"
 #include "runtime/executor/preparation.h"
@@ -1571,6 +1572,10 @@ struct LoopWork {
     std::uint64_t blob = 0;
     std::shared_ptr<wire::Bytes> payload;
     std::size_t input_metadata_bytes = 0;
+    std::uint64_t step               = 0;
+    std::uint32_t route = 0, columns = 0;
+    std::array<std::uint32_t, 2> row_grants{};
+    bool service = false;
 };
 
 struct LoopResult {
@@ -1586,7 +1591,10 @@ struct LoopTypes {
     using Result = LoopResult;
     using Commit = LoopCommit;
 
-    static ExecutionWork describe_work(const Work&) { return {ExecutionKind::Decode, 1, 1, 1}; }
+    static ExecutionWork describe_work(const Work& w) {
+        if (w.service) return {ExecutionKind::ExpertService};
+        return {ExecutionKind::Decode, 1, 1, 1};
+    }
 };
 
 class LoopCodec {
@@ -1902,7 +1910,7 @@ public:
                         events_.emplace_back(
                             runtime::DecisionNeeded{slot.req.ticket, {0, 32, {{0, {}}}}});
                     } else {
-                        ++sampling_collectives_;
+                        if (!slot.req.work.service) ++sampling_collectives_;
                         slot.phase = Phase::PendingCommit;
                         events_.emplace_back(
                             runtime::ResultReady<LoopTypes>{slot.req.ticket, {committed_}});
@@ -2115,6 +2123,355 @@ void local_discard_waits_for_quiescence() {
                 std::get<runtime::DeviceRetired>(*retired).ticket == ticket &&
                 program->discards == 1 && !executor.has_pending_work(),
             "latched local discard did not retire exactly once at the safe boundary");
+}
+
+class StepCodec : public LoopCodec {
+public:
+    explicit StepCodec(std::uint32_t replica) : replica_(replica) {}
+
+    runtime::protocol::Scope scope(const LoopWork& w, const dist::ExecutionTopology& t) const {
+        const auto& replica = t.replica(replica_);
+        return {replica.ranks, w.constrained ? replica.ranks : std::vector<dist::RankId>{},
+                replica.result_owner};
+    }
+
+    void encode_work(wire::Encoder& out, const LoopWork& w, dist::RankId r) const {
+        LoopCodec::encode_work(out, w, r);
+        out.u64(w.step);
+        out.u32(w.route);
+        out.u32(w.columns);
+        for (auto v : w.row_grants) out.u32(v);
+        out.boolean(w.service);
+    }
+
+    LoopWork decode_work(wire::Decoder& in) const {
+        auto w    = LoopCodec::decode_work(in);
+        w.step    = in.u64();
+        w.route   = in.u32();
+        w.columns = in.u32();
+        for (auto& v : w.row_grants) v = in.u32();
+        w.service = in.boolean();
+        return w;
+    }
+private:
+    std::uint32_t replica_;
+};
+
+struct StepModel {
+    bool* reject_service;
+
+    std::optional<runtime::CollectiveShape> shape(const LoopWork& work) const {
+        const auto columns = work.row_grants[0] + work.row_grants[1];
+        if (!columns) return {};
+        return runtime::CollectiveShape{work.route, {columns}};
+    }
+
+    void bind(LoopWork& work, const runtime::CollectiveDecision& d) const {
+        work.step    = d.step;
+        work.columns = d.shape.extents.at(0);
+    }
+
+    LoopWork service(const runtime::CollectiveDecision& d) const {
+        if (*reject_service) throw std::runtime_error("injected service submission failure");
+        return {.step    = d.step,
+                .route   = d.shape.route,
+                .columns = d.shape.extents.at(0),
+                .service = true};
+    }
+
+    LoopCommit service_commit(const LoopResult&) const { return {0}; }
+};
+
+struct StepRankTrace {
+    std::vector<LoopWork> work;
+    std::vector<std::uint64_t> commits;
+    std::uint32_t discards = 0;
+    std::atomic<std::uint64_t> forward{}, sampling{};
+    std::string error;
+};
+
+class StepProgram : public LoopProgram {
+public:
+    StepProgram(dist::RankId rank, StepRankTrace& trace)
+        : LoopProgram(rank, trace.forward, trace.sampling), trace_(trace) {}
+
+    runtime::ExecutionCapacity capacity() const noexcept { return {1, 1}; }
+
+    void start(runtime::ExecutionRequest<LoopTypes>&& req) {
+        if (!req.work.context) trace_.work.push_back(req.work);
+        LoopProgram::start(std::move(req));
+    }
+
+    void commit(runtime::ExecutionTicket t, runtime::CommandSequence c, LoopCommit&& work) {
+        trace_.commits.push_back(work.delta);
+        LoopProgram::commit(t, c, std::move(work));
+    }
+
+    void discard(runtime::ExecutionTicket t, runtime::CommandSequence c) {
+        ++trace_.discards;
+        LoopProgram::discard(t, c);
+    }
+private:
+    StepRankTrace& trace_;
+};
+
+class StepCluster {
+public:
+    using Executor = runtime::CollectiveExecutor<LoopTypes, StepModel>;
+
+    StepCluster(ParallelOptions options) : ranks(options.tp * options.dp), reject(options.dp) {
+        DeploymentOptions deployment{
+            .control_host = "127.0.0.1",
+            .parallel     = options,
+            .nodes        = {{.id = 0, .worker = "/worker", .artifact = "/model"}}};
+        for (std::uint32_t i = 0; i < ranks.size(); ++i)
+            deployment.ranks.push_back({i, 0, static_cast<int>(i)});
+        topology      = dist::build_cluster_topology(deployment);
+        topology.plan = 99;
+        std::map<std::uint32_t, std::vector<std::uint32_t>> domains;
+        for (const auto& r : topology.replicas)
+            domains[r.failure_domain_id].push_back(r.replica_id);
+        executors.resize(options.dp);
+        for (const auto& [id, members] : domains) {
+            auto domain = std::make_shared<runtime::CollectiveStepDomain>(
+                members.size(), std::vector<runtime::CollectiveRouteLimit>{{0, {64}}, {1, {64}}});
+            for (std::size_t i = 0; i < members.size(); ++i) {
+                const auto replica = members[i];
+                auto transport     = std::make_unique<dist::Transport>();
+                for (const auto rank : topology.replica(replica).ranks) {
+                    int pair[2];
+                    require(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0,
+                                         pair) == 0,
+                            "collective fixture socketpair failed");
+                    transport->add(rank, dist::Socket(pair[0]));
+                    workers.emplace_back(
+                        [this, rank, replica, socket = dist::Socket(pair[1])]() mutable {
+                            try {
+                                SocketWorkerConnection connection(topology.rank(rank), 13, topology,
+                                                                  std::move(socket));
+                                StepProgram program(rank, ranks[rank]);
+                                runtime::WorkerLoop<LoopTypes, StepProgram, StepCodec,
+                                                    SocketWorkerConnection>
+                                    loop(connection, program, StepCodec(replica));
+                                while (loop.advance()) {}
+                                connection.shutdown();
+                            } catch (const std::exception& e) { ranks[rank].error = e.what(); }
+                        });
+                }
+                transport->start();
+                dist::ReplicaTransportHandoff handoff;
+                handoff.transport        = std::move(transport);
+                handoff.epoch            = 13;
+                handoff.topology         = topology;
+                handoff.replica          = topology.replica(replica);
+                handoff.shutdown_timeout = std::chrono::seconds(2);
+                auto physical =
+                    std::make_unique<runtime::DistributedExecutor<LoopTypes, StepCodec>>(
+                        std::make_unique<dist::ReplicaGroup>(std::move(handoff)),
+                        runtime::ExecutionCapacity{1, 1}, StepCodec(replica), 1);
+                executors[replica] = std::make_unique<Executor>(
+                    std::move(physical), domain, i, StepModel{&reject[replica].value}, 1);
+            }
+        }
+    }
+
+    ~StepCluster() {
+        for (auto& executor : executors) {
+            try {
+                executor->drain();
+            } catch (...) {}
+        }
+        for (auto& worker : workers)
+            if (worker.joinable()) worker.join();
+    }
+
+    runtime::ExecutionTicket submit(std::uint32_t r, LoopWork w) {
+        auto& exec = *executors.at(r);
+        auto frame =
+            exec.try_reserve(w.context ? runtime::FrameKind::Context : runtime::FrameKind::Compute);
+        require(frame.has_value(), "collective fixture could not reserve an admission");
+        return exec.submit(std::move(*frame), std::move(w));
+    }
+
+    // Exercise the production wire and worker queues. Every delivered result and retirement
+    // must belong to an actual source or Context ticket explicitly listed by the caller.
+    void complete(std::span<const std::uint32_t> owners,
+                  std::vector<std::pair<std::uint32_t, runtime::ExecutionTicket>> tickets,
+                  bool discard = false) {
+        const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        bool busy;
+        do {
+            busy = false;
+            for (auto r : owners) {
+                auto& e = *executors[r];
+                if (auto event = e.poll()) {
+                    if (auto* f = std::get_if<runtime::ExecutionFailed>(&*event))
+                        throw std::runtime_error(f->message);
+                    const auto ticket = std::visit([](const auto& v) { return v.ticket; }, *event);
+                    const auto it     = std::ranges::find(tickets, std::pair{r, ticket});
+                    require(it != tickets.end(),
+                            "zero-source service leaked a logical result or retirement");
+                    if (std::holds_alternative<runtime::DecisionNeeded>(*event)) {
+                        require(!discard, "cancelled source published a decision");
+                        e.supply(ticket, {0, {{0, 1, 0, {1U}}}});
+                    }
+                    if (std::holds_alternative<runtime::ResultReady<LoopTypes>>(*event) &&
+                        ticket.frame.kind == runtime::FrameKind::Compute) {
+                        require(!discard, "cancelled source published a result");
+                        (void)e.commit(ticket, {1});
+                    }
+                    if (std::holds_alternative<runtime::DeviceRetired>(*event)) tickets.erase(it);
+                }
+                busy |= e.has_pending_work();
+            }
+            require(std::chrono::steady_clock::now() < until,
+                    "collective fixture failed to retire");
+            std::this_thread::yield();
+        } while (busy || !tickets.empty());
+    }
+
+    void finish() {
+        for (auto& e : executors) e->drain();
+        for (auto& w : workers) w.join();
+    }
+
+    dist::ExecutionTopology topology;
+    std::vector<StepRankTrace> ranks;
+
+    struct Rejection {
+        bool value = false;
+    };
+
+    std::vector<Rejection> reject;
+    std::vector<std::unique_ptr<Executor>> executors;
+private:
+    std::vector<std::thread> workers;
+};
+
+void collective_replica_execution() {
+    const std::array<std::uint32_t, 2> both{0, 1};
+    StepCluster c({.tp = 1, .ep = 2, .dp = 2});
+    auto& a              = *c.executors[0];
+    auto& b              = *c.executors[1];
+    const auto cancelled = c.submit(0, {.row_grants = {4, 0}});
+    require(a.try_withdraw(cancelled) && !a.try_withdraw(cancelled),
+            "unpublished offer was not revoked once");
+    const auto first  = c.submit(0, {.constrained = true, .row_grants = {4, 0}});
+    const auto second = c.submit(1, {.row_grants = {1, 6}});
+    require(!a.try_withdraw(first), "published source was revoked");
+    c.complete(both, {{0, first}, {1, second}});
+    const auto idle_measurement = [&] {
+        a.measure({runtime::MeasurementAction::Reset});
+        b.measure({runtime::MeasurementAction::Reset});
+    };
+    idle_measurement();
+    const auto only_b = c.submit(1, {.row_grants = {0, 3}});
+    c.complete(both, {{1, only_b}});
+    const auto only_a = c.submit(0, {.row_grants = {2, 0}});
+    c.complete(both, {{0, only_a}});
+    idle_measurement();
+    const auto third  = c.submit(0, {.route = 0, .row_grants = {1, 0}});
+    const auto fourth = c.submit(1, {.route = 1, .row_grants = {2, 0}});
+    c.complete(both, {{0, third}, {1, fourth}});
+    const auto late = c.submit(1, {.constrained = true, .row_grants = {1, 0}});
+    a.flush();
+    require(!b.try_withdraw(late), "late cancellation escaped a published source");
+    b.discard(late);
+    c.complete(both, {{1, late}}, true);
+    const auto ctx = c.submit(1, {.context = true});
+    c.complete(both, {{1, ctx}});
+    for (const auto& e : c.executors) {
+        const auto& service =
+            e->execution_statistics()[static_cast<std::size_t>(ExecutionKind::ExpertService)];
+        require(service.units && !service.rows && !service.input_tokens &&
+                    !service.scheduled_positions,
+                "expert service counted request rows or tokens");
+    }
+    c.finish();
+    for (const auto& rank : c.ranks) {
+        require(rank.error.empty() && rank.work.size() == 6,
+                "worker lost an ordered collective step");
+        for (std::size_t i = 0; i < rank.work.size(); ++i)
+            require(rank.work[i].step == i + 1, "stale or non-monotonic collective step");
+    }
+    const auto& x = c.ranks[0];
+    const auto& y = c.ranks[1];
+    require(!x.work[0].service && !y.work[0].service && x.work[0].columns == 7 &&
+                y.work[0].columns == 7 && x.work[0].row_grants == std::array{4U, 0U} &&
+                y.work[0].row_grants == std::array{1U, 6U},
+            "matching redistributed row grants");
+    require(x.work[1].service && !y.work[1].service && !x.work[2].service && y.work[2].service,
+            "swapping source did not swap real service work");
+    for (auto i : {3U, 4U})
+        require(x.work[i].route == y.work[i].route && x.work[i].service != y.work[i].service,
+                "incompatible routes ran on the same communication step");
+    require(x.work[3].route != x.work[4].route && x.work[5].service && y.discards == 1,
+            "an incompatible source starved or a published cancellation skipped service");
+    for (const auto* rank : {&x, &y}) {
+        for (std::size_t i = 0; i < rank->commits.size(); ++i)
+            require(rank->commits[i] == (rank->work[i].service ? 0U : 1U), "wrong service commit");
+        require(rank->sampling ==
+                    std::ranges::count_if(rank->work, [](const auto& w) { return !w.service; }) -
+                        rank->discards,
+                "service or cancelled source entered sampling");
+    }
+}
+
+void collective_failure_domains() {
+    // Two disjoint eight-rank EP groups on the production dp4/tp4/adp2 topology.
+    StepCluster c({.tp = 4, .ep = 8, .dp = 4, .adp = 2});
+    const std::array<std::uint32_t, 2> healthy{2, 3};
+    c.reject[1].value = true;
+    c.executors[1]->flush();
+    (void)c.submit(0, {.row_grants = {4, 0}});
+    // Source Submit is queued to four physical workers before its service peer fails.
+    c.executors[1]->flush();
+    for (auto r : {0U, 1U}) {
+        const auto event  = c.executors[r]->poll();
+        const auto* error = event ? std::get_if<runtime::ExecutionFailed>(&*event) : nullptr;
+        require(error && error->message == "injected service submission failure",
+                "collective lost the first failure");
+    }
+    const auto live = c.submit(3, {.row_grants = {2, 0}});
+    c.complete(healthy, {{3, live}});
+    c.finish();
+    for (auto r : healthy)
+        for (const auto global : c.topology.replica(r).ranks)
+            require(c.ranks[global].error.empty() && c.ranks[global].work.size() == 1 &&
+                        c.ranks[global].work[0].service == (r == 2),
+                    "healthy domain lost its physical work");
+}
+
+void collective_eight_rank_service() {
+    StepCluster c({.tp = 2, .ep = 8, .dp = 4, .adp = 2});
+    const std::array<std::uint32_t, 4> owners{0, 1, 2, 3};
+    // One logical admission. All four owners and their eight physical ranks must retire.
+    const auto only = c.submit(2, {.constrained = true, .row_grants = {2, 0}});
+    c.complete(owners, {{2, only}});
+    c.finish();
+    for (auto owner : owners)
+        for (auto rank : c.topology.replica(owner).ranks) {
+            const auto& trace = c.ranks[rank];
+            require(trace.error.empty() && trace.work.size() == 1 && trace.commits.size() == 1 &&
+                        trace.work.front().service == (owner != 2) &&
+                        trace.commits.front() == (owner == 2 ? 1U : 0U),
+                    "eight-rank step lost a physical participant or published a service row");
+        }
+}
+
+void collective_stop() {
+    for (bool published : {false, true}) {
+        StepCluster c({.tp = 1, .ep = 2, .dp = 2});
+        if (published) c.executors[1]->flush();
+        (void)c.submit(0, {.row_grants = {1, 0}});
+        c.executors[1]->drain();
+        const auto event  = c.executors[0]->poll();
+        const auto* error = event ? std::get_if<runtime::ExecutionFailed>(&*event) : nullptr;
+        require(error && error->message.find("stopped") != std::string::npos,
+                "owner stop stranded a source admission");
+        c.finish();
+        for (auto& e : c.executors) require(!e->has_pending_work(), "drain left collective frames");
+    }
 }
 
 void failed_executor_releases_media() {
@@ -2449,6 +2806,10 @@ int main(int argc, char** argv) {
         supervisor_domain_isolation();
         collective_order_across_poll_batches();
         local_discard_waits_for_quiescence();
+        collective_replica_execution();
+        collective_failure_domains();
+        collective_eight_rank_service();
+        collective_stop();
         failed_executor_releases_media();
         worker_loop_dual_frame_and_discard();
         RankSnapshot memory;

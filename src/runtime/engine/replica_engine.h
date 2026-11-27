@@ -175,6 +175,7 @@ public:
                          startup = std::move(startup)]() mutable {
                 try {
                     instance_.executor->bind_to_current_thread();
+                    instance_.executor->set_peer_wakeup([this] { wake(); });
                     auto summary = prepare_speculative_startup(spec, observer);
                     if (hooks_.prefix_routing_enabled()) quote_first_unit();
                     if (replica_id_ == 0) {
@@ -197,6 +198,7 @@ public:
             speculative_startup_ = started.get();
         } catch (...) {
             if (worker_.joinable()) { worker_.join(); }
+            instance_.executor->set_peer_wakeup({});
             throw;
         }
     }
@@ -218,6 +220,7 @@ public:
 
     void join() noexcept {
         if (worker_.joinable()) { worker_.join(); }
+        instance_.executor->set_peer_wakeup({});
     }
 
     // May be called while consumers are waiting; only the worker releases model resources.

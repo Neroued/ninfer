@@ -77,7 +77,6 @@ constexpr std::array kPrefixKinds{std::pair{"input_replay", &PrefixCacheStatisti
                                   std::pair{"long_anchor", &PrefixCacheStatistics::long_anchor},
                                   std::pair{"shared_prefix", &PrefixCacheStatistics::shared_prefix},
                                   std::pair{"continuation", &PrefixCacheStatistics::continuation}};
-constexpr std::array kKinds{"prefill", "decode", "replay", "control", "score", "context"};
 constexpr std::array kStages{"submitted", "decision", "result_ready", "retiring", "discarding"};
 
 template <class T, class Fields>
@@ -335,7 +334,7 @@ Json observation_json(const EngineSnapshot& snapshot, std::uint64_t now) {
                                      {"paused", p.paused},
                                      {"context_tokens", p.context_tokens}});
     for (std::size_t i = 0; i < snapshot.executions.size(); ++i)
-        out["executions"][kKinds[i]] = execution(snapshot.executions[i]);
+        out["executions"][kExecutionKindNames[i]] = execution(snapshot.executions[i]);
     out["decode_by_batch"] = Json::array();
     for (std::size_t i = 0; i < snapshot.decode_by_batch.size(); ++i) {
         auto row     = execution(snapshot.decode_by_batch[i]);
@@ -353,7 +352,7 @@ Json observation_json(const EngineSnapshot& snapshot, std::uint64_t now) {
         out["in_flight"].push_back({{"replica_id", unit.replica_id},
                                     {"id", unit.id},
                                     {"started_ns", unit.started_ns},
-                                    {"kind", kKinds[static_cast<std::size_t>(unit.work.kind)]},
+                                    {"kind", kExecutionKindNames[static_cast<std::size_t>(unit.work.kind)]},
                                     {"stage", kStages[static_cast<std::size_t>(unit.stage)]},
                                     {"rows", unit.work.rows},
                                     {"input_tokens", unit.work.input_tokens},
@@ -376,7 +375,7 @@ Json observation_json(const EngineSnapshot& snapshot, std::uint64_t now) {
             value["gpu_intervals"][kGpuIntervalNames[i]] = duration(rank.gpu_intervals[i]);
         for (std::size_t i = 0; i < rank.attention.size(); ++i) {
             const auto& a                      = rank.attention[i];
-            value["attention_work"][kKinds[i]] = {{"forwards", a.forwards},
+            value["attention_work"][kExecutionKindNames[i]] = {{"forwards", a.forwards},
                                                   {"rows", a.rows},
                                                   {"valid_positions", a.valid_positions},
                                                   {"scheduled_positions", a.scheduled_positions}};

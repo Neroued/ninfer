@@ -44,6 +44,13 @@ public:
         worker_                   = std::thread([this, startup = std::move(startup)]() mutable {
             try {
                 replica_.executor->bind_to_current_thread();
+                replica_.executor->set_peer_wakeup([this] {
+                    {
+                        std::lock_guard lock(queue_mutex_);
+                        peer_wakeup_ = true;
+                    }
+                    queue_cv_.notify_one();
+                });
                 publish();
                 startup.set_value();
             } catch (...) {
@@ -56,6 +63,7 @@ public:
             started.get();
         } catch (...) {
             if (worker_.joinable()) { worker_.join(); }
+            replica_.executor->set_peer_wakeup({});
             throw;
         }
     }
@@ -63,6 +71,7 @@ public:
     ~ReplicaCausalScoreWorker() noexcept {
         request_stop();
         if (worker_.joinable()) { worker_.join(); }
+        replica_.executor->set_peer_wakeup({});
     }
 
     ReplicaCausalScoreWorker(const ReplicaCausalScoreWorker&)            = delete;
@@ -98,7 +107,7 @@ public:
             job->prompt       = prompt;
             job->first_target = first_target;
             result            = job->promise.get_future();
-            job_ = std::move(job);
+            job_              = std::move(job);
         }
         queue_cv_.notify_one();
         return result;
@@ -169,21 +178,21 @@ private:
             for (auto& pool : published_.runtime.kv_pools) pool.occupied_page_groups = 0;
             return;
         }
-        const auto usage                      = replica_.session->physical_usage();
-        published_.executions                 = replica_.executor->execution_statistics();
+        const auto usage      = replica_.session->physical_usage();
+        published_.executions = replica_.executor->execution_statistics();
         published_.in_flight.clear();
         replica_.executor->observe_in_flight(published_.in_flight);
         for (auto& unit : published_.in_flight) { unit.replica_id = replica_.replica_id; }
-        published_.runtime.context_pools      = usage.pools;
-        published_.runtime.context_resources  = usage.resources;
-        const auto descriptions               = rank_descriptions();
+        published_.runtime.context_pools     = usage.pools;
+        published_.runtime.context_resources = usage.resources;
+        const auto descriptions              = rank_descriptions();
         for (auto& pool : published_.runtime.context_pools)
             pool.rank = descriptions[pool.rank].rank;
         for (auto& resource : published_.runtime.context_resources)
             resource.rank = descriptions[resource.rank].rank;
-        published_.runtime.context_metadata   = usage.metadata;
-        published_.runtime.state_objects      = usage.state_objects;
-        published_.runtime.history_objects    = usage.history_objects;
+        published_.runtime.context_metadata = usage.metadata;
+        published_.runtime.state_objects    = usage.state_objects;
+        published_.runtime.history_objects  = usage.history_objects;
         for (auto& pool : published_.runtime.kv_pools)
             pool.occupied_page_groups = usage.kv_page_groups.at(pool.id);
         const auto ranks = replica_.executor->observations();
@@ -193,16 +202,16 @@ private:
         bool has_device_pool = false;
         for (const auto& pool : usage.pools) {
             if (pool.domain != ContextMemoryDomain::Device || pool.capacity_bytes == 0) continue;
-            has_device_pool    = true;
-            const double avail = static_cast<double>(pool.assigned_free_bytes +
-                                                     pool.unassigned_free_bytes + pool.tail_bytes +
-                                                     pool.cached_bytes);
+            has_device_pool = true;
+            const double avail =
+                static_cast<double>(pool.assigned_free_bytes + pool.unassigned_free_bytes +
+                                    pool.tail_bytes + pool.cached_bytes);
             min_ratio = std::min(min_ratio, avail / static_cast<double>(pool.capacity_bytes));
         }
         published_.available_context_tokens_estimate =
             has_device_pool
-                ? static_cast<std::uint64_t>(
-                      static_cast<double>(initial_token_capacity_) * std::clamp(min_ratio, 0.0, 1.0))
+                ? static_cast<std::uint64_t>(static_cast<double>(initial_token_capacity_) *
+                                             std::clamp(min_ratio, 0.0, 1.0))
                 : initial_token_capacity_;
     }
 
@@ -211,7 +220,7 @@ private:
         std::unique_ptr<MeasurementRequest> queued_measurement;
         {
             std::lock_guard lock(queue_mutex_);
-            failed_ = true;
+            failed_            = true;
             queued_job         = std::move(job_);
             queued_measurement = std::move(measurement_);
         }
@@ -261,8 +270,11 @@ private:
             std::unique_ptr<MeasurementRequest> measurement;
             {
                 std::unique_lock lock(queue_mutex_);
-                queue_cv_.wait_for(lock, std::chrono::milliseconds(25),
-                                   [&] { return stopping_ || job_ || measurement_; });
+                if (!replica_.executor->has_pending_work())
+                    queue_cv_.wait_for(lock, std::chrono::milliseconds(25), [&] {
+                        return stopping_ || job_ || measurement_ || peer_wakeup_;
+                    });
+                peer_wakeup_ = false;
                 if (stopping_ && !job_) {
                     measurement = std::move(measurement_);
                     lock.unlock();
@@ -279,6 +291,8 @@ private:
             if (!job && !measurement) {
                 try {
                     (void)replica_.session->poll();
+                    if (replica_.executor->has_pending_work())
+                        replica_.executor->wait_for_activity(std::chrono::milliseconds(1));
                     if (replica_.executor->failed())
                         throw std::runtime_error("scoring worker disconnected while idle");
                 } catch (...) {
@@ -368,8 +382,9 @@ private:
     std::condition_variable queue_cv_;
     std::unique_ptr<Job> job_;
     std::unique_ptr<MeasurementRequest> measurement_;
-    bool stopping_ = false;
-    bool failed_   = false;
+    bool peer_wakeup_ = false;
+    bool stopping_    = false;
+    bool failed_      = false;
     std::thread worker_;
 };
 
@@ -504,8 +519,7 @@ public:
             auto rep_snap = workers_[i]->snapshot(rep_scoring);
             if (rep_snap.healthy) {
                 any_healthy = true;
-                out.available_context_tokens_estimate +=
-                    rep_snap.available_context_tokens_estimate;
+                out.available_context_tokens_estimate += rep_snap.available_context_tokens_estimate;
             }
             out.scoring.completed_jobs += rep_scoring.completed_jobs;
             out.scoring.failed_jobs += rep_scoring.failed_jobs;
@@ -548,8 +562,7 @@ public:
                 out.executions[k].units += rep_snap.executions[k].units;
                 out.executions[k].rows += rep_snap.executions[k].rows;
                 out.executions[k].input_tokens += rep_snap.executions[k].input_tokens;
-                out.executions[k].scheduled_positions +=
-                    rep_snap.executions[k].scheduled_positions;
+                out.executions[k].scheduled_positions += rep_snap.executions[k].scheduled_positions;
                 for (auto field : {&ExecutionExposure::result, &ExecutionExposure::resolution,
                                    &ExecutionExposure::retirement, &ExecutionExposure::total}) {
                     auto& dst       = out.executions[k].exposure.*field;

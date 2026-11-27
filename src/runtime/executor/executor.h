@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <functional>
 #include <stdexcept>
 #include <thread>
 
@@ -27,14 +28,21 @@ public:
     [[nodiscard]] virtual ExecutionCapacity capacity() const noexcept                = 0;
     [[nodiscard]] virtual std::optional<ExecutionReservation> try_reserve(FrameKind) = 0;
     [[nodiscard]] virtual ExecutionTicket submit(ExecutionReservation, typename Types::Work) = 0;
-    virtual void supply(ExecutionTicket, DecisionInput)                                      = 0;
-    [[nodiscard]] virtual CommitReceipt commit(ExecutionTicket, typename Types::Commit)      = 0;
-    virtual void discard(ExecutionTicket)                                                    = 0;
-    [[nodiscard]] virtual std::optional<ExecutionEvent<Types>> poll()                        = 0;
-    virtual void flush()                                                                     = 0;
-    virtual void wait_for_activity(std::chrono::milliseconds) const {
-        std::this_thread::yield();
-    }
+
+    // A true result returns ownership of a compute admission before any worker could see it.
+    // The caller may roll back its prepared resources; there will be no device retirement.
+    virtual bool try_withdraw(ExecutionTicket) { return false; }
+
+    virtual void set_peer_wakeup(std::function<void()>) {}
+
+    virtual void supply(ExecutionTicket, DecisionInput)                                 = 0;
+    [[nodiscard]] virtual CommitReceipt commit(ExecutionTicket, typename Types::Commit) = 0;
+    virtual void discard(ExecutionTicket)                                               = 0;
+    [[nodiscard]] virtual std::optional<ExecutionEvent<Types>> poll()                   = 0;
+    virtual void flush()                                                                = 0;
+
+    virtual void wait_for_activity(std::chrono::milliseconds) const { std::this_thread::yield(); }
+
     // Closes submission and completes all physical readers before control owners are released.
     virtual void drain()                                                  = 0;
     virtual void fail(std::string message)                                = 0;
@@ -43,7 +51,7 @@ public:
     virtual void measure(MeasurementCommand command)                      = 0;
     virtual void observe_in_flight(std::vector<ExecutionProgress>&) const = 0;
 
-    void reset_startup_observations() {
+    virtual void reset_startup_observations() {
         measure({MeasurementAction::ResetStartup});
         execution_statistics_ = {};
         std::ranges::fill(decode_statistics_, ExecutionCounters{});
@@ -57,19 +65,19 @@ public:
         }
     }
 
-    [[nodiscard]] std::span<const RankSnapshot> observations() const noexcept {
+    [[nodiscard]] virtual std::span<const RankSnapshot> observations() const noexcept {
         return observations_;
     }
 
-    [[nodiscard]] std::span<const RankDescriptor> rank_descriptions() const noexcept {
+    [[nodiscard]] virtual std::span<const RankDescriptor> rank_descriptions() const noexcept {
         return rank_descriptions_;
     }
 
-    [[nodiscard]] const ExecutionStatistics& execution_statistics() const noexcept {
+    [[nodiscard]] virtual const ExecutionStatistics& execution_statistics() const noexcept {
         return execution_statistics_;
     }
 
-    [[nodiscard]] std::span<const ExecutionCounters> decode_statistics() const noexcept {
+    [[nodiscard]] virtual std::span<const ExecutionCounters> decode_statistics() const noexcept {
         return decode_statistics_;
     }
 protected:

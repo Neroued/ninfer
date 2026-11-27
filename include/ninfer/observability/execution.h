@@ -11,7 +11,11 @@
 
 namespace ninfer {
 
-enum class ExecutionKind : std::uint8_t { Prefill, Decode, Replay, Control, Score, Context, Count };
+enum class ExecutionKind : std::uint8_t { Prefill, Decode, Replay, Control, Score, Context, ExpertService, Count };
+inline constexpr std::array kExecutionKindNames{"prefill", "decode", "replay", "control", "score",
+                                                "context", "expert_service"};
+static_assert(kExecutionKindNames.size() == static_cast<std::size_t>(ExecutionKind::Count));
+
 // Main-model traversal. Mixed denotes segmented graphs with Host execution handoffs.
 enum class ExecutionPath : std::uint8_t { Eager, Graph, Mixed };
 

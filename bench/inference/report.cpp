@@ -11,8 +11,6 @@ namespace {
 
 using Json = nlohmann::json;
 
-constexpr const char* kExecutions[] = {"prefill", "decode", "replay",
-                                       "control", "score",  "context"};
 
 Json ratio(double numerator, std::uint64_t denominator) {
     return denominator ? Json(numerator / denominator) : Json(nullptr);
@@ -210,7 +208,7 @@ Json summarize(std::span<const Repetition> repetitions, std::uint32_t target_bat
     for (std::size_t i = 0; i < execution.size(); ++i) {
         const auto& e                     = execution[i];
         const bool has_request_maximum    = i < static_cast<std::size_t>(ExecutionKind::Score);
-        out["executions"][kExecutions[i]] = {
+        out["executions"][kExecutionKindNames[i]] = {
             {"units", e.units},
             {"rows", e.rows},
             {"input_tokens", e.input_tokens},

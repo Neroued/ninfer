@@ -275,7 +275,6 @@ std::string Metrics::render(const EngineSnapshot& snapshot, const ServiceSnapsho
         static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                        std::chrono::steady_clock::now().time_since_epoch())
                                        .count());
-    constexpr const char* kinds[] = {"prefill", "decode", "replay", "control", "score", "context"};
     header("execution_units_total", "counter",
            "Accepted execution units retired by all owning ranks.");
     header("execution_rows_total", "counter", "Rows participating in completed execution units.");
@@ -286,7 +285,7 @@ std::string Metrics::render(const EngineSnapshot& snapshot, const ServiceSnapsho
     for (std::size_t i = 0; i < snapshot.executions.size(); ++i) {
         const auto& value = snapshot.executions[i];
         const auto emit   = [&](const char* name, auto value) {
-            out << "ninfer_" << name << "{kind=\"" << kinds[i] << "\"} " << value << '\n';
+            out << "ninfer_" << name << "{kind=\"" << kExecutionKindNames[i] << "\"} " << value << '\n';
         };
         emit("execution_units_total", value.units);
         emit("execution_rows_total", value.rows);
@@ -537,7 +536,7 @@ std::string Metrics::render(const EngineSnapshot& snapshot, const ServiceSnapsho
         out << "ninfer_" << name << "_count{" << labels << "} " << count << '\n';
     };
     for (std::size_t i = 0; i < snapshot.executions.size(); ++i) {
-        const auto labels = "kind=\"" + std::string(kinds[i]) + "\"";
+        const auto labels = "kind=\"" + std::string(kExecutionKindNames[i]) + "\"";
         stages(snapshot.executions[i], labels, "execution");
         execution_histogram(snapshot.executions[i], labels, "execution_unit_seconds");
     }
@@ -563,7 +562,7 @@ std::string Metrics::render(const EngineSnapshot& snapshot, const ServiceSnapsho
                             std::pair{"valid_positions", a.valid_positions},
                             std::pair{"scheduled_positions", a.scheduled_positions}})
                 out << "ninfer_rank_attention_work_total{rank=\"" << rank.rank << "\",kind=\""
-                    << kinds[i] << "\",work=\"" << name << "\"} " << value << '\n';
+                    << kExecutionKindNames[i] << "\",work=\"" << name << "\"} " << value << '\n';
         }
         if (const auto age = product::physical_sample_age_ns(rank, now))
             out << "ninfer_physical_memory_sample_age_seconds{rank=\"" << rank.rank << "\"} "

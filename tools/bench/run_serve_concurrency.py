@@ -147,6 +147,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=8192,
         help="per-request output budget for decode-saturation (default: 8192)",
     )
+    parser.add_argument(
+        "--saturation-messages",
+        type=Path,
+        default=None,
+        help="override messages JSON file used by decode-saturation",
+    )
     corpus.add_launch_arguments(parser)
     parser.add_argument(
         "--output", type=Path, required=True, help="benchmark output directory"
@@ -1311,6 +1317,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     validate_args(args)
     artifacts = corpus.parse_artifacts(args.artifact)
     fixtures = corpus.load_fixtures(args.thinking)
+    if args.saturation_messages is not None:
+        msg_path = args.saturation_messages.expanduser().resolve()
+        try:
+            custom_messages = json.loads(msg_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise corpus.CampaignError(
+                f"failed to load --saturation-messages {msg_path}: {exc}"
+            ) from exc
+        if not isinstance(custom_messages, list) or not custom_messages:
+            raise corpus.CampaignError(
+                f"--saturation-messages must be a non-empty JSON list: {msg_path}"
+            )
+        fixtures[SATURATION_FIXTURE] = dataclasses.replace(
+            fixtures[SATURATION_FIXTURE],
+            name=msg_path.stem,
+            messages=custom_messages,
+        )
     points = build_points(artifacts, args)
     output_dir = args.output.expanduser().resolve()
 

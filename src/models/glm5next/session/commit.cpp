@@ -13,8 +13,7 @@ bool reached_dead_end(const RowResult& row) {
 }
 } // namespace
 
-void SessionImpl::finish_result(ComputeResult result) {
-    auto& tx = *compute;
+void SessionImpl::finish_result(ComputeTransaction& tx, ComputeResult result) {
     if (result.rows.size() != tx.members.size())
         throw std::logic_error("GLM5Next result changed its membership");
     tx.result.emplace(std::move(result));
@@ -140,7 +139,7 @@ void SessionImpl::finish_result(ComputeResult result) {
 }
 
 void SessionImpl::retire_compute(const runtime::DeviceRetired& event) {
-    auto& tx = *compute;
+    auto& tx = require_compute(event.ticket);
     for (auto h : tx.members) sequence(h).computing = false;
     if (tx.vision_id) {
         const auto* window = vision_window.current();
@@ -177,7 +176,7 @@ void SessionImpl::retire_compute(const runtime::DeviceRetired& event) {
     }
     if (tx.event) events.push_back(std::move(*tx.event));
     const bool score = tx.kind == Kind::Score;
-    compute.reset();
+    flights[event.ticket.frame.index].reset();
     if (score && scoring) (void)submit_score();
 }
 
@@ -188,10 +187,10 @@ namespace ninfer::models::glm5next {
 CommitResult Session::commit(PendingBatch&& batch,
                              std::span<const runtime::CommitDecision> decisions) {
     auto& p = *impl_;
-    if (!p.compute || batch.ticket_ != p.compute->ticket || batch.members_ != p.compute->members ||
-        !p.compute->result || p.compute->committed || decisions.size() != batch.row_count())
+    auto& tx = p.require_compute(batch.ticket_);
+    if (batch.members_ != tx.members || !tx.result || tx.committed ||
+        decisions.size() != batch.row_count())
         throw std::logic_error("invalid pending GLM5Next transaction");
-    auto& tx = *p.compute;
     for (std::size_t b = 0; b < decisions.size(); ++b) {
         const auto& decision = decisions[b];
         const auto produced  = tx.result->rows[b].tokens.size();
@@ -298,13 +297,12 @@ CommitResult Session::commit(PendingBatch&& batch,
 
 DiscardResult Session::discard(PendingBatch&& batch) noexcept {
     auto& p = *impl_;
-    if (!p.compute || batch.ticket_ != p.compute->ticket || batch.members_ != p.compute->members ||
-        p.compute->committed)
-        return {};
+    auto* tx = p.find_compute(batch.ticket_);
+    if (!tx || batch.members_ != tx->members || tx->committed) return {};
     try {
-        p.executor->discard(p.compute->ticket);
-        p.compute->discarded = true;
-        p.compute->committed = true;
+        p.executor->discard(tx->ticket);
+        tx->discarded        = true;
+        tx->committed        = true;
         batch.ticket_        = {};
         return {runtime::ConsumeStatus::Consumed, batch.row_count()};
     } catch (...) { return {}; }

@@ -3,8 +3,7 @@
 namespace ninfer::runtime {
 
 template <class Instance>
-void ReplicaEngine<Instance>::commit_pending(PendingBatch&& pending, ComputeFlight flight) {
-    if (retiring_) throw std::logic_error("another model commit is still retiring");
+void ReplicaEngine<Instance>::commit_pending(PendingBatch&& pending, ComputeFlight& flight) {
     EnginePhaseScope phase(*this, EngineHostPhase::CommitOutput);
     const auto lane_indices     = std::span<const std::uint32_t>(flight.lanes);
     const bool decode_round     = flight.kind == UnitKind::Decode;
@@ -265,13 +264,11 @@ void ReplicaEngine<Instance>::commit_pending(PendingBatch&& pending, ComputeFlig
         }
     }
     phase.finish();
-    record_service(flight);
-    retiring_.emplace(std::move(flight));
 }
 
 template <class Instance>
 void ReplicaEngine<Instance>::resolve_prefill_progress(
-    typename ModelContract::PrefillProgress&& progress, ComputeFlight flight) {
+    typename ModelContract::PrefillProgress&& progress, ComputeFlight& flight) {
     EnginePhaseScope phase(*this, EngineHostPhase::CommitOutput);
     if (progress.rows.size() != flight.requests.size() ||
         (progress.pending && progress.pending->row_count() != progress.rows.size())) {
@@ -327,9 +324,7 @@ void ReplicaEngine<Instance>::resolve_prefill_progress(
     }
     if (progress.pending) {
         phase.finish();
-        commit_pending(std::move(*progress.pending), std::move(flight));
-    } else {
-        record_service(flight);
+        commit_pending(std::move(*progress.pending), flight);
     }
 }
 
@@ -369,12 +364,11 @@ template <class Instance>
     call.finish();
     if (!ticket) return false;
     flight.ticket = *ticket;
-    for (const auto& member : flight.requests) member->execution_in_flight = true;
     for (const auto lane : flight.lanes) reserved_units_[lane].reset();
     scheduler_.prefill_executed(flight.lanes.front(), max_concurrency_);
     prefill_coalesce_waits_ = 0;
     last_coalesced_request_ = 0;
-    compute_.emplace(std::move(flight));
+    install_flight(std::move(flight));
     return true;
 }
 
@@ -392,8 +386,7 @@ template <class Instance>
     if (!ticket) return false;
     flight.ticket = *ticket;
     for (const auto lane : flight.lanes) reserved_units_[lane].reset();
-    for (const auto& member : flight.requests) member->execution_in_flight = true;
-    compute_.emplace(std::move(flight));
+    install_flight(std::move(flight));
     return true;
 }
 
@@ -456,8 +449,7 @@ template <class Instance>
         reserved_units_[lane].reset();
         control_executed_[lane] = true;
     }
-    for (const auto& member : flight.requests) member->execution_in_flight = true;
-    compute_.emplace(std::move(flight));
+    install_flight(std::move(flight));
     return true;
 }
 
@@ -481,27 +473,27 @@ void ReplicaEngine<Instance>::resolve_control(ComputeFlight& flight) {
         update_recovery(request);
         request->model_state = EngineRequestState::DecodeReady;
     }
-    record_service(flight);
 }
 
 template <class Instance>
 void ReplicaEngine<Instance>::supply_decision(ExecutionTicket ticket,
                                            const DecisionRequest& decision) {
-    if (!compute_ || compute_->ticket != ticket || decision.vocabulary == 0) {
+    auto& flight = flight_for(ticket);
+    if (flight.semantic_done || decision.vocabulary == 0) {
         throw std::logic_error("decision input does not belong to an active execution");
     }
     DecisionInput input;
     input.stage = decision.stage;
     input.rows.reserve(decision.rows.size());
-    auto seen = std::span(row_flags_).first(compute_->requests.size());
+    auto seen = std::span(row_flags_).first(flight.requests.size());
     std::fill(seen.begin(), seen.end(), 0);
     const std::size_t words_per_position = (std::size_t(decision.vocabulary) + 31) / 32;
     for (const auto& row : decision.rows) {
-        if (row.member >= compute_->requests.size() || seen[row.member]) {
+        if (row.member >= flight.requests.size() || seen[row.member]) {
             throw std::logic_error("decision request has invalid compact membership");
         }
         seen[row.member]    = true;
-        const auto& request = compute_->requests[row.member];
+        const auto& request = flight.requests[row.member];
         if (!request->output.constrained()) {
             throw std::logic_error("decision requested a mask for an unconstrained row");
         }
@@ -518,14 +510,15 @@ void ReplicaEngine<Instance>::supply_decision(ExecutionTicket ticket,
 
 template <class Instance>
 void ReplicaEngine<Instance>::record_decision_upload(const DecisionConsumed& consumed) {
-    if (!compute_ || compute_->ticket != consumed.ticket) {
+    auto& flight = flight_for(consumed.ticket);
+    if (flight.semantic_done) {
         throw std::logic_error("decision upload does not belong to an active execution");
     }
     for (const auto& row : consumed.rows) {
-        if (row.member >= compute_->requests.size()) {
+        if (row.member >= flight.requests.size()) {
             throw std::logic_error("decision upload has invalid compact membership");
         }
-        compute_->requests[row.member]->output.constraint_uploaded(row.bytes);
+        flight.requests[row.member]->output.constraint_uploaded(row.bytes);
     }
 }
 
@@ -539,33 +532,32 @@ template <class Instance>
     }
     bool progressed = false;
     if constexpr (requires { instance_.session->withdraw_cancelled(ExecutionTicket{}); }) {
-        if (compute_ && std::ranges::all_of(compute_->requests, [](const auto& r) {
-                return r->cancelled.load(std::memory_order_acquire);
-            }) && instance_.session->withdraw_cancelled(compute_->ticket)) {
-            if (compute_->kind == UnitKind::Control) discard_control_preview(*compute_);
-            for (const auto& request : compute_->requests) {
+        for (auto& flight : flights_) {
+            if (!flight || flight->semantic_done ||
+                !std::ranges::all_of(
+                    flight->requests,
+                    [](const auto& r) { return r->cancelled.load(std::memory_order_acquire); }) ||
+                !instance_.session->withdraw_cancelled(flight->ticket))
+                continue;
+            if (flight->kind == UnitKind::Control) discard_control_preview(*flight);
+            for (const auto& request : flight->requests) {
                 request->pending_execution.reset();
                 request->execution_in_flight = false;
             }
-            compute_.reset();
+            flight.reset();
             request_admission_check();
             progressed = true;
         }
     }
     for (;;) {
+        finish_engine_phase(boundary, EngineHostPhase::Boundary);
+        set_wait_work_class();
+        boundary = begin_host_phase();
         ExecutionCallScope call(*this, CoordinatorCall::Poll);
         auto event = instance_.session->poll();
         call.finish();
         if (!event) break;
         progressed = true;
-        if (auto* decision = std::get_if<DecisionRequest>(&event->result)) {
-            supply_decision(event->ticket, *decision);
-            continue;
-        }
-        if (const auto* consumed = std::get_if<DecisionConsumed>(&event->result)) {
-            record_decision_upload(*consumed);
-            continue;
-        }
         if (auto* context = std::get_if<typename ModelContract::ContextProgress>(&event->result)) {
             finish_engine_phase(boundary, EngineHostPhase::Boundary);
             const auto previous_work = active_exposure_set();
@@ -577,44 +569,42 @@ template <class Instance>
             boundary = begin_host_phase();
             continue;
         }
+        auto& flight = flight_for(event->ticket);
+        if (flight.sequences != event->members)
+            throw std::logic_error("execution event changed its frozen membership");
+        finish_engine_phase(boundary, EngineHostPhase::Boundary);
+        set_flight_work_class(flight);
+        boundary = begin_host_phase();
+        if (auto* decision = std::get_if<DecisionRequest>(&event->result)) {
+            supply_decision(event->ticket, *decision);
+            continue;
+        }
+        if (const auto* consumed = std::get_if<DecisionConsumed>(&event->result)) {
+            record_decision_upload(*consumed);
+            continue;
+        }
         if (const auto* complete = std::get_if<ExecutionComplete>(&event->result)) {
-            const bool retiring = retiring_ && retiring_->ticket == event->ticket;
-            auto& flight        = retiring ? retiring_ : compute_;
-            if (!flight || flight->ticket != event->ticket || flight->sequences != event->members ||
-                complete->row_count != flight->requests.size())
-                throw std::logic_error("execution completion changed its frozen membership");
+            if (flight.retired_ns || complete->row_count != flight.requests.size())
+                throw std::logic_error("invalid physical compute retirement");
             const auto kind = static_cast<std::size_t>(complete->sample.work.kind);
-            for (const auto& request : flight->requests) {
+            for (const auto& request : flight.requests) {
                 request->executions[kind].observe(complete->sample.latency);
                 if (complete->sample.work.kind == ExecutionKind::Decode)
-                    request->decode_by_batch[flight->requests.size()].observe(
+                    request->decode_by_batch[flight.requests.size()].observe(
                         complete->sample.latency);
                 accumulate_gpu(request->max_rank_gpu, complete->sample.max_rank_gpu);
                 request->pending_execution.reset();
-                request->execution_in_flight = false;
             }
-            flight->retired_ns = complete->sample.latency.total_ns;
-            record_service(*flight);
-            if (retiring) retiring_.reset();
+            flight.retired_ns = complete->sample.latency.total_ns;
+            release_completed(flight);
             continue;
         }
-        if (!compute_ || compute_->ticket != event->ticket ||
-            compute_->sequences != event->members) {
-            throw std::logic_error("execution result changed its frozen membership");
-        }
-        auto flight = std::move(*compute_);
-        compute_.reset();
-        set_host_work_class(flight.kind == UnitKind::Decode    ? HostWorkClass::Decode
-                            : flight.kind == UnitKind::Control ? HostWorkClass::Control
-                                                               : HostWorkClass::Prefill,
-                            flight.kind == UnitKind::Decode
-                                ? std::span<const std::uint32_t>(flight.lanes)
-                                : std::span<const std::uint32_t>{});
+        if (flight.semantic_done) throw std::logic_error("duplicate semantic compute completion");
         if (auto* pending = std::get_if<PendingBatch>(&event->result)) {
-            commit_pending(std::move(*pending), std::move(flight));
+            commit_pending(std::move(*pending), flight);
         } else if (auto* prefill =
                        std::get_if<typename ModelContract::PrefillProgress>(&event->result)) {
-            resolve_prefill_progress(std::move(*prefill), std::move(flight));
+            resolve_prefill_progress(std::move(*prefill), flight);
         } else if (auto* replay =
                        std::get_if<typename ModelContract::ReplayProgress>(&event->result)) {
             const auto& request = flight.requests.front();
@@ -636,6 +626,8 @@ template <class Instance>
         } else {
             throw std::logic_error("generation Session emitted a scoring result");
         }
+        flight.semantic_done = true;
+        release_completed(flight);
     }
     if (context_was_pending && !instance_.session->has_context_operation()) {
         request_admission_check();
@@ -646,35 +638,82 @@ template <class Instance>
 
 template <class Instance>
 [[nodiscard]] bool ReplicaEngine<Instance>::execution_outstanding() const noexcept {
-    return compute_ || retiring_ || instance_.session->has_context_operation() ||
-           instance_.executor->has_pending_work();
+    return std::ranges::any_of(flights_, [](const auto& f) { return f.has_value(); }) ||
+           instance_.session->has_context_operation() || instance_.executor->has_pending_work();
 }
 
 template <class Instance>
-bool ReplicaEngine<Instance>::compute_pending() const noexcept {
-    if (compute_ || retiring_) return true;
-    return std::any_of(slots_.begin(), slots_.end(), [&](const auto& request) {
-        return request && request->sequence &&
-               instance_.session->execution_pending(*request->sequence);
-    });
+bool ReplicaEngine<Instance>::compute_full() const noexcept {
+    return std::ranges::all_of(flights_, [](const auto& f) { return f.has_value(); });
+}
+
+template <class Instance>
+void ReplicaEngine<Instance>::install_flight(ComputeFlight flight) {
+    const auto frame = flight.ticket.frame;
+    if (frame.kind != FrameKind::Compute || flights_.at(frame.index))
+        throw std::logic_error("submitted compute frame is already occupied");
+    for (const auto& member : flight.requests) {
+        if (member->execution_in_flight)
+            throw std::logic_error("sequence belongs to another compute flight");
+        member->execution_in_flight = true;
+    }
+    flights_[frame.index].emplace(std::move(flight));
+}
+
+template <class Instance>
+auto ReplicaEngine<Instance>::flight_for(ExecutionTicket ticket) -> ComputeFlight& {
+    if (ticket.frame.kind != FrameKind::Compute || ticket.frame.index >= flights_.size())
+        throw std::logic_error("execution event has no compute frame");
+    auto& slot = flights_[ticket.frame.index];
+    if (!slot || slot->ticket != ticket)
+        throw std::logic_error("execution event has a stale compute ticket");
+    return *slot;
+}
+
+template <class Instance>
+void ReplicaEngine<Instance>::release_completed(ComputeFlight& flight) {
+    if (!flight.semantic_done || !flight.retired_ns) return;
+    record_service(flight);
+    for (const auto& request : flight.requests) request->execution_in_flight = false;
+    flights_[flight.ticket.frame.index].reset();
+    request_admission_check();
+}
+
+template <class Instance>
+void ReplicaEngine<Instance>::set_flight_work_class(const ComputeFlight& flight) {
+    set_host_work_class(flight.kind == UnitKind::Decode    ? HostWorkClass::Decode
+                        : flight.kind == UnitKind::Control ? HostWorkClass::Control
+                                                           : HostWorkClass::Prefill,
+                        flight.kind == UnitKind::Decode
+                            ? std::span<const std::uint32_t>(flight.lanes)
+                            : std::span<const std::uint32_t>{});
+}
+
+template <class Instance>
+void ReplicaEngine<Instance>::set_wait_work_class() {
+    waiting_decode_lanes_.clear();
+    HostWorkClass work = HostWorkClass::Control;
+    for (const auto& flight : flights_) {
+        if (!flight) continue;
+        if (flight->kind == UnitKind::Decode) {
+            waiting_decode_lanes_.insert(waiting_decode_lanes_.end(), flight->lanes.begin(),
+                                         flight->lanes.end());
+        } else if (flight->kind != UnitKind::Control) {
+            work = HostWorkClass::Prefill;
+        }
+    }
+    set_host_work_class(waiting_decode_lanes_.empty() ? work : HostWorkClass::Decode,
+                        waiting_decode_lanes_);
 }
 
 template <class Instance>
 void ReplicaEngine<Instance>::record_service(ComputeFlight& flight) noexcept {
-    if (!flight.retired_ns || flight.service_accounted) return;
-    if (flight.kind == UnitKind::Replay) {
-        for (const auto& request : flight.requests)
-            scheduler_.recovery_work(request->id, *flight.retired_ns);
-        flight.service_accounted = true;
-        return;
-    }
-    bool progressed = false;
     for (std::size_t row = 0; row < flight.requests.size(); ++row) {
-        if (!flight.progressed[row]) continue;
-        scheduler_.served(flight.requests[row]->id, *flight.retired_ns);
-        progressed = true;
+        if (flight.kind == UnitKind::Replay)
+            scheduler_.recovery_work(flight.requests[row]->id, *flight.retired_ns);
+        else if (flight.progressed[row])
+            scheduler_.served(flight.requests[row]->id, *flight.retired_ns);
     }
-    flight.service_accounted = progressed;
 }
 
 template <class Instance>
@@ -684,11 +723,12 @@ void ReplicaEngine<Instance>::log_worker_failure(std::exception_ptr error) const
     const auto report = [&](const char* reason) {
         std::fprintf(stderr,
                      "NInfer worker failed: %s | cycle=%u progress_owner=%llu paused=%zu "
-                     "context=%d compute=%d retiring=%d\n",
+                     "context=%d active_compute=%zu\n",
                      reason, static_cast<unsigned>(cycle_step_),
                      static_cast<unsigned long long>(scheduler_.progress_owner().value_or(0)),
                      paused_.size(), instance_.session->has_context_operation(),
-                     compute_.has_value(), retiring_.has_value());
+                     static_cast<std::size_t>(std::ranges::count_if(
+                         flights_, [](const auto& f) { return f.has_value(); })));
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             const auto& request = slots_[lane];
             if (request)
@@ -735,12 +775,13 @@ void ReplicaEngine<Instance>::fail_all(std::exception_ptr error) noexcept {
         materializing_ ? materializing_->request : nullptr;
     // Native retires all transfer readers before any external checkpoint owner is destroyed.
     instance_.session->fail_all_cleanup();
-    if (compute_ && compute_->kind == UnitKind::Control) discard_control_preview(*compute_);
-    for (const auto* flight : {&compute_, &retiring_})
-        if (*flight)
-            for (const auto& request : (*flight)->requests) request->execution_in_flight = false;
-    compute_.reset();
-    retiring_.reset();
+    for (auto& flight : flights_) {
+        if (!flight) continue;
+        if (!flight->semantic_done && flight->kind == UnitKind::Control)
+            discard_control_preview(*flight);
+        for (const auto& request : flight->requests) request->execution_in_flight = false;
+        flight.reset();
+    }
     cycle_step_ = CycleStep::Boundary;
     materializing_.reset();
     admission_decision_.reset();

@@ -270,9 +270,14 @@ public:
                                                       context::ContextTransaction&);
     void adopt_commit(Sequence&, const ContinuationMetadata&, bool state_written,
                       bool retain_recovery) noexcept;
+    [[nodiscard]] bool has_compute() const noexcept;
+    [[nodiscard]] bool compute_full() const noexcept;
+    [[nodiscard]] std::unique_ptr<ComputeTransaction>& vacant_compute(runtime::FrameId);
+    [[nodiscard]] ComputeTransaction* find_compute(runtime::ExecutionTicket) const noexcept;
+    [[nodiscard]] ComputeTransaction& require_compute(runtime::ExecutionTicket) const;
     void retire_compute(const runtime::DeviceRetired&);
-    void finish_result(ComputeResult);
-    void finish_score(ScoreResult);
+    void finish_result(ComputeTransaction&, ComputeResult);
+    void finish_score(ComputeTransaction&, ScoreResult);
     [[nodiscard]] ResourceReservation reserve_units(std::span<const ExecutionUnit>);
     [[nodiscard]] bool submit_score();
 
@@ -335,7 +340,7 @@ public:
     std::optional<ContextAssessment> pending_maintenance;
     std::optional<PauseReservation> pause_reservation;
     models::vision::Window vision_window;
-    std::unique_ptr<ComputeTransaction> compute;
+    std::vector<std::unique_ptr<ComputeTransaction>> flights;
     std::unique_ptr<Scoring> scoring;
     std::deque<SessionEvent> events;
     std::vector<runtime::ResidencyId> releases;

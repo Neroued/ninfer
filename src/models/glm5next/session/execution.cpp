@@ -8,8 +8,8 @@ namespace ninfer::models::glm5next {
 namespace {
 using Kind = detail::ComputeTransaction::Kind;
 
-void submit(detail::SessionImpl& session, runtime::ExecutionReservation reservation, Work work) {
-    auto& tx = *session.compute;
+void submit(detail::SessionImpl& session, detail::ComputeTransaction& tx,
+            runtime::ExecutionReservation reservation, Work work) {
     if (work_batch(work).members.empty()) prepare_batch(work, *session.plan.batches);
     tx.context.prepare_actions();
     work.actions = session.actions(tx.context);
@@ -52,7 +52,7 @@ runtime::PrefillCandidateInfo Session::prefill_candidate(SequenceHandle handle) 
 
 std::optional<runtime::ExecutionTicket> Session::start_prefill(SequenceHandle handle,
                                                                bool constrained) {
-    if (impl_->compute) return {};
+    if (impl_->compute_full() || execution_pending(handle)) return {};
     const runtime::PrefillGrant grant{prefill_candidate(handle).unit_max_tokens, constrained};
     return start_prefill({&handle, 1}, {&grant, 1});
 }
@@ -61,7 +61,9 @@ std::optional<runtime::ExecutionTicket>
 Session::start_prefill(std::span<const SequenceHandle> members,
                        std::span<const runtime::PrefillGrant> grants) {
     auto& p = *impl_;
-    if (p.compute) return {};
+    if (p.compute_full() ||
+        std::ranges::any_of(members, [&](auto h) { return execution_pending(h); }))
+        return {};
     if (members.empty() || members.size() > p.shape.max_concurrency ||
         grants.size() != members.size())
         throw std::logic_error("invalid prefill membership");
@@ -89,8 +91,9 @@ Session::start_prefill(std::span<const SequenceHandle> members,
     }
     auto reservation = p.executor->try_reserve(runtime::FrameKind::Compute);
     if (!reservation) return {};
-    p.compute = std::make_unique<detail::ComputeTransaction>(Kind::Prefill, p.directory);
-    auto& tx  = *p.compute;
+    auto& slot = p.vacant_compute(reservation->frame());
+    slot       = std::make_unique<detail::ComputeTransaction>(Kind::Prefill, p.directory);
+    auto& tx   = *slot;
     try {
         tx.members.assign(members.begin(), members.end());
         tx.rows.reserve(members.size());
@@ -114,7 +117,7 @@ Session::start_prefill(std::span<const SequenceHandle> members,
             }
         }
         forward.rows = tx.rows;
-        submit(p, std::move(*reservation), {{}, std::move(forward)});
+        submit(p, tx, std::move(*reservation), {{}, std::move(forward)});
         return tx.ticket;
     } catch (const std::exception& error) {
         p.executor->fail(error.what());
@@ -125,7 +128,7 @@ Session::start_prefill(std::span<const SequenceHandle> members,
 std::optional<runtime::ExecutionTicket> Session::start_replay(SequenceHandle handle) {
     auto& p = *impl_;
     auto& s = p.sequence(handle);
-    if (p.compute) return {};
+    if (p.compute_full() || s.computing) return {};
     if (s.phase != detail::Phase::Replay || !s.permit || s.capture_pending)
         throw std::logic_error("replay has no executable unit");
     const auto begin = s.continuation.metadata.main_frontier;
@@ -133,8 +136,9 @@ std::optional<runtime::ExecutionTicket> Session::start_replay(SequenceHandle han
     if (end <= begin) throw std::logic_error("replay has no missing input window");
     auto reservation = p.executor->try_reserve(runtime::FrameKind::Compute);
     if (!reservation) return {};
-    p.compute = std::make_unique<detail::ComputeTransaction>(Kind::Replay, p.directory);
-    auto& tx  = *p.compute;
+    auto& slot = p.vacant_compute(reservation->frame());
+    slot       = std::make_unique<detail::ComputeTransaction>(Kind::Replay, p.directory);
+    auto& tx   = *slot;
     tx.members.push_back(handle);
     try {
         if (end > begin) p.prepare_write(s, end, tx.context);
@@ -144,7 +148,7 @@ std::optional<runtime::ExecutionTicket> Session::start_replay(SequenceHandle han
         forward.rows   = tx.rows;
         forward.visual = p.prepare_visual(s, begin, end);
         if (forward.visual) tx.vision_id = forward.visual->window.id;
-        submit(p, std::move(*reservation), {{}, std::move(forward)});
+        submit(p, tx, std::move(*reservation), {{}, std::move(forward)});
         return tx.ticket;
     } catch (const std::exception& error) {
         p.executor->fail(error.what());
@@ -164,7 +168,9 @@ Session::start_decode_round(std::span<const SequenceHandle> members,
                             speculative::DecodeRoundRequest selection,
                             std::span<const std::uint8_t> constrained) {
     auto& p = *impl_;
-    if (p.compute) return {};
+    if (p.compute_full() ||
+        std::ranges::any_of(members, [&](auto h) { return execution_pending(h); }))
+        return {};
     if (members.empty() || members.size() > p.shape.max_concurrency ||
         !selection.valid_membership(members.size()) ||
         (!constrained.empty() && constrained.size() != members.size()))
@@ -258,8 +264,8 @@ Session::start_decode_round(std::span<const SequenceHandle> members,
             work.operation = ForwardWork{ForwardKind::Ordinary, SampleKind::NextToken, tx.rows, {},
                                          std::move(batch),      std::move(geometry)};
         }
-        p.compute = std::move(pending);
-        submit(p, std::move(*reservation), std::move(work));
+        p.vacant_compute(reservation->frame()) = std::move(pending);
+        submit(p, tx, std::move(*reservation), std::move(work));
         return tx.ticket;
     } catch (const std::exception& error) {
         if (prepared) p.executor->fail(error.what());
@@ -271,7 +277,9 @@ std::optional<runtime::ExecutionTicket>
 Session::start_control(std::span<const SequenceHandle> members, std::span<const TokenId> tokens,
                        std::uint32_t stride) {
     auto& p = *impl_;
-    if (p.compute) return {};
+    if (p.compute_full() ||
+        std::ranges::any_of(members, [&](auto h) { return execution_pending(h); }))
+        return {};
     if (members.empty() || members.size() > p.shape.max_concurrency || !stride ||
         stride > p.definition->resources().text.control_tokens->size() ||
         tokens.size() != members.size() * stride)
@@ -292,8 +300,9 @@ Session::start_control(std::span<const SequenceHandle> members, std::span<const 
             throw std::invalid_argument("forced token is outside vocabulary");
     auto reservation = p.executor->try_reserve(runtime::FrameKind::Compute);
     if (!reservation) return {};
-    p.compute = std::make_unique<detail::ComputeTransaction>(Kind::Control, p.directory);
-    auto& tx  = *p.compute;
+    auto& slot = p.vacant_compute(reservation->frame());
+    slot       = std::make_unique<detail::ComputeTransaction>(Kind::Control, p.directory);
+    auto& tx   = *slot;
     tx.members.assign(members.begin(), members.end());
     try {
         for (std::size_t b = 0; b < members.size(); ++b) {
@@ -305,7 +314,7 @@ Session::start_control(std::span<const SequenceHandle> members, std::span<const 
             row.ids.insert(row.ids.end(), forced.begin(), forced.end() - 1);
             tx.rows.push_back(std::move(row));
         }
-        submit(p, std::move(*reservation),
+        submit(p, tx, std::move(*reservation),
                {{}, ForwardWork{ForwardKind::Control, SampleKind::None, tx.rows}});
         return tx.ticket;
     } catch (const std::exception& error) {
@@ -336,6 +345,8 @@ ResourceReservation detail::SessionImpl::reserve_units(std::span<const Execution
     const auto mark = p.next_membership_mark();
     for (const auto& unit : units) {
         auto& sequence = p.sequence(unit.sequence);
+        if (sequence.computing)
+            return {.status = runtime::UnitReservationStatus::ExecutionUnavailable};
         if ((unit.kind == ExecutionUnitKind::Prefill || unit.kind == ExecutionUnitKind::Replay) &&
             p.unit_end(sequence, unit.kind, unit.tokens) ==
                 sequence.continuation.metadata.main_frontier &&

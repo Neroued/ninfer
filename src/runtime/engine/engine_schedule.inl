@@ -397,7 +397,8 @@ bool ReplicaEngine<Instance>::pause_resident(std::uint32_t lane, PauseGoal goal,
                                           typename ResourceManagement::ReclaimCursor* parent) {
     if (instance_.session->has_context_operation()) { return false; }
     auto request = slots_[lane];
-    if (!request || !request->sequence || instance_.session->execution_pending(*request->sequence))
+    if (!request || !request->sequence || request->execution_in_flight ||
+        instance_.session->execution_pending(*request->sequence))
         return false;
     std::optional<PauseAction> selected;
     std::optional<typename ResourceManagement::ReclaimCursor> local_reclaim;
@@ -996,8 +997,8 @@ ReplicaEngine<Instance>::execution_unit(const Request& request) const {
 template <class Instance>
 [[nodiscard]] bool ReplicaEngine<Instance>::resident_runnable(std::uint32_t lane) const {
     const auto& request = slots_[lane];
-    return request && request->sequence && request->residency && !request->capture_pending &&
-           !request->cancelled.load(std::memory_order_acquire) &&
+    return request && request->sequence && request->residency && !request->execution_in_flight &&
+           !request->capture_pending && !request->cancelled.load(std::memory_order_acquire) &&
            !instance_.session->context_blocks(*request->sequence) &&
            !instance_.session->execution_pending(*request->sequence) &&
            (request->is_control_ready() || request->is_decode_ready() || request->is_prefilling() ||
@@ -1324,10 +1325,10 @@ void ReplicaEngine<Instance>::begin_cycle(HostPhaseMeasurement& boundary) {
 
 template <class Instance>
 [[nodiscard]] bool ReplicaEngine<Instance>::advance_cycle() {
-    if (compute_pending()) return false;
+    if (compute_full()) return false;
     set_host_work_class(HostWorkClass::Control);
     bool submitted = false;
-    while (!compute_ && cycle_step_ != CycleStep::Boundary) {
+    while (!compute_full() && cycle_step_ != CycleStep::Boundary) {
         switch (cycle_step_) {
         case CycleStep::Control: {
             auto& selected = control_membership_;
@@ -1422,6 +1423,7 @@ bool ReplicaEngine<Instance>::process_measurement() {
 template <class Instance>
 void ReplicaEngine<Instance>::worker_loop() noexcept {
     std::uint64_t scheduled_revision = 0;
+    bool refill                      = false;
     for (;;) {
         bool was_idle = false;
         bool cancelling_measurement = false;
@@ -1453,14 +1455,7 @@ void ReplicaEngine<Instance>::worker_loop() noexcept {
         bool progressed  = false;
         bool outstanding = false;
         try {
-            if (compute_) {
-                set_host_work_class(compute_->kind == UnitKind::Decode    ? HostWorkClass::Decode
-                                    : compute_->kind == UnitKind::Control ? HostWorkClass::Control
-                                                                          : HostWorkClass::Prefill,
-                                    compute_->kind == UnitKind::Decode
-                                        ? std::span<const std::uint32_t>(compute_->lanes)
-                                        : std::span<const std::uint32_t>{});
-            }
+            set_wait_work_class();
             auto boundary = begin_host_phase();
             progressed    = poll_execution(boundary);
             if (instance_.executor->failed()) {
@@ -1479,10 +1474,11 @@ void ReplicaEngine<Instance>::worker_loop() noexcept {
                 }
                 if (still_idle) continue;
             }
-            const bool schedule = progressed || revision != scheduled_revision ||
+            const bool schedule = refill || progressed || revision != scheduled_revision ||
                                   !execution_outstanding() || Clock::now() >= pending_deadline_ ||
                                   (prefill_coalesce_waits_ && !materializing_);
-            if (cycle_step_ == CycleStep::Boundary && !compute_pending() && schedule) {
+            refill = false;
+            if (cycle_step_ == CycleStep::Boundary && !compute_full() && schedule) {
                 scheduled_revision = revision;
                 set_host_work_class(HostWorkClass::Control);
                 boundary = begin_host_phase();
@@ -1490,6 +1486,7 @@ void ReplicaEngine<Instance>::worker_loop() noexcept {
                 finish_engine_phase(boundary, EngineHostPhase::Boundary);
             }
             if (advance_cycle()) {
+                refill     = !compute_full();
                 progressed = true;
                 publish_runtime_stats();
             }
@@ -1501,6 +1498,7 @@ void ReplicaEngine<Instance>::worker_loop() noexcept {
             outstanding = execution_outstanding();
             if (!outstanding) progressed |= process_measurement();
             if (outstanding && !progressed) {
+                set_wait_work_class();
                 const auto exposed = active_exposure_set();
                 const auto started = Clock::now();
                 instance_.executor->wait_for_activity(std::chrono::milliseconds(1));

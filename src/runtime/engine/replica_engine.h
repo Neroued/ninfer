@@ -166,6 +166,8 @@ public:
         published_requests_.reserve(max_outstanding_);
         published_snapshot_.decode_by_batch.resize(max_concurrency_);
         const auto frames = instance_.executor->capacity();
+        flights_.resize(frames.compute_frames);
+        waiting_decode_lanes_.reserve(max_concurrency_);
         execution_observations_.reserve(frames.compute_frames + frames.context_frames);
         published_snapshot_.in_flight.reserve(frames.compute_frames + frames.context_frames);
         std::promise<void> bound;
@@ -359,7 +361,7 @@ private:
         std::vector<std::uint8_t> cancelled;
         std::vector<std::uint8_t> progressed;
         std::optional<std::uint64_t> retired_ns;
-        bool service_accounted = false;
+        bool semantic_done = false;
         std::vector<TokenId> control_tokens;
         std::uint32_t control_stride = 0;
         std::vector<std::size_t> generated_sizes;
@@ -774,7 +776,7 @@ private:
 
     [[nodiscard]] bool expire_pending_requests();
 
-    void commit_pending(PendingBatch&& pending, ComputeFlight flight);
+    void commit_pending(PendingBatch&& pending, ComputeFlight& flight);
 
     void reserve_active_capture(const std::shared_ptr<Request>& request, EngineRequestState next);
 
@@ -782,7 +784,7 @@ private:
                                   bool allow_reclaim = true);
 
     void resolve_prefill_progress(typename ModelContract::PrefillProgress&& progress,
-                                  ComputeFlight flight);
+                                  ComputeFlight& flight);
 
     void ensure_base_plan(const std::shared_ptr<Request>& request);
 
@@ -862,7 +864,12 @@ private:
 
     [[nodiscard]] bool execution_outstanding() const noexcept;
 
-    [[nodiscard]] bool compute_pending() const noexcept;
+    [[nodiscard]] bool compute_full() const noexcept;
+    void install_flight(ComputeFlight);
+    ComputeFlight& flight_for(ExecutionTicket);
+    void release_completed(ComputeFlight&);
+    void set_wait_work_class();
+    void set_flight_work_class(const ComputeFlight&);
 
     void record_service(ComputeFlight& flight) noexcept;
     void log_worker_failure(std::exception_ptr error) const noexcept;
@@ -936,8 +943,8 @@ private:
     std::shared_ptr<Request> context_owner_;
     std::vector<std::shared_ptr<Request>> paused_;
     Scheduling scheduler_;
-    std::optional<ComputeFlight> compute_;
-    std::optional<ComputeFlight> retiring_;
+    std::vector<std::optional<ComputeFlight>> flights_;
+    std::vector<std::uint32_t> waiting_decode_lanes_;
     CycleStep cycle_step_                 = CycleStep::Boundary;
     std::uint32_t prefill_coalesce_waits_ = 0;
     std::uint64_t last_coalesced_request_ = 0;

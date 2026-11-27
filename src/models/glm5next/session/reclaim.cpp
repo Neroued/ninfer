@@ -96,7 +96,7 @@ ContextReclaimPlan SessionImpl::plan_reclaim(std::span<const CheckpointHandle> a
 
 runtime::ContextStart SessionImpl::try_pending_maintenance() {
     if (!pending_maintenance) return runtime::ContextStart::Stale;
-    if (operation || compute || executor->has_pending_work())
+    if (operation || has_compute() || executor->has_pending_work())
         return runtime::ContextStart::Deferred;
     auto execution = executor->try_reserve(runtime::FrameKind::Context);
     if (!execution) return runtime::ContextStart::Deferred;
@@ -159,7 +159,7 @@ runtime::ContextReleaseMeasure Session::release_measure(const ContextReleaseSet&
 
 runtime::ContextStart Session::start_maintenance(const ContextAssessment& assessment) {
     auto& session = *impl_;
-    if (session.operation || session.pending_maintenance || session.compute ||
+    if (session.operation || session.pending_maintenance || session.has_compute() ||
         session.executor->has_pending_work())
         return runtime::ContextStart::Deferred;
     const auto current = session.directory.assess(assessment.demand);

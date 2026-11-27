@@ -42,7 +42,7 @@ public:
     glm::WorkContract contract;
     mutable std::mutex mu;
     std::deque<rt::ExecutionEvent<glm::ExecutionTypes>> events;
-    rt::ExecutionPool pool{{1, 1}};
+    rt::ExecutionPool pool;
     std::uint64_t next = 0;
     bool failure       = false;
     std::atomic<bool> hold_poll{false};
@@ -58,11 +58,20 @@ public:
     bool measuring             = false;
     std::uint64_t unit_time_ns = 1'000'000;
     TokenId emitted_token      = 0;
-    glm::Work last;
-    glm::ComputeResult computed;
 
-    MockReplicaExecutor(glm::WorkContract c, std::uint32_t rank)
-        : rt::Executor<glm::ExecutionTypes>(c.shape.max_concurrency), contract(std::move(c)) {
+    struct Flight {
+        glm::Work work;
+        glm::ComputeResult computed;
+    };
+
+    std::vector<std::optional<Flight>> flights;
+    std::atomic<bool> hold_first_retirement{false};
+    std::atomic<bool> first_retirement_waiting{false};
+    std::atomic<unsigned> peak_active{0};
+
+    MockReplicaExecutor(glm::WorkContract c, std::uint32_t rank, unsigned compute_frames)
+        : rt::Executor<glm::ExecutionTypes>(c.shape.max_concurrency), contract(std::move(c)),
+          pool({compute_frames, 1}), flights(compute_frames) {
         rank_descriptions_.push_back({.rank = rank, .device = static_cast<int>(rank)});
         observations_.push_back({.rank = rank});
     }
@@ -73,7 +82,7 @@ public:
 
     rt::SessionEpoch epoch() const noexcept override { return {1}; }
 
-    rt::ExecutionCapacity capacity() const noexcept override { return {1, 1}; }
+    rt::ExecutionCapacity capacity() const noexcept override { return pool.capacity(); }
 
     std::optional<rt::ExecutionReservation> try_reserve(rt::FrameKind kind) override {
         std::lock_guard lock(mu);
@@ -84,19 +93,30 @@ public:
         std::lock_guard lock(mu);
         contract.validate(work, reservation.frame().kind);
         const rt::ExecutionTicket ticket{epoch(), ++next, pool.accept(std::move(reservation))};
-        last = std::move(work);
-        if (std::holds_alternative<glm::ContextWork>(last.operation)) {
+        if (std::holds_alternative<glm::ContextWork>(work.operation)) {
             events.emplace_back(rt::ResultReady<glm::ExecutionTypes>{ticket, glm::ContextResult{}});
             events.emplace_back(rt::DeviceRetired{ticket, {++next}, {}});
-        } else if (const auto* score = std::get_if<glm::ScoreWork>(&last.operation)) {
-            active_compute.fetch_add(1, std::memory_order_release);
+            return ticket;
+        }
+        for (const auto& flight : flights) {
+            if (!flight) continue;
+            for (const auto& active : glm::work_rows(flight->work))
+                for (const auto& row : glm::work_rows(work))
+                    require(active.member.sequence != row.member.sequence,
+                            "overlapping GLM source sequence");
+        }
+        auto& stored      = flights.at(ticket.frame.index).emplace(Flight{std::move(work), {}});
+        const auto& last  = stored.work;
+        auto& computed    = stored.computed;
+        const auto active = active_compute.fetch_add(1, std::memory_order_release) + 1;
+        peak_active.store(std::max(peak_active.load(), active));
+        if (const auto* score = std::get_if<glm::ScoreWork>(&last.operation)) {
             glm::ScoreResult result{static_cast<std::uint32_t>(score->row.ids.size()),
                                     std::vector<float>(score->targets.size(), -2.0F)};
             computed.rows = {{.processed = result.processed}};
             events.emplace_back(rt::ResultReady<glm::ExecutionTypes>{ticket, std::move(result)});
         } else {
             submitted_compute.fetch_add(1, std::memory_order_release);
-            active_compute.fetch_add(1, std::memory_order_release);
             glm::ComputeResult result;
             const auto* forward = std::get_if<glm::ForwardWork>(&last.operation);
             const auto rows     = glm::work_rows(last);
@@ -121,14 +141,18 @@ public:
 
     rt::CommitReceipt commit(rt::ExecutionTicket ticket, glm::Commit commit) override {
         std::lock_guard lock(mu);
-        contract.validate_commit(last, computed.rows, commit);
+        const auto& f = flights.at(ticket.frame.index).value();
+        contract.validate_commit(f.work, f.computed.rows, commit);
+        if (ticket.frame.index == 0 && hold_first_retirement) first_retirement_waiting = true;
         events.emplace_back(rt::DeviceRetired{ticket, {++next}, {}});
         return {ticket, {next}};
     }
 
     void discard(rt::ExecutionTicket ticket) override {
         std::lock_guard lock(mu);
-        events.clear();
+        std::erase_if(events, [&](const auto& e) {
+            return std::visit([&](const auto& v) { return v.ticket == ticket; }, e);
+        });
         events.emplace_back(rt::DeviceRetired{ticket, {++next}, {}});
     }
 
@@ -147,16 +171,26 @@ public:
             throw std::runtime_error("injected executor polling failure");
         }
         if (events.empty()) { return {}; }
+        const auto ready = std::ranges::find_if(events, [&](const auto& e) {
+            const auto* retired = std::get_if<rt::DeviceRetired>(&e);
+            return !retired || !hold_first_retirement ||
+                   retired->ticket.frame.kind != rt::FrameKind::Compute ||
+                   retired->ticket.frame.index != 0;
+        });
+        if (ready == events.end()) return {};
         const auto front_kind =
-            std::visit([](const auto& ev) { return ev.ticket.frame.kind; }, events.front());
+            std::visit([](const auto& ev) { return ev.ticket.frame.kind; }, *ready);
         if (front_kind == rt::FrameKind::Compute && hold_poll.load(std::memory_order_acquire)) {
             return {};
         }
         const auto delay = compute_delay_ms.load(std::memory_order_acquire);
-        auto e           = std::move(events.front());
-        events.pop_front();
+        auto e           = std::move(*ready);
+        events.erase(ready);
         if (auto* retired = std::get_if<rt::DeviceRetired>(&e)) {
             if (retired->ticket.frame.kind == rt::FrameKind::Compute) {
+                auto& f                 = flights.at(retired->ticket.frame.index);
+                retired->execution.work = glm::ExecutionTypes::describe_work(f->work);
+                f.reset();
                 active_compute.fetch_sub(1, std::memory_order_release);
             }
             pool.retire(retired->ticket.frame);
@@ -173,6 +207,7 @@ public:
     void drain() override {
         std::lock_guard lock(mu);
         events.clear();
+        for (auto& f : flights) f.reset();
         active_compute.store(0, std::memory_order_release);
         pool.retire_submitted();
     }
@@ -285,7 +320,8 @@ struct ClusterFixture {
 
     ClusterFixture(std::shared_ptr<const glm::ModelDefinition> def, std::uint32_t dp_count,
                    std::uint32_t max_concurrency, const std::vector<std::uint32_t>& replica_pages,
-                   bool context_cache = true, EnginePurpose purpose = EnginePurpose::Generation)
+                   bool context_cache = true, EnginePurpose purpose = EnginePurpose::Generation,
+                   unsigned compute_frames = 1)
         : definition(std::move(def)) {
         options.max_context           = 256;
         options.max_concurrency       = max_concurrency;
@@ -307,7 +343,7 @@ struct ClusterFixture {
                                   definition->config().text.vocabulary,
                                   definition->resources().text.public_token_count, 1, 0, 0,
                                   glm::make_decode_routes(layout.shape, *layout.batches)},
-                5 + r);
+                5 + r, compute_frames);
             executors.push_back(exec.get());
             auto directory   = std::make_unique<ctx::ContextDirectory>(layout.context);
             const auto usage = directory->usage();
@@ -382,6 +418,52 @@ void wait_until(auto predicate, const char* message) {
     while (!predicate() && std::chrono::steady_clock::now() < deadline)
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     require(predicate(), message);
+}
+
+void test_independent_compute_frames(std::shared_ptr<const glm::ModelDefinition> def,
+                                     bool cancel_first) {
+    ClusterFixture c(std::move(def), 1, 3, {128}, false, EnginePurpose::Generation, 2);
+    auto& exec                         = *c.executors.front();
+    exec.hold_first_retirement         = true;
+    std::atomic<bool> cancel           = false;
+    std::atomic<unsigned> cancel_polls = 0;
+    auto first = c.submit_tokens(c.make_pattern(12, 1), cancel_first ? 96 : 3, false);
+    auto a     = std::async(std::launch::async, [&] {
+        return first.wait(nullptr, CancellationView([&] {
+                              if (!cancel.load()) return false;
+                              ++cancel_polls;
+                              return true;
+                          }));
+    });
+    wait_until([&] { return exec.first_retirement_waiting.load(); },
+               "first frame never reached commit");
+    if (cancel_first) {
+        cancel = true;
+        // The second callback follows notification of the owner while its physical reader is held.
+        wait_until([&] { return cancel_polls >= 2; }, "consumer did not deliver cancellation");
+    }
+    auto second = c.submit_tokens(c.make_pattern(149, 4), 4, false);
+    auto b      = std::async(std::launch::async, [&] { return second.wait(nullptr, {}); });
+    require_ready(b, "held retirement blocked disjoint prefill and decode");
+    const auto result = b.get();
+    require(result.stats.computed_prefill_tokens == 149 && result.generated_token_ids.size() == 4 &&
+                exec.peak_active == 2 && exec.active_compute == 1 &&
+                a.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready,
+            "frame completion or ownership leaked between requests");
+    exec.hold_first_retirement = false;
+    require_ready(a, "delayed retirement stranded its source");
+    const auto delayed = a.get();
+    if (cancel_first)
+        require(delayed.finish_reason == FinishReason::Cancelled &&
+                    delayed.generated_token_ids.size() < 96,
+                "cancellation crossed the delayed ticket");
+    else
+        require(delayed.generated_token_ids.size() == 3, "delayed source lost its output");
+    (void)c.coordinator->measure({rt::MeasurementAction::Reset});
+    const auto settled = c.coordinator->snapshot();
+    require(!settled.runtime.state_objects && !settled.runtime.history_objects &&
+                !exec.has_pending_work(),
+            "compute retirement leaked a context lease");
 }
 
 void test_c_lt_dp_and_non_divisible_c(std::shared_ptr<const glm::ModelDefinition> def) {
@@ -909,6 +991,7 @@ int main(int argc, char** argv) {
         artifact::Reader reader(std::filesystem::path(argv[1]) / "model.ninfer");
         auto def = glm::read_definition(reader, {});
 
+        for (bool cancel : {false, true}) test_independent_compute_frames(def, cancel);
         test_c_lt_dp_and_non_divisible_c(def);
         test_prefix_affinity_and_bounce_back(def);
         test_global_preemption_permit_handoff(def);

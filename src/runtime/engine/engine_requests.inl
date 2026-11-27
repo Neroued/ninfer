@@ -408,7 +408,8 @@ bool ReplicaEngine<Instance>::settle_terminal_requests(HostPhaseMeasurement& bou
     std::vector<std::uint32_t> terminal;
     for (std::uint32_t lane = 0; lane < slots_.size(); ++lane) {
         const auto& request = slots_[lane];
-        if (request && (request->terminal_reason || request->terminal_error) &&
+        if (request && !request->execution_in_flight &&
+            (request->terminal_reason || request->terminal_error) &&
             (!request->sequence || !instance_.session->execution_pending(*request->sequence)))
             terminal.push_back(lane);
     }
@@ -476,7 +477,7 @@ void ReplicaEngine<Instance>::cancel_active_requests(
     for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
         const auto request = slots_[lane];
         if (request == nullptr || cancelled_at_boundary[lane] != request->id) { continue; }
-        if (request->capture_pending ||
+        if (request->execution_in_flight || request->capture_pending ||
             (request->sequence && instance_.session->execution_pending(*request->sequence))) {
             continue;
         }

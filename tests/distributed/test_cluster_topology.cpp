@@ -85,6 +85,25 @@ void test_valid_1_to_16_card_topologies() {
                 "1-rank baseline topology mismatch");
         roundtrip_if_enabled(d, t);
     }
+    {
+        const auto d = make_deployment({.tp = 2, .ep = 1, .dp = 1, .pp = 4, .adp = 1}, 2);
+        const auto t = dist::build_cluster_topology(d);
+        t.validate(d);
+        for (const auto& rank : t.ranks) {
+            const auto* input  = t.pipeline_input(rank.rank);
+            const auto* output = t.pipeline_output(rank.rank);
+            require(bool(input) == (rank.pp.rank != 0) && bool(output) == (rank.pp.rank != 3),
+                    "pipeline endpoints do not match stage ownership");
+            if (output) {
+                const auto peer = t.replica(0).stage_ranks[rank.pp.rank + 1].at(rank.tp.rank);
+                require(output == t.pipeline_input(peer) &&
+                            output->members == std::vector<dist::RankId>{rank.rank, peer} &&
+                            output->usage == dist::GroupUsage::PeerExchange,
+                        "PP4/TP2 pipeline connected the wrong tensor lane");
+            }
+        }
+        roundtrip_if_enabled(d, t);
+    }
 
     {
         const auto d = make_deployment({.tp = 2, .dp = 2});

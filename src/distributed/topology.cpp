@@ -1,6 +1,7 @@
 #include "distributed/topology.h"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <map>
 #include <set>
@@ -113,6 +114,18 @@ void ExecutionTopology::add_role(std::string_view name, std::span<const RankId> 
     }
 }
 
+const GroupDescription* ExecutionTopology::pipeline_input(RankId member) const {
+    const auto stage = rank(member).pp;
+    if (!stage.rank) return nullptr;
+    return &role_group("pipeline." + std::to_string(stage.rank - 1), member);
+}
+
+const GroupDescription* ExecutionTopology::pipeline_output(RankId member) const {
+    const auto stage = rank(member).pp;
+    if (stage.rank + 1 == stage.size) return nullptr;
+    return &role_group("pipeline." + std::to_string(stage.rank), member);
+}
+
 ExecutionTopology build_cluster_topology(const DeploymentOptions& raw_deployment) {
     const auto deployment = normalize_deployment(raw_deployment);
     const auto& p         = deployment.parallel;
@@ -157,6 +170,13 @@ ExecutionTopology build_cluster_topology(const DeploymentOptions& raw_deployment
             }
         }
         rep.result_owner = rep.stage_ranks[p.pp - 1][0];
+        for (std::uint32_t s = 1; s < p.pp; ++s) {
+            const auto role = "pipeline." + std::to_string(s - 1);
+            for (std::uint32_t t = 0; t < p.tp; ++t) {
+                const std::array pair{rep.stage_ranks[s - 1][t], rep.stage_ranks[s][t]};
+                out.add_role(role, pair, GroupUsage::PeerExchange);
+            }
+        }
     }
     return out;
 }

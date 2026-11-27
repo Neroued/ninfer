@@ -146,6 +146,11 @@ def main(argv=None):
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
+        "--workers", type=int, default=1,
+        help="CPU weight conversion jobs in parallel (default: 1); CUDA requires 1; "
+             "large objects are spooled to temporary files",
+    )
+    parser.add_argument(
         "--rows-per-chunk",
         type=int,
         help="override row batching (default: bounded batches sized in bytes)",
@@ -241,6 +246,7 @@ def main(argv=None):
             device=args.device,
             rows_per_chunk=args.rows_per_chunk,
             source_cache_bytes=args.source_cache_mib * 1024 * 1024,
+            workers=args.workers,
             max_file_bytes=args.max_file_bytes,
             progress=progress,
         )

@@ -243,33 +243,34 @@ void RankProgramImpl::forward_packed_prefill(const ForwardWork& work) {
     }
 }
 
-moe::SigmoidPass RankProgramImpl::expert_pass(std::size_t traversal) {
-    if (!expert_exchange) return {};
-    const auto& step = compute->request.work.exchange.value();
-    return {expert_exchange.get(), dimension(step.columns.at(traversal)),
+moe::SigmoidPass RankProgramImpl::expert_pass(int columns) {
+    return {expert_exchange.get(), columns, parameters.profile->local.rank == 0};
+}
 
-            parameters.profile->local.rank == 0};
+void RankProgramImpl::serve_expert_pass(bool draft, std::uint32_t columns) {
+    const auto pass = expert_pass(dimension(columns));
+    if (draft) {
+        const auto& m = parameters.profile->mtp->moe;
+        pass.run(m.bank, m.math, parameters.mtp->moe.weights, nullptr, nullptr, resources.workspace,
+                 cuda);
+        return;
+    }
+    for (std::size_t l = 0; l < parameters.text.layers.size(); ++l) {
+        const auto* m = std::get_if<execution::MoeProfile>(&parameters.profile->text.layers[l].ffn);
+        if (m)
+            pass.run(m->bank, m->math,
+                     std::get<execution::MoeParameters>(parameters.text.layers[l].ffn).weights,
+                     nullptr, nullptr, resources.workspace, cuda);
+    }
 }
 
 void RankProgramImpl::serve_experts() {
     const auto& step = *compute->request.work.exchange;
     for (std::size_t i = 0; i < step.columns.size(); ++i) {
-        const auto pass = expert_pass(i);
-        if (i < step.draft_passes) {
-            const auto& m = parameters.profile->mtp->moe;
-            pass.run(m.bank, m.math, parameters.mtp->moe.weights, nullptr, nullptr,
-                     resources.workspace, cuda);
-        } else {
-            for (std::size_t l = 0; l < parameters.text.layers.size(); ++l) {
-                const auto* m =
-                    std::get_if<execution::MoeProfile>(&parameters.profile->text.layers[l].ffn);
-                if (m)
-                    pass.run(
-                        m->bank, m->math,
-                        std::get<execution::MoeParameters>(parameters.text.layers[l].ffn).weights,
-                        nullptr, nullptr, resources.workspace, cuda);
-            }
-        }
+        if (step.graph)
+            service_graphs->launch(i < step.draft_passes, step.columns[i], cuda);
+        else
+            serve_expert_pass(i < step.draft_passes, step.columns[i]);
     }
     timer.record_result();
     compute_done.record(cuda.stream());
@@ -292,7 +293,10 @@ execution::TextRun RankProgramImpl::text_run(const execution::BatchView& call,
              ? draft_features(call, std::holds_alternative<execution::PackedPrefillUpdate>(update))
              : Tensor{},
          attention_groups(),
-         expert_exchange ? expert_pass(compute->main_pass++) : moe::SigmoidPass{}},
+         expert_pass(
+             expert_exchange && compute
+                 ? dimension(compute->request.work.exchange->columns.at(compute->main_pass++))
+                 : call.tokens * call.rows)},
         call, update, cuda);
 }
 
@@ -503,7 +507,10 @@ void RankProgramImpl::advance_compute() {
                     resources.vision->release(use.id);
             }
             auto observed = observation();
-            observed.path = f.graph_route ? ExecutionPath::Graph : ExecutionPath::Eager;
+            observed.path =
+                f.graph_route || (f.request.work.exchange && f.request.work.exchange->graph)
+                    ? ExecutionPath::Graph
+                    : ExecutionPath::Eager;
             timer.observe_retirement(f.gpu);
             observed.gpu       = f.gpu;
             observed.attention = {ExecutionTypes::describe_work(f.request.work).kind, f.attention};

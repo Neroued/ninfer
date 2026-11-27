@@ -8,7 +8,8 @@ RankExecutionObservation RankProgramImpl::retirement_observation() const noexcep
     RankExecutionObservation out;
     const auto peak            = std::max({resources.workspace.peak_used(),
                                 resources.vision ? resources.vision->workspace_peak_bytes() : 0,
-                                graphs ? graphs->workspace_peak() : 0});
+                                graphs ? graphs->workspace_peak() : 0,
+                                service_graphs ? service_graphs->workspace_peak() : 0});
     out.expert_upload_bytes    = resources.experts ? resources.experts->uploaded_bytes() : 0;
     out.ple_upload_bytes       = resources.ple_upload ? resources.ple_upload->uploaded_bytes() : 0;
     out.workspace_peak_bytes   = std::max(workspace_lifetime_peak, peak);
@@ -55,7 +56,8 @@ RankMemoryUsage RankProgramImpl::observe_resources() const {
     }
     const auto peak = std::max({resources.workspace.peak_used(),
                                 resources.vision ? resources.vision->workspace_peak_bytes() : 0,
-                                graphs ? graphs->workspace_peak() : 0});
+                                graphs ? graphs->workspace_peak() : 0,
+                                service_graphs ? service_graphs->workspace_peak() : 0});
     out.workspace   = {resources.workspace.used(), std::max(workspace_lifetime_peak, peak), peak};
     if (resources.vision) {
         out.vision = resources.vision->observe();
@@ -105,9 +107,11 @@ void RankProgramImpl::reset_measurement_peaks() noexcept {
     workspace_lifetime_peak =
         std::max({workspace_lifetime_peak, resources.workspace.peak_used(),
                   resources.vision ? resources.vision->workspace_peak_bytes() : 0,
-                  graphs ? graphs->workspace_peak() : 0});
+                  graphs ? graphs->workspace_peak() : 0,
+                  service_graphs ? service_graphs->workspace_peak() : 0});
     resources.workspace.reset_peak();
     if (graphs) graphs->reset_workspace_peak();
+    if (service_graphs) service_graphs->reset_workspace_peak();
     if (resources.vision) resources.vision->reset_peaks();
 }
 

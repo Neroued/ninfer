@@ -15,6 +15,8 @@ namespace ninfer::runtime {
 struct CollectiveShape {
     std::uint32_t route = 0;
     std::vector<std::uint32_t> extents;
+    // A captured route fixes its transport buckets. Eager sources may negotiate extents.
+    std::vector<std::uint32_t> captured_buckets;
     friend bool operator==(const CollectiveShape&, const CollectiveShape&) = default;
 };
 
@@ -49,6 +51,10 @@ public:
                                                              std::uint64_t offer) const;
     [[nodiscard]] bool ready(std::size_t member) const;
     void retire(std::size_t member, std::uint64_t step);
+    void finish_startup_sources(std::size_t member, bool calibrated);
+    [[nodiscard]] std::optional<bool> startup_drained() const;
+    void stop_sources(std::size_t member);
+    [[nodiscard]] bool stop_drained() const;
     // Stops new offers. An already published step must be retired or failed as a group.
     void close(std::size_t member);
     void fail(std::string reason);
@@ -65,9 +71,11 @@ private:
         std::uint64_t generation = 0;
         FrameId frame{};
         std::optional<CollectiveShape> source;
-        bool offered = false;
-        bool chosen  = false;
-        bool retired = false;
+        bool offered          = false;
+        bool chosen           = false;
+        bool retired          = false;
+        bool startup_finished = false;
+        bool sources_stopped  = false;
         mutable Wakeup wake;
     };
 
@@ -82,6 +90,7 @@ private:
     std::uint64_t next_offer_ = 0, step_ = 0;
     std::size_t next_source_ = 0;
     bool closed_             = false;
+    bool calibrated_         = false;
 };
 
 } // namespace ninfer::runtime

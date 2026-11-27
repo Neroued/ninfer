@@ -726,13 +726,7 @@ void ReplicaEngine<Instance>::fail_all(std::exception_ptr error) noexcept {
     }
     if (!is_shutdown) {
         hooks_.on_replica_failing(replica_id_);
-        std::string reason = "replica engine failed";
-        try {
-            if (error) std::rethrow_exception(error);
-        } catch (const std::exception& cause) { reason = cause.what(); } catch (...) {}
-        try {
-            instance_.executor->fail(reason);
-        } catch (...) {}
+        instance_.executor->fail_from_exception(error);
     }
     finish_completion_exposure();
     scheduler_            = Scheduling{};

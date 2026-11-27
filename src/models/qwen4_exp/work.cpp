@@ -112,13 +112,15 @@ void plan_work_batch(Work& work, const BatchExecutionPlan& plan) {
         work.operation);
 }
 
-std::optional<moe::ExpertStep> plan_expert_step(const Work& work, std::uint32_t chunk) {
+std::optional<moe::ExpertStep> plan_expert_step(const Work& work, std::uint32_t chunk,
+                                                bool decode_graph) {
     moe::ExpertStep step{};
     const auto rows = work_rows(work);
     if (rows.empty()) return {};
     const auto* forward = std::get_if<ForwardWork>(&work.operation);
     if (const auto* mtp = std::get_if<MtpWork>(&work.operation)) {
         if (!mtp->speculative) throw std::invalid_argument("missing Qwen4Exp proposal geometry");
+        step.graph        = decode_graph;
         step.draft_passes = mtp->speculative->mtp_steps;
         step.columns.assign(step.draft_passes, mtp->shape.rows);
         step.columns.push_back(mtp->speculative->verify_width * mtp->shape.rows);
@@ -129,6 +131,7 @@ std::optional<moe::ExpertStep> plan_expert_step(const Work& work, std::uint32_t 
                 step.columns.push_back(std::min<std::size_t>(chunk, row.ids.size() - begin));
     } else if (forward &&
                (forward->kind == ForwardKind::Ordinary || forward->kind == ForwardKind::Control)) {
+        step.graph = decode_graph && forward->kind == ForwardKind::Ordinary;
         step.columns.push_back(forward->shape.rows);
     } else {
         std::size_t columns = 0;
@@ -174,7 +177,7 @@ runtime::WorkPayloadCapacity WorkContract::payload_capacity(std::uint32_t rank_c
     // The longest schedule is a forced-control window split at the prefill boundary.
     const auto passes = std::max<std::size_t>(
         width, batch * (1 + control_token_limit / std::max<std::size_t>(chunk, 1)));
-    return {work + 21 + 4 * passes,
+    return {work + 22 + 4 * passes,
             context,
             decision,
             commit,
@@ -191,17 +194,16 @@ void WorkContract::validate(const Work& work, runtime::FrameKind kind) const {
             work.exchange->draft_passes >= work.exchange->columns.size() ||
             std::ranges::count(work.exchange->columns, 0U))
             throw std::invalid_argument("invalid Qwen4Exp expert traversal");
+        if (work.exchange->graph && !decode_routes)
+            throw std::invalid_argument("expert exchange graph has no prepared decode routes");
         if (service) {
             if (std::ranges::any_of(work.actions,
                                     [](const auto& item) { return !item.second.empty(); }))
                 throw std::invalid_argument("Qwen4Exp expert service carries request actions");
             return;
         }
-        const auto needed = plan_expert_step(work, shape.prefill_chunk);
-        if (!needed || needed->draft_passes != work.exchange->draft_passes ||
-            needed->columns.size() != work.exchange->columns.size() ||
-            !std::equal(needed->columns.begin(), needed->columns.end(),
-                        work.exchange->columns.begin(), std::less_equal<>{}))
+        const auto needed = plan_expert_step(work, shape.prefill_chunk, bool(decode_routes));
+        if (!needed || !work.exchange->covers(*needed))
             throw std::invalid_argument("Qwen4Exp expert traversal differs from its source work");
     }
     const auto rows     = work_rows(work);

@@ -9,6 +9,7 @@
 #include "models/qwen4_exp/execution/text.h"
 #include "models/qwen4_exp/execution/mtp.h"
 #include "models/common/graph/suite.h"
+#include "models/common/moe/service_graphs.h"
 #include "models/common/qwen/vision/vision.h"
 #include "models/common/vocabulary.h"
 #include "ninfer/ops/sampling.h"
@@ -104,6 +105,7 @@ public:
 
     GraphPreparationSample initialize_graphs(GraphPreparationMode = GraphPreparationMode::Complete);
     void release_graphs();
+    void serve_expert_pass(bool draft, std::uint32_t columns);
     void validate_work(const Work&, runtime::FrameKind) const;
     void start(runtime::ExecutionRequest<ExecutionTypes>&&);
     void validate_decision(runtime::ExecutionTicket, const runtime::DecisionInput&) const;
@@ -195,6 +197,7 @@ public:
     PinnedHostBuffer draft_output;
     const ExecutionShape& shape;
     std::unique_ptr<models::DecodeGraphSuite> graphs;
+    std::optional<moe::ExpertServiceGraphs> service_graphs;
     std::unique_ptr<GraphInputs> graph_inputs;
     std::optional<GraphMemorySummary> graph_memory;
     std::size_t workspace_lifetime_peak = 0;

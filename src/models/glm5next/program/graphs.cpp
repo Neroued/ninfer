@@ -137,9 +137,6 @@ ResidentTargetCapture bind_target(RankProgramImpl& p, ops::ContextBucketRange bu
 
 GraphPreparationSample RankProgramImpl::prepare_graphs(GraphPreparationMode mode) {
     if (!resources.plan.use_cuda_graph || graphs) return {};
-    if (expert_exchange)
-        throw std::invalid_argument(
-            "GLM5Next graph preparation requires a coordinated cross-replica expert route");
     if (mode == GraphPreparationMode::Complete) {
         prepare_graphs(GraphPreparationMode::Warmup);
         return prepare_graphs(GraphPreparationMode::Capture);
@@ -148,9 +145,12 @@ GraphPreparationSample RankProgramImpl::prepare_graphs(GraphPreparationMode mode
     // Retain inputs on failure until the executor aborts communication and drains the Program.
     graph_inputs = std::make_unique<GraphInputs>(*this);
     graph_inputs->prepare();
-    graphs =
-        std::make_unique<models::DecodeGraphSuite>(device, resources.workspace, shape.speculative,
-                                                   false, parallel ? &*parallel : nullptr, nullptr);
+    graphs = std::make_unique<models::DecodeGraphSuite>(
+        device, resources.workspace, shape.speculative, false,
+        parallel         ? &*parallel
+        : service_graphs ? &service_graphs->communication
+                         : nullptr,
+        nullptr);
 
     const auto buckets = ops::ContextBucketRange::through(shape.max_context);
     execution::BatchView main;
@@ -193,6 +193,10 @@ GraphPreparationSample RankProgramImpl::prepare_graphs(GraphPreparationMode mode
         };
     }
     graphs->prepare(*resources.plan.batches, *resources.plan.decode_routes, observation, bindings);
+    if (service_graphs)
+        service_graphs->prepare(*resources.plan.batches, *resources.plan.decode_routes, observation,
+                                resources.workspace, cuda,
+                                [this](bool draft, auto n) { serve_expert_pass(draft, n); });
     observation.checkpoint();
     graph_inputs.reset();
     const auto result = observation.sample();
@@ -209,6 +213,7 @@ GraphPreparationSample RankProgramImpl::prepare_graphs(GraphPreparationMode mode
 void RankProgramImpl::release_graphs() {
     device.synchronize();
     graphs.reset();
+    if (service_graphs) service_graphs->clear();
     graph_inputs.reset();
 }
 

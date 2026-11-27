@@ -30,6 +30,10 @@ RankProgramImpl::RankProgramImpl(const execution::Parameters& p, std::unique_ptr
         parallel->track_graph_group(binding.owners.group);
     }
     if (binding.heads.group) head_group.emplace(binding.heads);
+    if (expert_exchange && resources.plan.use_cuda_graph) {
+        service_graphs.emplace(expert_exchange->group());
+        if (parallel) parallel->track_graph_group(&expert_exchange->group());
+    }
     if (binding.owners.group) owner_group.emplace(binding.owners);
     if ((head_group ? head_group->size() : 1) != p.profile->local.attention.width() ||
         (owner_group ? owner_group->size() : 1) != p.profile->local.attention.size())
@@ -258,7 +262,8 @@ RankExecutionObservation RankProgramImpl::observation() const {
     RankExecutionObservation out;
     const auto peak            = std::max({resources.workspace.peak_used(),
                                 resources.vision ? resources.vision->workspace_peak_bytes() : 0,
-                                graphs ? graphs->workspace_peak() : 0});
+                                graphs ? graphs->workspace_peak() : 0,
+                                service_graphs ? service_graphs->workspace_peak() : 0});
     out.workspace_peak_bytes   = std::max(lifetime_peak, peak);
     out.measurement_peak_bytes = peak;
     return out;
@@ -292,6 +297,7 @@ void RankProgramImpl::reset_peaks() {
     resources.workspace.reset_peak();
     if (resources.vision) resources.vision->reset_peaks();
     if (graphs) graphs->reset_workspace_peak();
+    if (service_graphs) service_graphs->reset_workspace_peak();
 }
 
 } // namespace ninfer::models::glm5next::detail

@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
+#include <future>
 #include <iostream>
 #include <thread>
 
@@ -499,6 +500,33 @@ void materialization_host_waves() {
     require(runtime::build_materialization_waves(topology, reports, reserves) ==
                 std::vector<std::vector<dist::RankId>>{{0, 3}, {1}, {2}},
             "later waves ignored retained Host weights from earlier waves");
+}
+
+void graph_preparation_waves() {
+    auto topology = dist::build_cluster_topology(
+        DeploymentOptions{.control_host = "127.0.0.1",
+                          .parallel     = {.tp = 1, .ep = 2, .dp = 4},
+                          .nodes        = {{.id = 0, .worker = "/worker", .artifact = "/model"}},
+                          .ranks        = {{0, 0, 0}, {1, 0, 1}, {2, 0, 2}, {3, 0, 3}}});
+    std::vector<runtime::RankPreparationReport> reports(4);
+    for (auto& r : reports) r.capacity.shared_physical_memory = true;
+    const std::array<dist::RankId, 2> first{0, 1}, second{2, 3};
+    topology.add_role("graph-experts", first);
+    topology.add_role("graph-experts", second);
+    const auto a = topology.role_group("graph-experts", 0).id;
+    const auto b = topology.role_group("graph-experts", 2).id;
+    require(runtime::build_graph_waves(topology, reports).size() == 4,
+            "independent graph preparations exceeded one shared pool");
+    for (auto r : first) reports[r].graph_groups = {a};
+    for (auto r : second) reports[r].graph_groups = {b};
+    require(runtime::build_graph_waves(topology, reports) ==
+                std::vector<std::vector<dist::RankId>>{{0, 1}, {2, 3}},
+            "graph preparation split a collective or overbooked an unrelated cohort");
+    reports[1].graph_groups.clear();
+    try {
+        (void)runtime::build_graph_waves(topology, reports);
+    } catch (const std::invalid_argument&) { return; }
+    throw std::runtime_error("graph preparation accepted an absent peer");
 }
 
 q::WorkRow row() {
@@ -2481,6 +2509,72 @@ void collective_stop() {
     }
 }
 
+void collective_graph_matching() {
+    using runtime::CollectiveShape;
+    const auto check = [](CollectiveShape a, CollectiveShape b, bool together) {
+        runtime::CollectiveStepDomain domain(2, {{0, {256}}});
+        const runtime::FrameId frame{runtime::FrameKind::Compute, 0, 1};
+        const auto x     = domain.offer(0, frame, a);
+        const auto y     = domain.offer(1, frame, b);
+        const auto first = domain.decision(0, x), second = domain.decision(1, y);
+        require(first && second && first->source && second->source == together &&
+                    first->step == second->step && first->shape == second->shape,
+                "incompatible captured communications were paired");
+    };
+    check({0, {1}, {1}}, {0, {63}, {1}}, true);
+    check({0, {1}, {1}}, {0, {65}, {2}}, false);
+    check({0, {1}, {1}}, {0, {1}, {}}, false);
+}
+
+void stop_during_published_exchange() {
+    StepCluster c({.tp = 1, .ep = 2, .dp = 2});
+    c.executors[1]->flush();
+    (void)c.submit(0, {.constrained = true, .row_grants = {3, 0}});
+    auto peer = std::async(std::launch::async, [&] { c.executors[1]->finish_published_work(); });
+    c.executors[0]->finish_published_work();
+    peer.get();
+    c.finish();
+    require(c.ranks[0].work.size() == 1 && c.ranks[0].discards == 1 &&
+                c.ranks[1].work.size() == 1 && c.ranks[1].work.front().service &&
+                c.ranks[1].commits == std::vector<std::uint64_t>{0} && c.ranks[0].error.empty() &&
+                c.ranks[1].error.empty(),
+            "normal stop did not retire the published source and service");
+}
+
+void collective_startup() {
+    StepCluster c({.tp = 1, .ep = 2, .dp = 2});
+    auto idle = std::async(std::launch::async, [&] { c.executors[1]->finish_startup(false); });
+    try {
+        const auto probe = c.submit(0, {.row_grants = {3, 0}});
+        const std::array<std::uint32_t, 1> source{0};
+        c.complete(source, {{0, probe}});
+        c.executors[0]->finish_startup(true);
+    } catch (...) {
+        c.executors[0]->fail_from_exception(std::current_exception());
+        throw;
+    }
+    idle.get();
+    for (const auto& e : c.executors)
+        for (const auto& counts : e->execution_statistics())
+            require(!counts.units, "startup service was charged to user execution");
+    c.finish();
+    require(c.ranks[1].work.size() == 1 && c.ranks[1].work.front().service,
+            "owner without startup probes did not serve its peer");
+
+    StepCluster failed({.tp = 1, .ep = 2, .dp = 2});
+    auto waiting =
+        std::async(std::launch::async, [&] { failed.executors[1]->finish_startup(false); });
+    failed.executors[0]->fail("injected startup probe failure");
+    try {
+        waiting.get();
+    } catch (const std::runtime_error& e) {
+        require(std::string_view(e.what()) == "injected startup probe failure",
+                "startup replaced the failing peer's original error");
+        return;
+    }
+    throw std::runtime_error("startup admitted a failed domain");
+}
+
 void failed_executor_releases_media() {
     auto topology = dist::build_cluster_topology(DeploymentOptions{
         .control_host = "127.0.0.1",
@@ -2791,6 +2885,7 @@ int main(int argc, char** argv) {
         communication_selection();
         model_preparation();
         materialization_host_waves();
+        graph_preparation_waves();
         cache_profiles_roundtrip();
         native_work();
         context_observations();
@@ -2817,6 +2912,9 @@ int main(int argc, char** argv) {
         collective_failure_domains();
         collective_eight_rank_service();
         collective_stop();
+        collective_startup();
+        collective_graph_matching();
+        stop_during_published_exchange();
         failed_executor_releases_media();
         worker_loop_dual_frame_and_discard();
         RankSnapshot memory;

@@ -37,6 +37,7 @@ struct RankPreparationReport {
     std::uint64_t device_objects = 0, host_objects = 0;
     bool preparation_required = false;
     bool control_owner        = false;
+    std::vector<distributed::GroupId> graph_groups;
     std::string hardware_class, cuda_sync_mode;
     std::string failure;
 };
@@ -95,6 +96,9 @@ void encode_preparation_report(distributed::wire::Encoder&, const RankPreparatio
 [[nodiscard]] std::vector<std::vector<distributed::RankId>>
 build_materialization_waves(const distributed::ExecutionTopology&,
                             std::span<const RankPreparationReport>, const ClusterHostReservations&);
+
+[[nodiscard]] std::vector<std::vector<distributed::RankId>>
+build_graph_waves(const distributed::ExecutionTopology&, std::span<const RankPreparationReport>);
 
 // Orchestrates cluster startup in-place without restarting workers or reloading weights:
 // 1) PrepareCommunication warmup across all ranks;

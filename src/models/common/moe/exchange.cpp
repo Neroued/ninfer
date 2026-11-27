@@ -82,11 +82,7 @@ ExpertExchangeStage prepare_expert_exchange(const distributed::GroupDescription&
     return s;
 }
 
-int ExpertExchangeStage::blocks(int n) const {
-    if (n <= 0)
-        throw std::invalid_argument("expert exchange needs an agreed positive block extent");
-    return (n - 1) / block_columns + 1;
-}
+int ExpertExchangeStage::blocks(int n) const { return exchange_blocks(n, block_columns); }
 
 void ExpertExchangeStage::encode(distributed::wire::Encoder& e, int extent) const {
     (void)blocks(extent);
@@ -522,12 +518,18 @@ void ExpertExchange::routed_layer(const DeviceExpertPlacement& place,
 namespace {
 class ResidentExchange final : public ResidentExpertExchange {
 public:
+    explicit ResidentExchange(const distributed::Group& group) : communication_(group) {}
+
+    const distributed::Group& group() const noexcept override { return communication_; }
+
     ExpertExchangeWork stage(ExpertBankId bank, int columns) override {
         return {*frames.at(bank_frames.at(bank.index)), placements.at(bank.index), columns};
     }
     std::vector<std::unique_ptr<ExpertExchange>> frames;
     std::vector<DeviceExpertPlacement> placements;
     std::vector<std::size_t> bank_frames;
+private:
+    const distributed::Group& communication_;
 };
 } // namespace
 
@@ -553,7 +555,7 @@ ResidentExchangePlan::ResidentExchangePlan(std::shared_ptr<const ExpertDomain> d
 std::unique_ptr<ResidentExpertExchange>
 ResidentExchangePlan::prepare(const distributed::Group& group) const {
     if (group.rank() != peer_) throw std::logic_error("expert exchange prepared for another peer");
-    auto out = std::make_unique<ResidentExchange>();
+    auto out         = std::make_unique<ResidentExchange>(group);
     out->bank_frames = bank_frames_;
     for (auto bank : frame_banks_) out->frames.push_back(std::make_unique<ExpertExchange>(stages_[bank], group));
     for (const auto& s : stages_) out->placements.emplace_back(*domain_, s, peer_, group.device());

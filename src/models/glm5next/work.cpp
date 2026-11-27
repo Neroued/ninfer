@@ -71,13 +71,15 @@ make_decode_routes(const ExecutionShape& shape, const BatchExecutionPlan& batche
                                                                   shape.draft_tokens, widths);
 }
 
-std::optional<moe::ExpertStep> plan_expert_step(const Work& work, std::uint32_t chunk) {
+std::optional<moe::ExpertStep> plan_expert_step(const Work& work, std::uint32_t chunk,
+                                                bool decode_graph) {
     moe::ExpertStep step{};
     const auto rows = work_rows(work);
     if (rows.empty()) return {};
     const auto* forward = std::get_if<ForwardWork>(&work.operation);
     if (const auto* mtp = std::get_if<SpeculativeWork>(&work.operation)) {
         if (!mtp->speculative) throw std::invalid_argument("missing GLM5Next proposal geometry");
+        step.graph        = decode_graph;
         step.draft_passes = mtp->speculative->mtp_steps;
         step.columns.assign(step.draft_passes, mtp->batch.shape.rows);
         step.columns.push_back(mtp->speculative->verify_width * mtp->batch.shape.rows);
@@ -88,6 +90,7 @@ std::optional<moe::ExpertStep> plan_expert_step(const Work& work, std::uint32_t 
                 step.columns.push_back(std::min<std::size_t>(chunk, row.ids.size() - begin));
     } else if (forward &&
                (forward->kind == ForwardKind::Ordinary || forward->kind == ForwardKind::Control)) {
+        step.graph = decode_graph && forward->kind == ForwardKind::Ordinary;
         step.columns.push_back(forward->batch.shape.rows);
     } else {
         std::size_t columns = 0;
@@ -187,7 +190,7 @@ runtime::WorkPayloadCapacity WorkContract::payload_capacity(std::uint32_t rank_c
     const auto windows         = std::max<std::size_t>(
         width, batch * std::max<std::size_t>(1, (control_token_limit + chunk - 1) /
                                                             std::max<std::size_t>(1, chunk)));
-    return {work + 20 + 4 * windows,
+    return {work + 21 + 4 * windows,
             context,
             decision,
             commit,
@@ -204,17 +207,16 @@ void WorkContract::validate(const Work& work, runtime::FrameKind kind) const {
             work.exchange->draft_passes >= work.exchange->columns.size() ||
             std::ranges::count(work.exchange->columns, 0U))
             throw std::invalid_argument("invalid GLM5Next expert traversal");
+        if (work.exchange->graph && !decode_routes)
+            throw std::invalid_argument("expert exchange graph has no prepared decode routes");
         if (service) {
             if (std::ranges::any_of(work.actions,
                                     [](const auto& item) { return !item.second.empty(); }))
                 throw std::invalid_argument("GLM5Next expert service carries request actions");
             return;
         }
-        const auto needed = plan_expert_step(work, shape.prefill_chunk);
-        if (!needed || needed->draft_passes != work.exchange->draft_passes ||
-            needed->columns.size() != work.exchange->columns.size() ||
-            !std::equal(needed->columns.begin(), needed->columns.end(),
-                        work.exchange->columns.begin(), std::less_equal<>{}))
+        const auto needed = plan_expert_step(work, shape.prefill_chunk, bool(decode_routes));
+        if (!needed || !work.exchange->covers(*needed))
             throw std::invalid_argument("GLM5Next expert traversal differs from its source work");
     }
     if (const auto* c = std::get_if<ContextWork>(&work.operation)) {

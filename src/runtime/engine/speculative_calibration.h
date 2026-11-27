@@ -56,8 +56,8 @@ public:
             if (long_probe != schedule.end() && elapsed_ms() + 800.0 < constraints_.budget_ms)
                 run_context(long_probe->context_tokens, pattern, schedule);
             session_.fit_speculative_cost_model(anchors_, elapsed_ms());
-            executor_.reset_startup_observations();
         } catch (...) {
+            executor_.fail_from_exception(std::current_exception());
             session_.fail_all_cleanup();
             throw;
         }

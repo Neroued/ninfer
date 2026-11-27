@@ -170,6 +170,7 @@ void encode_work(Encoder& out, const Work& work, const VisionInputBindings& inpu
         out.u64(work.exchange->id);
         out.u32(work.exchange->draft_passes);
         integers(out, work.exchange->columns);
+        out.boolean(work.exchange->graph);
     }
     std::visit(
         [&](const auto& v) {
@@ -231,7 +232,8 @@ Work decode_work(Decoder& in, const VisionInputBindings& inputs) {
     const auto rank = in.u32();
     work.actions.emplace(rank, context::decode_actions(in));
     if (in.boolean())
-        work.exchange = moe::ExpertStep{in.u64(), in.u32(), integers<std::uint32_t>(in)};
+        work.exchange =
+            moe::ExpertStep{in.u64(), in.u32(), integers<std::uint32_t>(in), in.boolean()};
     switch (in.u8()) {
     case 1: {
         ForwardWork v;

@@ -168,8 +168,8 @@ struct WorkContract {
 };
 
 [[nodiscard]] std::span<const WorkRow> work_rows(const Work&);
-[[nodiscard]] std::optional<moe::ExpertStep> plan_expert_step(const Work&,
-                                                              std::uint32_t prefill_chunk);
+[[nodiscard]] std::optional<moe::ExpertStep>
+plan_expert_step(const Work&, std::uint32_t prefill_chunk, bool decode_graph = false);
 [[nodiscard]] const PhysicalBatchShape& work_shape(const Work&);
 void plan_work_batch(Work&, const BatchExecutionPlan&);
 void validate_decision_rows(const runtime::DecisionInput&, std::uint32_t stage,

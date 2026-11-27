@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <exception>
 #include <functional>
 #include <stdexcept>
 #include <thread>
@@ -35,6 +36,9 @@ public:
 
     virtual void set_peer_wakeup(std::function<void()>) {}
 
+    // Generation owners enter this boundary before releasing request resources on stop.
+    virtual void finish_published_work() {}
+
     virtual void supply(ExecutionTicket, DecisionInput)                                 = 0;
     [[nodiscard]] virtual CommitReceipt commit(ExecutionTicket, typename Types::Commit) = 0;
     virtual void discard(ExecutionTicket)                                               = 0;
@@ -51,7 +55,21 @@ public:
     virtual void measure(MeasurementCommand command)                      = 0;
     virtual void observe_in_flight(std::vector<ExecutionProgress>&) const = 0;
 
-    virtual void reset_startup_observations() {
+    void fail_from_exception(std::exception_ptr error) noexcept {
+        try {
+            std::string reason = "executor failed";
+            try {
+                if (error) std::rethrow_exception(error);
+            } catch (const std::exception& e) { reason = e.what(); } catch (...) {
+            }
+            fail(std::move(reason));
+        } catch (...) {}
+    }
+
+    // Each owner calls this after its local calibration sources have retired. Peers may
+    // still need service before startup observations can be reset.
+    virtual void finish_startup(bool calibrated) {
+        if (!calibrated) return;
         measure({MeasurementAction::ResetStartup});
         execution_statistics_ = {};
         std::ranges::fill(decode_statistics_, ExecutionCounters{});

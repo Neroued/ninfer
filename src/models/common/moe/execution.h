@@ -37,6 +37,7 @@ struct ExpertExchangeWork {
 class ResidentExpertExchange {
 public:
     virtual ~ResidentExpertExchange()                                                  = default;
+    [[nodiscard]] virtual const distributed::Group& group() const noexcept             = 0;
     [[nodiscard]] virtual ExpertExchangeWork stage(ExpertBankId, int physical_columns) = 0;
 };
 

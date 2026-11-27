@@ -3,6 +3,7 @@
 #include "models/common/moe/execution.h"
 #include "models/common/parallel_execution.h"
 #include "models/common/moe/placement.h"
+#include "models/common/moe/step.h"
 #include "distributed/communication.h"
 #include "distributed/wire.h"
 #include "ninfer/ops/moe_exchange.h"
@@ -42,7 +43,6 @@ struct ExpertExchangeStage {
                                                           const ExpertDomain&, ExpertBankId,
                                                           int hidden, int top_k, int block_columns);
 
-inline constexpr int expert_exchange_block_columns = 64;
 [[nodiscard]] distributed::GroupRequirements
 expert_exchange_requirements(const distributed::GroupDescription&, const ExpertDomain&,
                              unsigned peer, int hidden, int top_k, int block_columns);

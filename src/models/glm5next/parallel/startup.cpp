@@ -185,9 +185,11 @@ std::unique_ptr<ParallelStartup::Executor>
 ParallelStartup::coordinate(std::uint32_t replica, std::unique_ptr<Executor> executor) const {
     const auto& m = memberships_.at(replica);
     if (!m.domain) return executor;
-    const auto& shape = ranks_.at(parallel_.topology.replica(replica).result_owner).shape;
+    const auto& rank  = ranks_.at(parallel_.topology.replica(replica).result_owner);
+    const auto& shape = rank.shape;
     return std::make_unique<runtime::CollectiveExecutor<ExecutionTypes, ExpertSchedule>>(
-        std::move(executor), m.domain, m.member, ExpertSchedule{shape.prefill_chunk},
+        std::move(executor), m.domain, m.member,
+        ExpertSchedule{shape.prefill_chunk, !rank.batches.graph_rows.empty()},
         shape.max_concurrency);
 }
 

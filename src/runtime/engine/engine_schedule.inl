@@ -1439,8 +1439,14 @@ void ReplicaEngine<Instance>::worker_loop() noexcept {
                                      measurement_->command.action == MeasurementAction::Cancel;
             if (stopping_) {
                 lock.unlock();
-                fail_all(std::make_exception_ptr(RequestError(
-                    RequestErrorKind::Unavailable, "inference engine is shutting down")));
+                try {
+                    instance_.executor->finish_published_work();
+                    fail_all(std::make_exception_ptr(RequestError(
+                        RequestErrorKind::Unavailable, "inference engine is shutting down")));
+                } catch (...) {
+                    instance_.executor->fail_from_exception(std::current_exception());
+                    fail_all(std::current_exception());
+                }
                 return;
             }
         }

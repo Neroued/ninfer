@@ -149,7 +149,8 @@ struct WorkContract {
                   const runtime::DecisionInput&) const;
 };
 
-[[nodiscard]] std::optional<moe::ExpertStep> plan_expert_step(const Work&, std::uint32_t chunk);
+[[nodiscard]] std::optional<moe::ExpertStep> plan_expert_step(const Work&, std::uint32_t chunk,
+                                                              bool decode_graph = false);
 [[nodiscard]] std::span<const WorkRow> work_rows(const Work&);
 [[nodiscard]] const BatchPlan& work_batch(const Work&);
 void prepare_batch(Work&, const BatchExecutionPlan&);

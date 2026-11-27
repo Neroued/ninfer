@@ -73,6 +73,7 @@ endif()
 # Rank-owned storage, mathematical execution and graph preparation.
 add_library(ninfer_model_execution STATIC
   common/graph.cpp
+  common/moe/service_graphs.cpp
   common/graph/patch_site.cpp
   common/graph/target_body.cpp
   common/graph/suite.cpp

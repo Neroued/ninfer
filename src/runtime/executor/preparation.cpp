@@ -128,19 +128,40 @@ build_materialization_waves(const dist::ExecutionTopology& topology,
     return waves;
 }
 
-namespace {
-
-// Partitions replicas into waves where all ranks of a replica run together (preserving
-// intra-replica collective synchrony) while replicas sharing any physical GPU / UMA node run in
-// consecutive waves.
 std::vector<std::vector<dist::RankId>>
-build_replica_waves(const dist::ExecutionTopology& topology,
-                    std::span<const RankPreparationReport> reports) {
+build_graph_waves(const dist::ExecutionTopology& topology,
+                  std::span<const RankPreparationReport> reports) {
+    if (reports.size() != topology.ranks.size())
+        throw std::invalid_argument("graph preparation is missing rank reports");
     std::vector<std::vector<dist::RankId>> waves;
     std::vector<std::set<PhysicalPoolKey>> wave_pools;
+    std::vector<bool> included(reports.size());
     for (const auto& rep : topology.replicas) {
+        if (included.at(rep.ranks.front())) continue;
+        std::vector<dist::RankId> cohort;
+        const auto include_replica = [&](dist::RankId peer) {
+            for (auto rank : topology.replica_for_rank(peer).ranks) {
+                if (included.at(rank)) continue;
+                included[rank] = true;
+                cohort.push_back(rank);
+            }
+        };
+        include_replica(rep.ranks.front());
         std::set<PhysicalPoolKey> rep_pools;
-        for (auto rank : rep.ranks) rep_pools.insert(pool_key_for(topology, reports, rank));
+        for (std::size_t i = 0; i < cohort.size(); ++i) {
+            const auto rank = cohort[i];
+            rep_pools.insert(pool_key_for(topology, reports, rank));
+            for (auto id : reports[rank].graph_groups) {
+                const auto& group = topology.group(id);
+                (void)group.index(rank);
+                for (auto peer : group.members) {
+                    const auto& declared = reports[peer].graph_groups;
+                    if (std::ranges::find(declared, id) == declared.end())
+                        throw std::invalid_argument("graph group missing from peer preparation");
+                    include_replica(peer);
+                }
+            }
+        }
         std::size_t w = 0;
         for (; w < waves.size(); ++w) {
             const bool conflict =
@@ -152,11 +173,13 @@ build_replica_waves(const dist::ExecutionTopology& topology,
             waves.emplace_back();
             wave_pools.emplace_back();
         }
-        waves[w].insert(waves[w].end(), rep.ranks.begin(), rep.ranks.end());
+        waves[w].insert(waves[w].end(), cohort.begin(), cohort.end());
         wave_pools[w].insert(rep_pools.begin(), rep_pools.end());
     }
     return waves;
 }
+
+namespace {
 
 bool preserves_cluster_capacity(std::span<const ContextCapacityResolution> narrow,
                                 std::span<const ContextCapacityResolution> baseline) {
@@ -265,6 +288,8 @@ void encode_preparation_report(wire::Encoder& out, const RankPreparationReport& 
     out.u64(r.free_after_weights_bytes);
     out.boolean(r.preparation_required);
     out.boolean(r.control_owner);
+    out.u32(r.graph_groups.size());
+    for (auto id : r.graph_groups) out.u32(id);
     out.string(r.hardware_class);
     out.string(r.cuda_sync_mode);
     out.string(r.failure);
@@ -311,9 +336,11 @@ RankPreparationReport decode_preparation_report(wire::Decoder& in) {
     r.free_after_weights_bytes        = in.u64();
     r.preparation_required            = in.boolean();
     r.control_owner                   = in.boolean();
-    r.hardware_class                  = in.string();
-    r.cuda_sync_mode                  = in.string();
-    r.failure                         = in.string();
+    r.graph_groups.resize(in.u32());
+    for (auto& id : r.graph_groups) id = in.u32();
+    r.hardware_class = in.string();
+    r.cuda_sync_mode = in.string();
+    r.failure        = in.string();
     return r;
 }
 
@@ -490,12 +517,11 @@ prepare_execution_group(dist::ExecutionGroup& group, std::span<const wire::Bytes
                          PreparationAction::ConfigureTargets, narrow ? 1ULL : 0ULL);
             (void)recv_reports(everyone);
         };
-        const auto replica_waves = build_replica_waves(topology, state.reports);
         const auto calibrate     = [&]() -> std::string {
             if (std::none_of(state.reports.begin(), state.reports.end(),
                                  [](const auto& r) { return r.preparation_required; }))
                 return {};
-            for (const auto& wave : replica_waves) {
+            for (const auto& wave : build_graph_waves(topology, state.reports)) {
                 for (auto [probe, capture] :
                      {std::pair{PreparationAction::PrepareProbe, PreparationAction::Calibrate},
                       std::pair{PreparationAction::PrepareRebuildProbe,
@@ -633,7 +659,7 @@ prepare_execution_group(dist::ExecutionGroup& group, std::span<const wire::Bytes
                     cluster_host_reservations(offers, coordinator, state.capacities);
 
                 AttemptFailure failure;
-                for (const auto& wave : replica_waves) {
+                for (const auto& wave : build_graph_waves(topology, state.reports)) {
                     enter_subset(group, wave, state, current_attempt, PreparationAction::Allocate,
                                  std::nullopt, &state.host_reservations.by_node);
                     if (!recv_allocated(wave, PreparationAction::Allocate, failure)) break;

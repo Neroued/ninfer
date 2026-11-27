@@ -21,7 +21,9 @@ CollectiveStepDomain::CollectiveStepDomain(std::size_t members,
 void CollectiveStepDomain::validate(const CollectiveShape& shape) const {
     const auto& route  = limits_.at(shape.route);
     const auto& limits = route.extents;
-    if (shape.extents.empty() || shape.extents.size() % limits.size() ||
+    if ((!shape.captured_buckets.empty() &&
+         shape.captured_buckets.size() != shape.extents.size()) ||
+        shape.extents.empty() || shape.extents.size() % limits.size() ||
         shape.extents.size() / limits.size() > route.max_repetitions)
         throw std::invalid_argument("collective offer does not describe its prepared phases");
     for (std::size_t i = 0; i < shape.extents.size(); ++i)
@@ -57,6 +59,7 @@ bool CollectiveStepDomain::publish() {
     if (!active_) return false;
     for (auto& m : members_) {
         m.chosen = m.source && m.source->route == active_->route &&
+                   m.source->captured_buckets == active_->captured_buckets &&
                    m.source->extents.size() == active_->extents.size();
         if (m.chosen)
             for (std::size_t i = 0; i < active_->extents.size(); ++i)
@@ -131,6 +134,36 @@ void CollectiveStepDomain::retire(std::size_t owner, std::uint64_t step) {
         }
     }
     if (published) notify();
+}
+
+void CollectiveStepDomain::finish_startup_sources(std::size_t owner, bool calibrated) {
+    {
+        std::lock_guard lock(mutex_);
+        members_.at(owner).startup_finished = true;
+        calibrated_ |= calibrated;
+    }
+    notify();
+}
+
+std::optional<bool> CollectiveStepDomain::startup_drained() const {
+    std::lock_guard lock(mutex_);
+    if (failure_) throw std::runtime_error(*failure_);
+    if (active_ || !std::ranges::all_of(members_, &Member::startup_finished)) return {};
+    return calibrated_;
+}
+
+void CollectiveStepDomain::stop_sources(std::size_t owner) {
+    {
+        std::lock_guard lock(mutex_);
+        members_.at(owner).sources_stopped = true;
+    }
+    notify();
+}
+
+bool CollectiveStepDomain::stop_drained() const {
+    std::lock_guard lock(mutex_);
+    if (failure_) throw std::runtime_error(*failure_);
+    return !active_ && std::ranges::all_of(members_, &Member::sources_stopped);
 }
 
 void CollectiveStepDomain::close(std::size_t owner) {

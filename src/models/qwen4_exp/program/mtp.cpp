@@ -117,10 +117,10 @@ void RankProgramImpl::draft_forward(std::uint32_t step, std::int32_t batch, std:
         auto run = draft_run(step, batch, visible);
         run.stem();
         run.mixer(submit);
-        if (compute && compute->request.work.exchange) {
-            const auto stage =
-                exchange->stage(parameters.mtp->layer.moe.bank,
-                                dimension(compute->request.work.exchange->columns.at(step)));
+        if (exchange) {
+            const auto columns =
+                compute ? dimension(compute->request.work.exchange->columns.at(step)) : batch;
+            const auto stage = exchange->stage(parameters.mtp->layer.moe.bank, columns);
             run.feed_forward(&stage);
         } else
             run.feed_forward();

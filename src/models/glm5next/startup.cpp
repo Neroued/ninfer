@@ -100,7 +100,10 @@ runtime::RankPreparationReport RankPreparation::report(std::size_t available) co
             .device_objects       = s.device_object_count,
             .host_objects         = s.host_object_count,
             .preparation_required = plan_.use_cuda_graph,
-            .control_owner        = control_owner_};
+            .control_owner        = control_owner_,
+            .graph_groups         = plan_.use_cuda_graph && expert_requirements_
+                                        ? std::vector<distributed::GroupId>{expert_requirements_->group}
+                                        : std::vector<distributed::GroupId>{}};
 }
 
 void RankPreparation::prepare_probe() {

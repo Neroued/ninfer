@@ -60,16 +60,26 @@ public:
             throw std::invalid_argument("EngineCoordinator bounds are invalid");
         }
         replicas_.reserve(dp_count_);
+        std::promise<void> calibration;
+        const auto start = calibration.get_future().share();
+        bool released    = false;
         try {
             for (std::uint32_t r = 0; r < dp_count_; ++r) {
-                auto rep_engine = std::make_unique<ReplicaEngine<Replica>>(
+                replicas_.push_back(std::make_unique<ReplicaEngine<Replica>>(
                     *instance_.replicas[r], options,
                     instance_.replicas[r]->context_cost.value_or(context_cost),
-                    static_cast<ReplicaCoordinatorHooks<ModelContract>&>(*this), r, local_lanes_);
-                if (r == 0) speculative_startup_ = rep_engine->take_speculative_startup();
-                replicas_.push_back(std::move(rep_engine));
+                    static_cast<ReplicaCoordinatorHooks<ModelContract>&>(*this), r, local_lanes_,
+                    start));
+            }
+            for (auto& replica : replicas_) replica->wait_bound();
+            calibration.set_value();
+            released = true;
+            for (auto& replica : replicas_) {
+                auto summary = replica->wait_started();
+                if (replica->replica_id() == 0) speculative_startup_ = std::move(summary);
             }
         } catch (...) {
+            if (!released) calibration.set_exception(std::current_exception());
             stop_and_join();
             replicas_.clear();
             throw;

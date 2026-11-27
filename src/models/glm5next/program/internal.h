@@ -1,5 +1,6 @@
 #pragma once
 #include "models/common/graph/suite.h"
+#include "models/common/moe/service_graphs.h"
 #include "models/common/vocabulary.h"
 #include "models/glm5next/execution/mtp.h"
 #include "models/glm5next/execution/dflash.h"
@@ -102,7 +103,8 @@ public:
     [[nodiscard]] execution::StateUpdate target_update(int width);
     void target_forward(const execution::BatchView&, Tensor hidden, bool forced_control,
                         const execution::MlaSubmit& = {});
-    [[nodiscard]] moe::SigmoidPass expert_pass(std::size_t traversal);
+    [[nodiscard]] moe::SigmoidPass expert_pass(int columns);
+    void serve_expert_pass(bool draft, std::uint32_t columns);
     void serve_experts();
     [[nodiscard]] execution::TextRun text_run(const execution::BatchView&, execution::StateUpdate);
     [[nodiscard]] execution::MtpRun mtp_run(std::uint32_t step, const execution::BatchView&);
@@ -185,6 +187,7 @@ public:
     }
     std::unique_ptr<GraphInputs> graph_inputs;
     std::unique_ptr<models::DecodeGraphSuite> graphs;
+    std::optional<moe::ExpertServiceGraphs> service_graphs;
     GraphMemorySummary graph_memory;
     std::unique_ptr<ComputeFrame> compute;
     std::unique_ptr<ContextFrame> context;

@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -293,6 +294,15 @@ private:
 };
 
 Engine::Engine(EngineOptions options) {
+    if (options.startup_observer.callback && options.deployment &&
+        options.deployment->parallel.dp > 1) {
+        options.startup_observer.callback =
+            [callback = std::move(options.startup_observer.callback),
+             mutex    = std::make_shared<std::mutex>()](const StartupEvent& event) {
+                std::lock_guard lock(*mutex);
+                callback(event);
+            };
+    }
     StartupObserver startup_observer = options.startup_observer;
     StartupPhaseScope startup_phase(startup_observer, StartupPhase::EngineStartup);
     impl_ = std::make_shared<Impl>(std::move(options));

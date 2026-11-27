@@ -135,11 +135,14 @@ execution::MtpRun RankProgramImpl::mtp_run(std::uint32_t step, const execution::
     const auto before = step ? resources.mtp_tail(step == 1 ? 0 : 1 + (step - 2) % 2, c)
                              : resources.states.mtp_tail(call.attention.source_offsets);
     const auto after  = resources.mtp_tail(step ? 1 + (step - 1) % 2 : 0, c);
-    return execution::MtpRun(parameters,
-                             {resources.workspace, *resources.mtp, before, after,
-                              parallel ? &*parallel : nullptr, attention_groups(),
-                              expert_pass(step)},
-                             call, cuda);
+    return execution::MtpRun(
+        parameters,
+        {resources.workspace, *resources.mtp, before, after, parallel ? &*parallel : nullptr,
+         attention_groups(),
+         expert_pass(expert_exchange && compute
+                         ? dimension(compute->request.work.exchange->columns.at(step))
+                         : call.rows)},
+        call, cuda);
 }
 
 execution::MlaSelection RankProgramImpl::mtp_selection(std::uint32_t step, int c) {

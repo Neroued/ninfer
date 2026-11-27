@@ -165,6 +165,24 @@ public:
         return !closed_ && (admissions_.busy() || running_.has_value() || domain_->ready(member_));
     }
 
+    void finish_published_work() override {
+        if (closed_) return;
+        if (pending_ && !try_withdraw(pending_->ticket)) pending_->discard = true;
+        if (running_ && running_->logical) physical_->discard(running_->physical);
+        domain_->stop_sources(member_);
+        while (!domain_->stop_drained() || running_ || pending_) {
+            if (auto event = poll()) {
+                if (const auto* error = std::get_if<ExecutionFailed>(&*event))
+                    throw std::runtime_error(error->message);
+            } else {
+                physical_->flush();
+                physical_->wait_for_activity(std::chrono::milliseconds(1));
+            }
+        }
+        (void)withdraw_offer();
+        reserved_.reset();
+    }
+
     void drain() override {
         if (closed_) return;
         domain_->close(member_);
@@ -193,11 +211,23 @@ public:
         physical_->measure(command);
     }
 
-    void reset_startup_observations() override {
-        if (has_pending_work() || !withdraw_offer())
-            throw std::logic_error("collective startup reset requires an idle owner");
+    void finish_startup(bool calibrated) override {
+        domain_->finish_startup_sources(member_, calibrated);
+        auto measured = domain_->startup_drained();
+        while (!measured) {
+            if (auto event = poll()) {
+                if (const auto* error = std::get_if<ExecutionFailed>(&*event))
+                    throw std::runtime_error(error->message);
+                throw std::logic_error("collective calibration has an unconsumed source event");
+            }
+            physical_->flush();
+            measured = domain_->startup_drained();
+            if (!measured) physical_->wait_for_activity(std::chrono::milliseconds(1));
+        }
+        if (admissions_.busy() || running_ || !withdraw_offer())
+            throw std::logic_error("collective startup finished with an owned frame");
         reserved_.reset();
-        physical_->reset_startup_observations();
+        physical_->finish_startup(*measured);
     }
 
     void observe_in_flight(std::vector<ExecutionProgress>& out) const override {

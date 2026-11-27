@@ -154,8 +154,8 @@ ParallelStartup::coordinate(std::uint32_t replica, std::unique_ptr<Executor> phy
     if (!membership.domain) return physical;
     const auto& s = plans_[replica].session.shape;
     return std::make_unique<runtime::CollectiveExecutor<ExecutionTypes, ExpertSchedule>>(
-        std::move(physical), membership.domain, membership.member, ExpertSchedule{s.prefill_chunk},
-        s.max_concurrency);
+        std::move(physical), membership.domain, membership.member,
+        ExpertSchedule{s.prefill_chunk, s.cuda_graph}, s.max_concurrency);
 }
 
 runtime::ExecutionCapacity ParallelStartup::capacity(std::uint32_t replica_id) const {

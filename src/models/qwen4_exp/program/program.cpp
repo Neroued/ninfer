@@ -35,6 +35,11 @@ RankProgramImpl::RankProgramImpl(const execution::Parameters& p, ExecutionPlan p
       mtp_rows(shape.max_concurrency), valid_rows(shape.max_concurrency) {
     if (binding.group) parallel.emplace(binding);
     if (ple_group) ple_merge.emplace(ParallelBinding{ple_group});
+    if (parallel) parallel->track_graph_group(ple_group);
+    if (exchange && shape.cuda_graph) {
+        service_graphs.emplace(exchange->group());
+        if (parallel) parallel->track_graph_group(&exchange->group());
+    }
     if (bool(ple_merge) != (parameters.profile->ple_placement == ple::Placement::Sharded))
         throw std::logic_error("Qwen4Exp PLE merge group differs from table placement");
     if (static_cast<bool>(exchange) != static_cast<bool>(parameters.profile->exchange))

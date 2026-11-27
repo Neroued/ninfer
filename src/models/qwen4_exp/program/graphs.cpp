@@ -135,12 +135,17 @@ void consume_host_ple(RankProgramImpl& p, execution::TextRun& run, execution::Ba
 
 void forward_resident(RankProgramImpl& p, execution::TextRun& run, execution::TextOutputs output,
                       const execution::QsaSubmit& submit, const GraphBody& ple,
-                      const GraphBody& head) {
+                      const GraphBody& head, int columns) {
     run.stem();
     for (std::uint32_t layer = 0; layer < p.parameters.text.layers.size(); ++layer) {
         if (layer == p.parameters.profile->config.text.ple.layer) ple();
         run.mixer(layer, submit);
-        run.resident_moe(layer);
+        if (p.exchange) {
+            const auto stage = p.exchange->stage(p.parameters.text.layers[layer].moe.bank, columns);
+            run.resident_moe(layer, &stage);
+        } else {
+            run.resident_moe(layer);
+        }
         run.combine(layer);
     }
     run.finish(output);
@@ -195,7 +200,7 @@ ResidentTargetCapture bind_resident(RankProgramImpl& p, ops::ContextBucketRange 
                     run.consume_ple(p.device_embedding(batch.tokens, batch.batch));
                 }
             },
-            head);
+            head, batch.tokens * batch.batch);
         if (!p.host_ple) p.gpu_timer.end_target(true);
     };
     return capture;
@@ -296,7 +301,7 @@ void warmup_target(RankProgramImpl& p, execution::BatchView batch) {
         run.finish(output);
         head();
     } else {
-        forward_resident(p, run, output, {}, ple, head);
+        forward_resident(p, run, output, {}, ple, head, batch.tokens * batch.batch);
     }
     if (!p.host_ple) p.gpu_timer.end_target();
 }
@@ -305,9 +310,6 @@ void warmup_target(RankProgramImpl& p, execution::BatchView batch) {
 
 GraphPreparationSample RankProgramImpl::initialize_graphs(GraphPreparationMode mode) {
     if (!shape.cuda_graph) return {};
-    if (exchange)
-        throw std::invalid_argument(
-            "Qwen4Exp decode graph lacks a jointly prepared expert exchange route");
     if (graphs) throw std::logic_error("Qwen4Exp Graphs are already prepared");
     if (mode == GraphPreparationMode::Complete) {
         initialize_graphs(GraphPreparationMode::Warmup);
@@ -321,7 +323,10 @@ GraphPreparationSample RankProgramImpl::initialize_graphs(GraphPreparationMode m
         parameters.mtp && shape.draft_tokens ? SpeculativeBackend::Mtp : SpeculativeBackend::None;
     graphs = std::make_unique<models::DecodeGraphSuite>(
         device, resources.workspace, speculative, host_ple != nullptr,
-        parallel ? &*parallel : nullptr, resources.experts.get());
+        parallel         ? &*parallel
+        : service_graphs ? &service_graphs->communication
+                         : nullptr,
+        resources.experts.get());
 
     const auto buckets = ops::ContextBucketRange::through(shape.max_context);
     execution::BatchView main;
@@ -388,6 +393,10 @@ GraphPreparationSample RankProgramImpl::initialize_graphs(GraphPreparationMode m
             execute_mtp_commit(main.batch, main.tokens, true, true, repair, counts);
         };
     graphs->prepare(*resources.plan.batches, *resources.plan.decode_routes, observation, bindings);
+    if (service_graphs)
+        service_graphs->prepare(*resources.plan.batches, *resources.plan.decode_routes, observation,
+                                resources.workspace, cuda,
+                                [this](bool draft, auto n) { serve_expert_pass(draft, n); });
     observation.checkpoint();
     graph_inputs.reset();
     const auto result = observation.sample();
@@ -405,6 +414,7 @@ GraphPreparationSample RankProgramImpl::initialize_graphs(GraphPreparationMode m
 void RankProgramImpl::release_graphs() {
     resources.synchronize();
     graphs.reset();
+    if (service_graphs) service_graphs->clear();
     graph_inputs.reset();
 }
 

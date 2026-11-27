@@ -33,13 +33,13 @@ template <class Preparation>
 prepare_rank(distributed::WorkerConnection& connection, std::unique_ptr<artifact::Reader> reader,
              std::span<const std::byte> payload, std::size_t memory_headroom_bytes,
              std::unique_ptr<Preparation>& preparing) {
-    namespace wire                  = distributed::wire;
-    auto& device                    = connection.device();
-    const auto& topology            = connection.topology();
-    const auto& identity            = connection.bootstrap().identity;
-    const bool has_collective_peers = topology.replica_for_rank(identity.rank).ranks.size() > 1;
-    const auto initial              = connection.memory_origin();
-    const auto observer             = connection.startup_observer();
+    namespace wire            = distributed::wire;
+    auto& device              = connection.device();
+    const auto& topology      = connection.topology();
+    const auto& identity      = connection.bootstrap().identity;
+    bool has_collective_peers = topology.replica_for_rank(identity.rank).ranks.size() > 1;
+    const auto initial        = connection.memory_origin();
+    const auto observer       = connection.startup_observer();
     {
         StartupPhaseScope phase(observer, StartupPhase::TargetPlan);
         preparing = std::make_unique<Preparation>(*reader, payload, identity, device, topology,
@@ -67,7 +67,9 @@ prepare_rank(distributed::WorkerConnection& connection, std::unique_ptr<artifact
         out.u32(attempt);
         RankPreparationReport value;
         if (materialized) {
-            value                     = preparing->report(SIZE_MAX);
+            value                = preparing->report(SIZE_MAX);
+            has_collective_peers = topology.replica_for_rank(identity.rank).ranks.size() > 1 ||
+                                   !value.graph_groups.empty();
             graph_reserve_bytes       = SIZE_MAX - value.capacity.available_bytes;
             value.graph_reserve_bytes = graph_reserve_bytes;
             value.capacity.available_bytes =

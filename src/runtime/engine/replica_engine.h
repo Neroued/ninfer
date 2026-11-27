@@ -115,7 +115,7 @@ public:
 
     ReplicaEngine(Instance& instance, const EngineOptions& options,
                   ContextMachineCostModel context_cost, Hooks& hooks, std::uint32_t replica_id,
-                  std::uint32_t local_lanes)
+                  std::uint32_t local_lanes, std::shared_future<void> start)
         : instance_(instance), hooks_(hooks), replica_id_(replica_id),
           epoch_(instance.executor->epoch().value ? instance.executor->epoch().value : 1),
           max_context_(options.max_context), max_concurrency_(local_lanes),
@@ -168,44 +168,51 @@ public:
         const auto frames = instance_.executor->capacity();
         execution_observations_.reserve(frames.compute_frames + frames.context_frames);
         published_snapshot_.in_flight.reserve(frames.compute_frames + frames.context_frames);
+        std::promise<void> bound;
+        bound_ = bound.get_future();
         std::promise<std::optional<SpeculativeStartupSummary>> startup;
-        auto started = startup.get_future();
-        worker_ =
-            std::thread([this, spec = options.speculative, observer = options.startup_observer,
-                         startup = std::move(startup)]() mutable {
-                try {
-                    instance_.executor->bind_to_current_thread();
-                    instance_.executor->set_peer_wakeup([this] { wake(); });
-                    auto summary = prepare_speculative_startup(spec, observer);
-                    if (hooks_.prefix_routing_enabled()) quote_first_unit();
-                    if (replica_id_ == 0) {
-                        StartupPhaseScope phase(observer, StartupPhase::EngineFinalize);
-                        publish_runtime_stats();
-                        phase.complete();
-                    } else {
-                        publish_runtime_stats();
-                    }
-                    observer = {};
-                    startup.set_value(std::move(summary));
-                } catch (...) {
-                    observer = {};
-                    startup.set_exception(std::current_exception());
-                    return;
+        started_ = startup.get_future();
+        worker_  = std::thread([this, spec = options.speculative,
+                               observer = options.startup_observer, bound = std::move(bound),
+                               start = std::move(start), startup = std::move(startup)]() mutable {
+            try {
+                instance_.executor->bind_to_current_thread();
+                instance_.executor->set_peer_wakeup([this] { wake(); });
+                bound.set_value();
+            } catch (...) {
+                bound.set_exception(std::current_exception());
+                startup.set_exception(std::current_exception());
+                return;
+            }
+            try {
+                start.get();
+                auto summary = prepare_speculative_startup(spec, observer);
+                instance_.executor->finish_startup(summary && summary->calibrated);
+                if (hooks_.prefix_routing_enabled()) quote_first_unit();
+                if (replica_id_ == 0) {
+                    StartupPhaseScope phase(observer, StartupPhase::EngineFinalize);
+                    publish_runtime_stats();
+                    phase.complete();
+                } else {
+                    publish_runtime_stats();
                 }
-                worker_loop();
-            });
-        try {
-            speculative_startup_ = started.get();
-        } catch (...) {
-            if (worker_.joinable()) { worker_.join(); }
-            instance_.executor->set_peer_wakeup({});
-            throw;
-        }
+                observer = {};
+                startup.set_value(std::move(summary));
+            } catch (...) {
+                observer         = {};
+                const auto error = std::current_exception();
+                instance_.executor->fail_from_exception(error);
+                instance_.session->fail_all_cleanup();
+                startup.set_exception(error);
+                return;
+            }
+            worker_loop();
+        });
     }
 
-    [[nodiscard]] std::optional<SpeculativeStartupSummary> take_speculative_startup() noexcept {
-        return std::exchange(speculative_startup_, std::nullopt);
-    }
+    void wait_bound() { bound_.get(); }
+
+    [[nodiscard]] auto wait_started() { return started_.get(); }
 
     [[nodiscard]] std::uint32_t replica_id() const noexcept { return replica_id_; }
 
@@ -907,7 +914,8 @@ private:
     const std::uint32_t max_concurrency_;
     const std::size_t max_outstanding_;
     const std::uint32_t speculative_positions_;
-    std::optional<SpeculativeStartupSummary> speculative_startup_;
+    std::future<void> bound_;
+    std::future<std::optional<SpeculativeStartupSummary>> started_;
     ResourceManagement resources_;
     PlacementId next_placement_tie_;
 

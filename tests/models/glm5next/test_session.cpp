@@ -807,7 +807,8 @@ void calibrate_attention_owners(std::shared_ptr<const glm::ModelDefinition> defi
         if (event.phase == StartupPhase::SpeculativeCalibration) phases.push_back(event.status);
     }};
     const auto calibration = rt::calibrate_speculative(instance, observer, "aabbab");
-    const auto cost        = f.session.speculative_cost_summary();
+    f.executor.finish_startup(calibration.has_value());
+    const auto cost = f.session.speculative_cost_summary();
     require(cost.fitted && cost.anchor_count && !cost.online_cell_count,
             "two-owner calibration did not fit from isolated probes");
     require(calibration && calibration->anchors == cost.anchor_count &&

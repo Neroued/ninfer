@@ -5,6 +5,17 @@
 
 namespace ninfer::models::qwen4_exp::detail {
 
+void RankProgramImpl::serve_expert_pass(bool draft, std::uint32_t columns) {
+    const auto serve = [&](const moe::Parameters& layer) {
+        const auto stage = exchange->stage(layer.bank, dimension(columns));
+        moe::resident_layer(layer, nullptr, &stage, resources.workspace, cuda);
+    };
+    if (draft)
+        serve(parameters.mtp.value().layer.moe);
+    else
+        for (const auto& layer : parameters.text.layers) serve(layer.moe);
+}
+
 void RankProgramImpl::start(runtime::ExecutionRequest<ExecutionTypes>&& request) {
     if (request.ticket.frame.kind == runtime::FrameKind::Context) {
         if (context) throw std::logic_error("Qwen4Exp context frame is occupied");
@@ -23,16 +34,12 @@ void RankProgramImpl::start(runtime::ExecutionRequest<ExecutionTypes>&& request)
         last_expert_step = step->id;
         f.main_pass      = step->draft_passes;
         if (std::holds_alternative<moe::ExpertServiceWork>(f.request.work.operation)) {
-            const auto serve = [&](const moe::Parameters& layer, std::uint32_t columns) {
-                const auto stage = exchange->stage(layer.bank, dimension(columns));
-                moe::resident_layer(layer, nullptr, &stage, resources.workspace, cuda);
-            };
             for (std::size_t pass = 0; pass < step->columns.size(); ++pass) {
-                if (pass < step->draft_passes)
-                    serve(parameters.mtp.value().layer.moe, step->columns[pass]);
+                const bool draft = pass < step->draft_passes;
+                if (step->graph)
+                    service_graphs->launch(draft, step->columns[pass], cuda);
                 else
-                    for (const auto& layer : parameters.text.layers)
-                        serve(layer.moe, step->columns[pass]);
+                    serve_expert_pass(draft, step->columns[pass]);
             }
             gpu_timer.record_result();
             compute_done.record(cuda.stream());
@@ -371,9 +378,10 @@ void RankProgramImpl::retire_compute() {
     observation.gpu = compute->gpu;
     const auto work = ExecutionTypes::describe_work(compute->request.work);
     if (compute->attention.forwards) observation.attention = {work.kind, compute->attention};
-    observation.path = !compute->graph     ? ExecutionPath::Eager
-                       : resources.experts ? ExecutionPath::Mixed
-                                           : ExecutionPath::Graph;
+    observation.path = service && compute->request.work.exchange->graph ? ExecutionPath::Graph
+                       : !compute->graph                                ? ExecutionPath::Eager
+                       : resources.experts                              ? ExecutionPath::Mixed
+                                                                        : ExecutionPath::Graph;
     compute.reset();
     events.emplace_back(runtime::DeviceRetired{ticket, command, observation});
 }

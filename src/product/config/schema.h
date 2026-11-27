@@ -12,6 +12,8 @@ enum class Field {
     ChatTemplate,
     Vision,
     PleStorage,
+    PleDeviceLayout,
+    PlePreference,
     VisionMemoryBudget,
     Device,
     MaxContext,

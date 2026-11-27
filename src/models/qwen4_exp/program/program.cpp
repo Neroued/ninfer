@@ -25,7 +25,8 @@ void check_table(context::TableRow row, std::uint32_t pool, const QsaCache& cach
 RankProgramImpl::RankProgramImpl(const execution::Parameters& p, ExecutionPlan plan,
                                  DeviceContext& d, const StartupObserver& observer,
                                  ParallelBinding binding,
-                                 std::unique_ptr<moe::ResidentExpertExchange> expert_exchange)
+                                 std::unique_ptr<moe::ResidentExpertExchange> expert_exchange,
+                                 const distributed::Group* ple_group)
     : parameters(p), device(d), cuda(d.execution_view()), exchange(std::move(expert_exchange)),
       resources(p, std::move(plan), d, observer), ple_inputs(d), ple_ready(d), draft_copied(d),
       draft_output(resources.plan.pinned_draft_bytes), shape(resources.plan.shape),
@@ -33,6 +34,9 @@ RankProgramImpl::RankProgramImpl(const execution::Parameters& p, ExecutionPlan p
       bindings(shape.max_concurrency), input_rows(shape.max_concurrency),
       mtp_rows(shape.max_concurrency), valid_rows(shape.max_concurrency) {
     if (binding.group) parallel.emplace(binding);
+    if (ple_group) ple_merge.emplace(ParallelBinding{ple_group});
+    if (bool(ple_merge) != (parameters.profile->ple_placement == ple::Placement::Sharded))
+        throw std::logic_error("Qwen4Exp PLE merge group differs from table placement");
     if (static_cast<bool>(exchange) != static_cast<bool>(parameters.profile->exchange))
         throw std::logic_error("Qwen4Exp Program is missing its prepared expert route");
     if (parameters.profile->local.size != (parallel ? parallel->size() : 1))
@@ -183,9 +187,11 @@ namespace ninfer::models::qwen4_exp {
 RankProgram::RankProgram(const execution::Parameters& parameters, ExecutionPlan plan,
                          DeviceContext& device, const StartupObserver& observer,
                          ParallelBinding binding,
-                         std::unique_ptr<moe::ResidentExpertExchange> expert_exchange)
+                         std::unique_ptr<moe::ResidentExpertExchange> expert_exchange,
+                         const distributed::Group* ple_group)
     : impl_(std::make_unique<detail::RankProgramImpl>(parameters, std::move(plan), device, observer,
-                                                      binding, std::move(expert_exchange))) {}
+                                                      binding, std::move(expert_exchange),
+                                                      ple_group)) {}
 
 GraphPreparationSample RankProgram::prepare_execution(GraphPreparationMode mode) {
     return impl_->initialize_graphs(mode);

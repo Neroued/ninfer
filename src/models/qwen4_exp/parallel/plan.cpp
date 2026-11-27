@@ -1,6 +1,7 @@
 #include "models/qwen4_exp/parallel/plan.h"
 
 #include "models/common/parallel_weights.h"
+#include "models/qwen4_exp/ple/placement.h"
 
 #include <algorithm>
 #include <bit>
@@ -15,13 +16,14 @@ RankPlan rank_plan(const ModelDefinition& definition, const distributed::RankIde
     RankPlan p;
     p.placement             = RankPlacement(id);
     const auto [rank, size] = id.tp;
+    p.ple_candidates        = {table};
     p.ple_placement         = table;
     p.gdn_keys              = partition_range(c.gdn.key_heads, size, rank);
     p.gdn_values            = partition_range(c.gdn.value_heads, size, rank);
     p.qsa_queries           = partition_range(c.qsa.query_heads, size, rank);
     p.qsa_kv                = partition_range(c.qsa.kv_heads, size, rank);
     p.vocabulary            = partition_vocabulary_range(c.vocabulary, size, rank);
-    if (table == ple::Placement::Device) p.ple_shards = partition_range(c.ple.shards, size, rank);
+    p.ple_shards            = ple::shard_range(table, c.ple.shards, id.tp);
     p.shared_intermediate = partition_range(c.moe.shared_intermediate, size, rank).size;
     const auto per_owner  = partition_range(c.moe.experts, id.ep.size, id.ep.rank);
     const auto slice      = p.placement.expert_slice();
@@ -199,6 +201,9 @@ std::uint64_t compute_rank_shard_digest(const artifact::ArtifactId& artifact_id,
         geometry.push_back(range.begin);
         geometry.push_back(range.size);
     }
+    geometry.push_back(r.ple_candidates.size());
+    for (const auto candidate : r.ple_candidates)
+        geometry.push_back(static_cast<std::uint64_t>(candidate));
     geometry.push_back(r.shared_intermediate);
     return rank_weight_digest(artifact_id, options, geometry, r.whole, r.omitted, r.assemblies,
                               r.experts, r.expert_domain.get());
@@ -210,6 +215,12 @@ RankPlan plan_single_rank(const ModelDefinition& definition, ple::Placement tabl
 
 ParallelPlan plan_parallel(const ModelDefinition& definition, const DeploymentOptions& deployment,
                            ple::Placement table) {
+    return plan_parallel(definition, deployment, std::span(&table, 1));
+}
+
+ParallelPlan plan_parallel(const ModelDefinition& definition, const DeploymentOptions& deployment,
+                           std::span<const ple::Placement> candidates) {
+    if (candidates.empty()) throw std::invalid_argument("Qwen4Exp requires a PLE placement");
     const auto normalized = normalize_deployment(deployment);
     const auto& o         = normalized.parallel;
     if (o.pp != 1 || o.adp != 1)
@@ -218,11 +229,15 @@ ParallelPlan plan_parallel(const ModelDefinition& definition, const DeploymentOp
     ParallelPlan out;
     out.topology = distributed::build_cluster_topology(normalized);
     out.ranks.reserve(out.topology.ranks.size());
-    for (const auto& id : out.topology.ranks) out.ranks.push_back(rank_plan(definition, id, table));
+    for (const auto& id : out.topology.ranks) {
+        auto& rank = out.ranks.emplace_back(rank_plan(definition, id, candidates.front()));
+        rank.ple_candidates.assign(candidates.begin(), candidates.end());
+    }
     for (const auto& replica : out.topology.replicas) {
         out.topology.add_role("tensor", replica.ranks);
         out.topology.add_role("vocabulary", replica.ranks);
-        if (table == ple::Placement::Device) out.topology.add_role("ple", replica.ranks);
+        if (std::ranges::find(candidates, ple::Placement::Sharded) != candidates.end())
+            out.topology.add_role("ple", replica.ranks);
     }
     add_expert_roles(out.topology);
     const auto& moe = definition.config().text.moe;

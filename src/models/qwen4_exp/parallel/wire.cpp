@@ -22,6 +22,8 @@ void encode_rank_load(Encoder& out, const RankLoadRequest& request) {
     const auto& p = request.rank;
     out.u32(p.placement.global_rank);
     out.u8(static_cast<std::uint8_t>(p.ple_placement));
+    out.u32(p.ple_candidates.size());
+    for (const auto candidate : p.ple_candidates) out.u8(static_cast<std::uint8_t>(candidate));
     for (auto r : {p.gdn_keys, p.gdn_values, p.qsa_queries, p.qsa_kv, p.vocabulary, p.ple_shards})
         range(out, r);
     out.u32(p.shared_intermediate);
@@ -48,6 +50,11 @@ RankLoadRequest decode_rank_load(Decoder& in, const distributed::RankIdentity& i
         throw std::invalid_argument("Qwen4Exp load request addressed to another global rank");
     p.placement                    = RankPlacement(identity);
     p.ple_placement                = static_cast<ple::Placement>(in.u8());
+    p.ple_candidates.resize(in.u32());
+    for (auto& candidate : p.ple_candidates) candidate = static_cast<ple::Placement>(in.u8());
+    if (p.ple_candidates.empty() || p.ple_candidates.front() != p.ple_placement)
+        throw std::invalid_argument(
+            "Qwen4Exp PLE load candidate differs from its bootstrap layout");
     p.gdn_keys                     = range(in);
     p.gdn_values                   = range(in);
     p.qsa_queries                  = range(in);

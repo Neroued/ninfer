@@ -35,6 +35,7 @@ public:
     [[nodiscard]] const LookupParameters& parameters() const noexcept;
     [[nodiscard]] std::span<const io::FileView> files() const noexcept;
     [[nodiscard]] TableGeometry geometry() const noexcept;
+    [[nodiscard]] std::size_t memory_bytes() const noexcept;
 
 private:
     struct Impl;

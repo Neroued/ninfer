@@ -383,9 +383,18 @@ ParsedOptions parse(int argc, char** argv, EntryPoint entry,
             engine.kv_cache = kv_storage(string());
             break;
         case Field::PleStorage:
-            engine.ple_storage = string() == "device" ? PleStorage::Device
+            engine.ple.storage = string() == "device" ? PleStorage::Device
                                  : string() == "disk" ? PleStorage::Disk
                                                       : PleStorage::Auto;
+            break;
+        case Field::PleDeviceLayout:
+            engine.ple.device_layout = string() == "replicated" ? PleDeviceLayout::Replicated
+                                       : string() == "sharded"  ? PleDeviceLayout::Sharded
+                                                                : PleDeviceLayout::Auto;
+            break;
+        case Field::PlePreference:
+            engine.ple.preference =
+                string() == "latency" ? PlePreference::Latency : PlePreference::Capacity;
             break;
         case Field::LinearStateDtype:
             engine.linear_state_dtype = linear_state_dtype_from_option(string());

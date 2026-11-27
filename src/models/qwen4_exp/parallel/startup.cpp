@@ -35,9 +35,9 @@ struct ExpertSchedule {
 
 ParallelStartup::ParallelStartup(const artifact::Reader& reader, const EngineOptions& options)
     : definition_(read_definition(reader, load_options(options))),
-      parallel_(plan_parallel(*definition_, *options.deployment,
-                              options.ple_storage == PleStorage::Disk ? ple::Placement::Disk
-                                                                      : ple::Placement::Device)),
+      placements_(ple::placements(options.ple, definition_->config().text.ple.shards,
+                                  options.deployment->parallel.tp)),
+      parallel_(plan_parallel(*definition_, *options.deployment, placements_)),
       batches_(std::make_shared<const BatchExecutionPlan>(make_batch_execution_spec(
           (options.max_concurrency - 1) / options.deployment->parallel.dp + 1, 1,
           options.use_cuda_graph && options.purpose == EnginePurpose::Generation))) {
@@ -73,6 +73,12 @@ std::vector<distributed::wire::Bytes> ParallelStartup::requests(const EngineOpti
         payloads.push_back(std::move(out).take());
     }
     return payloads;
+}
+
+std::vector<std::string> ParallelStartup::placement_names() const {
+    std::vector<std::string> names;
+    for (const auto placement : placements_) names.emplace_back(ple::name(placement));
+    return names;
 }
 
 bool ParallelStartup::narrow_targets(const EngineOptions&) const noexcept { return false; }
@@ -189,7 +195,9 @@ std::string ParallelStartup::prefill_signature(std::uint32_t chunk,
     auto signature      = qwen4_exp::prefill_signature(*definition_, nullptr, chunk) +
                      ";tp=" + std::to_string(rank.placement.tp.size) +
                      ";ep=" + std::to_string(rank.placement.ep.size);
-    for (const auto& group : ranks_.at(replica.result_owner).observation.communication)
+    const auto& observation = ranks_.at(replica.result_owner).observation;
+    signature += ";ple=" + observation.memory.ple_table.value().placement;
+    for (const auto& group : observation.communication)
         for (const auto& backend : group.backends)
             signature +=
                 backend.backend == CommunicationBackend::Nccl ? ";comm=nccl" : ";comm=native";

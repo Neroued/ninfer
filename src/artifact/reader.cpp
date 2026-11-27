@@ -204,7 +204,7 @@ std::vector<std::byte> Reader::read_object(ObjectHandle handle) const {
 io::ReadOnlyFile Reader::open_file(std::size_t file_index, io::ReadMode mode) const {
     try {
         return impl_->open_file(file_index, mode);
-    } catch (const std::system_error& e) { throw ArtifactError(e.what()); }
+    } catch (const std::system_error& e) { throw ArtifactIoError(e.what()); }
 }
 
 } // namespace ninfer::artifact

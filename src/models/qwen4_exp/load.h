@@ -23,8 +23,7 @@ public:
     }
 
     [[nodiscard]] std::span<const moe::ExpertDescription> expert_data() const {
-        return selection_ ? std::span<const moe::ExpertDescription>(
-                                selection_->weights.expert_descriptions)
+        return selection_ ? std::span<const moe::ExpertDescription>(selection_->expert_descriptions)
                           : std::span<const moe::ExpertDescription>{};
     }
 
@@ -46,6 +45,8 @@ private:
     friend ResolvedLoadPlan resolve_rank_load(const artifact::Reader&,
                                               std::shared_ptr<const ModelDefinition>, RankPlan,
                                               Device);
+    friend std::unique_ptr<ModelShard> materialize_weights(ResolvedLoadPlan&&, DeviceContext&,
+                                                           const StartupObserver*);
     friend std::unique_ptr<ModelShard> materialize_model(ResolvedLoadPlan&&, DeviceContext&,
                                                          const StartupObserver*);
     ResolvedLoadPlan(const artifact::Reader&, std::shared_ptr<const ModelDefinition>, RankPlan,
@@ -57,8 +58,7 @@ private:
     std::vector<Device> devices_, bank_devices_;
     std::shared_ptr<const ple::disk::Table> ple_;
     RankPlan rank_;
-    std::vector<std::size_t> ple_requests_;
-    std::optional<WeightSelection> selection_;
+    std::optional<SelectedWeights> selection_;
     std::vector<WeightParent> parents_;
     std::vector<BoundWeight> descriptions_;
 };
@@ -68,6 +68,8 @@ private:
                                             std::optional<Device> main_experts            = {},
                                             std::shared_ptr<const ple::disk::Table> table = {},
                                             ple::Placement = ple::Placement::Disk);
+[[nodiscard]] std::unique_ptr<ModelShard> materialize_weights(ResolvedLoadPlan&&, DeviceContext&,
+                                                              const StartupObserver* = nullptr);
 [[nodiscard]] std::unique_ptr<ModelShard> materialize_model(ResolvedLoadPlan&&, DeviceContext&,
                                                             const StartupObserver* = nullptr);
 [[nodiscard]] ResolvedLoadPlan resolve_rank_load(const artifact::Reader&,

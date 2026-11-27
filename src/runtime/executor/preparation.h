@@ -13,6 +13,11 @@ struct PreparationMemory {
     std::size_t weight_bytes, host_weight_bytes, host_reservation_bytes;
 };
 
+struct PlacementOffer {
+    ContextCapacityPlan capacity;
+    std::size_t device_bytes, host_bytes;
+};
+
 struct RankPreparationRequest {
     std::uint64_t plan                = 0;
     std::size_t memory_headroom_bytes = 0;
@@ -60,6 +65,9 @@ enum class PreparationAction : std::uint8_t {
     CalibrateRebuild,
     PrepareExecution,
     CheckResidentMemory,
+    OfferPlacement,
+    MaterializePlacement,
+    ReleasePlacement,
 };
 
 enum class AllocationRetry : std::uint8_t { None, AllocatorFailure, ReduceCapacity };
@@ -75,6 +83,8 @@ struct GroupPreparationOptions {
     std::uint32_t coordinator_node    = 0;
     bool try_narrow_targets           = false;
     EnginePurpose purpose             = EnginePurpose::Generation;
+    std::vector<std::string> placement_names; // Model-supplied IDs in latency preference order.
+    bool maximize_context = true;
 };
 
 void encode_preparation_request(distributed::wire::Encoder&, const RankPreparationRequest&);

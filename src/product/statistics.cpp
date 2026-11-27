@@ -265,6 +265,13 @@ Json resource_json(const RankSnapshot& rank) {
                           {"uploaded_bytes", e.uploaded_bytes},
                           {"prefetched_bytes", e.prefetched_bytes}};
     }
+    if (m.ple_table) {
+        const auto& p    = *m.ple_table;
+        out["ple_table"] = {{"placement", p.placement},          {"first_shard", p.first_shard},
+                            {"local_shards", p.local_shards},    {"total_shards", p.total_shards},
+                            {"device_bytes", p.device_bytes},    {"host_bytes", p.host_bytes},
+                            {"merged_windows", p.merged_windows}};
+    }
     if (m.ple) {
         const auto& p = *m.ple;
         out["ple"]    = {{"rows", p.rows},

@@ -248,6 +248,7 @@ int main(int argc, char** argv) {
         auto deployment = product::read_deployment_file(argv[1]);
         artifact::Reader reader(argv[2]);
         EngineOptions options;
+        options.ple.device_layout = PleDeviceLayout::Sharded;
         options.use_cuda_graph   = false;
         options.enable_vision    = true;
         options.max_context      = 4096;
@@ -259,7 +260,7 @@ int main(int argc, char** argv) {
         auto definition     = q4::read_definition(reader, models::load_options(options));
         auto frontend       = q4::create_frontend(*definition, options);
         const auto parallel =
-            q4::plan_parallel(*definition, deployment, q4::ple::Placement::Device);
+            q4::plan_parallel(*definition, deployment, q4::ple::Placement::Sharded);
         const auto batches =
             models::make_batch_execution_spec(options.max_concurrency, 1, options.use_cuda_graph);
         std::vector<wire::Bytes> payloads;
@@ -279,7 +280,8 @@ int main(int argc, char** argv) {
             rt::GroupPreparationOptions{.memory_headroom_bytes = options.memory_headroom_bytes,
                                         .frontend_host_bytes =
                                             options.media_live_bytes + options.grammar_cache_bytes,
-                                        .coordinator_node = deployment.coordinator_node},
+                                        .coordinator_node = deployment.coordinator_node,
+                                        .placement_names  = {"device/sharded"}},
             std::chrono::minutes(15));
         rebuild(*group, prepared);
         std::vector<q4::RankExecutionDescription> descriptions;

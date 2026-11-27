@@ -37,24 +37,17 @@ ResolvedLoadPlan resolve_load(const artifact::Reader& reader,
             requests.push_back({part.object, devices[i],
                                 devices[i] == Device::cpu() ? artifact::HostAccess::CudaTransfer
                                                             : artifact::HostAccess::CpuOnly});
-    std::vector<std::size_t> ple_requests;
-    if (placement == ple::Placement::Device)
-        for (const auto& shard : definition->ple_parameters().shards) {
-            ple_requests.push_back(requests.size());
-            requests.push_back({shard.object, cuda, artifact::HostAccess::CpuOnly});
-        }
     auto storage = artifact::plan_materialization(reader, requests);
     if (placement == ple::Placement::Disk && !table)
         table = std::make_shared<const ple::disk::Table>(reader, definition->ple_parameters());
     auto rank = plan_single_rank(*definition, placement);
     ResolvedLoadPlan out{reader,
-            std::move(definition),
-            std::move(rank),
-            std::move(storage),
-            std::move(devices),
-            std::move(banks),
-            std::move(table)};
-    out.ple_requests_ = std::move(ple_requests);
+                         std::move(definition),
+                         std::move(rank),
+                         std::move(storage),
+                         std::move(devices),
+                         std::move(banks),
+                         std::move(table)};
     return out;
 }
 
@@ -64,64 +57,47 @@ ResolvedLoadPlan resolve_rank_load(const artifact::Reader& reader,
     if (!definition || definition->artifact_id() != reader.artifact_id())
         throw artifact::ArtifactError("rank definition belongs to another artifact");
     auto selection = select_weights(reader, *definition, rank, device);
-    auto storage   = artifact::plan_materialization(reader, selection.weights.requests);
-    std::shared_ptr<const ple::disk::Table> table;
-    if (rank.ple_placement == ple::Placement::Disk)
-        table = std::make_shared<const ple::disk::Table>(reader, definition->ple_parameters());
+    auto storage   = artifact::plan_materialization(reader, selection.requests);
     ResolvedLoadPlan out(reader, std::move(definition), std::move(rank), std::move(storage), {}, {},
-                         std::move(table));
-    out.ple_requests_ = std::move(selection.ple);
+                         {});
     out.selection_ = std::move(selection);
     out.parents_.reserve(out.materialization_.tensors.size());
     for (const auto& tensor : out.materialization_.tensors)
         out.parents_.push_back({tensor.geometry, device, nullptr, {}});
-    out.descriptions_ =
-        bind_selected_weights(out.definition_->weight_data(), out.selection_->weights,
-                              out.materialization_.requests, out.parents_);
+    out.descriptions_ = bind_selected_weights(out.definition_->weight_data(), *out.selection_,
+                                              out.materialization_.requests, out.parents_);
     return out;
 }
 
 std::unique_ptr<ModelShard> materialize_model(ResolvedLoadPlan&& plan, DeviceContext& device,
                                               const StartupObserver* observer) {
     if (!plan.definition_) throw artifact::ArtifactError("load plan was already consumed");
+    auto table = plan_ple_table(*plan.reader_, *plan.definition_, plan.rank_.ple_placement,
+                                plan.rank_.placement.tp, device.device(), std::move(plan.ple_));
+    auto model = materialize_weights(std::move(plan), device, observer);
+    model->prepare_ple(std::move(table), device, observer);
+    return model;
+}
+
+std::unique_ptr<ModelShard> materialize_weights(ResolvedLoadPlan&& plan, DeviceContext& device,
+                                                const StartupObserver* observer) {
+    if (!plan.definition_) throw artifact::ArtifactError("load plan was already consumed");
     auto definition         = std::move(plan.definition_);
     auto requests           = std::move(plan.materialization_.requests);
     const auto parent_count = plan.materialization_.tensors.size();
     auto backing            = artifact::materialize(*plan.reader_, std::move(plan.materialization_),
                                                     device.transfer_view(), observer);
-    const auto bind_ple = [&](ModelShard& out) {
-        if (out.rank_.ple_placement == ple::Placement::Device) {
-            auto& table = out.ple_.emplace<DevicePleTable>();
-            table.decode =
-                DeviceBuffer(device.device(), plan.ple_requests_.size() * sizeof(Nf4Bf16Lut));
-            for (std::size_t i = 0; i < plan.ple_requests_.size(); ++i) {
-                const auto shard_id = out.rank_.ple_shards.begin + i;
-                const auto& shard   = out.definition().ple_parameters().shards.at(shard_id);
-                const auto& p       = out.backing_.parent(requests.at(plan.ple_requests_[i]), device.device());
-                const auto lut      = make_nf4_bf16_lut(shard.divisor);
-                const auto offset   = i * sizeof(lut);
-                table.decode.copy_from_host(&lut, sizeof(lut), offset);
-                table.shards.push_back(
-                    {{p.data, p.geometry.matrix_scale_offset, device.device()},
-                     Tensor(table.decode.span().subspan(offset, sizeof(lut)), DType::BF16,
-                            {16, 128}),
-                     static_cast<std::uint32_t>(shard.row_end - shard.geometry.shape[0]),
-                     static_cast<std::uint32_t>(shard.geometry.shape[0])});
-            }
-        }
-    };
     if (plan.selection_) {
-        auto out = std::unique_ptr<ModelShard>(new ModelShard(
-            definition, std::move(plan.rank_), std::move(backing), {}, {}, std::move(plan.ple_)));
+        auto out = std::unique_ptr<ModelShard>(
+            new ModelShard(definition, std::move(plan.rank_), std::move(backing), {}, {}));
         out->local_parents_.reserve(parent_count);
         for (std::size_t i = 0; i < parent_count; ++i)
             out->local_parents_.push_back(out->backing_.parent({i}, device.device()));
-        out->bound_ = bind_selected_weights(definition->weight_data(), plan.selection_->weights,
-                                            requests, out->local_parents_);
-        out->local_banks_         = bind_selected_experts(plan.selection_->weights, requests,
-                                                          out->local_parents_, device.device());
-        out->expert_descriptions_ = std::move(plan.selection_->weights.expert_descriptions);
-        bind_ple(*out);
+        out->bound_ = bind_selected_weights(definition->weight_data(), *plan.selection_, requests,
+                                            out->local_parents_);
+        out->local_banks_ =
+            bind_selected_experts(*plan.selection_, requests, out->local_parents_, device.device());
+        out->expert_descriptions_ = std::move(plan.selection_->expert_descriptions);
         return out;
     }
     std::vector<PendingWeight> pending;
@@ -133,10 +109,9 @@ std::unique_ptr<ModelShard> materialize_model(ResolvedLoadPlan&& plan, DeviceCon
     }
     auto bound = resolve_weights(std::move(pending), backing, plan.devices_);
     auto banks = moe::bind_banks(definition->expert_banks(), backing, plan.bank_devices_);
-    auto out   = std::unique_ptr<ModelShard>(
-        new ModelShard(std::move(definition), std::move(plan.rank_), std::move(backing),
-                         std::move(bound), std::move(banks), std::move(plan.ple_)));
-    bind_ple(*out);
+    auto out   = std::unique_ptr<ModelShard>(new ModelShard(std::move(definition),
+                                                            std::move(plan.rank_), std::move(backing),
+                                                            std::move(bound), std::move(banks)));
     return out;
 }
 

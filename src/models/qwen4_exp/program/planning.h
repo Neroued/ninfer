@@ -80,6 +80,8 @@ plan_execution(std::shared_ptr<const execution::ModelProfile>, ple::disk::TableG
                                              DeviceContext&, std::shared_ptr<const moe::Plan>,
                                              GraphProbeBacking = GraphProbeBacking::Inputs);
 
+[[nodiscard]] runtime::ContextCapacityPlan describe_execution_capacity(const ExecutionPlan&,
+                                                                       const EngineOptions&);
 [[nodiscard]] runtime::ContextCapacityPlan
 describe_execution_capacity(std::shared_ptr<const execution::ModelProfile>, const EngineOptions&,
                             std::shared_ptr<const BatchExecutionPlan>, DeviceContext&,

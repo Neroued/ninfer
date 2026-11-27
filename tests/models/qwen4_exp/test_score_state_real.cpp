@@ -1,4 +1,5 @@
 #include "rank_fixture.h"
+#include "ple/lookup_reference.h"
 #include "models/qwen4_exp/program/internal.h"
 #include "models/qwen4_exp/session/session.h"
 #include "runtime/executor/local_executor.h"
@@ -30,8 +31,8 @@ std::vector<T> read_tensor(const Tensor& tensor) {
 class ObservedRank {
 public:
     ObservedRank(const q4::execution::Parameters& parameters, q4::ExecutionPlan plan,
-                 DeviceContext& device)
-        : implementation(parameters, std::move(plan), device) {
+                 DeviceContext& device, const artifact::Reader& reader)
+        : implementation(parameters, std::move(plan), device), reader_(reader) {
         implementation.initialize_graphs();
     }
 
@@ -142,6 +143,18 @@ public:
             for (std::size_t t = 0; t < positions.size(); ++t)
                 require(positions[t] == static_cast<std::int32_t>(row.main_frontier + t),
                         "scoring device positions do not follow the input frontier");
+            const auto embedding = frame.ple ? implementation.resources.ple_upload->device_slot(
+                                                   frame.ple->slot, frame.tokens, 1)
+                                             : implementation.device_embedding(frame.tokens, 1);
+            const auto& model    = implementation.parameters.model.definition();
+            const auto eos       = model.config().text.ple.eos;
+            for (const auto column : {std::size_t(0), row.ids.size() - 1}) {
+                const auto pos   = row.main_frontier + column;
+                const auto words = read_tensor<std::uint16_t>(embedding.slice(1, column, 1));
+                test::flash_next::check_ple_column(
+                    reader_, model, pos >= 2 ? expected_tokens[pos - 2] : eos,
+                    pos ? expected_tokens[pos - 1] : eos, expected_tokens[pos], words);
+            }
             const auto rope = read_tensor<std::int32_t>(frame.batch.rope_positions);
             require(rope.size() == 3 * row.ids.size(), "scoring omitted a device RoPE axis");
             for (std::size_t axis = 0; axis < 3; ++axis)
@@ -180,6 +193,7 @@ private:
         return bytes;
     }
 
+    const artifact::Reader& reader_;
     std::span<const TokenId> expected_tokens;
     std::size_t next_input = 0, next_target = 0;
     bool first_state_written = false;
@@ -212,7 +226,7 @@ q4::ScoreComplete finish_score(q4::Session& session, runtime::ExecutionTicket ti
 }
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     const char* path = std::getenv("NINFER_QWEN4_EXP_TEST_ARTIFACT");
     if (!path || !*path) return 77;
     try {
@@ -223,6 +237,11 @@ int main() {
         CUDA_CHECK(error);
         auto device = std::make_unique<DeviceContext>();
         EngineOptions options;
+        if (argc > 1) {
+            const std::string_view storage(argv[1]);
+            require(storage == "disk" || storage == "device", "expected disk or device PLE");
+            options.ple.storage = storage == "disk" ? PleStorage::Disk : PleStorage::Device;
+        }
         options.purpose         = EnginePurpose::CausalScoring;
         options.use_cuda_graph  = false;
         options.enable_vision   = false;
@@ -238,8 +257,8 @@ int main() {
         auto model             = startup.materialize(*device, selected.placement, {});
         auto instance          = std::make_unique<runtime::RankModelInstance<ObservedTypes>>(
             std::move(model), startup.profile);
-        instance->program = std::make_unique<ObservedRank>(instance->parameters,
-                                                           std::move(selected.sequence), *device);
+        instance->program = std::make_unique<ObservedRank>(
+            instance->parameters, std::move(selected.sequence), *device, reader);
         auto& rank        = *instance->program;
         auto worker       = std::make_unique<runtime::RankWorker<ObservedTypes>>(std::move(device),
                                                                                  std::move(instance));

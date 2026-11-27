@@ -153,6 +153,8 @@ public:
     void check();
     void abort() noexcept;
     void close(std::chrono::steady_clock::time_point deadline);
+    // At a collective-safe startup boundary retire all routes; logical group addresses survive.
+    void release_preparation(std::chrono::steady_clock::time_point deadline);
     [[nodiscard]] std::vector<CommunicationStatistics> statistics() const;
     void sample_startup_memory();
     void reset_statistics();

@@ -98,12 +98,20 @@ struct PleReadStats {
     std::uint64_t reads = 0, read_bytes = 0, uploaded_bytes = 0;
 };
 
+struct PleTableSummary {
+    std::string placement;
+    std::uint32_t first_shard = 0, local_shards = 0, total_shards = 0;
+    std::uint64_t device_bytes = 0, host_bytes = 0;
+    std::uint64_t merged_windows = 0;
+};
+
 struct RankMemoryUsage {
     MemoryAllocations allocations;
     WorkspaceUsage workspace;
     std::optional<VisionMemorySummary> vision;
     std::optional<MoeMemorySummary> experts;
     std::optional<PleReadStats> ple;
+    std::optional<PleTableSummary> ple_table;
 };
 
 struct PhysicalMemorySample {

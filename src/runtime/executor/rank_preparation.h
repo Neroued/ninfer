@@ -53,13 +53,14 @@ prepare_rank(distributed::WorkerConnection& connection, std::unique_ptr<artifact
 
     bool materialized = false;
     std::optional<DeviceMemorySnapshot> after_weights;
-    std::int64_t retained_bytes = 0;
+    std::int64_t retained_bytes = 0, base_retained_bytes = 0;
     std::uint32_t attempt       = 0;
     ContextCapacityPlan capacity_plan;
     std::size_t graph_reserve_bytes = 0;
     bool model_charges_control      = false;
 
-    const auto report = [&](DeviceMemorySnapshot snapshot, std::string phase_failure = {}) {
+    const auto report = [&](DeviceMemorySnapshot snapshot, std::string phase_failure = {},
+                            const PlacementOffer* offered = nullptr) {
         const auto available = budget.planning_available(snapshot);
         wire::Encoder out;
         out.u64(topology.plan);
@@ -78,6 +79,12 @@ prepare_rank(distributed::WorkerConnection& connection, std::unique_ptr<artifact
             value.weight_bytes             = requirement.weight_bytes;
             value.host_weight_bytes        = requirement.host_weight_bytes;
             value.staging_bytes            = staging_headroom;
+        }
+        if (offered) {
+            value.capacity.plan     = offered->capacity;
+            value.weight_bytes      = offered->device_bytes;
+            value.host_weight_bytes = offered->host_bytes;
+            value.staging_bytes     = offered->device_bytes ? staging_headroom : 0;
         }
         value.raw_available_bytes             = available;
         value.capacity.available_host_bytes   = snapshot.system_available_bytes;
@@ -208,7 +215,7 @@ prepare_rank(distributed::WorkerConnection& connection, std::unique_ptr<artifact
                 phase.complete();
             }
             preparing->materialize();
-            reader.reset();
+            if constexpr (!requires { preparing->offer_placement(0); }) reader.reset();
             device.synchronize();
             const auto after_materialize = device_memory_snapshot(device.device());
             materialized                 = true;
@@ -217,8 +224,50 @@ prepare_rank(distributed::WorkerConnection& connection, std::unique_ptr<artifact
                 before_weights, after_materialize,
                 loaded.weight_bytes +
                     (before_weights.shared_physical_memory ? loaded.host_weight_bytes : 0));
+            base_retained_bytes = retained_bytes;
             report(after_materialize);
             continue;
+        }
+        if constexpr (requires { preparing->offer_placement(0); }) {
+            if (action == PreparationAction::OfferPlacement) {
+                const auto before = device_memory_snapshot(device.device());
+                try {
+                    auto offer = preparing->offer_placement(capacity.device_bytes);
+                    report(before, {}, &offer);
+                } catch (const artifact::ArtifactIoError& error) {
+                    report(before, error.what());
+                } catch (const std::system_error& error) { report(before, error.what()); }
+                continue;
+            }
+            if (action == PreparationAction::MaterializePlacement) {
+                const auto before = device_memory_snapshot(device.device());
+                const auto base   = preparing->report(SIZE_MAX);
+                try {
+                    preparing->materialize_placement(capacity.device_bytes);
+                    device.synchronize();
+                    const auto after  = device_memory_snapshot(device.device());
+                    const auto loaded = preparing->report(SIZE_MAX);
+                    retained_bytes =
+                        base_retained_bytes +
+                        retained_startup_bytes(
+                            before, after,
+                            loaded.weight_bytes - base.weight_bytes +
+                                (before.shared_physical_memory
+                                     ? loaded.host_weight_bytes - base.host_weight_bytes
+                                     : 0));
+                    after_weights.reset();
+                    report(after);
+                } catch (const DeviceAllocationError& error) {
+                    report(device_memory_snapshot(device.device()), error.what());
+                } catch (const artifact::ArtifactIoError& error) {
+                    report(device_memory_snapshot(device.device()), error.what());
+                } catch (const std::bad_alloc& error) {
+                    report(device_memory_snapshot(device.device()), error.what());
+                } catch (const std::system_error& error) {
+                    report(device_memory_snapshot(device.device()), error.what());
+                }
+                continue;
+            }
         }
         if (action == PreparationAction::SampleBaseline) {
             device.synchronize();
@@ -292,10 +341,22 @@ prepare_rank(distributed::WorkerConnection& connection, std::unique_ptr<artifact
             report(device_memory_snapshot(device.device()), std::move(cal_failure));
             continue;
         }
-        if (action == PreparationAction::Release) {
+        if (action == PreparationAction::Release || action == PreparationAction::ReleasePlacement) {
             connection.startup_attempt(++attempt);
             StartupPhaseScope phase(observer, StartupPhase::RuntimeRelease);
-            preparing->release_resources();
+            if constexpr (requires { preparing->release_placement(); }) {
+                if (action == PreparationAction::ReleasePlacement) {
+                    preparing->release_placement();
+                    device.synchronize();
+                    connection.communication().release_preparation(
+                        std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(connection.bootstrap().connect_timeout_ms));
+                    after_weights.reset();
+                    retained_bytes = base_retained_bytes;
+                } else
+                    preparing->release_resources();
+            } else
+                preparing->release_resources();
             device.synchronize();
             failure.clear();
             entered = accepted = false;
@@ -351,8 +412,8 @@ prepare_rank(distributed::WorkerConnection& connection, std::unique_ptr<artifact
             } catch (const DeviceAllocationError& error) {
                 allocation_failed(error, AllocationRetry::AllocatorFailure);
             } catch (const ContextBudgetError& error) {
-                if (!can_reduce_rank()) throw;
-                allocation_failed(error, AllocationRetry::ReduceCapacity);
+                allocation_failed(error, can_reduce_rank() ? AllocationRetry::ReduceCapacity
+                                                           : AllocationRetry::None);
             }
             if (accepted)
                 phase.complete();
@@ -429,8 +490,8 @@ prepare_rank(distributed::WorkerConnection& connection, std::unique_ptr<artifact
         } catch (const DeviceAllocationError& error) {
             allocation_failed(error, AllocationRetry::AllocatorFailure);
         } catch (const ContextBudgetError& error) {
-            if (!can_reduce_rank()) throw;
-            allocation_failed(error, AllocationRetry::ReduceCapacity);
+            allocation_failed(error, can_reduce_rank() ? AllocationRetry::ReduceCapacity
+                                                       : AllocationRetry::None);
         }
         if (accepted)
             phase.complete();

@@ -14,7 +14,9 @@ inline models::qwen4_exp::Startup::ExecutionPlan plan_rank(models::qwen4_exp::St
     const auto memory = device_memory_snapshot(device.device());
     auto available    = memory.available_bytes();
     available -= std::min(available, options.memory_headroom_bytes);
-    for (const auto& candidate : startup.placements()) {
+    for (const auto& candidate :
+         startup.placements(device, options, available, memory.system_available_bytes,
+                            memory.shared_physical_memory)) {
         if (candidate.device_bytes > available ||
             candidate.host_bytes > memory.system_available_bytes)
             continue;

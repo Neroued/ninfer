@@ -6,17 +6,20 @@ namespace ninfer::models {
 
 enum class WeightPlacement { Resident, HostExperts };
 
-struct WeightCandidate {
-    WeightPlacement placement;
+template <class Placement>
+struct PlacementCandidate {
+    Placement placement;
     std::size_t device_bytes;
     std::size_t host_bytes;
 };
 
-template <class SequencePlan, class Preparation>
+using WeightCandidate = PlacementCandidate<WeightPlacement>;
+
+template <class SequencePlan, class Preparation, class Placement = WeightPlacement>
 struct ExecutionPlan {
     SequencePlan sequence;
     runtime::ContextCapacityResolution capacity;
-    WeightPlacement placement;
+    Placement placement;
     std::uint32_t chunk;
     Preparation preparation;
 };

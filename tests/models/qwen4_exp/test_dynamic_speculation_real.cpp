@@ -16,7 +16,9 @@ namespace ninfer::test::flash_next {
 namespace {
 class ObservedRank : public q::detail::RankProgramImpl {
 public:
-    using RankProgramImpl::RankProgramImpl;
+    ObservedRank(const q::execution::Parameters& parameters, q::ExecutionPlan plan,
+                 DeviceContext& device, const artifact::Reader& reader)
+        : RankProgramImpl(parameters, std::move(plan), device), reader_(reader) {}
 
     static constexpr runtime::ExecutionCapacity capacity() noexcept { return {1, 1}; }
 
@@ -48,13 +50,14 @@ public:
                       "MTP depths used different Target graphs in the same row bucket");
             }
         }
-        history.input(*this, adopted);
+        history.input(*this, adopted, reader_);
         RankProgramImpl::commit(ticket, sequence, std::move(adopted));
         history.compare(*this);
     }
 private:
     std::map<unsigned, const models::TargetGraphBody*> targets;
     HistoryReference history;
+    const artifact::Reader& reader_;
 };
 
 struct ObservedTypes : q::RuntimeTypes {
@@ -67,15 +70,15 @@ void local(const artifact::Reader& reader, const EngineOptions& o) {
     auto selected      = plan_rank(startup, *device, o);
     auto shard         = startup.materialize(*device, selected.placement, {});
     auto plan          = q::plan_session(selected.sequence);
-    const bool offload = selected.placement == models::WeightPlacement::HostExperts;
+    const bool offload = selected.placement.weights == models::WeightPlacement::HostExperts;
     const auto path    = !o.use_cuda_graph ? ExecutionPath::Eager
                          : offload         ? ExecutionPath::Mixed
                                            : ExecutionPath::Graph;
     check(plan.decode_path == path, "unexpected rank graph/offload placement");
     auto rank = std::make_unique<runtime::RankModelInstance<ObservedTypes>>(std::move(shard),
                                                                             startup.profile);
-    rank->program =
-        std::make_unique<ObservedRank>(rank->parameters, std::move(selected.sequence), *device);
+    rank->program = std::make_unique<ObservedRank>(rank->parameters, std::move(selected.sequence),
+                                                   *device, reader);
     rank->program->initialize_graphs();
     auto worker =
         std::make_unique<runtime::RankWorker<ObservedTypes>>(std::move(device), std::move(rank));
@@ -117,6 +120,8 @@ int main(int argc, char** argv) {
 #endif
             if (arg == "--graph" || arg == "--eager")
                 graphs = {arg == "--graph"};
+            else if (arg == "--ple-disk" || arg == "--ple-device")
+                o.ple.storage = arg == "--ple-disk" ? PleStorage::Disk : PleStorage::Device;
             else if (arg == "--gpu-timing")
                 o.observability.gpu_timing = true;
             else if (arg == "--draft-tokens" && i + 1 < argc)

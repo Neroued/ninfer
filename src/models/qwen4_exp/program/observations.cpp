@@ -21,7 +21,18 @@ RankMemoryUsage RankProgramImpl::observe_resources() const {
     const auto& weights = parameters.model.storage_stats();
     RankMemoryUsage out;
     auto& a                    = out.allocations;
-    a.device_weights_bytes     = weights.device_capacity_bytes;
+    const auto& model          = parameters.model;
+    const auto& rank           = model.rank_plan();
+    out.ple_table              = PleTableSummary{
+        ple::name(rank.ple_placement),
+        rank.ple_shards.begin,
+        rank.ple_shards.size,
+        static_cast<std::uint32_t>(model.definition().ple_parameters().shards.size()),
+        model.ple_device_bytes(),
+        model.ple_host_bytes(),
+        merged_ple_windows};
+    a.device_weights_bytes =
+        weights.device_capacity_bytes + model.metadata_bytes() - model.ple_device_bytes();
     a.host_weights_bytes       = weights.host_capacity_bytes;
     a.registered_weights_bytes = weights.registered_host_bytes;
     a.persistent_device_bytes  = plan.persistent.bytes + parameters.profile->exchange_bytes;
@@ -32,9 +43,10 @@ RankMemoryUsage RankProgramImpl::observe_resources() const {
                         plan.pinned_context_bytes() + plan.pinned_aux_bytes() +
                         plan.pinned_context_counts_bytes();
     a.host_context_bytes = plan.host_context_bytes;
-    a.ple_device_bytes   = plan.ple_upload.device_bytes;
+    a.ple_device_bytes   = plan.ple_upload.device_bytes + model.ple_device_bytes();
     a.ple_pinned_bytes   = plan.ple_upload.pinned_host_bytes;
-    a.ple_host_bytes     = plan.ple_prepare_bytes + plan.ple_upload.ordinary_host_bytes;
+    a.ple_host_bytes =
+        plan.ple_prepare_bytes + plan.ple_upload.ordinary_host_bytes + model.ple_host_bytes();
     if (plan.moe) {
         const auto& experts   = plan.moe->description();
         a.expert_device_bytes = experts.device_bytes;

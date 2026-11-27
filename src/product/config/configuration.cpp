@@ -104,9 +104,18 @@ StartupConfigurationView view(const LaunchOptions& launch, EntryPoint entry, con
             value = e.enable_vision;
             break;
         case Field::PleStorage:
-            value = std::string(e.ple_storage == PleStorage::Device ? "device"
-                                : e.ple_storage == PleStorage::Disk ? "disk"
+            value = std::string(e.ple.storage == PleStorage::Device ? "device"
+                                : e.ple.storage == PleStorage::Disk ? "disk"
                                                                     : "auto");
+            break;
+        case Field::PleDeviceLayout:
+            value = std::string(e.ple.device_layout == PleDeviceLayout::Replicated ? "replicated"
+                                : e.ple.device_layout == PleDeviceLayout::Sharded  ? "sharded"
+                                                                                   : "auto");
+            break;
+        case Field::PlePreference:
+            value =
+                std::string(e.ple.preference == PlePreference::Latency ? "latency" : "capacity");
             break;
         case Field::VisionMemoryBudget:
             value = std::uint64_t{e.vision_memory_budget_bytes};

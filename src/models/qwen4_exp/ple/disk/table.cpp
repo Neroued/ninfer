@@ -56,6 +56,15 @@ const LookupParameters& Table::parameters() const noexcept { return impl_->param
 
 std::span<const io::FileView> Table::files() const noexcept { return impl_->backing.files(); }
 
+std::size_t Table::memory_bytes() const noexcept {
+    auto bytes = sizeof(Impl) + impl_->backing.host_bytes() +
+                 impl_->shards.capacity() * sizeof(Impl::Shard) +
+                 impl_->parameters.shards.capacity() * sizeof(TableShard);
+    for (const auto& shard : impl_->parameters.shards)
+        bytes += shard.geometry.shape.capacity() * sizeof(std::uint64_t);
+    return bytes;
+}
+
 TableGeometry Table::geometry() const noexcept {
     TableGeometry out{impl_->max_segments};
     for (const auto file : files()) {

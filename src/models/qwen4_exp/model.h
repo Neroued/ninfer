@@ -3,18 +3,11 @@
 #include "models/qwen4_exp/definition.h"
 #include "models/qwen4_exp/ple/disk/table.h"
 #include "models/qwen4_exp/parallel/plan.h"
-#include "ninfer/ops/ple.h"
+#include "models/qwen4_exp/ple/table.h"
 
 namespace ninfer::models::qwen4_exp {
 
 class ResolvedLoadPlan;
-
-struct DevicePleTable {
-    DeviceBuffer decode;
-    std::vector<ops::Nf4EmbeddingShard> shards;
-};
-
-using PleTable = std::variant<std::shared_ptr<const ple::disk::Table>, DevicePleTable>;
 
 // Local immutable weight storage. Borrowers finish before its backing is released.
 class ModelShard {
@@ -37,11 +30,15 @@ public:
         return expert_descriptions_;
     }
 
-    [[nodiscard]] const artifact::MaterializationStats& storage_stats() const {
-        return backing_.stats();
-    }
+    [[nodiscard]] const artifact::MaterializationStats& storage_stats() const { return stats_; }
 
-    [[nodiscard]] const PleTable& ple_table() const { return ple_; }
+    [[nodiscard]] const PleTable& ple_table() const { return ple_.value(); }
+
+    [[nodiscard]] std::size_t ple_device_bytes() const;
+    [[nodiscard]] std::size_t ple_host_bytes() const;
+    // Startup calls these only after retiring all borrowing Programs and probes.
+    void prepare_ple(PleTablePlan&&, DeviceContext&, const StartupObserver*);
+    void release_ple();
 
     [[nodiscard]] const RankPlan& rank_plan() const { return rank_; }
 
@@ -52,15 +49,15 @@ public:
     [[nodiscard]] std::size_t metadata_bytes() const;
 
 private:
-    friend std::unique_ptr<ModelShard> materialize_model(ResolvedLoadPlan&&, DeviceContext&,
-                                                         const StartupObserver*);
+    friend std::unique_ptr<ModelShard> materialize_weights(ResolvedLoadPlan&&, DeviceContext&,
+                                                           const StartupObserver*);
     ModelShard(std::shared_ptr<const ModelDefinition>, RankPlan, artifact::MaterializedArtifact,
-               std::vector<BoundWeight>, std::vector<ExpertBankSource>,
-               std::shared_ptr<const ple::disk::Table>);
+               std::vector<BoundWeight>, std::vector<ExpertBankSource>);
 
     std::shared_ptr<const ModelDefinition> definition_;
     artifact::MaterializedArtifact backing_;
-    PleTable ple_;
+    std::optional<PleTable> ple_;
+    artifact::MaterializationStats stats_;
     std::vector<BoundWeight> bound_;
     std::vector<ExpertBankSource> banks_;
     RankPlan rank_;

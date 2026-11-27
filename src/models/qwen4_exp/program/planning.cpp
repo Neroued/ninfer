@@ -20,7 +20,7 @@ PersistentLayout persistent(const execution::ModelProfile& p, const EngineOption
         out.mtp = plan_qsa_cache(b, p.local.qsa, 1, o.max_context, o.max_concurrency, o.kv_cache);
     out.buffers =
         plan_buffers(b, p.config, o, o.prefill_chunk, p.public_tokens, p.local.gdn,
-                     p.local.vocabulary, p.local.size, p.ple_placement == ple::Placement::Device);
+                     p.local.vocabulary, p.local.size, p.ple_placement != ple::Placement::Disk);
     out.bytes = b.finish(256);
     return out;
 }
@@ -113,7 +113,7 @@ ExecutionPlan physical_plan(std::shared_ptr<const execution::ModelProfile> profi
     if (out.persistent.buffers.mtp && out.profile->ple_placement == ple::Placement::Disk)
         out.pinned_ple_handoff_bytes =
             2ULL * o.speculative.draft_tokens * o.max_concurrency * sizeof(TokenId);
-    if (out.persistent.buffers.mtp && out.profile->ple_placement == ple::Placement::Device)
+    if (out.persistent.buffers.mtp && out.profile->ple_placement != ple::Placement::Disk)
         out.pinned_draft_bytes =
             (o.speculative.draft_tokens + 1) * o.max_concurrency * sizeof(TokenId);
     if (out.persistent.buffers.sampled_ids) {
@@ -216,12 +216,19 @@ runtime::ContextCapacityPlan capacity_plan(const ExecutionPlan& base, const Engi
     plan.working_sets.push_back(
         work("concurrent requests", o.max_concurrency, o.max_concurrency * pages(short_tokens),
              o.max_concurrency * pages(short_tokens ? short_tokens - 1 : 0)));
-    plan.fixed_device_bytes = base.device_reservation_bytes();
+    plan.fixed_device_bytes = base.device_reservation_bytes() - base.capacity.device_bytes;
     plan.fixed_host_bytes   = base.host_reservation_bytes();
     plan.metadata           = session_metadata_plan(base, geometry);
     return plan;
 }
 } // namespace
+
+runtime::ContextCapacityPlan describe_execution_capacity(const ExecutionPlan& plan,
+                                                         const EngineOptions& supplied) {
+    auto o          = options(*plan.profile, supplied);
+    o.prefill_chunk = plan.shape.prefill_chunk;
+    return capacity_plan(plan, o);
+}
 
 std::optional<ExecutionPlan> plan_execution(std::shared_ptr<const execution::ModelProfile> profile,
                                             ple::disk::TableGeometry table,

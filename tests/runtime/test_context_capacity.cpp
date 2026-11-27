@@ -1,4 +1,5 @@
 #include "runtime/engine/context_capacity.h"
+#include "runtime/engine/placement_selection.h"
 #include "runtime/engine/startup_memory.h"
 #include "runtime/engine/context_cache/capture_policy.h"
 
@@ -20,6 +21,31 @@ int main() {
     int failures = 0;
     using namespace ninfer;
     using namespace ninfer::runtime;
+    {
+        // Both candidates have optimistic cold offers. Calibration makes the first score
+        // smaller than the second bound, but the first still wins on actual complete blocks.
+        std::vector<std::size_t> installed;
+        bool active       = false;
+        const auto select = [&](std::size_t second) {
+            active = false;
+            installed.clear();
+            return select_prepared_placement(
+                {{0, 0, 0, 100}, {1, 0, 1, 95}, {2, 0, 2, 10}},
+                [&](std::size_t id) -> std::optional<std::size_t> {
+                    if (active)
+                        throw std::logic_error("candidate reused another placement's resources");
+                    active = true;
+                    installed.push_back(id);
+                    return id == 0 ? 90 : second;
+                },
+                [&] { active = false; });
+        };
+        failures += check(select(80) == 0 && installed == std::vector<std::size_t>{0, 1, 0},
+                          "did not restore the best measured layout");
+        failures += check(select(92) == 1 && installed == std::vector<std::size_t>{0, 1},
+                          "did not keep the second measured winner");
+        failures += check(select(90) == 0, "equal measured capacity changed layout preference");
+    }
     constexpr std::size_t block = 1ULL << 20;
     const ContextCapacityPlan plan{
         .records            = {{block, 256}, {block / 4, 256}},

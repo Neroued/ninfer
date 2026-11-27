@@ -14,6 +14,7 @@ add_library(ninfer_model_loading STATIC
   common/weights.cpp
   common/moe/weights.cpp
   qwen4_exp/ple/parameters.cpp
+  qwen4_exp/ple/placement.cpp
   qwen4_exp/ple/disk/table.cpp)
 ninfer_internal_includes(ninfer_model_loading)
 target_link_libraries(ninfer_model_loading PUBLIC ninfer_artifact ninfer_text ninfer_ops ninfer_deployment)

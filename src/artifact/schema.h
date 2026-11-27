@@ -22,6 +22,11 @@ public:
     using std::runtime_error::runtime_error;
 };
 
+class ArtifactIoError : public ArtifactError {
+public:
+    using ArtifactError::ArtifactError;
+};
+
 using Json  = nlohmann::json;
 using Shape = std::vector<std::uint64_t>;
 

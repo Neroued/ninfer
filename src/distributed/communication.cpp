@@ -518,6 +518,27 @@ void CommunicationContext::close(std::chrono::steady_clock::time_point deadline)
     request_stop();
 }
 
+void CommunicationContext::release_preparation(std::chrono::steady_clock::time_point deadline) {
+    for (auto& group : groups_) {
+        auto& p = *group->impl_;
+        if (p.capture) throw std::logic_error("cannot retire communication during capture");
+        for (auto& route : p.backends) route.implementation->close(deadline);
+    }
+#if NINFER_TARGET_SPARK
+    if (native_progress_) native_progress_->stop();
+#endif
+    for (auto& group : groups_) {
+        auto& p = *group->impl_;
+        p.backends.clear();
+        p.routing      = {};
+        p.requirements = {};
+        p.graph_gating = false;
+        p.state        = Group::Impl::State::Created;
+    }
+    native_progress_.reset();
+    warmup_ = {};
+}
+
 void CommunicationContext::sample_startup_memory() {
     for (auto& group : groups_)
         for (auto& route : group->impl_->backends)

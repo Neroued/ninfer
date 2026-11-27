@@ -39,23 +39,27 @@ build_distributed_model(const artifact::Reader& reader, EngineOptions& options,
         setup.coordinator_payload_bytes(options);
     std::vector<typename Types::PreparedSession> sessions;
     const auto requested = options;
-    auto prepared        = prepare_execution_group(
-        *group, requests, options.context_capacity,
-        GroupPreparationOptions{.memory_headroom_bytes = options.memory_headroom_bytes,
-                                .frontend_host_bytes   = frontend_host_bytes,
-                                .coordinator_node      = options.deployment->coordinator_node,
-                                .try_narrow_targets    = want_narrow,
-                                .purpose               = options.purpose},
-        std::chrono::minutes(30),
-        {[&](auto descriptions) {
-             options = requested;
-             setup.resolve(descriptions, options);
-             sessions = setup.sessions();
-         },
-                [&] {
-             sessions.clear();
-             options = requested;
-         }});
+    GroupPreparationOptions preparation_options{
+        .memory_headroom_bytes = options.memory_headroom_bytes,
+        .frontend_host_bytes   = frontend_host_bytes,
+        .coordinator_node      = options.deployment->coordinator_node,
+        .try_narrow_targets    = want_narrow,
+        .purpose               = options.purpose};
+    if constexpr (requires { setup.placement_names(); }) {
+        preparation_options.placement_names  = setup.placement_names();
+        preparation_options.maximize_context = setup.prefer_context_capacity(options);
+    }
+    auto prepared = prepare_execution_group(*group, requests, options.context_capacity,
+                                            preparation_options, std::chrono::minutes(30),
+                                            {[&](auto descriptions) {
+                                                 options = requested;
+                                                 setup.resolve(descriptions, options);
+                                                 sessions = setup.sessions();
+                                             },
+                                             [&] {
+                                                 sessions.clear();
+                                                 options = requested;
+                                             }});
     const std::uint32_t dp_count =
         static_cast<std::uint32_t>(group->topology().replicas.size());
     if (sessions.size() != dp_count) {

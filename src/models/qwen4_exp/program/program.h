@@ -22,7 +22,8 @@ class RankProgram {
 public:
     RankProgram(const execution::Parameters&, ExecutionPlan, DeviceContext&,
                 const StartupObserver& observer = {}, ParallelBinding = {},
-                std::unique_ptr<moe::ResidentExpertExchange> exchange = {});
+                std::unique_ptr<moe::ResidentExpertExchange> exchange = {},
+                const distributed::Group* ple_group                   = nullptr);
     ~RankProgram();
     RankProgram(const RankProgram&)            = delete;
     RankProgram& operator=(const RankProgram&) = delete;

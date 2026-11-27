@@ -1,4 +1,5 @@
 #include "suite.h"
+#include "../ple/lookup_reference.h"
 #include "models/qwen4_exp/execution/mtp.h"
 
 #include <bit>
@@ -53,7 +54,8 @@ void close_words(const Tensor& a, const Tensor& b, double relative_tolerance, co
 }
 } // namespace
 
-void HistoryReference::input(q::detail::RankProgramImpl& rank, const q::Commit& commit) {
+void HistoryReference::input(q::detail::RankProgramImpl& rank, const q::Commit& commit,
+                             const artifact::Reader& reader) {
     rank.device.synchronize();
     const auto& f = *rank.compute;
     adopted_.assign(f.rows.size(), 0);
@@ -69,6 +71,33 @@ void HistoryReference::input(q::detail::RankProgramImpl& rank, const q::Commit& 
         if (!row.main_frontier) prefix = {};
         check(prefix.ids.size() == row.main_frontier, "reference lost the committed target prefix");
         const auto count = f.sequence ? row.ids.size() : commit.rows[b].accepted;
+        const auto eos   = rank.parameters.profile->config.text.ple.eos;
+        const std::array<TokenId, 2> tail{prefix.ids.size() < 2 ? eos
+                                                                : prefix.ids[prefix.ids.size() - 2],
+                                          prefix.ids.empty() ? eos : prefix.ids.back()};
+        check(row.ple_raw_tail == tail,
+              "PLE raw tail contains an unadopted proposal or lost a committed ID");
+        if (f.verify) {
+            const auto valid = read<std::int32_t>(f.batch.valid_columns).at(b);
+            const auto values =
+                f.ple
+                    ? rank.resources.ple_upload->device_slot(f.ple->slot, f.tokens, f.physical.rows)
+                    : rank.device_embedding(f.tokens, f.physical.rows);
+            auto older = tail[0], previous = tail[1];
+            for (std::uint32_t col = 0; col < f.tokens; ++col) {
+                const auto words = read<std::uint16_t>(values.slice(2, b, 1).slice(1, col, 1));
+                if (col >= static_cast<unsigned>(valid))
+                    check(std::ranges::all_of(words, [](auto word) { return word == 0; }),
+                          "inactive MTP PLE column contains a nonzero word");
+                else {
+                    const auto id = ids.at(b * f.tokens + col);
+                    check_ple_column(reader, rank.parameters.model.definition(), older, previous,
+                                     id, words);
+                    older    = previous;
+                    previous = id;
+                }
+            }
+        }
         adopted_[b]      = count;
         for (std::size_t j = 0; j < count; ++j) {
             const auto at = b * f.tokens + j;

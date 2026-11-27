@@ -224,6 +224,8 @@ void subtract_rank_snapshots(std::vector<RankSnapshot>& ranks,
             rank.memory.experts->uploaded_bytes -= prior->memory.experts->uploaded_bytes;
             rank.memory.experts->prefetched_bytes -= prior->memory.experts->prefetched_bytes;
         }
+        if (rank.memory.ple_table && prior->memory.ple_table)
+            rank.memory.ple_table->merged_windows -= prior->memory.ple_table->merged_windows;
         if (rank.memory.ple && prior->memory.ple)
             for (auto field :
                  {&PleReadStats::rows, &PleReadStats::cache_hits, &PleReadStats::shared_rows,

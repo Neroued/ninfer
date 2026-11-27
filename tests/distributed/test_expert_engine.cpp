@@ -85,7 +85,7 @@ int main(int argc, char** argv) {
         const auto& p   = o.deployment->parallel;
         require(p.dp == 2 && p.tp == 1 && p.adp == 1 && p.ep == 2 && p.pp == 1,
                 "this Engine test requires dp2/tp1/adp1/ep2/pp1");
-        o.ple_storage                       = ninfer::PleStorage::Disk;
+        o.ple.storage                       = ninfer::PleStorage::Disk;
         o.prefill_chunk                     = 128;
         o.max_context                       = 512;
         o.max_concurrency                   = 2;

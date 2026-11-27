@@ -12,7 +12,7 @@ RankPreparation::RankPreparation(const artifact::Reader& reader, std::span<const
                                  const distributed::ExecutionTopology& topology,
                                  distributed::CommunicationContext& communication,
                                  const StartupObserver& observer)
-    : device_(device) {
+    : device_(device), reader_(reader) {
     distributed::wire::Decoder in(payload);
     auto request = decode_rank_load(in, identity, reader.artifact_id());
     in.finish();
@@ -38,10 +38,22 @@ RankPreparation::RankPreparation(const artifact::Reader& reader, std::span<const
             group, *request.rank.expert_domain, group.index(identity.rank), config.hidden,
             config.moe.top_k, moe::expert_exchange_block_columns);
     }
+    placements_ = request.rank.ple_candidates;
+    if (request.rank.ple_shards != ple::shard_range(request.rank.ple_placement,
+                                                    definition->config().text.ple.shards,
+                                                    identity.tp))
+        throw std::invalid_argument(
+            "Qwen4Exp PLE shard range differs from its consumer coordinate");
+    if (std::ranges::find(placements_, ple::Placement::Sharded) != placements_.end()) {
+        const auto& consumers = topology.role_group("ple", identity.rank);
+        ple_group_            = &communication.group(consumers.id);
+        if (consumers.index(identity.rank) != identity.tp.rank ||
+            consumers.members != topology.replica_for_rank(identity.rank).ranks)
+            throw std::invalid_argument(
+                "Qwen4Exp PLE shards must cover consumers of the same windows in order");
+    }
     load_.emplace(resolve_rank_load(reader, std::move(definition), std::move(request.rank),
                                     device_.device()));
-    if (load_->rank_plan().ple_placement == ple::Placement::Disk)
-        ple_geometry_ = load_->ple_table().geometry();
     auto profile = execution::describe_model(load_->definition(), load_->weight_data(), load_->expert_data(),
                                             load_->rank_plan());
     if (expert_group) {
@@ -57,8 +69,6 @@ RankPreparation::RankPreparation(const artifact::Reader& reader, std::span<const
         profile->exchange = std::move(plan);
     }
     profile_ = std::move(profile);
-    capacity_plan_ =
-        describe_execution_capacity(profile_, options_, batches_, device_, ple_geometry_);
     const WorkContract contract{describe_execution_shape(*profile_, options_),
                                 profile_->config.text.vocabulary,
                                 profile_->public_tokens,
@@ -79,8 +89,42 @@ runtime::PreparationMemory RankPreparation::memory() const {
 void RankPreparation::materialize() {
     if (!load_) throw std::logic_error("Qwen4Exp rank weights are already materialized");
     instance_ = std::make_unique<Instance>(
-        materialize_model(std::move(*load_), device_, &options_.startup_observer), profile_);
+        materialize_weights(std::move(*load_), device_, &options_.startup_observer), profile_);
     load_.reset();
+}
+
+runtime::PlacementOffer RankPreparation::offer_placement(std::size_t id) const {
+    const auto& model = *instance_->model;
+    const auto layout = placements_.at(id);
+    auto table = plan_ple_table(reader_, model.definition(), layout, model.rank_plan().placement.tp,
+                                device_.device());
+    auto profile           = std::make_shared<execution::ModelProfile>(*profile_);
+    profile->ple_placement = layout;
+    auto plan = describe_execution_capacity(profile, options_, batches_, device_, table.geometry());
+    plan.fixed_device_bytes += table.device_bytes();
+    plan.fixed_host_bytes += table.host_bytes();
+    if (device_memory_snapshot(device_.device()).shared_physical_memory)
+        plan.fixed_device_bytes += table.host_bytes();
+    return {std::move(plan), table.device_bytes(), table.host_bytes()};
+}
+
+void RankPreparation::materialize_placement(std::size_t id) {
+    auto& model       = *instance_->model;
+    const auto layout = placements_.at(id);
+    auto table = plan_ple_table(reader_, model.definition(), layout, model.rank_plan().placement.tp,
+                                device_.device());
+    ple_geometry_           = table.geometry();
+    profile_->ple_placement = layout;
+    capacity_plan_ =
+        describe_execution_capacity(profile_, options_, batches_, device_, ple_geometry_);
+    model.prepare_ple(std::move(table), device_, &options_.startup_observer);
+}
+
+void RankPreparation::release_placement() {
+    release_resources();
+    instance_->model->release_ple();
+    graph_memory_  = {};
+    capacity_plan_ = {};
 }
 
 std::vector<distributed::GroupRequirements> RankPreparation::communication_requirements() const {
@@ -111,7 +155,7 @@ std::vector<distributed::GroupRequirements> RankPreparation::communication_requi
                                 conditioning * batch, 1, Reduction::Sum, owner});
         }
     }
-    if (plan.persistent.buffers.ple_embedding) {
+    if (profile_->ple_placement == ple::Placement::Sharded) {
         const auto words =
             profile_->config.text.ple.embedding * dtype_size(DType::BF16) / dtype_size(DType::U32);
         work.push_back({Collective::AllReduce, DType::U32, words, words * columns, words});
@@ -147,7 +191,7 @@ runtime::RankPreparationReport RankPreparation::report(std::size_t available) co
     const auto reserve = graph_memory_.rebuild_estimate_bytes;
     return {.capacity             = {capacity_plan_, available > reserve ? available - reserve : 0},
             .weight_bytes         = s.device_capacity_bytes + model.metadata_bytes(),
-            .host_weight_bytes    = s.host_capacity_bytes,
+            .host_weight_bytes    = s.host_capacity_bytes + model.ple_host_bytes(),
             .staging_bytes        = s.peak_staging_bytes,
             .read_bytes           = s.read_bytes,
             .upload_bytes         = s.h2d_bytes,
@@ -172,7 +216,8 @@ void RankPreparation::create_probe(GraphProbeBacking backing) {
     auto plan = plan_graph_probe(profile_, ple_geometry_, options_, batches_, device_, {}, backing);
     probe_    = std::make_unique<RankProgram>(
         instance_->parameters, std::move(plan), device_, options_.startup_observer, binding_,
-        expert_group_ ? profile_->exchange->prepare(*expert_group_) : nullptr);
+        expert_group_ ? profile_->exchange->prepare(*expert_group_) : nullptr,
+        profile_->ple_placement == ple::Placement::Sharded ? ple_group_ : nullptr);
 }
 
 void RankPreparation::calibrate() {
@@ -213,14 +258,15 @@ void RankPreparation::prepare(runtime::ContextCapacity capacity, std::size_t ava
             control_owner_ && shared_memory ? capacity_plan_.control_bytes(capacity) : 0;
         const auto required  = capacity_plan_.reservation_bytes(capacity) + control;
         const auto remaining = available > reserve ? available - reserve : 0;
-        throw std::runtime_error("Qwen4Exp rank allocation budget exceeded: required " +
-                                 std::to_string(required) + " bytes, available " +
-                                 std::to_string(remaining) + " bytes, shortfall " +
-                                 std::to_string(required - remaining) + " bytes");
+        throw runtime::ContextBudgetError(
+            "Qwen4Exp rank allocation budget exceeded: required " + std::to_string(required) +
+            " bytes, available " + std::to_string(remaining) + " bytes, shortfall " +
+            std::to_string(required - std::min(required, remaining)) + " bytes");
     }
     instance_->program = std::make_unique<RankProgram>(
         instance_->parameters, std::move(*plan), device_, options_.startup_observer, binding_,
-        expert_group_ ? profile_->exchange->prepare(*expert_group_) : nullptr);
+        expert_group_ ? profile_->exchange->prepare(*expert_group_) : nullptr,
+        profile_->ple_placement == ple::Placement::Sharded ? ple_group_ : nullptr);
 }
 
 void RankPreparation::release_resources() {

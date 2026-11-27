@@ -334,6 +334,7 @@ void RankProgramImpl::prepare_main() {
                     f.target_replay.proposal = proposal;
             }
             (void)graphs->start_target(route, f.target_replay);
+            if (ple_merge) ++merged_ple_windows;
             request_decision();
             f.graph_main = true;
             f.phase      = ComputePhase::AfterMain;
@@ -358,7 +359,7 @@ void RankProgramImpl::prepare_main() {
                                              records.coordinates,
                                              records.ple,
                                              parallel ? &*parallel : nullptr,
-                                             parallel && !host_ple ? &ple_ready : nullptr};
+                                             ple_merge ? &ple_ready : nullptr};
     execution::StateUpdate update = execution::StepUpdate{};
     if (f.verify)
         update.emplace<execution::VerifyRecords>(resources.replay(t).records);

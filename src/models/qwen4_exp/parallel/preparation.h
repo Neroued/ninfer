@@ -8,8 +8,8 @@
 
 namespace ninfer::models::qwen4_exp {
 
-// The source Reader is borrowed until materialize() returns. The same stable instance owns
-// weights, Parameters and the final Program through preparation and execution.
+// The prepare loop owns the Reader through candidate selection and drops it on activation.
+// Base weights survive table and Program retries.
 class RankPreparation {
 public:
     using Types    = RuntimeTypes;
@@ -22,6 +22,9 @@ public:
 
     [[nodiscard]] runtime::PreparationMemory memory() const;
     void materialize();
+    [[nodiscard]] runtime::PlacementOffer offer_placement(std::size_t id) const;
+    void materialize_placement(std::size_t id);
+    void release_placement();
     [[nodiscard]] std::vector<distributed::GroupRequirements> communication_requirements() const;
     void prepare_probe();
     void calibrate();
@@ -42,13 +45,16 @@ private:
     EngineOptions options_;
     std::shared_ptr<const BatchExecutionPlan> batches_;
     DeviceContext& device_;
+    const artifact::Reader& reader_;
+    std::vector<ple::Placement> placements_;
     ParallelBinding binding_;
+    const distributed::Group* ple_group_    = nullptr;
     const distributed::Group* expert_group_ = nullptr;
     std::optional<distributed::GroupRequirements> expert_requirements_;
     std::size_t host_reservation_bytes_ = 0;
     bool control_owner_                 = false;
     std::optional<ResolvedLoadPlan> load_;
-    std::shared_ptr<const execution::ModelProfile> profile_;
+    std::shared_ptr<execution::ModelProfile> profile_;
     ple::disk::TableGeometry ple_geometry_;
     runtime::ContextCapacityPlan capacity_plan_;
     std::unique_ptr<Instance> instance_;

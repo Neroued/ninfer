@@ -16,6 +16,10 @@ constexpr FieldSpec kFields[] = {
     {Field::Vision, "model.vision", "--vision", "--no-vision", "", "Load Vision resources."},
     {Field::PleStorage, "model.ple.storage", "--ple-storage", "", "auto|disk|device",
      "Qwen4Exp PLE table storage.", Scope::Common},
+    {Field::PleDeviceLayout, "model.ple.device_layout", "--ple-device-layout", "",
+     "auto|replicated|sharded", "Device PLE table placement among consumers.", Scope::Common},
+    {Field::PlePreference, "model.ple.preference", "--ple-preference", "", "capacity|latency",
+     "Preference among feasible PLE placements.", Scope::Common},
     {Field::VisionMemoryBudget, "vision.memory_budget", "--vision-memory-budget", "", "SIZE",
      "Per-rank Vision activation and output-window budget (1GiB); excludes weights.",
      Scope::Generation, ConfigurationUnit::Bytes},
@@ -392,6 +396,10 @@ FieldValue parse_field_value(Field field, const RawValue& value, bool command_li
         return enumeration(value, {"bf16", "int8", "fp8", "nvfp4", "k8v4"});
     case Field::PleStorage:
         return enumeration(value, {"auto", "disk", "device"});
+    case Field::PleDeviceLayout:
+        return enumeration(value, {"auto", "replicated", "sharded"});
+    case Field::PlePreference:
+        return enumeration(value, {"capacity", "latency"});
     case Field::LinearStateDtype:
         return enumeration(value, {"fp32", "bf16"});
     case Field::SpecBackend:

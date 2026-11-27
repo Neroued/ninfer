@@ -98,7 +98,8 @@ class RankProgramImpl {
 public:
     RankProgramImpl(const execution::Parameters&, ExecutionPlan, DeviceContext&,
                     const StartupObserver& observer = {}, ParallelBinding = {},
-                    std::unique_ptr<moe::ResidentExpertExchange> = {});
+                    std::unique_ptr<moe::ResidentExpertExchange> = {},
+                    const distributed::Group* ple_group          = nullptr);
     ~RankProgramImpl();
 
     GraphPreparationSample initialize_graphs(GraphPreparationMode = GraphPreparationMode::Complete);
@@ -184,7 +185,8 @@ public:
     const execution::Parameters& parameters;
     DeviceContext& device;
     CudaExecutionView cuda;
-    std::optional<ParallelExecution> parallel;
+    std::optional<ParallelExecution> parallel, ple_merge;
+    std::uint64_t merged_ple_windows = 0;
     std::unique_ptr<moe::ResidentExpertExchange> exchange;
     std::uint64_t last_expert_step = 0;
     Resources resources;

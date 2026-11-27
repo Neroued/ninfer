@@ -55,7 +55,10 @@ void RankProgramImpl::prepare_device_ple(const execution::BatchView& batch, bool
     ops::ngram_embedding_lookup(batch.ids, batch.valid_columns, {tail_field}, hash,
                                 parameters.profile->config.text.ple.eos, table.shards, embedding,
                                 producer);
-    if (parallel) parallel->merge_unique(embedding, producer);
+    if (ple_merge) {
+        ple_merge->merge_unique(embedding, producer);
+        if (compute) ++merged_ple_windows; // Graph construction has no submitted frame.
+    }
     ple_ready.record(producer.stream());
 }
 
@@ -73,7 +76,10 @@ void RankProgramImpl::prepare_packed_device_ple(const PackedInputLayout& io) {
     ops::ngram_embedding_lookup(f.batch.ids, f.packed->ragged, {tail}, hash,
                                 parameters.profile->config.text.ple.eos, table.shards, embedding,
                                 producer);
-    if (parallel) parallel->merge_unique(embedding, producer);
+    if (ple_merge) {
+        ple_merge->merge_unique(embedding, producer);
+        ++merged_ple_windows;
+    }
     ple_ready.record(producer.stream());
 }
 

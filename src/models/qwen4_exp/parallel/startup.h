@@ -20,6 +20,11 @@ public:
     [[nodiscard]] qwen::Frontend frontend(const EngineOptions&) const;
     [[nodiscard]] std::vector<distributed::wire::Bytes> requests(const EngineOptions&,
                                                                  bool narrow_targets = false) const;
+    [[nodiscard]] std::vector<std::string> placement_names() const;
+
+    [[nodiscard]] bool prefer_context_capacity(const EngineOptions& o) const {
+        return o.ple.preference == PlePreference::Capacity;
+    }
     [[nodiscard]] bool narrow_targets(const EngineOptions&) const noexcept;
     [[nodiscard]] std::size_t coordinator_payload_bytes(const EngineOptions&) const;
     void resolve(std::span<const distributed::wire::Payload>, EngineOptions&);
@@ -40,6 +45,7 @@ public:
 
 private:
     std::shared_ptr<const ModelDefinition> definition_;
+    std::vector<ple::Placement> placements_;
     ParallelPlan parallel_;
     std::shared_ptr<const BatchExecutionPlan> batches_;
     std::vector<GroupExecutionPlan> plans_;

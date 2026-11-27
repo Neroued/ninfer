@@ -96,7 +96,7 @@ execution::TextRun main_run(RankProgramImpl& p, execution::BatchView batch, Cuda
                                              records.coordinates,
                                              records.ple,
                                              p.parallel ? &*p.parallel : nullptr,
-                                             p.parallel && !p.host_ple ? &p.ple_ready : nullptr};
+                                             p.ple_merge ? &p.ple_ready : nullptr};
     execution::StateUpdate update = execution::StepUpdate{};
     if (batch.tokens > 1) update.emplace<execution::VerifyRecords>(r.replay(batch.tokens).records);
     return execution::TextRun(p.parameters, execution, batch, update, cuda);

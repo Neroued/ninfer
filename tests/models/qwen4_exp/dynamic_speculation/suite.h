@@ -15,7 +15,7 @@ void exercise(q::Session&, runtime::Executor<q::ExecutionTypes>&, models::qwen::
 
 class HistoryReference {
 public:
-    void input(q::detail::RankProgramImpl&, const q::Commit&);
+    void input(q::detail::RankProgramImpl&, const q::Commit&, const artifact::Reader&);
     void compare(q::detail::RankProgramImpl&);
 private:
     struct Prefix {

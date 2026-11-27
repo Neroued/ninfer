@@ -37,8 +37,11 @@ auto fields(T& v) {
     else if constexpr (std::is_same_v<Value, PleReadStats>)
         return std::tie(v.rows, v.cache_hits, v.shared_rows, v.shared_pages, v.reads, v.read_bytes,
                         v.uploaded_bytes);
+    else if constexpr (std::is_same_v<Value, PleTableSummary>)
+        return std::tie(v.placement, v.first_shard, v.local_shards, v.total_shards, v.device_bytes,
+                        v.host_bytes, v.merged_windows);
     else if constexpr (std::is_same_v<Value, RankMemoryUsage>)
-        return std::tie(v.allocations, v.workspace, v.vision, v.experts, v.ple);
+        return std::tie(v.allocations, v.workspace, v.vision, v.experts, v.ple, v.ple_table);
     else if constexpr (std::is_same_v<Value, PhysicalMemorySample>)
         return std::tie(v.cuda_total_bytes, v.cuda_free_bytes, v.system_total_bytes,
                         v.system_available_bytes, v.shared_physical_memory, v.sampled_ns);

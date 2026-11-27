@@ -41,6 +41,18 @@ std::span<const io::FileView> FileBacking::files() const noexcept {
     return impl_ ? std::span<const io::FileView>(impl_->files) : std::span<const io::FileView>{};
 }
 
+std::size_t FileBacking::host_bytes() const noexcept {
+    if (!impl_) return 0;
+    auto bytes = sizeof(Impl) + impl_->owners.capacity() * sizeof(io::ReadOnlyFile) +
+                 impl_->files.capacity() * sizeof(io::FileView);
+    for (const auto& item : impl_->objects) {
+        const auto& object = item.second;
+        bytes += sizeof(item) + object.segments.capacity() * sizeof(ReadSegment);
+        if (object.geometry) bytes += object.geometry->shape.capacity() * sizeof(std::uint64_t);
+    }
+    return bytes;
+}
+
 FileBacking prepare_file_backing(const Reader& reader, std::span<const ObjectHandle> objects) {
     FileBacking result;
     auto& out = *result.impl_;

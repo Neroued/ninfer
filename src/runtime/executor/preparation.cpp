@@ -2,9 +2,11 @@
 #include "core/device.h"
 #include "distributed/communication/preparation.h"
 #include "runtime/engine/startup_memory.h"
+#include "runtime/engine/placement_selection.h"
 
 #include <algorithm>
 #include <map>
+#include <iostream>
 #include <set>
 #include <thread>
 
@@ -448,10 +450,13 @@ prepare_execution_group(dist::ExecutionGroup& group, std::span<const wire::Bytes
         };
 
         (void)recv_reports(everyone);
-        enter_subset(group, everyone, state, current_attempt,
-                     PreparationAction::PrepareCommunication);
-        dist::prepare_communication(group, timeout);
-        (void)recv_reports(everyone);
+        const auto connect = [&] {
+            enter_subset(group, everyone, state, current_attempt,
+                         PreparationAction::PrepareCommunication);
+            dist::prepare_communication(group, timeout);
+            (void)recv_reports(everyone);
+        };
+        if (options.placement_names.empty()) connect();
 
         const auto loading_reservations =
             cluster_host_reservations(capacity_offers(state.reports), sample_coordinator_offer());
@@ -464,10 +469,10 @@ prepare_execution_group(dist::ExecutionGroup& group, std::span<const wire::Bytes
         }
         sample_baseline();
 
-        const auto release_all = [&]() {
+        const auto release_all = [&](PreparationAction action = PreparationAction::Release) {
             if (control.release) control.release();
             for (auto& layout : state.layouts) layout = {};
-            enter_subset(group, everyone, state, current_attempt, PreparationAction::Release);
+            enter_subset(group, everyone, state, current_attempt, action);
             ++current_attempt;
             for (auto& [peer, bytes] :
                  receive_subset(group, everyone, wire::Kind::Prepared, timeout)) {
@@ -578,6 +583,15 @@ prepare_execution_group(dist::ExecutionGroup& group, std::span<const wire::Bytes
             return retry;
         };
 
+        const auto block_score = [](std::span<const ContextCapacityResolution> capacities) {
+            std::size_t blocks = SIZE_MAX;
+            for (const auto& rank : capacities)
+                blocks = std::min(blocks, rank.device_bytes / rank.block_bytes);
+            return blocks;
+        };
+        const bool rank_by_capacity =
+            options.maximize_context && options.placement_names.size() > 1;
+        std::size_t accepted_blocks = 0;
         std::optional<std::vector<ContextCapacityResolution>> narrow_upper;
         std::vector<ContextCapacityPlan> baseline_plans;
         if (options.try_narrow_targets && policy.mode == ContextCapacityMode::Automatic) {
@@ -642,6 +656,9 @@ prepare_execution_group(dist::ExecutionGroup& group, std::span<const wire::Bytes
                     }
                     if (failure.message.empty()) {
                         state.attempt = current_attempt;
+                        if (rank_by_capacity)
+                            accepted_blocks = block_score(resolve_cluster_context_capacity(
+                                ContextCapacityPolicy::automatic(), offers, coordinator));
                         if (narrow && trial == 0 && !baseline_plans.empty()) {
                             // These offers were captured before Program, KV and directories
                             // existed.
@@ -667,6 +684,77 @@ prepare_execution_group(dist::ExecutionGroup& group, std::span<const wire::Bytes
             }
             return first_failure;
         };
+
+        if (!options.placement_names.empty()) {
+            std::vector<PlacementEstimate> candidates;
+            std::vector<std::vector<std::vector<dist::RankId>>> waves(
+                options.placement_names.size());
+            std::string failures;
+            const auto rejected = [&](std::size_t id, std::string_view reason) {
+                auto message = options.placement_names.at(id) + ": " + std::string(reason);
+                std::clog << "[placement] " << message << '\n';
+                if (!failures.empty()) failures += "; ";
+                failures += message;
+            };
+            const auto origin      = capacity_offers(state.reports);
+            const auto coordinator = sample_coordinator_offer();
+            for (std::size_t id = 0; id < options.placement_names.size(); ++id) {
+                enter_subset(group, everyone, state, current_attempt,
+                             PreparationAction::OfferPlacement, id);
+                if (auto error = recv_reports(everyone); !error.empty()) {
+                    rejected(id, error);
+                    continue;
+                }
+                auto offers = origin;
+                for (const auto rank : everyone)
+                    offers[rank].plan = state.reports[rank].capacity.plan;
+                try {
+                    (void)resolve_cluster_context_capacity(policy, offers, coordinator,
+                                                           options.purpose);
+                    const auto upper =
+                        rank_by_capacity
+                            ? block_score(resolve_cluster_context_capacity(
+                                  ContextCapacityPolicy::automatic(), offers, coordinator))
+                            : 0;
+                    const auto reservations = cluster_host_reservations(offers, coordinator);
+                    waves[id] = build_materialization_waves(topology, state.reports, reservations);
+                    candidates.push_back({id, 0, id, upper});
+                } catch (const ContextBudgetError& error) { rejected(id, error.what()); }
+            }
+            const auto install = [&](std::size_t id) -> std::optional<std::size_t> {
+                for (const auto& wave : waves[id]) {
+                    enter_subset(group, wave, state, current_attempt,
+                                 PreparationAction::MaterializePlacement, id);
+                    if (auto error = recv_reports(wave); !error.empty()) {
+                        rejected(id, error);
+                        return {};
+                    }
+                }
+                connect();
+                sample_baseline();
+                if (auto error = run_target_mode(false); !error.empty()) {
+                    rejected(id, error);
+                    return {};
+                }
+                return accepted_blocks;
+            };
+            const auto selected = select_prepared_placement(
+                candidates, install, [&] { release_all(PreparationAction::ReleasePlacement); });
+            if (selected) {
+                std::clog << "[placement] selected " << options.placement_names[*selected];
+                for (const auto& candidate : candidates) {
+                    if (candidate.id == *selected) continue;
+                    std::clog << "; alternative " << options.placement_names[candidate.id];
+                    if (rank_by_capacity)
+                        std::clog << " upper_bound_blocks=" << candidate.blocks;
+                    else
+                        std::clog << " preference=" << candidate.preference;
+                }
+                std::clog << '\n';
+                return state;
+            }
+            throw ContextBudgetError("no feasible model placement: " + failures);
+        }
 
         if (options.try_narrow_targets && run_target_mode(true).empty()) {
             if (policy.mode == ContextCapacityMode::Explicit ||

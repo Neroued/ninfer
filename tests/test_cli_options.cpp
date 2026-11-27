@@ -73,6 +73,20 @@ void test_arguments() {
     require(defaults.launch.generation.max_tokens == 128 &&
                 defaults.launch.generation.sampling.seed == 0,
             "CLI generation defaults differ");
+    require(engine.ple.storage == ninfer::PleStorage::Auto &&
+                engine.ple.device_layout == ninfer::PleDeviceLayout::Auto &&
+                engine.ple.preference == ninfer::PlePreference::Capacity,
+            "PLE policy defaults");
+    Files ple_file;
+    const auto ple_config = ple_file.write(
+        "[model.ple]\nstorage='device'\ndevice_layout='sharded'\npreference='latency'\n");
+    const auto ple = parse({"ninfer", "model.ninfer", "--prompt", "hello", "--config",
+                            ple_config.string(), "--ple-device-layout", "replicated"})
+                         .launch.engine.ple;
+    require(ple.storage == ninfer::PleStorage::Device &&
+                ple.device_layout == ninfer::PleDeviceLayout::Replicated &&
+                ple.preference == ninfer::PlePreference::Latency,
+            "PLE file settings and CLI override");
     const auto resources =
         parse({"ninfer", "model.ninfer", "--prompt", "hello", "--max-concurrency", "4",
                "--context-capacity", "2GiB", "--host-cache-capacity", "64MiB", "--prefix-reuse",

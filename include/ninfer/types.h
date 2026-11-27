@@ -161,6 +161,14 @@ struct ObservabilityOptions {
 };
 
 enum class PleStorage : std::uint8_t { Auto, Disk, Device };
+enum class PleDeviceLayout : std::uint8_t { Auto, Replicated, Sharded };
+enum class PlePreference : std::uint8_t { Capacity, Latency };
+
+struct PleOptions {
+    PleStorage storage            = PleStorage::Auto;
+    PleDeviceLayout device_layout = PleDeviceLayout::Auto;
+    PlePreference preference      = PlePreference::Capacity;
+};
 
 struct EngineOptions {
     ObservabilityOptions observability;
@@ -180,7 +188,7 @@ struct EngineOptions {
     // Zero uses 4096 for Qwen4Exp, GLM5Next, or CPU expert offload, otherwise 1024.
     std::uint32_t prefill_chunk = 0;
     MoeOptions moe;
-    PleStorage ple_storage              = PleStorage::Auto;
+    PleOptions ple;
     KvCacheStorage kv_cache             = KvCacheStorage::BFloat16;
     LinearStateDType linear_state_dtype = LinearStateDType::Float32;
     SpeculativeOptions speculative;

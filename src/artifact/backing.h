@@ -25,6 +25,7 @@ public:
     [[nodiscard]] FileObjectView object(ObjectHandle handle) const;
     [[nodiscard]] const WeightGeometry& geometry(ObjectHandle handle) const;
     [[nodiscard]] std::span<const io::FileView> files() const noexcept;
+    [[nodiscard]] std::size_t host_bytes() const noexcept;
 
 private:
     struct Impl;

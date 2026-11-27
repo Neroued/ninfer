@@ -5,6 +5,7 @@
 #include "runtime/executor/preparation.h"
 #include "runtime/engine/context_cache/context_cost.h"
 #include "runtime/engine/startup_memory.h"
+#include "runtime/engine/placement_selection.h"
 #include "artifact/reader.h"
 #include "artifact/formats.h"
 #include "models/common/startup.h"
@@ -32,12 +33,13 @@ template <class Plan>
 struct CalibratedPlan {
     Plan startup;
     GraphMemorySummary graph;
+    std::size_t placement_blocks = 0;
 };
 
-template <class Setup, class... TargetOptions>
+template <class Setup, class Placement, class... TargetOptions>
 auto plan_local_context(const Setup& setup, DeviceContext& device, const EngineOptions& options,
-                        models::WeightPlacement placement, std::size_t available,
-                        std::size_t available_host, const TargetOptions&... targets) {
+                        Placement placement, std::size_t available, std::size_t available_host,
+                        const TargetOptions&... targets) {
     auto plan = setup.plan(device, options, placement, available, available_host, targets...);
     if (!plan || options.purpose != EnginePurpose::CausalScoring ||
         options.context_capacity.mode != ContextCapacityMode::Automatic)
@@ -96,7 +98,15 @@ calibrate_plan(const Setup& setup, RankModelInstance<typename Setup::Types>& ins
         auto next = replan(setup, device, options, candidate, offered, available_host);
         if (!next) return std::nullopt;
         const auto next_key = setup.graph_plan(probe_options, next->preparation);
-        if (next_key == key) return CalibratedPlan{std::move(*next), graph};
+        const auto finish   = [&](auto ready, std::size_t ceiling) {
+            std::size_t blocks = 0;
+            if constexpr (requires {
+                              setup.capacity_blocks(ready, options, ceiling, available_host);
+                          })
+                blocks = setup.capacity_blocks(ready, options, ceiling, available_host);
+            return CalibratedPlan{std::move(ready), graph, blocks};
+        };
+        if (next_key == key) return finish(std::move(*next), offered);
         const bool revisited = std::any_of(measured.begin(), measured.end(),
                                            [&](const auto& item) { return item.plan == next_key; });
         if (revisited && candidate.sequence.device_reservation_bytes() <= offered) {
@@ -112,7 +122,7 @@ calibrate_plan(const Setup& setup, RankModelInstance<typename Setup::Types>& ins
                 } else
                     high = middle - 1;
             }
-            return CalibratedPlan{std::move(candidate), graph};
+            return finish(std::move(candidate), low);
         }
         candidate = std::move(*next);
     }
@@ -310,29 +320,16 @@ BuiltModel<typename Setup::Types> build_local_model(const artifact::Reader& read
     const auto limit            = device_budget(initial.available_bytes());
     const auto host_reservation = options.enable_vision ? options.media_live_bytes : 0;
     StartupMemoryBudget budget(initial, limit, options.memory_headroom_bytes, host_reservation);
-    const auto choices   = setup.placements();
-    std::size_t selected = 0;
-    const auto choose    = [&](DeviceMemorySnapshot snapshot) {
-        const auto available      = budget.planning_available(snapshot);
-        const auto host_available = budget.available_host(snapshot);
-        for (; selected < choices.size(); ++selected) {
-            const auto& choice = choices[selected];
-            if (choice.device_bytes > available || choice.host_bytes > host_available) continue;
-            auto remaining = available - choice.device_bytes;
-            if (snapshot.shared_physical_memory) {
-                if (choice.host_bytes > remaining) continue;
-                remaining -= choice.host_bytes;
-            }
-            auto plan = plan_local_context(setup, device, options, choice.placement, remaining,
-                                           host_available - choice.host_bytes);
-            if (plan) return plan;
+    const auto choices = [&] {
+        if constexpr (requires { setup.placements(device, options, limit, limit, true); }) {
+            const auto snapshot = device_memory_snapshot(device.device());
+            return setup.placements(device, options, budget.planning_available(snapshot),
+                                    budget.available_host(snapshot),
+                                    snapshot.shared_physical_memory);
+        } else {
+            return setup.placements();
         }
-        return std::optional<typename Setup::ExecutionPlan>{};
-    };
-    auto candidate = choose(device_memory_snapshot(device.device()));
-    if (!candidate)
-        throw std::invalid_argument(
-            "Device budget cannot hold model weights and required execution resources");
+    }();
     binding.complete();
     using Types = typename Setup::Types;
     std::unique_ptr<RankModelInstance<Types>> instance;
@@ -349,13 +346,40 @@ BuiltModel<typename Setup::Types> build_local_model(const artifact::Reader& read
     const auto& definition_stats = setup.definition()->resource_stats();
     LoadSummary summary;
     summary.artifact_bytes_read = definition_stats.read_bytes;
-    for (;;) {
+    const auto requested        = options;
+    std::string reasons;
+    const auto prepare = [&](std::size_t index) -> std::optional<std::size_t> {
+        const auto& choice = choices[index];
         try {
-            auto model =
-                setup.materialize(device, choices[selected].placement, options.startup_observer);
+            auto cost = choice;
+            if constexpr (requires { setup.outstanding(choice); }) {
+                setup.release_other_weights(choice.placement);
+                cost = setup.outstanding(choice);
+            }
+            const auto snapshot  = device_memory_snapshot(device.device());
+            const auto available = budget.planning_available(snapshot);
+            const auto host      = budget.available_host(snapshot);
+            if (cost.device_bytes > available || cost.host_bytes > host ||
+                (snapshot.shared_physical_memory &&
+                 cost.host_bytes > available - cost.device_bytes))
+                throw ContextBudgetError(
+                    "weight and table backing exceed the current physical budget");
+            const auto remaining = available - cost.device_bytes -
+                                   (snapshot.shared_physical_memory ? cost.host_bytes : 0);
+            auto candidate = plan_local_context(setup, device, options, choice.placement, remaining,
+                                                host - cost.host_bytes);
+            if (!candidate)
+                throw ContextBudgetError(
+                    "model and Context working set exceed the physical budget");
+            auto model = setup.materialize(device, choice.placement, options.startup_observer);
             device.synchronize();
             available_after_weights = device_memory_snapshot(device.device()).available_bytes();
-            const auto& stats       = model->storage_stats();
+            const auto stats        = [&] {
+                if constexpr (requires { setup.last_load(); })
+                    return setup.last_load();
+                else
+                    return model->storage_stats();
+            }();
             summary.upload_seconds += stats.upload_seconds;
             summary.artifact_bytes_read += stats.read_bytes;
             summary.host_to_device_bytes += stats.h2d_bytes;
@@ -364,20 +388,46 @@ BuiltModel<typename Setup::Types> build_local_model(const artifact::Reader& read
             instance = std::make_unique<RankModelInstance<Types>>(std::move(model), setup.profile);
             calibrated = initialize_program(setup, *instance, prepared_session, memory, device,
                                             options, budget, std::move(*candidate));
-        } catch (const DeviceAllocationError&) {
-            if (selected + 1 == choices.size()) throw;
-            calibrated.reset();
+            if (!calibrated)
+                throw ContextBudgetError(
+                    "calibrated execution exceeds the requested Context budget");
+            return calibrated->placement_blocks;
+        } catch (const DeviceAllocationError& error) {
+            if (choices.size() == 1) throw;
+            reasons += std::string(error.what()) + "; ";
+        } catch (const ContextBudgetError& error) {
+            if constexpr (requires { setup.placement_name(choice); })
+                reasons += setup.placement_name(choice) + ": ";
+            reasons += std::string(error.what()) + "; ";
         }
-        if (calibrated) break;
-        instance.reset();
+        return {};
+    };
+    const auto release = [&] {
+        prepared_session.reset();
+        if (instance) instance->program.reset();
         device.synchronize();
-        if (++selected == choices.size())
-            throw std::invalid_argument(
-                "Device budget cannot hold the calibrated runtime and requested Context capacity");
-        candidate = choose(device_memory_snapshot(device.device()));
-        if (!candidate)
-            throw std::invalid_argument("Device budget cannot hold model execution resources");
+        if constexpr (requires { setup.retain_weights(std::move(instance->model)); })
+            if (instance) setup.retain_weights(std::move(instance->model));
+        instance.reset();
+        calibrated.reset();
+        options = requested;
+        memory  = {};
+    };
+    std::vector<PlacementEstimate> ordering;
+    for (std::size_t i = 0; i < choices.size(); ++i) {
+        if constexpr (requires { setup.estimate(i, choices[i]); })
+            ordering.push_back(setup.estimate(i, choices[i]));
+        else
+            ordering.push_back({i, i, 0, 0});
     }
+    const auto installed = select_prepared_placement(std::move(ordering), prepare, release);
+    if (!installed)
+        throw ContextBudgetError("Device budget cannot hold model execution resources: " + reasons);
+    if constexpr (requires {
+                      setup.report_placement(choices, *installed, calibrated->placement_blocks,
+                                             reasons);
+                  })
+        setup.report_placement(choices, *installed, calibrated->placement_blocks, reasons);
     memory.context_capacities.front().available_after_weights_bytes = available_after_weights;
     memory.context_capacities.front().available_after_startup_bytes =
         device_memory_snapshot(device.device()).available_bytes();

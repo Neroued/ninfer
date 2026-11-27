@@ -251,6 +251,20 @@ void check_device(const artifact::Reader& reader, const Model& model, Bank bank)
 void qwen_case(const artifact::Reader& reader, const std::filesystem::path& path,
                const EngineOptions& options, std::optional<std::uint32_t> materialize) {
     auto def = qwen::read_definition(reader, models::load_options(options));
+    using qwen::ple::Placement;
+    const auto split = qwen::ple::shard_range;
+    require(split(Placement::Sharded, 5, {0, 3}) == models::IndexRange{0, 2} &&
+                split(Placement::Sharded, 5, {2, 3}) == models::IndexRange{4, 1} &&
+                split(Placement::Sharded, 2, {2, 3}) == models::IndexRange{2, 0},
+            "unequal PLE ranges lost coverage or an empty participant");
+    const auto forced = qwen::ple::placements({PleStorage::Auto, PleDeviceLayout::Sharded}, 5, 1);
+    require(forced == std::vector{Placement::Replicated},
+            "one-consumer sharded PLE was not canonicalized");
+    bool conflict = false;
+    try {
+        (void)qwen::ple::placements({PleStorage::Disk, PleDeviceLayout::Replicated}, 5, 2);
+    } catch (const std::invalid_argument&) { conflict = true; }
+    require(conflict, "explicit Disk and device layout conflict was accepted");
     auto p   = qwen::plan_parallel(*def, deployment(2, 1, 1, 2, path), qwen::ple::Placement::Disk);
     require(def->weights().mtp.has_value(), "fixture requires MTP");
     const auto full    = qwen::execution::describe_model(*def);

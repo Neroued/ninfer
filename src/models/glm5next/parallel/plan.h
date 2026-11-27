@@ -11,7 +11,8 @@ struct DraftPartition {
 };
 
 struct RankPlan {
-    std::uint32_t rank = 0, size = 1, ep_size = 1;
+    RankPlacement placement;
+    IndexRange mla_heads;
     IndexRange kda_heads, vocabulary, dense_intermediate, shared_intermediate;
     std::optional<DraftPartition> draft;
     std::vector<WeightId> whole;

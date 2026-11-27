@@ -8,7 +8,8 @@ Startup::Startup(const artifact::Reader& definition_source, const artifact::Read
                  const EngineOptions& options, Device device)
     : reader_(rank_source), definition_(read_definition(definition_source, load_options(options))) {
     if (options.deployment) {
-        const auto parallel = plan_parallel(*definition_, *options.deployment);
+        const auto parallel =
+            plan_parallel(*definition_, *options.deployment, ple::Placement::Disk);
         if (parallel.ranks.size() != 1)
             throw std::invalid_argument("Qwen4Exp distributed generation is not implemented");
     }

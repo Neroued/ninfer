@@ -86,6 +86,33 @@ const GroupDescription& ExecutionTopology::group(GroupId id) const {
     return *found;
 }
 
+const GroupDescription& ExecutionTopology::role_group(std::string_view name, RankId member) const {
+    for (const auto& binding : roles) {
+        if (binding.role != name) continue;
+        const auto& candidate = group(binding.group);
+        if (std::ranges::find(candidate.members, member) != candidate.members.end())
+            return candidate;
+    }
+    throw std::invalid_argument("missing communication role " + std::string(name) + " for rank " +
+                                std::to_string(member));
+}
+
+void ExecutionTopology::add_role(std::string_view name, std::span<const RankId> members,
+                                 GroupUsage usage) {
+    if (members.size() == 1) return; // Local roles require no communicator.
+    const auto same = std::ranges::find_if(groups, [&](const GroupDescription& g) {
+        return g.usage == usage && std::ranges::equal(g.members, members);
+    });
+    if (same == groups.end()) {
+        auto id = static_cast<GroupId>(groups.size());
+        while (std::ranges::find(groups, id, &GroupDescription::id) != groups.end()) ++id;
+        groups.push_back({id, {members.begin(), members.end()}, usage});
+        roles.push_back({std::string(name), id});
+    } else {
+        roles.push_back({std::string(name), same->id});
+    }
+}
+
 ExecutionTopology build_cluster_topology(const DeploymentOptions& raw_deployment) {
     const auto deployment = normalize_deployment(raw_deployment);
     const auto& p         = deployment.parallel;

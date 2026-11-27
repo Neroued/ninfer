@@ -6,7 +6,9 @@
 namespace ninfer::models::glm5next {
 
 void encode_rank_load(distributed::wire::Encoder&, const RankLoadRequest&);
-[[nodiscard]] RankLoadRequest decode_rank_load(distributed::wire::Decoder&);
+[[nodiscard]] RankLoadRequest decode_rank_load(distributed::wire::Decoder&,
+                                               const distributed::RankIdentity&,
+                                               const artifact::ArtifactId&);
 
 void encode(distributed::wire::Encoder&, const RankResourceDescription&);
 [[nodiscard]] RankResourceDescription decode_rank_resources(distributed::wire::Decoder&);

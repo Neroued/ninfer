@@ -86,6 +86,24 @@ void test_valid_1_to_16_card_topologies() {
         roundtrip_if_enabled(d, t);
     }
 
+    {
+        const auto d = make_deployment({.tp = 2, .dp = 2});
+        auto t       = dist::build_cluster_topology(d);
+        t.groups.push_back({1, t.replica(0).ranks});
+        t.add_role("tensor", t.replica(0).ranks);
+        t.add_role("tensor", t.replica(1).ranks);
+        t.add_role("vocabulary", t.replica(1).ranks);
+        t.add_role("context", t.replica(1).ranks, dist::GroupUsage::PeerExchange);
+        t.validate(d);
+        require(t.role_group("tensor", 0).id == 1 && t.role_group("tensor", 3).index(3) == 1 &&
+                    t.role_group("tensor", 3).id == t.role_group("vocabulary", 3).id &&
+                    t.role_group("tensor", 3).id != t.role_group("context", 3).id,
+                "role lookup lost member order or communication usage");
+        rejects([&] { (void)t.role_group("vocabulary", 1); },
+                "rank borrowed another replica's role");
+        roundtrip_if_enabled(d, t);
+    }
+
     // 8-card flagship Decode: tp=2, dp=4, adp=2, ep=8, pp=1
     {
         const auto d = make_deployment({.tp = 2, .ep = 8, .dp = 4, .pp = 1, .adp = 2});

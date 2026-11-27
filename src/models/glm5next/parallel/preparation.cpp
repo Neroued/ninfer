@@ -18,7 +18,8 @@ plan_replica_context(std::span<const RankPlan> expected_ranks,
     for (std::size_t rank = 0; rank < ranks.size(); ++rank) {
         const auto& r = ranks[rank];
         const auto& c = r.context;
-        if (r.rank != expected_ranks[rank].rank || r.rank != rank ||
+        if (r.observation.rank != expected_ranks[rank].placement.global_rank ||
+            r.rank != expected_ranks[rank].placement.tp.rank || r.rank != rank ||
             r.shape != ranks.front().shape || r.batches != ranks.front().batches ||
             c.ranks.size() != 1 || c.ranks.front().rank != rank ||
             c.state.layouts.size() != ranks.size() || c.pools.size() != out.pools.size() ||

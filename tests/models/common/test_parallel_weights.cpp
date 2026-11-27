@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstring>
 #include <iostream>
 #include <numeric>
@@ -430,13 +431,163 @@ void test_row_split_expert_selection() {
     }
 }
 
+// Reconstruct both halves of two non-adjacent experts from their encoded parents.
+// FP8 uses a 64-column cut inside an original 128x128 scale block.
+void test_mixed_expert_selection(bool nvfp4, std::optional<CudaExecutionView> execution = {}) {
+    const Device target           = execution ? execution->device() : Device::cpu();
+    constexpr std::uint32_t count = 8, hidden = 128;
+    const std::uint32_t intermediate = nvfp4 ? 256 : 128;
+    const auto format                = nvfp4 ? QType::NVFP4 : QType::FP8_E4M3FN_BLOCK128X128_BF16;
+    const auto layout =
+        nvfp4 ? QuantLayout::BatchedBlockScaleK16M128x4 : QuantLayout::BlockScaleM128K128;
+    const std::array shapes{artifact::Shape{count, 2 * intermediate, hidden},
+                            artifact::Shape{count, hidden, intermediate}};
+    const std::array names{"gu", "down"};
+    Fixture f;
+    f.payload.clear();
+    f.root = {{"components", {{"text", {{"config", Json::object()}}}}},
+              {"objects", Json::array()},
+              {"bindings", Json::object()},
+              {"uses", Json::array()}};
+    std::array<std::size_t, 2> bases;
+    for (unsigned m = 0; m < 2; ++m) {
+        const auto g    = weight_geometry(format, layout, shapes[m]);
+        const auto base = (f.payload.size() + 255) / 256 * 256;
+        bases[m]        = base;
+        f.payload.resize(base + g.bytes);
+        for (std::size_t i = 0; i < g.bytes; ++i)
+            f.payload[base + i] = std::byte((i * 37 + i / 73 + m * 13) % 251);
+        for (std::size_t e = 0; e < g.matrix_scale_count; ++e)
+            put_word(f.payload, base + g.matrix_scale_offset + 4 * e,
+                     std::bit_cast<std::uint32_t>(float(e + 1 + m * count)), 4);
+        f.root["objects"].push_back(
+            {{"id", names[m]},
+             {"kind", "tensor"},
+             {"shape", shapes[m]},
+             {"format", nvfp4 ? "nvfp4" : "fp8_e4m3fn_block128x128_bf16"},
+             {"layout", nvfp4 ? "batched_block_scale_k16_m128x4_v1" : "block_scale_m128_k128_v1"},
+             {"offset", base},
+             {"bytes", g.bytes}});
+    }
+    f.root["files"] = Json::array({{{"path", nullptr}, {"payload_bytes", f.payload.size()}}});
+    f.write();
+    artifact::Reader reader(f.entry);
+    const auto source = [&](unsigned m) -> moe::MatrixSource {
+        const auto obj  = reader.find(names[m]);
+        const auto rows = shapes[m][1];
+        return {obj, describe_weight_bank(reader.geometry(obj), {0, count, rows, rows})};
+    };
+    const auto width = intermediate / 2;
+    const std::vector<std::uint32_t> ids{1, 6};
+    for (const auto begin : {0U, width}) {
+        const ExpertWeightPartition part{{source(0), source(1)}, {}, {ids, {begin, width}}};
+        const auto selected = select_weights(reader, {}, {}, {}, {}, {&part, 1}, {}, target);
+        const auto& bank    = selected.experts.at(0).packed.value();
+        require(bank.logical_ids == ids && selected.expert_descriptions[0].count == count,
+                "compact slots or global routing domain differ");
+        auto plan           = artifact::plan_materialization(reader, selected.requests);
+        const auto requests = plan.requests;
+        const auto expected_bytes =
+            execution ? plan.device_capacity_bytes : plan.host_capacity_bytes;
+        const auto parent_count = plan.tensors.size();
+        auto storage            = artifact::materialize(reader, std::move(plan), execution);
+        const auto& stats       = storage.stats();
+        require((execution ? stats.device_capacity_bytes : stats.host_capacity_bytes) ==
+                    expected_bytes,
+                "mixed bank backing was misbudgeted");
+        if (execution) {
+            std::vector<WeightParent> parents;
+            for (std::size_t i = 0; i < parent_count; ++i)
+                parents.push_back(storage.parent({i}, target));
+            const auto resident = bind_selected_experts(selected, requests, parents, target);
+            const auto& view    = resident.front().view();
+            require(view.count == count && view.gate_up.physical_count == ids.size() &&
+                        view.gate_up.expert_indices &&
+                        view.down.expert_indices == view.gate_up.expert_indices,
+                    "device bank lost the distinction between logical experts and physical slots");
+            std::array<std::uint32_t, count> map;
+            std::array<std::int32_t, count> owned;
+            require(cudaMemcpy(map.data(), view.gate_up.expert_indices, sizeof(map),
+                               cudaMemcpyDeviceToHost) == cudaSuccess &&
+                        cudaMemcpy(owned.data(), resident.front().subset().mask.data, sizeof(owned),
+                                   cudaMemcpyDeviceToHost) == cudaSuccess,
+                    "could not read device expert metadata");
+            for (std::uint32_t e = 0; e < count; ++e) {
+                const auto it = std::ranges::find(ids, e);
+                require(map[e] == (it == ids.end()
+                                       ? UINT32_MAX
+                                       : static_cast<std::uint32_t>(it - ids.begin())) &&
+                            owned[e] == (it != ids.end()),
+                        "incorrect mixed bank slot or ownership mask");
+            }
+        }
+        for (unsigned m = 0; m < 2; ++m) {
+            const auto& parent = storage.parent(requests.at(m ? bank.down : bank.gate_up), target);
+            const auto& dst    = parent.geometry;
+            std::vector<std::byte> download;
+            const auto* words = parent.data;
+            if (execution) {
+                download.resize(dst.bytes);
+                require(cudaMemcpy(download.data(), words, download.size(),
+                                   cudaMemcpyDeviceToHost) == cudaSuccess,
+                        "could not read mixed expert payload");
+                words = download.data();
+            }
+            const auto& src = reader.geometry(reader.find(names[m]));
+            const auto rows = m ? hidden : 2 * width;
+            const auto cols = m ? width : hidden;
+            require(dst.shape == artifact::Shape{ids.size(), rows, cols} &&
+                        (nvfp4 || dst.format == QType::FP8_E4M3FN_BLOCK64X64_BF16),
+                    "mixed bank geometry differs");
+            const auto packing   = nvfp4 ? 2U : 1U;
+            const auto* original = f.payload.data() + bases[m];
+            for (std::size_t slot = 0; slot < ids.size(); ++slot) {
+                const auto expert = ids[slot];
+                if (nvfp4)
+                    require(parent.matrix_scales[slot] == float(expert + 1 + m * count),
+                            "matrix divisor no longer belongs to the selected expert");
+                for (std::uint32_t row = 0; row < rows; ++row) {
+                    const auto dr = slot * rows + row;
+                    const auto sr = expert * shapes[m][1] +
+                                    (m ? row : begin + row % width + (row / width) * intermediate);
+                    const auto sc = m ? begin : 0U;
+                    require(std::memcmp(words + dr * dst.code_bytes_per_row,
+                                        original + sr * src.code_bytes_per_row + sc / packing,
+                                        cols / packing) == 0,
+                            "mixed expert code row differs");
+                    for (std::uint32_t col = 0; col < cols; col += dst.group_size) {
+                        const auto target_scale =
+                            weight_scale_offset(dst, dr, col / dst.group_size);
+                        const auto source_scale =
+                            weight_scale_offset(src, sr, (col + sc) / src.group_size);
+                        require(std::memcmp(words + target_scale, original + source_scale,
+                                            dst.scale_word_bytes) == 0,
+                                "mixed expert scale differs");
+                    }
+                }
+            }
+        }
+    }
+}
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     try {
+        if (argc > 1) {
+            require(argc == 2 && std::string_view(argv[1]) == "--gpu", "unknown test mode");
+            int count = 0;
+            if (cudaGetDeviceCount(&count) != cudaSuccess || !count) return 77;
+            DeviceContext device;
+            test_mixed_expert_selection(true, device.transfer_view());
+            test_mixed_expert_selection(false, device.transfer_view());
+            std::cout << "PASS mixed expert device bindings\n";
+            return 0;
+        }
         test_vocabulary_partition_laws();
         test_tristate_selection_omission_and_head_reconstruction();
         test_row_split_expert_selection();
+        test_mixed_expert_selection(true);
+        test_mixed_expert_selection(false);
         std::cout << "PASS: parallel weight selection and RowSplit expert banks\n";
         return 0;
     } catch (const std::exception& e) {

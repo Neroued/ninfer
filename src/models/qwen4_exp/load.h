@@ -48,7 +48,7 @@ private:
                                               Device);
     friend std::unique_ptr<ModelShard> materialize_model(ResolvedLoadPlan&&, DeviceContext&,
                                                          const StartupObserver*);
-    ResolvedLoadPlan(const artifact::Reader&, std::shared_ptr<const ModelDefinition>,
+    ResolvedLoadPlan(const artifact::Reader&, std::shared_ptr<const ModelDefinition>, RankPlan,
                      artifact::MaterializationPlan, std::vector<Device>, std::vector<Device>,
                      std::shared_ptr<const ple::disk::Table>);
     const artifact::Reader* reader_;

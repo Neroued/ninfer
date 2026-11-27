@@ -20,9 +20,7 @@ IndexRange range(Decoder& in) { return {in.u32(), in.u32()}; }
 void encode_rank_load(Encoder& out, const RankLoadRequest& request) {
     out.raw(request.artifact);
     const auto& p = request.rank;
-    out.u32(p.rank);
-    out.u32(p.size);
-    out.u32(p.ep_size);
+    out.u32(p.placement.global_rank);
     out.u8(static_cast<std::uint8_t>(p.ple_placement));
     for (auto r : {p.gdn_keys, p.gdn_values, p.qsa_queries, p.qsa_kv, p.vocabulary, p.ple_shards})
         range(out, r);
@@ -37,14 +35,17 @@ void encode_rank_load(Encoder& out, const RankLoadRequest& request) {
     out.boolean(request.control_owner);
 }
 
-RankLoadRequest decode_rank_load(Decoder& in) {
+RankLoadRequest decode_rank_load(Decoder& in, const distributed::RankIdentity& identity,
+                                 const artifact::ArtifactId& expected_artifact) {
     RankLoadRequest request;
     const auto artifact = in.raw(request.artifact.size());
     std::copy(artifact.begin(), artifact.end(), request.artifact.begin());
     auto& p                        = request.rank;
-    p.rank                         = in.u32();
-    p.size                         = in.u32();
-    p.ep_size                      = in.u32();
+    if (request.artifact != expected_artifact)
+        throw artifact::ArtifactError("Qwen4Exp worker artifact differs from coordinator");
+    if (in.u32() != identity.rank)
+        throw std::invalid_argument("Qwen4Exp load request addressed to another global rank");
+    p.placement                    = RankPlacement(identity);
     p.ple_placement                = static_cast<ple::Placement>(in.u8());
     p.gdn_keys                     = range(in);
     p.gdn_values                   = range(in);
@@ -61,6 +62,9 @@ RankLoadRequest decode_rank_load(Decoder& in) {
     request.batches                = decode_batch_execution_spec(in);
     request.host_reservation_bytes = in.u64();
     request.control_owner          = in.boolean();
+    if (compute_rank_shard_digest(expected_artifact, models::load_options(request.options), p) !=
+        identity.shard_digest)
+        throw std::invalid_argument("Qwen4Exp rank shard digest differs from topology plan");
     return request;
 }
 

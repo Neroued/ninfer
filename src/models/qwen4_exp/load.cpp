@@ -6,14 +6,13 @@
 namespace ninfer::models::qwen4_exp {
 
 ResolvedLoadPlan::ResolvedLoadPlan(const artifact::Reader& reader,
-                                   std::shared_ptr<const ModelDefinition> definition,
+                                   std::shared_ptr<const ModelDefinition> definition, RankPlan rank,
                                    artifact::MaterializationPlan materialization,
                                    std::vector<Device> devices, std::vector<Device> bank_devices,
                                    std::shared_ptr<const ple::disk::Table> ple)
     : reader_(&reader), definition_(std::move(definition)),
       materialization_(std::move(materialization)), devices_(std::move(devices)),
-      bank_devices_(std::move(bank_devices)), ple_(std::move(ple)),
-      rank_(plan_single_rank(*definition_)) {}
+      bank_devices_(std::move(bank_devices)), ple_(std::move(ple)), rank_(std::move(rank)) {}
 
 ResolvedLoadPlan resolve_load(const artifact::Reader& reader,
                               std::shared_ptr<const ModelDefinition> definition, Device cuda,
@@ -41,8 +40,14 @@ ResolvedLoadPlan resolve_load(const artifact::Reader& reader,
     auto storage = artifact::plan_materialization(reader, requests);
     if (!table)
         table = std::make_shared<const ple::disk::Table>(reader, definition->ple_parameters());
-    return {reader,           std::move(definition), std::move(storage), std::move(devices),
-            std::move(banks), std::move(table)};
+    auto rank = plan_single_rank(*definition);
+    return {reader,
+            std::move(definition),
+            std::move(rank),
+            std::move(storage),
+            std::move(devices),
+            std::move(banks),
+            std::move(table)};
 }
 
 ResolvedLoadPlan resolve_rank_load(const artifact::Reader& reader,
@@ -55,9 +60,8 @@ ResolvedLoadPlan resolve_rank_load(const artifact::Reader& reader,
     std::shared_ptr<const ple::disk::Table> table;
     if (rank.ple_placement == ple::Placement::Disk)
         table = std::make_shared<const ple::disk::Table>(reader, definition->ple_parameters());
-    ResolvedLoadPlan out(reader, std::move(definition), std::move(storage), {}, {},
+    ResolvedLoadPlan out(reader, std::move(definition), std::move(rank), std::move(storage), {}, {},
                          std::move(table));
-    out.rank_      = std::move(rank);
     out.selection_ = std::move(selection);
     out.parents_.reserve(out.materialization_.tensors.size());
     for (const auto& tensor : out.materialization_.tensors)
@@ -77,9 +81,8 @@ std::unique_ptr<ModelShard> materialize_model(ResolvedLoadPlan&& plan, DeviceCon
     auto backing            = artifact::materialize(*plan.reader_, std::move(plan.materialization_),
                                                     device.transfer_view(), observer);
     if (plan.selection_) {
-        auto out = std::unique_ptr<ModelShard>(
-            new ModelShard(definition, std::move(backing), {}, {}, std::move(plan.ple_)));
-        out->rank_ = std::move(plan.rank_);
+        auto out = std::unique_ptr<ModelShard>(new ModelShard(
+            definition, std::move(plan.rank_), std::move(backing), {}, {}, std::move(plan.ple_)));
         out->local_parents_.reserve(parent_count);
         for (std::size_t i = 0; i < parent_count; ++i)
             out->local_parents_.push_back(out->backing_.parent({i}, device.device()));
@@ -121,10 +124,9 @@ std::unique_ptr<ModelShard> materialize_model(ResolvedLoadPlan&& plan, DeviceCon
     }
     auto bound = resolve_weights(std::move(pending), backing, plan.devices_);
     auto banks = moe::bind_banks(definition->expert_banks(), backing, plan.bank_devices_);
-    auto out = std::unique_ptr<ModelShard>(new ModelShard(std::move(definition), std::move(backing),
-                                                          std::move(bound), std::move(banks),
-                                                          std::move(plan.ple_)));
-    out->rank_ = std::move(plan.rank_);
+    auto out   = std::unique_ptr<ModelShard>(
+        new ModelShard(std::move(definition), std::move(plan.rank_), std::move(backing),
+                         std::move(bound), std::move(banks), std::move(plan.ple_)));
     return out;
 }
 

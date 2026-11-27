@@ -222,6 +222,15 @@ dist::TransportEvent next_event(dist::Transport& transport) {
     }
 }
 
+template <class Request>
+dist::RankIdentity load_identity(const Request& request) {
+    const auto& p = request.rank.placement;
+    dist::RankIdentity id{.rank = p.global_rank, .tp = p.tp, .ep = p.ep, .dp = p.dp, .adp = p.adp};
+    id.shard_digest = compute_rank_shard_digest(
+        request.artifact, models::load_options(request.options), request.rank);
+    return id;
+}
+
 void cache_profiles_roundtrip() {
     for (auto storage : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64,
                          KvCacheStorage::Fp8E4m3fnGroup128Ue8m0, KvCacheStorage::Nvfp4Group16,
@@ -236,7 +245,7 @@ void cache_profiles_roundtrip() {
         q::encode_rank_load(load_out, request);
         const auto load_bytes = std::move(load_out).take();
         wire::Decoder load_in(load_bytes);
-        const auto loaded = q::decode_rank_load(load_in);
+        const auto loaded = q::decode_rank_load(load_in, load_identity(request), request.artifact);
         load_in.finish();
         require(loaded.options.kv_cache == storage &&
                     loaded.options.linear_state_dtype == LinearStateDType::BFloat16 &&
@@ -329,17 +338,18 @@ void model_preparation() {
                 reported.failure == "probe shortfall",
             "preparation report lost the model's capacity reference or cluster fields");
 
-    glm::RankLoadRequest request;
-    request.artifact[3]              = std::byte{17};
-    request.rank.rank                = 1;
-    request.rank.size                = 2;
-    request.rank.ep_size             = 2;
-    request.rank.kda_heads           = {32, 32};
-    request.rank.vocabulary          = {77440, 77440};
-    request.rank.dense_intermediate  = {6144, 6144};
-    request.rank.shared_intermediate = {1024, 1024};
-    request.rank.experts             = {{{0, 7, 31}, {0, 2048}}, {{2, 9}, {0, 2048}}};
-    request.rank.assemblies          = {
+    glm::RankLoadRequest request{};
+    request.artifact[3]                = std::byte{17};
+    request.rank.placement.global_rank = 1;
+    request.rank.placement.tp          = {1, 2};
+    request.rank.placement.ep          = {1, 2};
+    request.rank.placement.adp         = {1, 2};
+    request.rank.kda_heads             = {32, 32};
+    request.rank.vocabulary            = {77440, 77440};
+    request.rank.dense_intermediate    = {6144, 6144};
+    request.rank.shared_intermediate   = {1024, 1024};
+    request.rank.experts               = {{{0, 7, 31}, {0, 2048}}, {{2, 9}, {0, 2048}}};
+    request.rank.assemblies            = {
         {{256, 128}, {{{5}, 128, 64, 128, 128, 128, 0}}, {{{5}, {128, 128}, 16384, 32768}}}};
     auto& o                             = request.options;
     o.max_concurrency                   = 8;
@@ -360,7 +370,7 @@ void model_preparation() {
     glm::encode_rank_load(out, request);
     const auto bytes = std::move(out).take();
     wire::Decoder in(bytes);
-    const auto decoded = glm::decode_rank_load(in);
+    const auto decoded = glm::decode_rank_load(in, load_identity(request), request.artifact);
     in.finish();
     for (const std::size_t headroom : {0ULL, 256ULL << 20}) {
         wire::Encoder prepare;
@@ -391,7 +401,7 @@ void model_preparation() {
     glm::encode_rank_load(draft_out, request);
     const auto draft_bytes = std::move(draft_out).take();
     wire::Decoder draft_in(draft_bytes);
-    const auto draft = glm::decode_rank_load(draft_in);
+    const auto draft = glm::decode_rank_load(draft_in, load_identity(request), request.artifact);
     draft_in.finish();
     require(draft.rank.draft && draft.rank.draft->features == request.rank.draft->features &&
                 draft.rank.draft->query_heads == request.rank.draft->query_heads &&
@@ -400,18 +410,18 @@ void model_preparation() {
                 draft.options.speculative.backend == SpeculativeBackend::DFlash2,
             "GLM preparation lost the selected draft partition");
 
-    q::RankLoadRequest qwen;
-    qwen.options         = o;
-    qwen.rank.assemblies = request.rank.assemblies;
-    qwen.rank.rank       = 1;
-    qwen.rank.size       = 2;
-    qwen.rank.experts    = {{{0, 1, 2}, {320, 320}}};
+    q::RankLoadRequest qwen{};
+    qwen.options                    = o;
+    qwen.rank.assemblies            = request.rank.assemblies;
+    qwen.rank.placement.global_rank = 1;
+    qwen.rank.placement.tp          = {1, 2};
+    qwen.rank.experts               = {{{0, 1, 2}, {320, 320}}};
     qwen.batches = models::make_batch_execution_spec(o.max_concurrency, 1, o.use_cuda_graph);
     wire::Encoder qw;
     q::encode_rank_load(qw, qwen);
     const auto qb = std::move(qw).take();
     wire::Decoder qi(qb);
-    const auto qd = q::decode_rank_load(qi);
+    const auto qd = q::decode_rank_load(qi, load_identity(qwen), qwen.artifact);
     qi.finish();
     wire::Encoder qr;
     q::encode_rank_load(qr, qd);

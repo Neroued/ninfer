@@ -7,7 +7,7 @@
 namespace ninfer::models::qwen4_exp {
 
 struct RankPlan {
-    std::uint32_t rank = 0, size = 1, ep_size = 1;
+    RankPlacement placement;
     ple::Placement ple_placement = ple::Placement::Disk;
     IndexRange gdn_keys, gdn_values, qsa_queries, qsa_kv, vocabulary, ple_shards;
     std::uint32_t shared_intermediate = 0;
@@ -24,7 +24,8 @@ struct ParallelPlan {
 
 [[nodiscard]] std::uint64_t compute_rank_shard_digest(const artifact::ArtifactId&, LoadOptions,
                                                       const RankPlan&);
-[[nodiscard]] ParallelPlan plan_parallel(const ModelDefinition&, const DeploymentOptions&);
+[[nodiscard]] ParallelPlan plan_parallel(const ModelDefinition&, const DeploymentOptions&,
+                                         ple::Placement);
 [[nodiscard]] RankPlan plan_single_rank(const ModelDefinition&);
 [[nodiscard]] std::span<const std::uint32_t> default_expert_priority(const TextConfig&,
                                                                      std::size_t layer);

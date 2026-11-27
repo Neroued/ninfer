@@ -54,7 +54,7 @@ public:
 private:
     friend std::unique_ptr<ModelShard> materialize_model(ResolvedLoadPlan&&, DeviceContext&,
                                                          const StartupObserver*);
-    ModelShard(std::shared_ptr<const ModelDefinition>, artifact::MaterializedArtifact,
+    ModelShard(std::shared_ptr<const ModelDefinition>, RankPlan, artifact::MaterializedArtifact,
                std::vector<BoundWeight>, std::vector<ExpertBankSource>,
                std::shared_ptr<const ple::disk::Table>);
 

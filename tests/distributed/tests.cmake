@@ -10,6 +10,10 @@ if(NINFER_ENABLE_DISTRIBUTED)
 endif()
 
 if(NINFER_ENABLE_DISTRIBUTED AND NINFER_BUILD_ENGINE)
+  # Explicit artifacts and optional device materialization; not an automatic download or GPU test.
+  add_executable(ninfer_model_rank_load_test "${CMAKE_CURRENT_LIST_DIR}/test_model_rank_load.cpp")
+  ninfer_internal_includes(ninfer_model_rank_load_test)
+  target_link_libraries(ninfer_model_rank_load_test PRIVATE ninfer_model_execution ninfer_model_control)
   ninfer_add_test(ninfer_distributed_protocol_test
     SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_protocol.cpp"
     LIBRARIES ninfer_runtime_distributed ninfer_model_control)

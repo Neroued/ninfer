@@ -13,41 +13,17 @@ RankLoadRequest request(const artifact::Reader& reader, std::span<const std::byt
                         const distributed::RankIdentity& identity,
                         const StartupObserver& observer) {
     distributed::wire::Decoder in(payload);
-    auto r = decode_rank_load(in);
+    auto r = decode_rank_load(in, identity, reader.artifact_id());
     in.finish();
-    if (r.artifact != reader.artifact_id())
-        throw artifact::ArtifactError("GLM5Next worker artifact differs from coordinator");
-    if (r.rank.rank != identity.tp.rank || r.rank.size != identity.tp.size ||
-        identity.ep.size != r.rank.ep_size ||
-        identity.ep.rank != (r.rank.ep_size == 1 ? 0U : identity.tp.rank) ||
-        identity.adp.size != r.rank.size || identity.adp.rank != identity.tp.rank ||
-        identity.dp.size < 1 || identity.pp.size != 1)
-        throw std::invalid_argument("GLM5Next rank plan differs from worker identity");
-    if (compute_rank_shard_digest(reader.artifact_id(), models::load_options(r.options), r.rank) !=
-        identity.shard_digest)
-        throw std::invalid_argument("GLM5Next rank shard digest differs from topology plan");
     r.options.startup_observer = observer;
     return r;
-}
-
-const distributed::GroupDescription&
-find_role_group(const distributed::ExecutionTopology& topology, std::string_view role_name,
-                distributed::RankId rank) {
-    for (const auto& role : topology.roles) {
-        if (role.role != role_name) continue;
-        const auto& group = topology.group(role.group);
-        if (std::find(group.members.begin(), group.members.end(), rank) != group.members.end())
-            return group;
-    }
-    throw std::invalid_argument("GLM5Next role group is absent for rank: " +
-                                std::string(role_name));
 }
 
 ContextCommunication context_group(const distributed::ExecutionTopology& topology,
                                    const distributed::RankIdentity& identity,
                                    distributed::CommunicationContext& communication) {
     if (identity.tp.size == 1) return {};
-    const auto& group   = find_role_group(topology, "context", identity.rank);
+    const auto& group   = topology.role_group("context", identity.rank);
     const auto& replica = topology.replica_for_rank(identity.rank);
     std::vector<std::uint32_t> local_members;
     local_members.reserve(group.members.size());
@@ -65,8 +41,7 @@ RankPreparation::RankPreparation(const artifact::Reader& reader, std::span<const
                                  distributed::CommunicationContext& communication,
                                  const StartupObserver& observer)
     : RankPreparation(reader, request(reader, payload, identity, observer), device,
-                      context_group(topology, identity, communication), identity.rank,
-                      identity.node) {
+                      context_group(topology, identity, communication), identity.node) {
     const auto& replica     = topology.replica_for_rank(identity.rank);
     const auto local_ranks  = static_cast<std::uint32_t>(replica.ranks.size());
     const WorkContract contract{plan_.shape,
@@ -79,7 +54,7 @@ RankPreparation::RankPreparation(const artifact::Reader& reader, std::span<const
     memory_.host_reservation_bytes = runtime::protocol::work_payload_memory(
         contract.payload_capacity(local_ranks), RankProgram::capacity(), local_ranks, false);
     if (identity.tp.size > 1) {
-        const auto& group    = find_role_group(topology, "tensor", identity.rank);
+        const auto& group    = topology.role_group("tensor", identity.rank);
         const auto result_id = replica.result_owner;
         binding_             = {&communication.group(group.id), group.index(result_id)};
     }

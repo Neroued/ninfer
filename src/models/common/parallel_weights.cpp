@@ -147,7 +147,8 @@ SelectedWeights select_weights(const artifact::Reader& reader,
         const bool complete   = partition.ids.size() == count;
         const bool compressed = source.gate_up.layout.layout == QuantLayout::Csf32 ||
                                 source.down.layout.layout == QuantLayout::Csf32;
-        if (complete || compressed) {
+        const bool sliced = range.begin != 0 || range.size != intermediate;
+        if (complete || compressed || sliced) {
             if (complete && !std::is_sorted(partition.ids.begin(), partition.ids.end()))
                 throw artifact::ArtifactError("affine expert partition requires global ID order");
             std::vector<artifact::MatrixSlice> gu, down;
@@ -178,8 +179,6 @@ SelectedWeights select_weights(const artifact::Reader& reader,
                                 materialize(source.down, down_shape, down),
                                 complete ? std::vector<std::uint32_t>{} : partition.ids};
         } else {
-            if (range.begin != 0 || range.size != intermediate)
-                throw artifact::ArtifactError("indexed expert partition requires whole experts");
             const auto matrix = [&](const moe::MatrixSource& source, std::uint32_t expert) {
                 const artifact::MatrixSlice slice{
                     source.object,

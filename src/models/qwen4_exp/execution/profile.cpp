@@ -105,19 +105,13 @@ std::shared_ptr<const ModelProfile> describe(const ModelDefinition& source,
                                              std::span<const BoundWeight> weights,
                                              std::span<const moe::ExpertDescription> experts,
                                              const RankPlan& rank) {
-    if (rank.size > 1 && experts.size() != source.expert_banks().size())
-        throw std::invalid_argument("Qwen4Exp local expert descriptions are incomplete");
-    auto out                   = std::make_shared<ModelProfile>();
-    out->config                = source.config();
-    out->options               = source.options();
-    out->ple_placement         = rank.ple_placement;
-    out->local                 = {out->config.text.gdn,
-                                  out->config.text.qsa,
-                                  rank.vocabulary.begin,
-                                  rank.vocabulary.size,
-                                  rank.rank,
-                                  rank.size};
-    out->local.gdn.key_heads   = rank.gdn_keys.size;
+    auto out                 = std::make_shared<ModelProfile>();
+    out->config              = source.config();
+    out->options             = source.options();
+    out->ple_placement       = rank.ple_placement;
+    out->local               = {out->config.text.gdn, out->config.text.qsa,   rank.vocabulary.begin,
+                                rank.vocabulary.size, rank.placement.tp.rank, rank.placement.tp.size};
+    out->local.gdn.key_heads = rank.gdn_keys.size;
     out->local.gdn.value_heads = rank.gdn_values.size;
     out->local.qsa.query_heads = rank.qsa_queries.size;
     out->local.qsa.kv_heads    = rank.qsa_kv.size;
@@ -137,7 +131,7 @@ std::shared_ptr<const ModelProfile> describe(const ModelDefinition& source,
     if (w.vision)
         out->vision = qwen::describe_vision(*w.vision,
                                             [&](WeightId id) { return weight_input(weights, id); });
-    if (rank.size == 1)
+    if (experts.empty())
         for (const auto& b : source.expert_banks())
             out->banks.push_back({b.gate_up.layout, b.down.layout});
     return out;
@@ -153,6 +147,8 @@ std::shared_ptr<const ModelProfile> describe_model(const ModelDefinition& source
                                                    std::span<const BoundWeight> weights,
                                                    std::span<const moe::ExpertDescription> experts,
                                                    const RankPlan& rank) {
+    if (experts.size() != source.expert_banks().size())
+        throw std::invalid_argument("Qwen4Exp local expert descriptions are incomplete");
     return describe(source, weights, experts, rank);
 }
 

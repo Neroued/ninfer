@@ -31,6 +31,7 @@ std::shared_ptr<const moe::Plan> describe_moe_plan(const execution::ModelProfile
                                                    const MoeOptions& o) {
     if (o.expert_priority && o.expert_priority->size() != p.text.layers.size())
         throw std::invalid_argument("expert priority must cover every Main layer");
+    if (p.banks.empty()) return {}; // Offload requires the full source banks.
     std::vector<moe::LayerSpec> layers;
     for (std::size_t i = 0; i < p.text.layers.size(); ++i) {
         const auto& m = p.text.layers[i].moe;

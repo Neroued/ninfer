@@ -7,9 +7,9 @@ namespace ninfer::models::qwen4_exp {
 
 ParallelStartup::ParallelStartup(const artifact::Reader& reader, const EngineOptions& options)
     : definition_(read_definition(reader, load_options(options))),
-      parallel_(plan_parallel(*definition_, *options.deployment)),
+      parallel_(plan_parallel(*definition_, *options.deployment, ple::Placement::Device)),
       batches_(std::make_shared<const BatchExecutionPlan>(make_batch_execution_spec(
-          options.max_concurrency, 1,
+          (options.max_concurrency - 1) / options.deployment->parallel.dp + 1, 1,
           options.use_cuda_graph && options.purpose == EnginePurpose::Generation))) {
     if (options.context_cache.host_capacity_bytes.value_or(0) > 0)
         throw std::invalid_argument(
@@ -25,12 +25,14 @@ std::vector<distributed::wire::Bytes> ParallelStartup::requests(const EngineOpti
     auto rank_options                              = options;
     rank_options.context_cache.host_capacity_bytes = 0;
     std::vector<distributed::wire::Bytes> payloads;
-    const auto control =
-        std::find_if(parallel_.ranks.begin(), parallel_.ranks.end(), [&](const auto& r) {
-            return parallel_.topology.rank(r.rank).node == options.deployment->coordinator_node;
-        });
+    rank_options.max_concurrency = batches_->spec().resident_capacity;
     for (const auto& rank : parallel_.ranks) {
-        const bool control_owner = control != parallel_.ranks.end() && control->rank == rank.rank;
+        const auto global        = rank.placement.global_rank;
+        const auto& replica      = parallel_.topology.replica_for_rank(global);
+        const auto control       = std::ranges::find_if(replica.ranks, [&](auto id) {
+            return parallel_.topology.rank(id).node == options.deployment->coordinator_node;
+        });
+        const bool control_owner = control != replica.ranks.end() && *control == global;
         distributed::wire::Encoder out;
         encode_rank_load(out, {definition_->artifact_id(), rank, rank_options, batches_->spec(), 0,
                                control_owner});
@@ -107,7 +109,8 @@ std::string ParallelStartup::prefill_signature(std::uint32_t chunk,
     const auto& replica = parallel_.topology.replica(replica_id);
     const auto& rank    = parallel_.ranks.at(replica.result_owner);
     auto signature      = qwen4_exp::prefill_signature(*definition_, nullptr, chunk) +
-                     ";tp=" + std::to_string(rank.size) + ";ep=" + std::to_string(rank.ep_size);
+                     ";tp=" + std::to_string(rank.placement.tp.size) +
+                     ";ep=" + std::to_string(rank.placement.ep.size);
     for (const auto& group : ranks_.at(replica.result_owner).observation.communication)
         for (const auto& backend : group.backends)
             signature +=

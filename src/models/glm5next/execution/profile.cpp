@@ -179,12 +179,8 @@ std::shared_ptr<const ModelProfile> describe_model(const ModelDefinition& defini
     auto out                 = std::make_shared<ModelProfile>();
     out->config              = definition.config();
     out->options             = definition.options();
-    out->local               = {rank.rank,
-                                rank.size,
-                                rank.kda_heads,
-                                rank.vocabulary,
-                                rank.dense_intermediate,
-                                rank.shared_intermediate};
+    out->local               = {rank.placement.tp.rank, rank.placement.tp.size,  rank.kda_heads,
+                                rank.vocabulary,        rank.dense_intermediate, rank.shared_intermediate};
     out->public_tokens       = definition.resources().text.public_token_count;
     out->control_token_limit = definition.resources().text.control_tokens->size();
     const auto& c            = out->config.text;

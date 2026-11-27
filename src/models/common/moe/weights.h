@@ -22,8 +22,8 @@ struct BankDescription {
     MatrixSource gate_up, down;
 };
 
-// The materialized matrix geometry and global routing domain are independent: an indexed
-// bank stores selected full experts, while an affine bank stores every expert's local slice.
+// Matrix geometry describes the materialized local slice. Count and subset describe the
+// global routing domain, including for compact banks holding only some IDs and columns.
 struct ExpertDescription {
     WeightGeometry gate_up, down;
     std::uint32_t count          = 0;

@@ -4,6 +4,24 @@
 #include <stdexcept>
 
 namespace ninfer::models {
+void add_expert_roles(distributed::ExecutionTopology& topology) {
+    const RankPlacement first(topology.ranks.front());
+    const auto lanes = first.expert_slice().size;
+    const auto replicas_per_group =
+        first.ep.size > first.tp.size ? first.ep.size / first.tp.size : 1U;
+    std::vector<distributed::RankId> domain;
+    for (const auto& replica : topology.replicas) {
+        auto members = std::span(replica.ranks);
+        domain.insert(domain.end(), members.begin(), members.end());
+        if ((replica.replica_id + 1) % replicas_per_group == 0) {
+            topology.add_role("expert", domain);
+            domain.clear();
+        }
+        for (std::size_t i = 0; i < members.size(); i += lanes)
+            topology.add_role("expert_tensor", members.subspan(i, lanes));
+    }
+}
+
 IndexRange partition_range(std::uint32_t total, std::uint32_t parts, std::uint32_t rank) {
     if (!total || !parts || rank >= parts || total % parts)
         throw std::invalid_argument("parallel partition requires equal, nonempty ranges");

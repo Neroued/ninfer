@@ -2,12 +2,12 @@
 
 namespace ninfer::models::qwen4_exp {
 
-ModelShard::ModelShard(std::shared_ptr<const ModelDefinition> definition,
+ModelShard::ModelShard(std::shared_ptr<const ModelDefinition> definition, RankPlan rank,
                        artifact::MaterializedArtifact backing, std::vector<BoundWeight> bound,
                        std::vector<ExpertBankSource> banks,
                        std::shared_ptr<const ple::disk::Table> ple)
     : definition_(std::move(definition)), backing_(std::move(backing)), ple_(std::move(ple)),
-      bound_(std::move(bound)), banks_(std::move(banks)) {}
+      bound_(std::move(bound)), banks_(std::move(banks)), rank_(std::move(rank)) {}
 
 ModelShard::~ModelShard() = default;
 

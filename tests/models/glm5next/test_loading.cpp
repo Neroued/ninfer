@@ -144,10 +144,10 @@ void selection_and_planning(const std::filesystem::path& directory) {
             for (const auto& rank : parallel.ranks) {
                 auto load       = glm::resolve_rank_load(reader, full, rank, Device::cuda(0));
                 const auto data = load.weight_data();
-                require(rank.kda_heads.begin == rank.rank && rank.kda_heads.size == 1 &&
-                            rank.experts.size() == 2 &&
-                            rank.experts[0].ids ==
-                                (ep == 2 ? std::vector{rank.rank} : std::vector{0U, 1U}) &&
+                require(rank.kda_heads.begin == rank.placement.tp.rank &&
+                            rank.kda_heads.size == 1 && rank.experts.size() == 2 &&
+                            rank.experts[0].ids == (ep == 2 ? std::vector{rank.placement.tp.rank}
+                                                            : std::vector{0U, 1U}) &&
                             rank.experts[1].ids == rank.experts[0].ids,
                         "TP/EP ownership differs");
                 require(data[k.query.index].view.shape == artifact::Shape{64, 128} &&
@@ -161,8 +161,9 @@ void selection_and_planning(const std::filesystem::path& directory) {
                 require(std::get<glm::execution::MoeProfile>(profile->text.layers[1].ffn)
                                     .math.routed.ffn.intermediate == local_i &&
                             profile->mtp->moe.math.routed.ffn.intermediate == local_i &&
-                            parallel.topology.ranks[rank.rank].ep.size == ep &&
-                            parallel.topology.ranks[rank.rank].ep.rank == (ep == 1 ? 0 : rank.rank),
+                            parallel.topology.ranks[rank.placement.global_rank].ep.size == ep &&
+                            parallel.topology.ranks[rank.placement.global_rank].ep.rank ==
+                                (ep == 1 ? 0 : rank.placement.tp.rank),
                         "expert TP/EP geometry or rank identity differs");
                 layouts(data, w);
                 require(data[w.text.embedding.index].view.parts[0].parent ==
@@ -245,6 +246,46 @@ void matrix_words(const BoundWeight& weight, const Encoded& expected, std::uint6
     if (a.format == QType::NVFP4) equal(a.matrix_scale_offset, e.matrix_scale_offset, 4);
 }
 
+void mla_head_loading(const std::filesystem::path& directory, DeviceContext* device = nullptr) {
+    artifact::Reader reader(directory / "model.ninfer");
+    const auto definition = glm::read_definition(reader, options(true, false));
+    auto d                = deployment();
+    d.parallel.adp        = 1;
+    const auto parallel   = glm::plan_parallel(*definition, d);
+    const auto& weights   = definition->weights();
+    const auto& geometry  = definition->config().text.mla;
+    for (const auto& rank : parallel.ranks) {
+        const auto lane = rank.placement.tp.rank;
+        require(rank.mla_heads == IndexRange{lane, 1}, "fixture MLA head placement differs");
+        auto load = glm::resolve_rank_load(reader, definition, rank, Device::cuda(0));
+        std::unique_ptr<glm::ModelShard> model;
+        if (device) model = glm::materialize_model(std::move(load), *device);
+        const auto local = model ? model->weight_data() : load.weight_data();
+        for (const auto* mla :
+             {&std::get<glm::MlaWeights>(weights.text.layers[1].mixer), &weights.mtp->attention}) {
+            const auto check = [&](WeightId id, artifact::Shape expected, std::uint64_t row,
+                                   std::uint64_t column) {
+                require(local[id.index].view.shape == expected, "MLA head shard has wrong shape");
+                if (model)
+                    matrix_words(local[id.index], source(reader, *definition, id), row, column);
+            };
+            check(mla->query_b, {geometry.query_dim, geometry.query_lowrank},
+                  lane * geometry.query_dim, 0);
+            check(mla->key_up, {1, geometry.query_dim, geometry.latent_dim},
+                  lane * geometry.query_dim, 0);
+            check(mla->value_up, {1, geometry.value_dim, geometry.latent_dim},
+                  lane * geometry.value_dim, 0);
+            check(mla->output, {definition->config().text.hidden, geometry.value_dim}, 0,
+                  lane * geometry.value_dim);
+            for (const auto id : {mla->index_query, mla->index_weight}) {
+                require(local[id.index].view.parts.empty() == (lane != 0),
+                        "MLA indexer must be bound only on the representative");
+                if (!lane && model) matrix_words(local[id.index], source(reader, *definition, id));
+            }
+        }
+    }
+}
+
 void draft_loading(const std::filesystem::path& directory, DeviceContext* device = nullptr) {
     artifact::Reader reader(directory / "model.ninfer");
     for (const auto head : {ProposalHead::Full, ProposalHead::Optimized}) {
@@ -260,6 +301,13 @@ void draft_loading(const std::filesystem::path& directory, DeviceContext* device
                 "DFlash2 selection retained MTP or lost its configuration");
         for (const auto& parameter : definition->parameters())
             require(!parameter.name.starts_with("mtp/"), "DFlash2 loading selected MTP weights");
+        const auto single = glm::plan_single_rank(*definition);
+        auto full_rank    = glm::resolve_rank_load(reader, definition, single, Device::cuda(0));
+        require(single.draft && single.draft->query_heads == IndexRange{0, 4} &&
+                    single.draft->key_value_heads == IndexRange{0, 2} &&
+                    !full_rank.weight_data()[definition->weights().draft->feature_projection.index]
+                         .view.parts.empty(),
+                "TP1 draft weight placement lost a head or projection");
         for (const auto& rank : glm::plan_parallel(*definition, deployment(1)).ranks) {
             auto load = glm::resolve_rank_load(reader, definition, rank, Device::cuda(0));
             std::unique_ptr<glm::ModelShard> model;
@@ -306,8 +354,10 @@ void draft_loading(const std::filesystem::path& directory, DeviceContext* device
                     continue;
                 const auto& local  = data[i].view.shape;
                 const auto& global = parameter.shape;
-                const auto row    = local.front() != global.front() ? rank.rank * local.front() : 0;
-                const auto column = local.back() != global.back() ? rank.rank * local.back() : 0;
+                const auto row =
+                    local.front() != global.front() ? rank.placement.tp.rank * local.front() : 0;
+                const auto column =
+                    local.back() != global.back() ? rank.placement.tp.rank * local.back() : 0;
                 matrix_words(data[i], source(reader, *definition, {i}), row, column);
             }
         }
@@ -610,12 +660,14 @@ int main(int argc, char** argv) {
         const std::filesystem::path directory(argv[1]);
         if (std::string_view(argv[2]) == "--host") {
             selection_and_planning(directory);
+            mla_head_loading(directory);
             draft_loading(directory);
         } else {
             require(std::string_view(argv[2]) == "--gpu", "unknown loading test mode");
             int count = 0;
             if (cudaGetDeviceCount(&count) != cudaSuccess || count == 0) return 77;
             DeviceContext device;
+            mla_head_loading(directory, &device);
             materialization(directory, device, 1, 0, false);
             materialization(directory, device, 2, 0, true);
             materialization(directory, device, 2, 1, true);

@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <map>
 #include <numeric>
 
 namespace ninfer::models::glm5next {
@@ -14,19 +15,17 @@ std::uint32_t dimension(std::uint64_t value) {
     return static_cast<std::uint32_t>(value);
 }
 
-RankPlan rank_plan(const ModelDefinition& definition, std::uint32_t size, std::uint32_t rank,
-                   std::uint32_t ep_size) {
-    if (size == 1 && definition.options().dflash2())
-        throw std::invalid_argument("GLM5Next DFlash2 requires TP=2");
+RankPlan rank_plan(const ModelDefinition& definition, const distributed::RankIdentity& id) {
+    const auto [rank, size] = id.tp;
     const auto& c = definition.config().text;
     const auto& w = definition.weights();
     RankPlan p;
-    p.rank                = rank;
-    p.size                = size;
-    p.ep_size             = ep_size;
-    p.kda_heads           = partition_range(c.kda.heads, size, rank);
-    p.vocabulary          = partition_vocabulary_range(c.vocabulary, size, rank);
-    p.dense_intermediate  = partition_range(c.dense_intermediate, size, rank);
+    p.placement                = RankPlacement(id);
+    const auto attention_slice = p.placement.attention_slice();
+    p.mla_heads          = partition_range(c.mla.heads, attention_slice.size, attention_slice.rank);
+    p.kda_heads          = partition_range(c.kda.heads, size, rank);
+    p.vocabulary         = partition_vocabulary_range(c.vocabulary, size, rank);
+    p.dense_intermediate = partition_range(c.dense_intermediate, size, rank);
     p.shared_intermediate = partition_range(dimension(c.moe.shared_intermediate()), size, rank);
     if (const auto& draft = definition.config().draft) {
         p.draft = {partition_range(c.hidden, size, rank),
@@ -34,23 +33,67 @@ RankPlan rank_plan(const ModelDefinition& definition, std::uint32_t size, std::u
                    partition_range(draft->attention.num_key_value_heads, size, rank),
                    partition_range(draft->intermediate_size, size, rank)};
     }
-    const auto experts = partition_range(c.moe.experts, ep_size, ep_size == 1 ? 0 : rank);
+    const auto experts = partition_range(c.moe.experts, id.ep.size, id.ep.rank);
+    const auto slice   = p.placement.expert_slice();
     p.experts.resize(definition.expert_banks().size());
     for (auto& bank : p.experts) {
         bank.ids.resize(experts.size);
         std::iota(bank.ids.begin(), bank.ids.end(), experts.begin);
-        bank.intermediate =
-            partition_range(c.moe.intermediate, size / ep_size, ep_size == 1 ? rank : 0);
+        bank.intermediate = partition_range(c.moe.intermediate, slice.size, slice.rank);
     }
 
     const auto whole = [&](std::initializer_list<WeightId> ids) {
         p.whole.insert(p.whole.end(), ids.begin(), ids.end());
     };
     const auto whole_mhc = [&](const MhcWeights& m) { whole({m.projection, m.base, m.scale}); };
-    const auto whole_mla = [&](const MlaWeights& m) {
-        whole({m.latent, m.index_key, m.pool_gate, m.query_a, m.index_weight, m.query_b,
-               m.index_query, m.key_up, m.value_up, m.output, m.query_norm, m.latent_norm,
-               m.index_norm, m.index_bias, m.pool_ape});
+    const auto mla       = [&](const MlaWeights& m) {
+        whole({m.query_norm, m.latent_norm, m.index_norm, m.index_bias, m.pool_ape});
+        if (attention_slice.size == 1) {
+            whole({m.latent, m.index_key, m.pool_gate, m.query_a, m.index_weight, m.query_b,
+                   m.index_query, m.key_up, m.value_up, m.output});
+            return;
+        }
+        // Preserve the artifact's fused projection parents, but include only the rows read
+        // by this member. In particular index_weight can share storage with index_key.
+        std::map<std::pair<std::size_t, std::uint64_t>, std::size_t> projections;
+        const auto projection = [&](WeightId weight, std::uint64_t first_row, std::uint64_t rows) {
+            const auto& ref    = definition.parameter(weight);
+            const auto columns = ref.shape.back();
+            auto assembly      = p.assemblies.size();
+            if (ref.binding.parts.size() == 1) {
+                const auto key = std::pair{ref.binding.parts.front().object.index, columns};
+                assembly       = projections.try_emplace(key, assembly).first->second;
+            }
+            if (assembly == p.assemblies.size()) p.assemblies.push_back({{0, columns}, {}, {}});
+            auto& dest       = p.assemblies[assembly];
+            const auto begin = dest.shape[0];
+            dest.slices.push_back({weight, first_row, 0, rows, columns, begin, 0});
+            dest.bindings.push_back(
+                {weight, {rows, columns}, begin * columns, (begin + rows) * columns});
+            dest.shape[0] += rows;
+        };
+        for (const auto weight : {m.latent, m.index_key, m.pool_gate, m.query_a})
+            projection(weight, 0, definition.parameter(weight).shape.front());
+        const auto& a             = c.mla;
+        const std::uint64_t first = p.mla_heads.begin, heads = p.mla_heads.size;
+        if (attention_slice.rank == 0)
+            projection(m.index_weight, 0, definition.parameter(m.index_weight).shape.front());
+        projection(m.query_b, first * a.query_dim, heads * a.query_dim);
+        if (attention_slice.rank == 0)
+            projection(m.index_query, 0, definition.parameter(m.index_query).shape.front());
+        else
+            p.omitted.insert(p.omitted.end(), {m.index_weight, m.index_query});
+        const auto select = [&](WeightId weight, artifact::Shape shape, std::uint64_t row,
+                                std::uint64_t column) {
+            const auto elements = weight_element_count(shape);
+            const auto columns  = shape.back();
+            p.assemblies.push_back({shape,
+                                    {{weight, row, column, elements / columns, columns}},
+                                    {{weight, shape, 0, elements}}});
+        };
+        select(m.key_up, {heads, a.query_dim, a.latent_dim}, first * a.query_dim, 0);
+        select(m.value_up, {heads, a.value_dim, a.latent_dim}, first * a.value_dim, 0);
+        select(m.output, {c.hidden, heads * a.value_dim}, 0, first * a.value_dim);
     };
     const auto whole_vision = [&](const VisionWeights& v) {
         whole({v.patch_embedding, v.patch_embedding_bias, v.post_norm});
@@ -72,14 +115,14 @@ RankPlan rank_plan(const ModelDefinition& definition, std::uint32_t size, std::u
         if (const auto* k = std::get_if<KdaWeights>(&layer.mixer))
             whole({k->norm});
         else
-            whole_mla(std::get<MlaWeights>(layer.mixer));
+            mla(std::get<MlaWeights>(layer.mixer));
         if (const auto* m = std::get_if<MoeWeights>(&layer.ffn))
             whole({m->router, m->correction_bias});
     }
     if (w.mtp) {
         whole({w.mtp->embedding, w.mtp->embedding_norm, w.mtp->hidden_norm, w.mtp->fc,
                w.mtp->final_norm, w.mtp->input_norm, w.mtp->post_attention_norm});
-        whole_mla(w.mtp->attention);
+        mla(w.mtp->attention);
         whole({w.mtp->moe.router, w.mtp->moe.correction_bias});
     }
     if (w.draft) {
@@ -221,7 +264,9 @@ RankPlan rank_plan(const ModelDefinition& definition, std::uint32_t size, std::u
 
 std::uint64_t compute_rank_shard_digest(const artifact::ArtifactId& artifact_id,
                                         LoadOptions options, const RankPlan& r) {
-    std::vector<std::uint64_t> geometry{r.rank, r.size, r.ep_size};
+    std::vector<std::uint64_t> geometry{
+        r.placement.tp.rank,  r.placement.tp.size,  r.placement.ep.rank, r.placement.ep.size,
+        r.placement.adp.rank, r.placement.adp.size, r.mla_heads.begin,   r.mla_heads.size};
     for (const auto range :
          {r.kda_heads, r.vocabulary, r.dense_intermediate, r.shared_intermediate}) {
         geometry.push_back(range.begin);
@@ -239,42 +284,30 @@ std::uint64_t compute_rank_shard_digest(const artifact::ArtifactId& artifact_id,
                               r.experts);
 }
 
-RankPlan plan_single_rank(const ModelDefinition& definition) {
-    return rank_plan(definition, 1, 0, 1);
-}
+RankPlan plan_single_rank(const ModelDefinition& definition) { return rank_plan(definition, {}); }
 
 ParallelPlan plan_parallel(const ModelDefinition& definition, const DeploymentOptions& deployment) {
     const auto normalized = normalize_deployment(deployment);
     const auto& o         = normalized.parallel;
-    const auto world_size = static_cast<std::uint32_t>(normalized.ranks.size());
-    if ((o.tp != 1 && o.tp != 2) || (o.ep != 1 && o.ep != o.tp) || o.adp != o.tp || o.dp < 1 ||
-        o.pp != 1 || world_size != o.dp * o.tp)
-        throw std::invalid_argument(
-            "GLM5Next weight placement supports DP>=1 with TP1/ADP1/EP1 or TP2/ADP2/(EP1|EP2) and PP1");
+    if (o.pp != 1) throw std::invalid_argument("GLM5Next weight placement requires PP1");
     ParallelPlan out;
     out.topology = distributed::build_cluster_topology(normalized);
-    out.ranks.reserve(world_size);
-    for (const auto& r : normalized.ranks) {
-        const auto& id = out.topology.rank(r.rank);
-        auto shard     = rank_plan(definition, o.tp, id.tp.rank, o.ep);
-        out.topology.ranks[r.rank].shard_digest =
+    out.ranks.reserve(out.topology.ranks.size());
+    for (auto& id : out.topology.ranks) {
+        auto shard = rank_plan(definition, id);
+        id.shard_digest =
             compute_rank_shard_digest(definition.artifact_id(), definition.options(), shard);
         out.ranks.push_back(std::move(shard));
     }
-    if (o.tp > 1) {
-        distributed::GroupId next_group_id = 0;
-        for (const auto& rep : out.topology.replicas) {
-            const auto general_id = next_group_id++;
-            const auto peer_id    = next_group_id++;
-            out.topology.groups.push_back({general_id, rep.ranks, distributed::GroupUsage::General});
-            out.topology.groups.push_back(
-                {peer_id, rep.ranks, distributed::GroupUsage::PeerExchange});
-            for (const char* role : {"tensor", "expert", "attention", "vocabulary", "vision"}) {
-                out.topology.roles.push_back({role, general_id});
-            }
-            out.topology.roles.push_back({"context", peer_id});
-        }
+    for (const auto& rep : out.topology.replicas) {
+        for (const char* role : {"tensor", "attention", "vocabulary", "vision"})
+            out.topology.add_role(role, rep.ranks);
+        out.topology.add_role("context", rep.ranks, distributed::GroupUsage::PeerExchange);
+        const auto lanes = out.ranks[rep.ranks.front()].placement.attention_slice().size;
+        for (std::size_t i = 0; i < rep.ranks.size(); i += lanes)
+            out.topology.add_role("attention_owner", std::span(rep.ranks).subspan(i, lanes));
     }
+    add_expert_roles(out.topology);
     out.topology.plan =
         distributed::compute_topology_plan_digest(definition.artifact_id(), out.topology);
     out.topology.validate(normalized);

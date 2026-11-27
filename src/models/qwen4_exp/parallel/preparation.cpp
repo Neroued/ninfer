@@ -12,28 +12,19 @@ RankPreparation::RankPreparation(const artifact::Reader& reader, std::span<const
                                  distributed::CommunicationContext& communication,
                                  const StartupObserver& observer)
     : device_(device) {
+    distributed::wire::Decoder in(payload);
+    auto request = decode_rank_load(in, identity, reader.artifact_id());
+    in.finish();
+    if (identity.ep.size > identity.tp.size)
+        throw std::invalid_argument(
+            "Qwen4Exp execution requires cross-replica expert dispatch and return");
+    if (identity.dp.size > 1)
+        throw std::invalid_argument("Qwen4Exp execution requires per-replica Session preparation");
     if (identity.tp.size > 1) {
-        const auto role = std::find_if(topology.roles.begin(), topology.roles.end(),
-                                       [](const auto& r) { return r.role == "tensor"; });
-        if (role == topology.roles.end())
-            throw std::invalid_argument("Qwen4Exp tensor group is absent");
-        const auto& group    = topology.group(role->group);
+        const auto& group    = topology.role_group("tensor", identity.rank);
         const auto result_id = topology.replica_for_rank(identity.rank).result_owner;
         binding_             = {&communication.group(group.id), group.index(result_id)};
     }
-    distributed::wire::Decoder in(payload);
-    auto request = decode_rank_load(in);
-    in.finish();
-    if (request.rank.rank != identity.rank || request.rank.size != identity.tp.size ||
-        identity.tp.rank != identity.rank || identity.ep.size != request.rank.ep_size ||
-        identity.ep.rank != (request.rank.ep_size == 1 ? 0U : request.rank.rank) ||
-        identity.dp.size != 1 || identity.pp.size != 1 || identity.adp.size != 1)
-        throw std::invalid_argument("Qwen4Exp rank plan differs from worker identity");
-    if (request.artifact != reader.artifact_id())
-        throw artifact::ArtifactError("Qwen4Exp worker artifact differs from coordinator");
-    if (compute_rank_shard_digest(reader.artifact_id(), models::load_options(request.options),
-                                  request.rank) != identity.shard_digest)
-        throw std::invalid_argument("Qwen4Exp rank shard digest differs from topology plan");
     batches_ = std::make_shared<const BatchExecutionPlan>(std::move(request.batches));
     options_ = std::move(request.options);
     options_.startup_observer = observer;
@@ -218,7 +209,7 @@ RankExecutionDescription RankPreparation::describe() const {
     const auto& program = *instance_->program;
     RankExecutionDescription result{program.session_plan(), program.capacity(),
                                     program.resource_budget()};
-    result.observation.rank     = profile_->local.rank;
+    result.observation.rank     = instance_->model->rank_plan().placement.global_rank;
     result.observation.memory   = program.observe_resources();
     result.observation.hardware = device_.properties().name;
     result.observation.physical_memory.emplace();

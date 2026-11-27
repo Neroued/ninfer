@@ -8,35 +8,35 @@
 
 namespace ninfer::models::qwen4_exp {
 namespace {
-RankPlan rank_plan(const ModelDefinition& definition, std::uint32_t size, std::uint32_t rank,
-                   std::uint32_t ep_size) {
+RankPlan rank_plan(const ModelDefinition& definition, const distributed::RankIdentity& id,
+                   ple::Placement table) {
     const auto& c = definition.config().text;
     const auto& w = definition.weights();
     RankPlan p;
-    p.rank                = rank;
-    p.size                = size;
-    p.ep_size             = ep_size;
-    p.ple_placement       = size == 1 ? ple::Placement::Disk : ple::Placement::Device;
-    p.gdn_keys            = partition_range(c.gdn.key_heads, size, rank);
-    p.gdn_values          = partition_range(c.gdn.value_heads, size, rank);
-    p.qsa_queries         = partition_range(c.qsa.query_heads, size, rank);
-    p.qsa_kv              = partition_range(c.qsa.kv_heads, size, rank);
-    p.vocabulary          = partition_vocabulary_range(c.vocabulary, size, rank);
-    p.ple_shards          = partition_range(c.ple.shards, size, rank);
+    p.placement             = RankPlacement(id);
+    const auto [rank, size] = id.tp;
+    p.ple_placement         = table;
+    p.gdn_keys              = partition_range(c.gdn.key_heads, size, rank);
+    p.gdn_values            = partition_range(c.gdn.value_heads, size, rank);
+    p.qsa_queries           = partition_range(c.qsa.query_heads, size, rank);
+    p.qsa_kv                = partition_range(c.qsa.kv_heads, size, rank);
+    p.vocabulary            = partition_vocabulary_range(c.vocabulary, size, rank);
+    if (table == ple::Placement::Device) p.ple_shards = partition_range(c.ple.shards, size, rank);
     p.shared_intermediate = partition_range(c.moe.shared_intermediate, size, rank).size;
-    (void)partition_range(c.moe.experts, ep_size, ep_size == 1 ? 0 : rank);
+    const auto per_owner  = partition_range(c.moe.experts, id.ep.size, id.ep.rank);
+    const auto slice      = p.placement.expert_slice();
     p.experts.resize(definition.expert_banks().size());
     for (std::size_t layer = 0; layer < p.experts.size(); ++layer) {
-        auto& bank = p.experts[layer];
-        bank.intermediate =
-            partition_range(c.moe.intermediate, size / ep_size, ep_size == 1 ? rank : 0);
-        if (ep_size == 1) {
+        auto& bank        = p.experts[layer];
+        bank.intermediate = partition_range(c.moe.intermediate, slice.size, slice.rank);
+        if (id.ep.size == 1) {
             bank.ids.resize(c.moe.experts);
             std::iota(bank.ids.begin(), bank.ids.end(), 0);
         } else {
             const auto priority = layer < w.text.layers.size() ? default_expert_priority(c, layer)
                                                                : std::span<const std::uint32_t>{};
-            for (std::uint32_t index = rank; index < c.moe.experts; index += ep_size)
+            bank.ids.reserve(per_owner.size);
+            for (std::uint32_t index = id.ep.rank; index < c.moe.experts; index += id.ep.size)
                 bank.ids.push_back(priority.empty() ? index : priority[index]);
             std::sort(bank.ids.begin(), bank.ids.end());
         }
@@ -191,7 +191,8 @@ RankPlan rank_plan(const ModelDefinition& definition, std::uint32_t size, std::u
 
 std::uint64_t compute_rank_shard_digest(const artifact::ArtifactId& artifact_id,
                                         LoadOptions options, const RankPlan& r) {
-    std::vector<std::uint64_t> geometry{r.rank, r.size, r.ep_size,
+    std::vector<std::uint64_t> geometry{r.placement.tp.rank, r.placement.tp.size,
+                                        r.placement.ep.rank, r.placement.ep.size,
                                         static_cast<std::uint64_t>(r.ple_placement)};
     for (const auto range :
          {r.gdn_keys, r.gdn_values, r.qsa_queries, r.qsa_kv, r.vocabulary, r.ple_shards}) {
@@ -204,30 +205,31 @@ std::uint64_t compute_rank_shard_digest(const artifact::ArtifactId& artifact_id,
 }
 
 RankPlan plan_single_rank(const ModelDefinition& definition) {
-    return rank_plan(definition, 1, 0, 1);
+    return rank_plan(definition, {}, ple::Placement::Disk);
 }
 
-ParallelPlan plan_parallel(const ModelDefinition& definition, const DeploymentOptions& deployment) {
+ParallelPlan plan_parallel(const ModelDefinition& definition, const DeploymentOptions& deployment,
+                           ple::Placement table) {
     const auto normalized = normalize_deployment(deployment);
     const auto& o         = normalized.parallel;
-    const auto size       = static_cast<std::uint32_t>(normalized.ranks.size());
-    if ((size != 1 && size != 2) || o.tp != size || (o.ep != 1 && o.ep != size) || o.dp != 1 ||
-        o.pp != 1 || o.adp != 1)
+    if (o.pp != 1 || o.adp != 1)
         throw std::invalid_argument(
-            "Qwen4Exp supports one rank or TP2 with EP1 or EP2 and DP1/ADP1/PP1");
+            "Qwen4Exp weight placement requires PP1 and a single QSA owner");
     ParallelPlan out;
     out.topology = distributed::build_cluster_topology(normalized);
-    out.ranks.reserve(size);
-    for (const auto& r : normalized.ranks) {
-        auto shard = rank_plan(definition, size, r.rank, o.ep);
-        out.topology.ranks[r.rank].shard_digest =
+    out.ranks.reserve(out.topology.ranks.size());
+    for (auto& id : out.topology.ranks) {
+        auto shard = rank_plan(definition, id, table);
+        id.shard_digest =
             compute_rank_shard_digest(definition.artifact_id(), definition.options(), shard);
         out.ranks.push_back(std::move(shard));
     }
-    if (size > 1) {
-        out.topology.groups.push_back({0, {0, 1}});
-        out.topology.roles = {{"tensor", 0}, {"expert", 0}, {"ple", 0}, {"vocabulary", 0}};
+    for (const auto& replica : out.topology.replicas) {
+        out.topology.add_role("tensor", replica.ranks);
+        out.topology.add_role("vocabulary", replica.ranks);
+        if (table == ple::Placement::Device) out.topology.add_role("ple", replica.ranks);
     }
+    add_expert_roles(out.topology);
     out.topology.plan =
         distributed::compute_topology_plan_digest(definition.artifact_id(), out.topology);
     out.topology.validate(normalized);

@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace ninfer::distributed {
@@ -61,6 +62,9 @@ struct ExecutionTopology {
     [[nodiscard]] const ReplicaTopology& replica(std::uint32_t replica_id) const;
     [[nodiscard]] const ReplicaTopology& replica_for_rank(RankId global_rank) const;
     [[nodiscard]] const GroupDescription& group(GroupId) const;
+    [[nodiscard]] const GroupDescription& role_group(std::string_view role, RankId member) const;
+    void add_role(std::string_view role, std::span<const RankId> members,
+                  GroupUsage usage = GroupUsage::General);
 };
 
 [[nodiscard]] ExecutionTopology build_cluster_topology(const DeploymentOptions&);

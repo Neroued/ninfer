@@ -333,19 +333,12 @@ int main(int argc, char** argv) {
                 if (backend == SpeculativeBackend::DFlash2) {
                     auto tp1              = *options.deployment;
                     tp1.parallel          = {.dp = static_cast<std::uint32_t>(tp1.ranks.size())};
-                    const auto reject_tp1 = [](auto make_plan) {
-                        try {
-                            make_plan();
-                        } catch (const std::invalid_argument& error) {
-                            check(std::string_view(error.what()) ==
-                                      "GLM5Next DFlash2 requires TP=2",
-                                  "GLM5Next TP1 rejected with the wrong reason");
-                            return;
-                        }
-                        throw std::runtime_error("GLM5Next TP1 accepted DFlash2");
-                    };
-                    reject_tp1([&] { (void)glm::plan_single_rank(*definition); });
-                    reject_tp1([&] { (void)glm::plan_parallel(*definition, tp1); });
+                    const auto local      = glm::plan_single_rank(*definition);
+                    const auto replicas   = glm::plan_parallel(*definition, tp1);
+                    check(local.draft && replicas.ranks.size() == tp1.ranks.size() &&
+                              replicas.ranks.back().draft &&
+                              replicas.ranks.back().draft->query_heads == local.draft->query_heads,
+                          "DFlash2 TP1 weight placement lost complete draft heads");
                 }
                 const auto window =
                     definition->config().draft && backend == SpeculativeBackend::DFlash2

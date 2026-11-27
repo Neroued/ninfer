@@ -26,11 +26,20 @@ bool can_narrow_dflash_targets(const EngineOptions& options) noexcept {
 
 RankPreparation::RankPreparation(const artifact::Reader& reader, RankLoadRequest request,
                                  DeviceContext& device, ContextCommunication peer,
-                                 std::uint32_t global_rank, std::uint32_t global_node)
-    : device_(device), options_(std::move(request.options)), global_rank_(global_rank),
-      global_node_(global_node), peer_(std::move(peer)), control_owner_(request.control_owner) {
+                                 std::uint32_t global_node)
+    : device_(device), options_(std::move(request.options)), global_node_(global_node),
+      peer_(std::move(peer)), control_owner_(request.control_owner) {
     if (request.artifact != reader.artifact_id())
         throw artifact::ArtifactError("GLM5Next worker artifact differs from coordinator");
+    const auto& placement = request.rank.placement;
+    if (placement.ep.size > placement.tp.size)
+        throw std::invalid_argument(
+            "GLM5Next execution requires cross-replica expert dispatch and return");
+    if (placement.attention_slice().size > 1)
+        throw std::invalid_argument("GLM5Next execution requires intra-owner MLA head reduction");
+    if (placement.adp.size > 2)
+        throw std::invalid_argument(
+            "GLM5Next packed MLA exchange supports at most two attention owners");
     auto definition = read_definition(reader, load_options(options_));
     load_.emplace(
         resolve_rank_load(reader, std::move(definition), std::move(request.rank), device.device()));
@@ -175,7 +184,7 @@ RankResourceDescription RankPreparation::describe() const {
                                 .batches = p.batches->spec(),
                                 .state   = describe_state(p.state),
                                 .context = describe_context(p)};
-    out.observation.rank     = global_rank_;
+    out.observation.rank     = instance_->model->rank_plan().placement.global_rank;
     out.observation.node     = global_node_;
     out.observation.hardware = device_.properties().name;
     out.observation.memory   = instance_->program->observe_resources();
@@ -222,7 +231,8 @@ Startup::Startup(const artifact::Reader& reader, const artifact::Reader& rank,
         throw artifact::ArtifactError("GLM5Next local artifact differs from coordinator");
     rank_ = options.deployment ? plan_parallel(*definition_, *options.deployment).ranks.at(0)
                                : plan_single_rank(*definition_);
-    if (rank_.size != 1 || (options.deployment && options.deployment->ranks.size() != 1))
+    if (rank_.placement.tp.size != 1 ||
+        (options.deployment && options.deployment->ranks.size() != 1))
         throw std::invalid_argument("GLM5Next local startup requires one rank");
 }
 

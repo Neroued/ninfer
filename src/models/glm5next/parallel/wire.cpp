@@ -11,10 +11,9 @@ using distributed::wire::Decoder;
 void encode_rank_load(Encoder& out, const RankLoadRequest& request) {
     out.raw(request.artifact);
     const auto& p = request.rank;
-    out.u32(p.rank);
-    out.u32(p.size);
-    out.u32(p.ep_size);
-    for (auto r : {p.kda_heads, p.vocabulary, p.dense_intermediate, p.shared_intermediate}) {
+    out.u32(p.placement.global_rank);
+    for (auto r :
+         {p.mla_heads, p.kda_heads, p.vocabulary, p.dense_intermediate, p.shared_intermediate}) {
         out.u32(r.begin);
         out.u32(r.size);
     }
@@ -37,15 +36,19 @@ void encode_rank_load(Encoder& out, const RankLoadRequest& request) {
     out.boolean(request.narrow_dflash_targets);
 }
 
-RankLoadRequest decode_rank_load(Decoder& in) {
+RankLoadRequest decode_rank_load(Decoder& in, const distributed::RankIdentity& identity,
+                                 const artifact::ArtifactId& expected_artifact) {
     RankLoadRequest request;
     const auto artifact = in.raw(request.artifact.size());
     std::copy(artifact.begin(), artifact.end(), request.artifact.begin());
     auto& p   = request.rank;
-    p.rank    = in.u32();
-    p.size    = in.u32();
-    p.ep_size = in.u32();
-    for (auto* r : {&p.kda_heads, &p.vocabulary, &p.dense_intermediate, &p.shared_intermediate})
+    if (request.artifact != expected_artifact)
+        throw artifact::ArtifactError("GLM5Next worker artifact differs from coordinator");
+    if (in.u32() != identity.rank)
+        throw std::invalid_argument("GLM5Next load request addressed to another global rank");
+    p.placement = RankPlacement(identity);
+    for (auto* r :
+         {&p.mla_heads, &p.kda_heads, &p.vocabulary, &p.dense_intermediate, &p.shared_intermediate})
         *r = {in.u32(), in.u32()};
     if (in.boolean()) {
         p.draft.emplace();
@@ -63,6 +66,9 @@ RankLoadRequest decode_rank_load(Decoder& in) {
     request.host_reservation_bytes = in.u64();
     request.control_owner          = in.boolean();
     request.narrow_dflash_targets  = in.boolean();
+    if (compute_rank_shard_digest(expected_artifact, models::load_options(request.options), p) !=
+        identity.shard_digest)
+        throw std::invalid_argument("GLM5Next rank shard digest differs from topology plan");
     return request;
 }
 

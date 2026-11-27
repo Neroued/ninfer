@@ -22,7 +22,6 @@ Frontend ParallelStartup::frontend(const EngineOptions& options) const {
 std::vector<distributed::wire::Bytes> ParallelStartup::requests(const EngineOptions& options,
                                                                 bool narrow_targets) const {
     const auto dp_count    = static_cast<std::uint32_t>(parallel_.topology.replicas.size());
-    const auto tp_size     = static_cast<std::uint32_t>(parallel_.topology.replicas.front().ranks.size());
     const auto local_lanes = (options.max_concurrency + dp_count - 1U) / dp_count;
     auto rank_options      = options;
     rank_options.max_concurrency              = local_lanes;
@@ -31,7 +30,7 @@ std::vector<distributed::wire::Bytes> ParallelStartup::requests(const EngineOpti
     std::vector<distributed::wire::Bytes> payloads;
     payloads.reserve(parallel_.ranks.size());
     const auto batches = make_batch_execution_spec(
-        local_lanes, tp_size,
+        local_lanes, parallel_.ranks.front().placement.adp.size,
         options.use_cuda_graph && options.purpose == EnginePurpose::Generation);
     for (std::size_t idx = 0; idx < parallel_.ranks.size(); ++idx) {
         const auto& rank_id = parallel_.topology.ranks[idx];
@@ -159,7 +158,8 @@ std::string ParallelStartup::prefill_signature(std::uint32_t chunk,
                                                std::uint32_t replica_id) const {
     const auto& replica = parallel_.topology.replica(replica_id);
     const auto& rank    = parallel_.ranks.at(replica.result_owner);
-    auto signature      = glm5next::prefill_signature(*definition_, chunk, rank.size, rank.ep_size);
+    auto signature      = glm5next::prefill_signature(*definition_, chunk, rank.placement.tp.size,
+                                                      rank.placement.ep.size);
     for (const auto& group : ranks_.at(replica.result_owner).observation.communication)
         for (const auto& backend : group.backends)
             signature +=

@@ -258,13 +258,14 @@ int main(int argc, char** argv) {
         options.speculative = {.backend = SpeculativeBackend::Mtp, .draft_tokens = 3};
         auto definition     = q4::read_definition(reader, models::load_options(options));
         auto frontend       = q4::create_frontend(*definition, options);
-        const auto parallel = q4::plan_parallel(*definition, deployment);
+        const auto parallel =
+            q4::plan_parallel(*definition, deployment, q4::ple::Placement::Device);
         const auto batches =
             models::make_batch_execution_spec(options.max_concurrency, 1, options.use_cuda_graph);
         std::vector<wire::Bytes> payloads;
         for (const auto& rank : parallel.ranks) {
             wire::Encoder out;
-            const auto node = parallel.topology.rank(rank.rank).node;
+            const auto node = parallel.topology.rank(rank.placement.global_rank).node;
             q4::encode_rank_load(out, {definition->artifact_id(), rank, options, batches, 0,
                                        node == deployment.coordinator_node});
             payloads.push_back(std::move(out).take());

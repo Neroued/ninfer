@@ -84,7 +84,10 @@ struct Fixture {
         : plans{storage_plan(0, mtp, storage, index_format, false, 3, linear_state_dtype),
                 storage_plan(1, mtp, storage, index_format, false, 3, linear_state_dtype)} {
         parallel.ranks.resize(2);
-        parallel.ranks[1].rank = 1;
+        parallel.ranks[0].placement.global_rank = 6;
+        parallel.ranks[1].placement.global_rank = 7;
+        parallel.ranks[0].placement.tp          = {0, 2};
+        parallel.ranks[1].placement.tp          = {1, 2};
         const std::array offers{
             runtime::RankCapacityOffer{glm::describe_execution_capacity(plans[0]), 1ULL << 30,
                                        2ULL << 30, plans[0].shared_physical_memory},
@@ -101,7 +104,7 @@ struct Fixture {
                                     glm::describe_state(p.state),
                                     glm::describe_context(p),
                                     {},
-                                    {},
+                                    RankSnapshot{.rank = rank + 6},
                                     0,
                                     p.mtp
                                         ? std::vector<KVPageGeometry>{p.main.cache.page.geometry,

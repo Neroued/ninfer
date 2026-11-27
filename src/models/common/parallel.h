@@ -3,6 +3,7 @@
 #include "models/common/weights.h"
 #include "artifact/binder.h"
 #include "artifact/encoded_slice.h"
+#include "distributed/topology.h"
 
 namespace ninfer::models {
 
@@ -16,6 +17,29 @@ struct ExpertPartition {
     std::vector<std::uint32_t> ids;
     IndexRange intermediate;
 };
+
+// Logical PP1 weight placement. Device and process identity stay with the topology.
+struct RankPlacement {
+    distributed::RankId global_rank = 0;
+    ParallelCoordinate tp, ep, adp, dp;
+
+    RankPlacement() = default;
+
+    explicit RankPlacement(const distributed::RankIdentity& id)
+        : global_rank(id.rank), tp(id.tp), ep(id.ep), adp(id.adp), dp(id.dp) {}
+
+    [[nodiscard]] ParallelCoordinate expert_slice() const {
+        const auto lanes = ep.size <= tp.size ? tp.size / ep.size : 1U;
+        return {tp.rank % lanes, lanes};
+    }
+
+    [[nodiscard]] ParallelCoordinate attention_slice() const {
+        const auto lanes = tp.size / adp.size;
+        return {tp.rank % lanes, lanes};
+    }
+};
+
+void add_expert_roles(distributed::ExecutionTopology&);
 
 [[nodiscard]] IndexRange partition_range(std::uint32_t total, std::uint32_t parts,
                                          std::uint32_t rank);

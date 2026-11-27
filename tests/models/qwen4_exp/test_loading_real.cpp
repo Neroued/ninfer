@@ -34,7 +34,7 @@ void rank_loading(const artifact::Reader& reader, DeviceContext& device, std::ui
     deployment.nodes        = {{0, {}, "/worker", "/model.ninfer", {}},
                                {1, "rank1", "/worker", "/model.ninfer", {}}};
     deployment.ranks        = {{0, 0, 0}, {1, 1, 0}};
-    const auto parallel     = q4::plan_parallel(*definition, deployment);
+    const auto parallel = q4::plan_parallel(*definition, deployment, q4::ple::Placement::Device);
     const auto& r           = parallel.ranks.at(rank);
     auto selected           = q4::resolve_rank_load(reader, definition, r, device.device());
     auto profile            = q4::execution::describe_model(*definition, selected.weight_data(),

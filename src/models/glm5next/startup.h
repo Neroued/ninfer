@@ -22,8 +22,7 @@ public:
     using Types    = RuntimeTypes;
     using Instance = runtime::RankModelInstance<Types>;
     RankPreparation(const artifact::Reader&, RankLoadRequest, DeviceContext&,
-                    ContextCommunication = {}, std::uint32_t global_rank = 0,
-                    std::uint32_t global_node = 0);
+                    ContextCommunication = {}, std::uint32_t global_node = 0);
     RankPreparation(const artifact::Reader&, std::span<const std::byte>,
                     const distributed::RankIdentity&, DeviceContext&,
                     const distributed::ExecutionTopology&, distributed::CommunicationContext&,
@@ -56,7 +55,6 @@ private:
     void create_probe(std::size_t context_bytes);
     DeviceContext& device_;
     EngineOptions options_;
-    std::uint32_t global_rank_ = 0;
     std::uint32_t global_node_ = 0;
     ContextCommunication peer_;
     ParallelBinding binding_;

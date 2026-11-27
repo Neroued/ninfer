@@ -5,6 +5,8 @@ ninfer_add_test(ninfer_batch_execution_test
 ninfer_add_test(ninfer_parallel_weights_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_parallel_weights.cpp"
   LIBRARIES ninfer_model_execution ninfer_core ninfer::json)
+add_test(NAME ninfer_parallel_weights_gpu_test COMMAND ninfer_parallel_weights_test --gpu)
+set_tests_properties(ninfer_parallel_weights_gpu_test PROPERTIES SKIP_RETURN_CODE 77 LABELS "gpu")
 
 ninfer_add_test(ninfer_sequence_parallel_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_sequence_parallel.cpp"

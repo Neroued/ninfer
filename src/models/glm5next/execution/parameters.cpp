@@ -144,8 +144,8 @@ private:
 
 Parameters::Parameters(const ModelShard& model, std::shared_ptr<const ModelProfile> profile)
     : model(model), profile(std::move(profile)) {
-    if (!this->profile || this->profile->local.rank != model.rank_plan().rank ||
-        this->profile->local.size != model.rank_plan().size ||
+    if (!this->profile || this->profile->local.rank != model.rank_plan().placement.tp.rank ||
+        this->profile->local.size != model.rank_plan().placement.tp.size ||
         this->profile->options != model.definition().options())
         throw std::invalid_argument("GLM5Next Parameters require their selected rank profile");
     const Prepare p(model);

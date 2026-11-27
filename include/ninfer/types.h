@@ -160,6 +160,8 @@ struct ObservabilityOptions {
     bool gpu_timing = false;
 };
 
+enum class PleStorage : std::uint8_t { Auto, Disk, Device };
+
 struct EngineOptions {
     ObservabilityOptions observability;
     std::optional<DeploymentOptions> deployment;
@@ -178,6 +180,7 @@ struct EngineOptions {
     // Zero uses 4096 for Qwen4Exp, GLM5Next, or CPU expert offload, otherwise 1024.
     std::uint32_t prefill_chunk = 0;
     MoeOptions moe;
+    PleStorage ple_storage              = PleStorage::Auto;
     KvCacheStorage kv_cache             = KvCacheStorage::BFloat16;
     LinearStateDType linear_state_dtype = LinearStateDType::Float32;
     SpeculativeOptions speculative;

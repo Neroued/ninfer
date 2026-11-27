@@ -17,8 +17,29 @@ void RankProgramImpl::start(runtime::ExecutionRequest<ExecutionTypes>&& request)
     if (compute) throw std::logic_error("Qwen4Exp compute frame is occupied");
     gpu_timer.begin();
     compute.emplace();
-    auto& f             = *compute;
-    f.request           = std::move(request);
+    auto& f   = *compute;
+    f.request = std::move(request);
+    if (const auto& step = f.request.work.exchange) {
+        last_expert_step = step->id;
+        f.main_pass      = step->draft_passes;
+        if (std::holds_alternative<ExpertServiceWork>(f.request.work.operation)) {
+            const auto serve = [&](const moe::Parameters& layer, std::uint32_t columns) {
+                const auto stage = exchange->stage(layer.bank, dimension(columns));
+                moe::resident_layer(layer, nullptr, &stage, resources.workspace, cuda);
+            };
+            for (std::size_t pass = 0; pass < step->columns.size(); ++pass) {
+                if (pass < step->draft_passes)
+                    serve(parameters.mtp.value().layer.moe, step->columns[pass]);
+                else
+                    for (const auto& layer : parameters.text.layers)
+                        serve(layer.moe, step->columns[pass]);
+            }
+            gpu_timer.record_result();
+            compute_done.record(cuda.stream());
+            f.phase = ComputePhase::AwaitExpertService;
+            return;
+        }
+    }
     f.physical          = work_shape(f.request.work);
     const auto* forward = std::get_if<ForwardWork>(&f.request.work.operation);
     const auto* mtp     = std::get_if<MtpWork>(&f.request.work.operation);
@@ -174,8 +195,18 @@ void RankProgramImpl::advance_compute() {
             return;
         case ComputePhase::PendingCommit:
             return;
+        case ComputePhase::AwaitExpertService:
+            if (!compute_done.ready()) return;
+            gpu_timer.observe_result(f.gpu);
+            events.emplace_back(runtime::ResultReady<ExecutionTypes>{
+                f.request.ticket, ExpertServiceResult{f.request.work.exchange->id}});
+            f.phase = ComputePhase::PendingCommit;
+            return;
         case ComputePhase::Retiring:
-            if (!compute_done.ready() || (host_ple && !host_ple->retired(f.request.ticket))) return;
+            if (!compute_done.ready() ||
+                (host_ple && !std::holds_alternative<ExpertServiceWork>(f.request.work.operation) &&
+                 !host_ple->retired(f.request.ticket)))
+                return;
             retire_compute();
             return;
         }
@@ -283,8 +314,9 @@ void RankProgramImpl::commit(runtime::ExecutionTicket ticket, runtime::CommandSe
     }
     for (const auto& row : commit.rows)
         f.release_vision |= row.cancelled || row.failed || row.terminal;
-    resources.compute_actions->submit(
-        local_actions(commit.actions, parameters.profile->local.rank));
+    if (!std::holds_alternative<ExpertServiceWork>(f.request.work.operation))
+        resources.compute_actions->submit(
+            local_actions(commit.actions, parameters.profile->local.rank));
     gpu_timer.record_retirement();
     compute_done.record(cuda.stream());
     f.retirement = command;
@@ -321,8 +353,9 @@ void RankProgramImpl::discard(runtime::ExecutionTicket ticket, runtime::CommandS
 void RankProgramImpl::retire_compute() {
     const auto ticket  = compute->request.ticket;
     const auto command = compute->retirement;
-    if (resources.compute_actions->occupied()) resources.compute_actions->finish();
-    if (resources.vision) {
+    const bool service = std::holds_alternative<ExpertServiceWork>(compute->request.work.operation);
+    if (!service && resources.compute_actions->occupied()) resources.compute_actions->finish();
+    if (!service && resources.vision) {
         const auto* active  = resources.vision->current();
         const auto* forward = std::get_if<ForwardWork>(&compute->request.work.operation);
         if (active && forward && forward->visual && forward->visual->window.id == active->id &&

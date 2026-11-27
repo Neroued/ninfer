@@ -51,6 +51,7 @@ private:
     const artifact::Reader& reader_;
     std::shared_ptr<const ModelDefinition> definition_;
     std::shared_ptr<const ple::disk::Table> table_;
+    ple::Placement placement_;
 };
 
 [[nodiscard]] qwen::Frontend create_frontend(const ModelDefinition&, const EngineOptions&);

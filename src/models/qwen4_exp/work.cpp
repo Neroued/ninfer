@@ -1,4 +1,5 @@
 #include "models/qwen4_exp/work.h"
+#include "models/qwen4_exp/config.h"
 #include "models/common/context/wire.h"
 #include "runtime/executor/protocol.h"
 
@@ -28,6 +29,8 @@ ExecutionWork ExecutionTypes::describe_work(const Work& work) {
                 result.kind        = ExecutionKind::Decode;
                 result.rows = result.input_tokens = op.rows.size();
                 for (const auto extent : op.draft_extents) result.scheduled_positions += extent + 1;
+            } else if constexpr (std::is_same_v<T, ExpertServiceWork>) {
+                result.kind = ExecutionKind::ExpertService;
             } else if constexpr (std::is_same_v<T, ScoreWork>) {
                 result.kind         = ExecutionKind::Score;
                 result.rows         = 1;
@@ -74,8 +77,8 @@ const PhysicalBatchShape& work_shape(const Work& work) {
     return std::visit(
         [](const auto& operation) -> const PhysicalBatchShape& {
             using T = std::decay_t<decltype(operation)>;
-            if constexpr (std::is_same_v<T, ContextWork>)
-                throw std::logic_error("Qwen4Exp Context work has no computation shape");
+            if constexpr (std::is_same_v<T, ContextWork> || std::is_same_v<T, ExpertServiceWork>)
+                throw std::logic_error("Qwen4Exp work has no source batch shape");
             else
                 return operation.shape;
         },
@@ -89,7 +92,8 @@ void plan_work_batch(Work& work, const BatchExecutionPlan& plan) {
     std::visit(
         [&](auto& operation) {
             using T = std::decay_t<decltype(operation)>;
-            if constexpr (!std::is_same_v<T, ContextWork>) {
+            if constexpr (!std::is_same_v<T, ContextWork> &&
+                          !std::is_same_v<T, ExpertServiceWork>) {
                 bool decode = std::is_same_v<T, MtpWork>;
                 if constexpr (std::is_same_v<T, ForwardWork>)
                     decode = operation.kind == ForwardKind::Ordinary;
@@ -105,6 +109,33 @@ void plan_work_batch(Work& work, const BatchExecutionPlan& plan) {
             }
         },
         work.operation);
+}
+
+std::optional<ExpertStep> plan_expert_step(const Work& work, std::uint32_t chunk) {
+    ExpertStep step{};
+    const auto rows = work_rows(work);
+    if (rows.empty()) return {};
+    const auto* forward = std::get_if<ForwardWork>(&work.operation);
+    if (const auto* mtp = std::get_if<MtpWork>(&work.operation)) {
+        if (!mtp->speculative) throw std::invalid_argument("missing Qwen4Exp proposal geometry");
+        step.draft_passes = mtp->speculative->mtp_steps;
+        step.columns.assign(step.draft_passes, mtp->shape.rows);
+        step.columns.push_back(mtp->speculative->verify_width * mtp->shape.rows);
+    } else if (forward && forward->kind == ForwardKind::Control && rows.front().ids.size() > 1) {
+        if (!chunk) throw std::logic_error("Qwen4Exp control has no traversal capacity");
+        for (const auto& row : rows)
+            for (std::size_t begin = 0; begin < row.ids.size(); begin += chunk)
+                step.columns.push_back(std::min<std::size_t>(chunk, row.ids.size() - begin));
+    } else if (forward &&
+               (forward->kind == ForwardKind::Ordinary || forward->kind == ForwardKind::Control)) {
+        step.columns.push_back(forward->shape.rows);
+    } else {
+        std::size_t columns = 0;
+        for (const auto& row : rows) columns += row.ids.size();
+        if (!columns) return {};
+        step.columns.push_back(dimension(columns));
+    }
+    return step;
 }
 
 const context::ContextActions& local_actions(const ContextActions& actions, std::uint32_t rank) {
@@ -139,7 +170,10 @@ runtime::WorkPayloadCapacity WorkContract::payload_capacity(std::uint32_t rank_c
     const auto context_rows = sizeof(Work) + sizeof(ContextWork) + sizeof(ResidencyBinding) +
                               4ULL * public_tokens + batch * sizeof(runtime::ResidencyId);
     const auto actions_storage = context::action_batch_storage_capacity() + 128;
-    return {work,
+    // The longest schedule is a forced-control window split at the prefill boundary.
+    const auto passes = std::max<std::size_t>(
+        width, batch * (1 + control_token_limit / std::max<std::size_t>(chunk, 1)));
+    return {work + 21 + 4 * passes,
             context,
             decision,
             commit,
@@ -149,6 +183,26 @@ runtime::WorkPayloadCapacity WorkContract::payload_capacity(std::uint32_t rank_c
 }
 
 void WorkContract::validate(const Work& work, runtime::FrameKind kind) const {
+    const bool service = std::holds_alternative<ExpertServiceWork>(work.operation);
+    if (service || work.exchange) {
+        if (kind != runtime::FrameKind::Compute || !work.exchange || !work.exchange->id ||
+            work.exchange->columns.empty() || work.exchange->draft_passes > shape.draft_tokens ||
+            work.exchange->draft_passes >= work.exchange->columns.size() ||
+            std::ranges::count(work.exchange->columns, 0U))
+            throw std::invalid_argument("invalid Qwen4Exp expert traversal");
+        if (service) {
+            if (std::ranges::any_of(work.actions,
+                                    [](const auto& item) { return !item.second.empty(); }))
+                throw std::invalid_argument("Qwen4Exp expert service carries request actions");
+            return;
+        }
+        const auto needed = plan_expert_step(work, shape.prefill_chunk);
+        if (!needed || needed->draft_passes != work.exchange->draft_passes ||
+            needed->columns.size() != work.exchange->columns.size() ||
+            !std::equal(needed->columns.begin(), needed->columns.end(),
+                        work.exchange->columns.begin(), std::less_equal<>{}))
+            throw std::invalid_argument("Qwen4Exp expert traversal differs from its source work");
+    }
     const auto rows     = work_rows(work);
     const auto* forward = std::get_if<ForwardWork>(&work.operation);
     const bool control  = forward && forward->kind == ForwardKind::Control;
@@ -355,7 +409,7 @@ void WorkContract::validate(const Work& work, runtime::FrameKind kind) const {
                     operation.row.constrained)
                     throw std::invalid_argument("invalid Qwen4Exp scoring work");
                 tokens(operation.targets, public_tokens);
-            } else {
+            } else if constexpr (std::is_same_v<T, ContextWork>) {
                 if (kind != runtime::FrameKind::Context || operation.bindings.size() > 1 ||
                     operation.releases.size() > shape.max_concurrency)
                     throw std::invalid_argument("invalid Qwen4Exp context reservation");
@@ -435,6 +489,13 @@ void WorkContract::validate(const Work& work, const runtime::DecisionRequest& re
 }
 
 void WorkContract::validate(const Work& work, const Result& result, const Commit& commit) const {
+    if (std::holds_alternative<ExpertServiceWork>(work.operation)) {
+        const auto* service = std::get_if<ExpertServiceResult>(&result);
+        if (!service || !work.exchange || service->step != work.exchange->id)
+            throw std::invalid_argument("Qwen4Exp expert service returned a different step");
+        validate_commit(work, {}, commit);
+        return;
+    }
     const auto* computed = std::get_if<ComputeResult>(&result);
     const bool scoring   = std::holds_alternative<ScoreWork>(work.operation);
     if ((scoring && !std::holds_alternative<ScoreResult>(result)) || (!scoring && !computed))
@@ -446,6 +507,13 @@ void WorkContract::validate(const Work& work, const Result& result, const Commit
 
 void WorkContract::validate_commit(const Work& work, std::span<const RowResult> results,
                                    const Commit& commit) const {
+    if (std::holds_alternative<ExpertServiceWork>(work.operation)) {
+        if (!results.empty() || !commit.rows.empty() ||
+            std::ranges::any_of(commit.actions,
+                                [](const auto& item) { return !item.second.empty(); }))
+            throw std::invalid_argument("Qwen4Exp expert service commit carries request state");
+        return;
+    }
     const auto rows      = work_rows(work);
     const auto* forward  = std::get_if<ForwardWork>(&work.operation);
     const auto* mtp_work = std::get_if<MtpWork>(&work.operation);

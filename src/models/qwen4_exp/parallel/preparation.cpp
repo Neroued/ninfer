@@ -26,10 +26,13 @@ RankPreparation::RankPreparation(const artifact::Reader& reader, std::span<const
     options_.startup_observer = observer;
     control_owner_            = request.control_owner;
     auto definition           = read_definition(reader, models::load_options(options_));
+    const distributed::GroupDescription* expert_group = nullptr;
     if (identity.ep.size > identity.tp.size) {
         if (!request.rank.expert_domain)
             throw std::invalid_argument("missing expert exchange placement");
         const auto& group    = topology.role_group("expert", identity.rank);
+        expert_group         = &group;
+        expert_group_        = &communication.group(group.id);
         const auto& config   = definition->config().text;
         expert_requirements_ = moe::expert_exchange_requirements(
             group, *request.rank.expert_domain, group.index(identity.rank), config.hidden,
@@ -39,8 +42,21 @@ RankPreparation::RankPreparation(const artifact::Reader& reader, std::span<const
                                     device_.device()));
     if (load_->rank_plan().ple_placement == ple::Placement::Disk)
         ple_geometry_ = load_->ple_table().geometry();
-    profile_       = execution::describe_model(load_->definition(), load_->weight_data(),
-                                               load_->expert_data(), load_->rank_plan());
+    auto profile = execution::describe_model(load_->definition(), load_->weight_data(), load_->expert_data(),
+                                            load_->rank_plan());
+    if (expert_group) {
+        const auto peer = expert_group->index(identity.rank);
+        auto plan = std::make_shared<moe::ResidentExchangePlan>(load_->rank_plan().expert_domain, *expert_group, peer,
+                                profile->config.text.hidden, profile->config.text.moe.top_k);
+        const auto bind = [&](execution::MoeProfile& layer) {
+            layer.exchange_workspace_bytes = plan->stage(layer.bank).softmax_workspace_bytes(peer, layer.math);
+        };
+        for (auto& layer : profile->text.layers) bind(layer.moe);
+        if (profile->mtp) bind(profile->mtp->layer.moe);
+        profile->exchange_bytes = plan->bytes();
+        profile->exchange = std::move(plan);
+    }
+    profile_ = std::move(profile);
     capacity_plan_ =
         describe_execution_capacity(profile_, options_, batches_, device_, ple_geometry_);
     const WorkContract contract{describe_execution_shape(*profile_, options_),
@@ -154,8 +170,9 @@ void RankPreparation::prepare_rebuild_probe() {
 
 void RankPreparation::create_probe(GraphProbeBacking backing) {
     auto plan = plan_graph_probe(profile_, ple_geometry_, options_, batches_, device_, {}, backing);
-    probe_    = std::make_unique<RankProgram>(instance_->parameters, std::move(plan), device_,
-                                              options_.startup_observer, binding_);
+    probe_    = std::make_unique<RankProgram>(
+        instance_->parameters, std::move(plan), device_, options_.startup_observer, binding_,
+        expert_group_ ? profile_->exchange->prepare(*expert_group_) : nullptr);
 }
 
 void RankPreparation::calibrate() {
@@ -202,7 +219,8 @@ void RankPreparation::prepare(runtime::ContextCapacity capacity, std::size_t ava
                                  std::to_string(required - remaining) + " bytes");
     }
     instance_->program = std::make_unique<RankProgram>(
-        instance_->parameters, std::move(*plan), device_, options_.startup_observer, binding_);
+        instance_->parameters, std::move(*plan), device_, options_.startup_observer, binding_,
+        expert_group_ ? profile_->exchange->prepare(*expert_group_) : nullptr);
 }
 
 void RankPreparation::release_resources() {

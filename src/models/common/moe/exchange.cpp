@@ -145,6 +145,23 @@ distributed::GroupRequirements expert_exchange_requirements(const distributed::G
     return out;
 }
 
+namespace {
+struct PlacementLayout {
+    LayoutRegion offsets, targets;
+    TensorRegion logical;
+    std::size_t bytes;
+    PlacementLayout(const ExpertExchangeStage& s, unsigned peer) {
+        std::size_t destinations = 0;
+        for (auto n : s.slots) destinations += n;
+        LayoutBuilder l;
+        offsets = l.add((s.experts + 1ULL) * sizeof(int), 4, "expert destinations offsets");
+        targets = l.add(destinations * sizeof(ops::ExpertDestination), 4, "expert destinations");
+        logical = l.add_tensor(DType::I32, {s.slots.at(peer)}, 4, "local logical expert IDs");
+        bytes = l.finish();
+    }
+};
+} // namespace
+
 DeviceExpertPlacement::DeviceExpertPlacement(const ExpertDomain& domain,
                                              const ExpertExchangeStage& s, unsigned local,
                                              Device device)
@@ -168,17 +185,14 @@ DeviceExpertPlacement::DeviceExpertPlacement(const ExpertDomain& domain,
         for (int slot = 0; slot < s.slots[p]; ++slot)
             destinations[cursor[parts[p].ids[slot]]++] = {int(p), slot};
     const auto& ids = parts.at(local).ids;
-    LayoutBuilder l;
-    auto off     = l.add(offsets.size() * sizeof(int), 4, "expert destinations offsets");
-    auto targets = l.add(destinations.size() * sizeof(destinations[0]), 4, "expert destinations");
-    auto logical = l.add_tensor(DType::I32, {s.slots.at(local)}, 4, "local logical expert IDs");
-    storage_     = DeviceBuffer(device, l.finish());
-    storage_.copy_from_host(offsets.data(), off.bytes, off.offset);
-    storage_.copy_from_host(destinations.data(), targets.bytes, targets.offset);
-    storage_.copy_from_host(ids.data(), logical.region.bytes, logical.region.offset);
-    dispatch    = {static_cast<const int*>(off.bind(storage_.span()).data),
-                   static_cast<const ops::ExpertDestination*>(targets.bind(storage_.span()).data)};
-    logical_ids = logical.bind(storage_.span());
+    const PlacementLayout layout(s, local);
+    storage_ = DeviceBuffer(device, layout.bytes);
+    storage_.copy_from_host(offsets.data(), layout.offsets.bytes, layout.offsets.offset);
+    storage_.copy_from_host(destinations.data(), layout.targets.bytes, layout.targets.offset);
+    storage_.copy_from_host(ids.data(), layout.logical.region.bytes, layout.logical.region.offset);
+    dispatch = {static_cast<const int*>(layout.offsets.bind(storage_.span()).data),
+                static_cast<const ops::ExpertDestination*>(layout.targets.bind(storage_.span()).data)};
+    logical_ids = layout.logical.bind(storage_.span());
 }
 
 namespace {
@@ -450,6 +464,47 @@ void ExpertExchange::routed_layer(const DeviceExpertPlacement& place,
         const auto part = shared->slice(1, base, n);
         block(place, p, weights, &src, &r, &part, arena, exec, totals);
     }
+}
+
+namespace {
+class ResidentExchange final : public ResidentExpertExchange {
+public:
+    ExpertExchangeWork stage(ExpertBankId bank, int columns) override {
+        return {*frames.at(bank_frames.at(bank.index)), placements.at(bank.index), columns};
+    }
+    std::vector<std::unique_ptr<ExpertExchange>> frames;
+    std::vector<DeviceExpertPlacement> placements;
+    std::vector<std::size_t> bank_frames;
+};
+} // namespace
+
+ResidentExchangePlan::ResidentExchangePlan(std::shared_ptr<const ExpertDomain> domain,
+                                           const distributed::GroupDescription& group,
+                                           unsigned peer, int hidden, int top_k)
+    : domain_(std::move(domain)), peer_(peer) {
+    for (std::uint32_t i = 0; i < domain_->banks.size(); ++i) {
+        const auto& s = stages_.emplace_back(prepare_expert_exchange(
+            group, *domain_, ExpertBankId{i}, hidden, top_k, expert_exchange_block_columns));
+        bytes_ += PlacementLayout(s, peer).bytes;
+        const auto found = std::ranges::find_if(frame_banks_, [&](auto bank) {
+            return stages_[bank].slots == s.slots;
+        });
+        bank_frames_.push_back(static_cast<std::size_t>(found - frame_banks_.begin()));
+        if (found == frame_banks_.end()) {
+            frame_banks_.push_back(i);
+            bytes_ += s.frame_bytes(peer);
+        }
+    }
+}
+
+std::unique_ptr<ResidentExpertExchange>
+ResidentExchangePlan::prepare(const distributed::Group& group) const {
+    if (group.rank() != peer_) throw std::logic_error("expert exchange prepared for another peer");
+    auto out = std::make_unique<ResidentExchange>();
+    out->bank_frames = bank_frames_;
+    for (auto bank : frame_banks_) out->frames.push_back(std::make_unique<ExpertExchange>(stages_[bank], group));
+    for (const auto& s : stages_) out->placements.emplace_back(*domain_, s, peer_, group.device());
+    return out;
 }
 
 } // namespace ninfer::models::moe

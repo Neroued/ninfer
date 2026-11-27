@@ -24,14 +24,17 @@ void check_table(context::TableRow row, std::uint32_t pool, const QsaCache& cach
 
 RankProgramImpl::RankProgramImpl(const execution::Parameters& p, ExecutionPlan plan,
                                  DeviceContext& d, const StartupObserver& observer,
-                                 ParallelBinding binding)
-    : parameters(p), device(d), cuda(d.execution_view()),
+                                 ParallelBinding binding,
+                                 std::unique_ptr<moe::ResidentExpertExchange> expert_exchange)
+    : parameters(p), device(d), cuda(d.execution_view()), exchange(std::move(expert_exchange)),
       resources(p, std::move(plan), d, observer), ple_inputs(d), ple_ready(d), draft_copied(d),
       draft_output(resources.plan.pinned_draft_bytes), shape(resources.plan.shape),
       prefill_timer(d), gpu_timer(d, shape.gpu_timing), compute_done(d), context_done(d),
       bindings(shape.max_concurrency), input_rows(shape.max_concurrency),
       mtp_rows(shape.max_concurrency), valid_rows(shape.max_concurrency) {
     if (binding.group) parallel.emplace(binding);
+    if (static_cast<bool>(exchange) != static_cast<bool>(parameters.profile->exchange))
+        throw std::logic_error("Qwen4Exp Program is missing its prepared expert route");
     if (parameters.profile->local.size != (parallel ? parallel->size() : 1))
         throw std::logic_error("Qwen4Exp Program communication differs from its weight partition");
     if (resources.ple_prepare) host_ple = std::make_unique<PlePipeline>(resources, d);
@@ -66,6 +69,16 @@ void RankProgramImpl::validate_work(const Work& work, runtime::FrameKind kind) c
                  resources.plan.batches,
                  resources.plan.decode_routes}
         .validate(work, kind);
+    if (kind == runtime::FrameKind::Compute) {
+        const bool needs_step =
+            exchange && (std::holds_alternative<ExpertServiceWork>(work.operation) ||
+                         plan_expert_step(work, shape.prefill_chunk).has_value());
+        if (needs_step != work.exchange.has_value() ||
+            (work.exchange && work.exchange->id != last_expert_step + 1))
+            throw std::invalid_argument(
+                "Qwen4Exp expert step differs from the prepared communication order");
+        if (std::holds_alternative<ExpertServiceWork>(work.operation)) return;
+    }
     const auto check_resident = [&](const runtime::ExecutionMember& member) {
         const auto& resident = bindings[member.residency.lane.value];
         if (!resident || !same_member(resident->member, member))
@@ -150,6 +163,7 @@ void RankProgramImpl::prepare_commit(runtime::ExecutionTicket ticket, const Comm
                  resources.plan.batches,
                  resources.plan.decode_routes}
         .validate_commit(frame.request.work, frame.result.rows, commit);
+    if (std::holds_alternative<ExpertServiceWork>(frame.request.work.operation)) return;
     for (const auto& row : commit.rows)
         check_selectors(row.states.at(parameters.profile->local.rank), resources.states->storage());
     resources.compute_actions->validate(
@@ -159,7 +173,7 @@ void RankProgramImpl::prepare_commit(runtime::ExecutionTicket ticket, const Comm
 bool RankProgramImpl::can_discard(runtime::ExecutionTicket ticket) const {
     if (!compute || compute->request.ticket != ticket) return false;
     return compute->phase == ComputePhase::PendingCommit ||
-           compute->phase == ComputePhase::AwaitResult ||
+           (compute->phase == ComputePhase::AwaitResult && !compute->request.work.exchange) ||
            (compute->phase == ComputePhase::Decision && !compute->decision);
 }
 
@@ -168,9 +182,10 @@ bool RankProgramImpl::can_discard(runtime::ExecutionTicket ticket) const {
 namespace ninfer::models::qwen4_exp {
 RankProgram::RankProgram(const execution::Parameters& parameters, ExecutionPlan plan,
                          DeviceContext& device, const StartupObserver& observer,
-                         ParallelBinding binding)
+                         ParallelBinding binding,
+                         std::unique_ptr<moe::ResidentExpertExchange> expert_exchange)
     : impl_(std::make_unique<detail::RankProgramImpl>(parameters, std::move(plan), device, observer,
-                                                      binding)) {}
+                                                      binding, std::move(expert_exchange))) {}
 
 GraphPreparationSample RankProgram::prepare_execution(GraphPreparationMode mode) {
     return impl_->initialize_graphs(mode);

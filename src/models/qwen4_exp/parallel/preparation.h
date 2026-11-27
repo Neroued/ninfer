@@ -43,6 +43,7 @@ private:
     std::shared_ptr<const BatchExecutionPlan> batches_;
     DeviceContext& device_;
     ParallelBinding binding_;
+    const distributed::Group* expert_group_ = nullptr;
     std::optional<distributed::GroupRequirements> expert_requirements_;
     std::size_t host_reservation_bytes_ = 0;
     bool control_owner_                 = false;

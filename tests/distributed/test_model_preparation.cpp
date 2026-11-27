@@ -299,7 +299,7 @@ int main(int argc, char** argv) {
                       << " upload=" << prepared.reports[i].upload_bytes << std::endl;
             descriptions.push_back(std::move(d));
         }
-        const auto plan = q4::plan_group_execution(parallel, descriptions);
+        const auto plan = q4::plan_replica_execution(parallel.topology.replica(0), descriptions);
         q4::ExecutionCodec codec(*definition, descriptions.front(), parallel.topology);
         rt::activate_execution_group(*group, prepared, std::chrono::seconds(30));
         std::vector<RankSnapshot> initial;

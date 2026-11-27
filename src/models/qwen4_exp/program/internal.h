@@ -43,6 +43,7 @@ enum class ComputePhase : std::uint8_t {
     AwaitScore,
     ControlCounts,
     AwaitControl,
+    AwaitExpertService,
     PendingCommit,
     Retiring,
 };
@@ -75,6 +76,7 @@ struct ComputeFrame {
     bool graph_main = false;
     std::vector<ops::ContextBucket> draft_buckets;
     std::uint32_t tokens = 0, visible = 0, layer = 0;
+    std::size_t main_pass  = 0;
     std::uint32_t score_at = 0, score_count = 0;
     std::vector<float> logprobs;
     std::uint32_t control_row    = 0;
@@ -95,7 +97,8 @@ struct ContextFrame {
 class RankProgramImpl {
 public:
     RankProgramImpl(const execution::Parameters&, ExecutionPlan, DeviceContext&,
-                    const StartupObserver& observer = {}, ParallelBinding = {});
+                    const StartupObserver& observer = {}, ParallelBinding = {},
+                    std::unique_ptr<moe::ResidentExpertExchange> = {});
     ~RankProgramImpl();
 
     GraphPreparationSample initialize_graphs(GraphPreparationMode = GraphPreparationMode::Complete);
@@ -182,6 +185,8 @@ public:
     DeviceContext& device;
     CudaExecutionView cuda;
     std::optional<ParallelExecution> parallel;
+    std::unique_ptr<moe::ResidentExpertExchange> exchange;
+    std::uint64_t last_expert_step = 0;
     Resources resources;
     std::unique_ptr<PlePipeline> host_ple;
     CudaCompletionEvent ple_inputs, ple_ready, draft_copied;

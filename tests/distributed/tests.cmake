@@ -19,6 +19,9 @@ if(NINFER_ENABLE_DISTRIBUTED AND NINFER_BUILD_ENGINE)
     LIBRARIES ninfer_runtime_distributed ninfer_model_control)
   # Explicit deployment is required; ordinary CTest does not launch remote processes.
   add_executable(ninfer_distributed_execution_test "${CMAKE_CURRENT_LIST_DIR}/test_execution.cpp")
+  add_executable(ninfer_expert_engine_test "${CMAKE_CURRENT_LIST_DIR}/test_expert_engine.cpp")
+  ninfer_internal_includes(ninfer_expert_engine_test)
+  target_link_libraries(ninfer_expert_engine_test PRIVATE ninfer_engine ninfer_product_config)
   ninfer_internal_includes(ninfer_distributed_execution_test)
   target_link_libraries(ninfer_distributed_execution_test PRIVATE
     ninfer_runtime_distributed ninfer_model_execution ninfer_product_config)

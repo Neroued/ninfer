@@ -382,6 +382,11 @@ ParsedOptions parse(int argc, char** argv, EntryPoint entry,
         case Field::KvDtype:
             engine.kv_cache = kv_storage(string());
             break;
+        case Field::PleStorage:
+            engine.ple_storage = string() == "device" ? PleStorage::Device
+                                 : string() == "disk" ? PleStorage::Disk
+                                                      : PleStorage::Auto;
+            break;
         case Field::LinearStateDtype:
             engine.linear_state_dtype = linear_state_dtype_from_option(string());
             break;

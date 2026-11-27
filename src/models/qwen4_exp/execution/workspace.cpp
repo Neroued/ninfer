@@ -110,8 +110,10 @@ std::size_t body(const ModelProfile& p, const EngineOptions& options, int first,
             }
         }
         scratch(ops::hc_mix_workspace_capacity_bytes(layer.moe_hc, lo, hi));
-        scratch(moe::workspace_bytes(layer.moe.math, ops::MoeEpilogue::Write, minimum, columns,
-                                     layer.moe.subset));
+        scratch(layer.moe.exchange_workspace_bytes
+                    ? layer.moe.exchange_workspace_bytes
+                    : moe::workspace_bytes(layer.moe.math, ops::MoeEpilogue::Write, minimum,
+                                           columns, layer.moe.subset));
         if (!mtp && offload) {
             scratch(offload->workspace_bytes(layer.moe.bank, minimum, columns, !prefill));
         }

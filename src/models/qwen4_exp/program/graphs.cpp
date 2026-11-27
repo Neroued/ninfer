@@ -234,11 +234,11 @@ OffloadedTargetCapture bind_offloaded(RankProgramImpl& p, ops::ContextBucketRang
                                   [run](const moe::GpuCall& call) { run->gpu_moe(call); },
                                   [run, i] { run->combine(i); }});
     }
-    capture.hook = InterLayerHookCapture{
-        p.parameters.profile->config.text.ple.layer,
-        [&p, run, batch](std::uint32_t slot, CudaExecutionView cuda) {
-            consume_host_ple(p, *run, batch, slot, cuda.stream());
-        }};
+    capture.hook =
+        InterLayerHookCapture{p.parameters.profile->config.text.ple.layer,
+                              [&p, run, batch](std::uint32_t slot, CudaExecutionView cuda) {
+                                  consume_host_ple(p, *run, batch, slot, cuda.stream());
+                              }};
     capture.suffix = [run, output] { run->finish(output); };
     capture.head   = bind_head(p, batch, output.sample);
     return capture;
@@ -305,6 +305,9 @@ void warmup_target(RankProgramImpl& p, execution::BatchView batch) {
 
 GraphPreparationSample RankProgramImpl::initialize_graphs(GraphPreparationMode mode) {
     if (!shape.cuda_graph) return {};
+    if (exchange)
+        throw std::invalid_argument(
+            "Qwen4Exp decode graph lacks a jointly prepared expert exchange route");
     if (graphs) throw std::logic_error("Qwen4Exp Graphs are already prepared");
     if (mode == GraphPreparationMode::Complete) {
         initialize_graphs(GraphPreparationMode::Warmup);

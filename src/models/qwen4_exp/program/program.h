@@ -5,6 +5,7 @@
 #include "models/qwen4_exp/work.h"
 #include "models/common/parallel_execution.h"
 #include "models/common/graph_preparation.h"
+#include "models/common/moe/execution.h"
 
 namespace ninfer::models::qwen4_exp {
 namespace execution {
@@ -20,7 +21,8 @@ class RankProgramImpl;
 class RankProgram {
 public:
     RankProgram(const execution::Parameters&, ExecutionPlan, DeviceContext&,
-                const StartupObserver& observer = {}, ParallelBinding = {});
+                const StartupObserver& observer = {}, ParallelBinding = {},
+                std::unique_ptr<moe::ResidentExpertExchange> exchange = {});
     ~RankProgram();
     RankProgram(const RankProgram&)            = delete;
     RankProgram& operator=(const RankProgram&) = delete;

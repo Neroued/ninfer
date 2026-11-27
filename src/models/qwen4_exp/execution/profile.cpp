@@ -101,10 +101,10 @@ private:
     std::span<const moe::ExpertDescription> experts_;
 };
 
-std::shared_ptr<const ModelProfile> describe(const ModelDefinition& source,
-                                             std::span<const BoundWeight> weights,
-                                             std::span<const moe::ExpertDescription> experts,
-                                             const RankPlan& rank) {
+std::shared_ptr<ModelProfile> describe(const ModelDefinition& source,
+                                       std::span<const BoundWeight> weights,
+                                       std::span<const moe::ExpertDescription> experts,
+                                       const RankPlan& rank) {
     auto out                 = std::make_shared<ModelProfile>();
     out->config              = source.config();
     out->options             = source.options();
@@ -139,14 +139,13 @@ std::shared_ptr<const ModelProfile> describe(const ModelDefinition& source,
 
 } // namespace
 
-std::shared_ptr<const ModelProfile> describe_model(const ModelDefinition& source) {
-    return describe(source, source.weight_data(), {}, plan_single_rank(source));
+std::shared_ptr<const ModelProfile> describe_model(const ModelDefinition& source, ple::Placement placement) {
+    return describe(source, source.weight_data(), {}, plan_single_rank(source, placement));
 }
 
-std::shared_ptr<const ModelProfile> describe_model(const ModelDefinition& source,
-                                                   std::span<const BoundWeight> weights,
-                                                   std::span<const moe::ExpertDescription> experts,
-                                                   const RankPlan& rank) {
+std::shared_ptr<ModelProfile>
+describe_model(const ModelDefinition& source, std::span<const BoundWeight> weights,
+               std::span<const moe::ExpertDescription> experts, const RankPlan& rank) {
     if (experts.size() != source.expert_banks().size())
         throw std::invalid_argument("Qwen4Exp local expert descriptions are incomplete");
     return describe(source, weights, experts, rank);

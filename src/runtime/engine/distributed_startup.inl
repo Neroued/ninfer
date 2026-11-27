@@ -91,8 +91,10 @@ build_distributed_model(const artifact::Reader& reader, EngineOptions& options,
     for (std::uint32_t r = 0; r < dp_count; ++r) {
         const auto& rep_topo = group->topology().replica(r);
         // Each executor reserves runtime control capacity against its own replica transport.
-        auto executor = std::make_unique<Distributed>(
+        std::unique_ptr<Executor<typename Types::ExecutionTypes>> executor = std::make_unique<Distributed>(
             group->take_replica(r), setup.capacity(r), setup.codec(r), local_lanes, all_observations);
+        if constexpr (requires { setup.coordinate(r, std::move(executor)); })
+            executor = setup.coordinate(r, std::move(executor));
         executor->bind_to_current_thread();
 
         StartupMemorySummary rep_memory;

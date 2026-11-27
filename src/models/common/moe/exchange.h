@@ -59,6 +59,27 @@ private:
     DeviceBuffer storage_;
 };
 
+class ResidentExchangePlan {
+public:
+    ResidentExchangePlan(std::shared_ptr<const ExpertDomain>, const distributed::GroupDescription&,
+                         unsigned peer, int hidden, int top_k);
+
+    [[nodiscard]] const ExpertExchangeStage& stage(ExpertBankId bank) const {
+        return stages_.at(bank.index);
+    }
+
+    [[nodiscard]] std::size_t bytes() const noexcept { return bytes_; }
+
+    [[nodiscard]] std::unique_ptr<ResidentExpertExchange> prepare(const distributed::Group&) const;
+private:
+    std::shared_ptr<const ExpertDomain> domain_;
+    unsigned peer_;
+    std::vector<ExpertExchangeStage> stages_;
+    std::vector<std::size_t> frame_banks_;
+    std::vector<std::size_t> bank_frames_;
+    std::size_t bytes_ = 0;
+};
+
 // Compatible banks share one in-flight frame, including its send/return buffers. Enqueues on the
 // supplied ordered stream; backing and source views survive all consumers, including
 // capture/replay. reset/destroy after retirement.

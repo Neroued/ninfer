@@ -10,6 +10,10 @@
 #include <memory>
 #include <variant>
 
+namespace ninfer::models::moe {
+class ResidentExchangePlan;
+}
+
 namespace ninfer::models::qwen4_exp {
 class ModelDefinition;
 struct RankPlan;
@@ -37,7 +41,8 @@ struct MoeProfile {
     ops::MoeProfile math;
     ExpertBankId bank;
     ops::ExpertActivationCalibration activation_calibration;
-    ops::ExpertSubsetKind subset = ops::ExpertSubsetKind::All;
+    ops::ExpertSubsetKind subset         = ops::ExpertSubsetKind::All;
+    std::size_t exchange_workspace_bytes = 0;
 };
 
 struct BlockProfile {
@@ -88,10 +93,12 @@ struct ModelProfile {
     std::optional<MtpProfile> mtp;
     std::optional<qwen::VisionProfile> vision;
     std::vector<BankLayout> banks;
+    std::shared_ptr<const moe::ResidentExchangePlan> exchange;
+    std::size_t exchange_bytes = 0;
 };
 
-[[nodiscard]] std::shared_ptr<const ModelProfile> describe_model(const ModelDefinition&);
-[[nodiscard]] std::shared_ptr<const ModelProfile>
+[[nodiscard]] std::shared_ptr<const ModelProfile> describe_model(const ModelDefinition&, ple::Placement = ple::Placement::Disk);
+[[nodiscard]] std::shared_ptr<ModelProfile>
 describe_model(const ModelDefinition&, std::span<const BoundWeight>,
                std::span<const moe::ExpertDescription>, const RankPlan&);
 [[nodiscard]] std::size_t qsa_projection_workspace_bytes(const QsaProfile&, std::int32_t first,

@@ -41,16 +41,22 @@ runtime::protocol::ControlBudget control_budget(const ModelDefinition& definitio
 
 } // namespace
 
-GroupExecutionPlan plan_group_execution(const ParallelPlan& parallel,
-                                        std::span<const RankExecutionDescription> ranks) {
-    if (ranks.empty() || ranks.size() != parallel.ranks.size())
-        throw std::invalid_argument("Qwen4Exp execution descriptions omit a rank");
-    GroupExecutionPlan plan{ranks.front().session, ranks.front().capacity};
+GroupExecutionPlan plan_replica_execution(const distributed::ReplicaTopology& replica,
+                                          std::span<const RankExecutionDescription> ranks) {
+    const auto description = [&](distributed::RankId id) -> const RankExecutionDescription& {
+        if (id >= ranks.size() || ranks[id].observation.rank != id)
+            throw std::invalid_argument(
+                "Qwen4Exp replica execution description has an incorrect rank identity");
+        return ranks[id];
+    };
+    const auto& result = description(replica.result_owner);
+    GroupExecutionPlan plan{result.session, result.capacity};
     plan.session.context.ranks.clear();
     plan.session.context.state.layouts.front().parts.clear();
     plan.session.context.metadata_budget_bytes = 0;
     for (auto& pool : plan.session.context.pools) pool.parts.clear();
-    for (const auto& rank : ranks) {
+    for (const auto global : replica.ranks) {
+        const auto& rank    = description(global);
         const auto& session = rank.session;
         if (session.shape != plan.session.shape || !session.batches || !plan.session.batches ||
             session.batches->spec() != plan.session.batches->spec() ||
@@ -102,13 +108,13 @@ ExecutionCodec::ExecutionCodec(const ModelDefinition& definition,
                 static_cast<std::uint32_t>(definition.resources().text.control_tokens->size()),
                 rank.session.batches,
                 rank.session.decode_routes} {
-    replica_                = topology.replica_for_rank(rank.observation.rank);
-    rank_                   = replica_.local_index(rank.observation.rank);
-    ranks_                  = static_cast<std::uint32_t>(replica_.ranks.size());
-    max_features_           = rank.session.vision_max_features;
-    scope_.participants     = replica_.ranks;
-    scope_.decision_owners  = replica_.ranks;
-    scope_.result_owner     = replica_.result_owner;
+    replica_               = topology.replica_for_rank(rank.observation.rank);
+    rank_                  = replica_.local_index(rank.observation.rank);
+    ranks_                 = static_cast<std::uint32_t>(replica_.ranks.size());
+    max_features_          = rank.session.vision_max_features;
+    scope_.participants    = replica_.ranks;
+    scope_.decision_owners = replica_.ranks;
+    scope_.result_owner    = replica_.result_owner;
     scope_.validate(topology);
     auto described = rank;
     described.observation.communication.clear();
@@ -131,6 +137,8 @@ void ExecutionCodec::validate_commit(const Work& work, const Result& result,
 
 runtime::protocol::Scope ExecutionCodec::scope(const Work& work,
                                                const distributed::ExecutionTopology&) const {
+    if (std::holds_alternative<ExpertServiceWork>(work.operation))
+        return {replica_.ranks, {}, replica_.result_owner};
     const auto* context = std::get_if<ContextWork>(&work.operation);
     if (!context || !context->bindings.empty() || !context->releases.empty()) return scope_;
     runtime::protocol::Scope scope;

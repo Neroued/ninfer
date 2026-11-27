@@ -27,7 +27,7 @@ struct ParallelPlan {
                                                       const RankPlan&);
 [[nodiscard]] ParallelPlan plan_parallel(const ModelDefinition&, const DeploymentOptions&,
                                          ple::Placement);
-[[nodiscard]] RankPlan plan_single_rank(const ModelDefinition&);
+[[nodiscard]] RankPlan plan_single_rank(const ModelDefinition&, ple::Placement = ple::Placement::Disk);
 [[nodiscard]] std::span<const std::uint32_t> default_expert_priority(const TextConfig&,
                                                                      std::size_t layer);
 

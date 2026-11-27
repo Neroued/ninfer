@@ -343,4 +343,20 @@ AbortResult Session::abort(SequenceHandle handle) {
     return result;
 }
 
+bool Session::withdraw_cancelled(runtime::ExecutionTicket ticket) {
+    auto& p = *impl_;
+    if (!p.compute || p.compute->ticket != ticket || p.compute->committed || p.compute->result ||
+        !p.executor->try_withdraw(ticket))
+        return false;
+    auto& tx = *p.compute;
+    tx.context.withdraw_submission();
+    if (tx.vision_id) {
+        p.vision_window.consumed(tx.vision_id, true);
+        p.vision_window.retired(ticket);
+    }
+    for (auto h : tx.members) p.sequence(h).computing = false;
+    p.compute.reset();
+    return true;
+}
+
 } // namespace ninfer::models::qwen4_exp

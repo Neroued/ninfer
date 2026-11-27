@@ -165,6 +165,12 @@ void encode_work(Encoder& out, const Work& work, const VisionInputBindings& inpu
                  std::uint32_t rank) {
     out.u32(rank);
     context::encode_actions(out, local_actions(work.actions, rank));
+    out.boolean(work.exchange.has_value());
+    if (work.exchange) {
+        out.u64(work.exchange->id);
+        out.u32(work.exchange->draft_passes);
+        integers(out, work.exchange->columns);
+    }
     std::visit(
         [&](const auto& v) {
             using T = std::decay_t<decltype(v)>;
@@ -206,13 +212,15 @@ void encode_work(Encoder& out, const Work& work, const VisionInputBindings& inpu
                 }
                 out.u64(v.releases.size());
                 for (auto id : v.releases) residency(out, id);
-            } else {
+            } else if constexpr (std::is_same_v<T, ScoreWork>) {
                 out.u8(4);
                 out.u32(v.shape.rows);
                 out.u32(v.shape.attention_rows);
                 row(out, v.row, rank);
                 integers(out, v.targets);
                 out.u32(v.first_target_column);
+            } else {
+                out.u8(5);
             }
         },
         work.operation);
@@ -222,6 +230,7 @@ Work decode_work(Decoder& in, const VisionInputBindings& inputs) {
     Work work;
     const auto rank = in.u32();
     work.actions.emplace(rank, context::decode_actions(in));
+    if (in.boolean()) work.exchange = ExpertStep{in.u64(), in.u32(), integers<std::uint32_t>(in)};
     switch (in.u8()) {
     case 1: {
         ForwardWork v;
@@ -277,6 +286,9 @@ Work decode_work(Decoder& in, const VisionInputBindings& inputs) {
         work.operation        = std::move(v);
         break;
     }
+    case 5:
+        work.operation = ExpertServiceWork{};
+        break;
     default:
         throw std::invalid_argument("unknown Qwen4Exp work kind");
     }
@@ -335,11 +347,14 @@ void encode_result(Encoder& out, const Result& result) {
             } else if constexpr (std::is_same_v<T, ContextResult>) {
                 out.u8(2);
                 context::encode_transfers(out, v.transfers);
-            } else {
+            } else if constexpr (std::is_same_v<T, ScoreResult>) {
                 out.u8(3);
                 out.u32(v.processed);
                 out.u64(v.logprobs.size());
                 for (auto value : v.logprobs) out.f32(value);
+            } else {
+                out.u8(4);
+                out.u64(v.step);
             }
         },
         result);
@@ -374,6 +389,8 @@ Result decode_result(Decoder& in) {
 
         return v;
     }
+    case 4:
+        return ExpertServiceResult{in.u64()};
     default:
         throw std::invalid_argument("unknown Qwen4Exp result kind");
     }

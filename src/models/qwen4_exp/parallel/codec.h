@@ -14,8 +14,8 @@ struct GroupExecutionPlan {
     runtime::ExecutionCapacity capacity;
 };
 
-[[nodiscard]] GroupExecutionPlan plan_group_execution(const ParallelPlan&,
-                                                      std::span<const RankExecutionDescription>);
+[[nodiscard]] GroupExecutionPlan plan_replica_execution(const distributed::ReplicaTopology&,
+                                                        std::span<const RankExecutionDescription>);
 
 class ExecutionCodec {
 public:

@@ -538,6 +538,20 @@ template <class Instance>
         instance_.session->cancel_context();
     }
     bool progressed = false;
+    if constexpr (requires { instance_.session->withdraw_cancelled(ExecutionTicket{}); }) {
+        if (compute_ && std::ranges::all_of(compute_->requests, [](const auto& r) {
+                return r->cancelled.load(std::memory_order_acquire);
+            }) && instance_.session->withdraw_cancelled(compute_->ticket)) {
+            if (compute_->kind == UnitKind::Control) discard_control_preview(*compute_);
+            for (const auto& request : compute_->requests) {
+                request->pending_execution.reset();
+                request->execution_in_flight = false;
+            }
+            compute_.reset();
+            request_admission_check();
+            progressed = true;
+        }
+    }
     for (;;) {
         ExecutionCallScope call(*this, CoordinatorCall::Poll);
         auto event = instance_.session->poll();

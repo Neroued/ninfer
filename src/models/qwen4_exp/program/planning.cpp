@@ -84,10 +84,10 @@ ExecutionPlan physical_plan(std::shared_ptr<const execution::ModelProfile> profi
     if (!batches || batches->resident_capacity() != o.max_concurrency ||
         batches->attention_owners() != 1)
         throw std::invalid_argument("Qwen4Exp batch plan differs from execution configuration");
-    out.batches = std::move(batches);
-    out.profile = std::move(profile);
+    out.batches                = std::move(batches);
+    out.profile                = std::move(profile);
     out.shared_physical_memory = device_memory_snapshot(device.device()).shared_physical_memory;
-    out.shape   = describe_execution_shape(*out.profile, o);
+    out.shape                  = describe_execution_shape(*out.profile, o);
     if (out.shape.cuda_graph)
         out.decode_routes = std::make_shared<const speculative::DecodeGraphRoutes>(
             *out.batches, o.speculative.backend, out.shape.draft_tokens);
@@ -147,8 +147,8 @@ ExecutionShape describe_execution_shape(const execution::ModelProfile& profile,
 }
 
 std::size_t ExecutionPlan::device_bytes() const {
-    return capacity.device_bytes + persistent.bytes + workspace.bytes + ple_upload.device_bytes +
-           (workspace.vision ? workspace.vision->output_bytes : 0) +
+    return capacity.device_bytes + persistent.bytes + profile->exchange_bytes + workspace.bytes +
+           ple_upload.device_bytes + (workspace.vision ? workspace.vision->output_bytes : 0) +
            (moe ? moe->description().device_bytes : 0);
 }
 

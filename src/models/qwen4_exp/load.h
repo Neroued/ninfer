@@ -42,7 +42,7 @@ private:
     friend ResolvedLoadPlan resolve_load(const artifact::Reader&,
                                          std::shared_ptr<const ModelDefinition>, Device,
                                          std::optional<Device>,
-                                         std::shared_ptr<const ple::disk::Table>);
+                                         std::shared_ptr<const ple::disk::Table>, ple::Placement);
     friend ResolvedLoadPlan resolve_rank_load(const artifact::Reader&,
                                               std::shared_ptr<const ModelDefinition>, RankPlan,
                                               Device);
@@ -57,6 +57,7 @@ private:
     std::vector<Device> devices_, bank_devices_;
     std::shared_ptr<const ple::disk::Table> ple_;
     RankPlan rank_;
+    std::vector<std::size_t> ple_requests_;
     std::optional<WeightSelection> selection_;
     std::vector<WeightParent> parents_;
     std::vector<BoundWeight> descriptions_;
@@ -65,7 +66,8 @@ private:
 [[nodiscard]] ResolvedLoadPlan resolve_load(const artifact::Reader&,
                                             std::shared_ptr<const ModelDefinition>, Device,
                                             std::optional<Device> main_experts            = {},
-                                            std::shared_ptr<const ple::disk::Table> table = {});
+                                            std::shared_ptr<const ple::disk::Table> table = {},
+                                            ple::Placement = ple::Placement::Disk);
 [[nodiscard]] std::unique_ptr<ModelShard> materialize_model(ResolvedLoadPlan&&, DeviceContext&,
                                                             const StartupObserver* = nullptr);
 [[nodiscard]] ResolvedLoadPlan resolve_rank_load(const artifact::Reader&,

@@ -3,6 +3,7 @@
 #include "models/qwen4_exp/parallel/codec.h"
 #include "models/qwen4_exp/runtime_types.h"
 #include "models/qwen4_exp/startup.h"
+#include "runtime/executor/collective_step.h"
 
 namespace ninfer::models::qwen4_exp {
 
@@ -24,6 +25,9 @@ public:
     void resolve(std::span<const distributed::wire::Payload>, EngineOptions&);
     [[nodiscard]] std::vector<PreparedSession> sessions() const;
     [[nodiscard]] Codec codec(std::uint32_t replica_id) const;
+    using Executor = runtime::Executor<ExecutionTypes>;
+    [[nodiscard]] std::unique_ptr<Executor> coordinate(std::uint32_t,
+                                                       std::unique_ptr<Executor>) const;
     [[nodiscard]] std::vector<RankSnapshot> observations() const;
     [[nodiscard]] std::vector<RankMemoryBudget> memory_budgets() const;
 
@@ -38,7 +42,14 @@ private:
     std::shared_ptr<const ModelDefinition> definition_;
     ParallelPlan parallel_;
     std::shared_ptr<const BatchExecutionPlan> batches_;
-    GroupExecutionPlan plan_;
+    std::vector<GroupExecutionPlan> plans_;
+
+    struct Membership {
+        std::shared_ptr<runtime::CollectiveStepDomain> domain;
+        std::size_t member = 0;
+    };
+
+    std::vector<Membership> memberships_;
     std::vector<RankExecutionDescription> ranks_;
 };
 

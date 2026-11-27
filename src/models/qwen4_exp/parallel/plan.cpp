@@ -204,8 +204,8 @@ std::uint64_t compute_rank_shard_digest(const artifact::ArtifactId& artifact_id,
                               r.experts, r.expert_domain.get());
 }
 
-RankPlan plan_single_rank(const ModelDefinition& definition) {
-    return rank_plan(definition, {}, ple::Placement::Disk);
+RankPlan plan_single_rank(const ModelDefinition& definition, ple::Placement table) {
+    return rank_plan(definition, {}, table);
 }
 
 ParallelPlan plan_parallel(const ModelDefinition& definition, const DeploymentOptions& deployment,

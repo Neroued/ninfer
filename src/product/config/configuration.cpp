@@ -103,6 +103,11 @@ StartupConfigurationView view(const LaunchOptions& launch, EntryPoint entry, con
         case Field::Vision:
             value = e.enable_vision;
             break;
+        case Field::PleStorage:
+            value = std::string(e.ple_storage == PleStorage::Device ? "device"
+                                : e.ple_storage == PleStorage::Disk ? "disk"
+                                                                    : "auto");
+            break;
         case Field::VisionMemoryBudget:
             value = std::uint64_t{e.vision_memory_budget_bytes};
             break;

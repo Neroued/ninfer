@@ -96,9 +96,20 @@ struct ScoreWork {
     PhysicalBatchShape shape;
 };
 
+// Each column extent is one traversal. Proposal traversals visit the MTP bank, and each
+// remaining traversal visits Main banks in layer order. Widths bound only the exchange.
+struct ExpertStep {
+    std::uint64_t id;
+    std::uint32_t draft_passes;
+    std::vector<std::uint32_t> columns;
+};
+
+struct ExpertServiceWork {};
+
 struct Work {
     ContextActions actions;
-    std::variant<ForwardWork, MtpWork, ContextWork, ScoreWork> operation;
+    std::variant<ForwardWork, MtpWork, ContextWork, ScoreWork, ExpertServiceWork> operation;
+    std::optional<ExpertStep> exchange;
 };
 
 struct RowResult {
@@ -124,7 +135,11 @@ struct ScoreResult {
     std::vector<float> logprobs;
 };
 
-using Result = std::variant<ComputeResult, ContextResult, ScoreResult>;
+struct ExpertServiceResult {
+    std::uint64_t step;
+};
+
+using Result = std::variant<ComputeResult, ContextResult, ScoreResult, ExpertServiceResult>;
 
 struct CommitRow {
     runtime::ExecutionMember member;
@@ -166,6 +181,7 @@ struct WorkContract {
 };
 
 [[nodiscard]] std::span<const WorkRow> work_rows(const Work&);
+[[nodiscard]] std::optional<ExpertStep> plan_expert_step(const Work&, std::uint32_t prefill_chunk);
 [[nodiscard]] const PhysicalBatchShape& work_shape(const Work&);
 void plan_work_batch(Work&, const BatchExecutionPlan&);
 void validate_decision_rows(const runtime::DecisionInput&, std::uint32_t stage,

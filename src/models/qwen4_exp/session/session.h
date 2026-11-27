@@ -460,6 +460,7 @@ public:
     void supply(runtime::ExecutionTicket, runtime::DecisionInput&&);
     [[nodiscard]] CommitResult commit(PendingBatch&&, std::span<const runtime::CommitDecision>);
     [[nodiscard]] DiscardResult discard(PendingBatch&&) noexcept;
+    [[nodiscard]] bool withdraw_cancelled(runtime::ExecutionTicket);
     [[nodiscard]] FinishResult finish(SequenceHandle);
     [[nodiscard]] AbortResult abort(SequenceHandle);
     void fail_all_cleanup() noexcept;

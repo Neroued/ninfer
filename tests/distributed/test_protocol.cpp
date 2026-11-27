@@ -537,6 +537,10 @@ void native_work() {
                                            .owner_target_tokens = {3}});
     q::Work work{{}, q::MtpWork{{original}, {2}, {}, geometry}};
     q::plan_work_batch(work, *contract.batches);
+    work.exchange = q::plan_expert_step(work, contract.shape.prefill_chunk);
+    require(work.exchange && work.exchange->columns == std::vector{1U, 1U, 3U},
+            "proposal and verification traversals have incorrect extents");
+    work.exchange->id          = 17;
     work.actions[0].operations = {ctx::RecordClear{{ctx::ContextMemory::Device, 16384, 1024}},
                                   ctx::RecordCopy{{ctx::ContextMemory::Device, 2176, 256},
                                                   {ctx::ContextMemory::Device, 4224, 256},
@@ -557,6 +561,9 @@ void native_work() {
     const auto decoded = q::decode_work(input, bindings);
     input.finish();
     contract.validate(decoded, runtime::FrameKind::Compute);
+    require(decoded.exchange && decoded.exchange->id == 17 && decoded.exchange->draft_passes == 2 &&
+                decoded.exchange->columns == work.exchange->columns,
+            "Qwen4Exp worker lost the published expert traversal");
     const auto& mtp = std::get<q::MtpWork>(decoded.operation);
     const auto& r   = mtp.rows.at(0);
     require(

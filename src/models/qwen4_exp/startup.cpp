@@ -6,25 +6,26 @@
 namespace ninfer::models::qwen4_exp {
 Startup::Startup(const artifact::Reader& definition_source, const artifact::Reader& rank_source,
                  const EngineOptions& options, Device device)
-    : reader_(rank_source), definition_(read_definition(definition_source, load_options(options))) {
+    : reader_(rank_source), definition_(read_definition(definition_source, load_options(options))),
+      placement_(options.ple_storage == PleStorage::Device ? ple::Placement::Device : ple::Placement::Disk) {
     if (options.deployment) {
         const auto parallel =
-            plan_parallel(*definition_, *options.deployment, ple::Placement::Disk);
+            plan_parallel(*definition_, *options.deployment, placement_);
         if (parallel.ranks.size() != 1)
             throw std::invalid_argument("Qwen4Exp distributed generation is not implemented");
     }
     batches_      = std::make_shared<const BatchExecutionPlan>(make_batch_execution_spec(
         options.max_concurrency, 1,
         options.use_cuda_graph && options.purpose == EnginePurpose::Generation));
-    profile       = execution::describe_model(*definition_);
-    auto resident = resolve_load(reader_, definition_, device);
+    profile       = execution::describe_model(*definition_, placement_);
+    auto resident = resolve_load(reader_, definition_, device, {}, {}, placement_);
     table_        = resident.ple_table_owner();
     placements_.push_back({WeightPlacement::Resident,
                            resident.materialization().device_capacity_bytes,
                            resident.materialization().host_capacity_bytes});
     offload_ = describe_moe_plan(*profile, options.moe);
     if (offload_) {
-        const auto host = resolve_load(reader_, definition_, device, Device::cpu(), table_);
+        const auto host = resolve_load(reader_, definition_, device, Device::cpu(), table_, placement_);
         placements_.push_back({WeightPlacement::HostExperts,
                                host.materialization().device_capacity_bytes,
                                host.materialization().host_capacity_bytes});
@@ -36,7 +37,7 @@ Startup::plan(DeviceContext& device, const EngineOptions& options, WeightPlaceme
               std::size_t available, std::size_t available_host_bytes) const {
     const bool host = placement == WeightPlacement::HostExperts;
     if (host && !offload_) return {};
-    auto planned = plan_execution(profile, table_->geometry(), options, batches_, device, available,
+    auto planned = plan_execution(profile, table_ ? table_->geometry() : ple::disk::TableGeometry{}, options, batches_, device, available,
                                   host ? offload_ : nullptr, true, available_host_bytes);
     if (!planned) return {};
     const auto capacity = planned->capacity;
@@ -49,7 +50,7 @@ std::unique_ptr<ModelShard> Startup::materialize(DeviceContext& device, WeightPl
                                                  const StartupObserver& observer) {
     auto resolved = resolve_load(
         reader_, definition_, device.device(),
-        placement == WeightPlacement::HostExperts ? Device::cpu() : device.device(), table_);
+        placement == WeightPlacement::HostExperts ? Device::cpu() : device.device(), table_, placement_);
     return materialize_model(std::move(resolved), device, &observer);
 }
 

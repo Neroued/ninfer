@@ -263,6 +263,17 @@ void test_mixed_context_demand() {
          .metadata_budget_bytes = 1024 * 1024});
     auto& histories = directory.pool(0).histories();
     const std::array<std::uint32_t, 1> owner_zero{0}, owner_one{1};
+    {
+        const auto destination = directory.states().reserve_destination().value();
+        store::ContextTransaction pending(directory);
+        pending.own_state(destination);
+        pending.clear_state();
+        pending.prepare_actions();
+        pending.mark_submitted();
+        pending.withdraw_submission();
+        expect(!directory.states().valid(destination),
+               "withdrawn work retained an unsubmitted state binding");
+    }
     store::ContextDemand demand;
     const auto state_zero = demand.add_state({.count = 1, .variant = 0});
     const auto history_zero =

@@ -1260,6 +1260,13 @@ void ContextTransaction::adopt() noexcept {
     adopted_ = true;
 }
 
+void ContextTransaction::withdraw_submission() {
+    if (stage_ != Stage::Submitted || adopted_)
+        throw std::logic_error("cannot withdraw resolved context actions");
+    stage_ = Stage::Prepared;
+    discard();
+}
+
 void ContextTransaction::mark_completed() {
     if (stage_ != Stage::Submitted) throw std::logic_error("context transaction was not submitted");
     stage_ = Stage::Completed;

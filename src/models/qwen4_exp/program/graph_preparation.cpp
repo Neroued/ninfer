@@ -40,9 +40,11 @@ GraphCalibration calibrate_graphs(const execution::Parameters& parameters, Devic
     result.plan = describe_graph_preparation(options, *batches, moe.get());
     if (!options.use_cuda_graph) return result;
     StartupPhaseScope phase(options.startup_observer, StartupPhase::CudaGraphCalibration);
+    const auto* disk = std::get_if<std::shared_ptr<const ple::disk::Table>>(&parameters.model.ple_table());
+    const auto table = disk ? (*disk)->geometry() : ple::disk::TableGeometry{};
     auto plan = plan_graph_probe(
         parameters.profile,
-        std::get<std::shared_ptr<const ple::disk::Table>>(parameters.model.ple_table())->geometry(),
+        table,
         options, batches, device, moe);
     auto probe    = std::make_unique<detail::RankProgramImpl>(parameters, std::move(plan), device);
     result.memory = begin_graph_calibration(
@@ -52,7 +54,7 @@ GraphCalibration calibrate_graphs(const execution::Parameters& parameters, Devic
     device.synchronize();
     plan = plan_graph_probe(
         parameters.profile,
-        std::get<std::shared_ptr<const ple::disk::Table>>(parameters.model.ple_table())->geometry(),
+        table,
         options, batches, device, moe, GraphProbeBacking::StartupWorkingSet);
     probe = std::make_unique<detail::RankProgramImpl>(parameters, std::move(plan), device);
     complete_graph_calibration(

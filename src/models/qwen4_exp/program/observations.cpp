@@ -24,7 +24,7 @@ RankMemoryUsage RankProgramImpl::observe_resources() const {
     a.device_weights_bytes     = weights.device_capacity_bytes;
     a.host_weights_bytes       = weights.host_capacity_bytes;
     a.registered_weights_bytes = weights.registered_host_bytes;
-    a.persistent_device_bytes  = plan.persistent.bytes;
+    a.persistent_device_bytes  = plan.persistent.bytes + parameters.profile->exchange_bytes;
     a.context_device_bytes     = plan.capacity.device_bytes;
     a.workspace_device_bytes   = plan.workspace.bytes;
     a.io_pinned_bytes = plan.pinned_draft_bytes + plan.pinned_io_bytes + plan.pinned_output_bytes +

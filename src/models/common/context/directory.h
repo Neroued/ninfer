@@ -298,6 +298,8 @@ public:
     void prepare_actions();
     [[nodiscard]] const ContextActions& actions(std::uint32_t rank = 0) const;
     void mark_submitted();
+    // The executor returned an admission before a physical reader received any actions.
+    void withdraw_submission();
     void adopt() noexcept;
     void mark_completed();
     void publish();

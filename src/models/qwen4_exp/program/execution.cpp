@@ -379,7 +379,15 @@ bool RankProgramImpl::advance_layers(std::uint32_t end) {
     std::optional<nvtx::ScopedRange> range;
     if (f.verify) range.emplace(nvtx::Name::DecodeMtpTarget, nvtx::Category::Mtp);
     while (f.layer < end) {
-        if (!f.run->advance_layer(f.layer)) return false;
+        if (const auto& step = f.request.work.exchange) {
+            const auto& layer = parameters.text.layers.at(f.layer);
+            const auto stage =
+                exchange->stage(layer.moe.bank, dimension(step->columns.at(f.main_pass)));
+            f.run->mixer(f.layer);
+            f.run->resident_moe(f.layer, &stage);
+            f.run->combine(f.layer);
+        } else if (!f.run->advance_layer(f.layer))
+            return false;
         ++f.layer;
     }
     return true;
@@ -387,6 +395,7 @@ bool RankProgramImpl::advance_layers(std::uint32_t end) {
 
 void RankProgramImpl::after_main() {
     auto& f = *compute;
+    if (f.request.work.exchange) ++f.main_pass;
     if (!f.sequence && !f.graph_main) gpu_timer.end_target();
     f.run.reset();
     const auto* source    = std::get_if<ForwardWork>(&f.request.work.operation);
@@ -534,8 +543,9 @@ void RankProgramImpl::install_sampling(bool speculative) {
         auto* positions =
             static_cast<std::int32_t*>(host_tensor(buffers.batch.sampling_positions).data);
         auto* sampled_offsets =
-            f.packed ? static_cast<std::int64_t*>(host_tensor(*buffers.prefill_sampled_offsets).data)
-                     : nullptr;
+            f.packed
+                ? static_cast<std::int64_t*>(host_tensor(*buffers.prefill_sampled_offsets).data)
+                : nullptr;
         const auto rank = parameters.profile->local.rank;
         for (std::size_t b = 0; b < batch; ++b) {
             const auto& row = f.rows[member(b)];
@@ -594,11 +604,10 @@ void RankProgramImpl::prepare_decision() {
                 Tensor sample;
                 if (f.packed) {
                     sample = device_tensor(*buffers.prefill_sampled_hidden).slice(1, 0, batch);
-                    ops::gather(resources.states->sample_hidden(
-                                    device_tensor(*buffers.prefill_sampled_offsets)
-                                        .slice(0, 0, batch)),
-                                device_tensor(buffers.batch.live_rows).slice(0, 0, batch), sample,
-                                cuda);
+                    ops::gather(
+                        resources.states->sample_hidden(
+                            device_tensor(*buffers.prefill_sampled_offsets).slice(0, 0, batch)),
+                        device_tensor(buffers.batch.live_rows).slice(0, 0, batch), sample, cuda);
                 } else {
                     sample = f.tokens ? f.sample.slice(1, f.tokens - 1, 1) : f.sample;
                 }

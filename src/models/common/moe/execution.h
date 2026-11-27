@@ -31,6 +31,14 @@ struct ExpertExchangeWork {
     Tensor* observation = nullptr;
 };
 
+// Immutable bank maps and reusable exchange frames belong to the rank Program. A layer
+// borrows the selected frame; its source activations and scratch stay on the execution stream.
+class ResidentExpertExchange {
+public:
+    virtual ~ResidentExpertExchange()                                                  = default;
+    [[nodiscard]] virtual ExpertExchangeWork stage(ExpertBankId, int physical_columns) = 0;
+};
+
 void resident_layer(const Parameters&, const LayerSource*, const ExpertExchangeWork*, MemoryArena&,
                     CudaExecutionView);
 

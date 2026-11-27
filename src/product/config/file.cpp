@@ -79,16 +79,28 @@ public:
         : path_(path), result_(result) {}
 
     DeploymentOptions read(const toml::node& node, int default_device) {
-        const auto& t =
-            table(node, "distributed",
-                  {"coordinator_node", "control_host", "control_port", "connect_timeout",
-                   "shutdown_timeout", "allow_shared_device", "parallel", "nodes", "ranks"});
+        const auto& t = table(node, "distributed",
+                              {"coordinator_node", "control_host", "control_port",
+                               "connect_timeout", "shutdown_timeout", "communication_policy",
+                               "allow_shared_device", "parallel", "nodes", "ranks"});
         DeploymentOptions out;
         out.coordinator_node    = number(t, "coordinator_node", "distributed", 0);
         out.control_host        = string(t, "control_host", "distributed", true);
         out.control_port        = number(t, "control_port", "distributed", 0, UINT16_MAX);
         out.connect_timeout_ms  = duration(t, "connect_timeout", out.connect_timeout_ms);
         out.shutdown_timeout_ms = duration(t, "shutdown_timeout", out.shutdown_timeout_ms);
+        if (const auto* policy = t.get("communication_policy")) {
+            using distributed::CommunicationPolicy;
+            const auto value = string(t, "communication_policy", "distributed", true);
+            if (value == "auto")
+                out.communication_policy = CommunicationPolicy::Auto;
+            else if (value == "native")
+                out.communication_policy = CommunicationPolicy::Native;
+            else if (value == "nccl")
+                out.communication_policy = CommunicationPolicy::Nccl;
+            else
+                error(*policy, "distributed.communication_policy", "expected auto, native or nccl");
+        }
         out.allow_shared_device = boolean(t, "allow_shared_device", "distributed", false);
         if (const auto* p = t.get("parallel")) {
             const auto& values = table(*p, "distributed.parallel", {"tp", "ep", "dp", "pp", "adp"});

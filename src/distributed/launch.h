@@ -16,6 +16,7 @@ struct WorkerBootstrap {
     std::map<std::string, std::string, std::less<>> environment;
     std::uint32_t shutdown_timeout_ms = 30'000;
     std::uint32_t node_worker_count   = 1;
+    CommunicationPolicy communication_policy = CommunicationPolicy::Auto;
 };
 
 [[nodiscard]] WorkerBootstrap read_worker_bootstrap();

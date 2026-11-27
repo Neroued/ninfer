@@ -565,7 +565,8 @@ struct ExecutionGroup::Impl {
                                       node->artifact,
                                       {},
                                       options.shutdown_timeout_ms,
-                                      node_worker_counts[rank.node]};
+                                      node_worker_counts[rank.node],
+                                      options.communication_policy};
             specs.push_back({*node, std::move(bootstrap),
                              topology.replica_for_rank(rank.rank).failure_domain_id, local});
         }

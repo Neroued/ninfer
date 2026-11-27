@@ -9,6 +9,7 @@ add_library(ninfer_model_loading STATIC
   common/dflash/weights.cpp
   common/parallel.cpp
   common/parallel_weights.cpp
+  common/moe/placement.cpp
   common/vision/resources.cpp
   common/weights.cpp
   common/moe/weights.cpp
@@ -89,6 +90,10 @@ add_library(ninfer_model_execution STATIC
 ninfer_internal_includes(ninfer_model_execution)
 target_link_libraries(ninfer_model_execution
   PUBLIC ninfer_model_loading ninfer_model_control ninfer_ops ninfer_runtime_support)
+
+if(NINFER_ENABLE_DISTRIBUTED)
+  target_sources(ninfer_model_execution PRIVATE common/moe/exchange.cpp)
+endif()
 
 if(NINFER_TARGET STREQUAL "rtx5090")
   target_link_libraries(ninfer_model_execution PRIVATE ninfer_cpu_executor)

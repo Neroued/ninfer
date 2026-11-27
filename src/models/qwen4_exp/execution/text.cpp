@@ -129,10 +129,10 @@ void TextRun::mixer(std::uint32_t i, const QsaSubmit& submit) {
     mix(p.moe_hc);
 }
 
-void TextRun::resident_moe(std::uint32_t i) {
-    const auto& p = parameters_.text.layers[i].moe;
-    moe::execute(roots_.input, p, p.resident, ops::MoeEpilogue::Write, roots_.output,
-                 {batch_.valid_columns, batch_.tokens}, execution_.workspace, cuda_);
+void TextRun::resident_moe(std::uint32_t i, const moe::ExpertExchangeWork* step) {
+    const moe::LayerSource source{
+        roots_.input, roots_.output, {batch_.valid_columns, batch_.tokens}};
+    moe::resident_layer(parameters_.text.layers[i].moe, &source, step, execution_.workspace, cuda_);
 }
 
 void TextRun::gpu_moe(const moe::GpuCall& call) {

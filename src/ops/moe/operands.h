@@ -24,6 +24,7 @@ public:
     void control(const Weight& control, const RouteProfile& profile);
     void sigmoid_control(const Weight& control, const RouteProfile& profile);
     void routes(const ExpertRoutes& routes, int top_k, int tokens, bool writing);
+    void vector_input(const Tensor&, DType, int size, const char* name);
     void coefficient(const Tensor& value, int tokens, bool writing);
     void subset(ExpertSubset subset, int experts);
     void experts(const CudaSwiGLUExperts& weights, const RoutedSwiGLUProfile& profile);

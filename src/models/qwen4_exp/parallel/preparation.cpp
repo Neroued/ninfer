@@ -1,6 +1,7 @@
 #include "models/qwen4_exp/parallel/preparation.h"
 #include "models/common/vocabulary.h"
 #include "core/platform.h"
+#include "models/common/moe/exchange.h"
 
 #include <algorithm>
 
@@ -15,11 +16,6 @@ RankPreparation::RankPreparation(const artifact::Reader& reader, std::span<const
     distributed::wire::Decoder in(payload);
     auto request = decode_rank_load(in, identity, reader.artifact_id());
     in.finish();
-    if (identity.ep.size > identity.tp.size)
-        throw std::invalid_argument(
-            "Qwen4Exp execution requires cross-replica expert dispatch and return");
-    if (identity.dp.size > 1)
-        throw std::invalid_argument("Qwen4Exp execution requires per-replica Session preparation");
     if (identity.tp.size > 1) {
         const auto& group    = topology.role_group("tensor", identity.rank);
         const auto result_id = topology.replica_for_rank(identity.rank).result_owner;
@@ -30,6 +26,15 @@ RankPreparation::RankPreparation(const artifact::Reader& reader, std::span<const
     options_.startup_observer = observer;
     control_owner_            = request.control_owner;
     auto definition           = read_definition(reader, models::load_options(options_));
+    if (identity.ep.size > identity.tp.size) {
+        if (!request.rank.expert_domain)
+            throw std::invalid_argument("missing expert exchange placement");
+        const auto& group    = topology.role_group("expert", identity.rank);
+        const auto& config   = definition->config().text;
+        expert_requirements_ = moe::expert_exchange_requirements(
+            group, *request.rank.expert_domain, group.index(identity.rank), config.hidden,
+            config.moe.top_k, moe::expert_exchange_block_columns);
+    }
     load_.emplace(resolve_rank_load(reader, std::move(definition), std::move(request.rank),
                                     device_.device()));
     if (load_->rank_plan().ple_placement == ple::Placement::Disk)
@@ -63,7 +68,9 @@ void RankPreparation::materialize() {
 }
 
 std::vector<distributed::GroupRequirements> RankPreparation::communication_requirements() const {
-    if (!binding_.group) return {};
+    std::vector<distributed::GroupRequirements> requirements;
+    if (expert_requirements_) requirements.push_back(*expert_requirements_);
+    if (!binding_.group) return requirements;
     using distributed::Collective;
     using distributed::Reduction;
     const auto plan   = plan_graph_probe(profile_, ple_geometry_, options_, batches_, device_, {});
@@ -111,7 +118,11 @@ std::vector<distributed::GroupRequirements> RankPreparation::communication_requi
             work.push_back({Collective::Broadcast, DType::BF16, hidden,
                             plan.workspace.vision->output_bytes / dtype_size(DType::BF16), hidden,
                             Reduction::Sum, root});
-    return {std::move(result)};
+    if (!requirements.empty() && requirements.front().group == result.group)
+        requirements.front().collectives = std::move(result.collectives);
+    else
+        requirements.push_back(std::move(result));
+    return requirements;
 }
 
 runtime::RankPreparationReport RankPreparation::report(std::size_t available) const {

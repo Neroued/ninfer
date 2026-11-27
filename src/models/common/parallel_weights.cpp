@@ -27,7 +27,8 @@ std::uint64_t rank_weight_digest(const artifact::ArtifactId& artifact, LoadOptio
                                  std::span<const std::uint64_t> rank_geometry,
                                  std::span<const WeightId> whole, std::span<const WeightId> omitted,
                                  std::span<const ParameterAssembly> assemblies,
-                                 std::span<const ExpertPartition> experts) {
+                                 std::span<const ExpertPartition> experts,
+                                 const moe::ExpertDomain* domain) {
     std::uint64_t identity = 14695981039346656037ULL;
     const auto mix         = [&](std::uint64_t value) {
         for (unsigned i = 0; i < 8; ++i) {
@@ -74,6 +75,10 @@ std::uint64_t rank_weight_digest(const artifact::ArtifactId& artifact, LoadOptio
         mix(bank.intermediate.size);
         mix(bank.ids.size());
         for (const auto expert : bank.ids) mix(expert);
+    }
+    if (domain) {
+        mix(domain->banks.size());
+        for (std::size_t b = 0; b < domain->banks.size(); ++b) mix(domain->bank_signature(b));
     }
     return identity ? identity : 1ULL;
 }

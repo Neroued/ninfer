@@ -25,6 +25,8 @@ void validate_deployment(const DeploymentOptions& options) {
     if (options.control_host.empty()) fail("control_host must not be empty");
     if (!options.connect_timeout_ms || !options.shutdown_timeout_ms)
         fail("connection and shutdown timeouts must be positive");
+    if (options.communication_policy > distributed::CommunicationPolicy::Auto)
+        fail("invalid communication policy");
     const auto& p = options.parallel;
     if (!p.tp || !p.ep || !p.dp || !p.pp || !p.adp) fail("parallel sizes must be positive");
     const auto dp_pp = checked_product(p.dp, p.pp);

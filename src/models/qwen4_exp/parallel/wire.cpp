@@ -28,6 +28,7 @@ void encode_rank_load(Encoder& out, const RankLoadRequest& request) {
     encode_weight_ids(out, p.whole);
     encode_assemblies(out, p.assemblies);
     encode_expert_partitions(out, p.experts);
+    encode_expert_domain(out, p.expert_domain.get());
     encode_weight_ids(out, p.omitted);
     encode_rank_options(out, request.options);
     encode_batch_execution_spec(out, request.batches);
@@ -57,6 +58,7 @@ RankLoadRequest decode_rank_load(Decoder& in, const distributed::RankIdentity& i
     p.whole                        = decode_weight_ids(in);
     p.assemblies                   = decode_assemblies(in);
     p.experts                      = decode_expert_partitions(in);
+    p.expert_domain                = decode_expert_domain(in);
     p.omitted                      = decode_weight_ids(in);
     request.options                = decode_rank_options(in);
     request.batches                = decode_batch_execution_spec(in);
@@ -65,6 +67,7 @@ RankLoadRequest decode_rank_load(Decoder& in, const distributed::RankIdentity& i
     if (compute_rank_shard_digest(expected_artifact, models::load_options(request.options), p) !=
         identity.shard_digest)
         throw std::invalid_argument("Qwen4Exp rank shard digest differs from topology plan");
+    if (p.expert_domain) p.expert_domain->validate_local(identity.rank, p.experts);
     return request;
 }
 

@@ -87,6 +87,30 @@ std::vector<ExpertPartition> decode_expert_partitions(Decoder& in) {
     return partitions;
 }
 
+void encode_expert_domain(Encoder& out, const moe::ExpertDomain* d) {
+    out.boolean(d != nullptr);
+    if (!d) return;
+    out.u32(d->experts);
+    out.u32(d->intermediate);
+    out.u64(d->members.size());
+    for (auto r : d->members) out.u32(r);
+    out.u64(d->banks.size());
+    for (const auto& bank : d->banks) encode_expert_partitions(out, bank);
+}
+
+std::shared_ptr<const moe::ExpertDomain> decode_expert_domain(Decoder& in) {
+    if (!in.boolean()) return {};
+    auto d          = std::make_shared<moe::ExpertDomain>();
+    d->experts      = in.u32();
+    d->intermediate = in.u32();
+    d->members.resize(in.count(4));
+    for (auto& r : d->members) r = in.u32();
+    d->banks.resize(in.count(8));
+    for (auto& bank : d->banks) bank = decode_expert_partitions(in);
+    d->validate();
+    return d;
+}
+
 void encode_weight_ids(Encoder& out, std::span<const WeightId> ids) {
     out.u64(ids.size());
     for (const auto id : ids) out.u64(id.index);

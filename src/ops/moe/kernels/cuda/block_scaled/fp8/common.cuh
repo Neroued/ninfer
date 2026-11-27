@@ -32,6 +32,7 @@ struct Matrix {
 };
 
 __device__ __forceinline__ Matrix resolve(const ExpertMatrixDeviceView& matrix, int expert) {
+    if (matrix.expert_indices) expert = matrix.expert_indices[expert];
     const auto offset = matrix.offsets ? matrix.offsets[expert] : 0;
     return {reinterpret_cast<const std::uint8_t*>(matrix.codes) +
                 (matrix.offsets ? offset : expert * matrix.code_stride),

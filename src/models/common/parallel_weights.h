@@ -1,6 +1,7 @@
 #pragma once
 
 #include "models/common/moe/weights.h"
+#include "models/common/moe/placement.h"
 #include "models/common/parallel.h"
 #include "models/load_options.h"
 #include "artifact/framing.h"
@@ -55,12 +56,11 @@ struct ExpertWeightPartition {
     ExpertPartition partition;
 };
 
-[[nodiscard]] std::uint64_t rank_weight_digest(const artifact::ArtifactId&, LoadOptions,
-                                               std::span<const std::uint64_t> rank_geometry,
-                                               std::span<const WeightId> whole,
-                                               std::span<const WeightId> omitted,
-                                               std::span<const ParameterAssembly>,
-                                               std::span<const ExpertPartition>);
+[[nodiscard]] std::uint64_t
+rank_weight_digest(const artifact::ArtifactId&, LoadOptions,
+                   std::span<const std::uint64_t> rank_geometry, std::span<const WeightId> whole,
+                   std::span<const WeightId> omitted, std::span<const ParameterAssembly>,
+                   std::span<const ExpertPartition>, const moe::ExpertDomain* = nullptr);
 
 // Every destination parameter in [0, references.size()) must be classified exactly once across
 // whole, assemblies[].bindings[].parameter, experts[].parameters, and omitted.

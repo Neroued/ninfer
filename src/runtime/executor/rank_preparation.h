@@ -182,7 +182,8 @@ prepare_rank(distributed::WorkerConnection& connection, std::unique_ptr<artifact
 
         if (action == PreparationAction::PrepareCommunication) {
             if (!distributed::prepare_communication(connection,
-                                                    preparing->communication_requirements()))
+                                                    preparing->communication_requirements(),
+                                                    connection.bootstrap().communication_policy))
                 return std::nullopt;
             device.synchronize();
             report(device_memory_snapshot(device.device()));

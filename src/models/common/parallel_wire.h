@@ -1,7 +1,7 @@
 #pragma once
 
 #include "models/common/batch.h"
-#include "models/common/parallel.h"
+#include "models/common/moe/placement.h"
 #include "models/common/speculative/controller.h"
 #include "models/common/token_input.h"
 #include "distributed/wire.h"
@@ -17,6 +17,10 @@ void encode_token_counts(distributed::wire::Encoder&, const TokenCounts&);
 
 void encode_expert_partitions(distributed::wire::Encoder&, std::span<const ExpertPartition>);
 [[nodiscard]] std::vector<ExpertPartition> decode_expert_partitions(distributed::wire::Decoder&);
+
+void encode_expert_domain(distributed::wire::Encoder&, const moe::ExpertDomain*);
+[[nodiscard]] std::shared_ptr<const moe::ExpertDomain>
+decode_expert_domain(distributed::wire::Decoder&);
 
 void encode_weight_ids(distributed::wire::Encoder&, std::span<const WeightId>);
 [[nodiscard]] std::vector<WeightId> decode_weight_ids(distributed::wire::Decoder&);

@@ -17,7 +17,7 @@ public:
     void stem();
     void mixer(const QsaSubmit& = {});
     [[nodiscard]] QsaRun local_qsa();
-    void feed_forward();
+    void feed_forward(const moe::ExpertExchangeWork* = nullptr);
     void finish(TextOutputs);
 
 private:

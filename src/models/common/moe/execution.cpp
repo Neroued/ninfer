@@ -1,6 +1,27 @@
 #include "models/common/moe/execution.h"
 
+#if NINFER_ENABLE_DISTRIBUTED
+#    include "models/common/moe/exchange.h"
+#endif
+
 namespace ninfer::models::moe {
+
+void resident_layer(const Parameters& p, const LayerSource* src, const ExpertExchangeWork* step,
+                    MemoryArena& workspace, CudaExecutionView cuda) {
+    if (step) {
+#if NINFER_ENABLE_DISTRIBUTED
+        step->frame.softmax_layer(step->placement, p, step->physical_columns, src, workspace, cuda,
+                                  step->observation);
+        return;
+#else
+        throw std::invalid_argument("expert exchange requires distributed execution");
+#endif
+    }
+    if (!src) throw std::invalid_argument("local resident MoE requires a source");
+    auto output = src->output;
+    execute(src->hidden, p, p.resident, src->mode, output, src->validity, workspace, cuda);
+}
+
 
 std::size_t workspace_bytes(const ops::MoeProfile& profile, ops::MoeEpilogue epilogue,
                             std::int32_t first, std::int32_t last, ops::ExpertSubsetKind subset) {

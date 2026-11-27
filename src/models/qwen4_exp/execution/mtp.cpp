@@ -76,12 +76,12 @@ void MtpRun::mixer(const QsaSubmit& submit) {
     mix(roots_.normalized, parameters_.layer.moe_hc, roots_, arena_, cuda_);
 }
 
-void MtpRun::feed_forward() {
+void MtpRun::feed_forward(const moe::ExpertExchangeWork* step) {
     {
         auto scratch = arena_.scope();
-        moe::execute(roots_.input, parameters_.layer.moe, parameters_.layer.moe.resident,
-                     ops::MoeEpilogue::Write, roots_.output, {batch_.valid_columns, batch_.tokens},
-                     arena_, cuda_);
+        const moe::LayerSource source{
+            roots_.input, roots_.output, {batch_.valid_columns, batch_.tokens}};
+        moe::resident_layer(parameters_.layer.moe, &source, step, arena_, cuda_);
     }
     if (parallel_) parallel_->sum(roots_.output, cuda_);
     ops::hc_combine_norm(roots_.residual, roots_.output, roots_.injection,

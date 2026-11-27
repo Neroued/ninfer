@@ -196,6 +196,11 @@ void MoeOperands::routes(const ExpertRoutes& r, int top_k, int tokens, bool writ
     }
 }
 
+void MoeOperands::vector_input(const Tensor& value, DType type, int size, const char* name) {
+    operand::tensor(value, type, {size}, 4, op_, name, device_);
+    read(value.data, value.bytes());
+}
+
 void MoeOperands::coefficient(const Tensor& value, int tokens, bool writing) {
     operand::tensor(value, DType::FP32, {tokens}, 4, op_, "shared coefficients", device_);
     if (writing) {
@@ -324,13 +329,19 @@ void MoeOperands::experts(const CudaSwiGLUExperts& w, const RoutedSwiGLUProfile&
             return;
         }
         const auto bytes = matrix_bytes(type, layout, n, k);
+        const auto count = view.expert_indices ? view.physical_count : std::uint32_t(p.experts);
+        if (view.expert_indices) {
+            require(!view.offsets && count && count <= std::uint32_t(p.experts) &&
+                        operand::aligned(view.expert_indices, 4),
+                    "MoE: invalid affine expert map");
+            read(view.expert_indices, std::size_t(p.experts) * 4);
+        }
         if (type == QType::NVFP4) {
             require(operand::aligned(view.matrix_scales, alignof(float)) &&
                         view.matrix_scale_stride <=
-                            (SIZE_MAX / sizeof(float) - 1) / (p.experts - 1),
+                            (SIZE_MAX / sizeof(float) - 1) / std::max(1U, count - 1),
                     "MoE: invalid NVFP4 matrix divisors");
-            read(view.matrix_scales,
-                 ((p.experts - 1) * view.matrix_scale_stride + 1) * sizeof(float));
+            read(view.matrix_scales, ((count - 1) * view.matrix_scale_stride + 1) * sizeof(float));
         } else {
             require(!view.matrix_scales && view.matrix_scale_stride == 0,
                     "MoE: this weight format has no matrix divisors");
@@ -358,9 +369,9 @@ void MoeOperands::experts(const CudaSwiGLUExperts& w, const RoutedSwiGLUProfile&
                         "MoE: indexed plane lies outside its storage");
             } else {
                 require(stride >= size && stride % alignment == 0 &&
-                            stride <= (SIZE_MAX - size) / std::size_t(p.experts - 1),
+                            stride <= (SIZE_MAX - size) / std::max(1U, count - 1),
                         "MoE: invalid expert stride");
-                read(base, (p.experts - 1) * stride + size);
+                read(base, (count - 1) * stride + size);
             }
         };
         plane(view.codes, bytes.codes, view.code_stride);

@@ -1,4 +1,6 @@
 target_sources(ninfer_ops PRIVATE
+  "${CMAKE_CURRENT_LIST_DIR}/compact/entry.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/compact/packet.cu"
   "${CMAKE_CURRENT_LIST_DIR}/weights.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/operands.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/kernels/cuda/block_scaled/launch.cu"

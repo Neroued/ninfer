@@ -476,6 +476,7 @@ context_cache.max_cached_checkpoints_per_replica = 128
 [distributed]
 coordinator_node = 0
 control_host = '127.0.0.1'
+communication_policy = "native"
 allow_shared_device = true
 [distributed.parallel]
 dp = 2
@@ -486,6 +487,8 @@ artifact = '/home/neroued/ninfer/out/model.ninfer'
 )");
     const auto dp_cli = parse({"ninfer", "--config", pure_dp_shared.string()});
     require(dp_cli.launch.engine.deployment.has_value() &&
+                dp_cli.launch.engine.deployment->communication_policy ==
+                    ninfer::distributed::CommunicationPolicy::Native &&
                 dp_cli.launch.engine.deployment->allow_shared_device &&
                 dp_cli.launch.engine.deployment->ranks.size() == 2 &&
                 dp_cli.launch.engine.deployment->ranks[0].device == 2 &&

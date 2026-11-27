@@ -62,6 +62,7 @@ wire::Message bootstrap_message(const WorkerBootstrap& b, bool local,
     }
     out.u32(b.shutdown_timeout_ms);
     out.u32(b.node_worker_count);
+    out.u8(static_cast<std::uint8_t>(b.communication_policy));
     out.boolean(local);
     out.u64(expected_parent_pid);
     return {wire::Kind::Join, b.epoch, std::move(out).take()};
@@ -137,6 +138,9 @@ WorkerBootstrap read_worker_bootstrap() {
     }
     out.shutdown_timeout_ms       = in.u32();
     out.node_worker_count         = in.u32();
+    out.communication_policy      = static_cast<CommunicationPolicy>(in.u8());
+    if (out.communication_policy > CommunicationPolicy::Auto)
+        throw std::invalid_argument("invalid worker communication policy");
     const bool local              = in.boolean();
     const auto expected_launcher  = static_cast<pid_t>(in.u64());
     in.finish();

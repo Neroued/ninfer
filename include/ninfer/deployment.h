@@ -8,6 +8,10 @@
 
 namespace ninfer {
 
+namespace distributed {
+enum class CommunicationPolicy : std::uint8_t { Nccl, Native, Auto };
+} // namespace distributed
+
 struct ParallelCoordinate {
     std::uint32_t rank = 0, size = 1;
 };
@@ -41,6 +45,7 @@ struct DeploymentOptions {
     ParallelOptions parallel;
     std::vector<DeploymentNode> nodes;
     std::vector<DeploymentRank> ranks;
+    distributed::CommunicationPolicy communication_policy = distributed::CommunicationPolicy::Auto;
 };
 
 // Validates deployment identities, parallel geometry nesting, paths and references.

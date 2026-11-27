@@ -201,7 +201,7 @@ std::uint64_t compute_rank_shard_digest(const artifact::ArtifactId& artifact_id,
     }
     geometry.push_back(r.shared_intermediate);
     return rank_weight_digest(artifact_id, options, geometry, r.whole, r.omitted, r.assemblies,
-                              r.experts);
+                              r.experts, r.expert_domain.get());
 }
 
 RankPlan plan_single_rank(const ModelDefinition& definition) {
@@ -218,18 +218,18 @@ ParallelPlan plan_parallel(const ModelDefinition& definition, const DeploymentOp
     ParallelPlan out;
     out.topology = distributed::build_cluster_topology(normalized);
     out.ranks.reserve(out.topology.ranks.size());
-    for (auto& id : out.topology.ranks) {
-        auto shard = rank_plan(definition, id, table);
-        id.shard_digest =
-            compute_rank_shard_digest(definition.artifact_id(), definition.options(), shard);
-        out.ranks.push_back(std::move(shard));
-    }
+    for (const auto& id : out.topology.ranks) out.ranks.push_back(rank_plan(definition, id, table));
     for (const auto& replica : out.topology.replicas) {
         out.topology.add_role("tensor", replica.ranks);
         out.topology.add_role("vocabulary", replica.ranks);
         if (table == ple::Placement::Device) out.topology.add_role("ple", replica.ranks);
     }
     add_expert_roles(out.topology);
+    const auto& moe = definition.config().text.moe;
+    moe::bind_expert_domains(out.topology, out.ranks, moe.experts, moe.intermediate);
+    for (auto& id : out.topology.ranks)
+        id.shard_digest = compute_rank_shard_digest(definition.artifact_id(), definition.options(),
+                                                    out.ranks.at(id.rank));
     out.topology.plan =
         distributed::compute_topology_plan_digest(definition.artifact_id(), out.topology);
     out.topology.validate(normalized);

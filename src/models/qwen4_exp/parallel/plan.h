@@ -1,6 +1,6 @@
 #pragma once
 
-#include "models/common/parallel.h"
+#include "models/common/moe/placement.h"
 #include "models/qwen4_exp/definition.h"
 #include "distributed/topology.h"
 
@@ -14,6 +14,7 @@ struct RankPlan {
     std::vector<WeightId> whole;
     std::vector<ParameterAssembly> assemblies;
     std::vector<ExpertPartition> experts;
+    std::shared_ptr<const moe::ExpertDomain> expert_domain;
     std::vector<WeightId> omitted;
 };
 

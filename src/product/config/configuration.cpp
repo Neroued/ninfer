@@ -332,6 +332,11 @@ StartupConfigurationView view(const LaunchOptions& launch, EntryPoint entry, con
                ConfigurationUnit::Milliseconds);
         append("distributed.shutdown_timeout", std::uint64_t{d.shutdown_timeout_ms},
                ConfigurationUnit::Milliseconds);
+        const auto policy = d.communication_policy;
+        append("distributed.communication_policy",
+               std::string(policy == distributed::CommunicationPolicy::Auto     ? "auto"
+                           : policy == distributed::CommunicationPolicy::Native ? "native"
+                                                                                : "nccl"));
         append("distributed.allow_shared_device", d.allow_shared_device);
         append("distributed.parallel.tp", std::uint64_t{d.parallel.tp});
         append("distributed.parallel.ep", std::uint64_t{d.parallel.ep});

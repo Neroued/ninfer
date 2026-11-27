@@ -1,7 +1,7 @@
 #pragma once
 
 #include "distributed/topology.h"
-#include "models/common/parallel.h"
+#include "models/common/moe/placement.h"
 #include "models/glm5next/definition.h"
 
 namespace ninfer::models::glm5next {
@@ -18,6 +18,7 @@ struct RankPlan {
     std::vector<WeightId> whole;
     std::vector<ParameterAssembly> assemblies;
     std::vector<ExpertPartition> experts;
+    std::shared_ptr<const moe::ExpertDomain> expert_domain;
     std::vector<WeightId> omitted;
 };
 

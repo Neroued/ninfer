@@ -18,8 +18,6 @@ namespace detail {
 class NativeProgress;
 }
 
-enum class CommunicationPolicy : std::uint8_t { Nccl, Native, Auto };
-
 enum class Reduction : std::uint8_t { Sum, Max };
 enum class Collective : std::uint8_t { AllReduce, Broadcast, AllGather, ReduceScatter };
 

@@ -11,6 +11,8 @@ ParallelStartup::ParallelStartup(const artifact::Reader& reader, const EngineOpt
       batches_(std::make_shared<const BatchExecutionPlan>(make_batch_execution_spec(
           (options.max_concurrency - 1) / options.deployment->parallel.dp + 1, 1,
           options.use_cuda_graph && options.purpose == EnginePurpose::Generation))) {
+    if (parallel_.topology.replicas.size() > 1)
+        throw std::invalid_argument("Qwen4Exp execution requires per-replica Session preparation");
     if (options.context_cache.host_capacity_bytes.value_or(0) > 0)
         throw std::invalid_argument(
             "distributed execution requires device-resident Context storage");

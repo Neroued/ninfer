@@ -3,6 +3,7 @@
 #include "models/qwen4_exp/load.h"
 #include "models/qwen4_exp/execution/profile.h"
 #include "models/qwen4_exp/parallel/wire.h"
+#include "models/common/moe/exchange.h"
 #include "models/qwen4_exp/program/planning.h"
 #include "artifact/reader.h"
 #include "core/platform.h"
@@ -66,6 +67,42 @@ auto roundtrip(Request request, const dist::ExecutionTopology& topology, Decode 
     auto bytes = encode();
     auto rank  = read(bytes, identity);
     rejected([&] { read(bytes, topology.rank((id + 1) % topology.ranks.size())); }, "global rank");
+    const auto& domain = *rank.expert_domain;
+    require(domain.members == topology.role_group("expert", id).members,
+            "dispatch peer order differs");
+    for (std::size_t bank = 0; bank < rank.experts.size(); ++bank) {
+        const auto& local = domain.banks[bank].at(topology.role_group("expert", id).index(id));
+        require(local.ids == rank.experts[bank].ids &&
+                    local.intermediate == rank.experts[bank].intermediate,
+                "dispatch slots differ from actual materialized partition");
+    }
+    const auto& g    = topology.role_group("expert", id);
+    const auto stage = models::moe::prepare_expert_exchange(g, domain, {0}, 2560, 8, 2);
+    wire::Encoder desc;
+    stage.encode(desc, 5);
+    const auto contract = std::move(desc).take();
+    wire::Decoder accepted(contract);
+    stage.expect(accepted, 5);
+    accepted.finish();
+    auto different = stage;
+    different.dispatch_bytes.front() += 16;
+    rejected(
+        [&] {
+            wire::Decoder in(contract);
+            different.expect(in, 5);
+        },
+        "differs across participants");
+    rejected(
+        [&] {
+            wire::Decoder in(contract);
+            stage.expect(in, 4);
+        },
+        "differs across participants");
+    auto changed = std::make_shared<models::moe::ExpertDomain>(domain);
+    std::swap(changed->members.front(), changed->members.back());
+    request.rank.expert_domain = changed;
+    rejected([&] { read(encode(), identity); }, "shard digest");
+    request.rank.expert_domain = rank.expert_domain;
     ++request.rank.experts.front().intermediate.begin;
     rejected([&] { read(encode(), identity); }, "shard digest");
     --request.rank.experts.front().intermediate.begin;

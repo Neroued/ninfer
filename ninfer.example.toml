@@ -111,6 +111,7 @@ kind = "none" # none / grammar / json_object / json_schema / regex / choice
 # control_port = 0
 # connect_timeout = "60s"
 # shutdown_timeout = "30s"
+# communication_policy = "auto" # auto, native or nccl.
 # [distributed.parallel]
 # tp = 2
 # ep = 1 # 1: expert TP; 2: whole-expert EP when tp = 2.

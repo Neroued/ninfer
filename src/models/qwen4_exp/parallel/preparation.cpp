@@ -35,10 +35,6 @@ RankPreparation::RankPreparation(const artifact::Reader& reader, std::span<const
         const auto& group    = topology.role_group("expert", identity.rank);
         expert_group         = &group;
         expert_group_        = &communication.group(group.id);
-        const auto& config   = definition->config().text;
-        expert_requirements_ = moe::expert_exchange_requirements(
-            group, *request.rank.expert_domain, group.index(identity.rank), config.hidden,
-            config.moe.top_k, moe::expert_exchange_block_columns);
     }
     placements_ = request.rank.ple_candidates;
     if (request.rank.ple_shards !=
@@ -70,6 +66,7 @@ RankPreparation::RankPreparation(const artifact::Reader& reader, std::span<const
         };
         for (auto& layer : profile->text.layers) bind(layer.moe);
         if (profile->mtp) bind(profile->mtp->layer.moe);
+        expert_requirements_    = plan->requirements();
         profile->exchange_bytes = plan->bytes();
         profile->exchange = std::move(plan);
     }

@@ -552,6 +552,7 @@ void native_work() {
     q::VisionInputBindings bindings;
     q::WorkContract contract{
         {128, 2, 32, 3, KvCacheStorage::BFloat16, EnginePurpose::Generation}, 256, 250, true, true};
+    contract.shape.exchange = {64};
     contract.batches = std::make_shared<const models::BatchExecutionPlan>(
         models::make_batch_execution_spec(2, 1, false));
     const auto original = row();

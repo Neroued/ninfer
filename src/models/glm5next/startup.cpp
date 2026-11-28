@@ -54,10 +54,8 @@ RankPreparation::RankPreparation(const artifact::Reader& reader, RankLoadRequest
             if (auto* m = std::get_if<execution::MoeProfile>(&layer.ffn)) bind(*m);
         if (profile->mtp) bind(profile->mtp->moe);
         profile->exchange_bytes = route->bytes();
+        expert_requirements_    = route->requirements();
         profile->exchange       = std::move(route);
-        expert_requirements_ =
-            moe::expert_exchange_requirements(*experts, *rp.expert_domain, peer, c.hidden,
-                                              c.moe.top_k, moe::expert_exchange_block_columns);
     }
 #endif
     plan_        = plan_execution(

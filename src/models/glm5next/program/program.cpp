@@ -45,7 +45,7 @@ RankProgramImpl::RankProgramImpl(const execution::Parameters& p, std::unique_ptr
     }
     if (binding.heads.group) head_group.emplace(binding.heads);
     if (expert_exchange && resources.plan.use_cuda_graph) {
-        service_graphs.emplace(expert_exchange->group());
+        service_graphs.emplace(expert_exchange->group(), shape.exchange);
         if (parallel) parallel->track_graph_group(&expert_exchange->group());
     }
     if (binding.owners.group) owner_group.emplace(binding.owners);

@@ -82,7 +82,9 @@ ExpertExchangeStage prepare_expert_exchange(const distributed::GroupDescription&
     return s;
 }
 
-int ExpertExchangeStage::blocks(int n) const { return exchange_blocks(n, block_columns); }
+int ExpertExchangeStage::blocks(int n) const {
+    return dimension(ExchangeGeometry{static_cast<unsigned>(block_columns)}.blocks(dimension(n)));
+}
 
 void ExpertExchangeStage::encode(distributed::wire::Encoder& e, int extent) const {
     (void)blocks(extent);
@@ -119,15 +121,10 @@ distributed::GroupRequirements ExpertExchangeStage::requirements(unsigned peer) 
     return r;
 }
 
-distributed::GroupRequirements expert_exchange_requirements(const distributed::GroupDescription& g,
-                                                            const ExpertDomain& domain,
-                                                            unsigned peer, int hidden, int top_k,
-                                                            int block_columns) {
-    distributed::GroupRequirements out{g.id, {}, {}};
-    for (std::size_t b = 0; b < domain.banks.size(); ++b) {
-        auto next = prepare_expert_exchange(g, domain, ExpertBankId{static_cast<std::uint32_t>(b)},
-                                            hidden, top_k, block_columns)
-                        .requirements(peer);
+distributed::GroupRequirements ResidentExchangePlan::requirements() const {
+    distributed::GroupRequirements out{stages_.front().group, {}, {}};
+    for (const auto& stage : stages_) {
+        const auto next = stage.requirements(peer_);
         if (out.peers.empty()) {
             out = std::move(next);
             continue;
@@ -567,9 +564,11 @@ ResidentExchangePlan::ResidentExchangePlan(std::shared_ptr<const ExpertDomain> d
                                            const distributed::GroupDescription& group,
                                            unsigned peer, int hidden, int top_k)
     : domain_(std::move(domain)), peer_(peer) {
+    if (!domain_ || domain_->banks.empty())
+        throw std::invalid_argument("expert exchange plan requires at least one bank");
     for (std::uint32_t i = 0; i < domain_->banks.size(); ++i) {
         const auto& s = stages_.emplace_back(prepare_expert_exchange(
-            group, *domain_, ExpertBankId{i}, hidden, top_k, expert_exchange_block_columns));
+            group, *domain_, ExpertBankId{i}, hidden, top_k, geometry_.max_block_columns));
         bytes_ += PlacementLayout(s, peer).bytes;
         const auto found = std::ranges::find_if(frame_banks_, [&](auto bank) {
             return stages_[bank].slots == s.slots;

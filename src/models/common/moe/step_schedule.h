@@ -12,6 +12,7 @@ struct ExpertSchedule {
     using Commit = typename Types::Commit;
     std::uint32_t chunk;
     bool decode_graph;
+    ExchangeGeometry geometry;
 
     std::optional<runtime::CollectiveShape> shape(const Work& work) const {
         auto step = plan_expert_step(work, chunk, decode_graph);
@@ -19,7 +20,7 @@ struct ExpertSchedule {
         runtime::CollectiveShape shape{step->draft_passes, std::move(step->columns)};
         if (step->graph)
             for (auto columns : shape.extents)
-                shape.captured_buckets.push_back(exchange_blocks(columns));
+                shape.captured_buckets.push_back(geometry.capture_bucket(columns));
         return shape;
     }
 

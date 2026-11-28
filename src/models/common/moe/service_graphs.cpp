@@ -12,9 +12,9 @@ void ExpertServiceGraphs::prepare(const BatchExecutionPlan& batches,
     for (auto shape : batches.graph_shapes()) {
         for (const auto& route : routes.at(shape)) {
             const auto columns = shape.rows * route.width;
-            passes.try_emplace({false, exchange_blocks(columns)}, columns);
+            passes.try_emplace({false, geometry_.capture_bucket(columns)}, columns);
             if (route.mtp_steps)
-                passes.try_emplace({true, exchange_blocks(shape.rows)}, shape.rows);
+                passes.try_emplace({true, geometry_.capture_bucket(shape.rows)}, shape.rows);
         }
     }
     for (const auto& [key, columns] : passes) {
@@ -33,7 +33,7 @@ void ExpertServiceGraphs::prepare(const BatchExecutionPlan& batches,
 }
 
 void ExpertServiceGraphs::launch(bool draft, std::uint32_t columns, CudaExecutionView cuda) {
-    auto& entry = graphs_.at({draft, exchange_blocks(columns)});
+    auto& entry = graphs_.at({draft, geometry_.capture_bucket(columns)});
     entry.segment.launch(cuda, &communication);
     workspace_peak_ = std::max(workspace_peak_, entry.workspace_bytes);
 }

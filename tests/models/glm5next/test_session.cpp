@@ -574,6 +574,8 @@ void schedule_experts(const artifact::Reader& reader, const DeploymentOptions& d
     options.speculative.backend      = SpeculativeBackend::Mtp;
     options.speculative.draft_tokens = layout.shape.draft_tokens;
     options.context_cache.host_capacity_bytes = 0;
+    auto shape = layout.shape;
+    shape.exchange = {64};
     glm::ParallelStartup startup(reader, options);
     const auto& topo = startup.topology();
     std::vector<distributed::wire::Payload> layouts;
@@ -590,7 +592,7 @@ void schedule_experts(const artifact::Reader& reader, const DeploymentOptions& d
             const auto part = pool.parts.at(r);
             pool.parts      = {part};
         }
-        glm::RankResourceDescription report{r, layout.shape, layout.batches->spec(),
+        glm::RankResourceDescription report{r, shape, layout.batches->spec(),
                                             layout.states.at(r), std::move(spec)};
         for (const auto& cache : layout.caches) report.caches.push_back(cache.front().geometry);
         report.observation.rank = identity.rank;
@@ -603,7 +605,7 @@ void schedule_experts(const artifact::Reader& reader, const DeploymentOptions& d
     std::vector<std::unique_ptr<glm::ParallelStartup::Executor>> execution;
     const auto& definition = *startup.definition();
     for (const auto& replica : topo.replicas) {
-        glm::WorkContract contract{layout.shape,
+        glm::WorkContract contract{shape,
                                    layout.batches,
                                    definition.config().text.vocabulary,
                                    definition.resources().text.public_token_count,

@@ -1,3 +1,4 @@
+#include "models/common/moe/exchange.h"
 #include "models/qwen4_exp/program/planning.h"
 #include "models/qwen4_exp/parallel/plan.h"
 #include "models/qwen4_exp/session/planning.h"
@@ -167,7 +168,8 @@ ExecutionShape describe_execution_shape(const execution::ModelProfile& profile,
             o.observability.gpu_timing,
             o.speculative.length_policy,
             o.linear_state_dtype,
-            profile.stage.size};
+            profile.stage.size,
+            profile.exchange ? profile.exchange->geometry() : moe::ExchangeGeometry{}};
 }
 
 std::size_t ExecutionPlan::device_bytes() const {

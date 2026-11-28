@@ -89,6 +89,7 @@ void encode(Encoder& out, const RankResourceDescription& r) {
     out.u8(static_cast<std::uint8_t>(s.length_policy));
     out.u8(static_cast<std::uint8_t>(s.linear_state_dtype));
     out.u32(s.pipeline_stages);
+    out.u32(s.exchange.max_block_columns);
     encode_batch_execution_spec(out, r.batches);
     for (auto record : {r.state.common, r.state.owner}) {
         out.u64(record.bytes);
@@ -137,6 +138,7 @@ RankResourceDescription decode_rank_resources(Decoder& in) {
                             static_cast<SpeculativeLengthPolicy>(in.u8()),
                             static_cast<LinearStateDType>(in.u8()),
                             in.u32()};
+    r.shape.exchange     = {in.u32()};
     r.batches            = decode_batch_execution_spec(in);
     r.state.common       = {in.u64(), in.u64()};
     r.state.owner        = {in.u64(), in.u64()};

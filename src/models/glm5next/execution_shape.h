@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ninfer/types.h"
+#include "models/common/moe/step.h"
 
 namespace ninfer::models::glm5next {
 
@@ -15,6 +16,7 @@ struct ExecutionShape {
     SpeculativeLengthPolicy length_policy        = SpeculativeLengthPolicy::Adaptive;
     LinearStateDType linear_state_dtype          = LinearStateDType::Float32;
     std::uint32_t pipeline_stages                = 1;
+    moe::ExchangeGeometry exchange;
     bool operator==(const ExecutionShape&) const = default;
 };
 

@@ -1,3 +1,4 @@
+#include "models/common/moe/exchange.h"
 #include "models/glm5next/program/planning.h"
 
 #include "core/platform.h"
@@ -41,7 +42,8 @@ ExecutionShape shape(const execution::ModelProfile& p, const EngineOptions& o,
             false,
             o.speculative.length_policy,
             o.linear_state_dtype,
-            p.stage.size};
+            p.stage.size,
+            p.exchange ? p.exchange->geometry() : moe::ExchangeGeometry{}};
 }
 
 context::ContextDirectorySpec schema(const ExecutionPlan& p, std::size_t capacity, bool global) {

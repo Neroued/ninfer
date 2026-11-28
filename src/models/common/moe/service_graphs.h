@@ -1,6 +1,7 @@
 #pragma once
 
 #include "models/common/graph.h"
+#include "models/common/moe/step.h"
 #include "models/common/speculative/round_plan.h"
 
 #include <map>
@@ -15,7 +16,8 @@ namespace ninfer::models::moe {
 // shape with the same number of transport blocks, independently of its attention geometry.
 class ExpertServiceGraphs {
 public:
-    explicit ExpertServiceGraphs(const distributed::Group& group) : communication({&group}) {}
+    ExpertServiceGraphs(const distributed::Group& group, ExchangeGeometry geometry)
+        : communication({&group}), geometry_(geometry) {}
 
     using Pass = std::function<void(bool draft, std::uint32_t columns)>;
     void prepare(const BatchExecutionPlan&, const speculative::DecodeGraphRoutes&,
@@ -38,7 +40,8 @@ private:
         std::size_t workspace_bytes = 0;
     };
 
-    std::map<std::pair<bool, int>, Entry> graphs_;
+    ExchangeGeometry geometry_;
+    std::map<std::pair<bool, std::uint32_t>, Entry> graphs_;
     std::size_t workspace_peak_ = 0;
 };
 

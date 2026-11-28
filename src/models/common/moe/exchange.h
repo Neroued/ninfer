@@ -43,10 +43,6 @@ struct ExpertExchangeStage {
                                                           const ExpertDomain&, ExpertBankId,
                                                           int hidden, int top_k, int block_columns);
 
-[[nodiscard]] distributed::GroupRequirements
-expert_exchange_requirements(const distributed::GroupDescription&, const ExpertDomain&,
-                             unsigned peer, int hidden, int top_k, int block_columns);
-
 // Immutable maps live with the prepared layer, independently of in-flight frame storage.
 class DeviceExpertPlacement {
 public:
@@ -73,10 +69,15 @@ public:
 
     [[nodiscard]] std::size_t bytes() const noexcept { return bytes_; }
 
+    [[nodiscard]] ExchangeGeometry geometry() const noexcept { return geometry_; }
+
+    [[nodiscard]] distributed::GroupRequirements requirements() const;
+
     [[nodiscard]] std::unique_ptr<ResidentExpertExchange> prepare(const distributed::Group&) const;
 private:
     std::shared_ptr<const ExpertDomain> domain_;
     unsigned peer_;
+    ExchangeGeometry geometry_{64};
     std::vector<ExpertExchangeStage> stages_;
     std::vector<std::size_t> frame_banks_;
     std::vector<std::size_t> bank_frames_;

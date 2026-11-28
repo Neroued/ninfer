@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ninfer/types.h"
+#include "models/common/moe/step.h"
 
 namespace ninfer::models::qwen4_exp {
 
@@ -15,6 +16,7 @@ struct ExecutionShape {
     LinearStateDType linear_state_dtype   = LinearStateDType::Float32;
 
     std::uint32_t pipeline_stages                = 1;
+    moe::ExchangeGeometry exchange;
     bool operator==(const ExecutionShape&) const = default;
 };
 

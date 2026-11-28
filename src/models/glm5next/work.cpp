@@ -217,8 +217,9 @@ void WorkContract::validate(const Work& work, runtime::FrameKind kind) const {
     }
     const bool service = std::holds_alternative<moe::ExpertServiceWork>(work.operation);
     if (service || work.exchange) {
-        if (kind != runtime::FrameKind::Compute || !work.exchange || !work.exchange->id ||
-            work.exchange->columns.empty() || work.exchange->draft_passes > shape.draft_tokens ||
+        if (!shape.exchange.max_block_columns || kind != runtime::FrameKind::Compute ||
+            !work.exchange || !work.exchange->id || work.exchange->columns.empty() ||
+            work.exchange->draft_passes > shape.draft_tokens ||
             work.exchange->draft_passes >= work.exchange->columns.size() ||
             std::ranges::count(work.exchange->columns, 0U))
             throw std::invalid_argument("invalid GLM5Next expert traversal");
@@ -231,7 +232,7 @@ void WorkContract::validate(const Work& work, runtime::FrameKind kind) const {
             return;
         }
         const auto needed = plan_expert_step(work, shape.prefill_chunk, bool(decode_routes));
-        if (!needed || !work.exchange->covers(*needed))
+        if (!needed || !work.exchange->covers(*needed, shape.exchange))
             throw std::invalid_argument("GLM5Next expert traversal differs from its source work");
     }
     if (const auto* c = std::get_if<ContextWork>(&work.operation)) {

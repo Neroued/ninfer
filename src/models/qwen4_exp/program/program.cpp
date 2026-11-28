@@ -53,7 +53,7 @@ RankProgramImpl::RankProgramImpl(const execution::Parameters& p, ExecutionPlan p
     if (ple_group) ple_merge.emplace(ParallelBinding{ple_group});
     if (parallel) parallel->track_graph_group(ple_group);
     if (exchange && shape.cuda_graph) {
-        service_graphs.emplace(exchange->group());
+        service_graphs.emplace(exchange->group(), shape.exchange);
         if (parallel) parallel->track_graph_group(&exchange->group());
     }
     if (bool(ple_merge) != (parameters.profile->owns_ple &&

@@ -66,7 +66,8 @@ target_include_directories(ninfer_model_control SYSTEM PRIVATE
 if(NINFER_ENABLE_DISTRIBUTED)
   target_sources(ninfer_model_control PRIVATE common/context/wire.cpp common/vision/input.cpp
     common/qwen/vision/wire.cpp
-    common/parallel_wire.cpp)
+    common/parallel_wire.cpp
+    common/pipeline_placement.cpp)
   target_link_libraries(ninfer_model_control PRIVATE ninfer_distributed_wire)
 endif()
 

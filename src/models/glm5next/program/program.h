@@ -26,9 +26,8 @@ public:
 
     [[nodiscard]] static runtime::ExecutionCapacity
     frame_capacity(std::uint32_t stages, std::uint32_t lanes, EnginePurpose purpose) noexcept {
-        return {stages == 1 || purpose != EnginePurpose::Generation ? 1U
-                                                                    : std::min(stages + 1, lanes),
-                1};
+        return runtime::ExecutionCapacity::pipeline(stages, lanes,
+                                                    purpose == EnginePurpose::Generation);
     }
 
     [[nodiscard]] runtime::ExecutionCapacity capacity() const noexcept;

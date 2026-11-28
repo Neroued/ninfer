@@ -2,6 +2,7 @@
 
 #include "runtime/contract/execution.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -60,6 +61,12 @@ struct CommandSequence {
 struct ExecutionCapacity {
     std::uint32_t compute_frames = 1;
     std::uint32_t context_frames = 1;
+
+    // One additional in-flight generation can cover the pipeline round trip.
+    static constexpr ExecutionCapacity pipeline(std::uint32_t stages, std::uint32_t lanes,
+                                                bool generation) noexcept {
+        return {stages <= 1 || !generation ? 1U : std::min(stages + 1, lanes), 1U};
+    }
 };
 
 struct ExecutionMember {

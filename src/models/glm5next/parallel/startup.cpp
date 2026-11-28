@@ -2,8 +2,7 @@
 
 #include "models/glm5next/startup.h"
 #include "models/glm5next/load.h"
-#include <map>
-#include <tuple>
+#include "models/common/pipeline_placement.h"
 #include "runtime/executor/collective_executor.h"
 #include "models/common/moe/step_schedule.h"
 
@@ -32,77 +31,23 @@ distributed::SelectShards ParallelStartup::select_shards(const artifact::Reader&
     return [this, &reader, &options](std::span<const distributed::RankMemoryOffer> offers)
                -> std::optional<distributed::ShardAssignment> {
         const auto& hardware = parallel_.topology;
-        const auto& stages   = hardware.replicas.front().stage_ranks;
-        if (offers.size() != hardware.ranks.size())
-            throw std::invalid_argument("incomplete pipeline rank capacities");
-        std::map<distributed::PhysicalPoolKey, std::size_t> pools;
-        std::vector<std::size_t> allowance, ranks_per_pool, rank_pool;
-        for (const auto& rank : hardware.ranks) {
-            const auto& offer      = offers[rank.rank];
-            const auto key         = rank.memory_pool(offer.shared_physical_memory);
-            const auto [it, added] = pools.try_emplace(key, pools.size());
-            const auto pool        = it->second;
-            if (added) {
-                allowance.push_back(offer.available_bytes);
-                ranks_per_pool.push_back(0);
-            }
-            allowance[pool] = std::min<std::size_t>(allowance[pool], offer.available_bytes);
-            ++ranks_per_pool[pool];
-            rank_pool.push_back(pool);
-        }
-        for (std::size_t i = 0; i < allowance.size(); ++i) {
-            auto& free = allowance[i];
-            free -= std::min(free, options.memory_headroom_bytes);
-            if (options.context_capacity.mode == ContextCapacityMode::Explicit) {
-                const auto per_rank = options.context_capacity.explicit_bytes;
-                free =
-                    per_rank > free / ranks_per_pool[i] ? 0 : free - per_rank * ranks_per_pool[i];
-            }
-        }
-        // Materialization includes the embedding/head only on their actual pipeline endpoints.
-        // The CPU load planner measures the encoded TP/EP shards without reading tensor payloads.
-        using Interval = std::tuple<std::size_t, std::uint32_t, std::uint32_t>;
-        std::map<Interval, std::vector<std::size_t>> charges;
-        const auto fits = [&](std::span<const IndexRange> prefix) {
-            auto remaining = allowance;
-            for (std::size_t s = 0; s < prefix.size(); ++s) {
-                const auto range          = prefix[s];
-                const auto [it, inserted] = charges.try_emplace({s, range.begin, range.size});
-                auto& bytes               = it->second;
-                if (inserted) {
-                    bytes.resize(allowance.size());
-                    for (const auto r : stages[s]) {
-                        const auto& id = hardware.rank(r);
-                        auto rank      = plan_rank_layers(*definition_, id, range);
-                        auto load      = resolve_rank_load(reader, definition_, std::move(rank),
-                                                           Device::cuda(id.device));
-                        const auto& storage = load.materialization();
-                        auto& total         = bytes[rank_pool[r]];
-                        for (auto value :
-                             {storage.device_capacity_bytes, offers[r].shared_physical_memory
-                                                                 ? storage.host_capacity_bytes
-                                                                 : std::size_t(0)}) {
-                            if (value > SIZE_MAX - total)
-                                throw std::overflow_error("pipeline weight bytes overflow");
-                            total += value;
-                        }
-                    }
-                }
-                for (std::size_t pool = 0; pool < bytes.size(); ++pool) {
-                    if (bytes[pool] > remaining[pool]) return false;
-                    remaining[pool] -= bytes[pool];
-                }
-            }
-            return true;
-        };
         std::vector<IndexRange> current;
-        for (const auto& stage : stages)
+        for (const auto& stage : hardware.replicas.front().stage_ranks)
             current.push_back(parallel_.ranks.at(stage.front()).layers);
-        if (fits(current)) return {};
-        auto deployment     = *options.deployment;
-        const auto selected = partition_pipeline_layers(pipeline_layer_demands(*definition_),
-                                                        deployment.parallel, fits);
-        for (auto range : selected) deployment.parallel.stage_layers.push_back(range.size);
+        auto selected = fit_pipeline_layers(
+            hardware, options, offers, current, pipeline_layer_demands(*definition_),
+            [&](const distributed::RankIdentity& id, IndexRange range, bool shared) {
+                auto rank           = plan_rank_layers(*definition_, id, range);
+                auto load           = resolve_rank_load(reader, definition_, std::move(rank),
+                                                        Device::cuda(id.device));
+                const auto& storage = load.materialization();
+                return artifact::checked_add(storage.device_capacity_bytes,
+                                             shared ? storage.host_capacity_bytes : 0,
+                                             "pipeline shard capacity");
+            });
+        if (!selected) return {};
+        auto deployment = *options.deployment;
+        for (auto range : *selected) deployment.parallel.stage_layers.push_back(range.size);
         parallel_ = plan_parallel(*definition_, deployment);
         distributed::ShardAssignment assignment{parallel_.topology.plan, {}};
         for (const auto& rank : parallel_.topology.ranks)

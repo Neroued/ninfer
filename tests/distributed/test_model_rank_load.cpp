@@ -296,8 +296,34 @@ void qwen_case(const artifact::Reader& reader, const std::filesystem::path& path
         for (unsigned i = 0; i < ranks / 2; ++i)
             require(replicas[i] == i && topology.replica(i).ranks.size() == 2,
                     "expert service lost a source replica or its TP follower");
+        const auto requests = startup.requests(options_ep, false);
+        const auto& config  = def->config().text.moe;
+        for (auto id : {0U, ranks - 1}) {
+            wire::Decoder in(requests.at(id));
+            auto request = qwen::decode_rank_load(in, topology.rank(id), reader.artifact_id());
+            in.finish();
+            const auto& domain = *request.rank.expert_domain;
+            require(domain.peer_owners.at(experts.index(id)) == topology.rank(id).dp.rank &&
+                        domain.owner_count() == replicas.size(),
+                    "worker assigned its TP lane to a different source replica");
+            auto load =
+                qwen::resolve_rank_load(reader, def, std::move(request.rank), Device::cuda(0));
+            const auto& local = load.rank_plan();
+            const auto& w     = def->weights();
+            const auto shared = config.shared_intermediate / local.placement.tp.size;
+            for (const auto* layer : {&w.text.layers.front().moe, &w.mtp->layer.moe}) {
+                const auto& part = local.experts.at(layer->bank.index);
+                require(
+                    part.ids.size() * ranks == config.experts &&
+                        part.intermediate == models::IndexRange{0, config.intermediate} &&
+                        local.shared_intermediate == shared &&
+                        load.weight_data()[layer->shared_gate.index].view.shape.front() == shared &&
+                        load.weight_data()[layer->shared_down.index].view.shape.back() == shared,
+                    "Main or MTP rank bound the wrong routed or shared projection");
+            }
+        }
     }
-    auto p   = qwen::plan_parallel(*def, deployment(2, 1, 1, 2, path), qwen::ple::Placement::Disk);
+    auto p = qwen::plan_parallel(*def, deployment(2, 1, 1, 2, path), qwen::ple::Placement::Disk);
     require(def->weights().mtp.has_value(), "fixture requires MTP");
     const auto full    = qwen::execution::describe_model(*def);
     const auto offload = qwen::describe_moe_plan(*full, options.moe);

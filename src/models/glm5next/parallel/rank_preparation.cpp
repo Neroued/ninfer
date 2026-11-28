@@ -185,7 +185,7 @@ std::vector<distributed::GroupRequirements> RankPreparation::communication_requi
         requirements(*binding_.owners.group)
             .push_back({Collective::AllGather, DType::BF16, hidden, hidden * decode, hidden});
     if (expert_requirements_) {
-        const auto block = static_cast<std::size_t>(shape.exchange.max_block_columns);
+        const auto block = static_cast<std::size_t>(shape.exchange.window_columns());
         auto& tp         = requirements(*binding_.tensor.group);
         tp.push_back({Collective::AllReduce, DType::FP32, hidden, hidden * block, hidden});
         tp.push_back({Collective::ReduceScatter, DType::FP32, hidden, hidden * block, hidden});

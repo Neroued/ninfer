@@ -553,6 +553,12 @@ void native_work() {
     q::WorkContract contract{
         {128, 2, 32, 3, KvCacheStorage::BFloat16, EnginePurpose::Generation}, 256, 250, true, true};
     contract.shape.exchange = {64};
+    const models::moe::ExchangeGeometry geometry_plan{64, 4};
+    require(geometry_plan.capture_bucket(1) == 1 && geometry_plan.capture_bucket(3) == 4 &&
+                geometry_plan.capture_bucket(63) == geometry_plan.capture_bucket(64) &&
+                geometry_plan.capture_bucket(65) != geometry_plan.capture_bucket(64) &&
+                geometry_plan.capture_bucket(257) == 320,
+            "captured expert service did not match the physical packet envelope");
     contract.batches = std::make_shared<const models::BatchExecutionPlan>(
         models::make_batch_execution_spec(2, 1, false));
     const auto original = row();

@@ -60,10 +60,13 @@ ops::MoeTokenValidity block_validity(const LayerSource& source, int base, int n,
 
 ExpertExchangeStage prepare_expert_exchange(const distributed::GroupDescription& g,
                                             const ExpertDomain& d, ExpertBankId bank, int h, int k,
-                                            int b) {
+                                            int b, int windows) {
     if (g.members != d.members || h <= 0 || h % 8 || b <= 0 || k <= 0 ||
         std::uint32_t(k) > d.experts)
         throw std::invalid_argument("expert exchange geometry or group membership differs");
+    if (windows < 1 || std::uint64_t(windows) * b > INT_MAX ||
+        std::uint64_t(windows) * g.members.size() > 65535)
+        throw std::invalid_argument("invalid expert compute window");
     ExpertExchangeStage s{.group               = g.id,
                           .bank                = bank,
                           .members             = g.members,
@@ -73,6 +76,7 @@ ExpertExchangeStage prepare_expert_exchange(const distributed::GroupDescription&
                           .block_columns       = b,
                           .placement_signature = d.bank_signature(bank.index),
                           .return_bytes        = Tensor::metadata(DType::FP32, {h, b}).bytes()};
+    s.blocks_per_window = windows;
     for (const auto& part : d.banks.at(bank.index)) {
         const int slots = dimension(part.ids.size());
         s.slots.push_back(slots);
@@ -83,8 +87,11 @@ ExpertExchangeStage prepare_expert_exchange(const distributed::GroupDescription&
 }
 
 int ExpertExchangeStage::blocks(int n) const {
-    return dimension(ExchangeGeometry{static_cast<unsigned>(block_columns)}.blocks(dimension(n)));
+    if (n <= 0) throw std::invalid_argument("invalid expert extent");
+    return 1 + (n - 1) / block_columns;
 }
+
+int ExpertExchangeStage::windows(int n) const { return 1 + (blocks(n) - 1) / blocks_per_window; }
 
 void ExpertExchangeStage::encode(distributed::wire::Encoder& e, int extent) const {
     (void)blocks(extent);
@@ -94,6 +101,7 @@ void ExpertExchangeStage::encode(distributed::wire::Encoder& e, int extent) cons
     e.u32(hidden);
     e.u32(top_k);
     e.u32(block_columns);
+    e.u32(blocks_per_window);
     e.u32(extent);
     e.u64(return_bytes);
     e.u64(members.size());
@@ -197,69 +205,82 @@ struct FrameLayout {
     std::vector<Regions> peers;
     LayoutRegion handles;
     TensorRegion unit;
-    std::size_t bytes;
+    std::size_t payload_bytes, metadata_bytes;
 };
 
 FrameLayout frame_layout(const ExpertExchangeStage& st, unsigned self) {
     const int b = st.block_columns;
-    (void)st.slots.at(self);
-    LayoutBuilder l;
-
+    LayoutBuilder payload, metadata;
     FrameLayout out;
-    out.unit    = l.add_tensor(DType::FP32, {b}, 16, "unit shared coefficients");
-    out.handles = l.add(st.members.size() * sizeof(ops::ExpertPeerBuffers),
-                        alignof(ops::ExpertPeerBuffers), "expert peer views");
-    for (unsigned p = 0; p < st.members.size(); ++p) {
-        Regions r;
-        r.send     = l.add(st.dispatch_bytes[p], 16, "expert send");
-        r.receive  = p == self ? r.send : l.add(st.dispatch_bytes[self], 16, "expert receive");
-        r.result   = l.add(st.return_bytes, 16, "weighted expert returns");
-        r.returned = p == self ? r.result : l.add(st.return_bytes, 16, "received expert returns");
-        r.inverse  = l.add(std::size_t(b) * 4, 4, "expert source inverse");
-        out.peers.push_back(r);
-    }
-    out.bytes = l.finish();
+    out.unit =
+        metadata.add_tensor(DType::FP32, {st.window_columns()}, 16, "unit shared coefficients");
+    out.handles =
+        metadata.add(st.members.size() * st.blocks_per_window * sizeof(ops::ExpertPeerBuffers),
+                     alignof(ops::ExpertPeerBuffers), "expert peer views");
+    for (int packet = 0; packet < st.blocks_per_window; ++packet)
+        for (unsigned p = 0; p < st.members.size(); ++p) {
+            Regions r;
+            r.send = payload.add(st.dispatch_bytes[p], 16, "expert send");
+            r.receive =
+                p == self ? r.send : payload.add(st.dispatch_bytes[self], 16, "expert receive");
+            r.result = payload.add(st.return_bytes, 16, "weighted expert returns");
+            r.returned =
+                p == self ? r.result : payload.add(st.return_bytes, 16, "received expert returns");
+            r.inverse = payload.add(std::size_t(b) * 4, 4, "expert source inverse");
+            out.peers.push_back(r);
+        }
+    out.payload_bytes  = payload.finish();
+    out.metadata_bytes = metadata.finish();
     return out;
 }
 } // namespace
 
 std::size_t ExpertExchangeStage::frame_bytes(unsigned peer) const {
-    return frame_layout(*this, peer).bytes;
+    const auto layout = frame_layout(*this, peer);
+    return layout.payload_bytes + layout.metadata_bytes;
 }
 
 ExpertExchange::ExpertExchange(ExpertExchangeStage s, const distributed::Group& group)
-    : stage_(std::move(s)), group_(group) {
+    : ExpertExchange(s, group,
+                     std::make_shared<ExpertExchangeStorage>(
+                         group.device(), frame_layout(s, group.rank()).payload_bytes)) {}
+
+ExpertExchange::ExpertExchange(ExpertExchangeStage s, const distributed::Group& group,
+                               std::shared_ptr<ExpertExchangeStorage> storage)
+    : stage_(std::move(s)), group_(group), storage_(std::move(storage)) {
     const auto& st = stage_;
     if (group.id() != st.group || group.size() != st.members.size())
         throw std::invalid_argument("expert exchange group differs");
     const unsigned self = group.rank();
-    const int b = st.block_columns, h = st.hidden;
-    const auto frame   = frame_layout(st, self);
-    const auto handles = frame.handles;
-    storage_           = DeviceBuffer(group.device(), frame.bytes);
-    storage_.fill(0);
-    const auto arena = storage_.span();
-    unit_            = frame.unit.bind(arena);
-    const std::vector<float> unit(b, 1.F);
-    storage_.copy_from_host(unit.data(), unit_.bytes(), frame.unit.region.offset);
+    const auto frame    = frame_layout(st, self);
+    if (!storage_ || storage_->payload.size() < frame.payload_bytes)
+        throw std::invalid_argument("undersized expert packet backing");
+    metadata_ = DeviceBuffer(group.device(), frame.metadata_bytes);
+    unit_     = frame.unit.bind(metadata_.span());
+    const std::vector<float> ones(st.window_columns(), 1.F);
+    metadata_.copy_from_host(ones.data(), unit_.bytes(), frame.unit.region.offset);
     std::vector<ops::ExpertPeerBuffers> host;
-    for (unsigned p = 0; p < group.size(); ++p) {
-        const auto& r = frame.peers[p];
-        const auto tx = r.send.bind(arena), rx = r.receive.bind(arena),
-                   result = r.result.bind(arena), returned = r.returned.bind(arena);
-        PacketLayout incoming(h, b, hit_capacity(b, st.top_k, st.slots[self]));
-        ops::ExpertPeerBuffers v{
-            PacketLayout(h, b, hit_capacity(b, st.top_k, st.slots[p])).view(tx), incoming.view(rx),
-            static_cast<int*>(r.inverse.bind(arena).data), static_cast<float*>(returned.data),
-            static_cast<float*>(result.data)};
-        host.push_back(v);
+    const auto backing = storage_->payload.span();
+    for (std::size_t i = 0; i < frame.peers.size(); ++i) {
+        const unsigned p = i % group.size();
+        const auto& r    = frame.peers[i];
+        const auto tx = r.send.bind(backing), rx = r.receive.bind(backing),
+                   result = r.result.bind(backing), returned = r.returned.bind(backing);
+        const auto packet = [&](unsigned dest, MemorySpan bytes) {
+            return PacketLayout(st.hidden, st.block_columns,
+                                hit_capacity(st.block_columns, st.top_k, st.slots[dest]))
+                .view(bytes);
+        };
+        host.push_back({packet(p, tx), packet(self, rx),
+                        static_cast<int*>(r.inverse.bind(backing).data),
+                        static_cast<float*>(returned.data), static_cast<float*>(result.data)});
         if (p != self) {
             send_.push_back({p, tx, rx});
             back_.push_back({p, result, returned});
         }
     }
-    storage_.copy_from_host(host.data(), handles.bytes, handles.offset);
-    device_peers_ = static_cast<ops::ExpertPeerBuffers*>(handles.bind(arena).data);
+    metadata_.copy_from_host(host.data(), frame.handles.bytes, frame.handles.offset);
+    device_peers_ = static_cast<ops::ExpertPeerBuffers*>(frame.handles.bind(metadata_.span()).data);
 }
 
 namespace {
@@ -288,7 +309,7 @@ SourceScratch source_scratch(Arena& a, int h, int k, int n, bool gate = true) {
 
 std::size_t ExpertExchangeStage::routed_workspace_bytes(unsigned peer,
                                                         const ops::RoutedSwiGLUProfile& p) const {
-    const int slots = this->slots.at(peer), b = block_columns;
+    const int slots = this->slots.at(peer), b = window_columns();
     const int m = dimension(members.size() * hit_capacity(b, p.top_k, slots));
     WorkspaceLayoutBuilder l;
     (void)l.alloc(DType::I32, {b}); // Worst-case block validity crossing a packed row boundary.
@@ -307,7 +328,7 @@ void plan_shared_exchange(WorkspaceLayoutBuilder& l, int h, int block, unsigned 
 
 std::size_t ExpertExchangeStage::softmax_workspace_bytes(unsigned peer, const ops::MoeProfile& p,
                                                          unsigned tensor_size) const {
-    const int b = block_columns;
+    const int b = window_columns();
     WorkspaceLayoutBuilder l;
     source_scratch(l, hidden, top_k, b);
     plan_shared_exchange(l, hidden, b, tensor_size);
@@ -332,7 +353,7 @@ std::size_t ExpertExchangeStage::sigmoid_workspace_bytes(unsigned peer,
                                                          const ops::SigmoidMoeProfile& p,
                                                          unsigned tensor_size) const {
     WorkspaceLayoutBuilder l;
-    const int b = block_columns, local = slots.at(peer);
+    const int b = window_columns(), local = slots.at(peer);
     source_scratch(l, hidden, top_k, b, false);
     plan_shared_exchange(l, hidden, b, tensor_size);
     (void)l.alloc(DType::I32, {b});
@@ -357,9 +378,7 @@ void ExpertExchange::validate(const DeviceExpertPlacement& placement,
     // properties of the selected bank, so Main and MTP can reuse the same packet backing.
     if (exec.device() != d || placement.logical_ids.device != d ||
         placement.peer != group_.rank() || selected.group != stage_.group ||
-        selected.members != stage_.members || selected.block_columns != stage_.block_columns ||
-        selected.dispatch_bytes != stage_.dispatch_bytes ||
-        selected.return_bytes != stage_.return_bytes || selected.slots != stage_.slots ||
+        selected.members != stage_.members || selected.slots != stage_.slots ||
         p.ffn.intermediate != dimension(selected.intermediate.at(placement.peer).size) ||
         p.experts != selected.experts || p.top_k != selected.top_k ||
         p.ffn.hidden != selected.hidden || selected.hidden != stage_.hidden ||
@@ -386,39 +405,74 @@ void ExpertExchange::validate(const DeviceExpertPlacement& placement,
                        d);
 }
 
+namespace {
+LayerSource packet_source(const LayerSource& source, int begin, int count) {
+    const auto flags = source.validity.valid_columns.data
+                           ? source.validity.valid_columns.slice(0, begin, count)
+                           : Tensor{};
+    return {source.hidden.slice(1, begin, count),
+            source.output.slice(1, begin, count),
+            {flags, 1},
+            source.mode};
+}
+} // namespace
+
 ExpertExchange::Call ExpertExchange::dispatch(const DeviceExpertPlacement& place,
                                               const LayerSource* source,
-                                              const ops::ExpertRoutes* routes,
+                                              const ops::ExpertRoutes* routes, int matched_columns,
                                               CudaExecutionView exec) {
-    if (occupied_) throw std::logic_error("previous expert dispatch still owns the frame");
-    occupied_ = true;
-    ops::pack_expert_rows(source ? &source->hidden : nullptr, routes,
-                          source ? source->validity : ops::MoeTokenValidity{}, place.dispatch,
-                          device_peers_, group_.size(), stage_.block_columns, exec);
-    group_.exchange(send_, exec);
-    return Call(*this, source, exec);
+    const auto packets = stage_.blocks(matched_columns);
+    if (packets > stage_.blocks_per_window || bool(source) != bool(routes) ||
+        (source && (source->hidden.ne[1] > matched_columns ||
+                    (source->validity.valid_columns.data && source->validity.tokens_per_row != 1))))
+        throw std::invalid_argument("invalid expert dispatch window");
+    if (storage_->occupied) throw std::logic_error("previous expert dispatch still owns the frame");
+    storage_->occupied = true;
+    const int peers = dimension(group_.size()), b = stage_.block_columns;
+    for (int i = 0; i < packets; ++i) {
+        auto* handles   = device_peers_ + i * peers;
+        const auto base = i * b;
+        if (source && base < source->hidden.ne[1]) {
+            const int n     = std::min(b, source->hidden.ne[1] - base);
+            const auto part = packet_source(*source, base, n);
+            const ops::ExpertRoutes r{routes->ids.slice(1, base, n),
+                                      routes->coefficients.slice(1, base, n)};
+            ops::pack_expert_rows(&part.hidden, &r, part.validity, place.dispatch, handles, peers,
+                                  b, exec);
+        } else {
+            ops::pack_expert_rows(nullptr, nullptr, {}, place.dispatch, handles, peers, b, exec);
+        }
+        group_.exchange(std::span(send_).subspan(i * (peers - 1), peers - 1), exec);
+    }
+    return Call(*this, source, packets, exec);
 }
 
 ops::ExpertPacketBatch ExpertExchange::Call::received() const {
     if (!frame_) throw std::logic_error("expert dispatch has been consumed");
-    return {frame_->device_peers_, dimension(frame_->group_.size()), frame_->stage_.block_columns,
-            exec_.device()};
+    return {frame_->device_peers_, packets_ * dimension(frame_->group_.size()),
+            frame_->stage_.block_columns, exec_.device()};
 }
 
 void ExpertExchange::Call::combine(const Tensor* shared, Tensor* observation,
                                    const Tensor* shared_gate) && {
     if (!frame_ || (source_ && !shared)) throw std::logic_error("invalid expert combine");
     auto& frame = *frame_;
-    frame.group_.exchange(frame.back_, exec_);
-    if (source_) {
-        auto out = source_->output;
-        ops::return_expert_rows(frame.device_peers_, frame.group_.size(), *shared, out,
-                                source_->validity, source_->mode, exec_, shared_gate);
+    const int peers = dimension(frame.group_.size()), b = frame.stage_.block_columns;
+    for (int i = 0; i < packets_; ++i) {
+        auto* handles = frame.device_peers_ + i * peers;
+        frame.group_.exchange(std::span(frame.back_).subspan(i * (peers - 1), peers - 1), exec_);
+        const int base = i * b;
+        if (source_ && base < source_->hidden.ne[1]) {
+            const int n = std::min(b, source_->hidden.ne[1] - base);
+            auto part   = packet_source(*source_, base, n);
+            auto gate   = shared_gate ? shared_gate->slice(0, base, n) : Tensor{};
+            ops::return_expert_rows(handles, peers, shared->slice(1, base, n), part.output,
+                                    part.validity, part.mode, exec_, shared_gate ? &gate : nullptr);
+        }
+        if (observation) ops::observe_expert_packets(handles, peers, *observation, exec_);
     }
-    if (observation)
-        ops::observe_expert_packets(frame.device_peers_, frame.group_.size(), *observation, exec_);
-    frame.occupied_ = false;
-    frame_          = nullptr;
+    frame.storage_->occupied = false;
+    frame_                   = nullptr;
 }
 
 namespace {
@@ -436,11 +490,13 @@ void run_experts(ops::ExpertPacketBatch received, const DeviceExpertPlacement& p
     ops::compact_routed_swiglu(received, profile, weights, grouped, arena, exec);
 }
 
-void routed_block(const ExpertExchangeWork& work, const ops::RoutedSwiGLUProfile& profile,
-                  const ops::CudaSwiGLUExperts& weights, const LayerSource* source,
-                  const ops::ExpertRoutes* routes, const Tensor* shared, MemoryArena& arena,
-                  CudaExecutionView exec, const Tensor* shared_gate = nullptr) {
-    auto call = work.frame.dispatch(work.placement, source, routes, exec);
+void routed_block(const ExpertExchangeWork& work, int window,
+                  const ops::RoutedSwiGLUProfile& profile, const ops::CudaSwiGLUExperts& weights,
+                  const LayerSource* source, const ops::ExpertRoutes* routes, const Tensor* shared,
+                  MemoryArena& arena, CudaExecutionView exec, const Tensor* shared_gate = nullptr) {
+    const int c       = work.frame.stage().window_columns();
+    const auto extent = std::min(c, work.physical_columns - window * c);
+    auto call         = work.frame.dispatch(work.placement, source, routes, extent, exec);
     run_experts(call.received(), work.placement, profile, weights, arena, exec);
     std::move(call).combine(shared, work.observation, shared_gate);
 }
@@ -455,12 +511,12 @@ void tensor_layer(const ExpertExchangeWork& work, const ops::RoutedSwiGLUProfile
     const auto& st  = work.placement.stage;
     const int lanes = dimension(tensor.size()), rank = dimension(tensor.rank());
     const bool split  = partition && partition->split();
-    const int width   = split ? shared_columns(st.block_columns, lanes) : st.block_columns;
+    const int width   = split ? shared_columns(st.window_columns(), lanes) : st.window_columns();
     const int segment = split ? partition->segment : source.hidden.ne[1];
-    for (int wave = 0; wave < st.blocks(work.physical_columns); ++wave) {
+    for (int wave = 0; wave < st.windows(work.physical_columns); ++wave) {
         const int offset = wave * width;
         if (offset >= segment) {
-            routed_block(work, p, experts, nullptr, nullptr, nullptr, arena, exec);
+            routed_block(work, wave, p, experts, nullptr, nullptr, nullptr, arena, exec);
             continue;
         }
         const int span = std::min(width, segment - offset);
@@ -496,10 +552,10 @@ void tensor_layer(const ExpertExchangeWork& work, const ops::RoutedSwiGLUProfile
             auto shared = scratch.shared.slice(1, 0, n);
             Tensor gate = gated ? scratch.gate.slice(0, 0, n) : Tensor{};
             route(local, routes, gate);
-            routed_block(work, p, experts, &local, &routes, &shared, arena, exec,
+            routed_block(work, wave, p, experts, &local, &routes, &shared, arena, exec,
                          gated ? &gate : nullptr);
         } else {
-            routed_block(work, p, experts, nullptr, nullptr, nullptr, arena, exec);
+            routed_block(work, wave, p, experts, nullptr, nullptr, nullptr, arena, exec);
         }
         if (!split) {
             auto out = source.output.slice(1, offset, span);
@@ -513,7 +569,7 @@ void softmax_exchange(const ExpertExchangeWork& work, const Parameters& p,
                       const LayerSource* source, MemoryArena& workspace, CudaExecutionView exec,
                       ParallelExecution* tensor, const TokenPartition* partition) {
     const auto& place = work.placement;
-    const auto& stage = place.stage;
+    const auto& stage = work.frame.stage();
     const int extent  = work.physical_columns;
     work.frame.validate(place, p.profile.routed, extent, source, work.observation, exec);
     if (p.bank != place.stage.bank)
@@ -541,13 +597,14 @@ void softmax_exchange(const ExpertExchangeWork& work, const Parameters& p,
             });
         return;
     }
-    for (int wave = 0; wave < stage.blocks(extent); ++wave) {
-        const int base = wave * stage.block_columns;
+    for (int wave = 0; wave < stage.windows(extent); ++wave) {
+        const int base = wave * stage.window_columns();
         if (!source || base >= source->hidden.ne[1]) {
-            routed_block(work, p.profile.routed, weights, nullptr, nullptr, nullptr, arena, exec);
+            routed_block(work, wave, p.profile.routed, weights, nullptr, nullptr, nullptr, arena,
+                         exec);
             continue;
         }
-        const int n  = std::min(stage.block_columns, source->hidden.ne[1] - base);
+        const int n  = std::min(stage.window_columns(), source->hidden.ne[1] - base);
         auto scope   = arena.scope();
         auto scratch = source_scratch(arena, stage.hidden, stage.top_k, n);
         LayerSource src{source->hidden.slice(1, base, n), source->output.slice(1, base, n),
@@ -557,8 +614,8 @@ void softmax_exchange(const ExpertExchangeWork& work, const Parameters& p,
         ops::routed_swiglu(src.hidden, p.profile.routed, {}, {}, {ops::ExpertSubsetKind::None, {}},
                            {p.shared, scratch.gate}, ops::MoeEpilogue::Write, scratch.shared, arena,
                            exec);
-        routed_block(work, p.profile.routed, weights, &src, &scratch.routes, &scratch.shared, arena,
-                     exec);
+        routed_block(work, wave, p.profile.routed, weights, &src, &scratch.routes, &scratch.shared,
+                     arena, exec);
     }
 }
 
@@ -567,7 +624,7 @@ void sigmoid_exchange(const ExpertExchangeWork& work, const ops::SigmoidMoeProfi
                       ParallelExecution* tensor, MemoryArena& workspace, CudaExecutionView exec,
                       const TokenPartition* partition) {
     const auto& place = work.placement;
-    const auto& stage = place.stage;
+    const auto& stage = work.frame.stage();
     const int extent  = work.physical_columns;
     work.frame.validate(place, p.routed, extent, source, work.observation, exec);
     auto lease = workspace.scope();
@@ -587,13 +644,14 @@ void sigmoid_exchange(const ExpertExchangeWork& work, const ops::SigmoidMoeProfi
             });
         return;
     }
-    for (int wave = 0; wave < stage.blocks(extent); ++wave) {
-        const auto base = wave * stage.block_columns;
+    for (int wave = 0; wave < stage.windows(extent); ++wave) {
+        const auto base = wave * stage.window_columns();
         if (!source || base >= source->hidden.ne[1]) {
-            routed_block(work, p.routed, weights.routed, nullptr, nullptr, nullptr, arena, exec);
+            routed_block(work, wave, p.routed, weights.routed, nullptr, nullptr, nullptr, arena,
+                         exec);
             continue;
         }
-        const auto n = std::min(stage.block_columns, source->hidden.ne[1] - base);
+        const auto n = std::min(stage.window_columns(), source->hidden.ne[1] - base);
         auto scope   = arena.scope();
         auto scratch = source_scratch(arena, stage.hidden, stage.top_k, n, false);
         LayerSource local{source->hidden.slice(1, base, n), source->output.slice(1, base, n),
@@ -601,7 +659,7 @@ void sigmoid_exchange(const ExpertExchangeWork& work, const ops::SigmoidMoeProfi
         ops::swiglu(local.hidden, p.shared, weights.shared, scratch.shared, arena, exec);
         ops::topk_sigmoid_route(local.hidden, p.routing, weights.control, weights.correction_bias,
                                 scratch.routes, local.validity, arena, exec);
-        routed_block(work, p.routed, weights.routed, &local, &scratch.routes, &scratch.shared,
+        routed_block(work, wave, p.routed, weights.routed, &local, &scratch.routes, &scratch.shared,
                      arena, exec);
     }
 }
@@ -611,7 +669,7 @@ void routed_exchange(const ExpertExchangeWork& work, const ops::RoutedSwiGLUProf
                      const ops::ExpertRoutes* routes, const Tensor* shared, MemoryArena& workspace,
                      CudaExecutionView exec) {
     const auto& place = work.placement;
-    const auto& stage = place.stage;
+    const auto& stage = work.frame.stage();
     const int extent  = work.physical_columns;
     work.frame.validate(place, p, extent, source, work.observation, exec);
     if (source) {
@@ -628,70 +686,91 @@ void routed_exchange(const ExpertExchangeWork& work, const ops::RoutedSwiGLUProf
         throw std::invalid_argument("expert workspace belongs to another device");
     MemoryArena arena(workspace.alloc_bytes(stage.routed_workspace_bytes(place.peer, p)));
     start_observation(work.observation, exec);
-    for (int wave = 0; wave < stage.blocks(extent); ++wave) {
-        const int base = wave * stage.block_columns;
+    for (int wave = 0; wave < stage.windows(extent); ++wave) {
+        const int base = wave * stage.window_columns();
         if (!source || base >= source->hidden.ne[1]) {
-            routed_block(work, p, weights, nullptr, nullptr, nullptr, arena, exec);
+            routed_block(work, wave, p, weights, nullptr, nullptr, nullptr, arena, exec);
             continue;
         }
-        const int n = std::min(stage.block_columns, source->hidden.ne[1] - base);
+        const int n = std::min(stage.window_columns(), source->hidden.ne[1] - base);
         auto scope  = arena.scope();
         const LayerSource src{source->hidden.slice(1, base, n), source->output.slice(1, base, n),
                               block_validity(*source, base, n, arena, exec), source->mode};
         const ops::ExpertRoutes r{routes->ids.slice(1, base, n),
                                   routes->coefficients.slice(1, base, n)};
         const auto part = shared->slice(1, base, n);
-        routed_block(work, p, weights, &src, &r, &part, arena, exec);
+        routed_block(work, wave, p, weights, &src, &r, &part, arena, exec);
     }
 }
 
 namespace {
 class ResidentExchange final : public ResidentExpertExchange {
 public:
-    explicit ResidentExchange(const distributed::Group& group) : communication_(group) {}
+    ResidentExchange(const distributed::Group& group, ExchangeGeometry geometry)
+        : communication_(group), geometry_(geometry) {}
 
     const distributed::Group& group() const noexcept override { return communication_; }
-
     ExpertExchangeWork stage(ExpertBankId bank, int columns) override {
-        return {*frames.at(bank_frames.at(bank.index)), placements.at(bank.index), columns};
+        auto& variants = frames.at(bank_frames.at(bank.index));
+        return {*variants.at(geometry_.variant(columns)), placements.at(bank.index), columns};
     }
-    std::vector<std::unique_ptr<ExpertExchange>> frames;
+
+    std::vector<std::vector<std::unique_ptr<ExpertExchange>>> frames;
     std::vector<DeviceExpertPlacement> placements;
     std::vector<std::size_t> bank_frames;
 private:
     const distributed::Group& communication_;
+    ExchangeGeometry geometry_;
 };
 } // namespace
 
 ResidentExchangePlan::ResidentExchangePlan(std::shared_ptr<const ExpertDomain> domain,
                                            const distributed::GroupDescription& group,
-                                           unsigned peer, int hidden, int top_k)
-    : domain_(std::move(domain)), peer_(peer) {
+                                           unsigned peer, int hidden, int top_k,
+                                           ExchangeGeometry geometry)
+    : domain_(std::move(domain)), peer_(peer), geometry_(geometry) {
     if (!domain_ || domain_->banks.empty())
         throw std::invalid_argument("expert exchange plan requires at least one bank");
+    (void)geometry_.window_columns();
     for (std::uint32_t i = 0; i < domain_->banks.size(); ++i) {
-        const auto& s = stages_.emplace_back(prepare_expert_exchange(
-            group, *domain_, ExpertBankId{i}, hidden, top_k, geometry_.max_block_columns));
-        bytes_ += PlacementLayout(s, peer).bytes;
-        const auto found = std::ranges::find_if(frame_banks_, [&](auto bank) {
-            return stages_[bank].slots == s.slots;
+        auto make = [&](unsigned b, unsigned w) {
+            return prepare_expert_exchange(group, *domain_, ExpertBankId{i}, hidden, top_k,
+                                           dimension(b), dimension(w));
+        };
+        const auto& largest =
+            stages_.emplace_back(make(geometry_.max_block_columns, geometry_.blocks_per_window));
+        bytes_ += PlacementLayout(largest, peer).bytes;
+        const auto found = std::ranges::find_if(frame_shapes_, [&](const auto& variants) {
+            return variants.back().slots == largest.slots;
         });
-        bank_frames_.push_back(static_cast<std::size_t>(found - frame_banks_.begin()));
-        if (found == frame_banks_.end()) {
-            frame_banks_.push_back(i);
-            bytes_ += s.frame_bytes(peer);
+        bank_frames_.push_back(static_cast<std::size_t>(found - frame_shapes_.begin()));
+        if (found != frame_shapes_.end()) continue;
+        auto& variants = frame_shapes_.emplace_back();
+        for (unsigned width = 1; width < geometry_.max_block_columns; width *= 2)
+            variants.push_back(make(width, 1));
+        variants.push_back(make(geometry_.max_block_columns, 1));
+        if (geometry_.blocks_per_window > 1) variants.push_back(largest);
+        for (const auto& v : variants) {
+            const auto layout = frame_layout(v, peer);
+            bytes_ += layout.metadata_bytes;
+            payload_bytes_ = std::max(payload_bytes_, layout.payload_bytes);
         }
     }
+    bytes_ += payload_bytes_;
 }
 
 std::unique_ptr<ResidentExpertExchange>
 ResidentExchangePlan::prepare(const distributed::Group& group) const {
     if (group.rank() != peer_) throw std::logic_error("expert exchange prepared for another peer");
-    auto out         = std::make_unique<ResidentExchange>(group);
+    auto out         = std::make_unique<ResidentExchange>(group, geometry_);
     out->bank_frames = bank_frames_;
-    for (auto bank : frame_banks_) out->frames.push_back(std::make_unique<ExpertExchange>(stages_[bank], group));
+    auto backing     = std::make_shared<ExpertExchangeStorage>(group.device(), payload_bytes_);
+    for (const auto& variants : frame_shapes_) {
+        auto& frames = out->frames.emplace_back();
+        for (const auto& variant : variants)
+            frames.push_back(std::make_unique<ExpertExchange>(variant, group, backing));
+    }
     for (const auto& s : stages_) out->placements.emplace_back(*domain_, s, peer_, group.device());
     return out;
 }
-
 } // namespace ninfer::models::moe

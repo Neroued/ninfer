@@ -23,6 +23,12 @@ struct ExpertExchangeStage {
     std::vector<IndexRange> intermediate;
     std::vector<std::size_t> dispatch_bytes;
     std::size_t return_bytes;
+    int blocks_per_window = 1;
+
+    [[nodiscard]] int window_columns() const { return block_columns * blocks_per_window; }
+
+    [[nodiscard]] int windows(int extent) const;
+
 
     [[nodiscard]] distributed::GroupRequirements requirements(unsigned peer) const;
     [[nodiscard]] int blocks(int physical_columns) const;
@@ -42,7 +48,8 @@ struct ExpertExchangeStage {
 
 [[nodiscard]] ExpertExchangeStage prepare_expert_exchange(const distributed::GroupDescription&,
                                                           const ExpertDomain&, ExpertBankId,
-                                                          int hidden, int top_k, int block_columns);
+                                                          int hidden, int top_k, int block_columns,
+                                                          int blocks_per_window = 1);
 
 // Immutable maps live with the prepared layer, independently of in-flight frame storage.
 class DeviceExpertPlacement {
@@ -62,7 +69,7 @@ private:
 class ResidentExchangePlan {
 public:
     ResidentExchangePlan(std::shared_ptr<const ExpertDomain>, const distributed::GroupDescription&,
-                         unsigned peer, int hidden, int top_k);
+                         unsigned peer, int hidden, int top_k, ExchangeGeometry geometry = {64, 1});
 
     [[nodiscard]] const ExpertExchangeStage& stage(ExpertBankId bank) const {
         return stages_.at(bank.index);
@@ -78,17 +85,34 @@ public:
 private:
     std::shared_ptr<const ExpertDomain> domain_;
     unsigned peer_;
-    ExchangeGeometry geometry_{64};
+    ExchangeGeometry geometry_;
     std::vector<ExpertExchangeStage> stages_;
-    std::vector<std::size_t> frame_banks_;
+    std::vector<std::vector<ExpertExchangeStage>> frame_shapes_;
+    std::size_t payload_bytes_ = 0;
     std::vector<std::size_t> bank_frames_;
     std::size_t bytes_ = 0;
+};
+
+// Packet shapes share the largest payload backing. Their immutable address tables
+// remain distinct so a captured graph never observes a later shape's descriptors.
+struct ExpertExchangeStorage {
+    ExpertExchangeStorage(Device device, std::size_t bytes) : payload(device, bytes) {
+        payload.fill(0);
+    }
+
+    DeviceBuffer payload;
+    bool occupied = false;
 };
 
 class ExpertExchange {
 public:
     ExpertExchange(ExpertExchangeStage, const distributed::Group&);
-    [[nodiscard]] std::size_t bytes() const { return storage_.size(); }
+    ExpertExchange(ExpertExchangeStage, const distributed::Group&,
+                   std::shared_ptr<ExpertExchangeStorage>);
+
+    [[nodiscard]] const ExpertExchangeStage& stage() const noexcept { return stage_; }
+
+    [[nodiscard]] std::size_t bytes() const { return metadata_.size() + storage_->payload.size(); }
 
     [[nodiscard]] Tensor unit_coefficients(int columns) const { return unit_.slice(0, 0, columns); }
 
@@ -105,26 +129,27 @@ public:
     private:
         friend class ExpertExchange;
 
-        Call(ExpertExchange& frame, const LayerSource* source, CudaExecutionView exec)
-            : frame_(&frame), source_(source), exec_(exec) {}
+        Call(ExpertExchange& frame, const LayerSource* source, int packets, CudaExecutionView exec)
+            : frame_(&frame), source_(source), packets_(packets), exec_(exec) {}
 
         ExpertExchange* frame_;
         const LayerSource* source_;
+        int packets_;
         CudaExecutionView exec_;
     };
 
     void validate(const DeviceExpertPlacement&, const ops::RoutedSwiGLUProfile&, int extent,
                   const LayerSource*, Tensor* observation, CudaExecutionView) const;
     [[nodiscard]] Call dispatch(const DeviceExpertPlacement&, const LayerSource*,
-                                const ops::ExpertRoutes*, CudaExecutionView);
+                                const ops::ExpertRoutes*, int matched_columns, CudaExecutionView);
 private:
     ExpertExchangeStage stage_;
     const distributed::Group& group_;
-    DeviceBuffer storage_;
+    std::shared_ptr<ExpertExchangeStorage> storage_;
+    DeviceBuffer metadata_;
     ops::ExpertPeerBuffers* device_peers_ = nullptr;
     std::vector<distributed::PeerTransfer> send_, back_;
     Tensor unit_;
-    bool occupied_ = false;
 };
 
 // The three callers supply distinct model mathematics. They share the same dispatch,

@@ -342,7 +342,7 @@ int worker() {
         const auto bank    = def->weights().text.layers.front().moe.bank;
         const auto& domain = *req.rank.expert_domain;
         const auto& desc   = c.topology().role_group("expert", c.identity().rank);
-        const auto stage   = moe::prepare_expert_exchange(desc, domain, bank, H, K, 2);
+        const auto stage   = moe::prepare_expert_exchange(desc, domain, bank, H, K, 2, 2);
         stage.expect(in, 5);
         in.finish();
         auto needs = [&] {
@@ -354,10 +354,10 @@ int worker() {
                     needs.front().peers.size() == 1,
                 "TP1 Worker did not prepare its independent expert group");
         auto& collectives = needs.front().collectives;
-        collectives.push_back({dist::Collective::AllReduce, DType::FP32, H, 2 * H, H});
-        collectives.push_back({dist::Collective::ReduceScatter, DType::FP32, H, 2 * H, H});
+        collectives.push_back({dist::Collective::AllReduce, DType::FP32, H, 4 * H, H});
+        collectives.push_back({dist::Collective::ReduceScatter, DType::FP32, H, 4 * H, H});
         collectives.push_back(
-            {dist::Collective::Broadcast, DType::BF16, H, 2 * H, H, dist::Reduction::Sum, 0});
+            {dist::Collective::Broadcast, DType::BF16, H, 4 * H, H, dist::Reduction::Sum, 0});
         if (!dist::prepare_communication(c, needs, policy)) {
             c.shutdown();
             return 0;
@@ -440,7 +440,7 @@ int coordinator(const char* deploy, const std::string& backend) {
         out.raw(load_bytes);
         const auto& g = plans.topology.role_group("expert", p.placement.global_rank);
         const auto st = moe::prepare_expert_exchange(
-            g, *p.expert_domain, def->weights().text.layers.front().moe.bank, H, K, 2);
+            g, *p.expert_domain, def->weights().text.layers.front().moe.bank, H, K, 2, 2);
         st.encode(out, 5);
         requests.push_back({p.placement.global_rank,
                             std::make_shared<const wire::Message>(wire::Message{

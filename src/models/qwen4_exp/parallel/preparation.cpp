@@ -167,7 +167,7 @@ std::vector<distributed::GroupRequirements> RankPreparation::communication_requi
     const auto columns = std::max({batch, decode, std::size_t(shape.prefill_chunk)});
     work.push_back({Collective::AllReduce, DType::BF16, hidden, hidden * columns, hidden});
     if (expert_requirements_) {
-        const auto block = shape.exchange.max_block_columns;
+        const auto block = shape.exchange.window_columns();
         work.push_back({Collective::AllReduce, DType::FP32, hidden, hidden * block, hidden});
         work.push_back({Collective::ReduceScatter, DType::FP32, hidden, hidden * block, hidden});
         work.push_back({Collective::Broadcast, DType::BF16, hidden, hidden * block, hidden,

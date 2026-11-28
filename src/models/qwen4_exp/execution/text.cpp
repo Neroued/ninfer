@@ -142,7 +142,7 @@ void TextRun::exchanged_moe(std::uint32_t i, const moe::ExpertExchangeWork& step
         std::holds_alternative<PackedPrefillState>(update_) ? Tensor{} : batch_.valid_columns;
     const moe::LayerSource source{roots_.input, roots_.output, {valid, batch_.tokens}};
     moe::resident_layer(parameters_.text.layers[i].moe, &source, &step, execution_.workspace, cuda_,
-                        execution_.parallel, &partition_);
+                        execution_.parallel, partitioned_ ? &partition_ : nullptr);
     combine(i, partitioned_ ? partition_.local(roots_.exchange_output, 1) : roots_.output);
 }
 

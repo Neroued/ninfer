@@ -7,6 +7,7 @@
 #include "models/qwen4_exp/load.h"
 #include "product/config/options.h"
 #include "ops/op_tester.h"
+#include "ops/moe/block_scaled_criterion.h"
 #include "core/decode_graph.h"
 #include <iostream>
 #include <numeric>
@@ -131,9 +132,10 @@ public:
                 ref.push_back(sum);
             }
         }
-        // Sparse represented operands, FP32 expert sums and one final BF16 conversion.
         if (!got.empty())
-            require(!test::verify_reduction("exchanged Qwen layer", got, ref, {.012, 1e-6, .035}),
+            require(!test::verify_reduction(
+                        "exchanged Qwen layer", got, ref,
+                        test::block_scaled_moe_criterion(fixture.parameters.profile.routed.ffn)),
                     "layer differs from independent FP64 reference");
         const int other  = 1 - rank;
         const auto now   = peer_bytes();
@@ -205,7 +207,9 @@ public:
                         expected.push_back(reference[i]);
                     }
                 }
-            require(!test::verify_reduction("TP expert sources", got, expected, {.012, 1e-6, .035}),
+            require(!test::verify_reduction(
+                        "TP expert sources", got, expected,
+                        test::block_scaled_moe_criterion(fixture.parameters.profile.routed.ffn)),
                     "TP source ownership duplicated routed or shared contributions");
         }
     }
@@ -408,10 +412,10 @@ int worker() {
             calls.tensor_sources();
         }
         {
-            auto native_stage         = stage;
+            auto native_stage              = stage;
             native_stage.overlap           = true;
             native_stage.blocks_per_window = 1;
-            native_stage.input_layout = moe::ExpertInputLayout::TokenRoutes;
+            native_stage.input_layout      = moe::ExpertInputLayout::TokenRoutes;
             Calls native(c, domain, native_stage);
             native.eager({{5, 2}, {1, 9}, {4, 1}, true});
             const std::array<Batch, 2> graphs{

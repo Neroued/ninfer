@@ -1,5 +1,6 @@
 #include "distributed/moe/fixture.h"
 #include "ops/op_tester.h"
+#include <numeric>
 
 namespace ninfer::test::exchange {
 namespace {
@@ -164,8 +165,66 @@ double Column::shared(int r) const {
            (r % 2 ? .25 : -.5) / (1 + std::exp(-double(bf16_to_f32(input[E]))));
 }
 
+namespace {
+// These two adapters copy rows and route records. Only the order of hits within one row is free.
+void check_packet_routes(DeviceContext& device) {
+    constexpr int h = 8, columns = 2, k = 2, rows = 4;
+    const auto gpu = device.device();
+    std::vector<std::uint16_t> hidden(rows * h);
+    std::iota(hidden.begin(), hidden.end(), std::uint16_t{0x3f00});
+    auto input  = to_device(hidden);
+    auto counts = to_device<int>({1, 2, 2, 2});
+    auto hits = to_device<ops::ExpertHit>({{0, 2, .125F}, {0, 0, .5F}, {1, 1, .25F}, {0, 0, .75F}});
+    auto logical = to_device<int>({21, 34, 55});
+    std::vector<float> partial(rows * h);
+    std::iota(partial.begin(), partial.end(), 1.F);
+    auto projected = to_device(partial);
+    auto returned  = to_device(std::vector<float>(rows * h, -73.F));
+    std::vector<ops::ExpertPeerBuffers> descriptors(2);
+    for (int i = 0; i < 2; ++i) {
+        descriptors[i].receive = {static_cast<int*>(counts.data()) + 2 * i,
+                                  static_cast<std::uint16_t*>(input.data()) + columns * h * i,
+                                  static_cast<ops::ExpertHit*>(hits.data()) + 2 * i};
+        descriptors[i].partial = static_cast<float*>(returned.data()) + columns * h * i;
+    }
+    auto peers = to_device(descriptors);
+    ops::ExpertPacketBatch batch{static_cast<const ops::ExpertPeerBuffers*>(peers.data()), 2,
+                                 columns, gpu};
+    DeviceBuffer x(gpu, input.size()), ids(gpu, rows * k * sizeof(int)),
+        weights(gpu, rows * k * sizeof(float)), cursors(gpu, rows * sizeof(int));
+    Tensor output(x.span(), DType::BF16, {h, rows}), next(cursors.span(), DType::I32, {rows});
+    ops::ExpertRoutes routes{{ids.span(), DType::I32, {k, rows}},
+                             {weights.span(), DType::FP32, {k, rows}}};
+    ops::unpack_expert_routes(batch, {logical.span(), DType::I32, {3}}, output, routes, next,
+                              device.execution_view());
+    ops::pack_expert_partials(batch, {projected.span(), DType::FP32, {h, rows}},
+                              device.execution_view());
+    device.synchronize();
+    std::fill_n(hidden.begin() + h, h, 0);
+    std::fill_n(partial.begin() + h, h, -73.F);
+    if (from_device<std::uint16_t>(x, rows * h) != hidden ||
+        from_device<float>(returned, rows * h) != partial)
+        throw std::runtime_error("expert adapter changed a row, padding, or a return destination");
+    const auto all_ids     = from_device<int>(ids, rows * k);
+    const auto all_weights = from_device<float>(weights, rows * k);
+    using Route            = std::pair<int, float>;
+    const std::vector<std::array<Route, k>> expected{{{{21, .5F}, {55, .125F}}},
+                                                     {{{-1, 0}, {-1, 0}}},
+                                                     {{{-1, 0}, {21, .75F}}},
+                                                     {{{-1, 0}, {34, .25F}}}};
+    for (int row = 0; row < rows; ++row) {
+        std::array<Route, k> got;
+        for (int j = 0; j < k; ++j) got[j] = {all_ids[row * k + j], all_weights[row * k + j]};
+        std::ranges::sort(got);
+        if (got != expected[row])
+            throw std::runtime_error("expert adapter misplaced an ID or coefficient");
+    }
+}
+} // namespace
+
 void local_reference(DeviceContext& device, const models::moe::ExpertDomain& domain,
                      ExpertBankId bank) {
+    check_packet_routes(device);
     const auto& peers = domain.banks.at(bank.index);
     const auto& ids   = peers.at(1).ids;
     for (bool fp8 : {false, true})

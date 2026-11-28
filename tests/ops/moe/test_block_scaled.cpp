@@ -1,4 +1,5 @@
 #include "ops/suite.h"
+#include "ops/moe/block_scaled_criterion.h"
 #include "core/buffer.h"
 #include "ninfer/ops/moe.h"
 #include "ops/op_tester.h"
@@ -11,11 +12,6 @@
 namespace ninfer::test::moe_block_scaled {
 namespace {
 constexpr int H = 2560, I = 640, E = 512, TopK = 10;
-// Two activation quantizations with a nonlinear product between them. The FP64 oracle
-// retains the original BF16 input and decoded weights; no private quantization is imitated.
-constexpr ReductionCriterion kA4{0.25, 1e-7, 0.35};
-constexpr ReductionCriterion kA8{0.08, 1e-7, 0.12};
-constexpr ReductionCriterion kA16{0.012, 1e-6, 0.008};
 // Same BF16/FP32 routing budget as the integer MoE suite; probabilities have unit scale.
 constexpr ReductionCriterion kRoute{3e-5, 5e-6, 0};
 
@@ -367,7 +363,7 @@ int run(Fixture& f, CudaExecutionView execution, int tokens, ops::ExpertSubsetKi
             const auto& logits = f.logits[p];
             auto& record       = tokens_ref[t];
             auto& coefficients = record.coefficients;
-            double total = 0;
+            double total       = 0;
             for (int j = 0; j < TopK; ++j) {
                 int e = complete ? order[j] : (replay == 1 ? j : (t * 13 + j * 31) % E);
                 if (!complete && f.fp8 && tokens == 2) {
@@ -385,8 +381,8 @@ int run(Fixture& f, CudaExecutionView execution, int tokens, ops::ExpertSubsetKi
                     complete ? std::exp(logits[e] - logits[order[0]]) : alpha[t * TopK + j];
                 total += coefficients[j];
             }
-            beta[t]                         = .25F + p * .125F;
-            record.shared_coefficient       = complete ? 1 / (1 + std::exp(-logits[E])) : beta[t];
+            beta[t]                   = .25F + p * .125F;
+            record.shared_coefficient = complete ? 1 / (1 + std::exp(-logits[E])) : beta[t];
             for (int j = 0; j < TopK; ++j) {
                 if (complete) { coefficients[j] /= total; }
                 const int e        = ids[t * TopK + j];
@@ -458,8 +454,8 @@ int run(Fixture& f, CudaExecutionView execution, int tokens, ops::ExpertSubsetKi
             std::string(complete ? "complete" : "routed") + (f.fp8 ? " fp8 M=" : " nvfp4 M=") +
             std::to_string(tokens) + " subset=" + std::to_string(int(kind)) +
             " shared=" + std::to_string(shared) + " replay=" + std::to_string(replay);
-        failures += verify_reduction(
-            label, actual, ref, kind == ops::ExpertSubsetKind::None ? kA16 : (f.fp8 ? kA8 : kA4));
+        const auto& ffn = kind == ops::ExpertSubsetKind::None ? profile.shared : profile.routed.ffn;
+        failures += verify_reduction(label, actual, ref, block_scaled_moe_criterion(ffn));
         failures +=
             scratch.verify_guards(label + " scratch") + result.verify_guards(label + " output");
         if (arena.used() || arena.peak_used() != bytes) {

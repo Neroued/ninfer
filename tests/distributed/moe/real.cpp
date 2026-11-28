@@ -2,6 +2,7 @@
 #include "models/qwen4_exp/execution/parameters.h"
 #include "models/qwen4_exp/load.h"
 #include "ops/op_tester.h"
+#include "ops/moe/block_scaled_criterion.h"
 #include <numeric>
 
 namespace ninfer::test::exchange {
@@ -138,40 +139,51 @@ void real_layer(distributed::WorkerConnection& c, const moe::ExpertExchangeStage
     // Main and MTP have different ownership/weight formats but identical physical envelopes.
     // Bind both before enqueue and reuse one frame and one caller workspace across layers.
     const auto& description = c.topology().role_group("expert", c.identity().rank);
-    moe::ResidentExchangePlan plan(request.rank.expert_domain, description, group.rank(),
-                                   stage.hidden, stage.top_k, {1, 1});
-    std::size_t peak = 0;
-    const auto bind  = [&](const moe::Parameters& p) {
-        peak = std::max(peak, plan.bind_layer(p.bank, p.profile, 1));
-    };
-    for (const auto& layer : parameters.text.layers) bind(layer.moe);
-    bind(parameters.mtp->layer.moe);
-    auto exchange = plan.prepare(group, device);
-    DeviceBuffer storage(d, peak);
-    MemoryArena arena(storage.span());
-    for (const auto* p : layers) {
-        Tensor totals(obs.span(), DType::U64, {4, int(group.size())});
-        const moe::LayerSource source{{x.span(), DType::BF16, {stage.hidden, 1}},
-                                      {y.span(), DType::BF16, {stage.hidden, 1}},
-                                      {}};
-        auto work        = exchange->stage(p->bank, 1);
-        work.observation = &totals;
-        moe::resident_layer(*p, &source, &work, arena, device.execution_view());
-        device.synchronize();
-        std::vector<std::uint16_t> actual(inputs.size());
-        y.copy_to_host(actual.data(), y.size());
-        std::vector<double> got;
-        for (int r : outputs) got.push_back(bf16_to_f32(actual[r]));
-        const auto ref = reference(reader, def->expert_banks()[p->bank.index], *p, inputs);
-        if (verify_reduction("artifact sampled layer", got, ref, {.02, 1e-6, .05}))
-            throw std::runtime_error("real Qwen layer differs from original expert weights");
-        std::array<std::uint64_t, 8> counts{};
-        obs.copy_to_host(counts.data(), obs.size());
-        if (counts[1] + counts[5] != stage.top_k)
-            throw std::runtime_error("natural routes lost an assignment");
-        std::cerr << "real bank=" << p->bank.index << " rank=" << group.rank()
-                  << " peer_hits=" << counts[4 * (1 - group.rank()) + 1]
-                  << " sampled_outputs=" << got.size() << '\n';
+    std::array<std::vector<double>, 2> references;
+    for (std::size_t i = 0; i < layers.size(); ++i) {
+        const auto& p = *layers[i];
+        references[i] = reference(reader, def->expert_banks()[p.bank.index], p, inputs);
+    }
+    for (auto layout : {moe::ExpertInputLayout::PacketRows, moe::ExpertInputLayout::TokenRoutes}) {
+        moe::ResidentExchangePlan plan(request.rank.expert_domain, description, group.rank(),
+                                       stage.hidden, stage.top_k, {1, 1});
+        std::size_t peak = 0;
+        const auto bind  = [&](const moe::Parameters& p) {
+            peak = std::max(peak, plan.bind_layer(p.bank, p.profile, 1, layout));
+        };
+        for (const auto& layer : parameters.text.layers) bind(layer.moe);
+        bind(parameters.mtp->layer.moe);
+        auto exchange = plan.prepare(group, device);
+        DeviceBuffer storage(d, peak);
+        MemoryArena arena(storage.span());
+        for (std::size_t i = 0; i < layers.size(); ++i) {
+            const auto* p = layers[i];
+            Tensor totals(obs.span(), DType::U64, {4, int(group.size())});
+            const moe::LayerSource source{{x.span(), DType::BF16, {stage.hidden, 1}},
+                                          {y.span(), DType::BF16, {stage.hidden, 1}},
+                                          {}};
+            auto work = exchange->stage(p->bank, 1);
+            if (work.placement.stage.input_layout != layout)
+                throw std::logic_error("fixture did not bind the requested expert layout");
+            work.observation = &totals;
+            moe::resident_layer(*p, &source, &work, arena, device.execution_view());
+            device.synchronize();
+            std::vector<std::uint16_t> actual(inputs.size());
+            y.copy_to_host(actual.data(), y.size());
+            std::vector<double> got;
+            for (int r : outputs) got.push_back(bf16_to_f32(actual[r]));
+            if (verify_reduction("artifact sampled layer", got, references[i],
+                                 block_scaled_moe_criterion(p->profile.routed.ffn)))
+                throw std::runtime_error("real Qwen layer differs from original expert weights");
+            std::array<std::uint64_t, 8> counts{};
+            obs.copy_to_host(counts.data(), obs.size());
+            if (counts[1] + counts[5] != stage.top_k)
+                throw std::runtime_error("natural routes lost an assignment");
+            std::cerr << "real bank=" << p->bank.index << " rank=" << group.rank() << " layout="
+                      << (layout == moe::ExpertInputLayout::PacketRows ? "packet" : "native")
+                      << " peer_hits=" << counts[4 * (1 - group.rank()) + 1]
+                      << " sampled_outputs=" << got.size() << '\n';
+        }
     }
 }
 } // namespace ninfer::test::exchange

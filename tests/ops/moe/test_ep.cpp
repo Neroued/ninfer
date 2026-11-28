@@ -1,4 +1,5 @@
 #include "ops/moe/ep_fixture.h"
+#include "ops/moe/block_scaled_criterion.h"
 #include "ops/op_tester.h"
 #include "ops/suite.h"
 #include <array>
@@ -6,9 +7,6 @@
 
 namespace ninfer::test::moe_ep {
 namespace {
-constexpr ReductionCriterion kA8{.08, 1e-7, .12};
-constexpr ReductionCriterion kA4{.25, 1e-7, .35};
-
 struct Case {
     int tokens;
     std::string distribution;
@@ -219,7 +217,8 @@ int run(Weights& w, CudaExecutionView execution, const Case& c,
             for (std::size_t i = std::size_t(first) * H; i < std::size_t(last) * H; ++i)
                 got[i] = bf16_to_f32(actual_bits[i]);
         });
-        failures += verify_reduction(label, got, reference, fp8 ? kA8 : kA4);
+        failures +=
+            verify_reduction(label, got, reference, block_scaled_moe_criterion(profile.routed.ffn));
         failures +=
             scratch.verify_guards(label) + result.verify_guards(label) + w.verify_controls();
         if (arena.used() != 0 || arena.peak_used() != bytes) {

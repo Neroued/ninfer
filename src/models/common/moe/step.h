@@ -14,6 +14,7 @@ namespace ninfer::models::moe {
 struct ExchangeGeometry {
     std::uint32_t max_block_columns                            = 0;
     std::uint32_t blocks_per_window                            = 1;
+    bool overlap                                               = false;
     friend bool operator==(ExchangeGeometry, ExchangeGeometry) = default;
 
     [[nodiscard]] std::uint32_t window_columns() const {
@@ -39,7 +40,8 @@ struct ExchangeGeometry {
 
     [[nodiscard]] unsigned variant(std::uint32_t columns) const {
         const auto width = packet_columns(columns);
-        return std::bit_width(width - 1) + (columns > max_block_columns && blocks_per_window > 1);
+        return std::bit_width(width - 1) +
+               (columns > max_block_columns && (blocks_per_window > 1 || overlap));
     }
 };
 

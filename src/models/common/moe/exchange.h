@@ -7,6 +7,7 @@
 #include "distributed/communication.h"
 #include "distributed/wire.h"
 #include "ninfer/ops/moe_exchange.h"
+#include <utility>
 
 namespace ninfer::models::moe {
 
@@ -26,11 +27,13 @@ struct ExpertExchangeStage {
     std::vector<std::size_t> dispatch_bytes;
     std::size_t return_bytes;
     int blocks_per_window = 1;
+    bool overlap                   = false;
     ExpertInputLayout input_layout = ExpertInputLayout::PacketRows;
 
     [[nodiscard]] int window_columns() const { return block_columns * blocks_per_window; }
 
     [[nodiscard]] int windows(int extent) const;
+    [[nodiscard]] std::size_t layer_workspace_bytes(std::size_t per_window) const;
 
 
     [[nodiscard]] distributed::GroupRequirements requirements(unsigned peer) const;
@@ -87,7 +90,8 @@ public:
 
     [[nodiscard]] distributed::GroupRequirements requirements() const;
 
-    [[nodiscard]] std::unique_ptr<ResidentExpertExchange> prepare(const distributed::Group&) const;
+    [[nodiscard]] std::unique_ptr<ResidentExpertExchange> prepare(const distributed::Group&,
+                                                                  const DeviceContext&) const;
 private:
     std::shared_ptr<const ExpertDomain> domain_;
     unsigned peer_;
@@ -97,6 +101,24 @@ private:
     std::size_t payload_bytes_ = 0;
     std::vector<std::size_t> bank_frames_;
     std::size_t bytes_ = 0;
+};
+
+// One auxiliary stream per Program, two completion records for the two packet slots.
+class ExpertOverlapResources {
+public:
+    explicit ExpertOverlapResources(const DeviceContext&);
+    void join_after_failure(CudaExecutionView) noexcept;
+
+    struct Events {
+        explicit Events(const DeviceContext& device)
+            : inputs(device), received(device), done(device) {}
+
+        CudaCompletionEvent inputs, received, done;
+    };
+
+    CudaStream stream;
+    CudaExecutionView compute;
+    std::array<Events, 2> slots;
 };
 
 // Packet shapes share the largest payload backing. Their immutable address tables
@@ -126,6 +148,9 @@ public:
     // A failed or abandoned dispatch must be drained with its execution group.
     class Call {
     public:
+        Call(Call&& other) noexcept
+            : frame_(std::exchange(other.frame_, nullptr)), source_(other.source_),
+              packets_(other.packets_), exec_(other.exec_) {}
         Call(const Call&)            = delete;
         Call& operator=(const Call&) = delete;
 

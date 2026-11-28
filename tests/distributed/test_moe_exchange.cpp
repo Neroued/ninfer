@@ -41,8 +41,14 @@ public:
           fixture(device.device(), d.banks.at(st.bank.index).at(rank).ids, st.bank),
           x(device.device(), 5 * H * 2), y(device.device(), 5 * H * 2), length(device.device(), 4),
           obs(device.device(), 64),
-          scratch(device.device(), stage.softmax_workspace_bytes(rank, fixture.parameters.profile)),
-          arena(scratch.span()), totals(obs.span(), DType::U64, {4, 2}) {}
+          scratch(device.device(), stage.layer_workspace_bytes(stage.softmax_workspace_bytes(
+                                       rank, fixture.parameters.profile))),
+          arena(scratch.span()), totals(obs.span(), DType::U64, {4, 2}) {
+        if (stage.overlap) {
+            alternate.emplace(stage, group);
+            streams.emplace(device);
+        }
+    }
 
     void upload(const Batch& b) {
         std::vector<std::uint16_t> bits(5 * H);
@@ -65,8 +71,9 @@ public:
                                             {{length.span(), DType::I32, {1}}, n},
                                             b.residual ? ops::MoeEpilogue::AddResidual
                                                        : ops::MoeEpilogue::Write});
-        const moe::ExpertExchangeWork work{parallel, placement,
-                                           std::max(b.columns[0], b.columns[1]), &totals};
+        moe::ExpertExchangeWork work{parallel, placement, std::max(b.columns[0], b.columns[1]),
+                                     &totals};
+        if (streams) work.overlap.emplace(moe::ExpertOverlapWork{*alternate, *streams});
         moe::resident_layer(fixture.parameters, source ? &*source : nullptr, &work, arena,
                             device.execution_view());
     }
@@ -229,6 +236,8 @@ public:
     moe::ExpertExchange parallel;
     moe::DeviceExpertPlacement placement;
     Fixture fixture;
+    std::optional<moe::ExpertExchange> alternate;
+    std::optional<moe::ExpertOverlapResources> streams;
     DeviceBuffer x, y, length, obs, scratch;
     MemoryArena arena;
     Tensor totals;
@@ -382,12 +391,17 @@ int worker() {
         }
         {
             auto native_stage         = stage;
+            native_stage.overlap           = true;
+            native_stage.blocks_per_window = 1;
             native_stage.input_layout = moe::ExpertInputLayout::TokenRoutes;
             Calls native(c, domain, native_stage);
             native.eager({{5, 2}, {1, 9}, {4, 1}, true});
             const std::array<Batch, 2> graphs{
                 {{{2, 2}, {7, 7}, {2, 0}}, {{2, 2}, {0, 10}, {0, 2}}}};
             native.graph(graphs.front(), graphs);
+            const std::array<Batch, 2> long_graphs{
+                {{{5, 3}, {7, 1}, {5, 2}}, {{5, 3}, {0, 10}, {1, 3}}}};
+            native.graph(long_graphs.front(), long_graphs);
         }
         split_intermediate(c, stage, domain);
         real_layer(c, stage, req, reader, std::move(def));

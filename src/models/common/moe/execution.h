@@ -23,6 +23,12 @@ struct LayerSource {
 
 class ExpertExchange;
 class DeviceExpertPlacement;
+class ExpertOverlapResources;
+
+struct ExpertOverlapWork {
+    ExpertExchange& alternate;
+    ExpertOverlapResources& streams;
+};
 
 // A matched layer stage borrows a single frame and immutable placement until consumption.
 struct ExpertExchangeWork {
@@ -30,6 +36,7 @@ struct ExpertExchangeWork {
     const DeviceExpertPlacement& placement;
     int physical_columns;
     Tensor* observation = nullptr;
+    std::optional<ExpertOverlapWork> overlap;
 };
 
 // Immutable bank maps and reusable exchange frames belong to the rank Program. A layer

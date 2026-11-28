@@ -93,6 +93,32 @@ int ExpertExchangeStage::blocks(int n) const {
 
 int ExpertExchangeStage::windows(int n) const { return 1 + (blocks(n) - 1) / blocks_per_window; }
 
+std::size_t ExpertExchangeStage::layer_workspace_bytes(std::size_t per_window) const {
+    if (!overlap) return per_window;
+    WorkspaceLayoutBuilder layout;
+    (void)layout.alloc_bytes(per_window);
+    (void)layout.alloc_bytes(per_window);
+    return layout.peak_bytes();
+}
+
+ExpertOverlapResources::ExpertOverlapResources(const DeviceContext& device)
+    : stream(device), compute(device.execution_view(stream.stream())),
+      slots{Events(device), Events(device)} {}
+
+void ExpertOverlapResources::join_after_failure(CudaExecutionView primary) noexcept {
+    try {
+        slots[0].done.record(compute.stream());
+        slots[0].done.wait(primary.stream());
+    } catch (...) {
+        // An invalidated capture has no executing nodes. Outside capture, drain any
+        // submitted readers before the rank can release their backing.
+        cudaStreamCaptureStatus status;
+        if (cudaStreamIsCapturing(compute.stream(), &status) == cudaSuccess &&
+            status == cudaStreamCaptureStatusNone)
+            (void)cudaStreamSynchronize(compute.stream());
+    }
+}
+
 void ExpertExchangeStage::encode(distributed::wire::Encoder& e, int extent) const {
     (void)blocks(extent);
     e.u64(placement_signature);
@@ -102,6 +128,7 @@ void ExpertExchangeStage::encode(distributed::wire::Encoder& e, int extent) cons
     e.u32(top_k);
     e.u32(block_columns);
     e.u32(blocks_per_window);
+    e.boolean(overlap);
     e.u32(extent);
     e.u64(return_bytes);
     e.u64(members.size());
@@ -527,78 +554,152 @@ void run_experts(ops::ExpertPacketBatch received, const DeviceExpertPlacement& p
     ops::compact_routed_swiglu(received, profile, weights, grouped, arena, exec);
 }
 
-void routed_block(const ExpertExchangeWork& work, int window,
-                  const ops::RoutedSwiGLUProfile& profile, const ops::CudaSwiGLUExperts& weights,
-                  const LayerSource* source, const ops::ExpertRoutes* routes, const Tensor* shared,
-                  MemoryArena& arena, CudaExecutionView exec, const Tensor* shared_gate = nullptr) {
-    const int c       = work.frame.stage().window_columns();
-    const auto extent = std::min(c, work.physical_columns - window * c);
-    auto call         = work.frame.dispatch(work.placement, source, routes, extent, exec);
-    run_experts(call.received(), work.placement, profile, weights, arena, exec);
-    std::move(call).combine(shared, work.observation, shared_gate);
-}
+// Each slot owns the host views and device scratch used until the ordered return.
+struct PendingWindow {
+    std::optional<LayerSource> source;
+    ops::ExpertRoutes routes;
+    Tensor shared, gate, broadcast;
+    std::optional<ExpertExchange::Call> call;
+};
 
-// For split sequences each lane dispatches its own columns. Shared projections use the
-// already gathered input, then reduce-scatter matching segments back to their consumers.
 template <class Route, class Shared>
-void tensor_layer(const ExpertExchangeWork& work, const ops::RoutedSwiGLUProfile& p,
-                  const ops::CudaSwiGLUExperts& experts, const LayerSource& source,
-                  ParallelExecution& tensor, const TokenPartition* partition, bool gated,
-                  MemoryArena& arena, CudaExecutionView exec, Route route, Shared project_shared) {
-    const auto& st  = work.frame.stage();
-    const int lanes = dimension(tensor.size()), rank = dimension(tensor.rank());
-    const bool split  = partition && partition->split();
+void prepare_source(PendingWindow& out, int window, const ExpertExchangeWork& work,
+                    const LayerSource& source, ParallelExecution* tensor,
+                    const TokenPartition* partition, bool gated, MemoryArena& arena,
+                    CudaExecutionView main, ExpertOverlapResources* overlap, Route& route,
+                    Shared& project) {
+    const auto& st    = work.frame.stage();
+    const bool split  = tensor && partition && partition->split();
+    const int lanes   = tensor ? dimension(tensor->size()) : 1;
+    const int lane    = tensor ? dimension(tensor->rank()) : 0;
     const int width   = split ? shared_columns(st.window_columns(), lanes) : st.window_columns();
     const int segment = split ? partition->segment : source.hidden.ne[1];
-    for (int wave = 0; wave < st.windows(work.physical_columns); ++wave) {
-        const int offset = wave * width;
-        if (offset >= segment) {
-            routed_block(work, wave, p, experts, nullptr, nullptr, nullptr, arena, exec);
-            continue;
-        }
-        const int span = std::min(width, segment - offset);
-        auto scope     = arena.scope();
-        auto scratch   = source_scratch(arena, st.hidden, st.top_k, span, gated);
-        if (split) {
-            auto all = arena.alloc(DType::FP32, {st.hidden, span * lanes});
-            for (int lane = 0; lane < lanes; ++lane) {
-                const int start = lane * segment + offset;
-                const int count = std::clamp(source.hidden.ne[1] - start, 0, span);
-                if (count) {
-                    auto y = all.slice(1, lane * span, count);
-                    project_shared(source.hidden.slice(1, start, count), y);
-                }
-                if (count < span) {
-                    auto tail = all.slice(1, lane * span + count, span - count);
-                    CUDA_CHECK(cudaMemsetAsync(tail.data, 0, tail.bytes(), exec.stream()));
-                }
-            }
-            tensor.sum_scatter(all, scratch.shared, exec);
-        } else {
-            auto x = source.hidden.slice(1, offset, span);
-            project_shared(x, scratch.shared);
-            tensor.sum(scratch.shared, exec);
-        }
-        const int first = split ? rank * segment + offset : offset;
-        const int n     = std::clamp(source.hidden.ne[1] - first, 0, span);
-        if (n && (split || rank == 0)) {
-            LayerSource local{source.hidden.slice(1, first, n), source.output.slice(1, first, n),
-                              block_validity(source, first, n, arena, exec), source.mode};
-            ops::ExpertRoutes routes{scratch.routes.ids.slice(1, 0, n),
-                                     scratch.routes.coefficients.slice(1, 0, n)};
-            auto shared = scratch.shared.slice(1, 0, n);
-            Tensor gate = gated ? scratch.gate.slice(0, 0, n) : Tensor{};
-            route(local, routes, gate);
-            routed_block(work, wave, p, experts, &local, &routes, &shared, arena, exec,
-                         gated ? &gate : nullptr);
-        } else {
-            routed_block(work, wave, p, experts, nullptr, nullptr, nullptr, arena, exec);
-        }
-        if (!split) {
-            auto out = source.output.slice(1, offset, span);
-            tensor.broadcast(out, 0, exec);
-        }
+    const int offset  = window * width;
+    if (offset >= segment) return;
+    const int span      = std::min(width, segment - offset);
+    auto scratch        = source_scratch(arena, st.hidden, st.top_k, span, gated);
+    const int first     = split ? lane * segment + offset : offset;
+    const int n         = std::clamp(source.hidden.ne[1] - first, 0, span);
+    const bool dispatch = n && (split || lane == 0);
+    Tensor all;
+    if (split) all = arena.alloc(DType::FP32, {st.hidden, span * lanes});
+    Tensor gate;
+    if (dispatch) {
+        out.source.emplace(LayerSource{source.hidden.slice(1, first, n),
+                                       source.output.slice(1, first, n),
+                                       block_validity(source, first, n, arena, main), source.mode});
+        out.routes = {scratch.routes.ids.slice(1, 0, n),
+                      scratch.routes.coefficients.slice(1, 0, n)};
+        gate       = gated ? scratch.gate.slice(0, 0, n) : Tensor{};
+        route(*out.source, out.routes, gate, arena, main);
+        out.shared = scratch.shared.slice(1, 0, n);
     }
+    if (!tensor) {
+        auto stream = main;
+        if (overlap) {
+            auto& event = overlap->slots[window % 2].inputs;
+            event.record(main.stream());
+            stream = overlap->compute;
+            event.wait(stream.stream());
+        }
+        project(out.source->hidden, scratch.shared, gated ? &gate : nullptr, arena, stream);
+        return;
+    }
+    // TP shared partials must be complete at the consumer before applying its gate.
+    if (split) {
+        for (int peer = 0; peer < lanes; ++peer) {
+            const int start = peer * segment + offset;
+            const int count = std::clamp(source.hidden.ne[1] - start, 0, span);
+            if (count) {
+                auto y = all.slice(1, peer * span, count);
+                project(source.hidden.slice(1, start, count), y, nullptr, arena, main);
+            }
+            if (count < span) {
+                auto tail = all.slice(1, peer * span + count, span - count);
+                CUDA_CHECK(cudaMemsetAsync(tail.data, 0, tail.bytes(), main.stream()));
+            }
+        }
+        tensor->sum_scatter(all, scratch.shared, main);
+    } else {
+        project(source.hidden.slice(1, offset, span), scratch.shared, nullptr, arena, main);
+        tensor->sum(scratch.shared, main);
+        out.broadcast = source.output.slice(1, offset, span);
+    }
+    out.gate = gate;
+}
+
+template <class Prepare>
+void run_windows(const ExpertExchangeWork& work, const ops::RoutedSwiGLUProfile& profile,
+                 const ops::CudaSwiGLUExperts& experts, ParallelExecution* tensor,
+                 std::size_t slot_bytes, MemoryArena& workspace, CudaExecutionView main,
+                 Prepare prepare) {
+    const auto& stage = work.frame.stage();
+    if (workspace.device() != main.device())
+        throw std::invalid_argument("expert workspace belongs to another device");
+    const auto slots = work.overlap ? 2 : 1;
+    auto lease       = workspace.scope();
+    // Reserve every slot before entering any collective on a peer.
+    std::array<MemorySpan, 2> storage;
+    for (int i = 0; i < slots; ++i) storage[i] = workspace.alloc_bytes(slot_bytes);
+    std::array<PendingWindow, 2> pending;
+    auto* overlap     = work.overlap ? &work.overlap->streams : nullptr;
+    const auto finish = [&](int i) {
+        auto& slot = pending[i];
+        if (!slot.call) return;
+        if (overlap) overlap->slots[i].done.wait(main.stream());
+        std::move(*slot.call)
+            .combine(slot.shared.data ? &slot.shared : nullptr, work.observation,
+                     slot.gate.data ? &slot.gate : nullptr);
+        if (slot.broadcast.data) tensor->broadcast(slot.broadcast, 0, main);
+        slot.call.reset();
+        slot.source.reset();
+        slot.shared = slot.gate = slot.broadcast = {};
+    };
+
+    start_observation(work.observation, main);
+    const int windows = stage.windows(work.physical_columns);
+    try {
+        for (int window = 0; window < windows; ++window) {
+            const int i = window % slots;
+            finish(i);
+            MemoryArena arena(storage[i]);
+            auto& slot = pending[i];
+            prepare(slot, window, arena, overlap);
+            const int c       = stage.window_columns();
+            const auto extent = std::min(c, work.physical_columns - window * c);
+            auto& frame       = i ? work.overlap->alternate : work.frame;
+            slot.call.emplace(frame.dispatch(work.placement, slot.source ? &*slot.source : nullptr,
+                                             slot.source ? &slot.routes : nullptr, extent, main));
+            auto compute = main;
+            if (overlap) {
+                compute = overlap->compute;
+                overlap->slots[i].received.record(main.stream());
+                overlap->slots[i].received.wait(compute.stream());
+            }
+            run_experts(slot.call->received(), work.placement, profile, experts, arena, compute);
+            if (overlap) overlap->slots[i].done.record(compute.stream());
+        }
+        for (int window = std::max(0, windows - slots); window < windows; ++window)
+            finish(window % slots);
+    } catch (...) {
+        if (overlap) overlap->join_after_failure(main);
+        throw;
+    }
+}
+
+template <class Route, class Shared>
+void run_layer(const ExpertExchangeWork& work, const ops::RoutedSwiGLUProfile& profile,
+               const ops::CudaSwiGLUExperts& experts, const LayerSource* source,
+               ParallelExecution* tensor, const TokenPartition* partition, bool gated,
+               std::size_t slot_bytes, MemoryArena& workspace, CudaExecutionView main, Route route,
+               Shared project) {
+    run_windows(
+        work, profile, experts, tensor, slot_bytes, workspace, main,
+        [&](PendingWindow& slot, int window, MemoryArena& arena, ExpertOverlapResources* overlap) {
+            if (source)
+                prepare_source(slot, window, work, *source, tensor, partition, gated, arena, main,
+                               overlap, route, project);
+        });
 }
 } // namespace
 
@@ -606,56 +707,29 @@ void softmax_exchange(const ExpertExchangeWork& work, const Parameters& p,
                       const LayerSource* source, MemoryArena& workspace, CudaExecutionView exec,
                       ParallelExecution* tensor, const TokenPartition* partition) {
     const auto& place = work.placement;
-    const auto& stage = work.frame.stage();
-    const int extent  = work.physical_columns;
-    work.frame.validate(place, p.profile.routed, extent, source, work.observation, exec);
+    const auto& st    = work.frame.stage();
+    work.frame.validate(place, p.profile.routed, work.physical_columns, source, work.observation,
+                        exec);
     if (p.bank != place.stage.bank)
         throw std::invalid_argument("expert parameters belong to another bank");
-    auto lease = workspace.scope();
-    if (workspace.device() != exec.device())
-        throw std::invalid_argument("expert workspace belongs to another device");
-    MemoryArena arena(workspace.alloc_bytes(
-        source ? stage.softmax_workspace_bytes(place.peer, p.profile, tensor ? tensor->size() : 1,
-                                               place.stage.input_layout)
-               : stage.routed_workspace_bytes(place.peer, p.profile.routed,
-                                              place.stage.input_layout)));
-    start_observation(work.observation, exec);
-    const ops::CudaSwiGLUExperts weights{p.resident, p.activation_calibration};
-    if (source && tensor) {
-        tensor_layer(
-            work, p.profile.routed, weights, *source, *tensor, partition, true, arena, exec,
-            [&](const LayerSource& local, ops::ExpertRoutes& routes, Tensor& gate) {
-                ops::topk_softmax_route(local.hidden, {stage.hidden, stage.experts, stage.top_k},
-                                        p.control, routes, gate, local.validity, arena, exec);
-            },
-            [&](const Tensor& input, Tensor& output) {
-                ops::routed_swiglu(input, p.profile.routed, {}, {},
-                                   {ops::ExpertSubsetKind::None, {}},
-                                   {p.shared, work.frame.unit_coefficients(input.ne[1])},
-                                   ops::MoeEpilogue::Write, output, arena, exec);
-            });
-        return;
-    }
-    for (int wave = 0; wave < stage.windows(extent); ++wave) {
-        const int base = wave * stage.window_columns();
-        if (!source || base >= source->hidden.ne[1]) {
-            routed_block(work, wave, p.profile.routed, weights, nullptr, nullptr, nullptr, arena,
-                         exec);
-            continue;
-        }
-        const int n  = std::min(stage.window_columns(), source->hidden.ne[1] - base);
-        auto scope   = arena.scope();
-        auto scratch = source_scratch(arena, stage.hidden, stage.top_k, n);
-        LayerSource src{source->hidden.slice(1, base, n), source->output.slice(1, base, n),
-                        block_validity(*source, base, n, arena, exec), source->mode};
-        ops::topk_softmax_route(src.hidden, {stage.hidden, stage.experts, stage.top_k}, p.control,
-                                scratch.routes, scratch.gate, src.validity, arena, exec);
-        ops::routed_swiglu(src.hidden, p.profile.routed, {}, {}, {ops::ExpertSubsetKind::None, {}},
-                           {p.shared, scratch.gate}, ops::MoeEpilogue::Write, scratch.shared, arena,
-                           exec);
-        routed_block(work, wave, p.profile.routed, weights, &src, &scratch.routes, &scratch.shared,
-                     arena, exec);
-    }
+    const auto layout = place.stage.input_layout;
+    const auto bytes  = source ? st.softmax_workspace_bytes(place.peer, p.profile,
+                                                           tensor ? tensor->size() : 1, layout)
+                               : st.routed_workspace_bytes(place.peer, p.profile.routed, layout);
+    run_layer(
+        work, p.profile.routed, {p.resident, p.activation_calibration}, source, tensor, partition,
+        true, bytes, workspace, exec,
+        [&](const LayerSource& local, ops::ExpertRoutes& routes, Tensor& gate, MemoryArena& arena,
+            CudaExecutionView stream) {
+            ops::topk_softmax_route(local.hidden, {st.hidden, st.experts, st.top_k}, p.control,
+                                    routes, gate, local.validity, arena, stream);
+        },
+        [&](const Tensor& x, Tensor& y, const Tensor* gate, MemoryArena& arena,
+            CudaExecutionView stream) {
+            ops::routed_swiglu(x, p.profile.routed, {}, {}, {ops::ExpertSubsetKind::None, {}},
+                               {p.shared, gate ? *gate : work.frame.unit_coefficients(x.ne[1])},
+                               ops::MoeEpilogue::Write, y, arena, stream);
+        });
 }
 
 void sigmoid_exchange(const ExpertExchangeWork& work, const ops::SigmoidMoeProfile& p,
@@ -663,45 +737,23 @@ void sigmoid_exchange(const ExpertExchangeWork& work, const ops::SigmoidMoeProfi
                       ParallelExecution* tensor, MemoryArena& workspace, CudaExecutionView exec,
                       const TokenPartition* partition) {
     const auto& place = work.placement;
-    const auto& stage = work.frame.stage();
-    const int extent  = work.physical_columns;
-    work.frame.validate(place, p.routed, extent, source, work.observation, exec);
-    auto lease = workspace.scope();
-    MemoryArena arena(workspace.alloc_bytes(
-        source ? stage.sigmoid_workspace_bytes(place.peer, p, tensor ? tensor->size() : 1,
-                                               place.stage.input_layout)
-               : stage.routed_workspace_bytes(place.peer, p.routed, place.stage.input_layout)));
-    if (source && tensor) {
-        tensor_layer(
-            work, p.routed, weights.routed, *source, *tensor, partition, false, arena, exec,
-            [&](const LayerSource& local, ops::ExpertRoutes& routes, Tensor&) {
-                ops::topk_sigmoid_route(local.hidden, p.routing, weights.control,
-                                        weights.correction_bias, routes, local.validity, arena,
-                                        exec);
-            },
-            [&](const Tensor& input, Tensor& output) {
-                ops::swiglu(input, p.shared, weights.shared, output, arena, exec);
-            });
-        return;
-    }
-    for (int wave = 0; wave < stage.windows(extent); ++wave) {
-        const auto base = wave * stage.window_columns();
-        if (!source || base >= source->hidden.ne[1]) {
-            routed_block(work, wave, p.routed, weights.routed, nullptr, nullptr, nullptr, arena,
-                         exec);
-            continue;
-        }
-        const auto n = std::min(stage.window_columns(), source->hidden.ne[1] - base);
-        auto scope   = arena.scope();
-        auto scratch = source_scratch(arena, stage.hidden, stage.top_k, n, false);
-        LayerSource local{source->hidden.slice(1, base, n), source->output.slice(1, base, n),
-                          block_validity(*source, base, n, arena, exec), source->mode};
-        ops::swiglu(local.hidden, p.shared, weights.shared, scratch.shared, arena, exec);
-        ops::topk_sigmoid_route(local.hidden, p.routing, weights.control, weights.correction_bias,
-                                scratch.routes, local.validity, arena, exec);
-        routed_block(work, wave, p.routed, weights.routed, &local, &scratch.routes, &scratch.shared,
-                     arena, exec);
-    }
+    const auto& st    = work.frame.stage();
+    work.frame.validate(place, p.routed, work.physical_columns, source, work.observation, exec);
+    const auto layout = place.stage.input_layout;
+    const auto bytes =
+        source ? st.sigmoid_workspace_bytes(place.peer, p, tensor ? tensor->size() : 1, layout)
+               : st.routed_workspace_bytes(place.peer, p.routed, layout);
+    run_layer(
+        work, p.routed, weights.routed, source, tensor, partition, false, bytes, workspace, exec,
+        [&](const LayerSource& local, ops::ExpertRoutes& routes, Tensor&, MemoryArena& arena,
+            CudaExecutionView stream) {
+            ops::topk_sigmoid_route(local.hidden, p.routing, weights.control,
+                                    weights.correction_bias, routes, local.validity, arena, stream);
+        },
+        [&](const Tensor& x, Tensor& y, const Tensor*, MemoryArena& arena,
+            CudaExecutionView stream) {
+            ops::swiglu(x, p.shared, weights.shared, y, arena, stream);
+        });
 }
 
 void routed_exchange(const ExpertExchangeWork& work, const ops::RoutedSwiGLUProfile& p,
@@ -721,44 +773,46 @@ void routed_exchange(const ExpertExchangeWork& work, const ops::RoutedSwiGLUProf
                        exec.device());
         require_tensor(*shared, DType::FP32, {stage.hidden, n}, 4, "shared", exec.device());
     }
-    auto lease = workspace.scope();
-    if (workspace.device() != exec.device())
-        throw std::invalid_argument("expert workspace belongs to another device");
-    MemoryArena arena(workspace.alloc_bytes(
-        stage.routed_workspace_bytes(place.peer, p, place.stage.input_layout)));
-    start_observation(work.observation, exec);
-    for (int wave = 0; wave < stage.windows(extent); ++wave) {
-        const int base = wave * stage.window_columns();
-        if (!source || base >= source->hidden.ne[1]) {
-            routed_block(work, wave, p, weights, nullptr, nullptr, nullptr, arena, exec);
-            continue;
-        }
-        const int n = std::min(stage.window_columns(), source->hidden.ne[1] - base);
-        auto scope  = arena.scope();
-        const LayerSource src{source->hidden.slice(1, base, n), source->output.slice(1, base, n),
-                              block_validity(*source, base, n, arena, exec), source->mode};
-        const ops::ExpertRoutes r{routes->ids.slice(1, base, n),
-                                  routes->coefficients.slice(1, base, n)};
-        const auto part = shared->slice(1, base, n);
-        routed_block(work, wave, p, weights, &src, &r, &part, arena, exec);
-    }
+    const auto bytes = stage.routed_workspace_bytes(place.peer, p, place.stage.input_layout);
+    run_windows(
+        work, p, weights, nullptr, bytes, workspace, exec,
+        [&](PendingWindow& slot, int window, MemoryArena& arena, ExpertOverlapResources*) {
+            const int base = window * stage.window_columns();
+            if (!source || base >= source->hidden.ne[1]) return;
+            const int n = std::min(stage.window_columns(), source->hidden.ne[1] - base);
+            slot.source.emplace(
+                LayerSource{source->hidden.slice(1, base, n), source->output.slice(1, base, n),
+                            block_validity(*source, base, n, arena, exec), source->mode});
+            slot.routes = {routes->ids.slice(1, base, n), routes->coefficients.slice(1, base, n)};
+            slot.shared = shared->slice(1, base, n);
+        });
 }
 
 namespace {
 class ResidentExchange final : public ResidentExpertExchange {
 public:
-    ResidentExchange(const distributed::Group& group, ExchangeGeometry geometry)
-        : communication_(group), geometry_(geometry) {}
-
+    ResidentExchange(const distributed::Group& group, ExchangeGeometry geometry,
+                     const DeviceContext& device)
+        : communication_(group), geometry_(geometry) {
+        if (geometry.overlap) streams.emplace(device);
+    }
     const distributed::Group& group() const noexcept override { return communication_; }
     ExpertExchangeWork stage(ExpertBankId bank, int columns) override {
         auto& variants = frames.at(bank_frames.at(bank.index));
-        return {*variants.at(geometry_.variant(columns)), placements.at(bank.index), columns};
+        auto& pair     = variants.at(geometry_.variant(columns));
+        ExpertExchangeWork work{*pair.primary, placements.at(bank.index), columns};
+        if (pair.alternate) work.overlap.emplace(ExpertOverlapWork{*pair.alternate, *streams});
+        return work;
     }
 
-    std::vector<std::vector<std::unique_ptr<ExpertExchange>>> frames;
+    struct Frames {
+        std::unique_ptr<ExpertExchange> primary, alternate;
+    };
+
+    std::vector<std::vector<Frames>> frames;
     std::vector<DeviceExpertPlacement> placements;
     std::vector<std::size_t> bank_frames;
+    std::optional<ExpertOverlapResources> streams;
 private:
     const distributed::Group& communication_;
     ExchangeGeometry geometry_;
@@ -778,8 +832,9 @@ ResidentExchangePlan::ResidentExchangePlan(std::shared_ptr<const ExpertDomain> d
             return prepare_expert_exchange(group, *domain_, ExpertBankId{i}, hidden, top_k,
                                            dimension(b), dimension(w));
         };
-        const auto& largest =
+        auto& largest =
             stages_.emplace_back(make(geometry_.max_block_columns, geometry_.blocks_per_window));
+        largest.overlap = geometry_.overlap;
         bytes_ += PlacementLayout(largest, peer).bytes;
         const auto found = std::ranges::find_if(frame_shapes_, [&](const auto& variants) {
             return variants.back().slots == largest.slots;
@@ -790,14 +845,14 @@ ResidentExchangePlan::ResidentExchangePlan(std::shared_ptr<const ExpertDomain> d
         for (unsigned width = 1; width < geometry_.max_block_columns; width *= 2)
             variants.push_back(make(width, 1));
         variants.push_back(make(geometry_.max_block_columns, 1));
-        if (geometry_.blocks_per_window > 1) variants.push_back(largest);
+        if (geometry_.blocks_per_window > 1 || geometry_.overlap) variants.push_back(largest);
         for (const auto& v : variants) {
             const auto layout = frame_layout(v, peer);
-            bytes_ += layout.metadata_bytes;
+            bytes_ += layout.metadata_bytes * (v.overlap ? 2 : 1);
             payload_bytes_ = std::max(payload_bytes_, layout.payload_bytes);
         }
     }
-    bytes_ += payload_bytes_;
+    bytes_ += payload_bytes_ * (geometry_.overlap ? 2 : 1);
 }
 
 void ResidentExchangePlan::bind_experts(ExpertBankId bank, const ops::RoutedSwiGLUProfile& profile,
@@ -822,15 +877,21 @@ void ResidentExchangePlan::bind_experts(ExpertBankId bank, const ops::RoutedSwiG
 }
 
 std::unique_ptr<ResidentExpertExchange>
-ResidentExchangePlan::prepare(const distributed::Group& group) const {
+ResidentExchangePlan::prepare(const distributed::Group& group, const DeviceContext& device) const {
     if (group.rank() != peer_) throw std::logic_error("expert exchange prepared for another peer");
-    auto out         = std::make_unique<ResidentExchange>(group, geometry_);
+    auto out         = std::make_unique<ResidentExchange>(group, geometry_, device);
     out->bank_frames = bank_frames_;
     auto backing     = std::make_shared<ExpertExchangeStorage>(group.device(), payload_bytes_);
+    auto second      = geometry_.overlap
+                           ? std::make_shared<ExpertExchangeStorage>(group.device(), payload_bytes_)
+                           : nullptr;
     for (const auto& variants : frame_shapes_) {
         auto& frames = out->frames.emplace_back();
         for (const auto& variant : variants)
-            frames.push_back(std::make_unique<ExpertExchange>(variant, group, backing));
+            frames.push_back({std::make_unique<ExpertExchange>(variant, group, backing),
+                              variant.overlap
+                                  ? std::make_unique<ExpertExchange>(variant, group, second)
+                                  : nullptr});
     }
     for (const auto& s : stages_) out->placements.emplace_back(*domain_, s, peer_, group.device());
     return out;

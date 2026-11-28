@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <climits>
+#include <type_traits>
 
 namespace ninfer::ops {
 namespace {

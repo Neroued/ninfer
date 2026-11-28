@@ -48,9 +48,9 @@ RankPreparation::RankPreparation(const artifact::Reader& reader, RankLoadRequest
                                                                  c.hidden, c.moe.top_k);
         const auto bind = [&](execution::MoeProfile& layer) {
             route->bind_experts(layer.bank, layer.math.routed, moe::ExpertInputLayout::PacketRows);
-            layer.exchange_workspace =
-                route->stage(layer.bank)
-                    .sigmoid_workspace_bytes(peer, layer.math, profile->local.size);
+            const auto& stage        = route->stage(layer.bank);
+            layer.exchange_workspace = stage.layer_workspace_bytes(
+                stage.sigmoid_workspace_bytes(peer, layer.math, profile->local.size));
         };
         for (auto& layer : profile->text.layers)
             if (auto* m = std::get_if<execution::MoeProfile>(&layer.ffn)) bind(*m);
@@ -73,7 +73,7 @@ runtime::PreparationMemory RankPreparation::memory() const { return memory_; }
 
 std::unique_ptr<moe::ResidentExpertExchange> RankPreparation::prepare_experts() const {
 #if NINFER_ENABLE_DISTRIBUTED
-    if (expert_group_) return plan_.profile->exchange->prepare(*expert_group_);
+    if (expert_group_) return plan_.profile->exchange->prepare(*expert_group_, device_);
 #endif
     return {};
 }

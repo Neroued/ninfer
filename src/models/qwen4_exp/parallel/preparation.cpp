@@ -63,9 +63,9 @@ RankPreparation::RankPreparation(const artifact::Reader& reader, std::span<const
                                 profile->config.text.hidden, profile->config.text.moe.top_k);
         const auto bind = [&](execution::MoeProfile& layer) {
             plan->bind_experts(layer.bank, layer.math.routed, moe::ExpertInputLayout::PacketRows);
-            layer.exchange_workspace_bytes =
-                plan->stage(layer.bank)
-                    .softmax_workspace_bytes(peer, layer.math, profile->local.size);
+            const auto& stage              = plan->stage(layer.bank);
+            layer.exchange_workspace_bytes = stage.layer_workspace_bytes(
+                stage.softmax_workspace_bytes(peer, layer.math, profile->local.size));
         };
         for (auto& layer : profile->text.layers) bind(layer.moe);
         if (profile->mtp) bind(profile->mtp->layer.moe);
@@ -256,7 +256,7 @@ void RankPreparation::create_probe(GraphProbeBacking backing) {
     auto plan = plan_graph_probe(profile_, ple_geometry_, options_, batches_, device_, {}, backing);
     probe_    = std::make_unique<RankProgram>(
         instance_->parameters, std::move(plan), device_, options_.startup_observer, binding_,
-        expert_group_ ? profile_->exchange->prepare(*expert_group_) : nullptr,
+        expert_group_ ? profile_->exchange->prepare(*expert_group_, device_) : nullptr,
         profile_->owns_ple && profile_->ple_placement == ple::Placement::Sharded ? ple_group_
                                                                                     : nullptr,
         pipeline_);
@@ -307,7 +307,7 @@ void RankPreparation::prepare(runtime::ContextCapacity capacity, std::size_t ava
     }
     instance_->program = std::make_unique<RankProgram>(
         instance_->parameters, std::move(*plan), device_, options_.startup_observer, binding_,
-        expert_group_ ? profile_->exchange->prepare(*expert_group_) : nullptr,
+        expert_group_ ? profile_->exchange->prepare(*expert_group_, device_) : nullptr,
         profile_->owns_ple && profile_->ple_placement == ple::Placement::Sharded ? ple_group_
                                                                                  : nullptr,
         pipeline_);

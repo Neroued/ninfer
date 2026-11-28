@@ -250,8 +250,8 @@ ExpertExchange::ExpertExchange(ExpertExchangeStage s, const distributed::Group& 
             PacketLayout(h, b, hit_capacity(b, st.top_k, st.slots[p])).view(tx), incoming.view(rx),
             static_cast<int*>(r.inverse.bind(arena).data), static_cast<float*>(returned.data)};
         host.push_back(v);
-        buffers_.push_back({v, incoming.counts.bind(rx), incoming.hidden.bind(rx),
-                            Tensor(result, DType::FP32, {h, b})});
+        received_.push_back({v.receive, incoming.counts.bind(rx), incoming.hidden.bind(rx),
+                             Tensor(result, DType::FP32, {h, b})});
         if (p != self) {
             send_.push_back({p, tx, rx});
             back_.push_back({p, result, returned});
@@ -285,10 +285,6 @@ SourceScratch source_scratch(Arena& a, int h, int k, int n, bool gate = true) {
 }
 } // namespace
 
-std::size_t ExpertExchange::routed_workspace_bytes(const ops::RoutedSwiGLUProfile& p) const {
-    return stage_.routed_workspace_bytes(group_.rank(), p);
-}
-
 std::size_t ExpertExchangeStage::routed_workspace_bytes(unsigned peer,
                                                         const ops::RoutedSwiGLUProfile& p) const {
     const int slots = this->slots.at(peer), b = block_columns;
@@ -298,10 +294,6 @@ std::size_t ExpertExchangeStage::routed_workspace_bytes(unsigned peer,
     group_scratch(l, slots, m);
     (void)l.alloc_bytes(ops::compact_routed_swiglu_workspace_bytes(p, m));
     return l.peak_bytes();
-}
-
-std::size_t ExpertExchange::softmax_workspace_bytes(const ops::MoeProfile& p) const {
-    return stage_.softmax_workspace_bytes(group_.rank(), p);
 }
 
 std::size_t ExpertExchangeStage::softmax_workspace_bytes(unsigned peer,
@@ -343,9 +335,9 @@ std::size_t ExpertExchangeStage::sigmoid_workspace_bytes(unsigned peer,
     return l.peak_bytes();
 }
 
-void ExpertExchange::check(const DeviceExpertPlacement& placement,
-                           const ops::RoutedSwiGLUProfile& p, int extent, const LayerSource* src,
-                           Tensor* totals, CudaExecutionView exec) const {
+void ExpertExchange::validate(const DeviceExpertPlacement& placement,
+                              const ops::RoutedSwiGLUProfile& p, int extent, const LayerSource* src,
+                              Tensor* totals, CudaExecutionView exec) const {
     const auto d         = group_.device();
     const auto& selected = placement.stage;
     // The frame is sized by communication geometry. Local slots and weight precision are
@@ -381,87 +373,124 @@ void ExpertExchange::check(const DeviceExpertPlacement& placement,
                        d);
 }
 
-void ExpertExchange::block(const DeviceExpertPlacement& place, const ops::RoutedSwiGLUProfile& p,
-                           const ops::CudaSwiGLUExperts& weights, const LayerSource* src,
-                           const ops::ExpertRoutes* routes, const Tensor* shared,
-                           MemoryArena& arena, CudaExecutionView exec, Tensor* totals) {
-    ops::pack_expert_rows(src ? &src->hidden : nullptr, routes,
-                          src ? src->validity : ops::MoeTokenValidity{}, place.dispatch,
+ExpertExchange::Call ExpertExchange::dispatch(const DeviceExpertPlacement& place,
+                                              const LayerSource* source,
+                                              const ops::ExpertRoutes* routes,
+                                              CudaExecutionView exec) {
+    if (occupied_) throw std::logic_error("previous expert dispatch still owns the frame");
+    occupied_ = true;
+    ops::pack_expert_rows(source ? &source->hidden : nullptr, routes,
+                          source ? source->validity : ops::MoeTokenValidity{}, place.dispatch,
                           device_peers_, group_.size(), stage_.block_columns, exec);
     group_.exchange(send_, exec);
-    const int slots = place.logical_ids.ne[0],
-              m     = hit_capacity(stage_.block_columns, p.top_k, slots);
-    auto scope      = arena.scope();
-    auto scratch    = group_scratch(arena, slots, m);
-    for (auto& peer : buffers_) {
-        ops::CompactExpertAssignments grouped{peer.counts, scratch.offsets, place.logical_ids,
-                                              scratch.rows, scratch.weights};
-        ops::group_expert_hits(peer.view.receive, grouped, scratch.cursors, exec);
-        ops::compact_routed_swiglu(peer.hidden, p, weights, grouped, peer.partial, arena, exec);
-    }
-    group_.exchange(back_, exec);
-    if (src) {
-        auto out = src->output;
-        ops::return_expert_rows(device_peers_, group_.size(), *shared, out, src->validity,
-                                src->mode, exec);
-    }
-    if (totals) ops::observe_expert_packets(device_peers_, group_.size(), *totals, exec);
+    return Call(*this, source, exec);
 }
 
-void ExpertExchange::softmax_layer(const DeviceExpertPlacement& place, const Parameters& p,
-                                   int extent, const LayerSource* source, MemoryArena& workspace,
-                                   CudaExecutionView exec, Tensor* totals) {
-    check(place, p.profile.routed, extent, source, totals, exec);
+std::span<const ReceivedExpertRows> ExpertExchange::Call::received() const {
+    if (!frame_) throw std::logic_error("expert dispatch has been consumed");
+    return frame_->received_;
+}
+
+void ExpertExchange::Call::combine(const Tensor* shared, Tensor* observation) && {
+    if (!frame_ || (source_ && !shared)) throw std::logic_error("invalid expert combine");
+    auto& frame = *frame_;
+    frame.group_.exchange(frame.back_, exec_);
+    if (source_) {
+        auto out = source_->output;
+        ops::return_expert_rows(frame.device_peers_, frame.group_.size(), *shared, out,
+                                source_->validity, source_->mode, exec_);
+    }
+    if (observation)
+        ops::observe_expert_packets(frame.device_peers_, frame.group_.size(), *observation, exec_);
+    frame.occupied_ = false;
+    frame_          = nullptr;
+}
+
+namespace {
+void run_experts(std::span<const ReceivedExpertRows> received, const DeviceExpertPlacement& place,
+                 const ops::RoutedSwiGLUProfile& profile, const ops::CudaSwiGLUExperts& weights,
+                 MemoryArena& arena, CudaExecutionView exec) {
+    const int slots = place.logical_ids.ne[0];
+    const int m     = hit_capacity(place.stage.block_columns, profile.top_k, slots);
+    auto scope      = arena.scope();
+    auto scratch    = group_scratch(arena, slots, m);
+    for (const auto& peer : received) {
+        ops::CompactExpertAssignments grouped{peer.counts, scratch.offsets, place.logical_ids,
+                                              scratch.rows, scratch.weights};
+        ops::group_expert_hits(peer.packet, grouped, scratch.cursors, exec);
+        auto partial = peer.partial;
+        ops::compact_routed_swiglu(peer.hidden, profile, weights, grouped, partial, arena, exec);
+    }
+}
+
+void routed_block(const ExpertExchangeWork& work, const ops::RoutedSwiGLUProfile& profile,
+                  const ops::CudaSwiGLUExperts& weights, const LayerSource* source,
+                  const ops::ExpertRoutes* routes, const Tensor* shared, MemoryArena& arena,
+                  CudaExecutionView exec) {
+    auto call = work.frame.dispatch(work.placement, source, routes, exec);
+    run_experts(call.received(), work.placement, profile, weights, arena, exec);
+    std::move(call).combine(shared, work.observation);
+}
+} // namespace
+
+void softmax_exchange(const ExpertExchangeWork& work, const Parameters& p,
+                      const LayerSource* source, MemoryArena& workspace, CudaExecutionView exec) {
+    const auto& place = work.placement;
+    const auto& stage = place.stage;
+    const int extent  = work.physical_columns;
+    work.frame.validate(place, p.profile.routed, extent, source, work.observation, exec);
     if (p.bank != place.stage.bank)
         throw std::invalid_argument("expert parameters belong to another bank");
     auto lease = workspace.scope();
     if (workspace.device() != exec.device())
         throw std::invalid_argument("expert workspace belongs to another device");
-    MemoryArena arena(workspace.alloc_bytes(source ? softmax_workspace_bytes(p.profile)
-                                                   : routed_workspace_bytes(p.profile.routed)));
-    start_observation(totals, exec);
+    MemoryArena arena(
+        workspace.alloc_bytes(source ? stage.softmax_workspace_bytes(place.peer, p.profile)
+                                     : stage.routed_workspace_bytes(place.peer, p.profile.routed)));
+    start_observation(work.observation, exec);
     const ops::CudaSwiGLUExperts weights{p.resident, p.activation_calibration};
-    for (int wave = 0; wave < stage_.blocks(extent); ++wave) {
-        const int base = wave * stage_.block_columns;
+    for (int wave = 0; wave < stage.blocks(extent); ++wave) {
+        const int base = wave * stage.block_columns;
         if (!source || base >= source->hidden.ne[1]) {
-            block(place, p.profile.routed, weights, nullptr, nullptr, nullptr, arena, exec, totals);
+            routed_block(work, p.profile.routed, weights, nullptr, nullptr, nullptr, arena, exec);
             continue;
         }
-        const int n  = std::min(stage_.block_columns, source->hidden.ne[1] - base);
+        const int n  = std::min(stage.block_columns, source->hidden.ne[1] - base);
         auto scope   = arena.scope();
-        auto scratch = source_scratch(arena, stage_.hidden, stage_.top_k, n);
+        auto scratch = source_scratch(arena, stage.hidden, stage.top_k, n);
         LayerSource src{source->hidden.slice(1, base, n), source->output.slice(1, base, n),
                         block_validity(*source, base, n, arena, exec), source->mode};
-        ops::topk_softmax_route(src.hidden, {stage_.hidden, stage_.experts, stage_.top_k},
-                                p.control, scratch.routes, scratch.gate, src.validity, arena, exec);
+        ops::topk_softmax_route(src.hidden, {stage.hidden, stage.experts, stage.top_k}, p.control,
+                                scratch.routes, scratch.gate, src.validity, arena, exec);
         ops::routed_swiglu(src.hidden, p.profile.routed, {}, {}, {ops::ExpertSubsetKind::None, {}},
                            {p.shared, scratch.gate}, ops::MoeEpilogue::Write, scratch.shared, arena,
                            exec);
-        block(place, p.profile.routed, weights, &src, &scratch.routes, &scratch.shared, arena, exec,
-              totals);
+        routed_block(work, p.profile.routed, weights, &src, &scratch.routes, &scratch.shared, arena,
+                     exec);
     }
 }
 
-void ExpertExchange::sigmoid_layer(const DeviceExpertPlacement& place,
-                                   const ops::SigmoidMoeProfile& p,
-                                   const ops::SigmoidMoeWeights& weights, int extent,
-                                   const LayerSource* source, bool representative,
-                                   ParallelExecution* tensor, MemoryArena& workspace,
-                                   CudaExecutionView exec) {
-    check(place, p.routed, extent, source, nullptr, exec);
+void sigmoid_exchange(const ExpertExchangeWork& work, const ops::SigmoidMoeProfile& p,
+                      const ops::SigmoidMoeWeights& weights, const LayerSource* source,
+                      bool representative, ParallelExecution* tensor, MemoryArena& workspace,
+                      CudaExecutionView exec) {
+    const auto& place = work.placement;
+    const auto& stage = place.stage;
+    const int extent  = work.physical_columns;
+    work.frame.validate(place, p.routed, extent, source, work.observation, exec);
     auto lease = workspace.scope();
-    MemoryArena arena(workspace.alloc_bytes(source
-                                                ? stage_.sigmoid_workspace_bytes(group_.rank(), p)
-                                                : routed_workspace_bytes(p.routed)));
-    for (int wave = 0; wave < stage_.blocks(extent); ++wave) {
-        const auto base = wave * stage_.block_columns;
+    MemoryArena arena(
+        workspace.alloc_bytes(source ? stage.sigmoid_workspace_bytes(place.peer, p)
+                                     : stage.routed_workspace_bytes(place.peer, p.routed)));
+    for (int wave = 0; wave < stage.blocks(extent); ++wave) {
+        const auto base = wave * stage.block_columns;
         if (!source || base >= source->hidden.ne[1]) {
-            block(place, p.routed, weights.routed, nullptr, nullptr, nullptr, arena, exec, nullptr);
+            routed_block(work, p.routed, weights.routed, nullptr, nullptr, nullptr, arena, exec);
             continue;
         }
-        const auto n = std::min(stage_.block_columns, source->hidden.ne[1] - base);
+        const auto n = std::min(stage.block_columns, source->hidden.ne[1] - base);
         auto scope   = arena.scope();
-        auto scratch = source_scratch(arena, stage_.hidden, stage_.top_k, n, false);
+        auto scratch = source_scratch(arena, stage.hidden, stage.top_k, n, false);
         LayerSource local{source->hidden.slice(1, base, n), source->output.slice(1, base, n),
                           block_validity(*source, base, n, arena, exec), source->mode};
         ops::swiglu(local.hidden, p.shared, weights.shared, scratch.shared, arena, exec);
@@ -470,48 +499,49 @@ void ExpertExchange::sigmoid_layer(const DeviceExpertPlacement& place,
             ops::topk_sigmoid_route(local.hidden, p.routing, weights.control,
                                     weights.correction_bias, scratch.routes, local.validity, arena,
                                     exec);
-        block(place, p.routed, weights.routed, representative ? &local : nullptr,
-              representative ? &scratch.routes : nullptr,
-              representative ? &scratch.shared : nullptr, arena, exec, nullptr);
+        routed_block(work, p.routed, weights.routed, representative ? &local : nullptr,
+                     representative ? &scratch.routes : nullptr,
+                     representative ? &scratch.shared : nullptr, arena, exec);
         if (tensor) tensor->broadcast(local.output, 0, exec);
     }
 }
 
-void ExpertExchange::routed_layer(const DeviceExpertPlacement& place,
-                                  const ops::RoutedSwiGLUProfile& p,
-                                  const ops::CudaSwiGLUExperts& weights, int extent,
-                                  const LayerSource* source, const ops::ExpertRoutes* routes,
-                                  const Tensor* shared, MemoryArena& workspace,
-                                  CudaExecutionView exec, Tensor* totals) {
-    check(place, p, extent, source, totals, exec);
+void routed_exchange(const ExpertExchangeWork& work, const ops::RoutedSwiGLUProfile& p,
+                     const ops::CudaSwiGLUExperts& weights, const LayerSource* source,
+                     const ops::ExpertRoutes* routes, const Tensor* shared, MemoryArena& workspace,
+                     CudaExecutionView exec) {
+    const auto& place = work.placement;
+    const auto& stage = place.stage;
+    const int extent  = work.physical_columns;
+    work.frame.validate(place, p, extent, source, work.observation, exec);
     if (source) {
         if (!routes || !shared)
             throw std::invalid_argument("missing expert source routes or shared contribution");
         const int n = source->hidden.ne[1];
-        require_tensor(routes->ids, DType::I32, {stage_.top_k, n}, 4, "route IDs", exec.device());
-        require_tensor(routes->coefficients, DType::FP32, {stage_.top_k, n}, 4, "route weights",
+        require_tensor(routes->ids, DType::I32, {stage.top_k, n}, 4, "route IDs", exec.device());
+        require_tensor(routes->coefficients, DType::FP32, {stage.top_k, n}, 4, "route weights",
                        exec.device());
-        require_tensor(*shared, DType::FP32, {stage_.hidden, n}, 4, "shared", exec.device());
+        require_tensor(*shared, DType::FP32, {stage.hidden, n}, 4, "shared", exec.device());
     }
     auto lease = workspace.scope();
     if (workspace.device() != exec.device())
         throw std::invalid_argument("expert workspace belongs to another device");
-    MemoryArena arena(workspace.alloc_bytes(routed_workspace_bytes(p)));
-    start_observation(totals, exec);
-    for (int wave = 0; wave < stage_.blocks(extent); ++wave) {
-        const int base = wave * stage_.block_columns;
+    MemoryArena arena(workspace.alloc_bytes(stage.routed_workspace_bytes(place.peer, p)));
+    start_observation(work.observation, exec);
+    for (int wave = 0; wave < stage.blocks(extent); ++wave) {
+        const int base = wave * stage.block_columns;
         if (!source || base >= source->hidden.ne[1]) {
-            block(place, p, weights, nullptr, nullptr, nullptr, arena, exec, totals);
+            routed_block(work, p, weights, nullptr, nullptr, nullptr, arena, exec);
             continue;
         }
-        const int n = std::min(stage_.block_columns, source->hidden.ne[1] - base);
+        const int n = std::min(stage.block_columns, source->hidden.ne[1] - base);
         auto scope  = arena.scope();
         const LayerSource src{source->hidden.slice(1, base, n), source->output.slice(1, base, n),
                               block_validity(*source, base, n, arena, exec), source->mode};
         const ops::ExpertRoutes r{routes->ids.slice(1, base, n),
                                   routes->coefficients.slice(1, base, n)};
         const auto part = shared->slice(1, base, n);
-        block(place, p, weights, &src, &r, &part, arena, exec, totals);
+        routed_block(work, p, weights, &src, &r, &part, arena, exec);
     }
 }
 

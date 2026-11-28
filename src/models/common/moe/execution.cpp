@@ -11,8 +11,7 @@ void SigmoidPass::run(ExpertBankId bank, const ops::SigmoidMoeProfile& p,
                       ParallelExecution* tensor, MemoryArena& arena, CudaExecutionView cuda) const {
 #if NINFER_ENABLE_DISTRIBUTED
     auto step = exchange->stage(bank, columns);
-    step.frame.sigmoid_layer(step.placement, p, weights, columns, source, representative, tensor,
-                             arena, cuda);
+    sigmoid_exchange(step, p, weights, source, representative, tensor, arena, cuda);
 #else
     throw std::logic_error("sigmoid expert exchange requires distributed execution");
 #endif
@@ -22,8 +21,7 @@ void resident_layer(const Parameters& p, const LayerSource* src, const ExpertExc
                     MemoryArena& workspace, CudaExecutionView cuda) {
     if (step) {
 #if NINFER_ENABLE_DISTRIBUTED
-        step->frame.softmax_layer(step->placement, p, step->physical_columns, src, workspace, cuda,
-                                  step->observation);
+        softmax_exchange(*step, p, src, workspace, cuda);
         return;
 #else
         throw std::invalid_argument("expert exchange requires distributed execution");

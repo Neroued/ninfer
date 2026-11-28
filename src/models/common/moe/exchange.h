@@ -83,52 +83,60 @@ private:
     std::size_t bytes_ = 0;
 };
 
-// Compatible banks share one in-flight frame, including its send/return buffers. Enqueues on the
-// supplied ordered stream; backing and source views survive all consumers, including
-// capture/replay. reset/destroy after retirement.
+// Inputs received from one source and its destination for weighted FP32 row results.
+struct ReceivedExpertRows {
+    ops::ExpertPacket packet;
+    Tensor counts, hidden, partial;
+};
+
 class ExpertExchange {
 public:
     ExpertExchange(ExpertExchangeStage, const distributed::Group&);
-
     [[nodiscard]] std::size_t bytes() const { return storage_.size(); }
 
-    [[nodiscard]] std::size_t routed_workspace_bytes(const ops::RoutedSwiGLUProfile&) const;
-    [[nodiscard]] std::size_t softmax_workspace_bytes(const ops::MoeProfile&) const;
-    // A null source still services every peer. Optional U64[4,peers] observation is reset
-    // per call and contains tx unique rows, tx assignments, rx unique rows, rx assignments.
-    void softmax_layer(const DeviceExpertPlacement&, const Parameters&, int physical_columns,
-                       const LayerSource*, MemoryArena&, CudaExecutionView,
-                       Tensor* observation = nullptr);
-    // A replica's TP ranks share the same activations. Each computes its own shared
-    // intermediate slice; one representative dispatches the unique routed columns.
-    void sigmoid_layer(const DeviceExpertPlacement&, const ops::SigmoidMoeProfile&,
-                       const ops::SigmoidMoeWeights&, int physical_columns, const LayerSource*,
-                       bool representative, ParallelExecution* tensor, MemoryArena&,
-                       CudaExecutionView);
-    // For a model with its own router and shared term. Source routes are global and shared is
-    // its already scaled FP32 contribution. Both are ignored when the local source is absent.
-    void routed_layer(const DeviceExpertPlacement&, const ops::RoutedSwiGLUProfile&,
-                      const ops::CudaSwiGLUExperts&, int physical_columns, const LayerSource*,
-                      const ops::ExpertRoutes*, const Tensor* shared, MemoryArena&,
-                      CudaExecutionView, Tensor* observation = nullptr);
+    // One ordered stream owns the frame. The call borrows the source through combine.
+    // A failed or abandoned dispatch must be drained with its execution group.
+    class Call {
+    public:
+        Call(const Call&)            = delete;
+        Call& operator=(const Call&) = delete;
 
-private:
-    struct Buffers {
-        ops::ExpertPeerBuffers view;
-        Tensor counts, hidden, partial;
+        [[nodiscard]] std::span<const ReceivedExpertRows> received() const;
+        void combine(const Tensor* shared, Tensor* observation) &&;
+    private:
+        friend class ExpertExchange;
+
+        Call(ExpertExchange& frame, const LayerSource* source, CudaExecutionView exec)
+            : frame_(&frame), source_(source), exec_(exec) {}
+
+        ExpertExchange* frame_;
+        const LayerSource* source_;
+        CudaExecutionView exec_;
     };
 
-    void block(const DeviceExpertPlacement&, const ops::RoutedSwiGLUProfile&,
-               const ops::CudaSwiGLUExperts&, const LayerSource*, const ops::ExpertRoutes*,
-               const Tensor*, MemoryArena&, CudaExecutionView, Tensor*);
-    void check(const DeviceExpertPlacement&, const ops::RoutedSwiGLUProfile&, int,
-               const LayerSource*, Tensor*, CudaExecutionView) const;
+    void validate(const DeviceExpertPlacement&, const ops::RoutedSwiGLUProfile&, int extent,
+                  const LayerSource*, Tensor* observation, CudaExecutionView) const;
+    [[nodiscard]] Call dispatch(const DeviceExpertPlacement&, const LayerSource*,
+                                const ops::ExpertRoutes*, CudaExecutionView);
+private:
     ExpertExchangeStage stage_;
     const distributed::Group& group_;
     DeviceBuffer storage_;
     ops::ExpertPeerBuffers* device_peers_ = nullptr;
-    std::vector<Buffers> buffers_;
+    std::vector<ReceivedExpertRows> received_;
     std::vector<distributed::PeerTransfer> send_, back_;
+    bool occupied_ = false;
 };
+
+// The three callers supply distinct model mathematics. They share the same dispatch,
+// expert and combine path, including when a rank only services other sources.
+void softmax_exchange(const ExpertExchangeWork&, const Parameters&, const LayerSource*,
+                      MemoryArena&, CudaExecutionView);
+void sigmoid_exchange(const ExpertExchangeWork&, const ops::SigmoidMoeProfile&,
+                      const ops::SigmoidMoeWeights&, const LayerSource*, bool representative,
+                      ParallelExecution*, MemoryArena&, CudaExecutionView);
+void routed_exchange(const ExpertExchangeWork&, const ops::RoutedSwiGLUProfile&,
+                     const ops::CudaSwiGLUExperts&, const LayerSource*, const ops::ExpertRoutes*,
+                     const Tensor* shared, MemoryArena&, CudaExecutionView);
 
 } // namespace ninfer::models::moe

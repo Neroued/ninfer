@@ -41,7 +41,7 @@ public:
           fixture(device.device(), d.banks.at(st.bank.index).at(rank).ids, st.bank),
           x(device.device(), 5 * H * 2), y(device.device(), 5 * H * 2), length(device.device(), 4),
           obs(device.device(), 64),
-          scratch(device.device(), parallel.softmax_workspace_bytes(fixture.parameters.profile)),
+          scratch(device.device(), stage.softmax_workspace_bytes(rank, fixture.parameters.profile)),
           arena(scratch.span()), totals(obs.span(), DType::U64, {4, 2}) {}
 
     void upload(const Batch& b) {
@@ -238,8 +238,8 @@ void split_intermediate(dist::WorkerConnection& c, const moe::ExpertExchangeStag
         MemoryArena short_frame(memory.span().subspan(0, capacity - 1));
         bool refused = false;
         try {
-            frame.routed_layer(placement, prof, experts, 1, nullptr, nullptr, nullptr, short_frame,
-                               device.execution_view());
+            moe::routed_exchange({frame, placement, 1, &totals}, prof, experts, nullptr, nullptr,
+                                 nullptr, short_frame, device.execution_view());
         } catch (const std::bad_alloc&) { refused = true; }
         require(refused, "undersized expert workspace reached device communication");
     }
@@ -247,9 +247,9 @@ void split_intermediate(dist::WorkerConnection& c, const moe::ExpertExchangeStag
         valid.copy_from_host(&live, 4);
         std::vector<std::uint16_t> out(H, test::f32_to_bf16(.5F));
         y.copy_from_host(out.data(), y.size());
-        frame.routed_layer(placement, prof, experts, 1, peer ? nullptr : &source,
-                           peer ? nullptr : &routes, peer ? nullptr : &sh_view, arena,
-                           device.execution_view(), &totals);
+        moe::routed_exchange({frame, placement, 1, &totals}, prof, experts,
+                             peer ? nullptr : &source, peer ? nullptr : &routes,
+                             peer ? nullptr : &sh_view, arena, device.execution_view());
         device.synchronize();
         y.copy_to_host(out.data(), y.size());
         std::array<std::uint64_t, 8> seen{};

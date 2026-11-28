@@ -71,13 +71,13 @@ void RankProgramImpl::pipeline_commit_counts(const Commit& commit) {
     auto host       = resources.pipeline_counts();
     auto* fields    = static_cast<std::int32_t*>(host.data);
     int rows        = 0;
-    for (std::size_t i = 0; i < commit.rows.size(); ++i) {
-        const auto& sampling = work[i].sampling;
-        if ((!sampling.presence_penalty && !sampling.frequency_penalty) || !commit.rows[i].accepted)
-            continue;
-        fields[rows]           = f.result.rows[i].tokens.at(0);
+    for (const auto member : f.sampling_members()) {
+        const auto& sampling = work[member].sampling;
+        const auto& row      = commit.rows[member];
+        if ((!sampling.presence_penalty && !sampling.frequency_penalty) || !row.accepted) continue;
+        fields[rows]           = f.result.rows[member].tokens.at(0);
         fields[cap + rows]     = 1;
-        fields[2 * cap + rows] = commit.rows[i].member.residency.lane.value;
+        fields[2 * cap + rows] = row.member.residency.lane.value;
         ++rows;
     }
     if (!rows) return;

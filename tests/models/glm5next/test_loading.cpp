@@ -377,7 +377,9 @@ void packed_prefill_inputs(const glm::execution::Parameters& parameters, DeviceC
                                        plan.shape.max_concurrency, ops::KpoolMlaStorage::BFloat16,
                                        KvCacheVectorFormat::BFloat16);
     plan.frame       = glm::plan_frame(layout, *plan.profile, plan.shape);
-    plan.fixed_bytes = layout.finish(256);
+    plan.pipeline_counts =
+        layout.add_tensor(DType::I32, {2, 3}, 256, "pipeline token count commit");
+    plan.fixed_bytes           = layout.finish(256);
     plan.mapping_elements      = plan.main.tables.page_offsets.region.bytes / sizeof(std::int64_t);
     plan.pinned_output_bytes   = plan.frame.egress.bytes;
     plan.capacity.device_bytes = 3 * plan.state.owner.image_bytes;
@@ -393,21 +395,26 @@ void packed_prefill_inputs(const glm::execution::Parameters& parameters, DeviceC
         forward.rows[row].member     = {{row + 1, 1}, {{row}, 1}};
         forward.rows[row].main_table = {0, row, 1};
     }
-    forward.rows[0].ids               = {1, 2};
-    forward.rows[0].states            = {{0, {0, image_bytes}}};
-    forward.rows[1].states            = {{0, {2 * image_bytes, 2 * image_bytes}}};
-    forward.rows[1].main_frontier     = 5;
-    forward.rows[1].sampling_position = 5;
-    forward.rows[1].sample            = true;
-    forward.sample                    = glm::SampleKind::FirstToken;
+    forward.rows[0].ids                        = {1, 2};
+    forward.rows[0].states                     = {{0, {0, image_bytes}}};
+    forward.rows[1].states                     = {{0, {2 * image_bytes, 2 * image_bytes}}};
+    forward.rows[1].main_frontier              = 5;
+    forward.rows[1].sampling_position          = 5;
+    forward.rows[1].sample                     = true;
+    forward.sample                             = glm::SampleKind::FirstToken;
+    forward.rows[0].sampling.presence_penalty  = 0.2F;
+    forward.rows[1].sampling.frequency_penalty = 0.2F;
 
+    const runtime::ExecutionTicket ticket{{1}, 1, {runtime::FrameKind::Compute, 0, 1}};
     const auto prepare = [&](const glm::ForwardWork& prefill) {
         glm::Work work{{}, prefill};
         glm::prepare_batch(work, *rank.contract().batches);
         rank.contract().validate(work, runtime::FrameKind::Compute);
-        rank.compute = std::make_unique<glm::detail::ComputeFrame>();
+        rank.compute          = std::make_unique<glm::detail::ComputeFrame>();
+        rank.compute->request = {ticket, {1}, std::move(work)};
         rank.compute->result.rows.resize(prefill.rows.size());
-        rank.prepare_packed_inputs(std::get<glm::ForwardWork>(work.operation));
+        rank.prepare_packed_inputs(
+            std::get<glm::ForwardWork>(rank.compute->request.work.operation));
         device.synchronize();
     };
     prepare(forward);
@@ -425,6 +432,26 @@ void packed_prefill_inputs(const glm::execution::Parameters& parameters, DeviceC
     CUDA_CHECK(cudaMemcpy(&sampled_offset, rank.resources.tensor(ingress.sampled_offsets).data,
                           sizeof(sampled_offset), cudaMemcpyDeviceToHost));
     require(sampled_offset == 2 * image_bytes, "slot zero did not select cached hidden state");
+
+    // The unfinished row commits prompt progress; only the cache hit contributes an output ID.
+    constexpr TokenId generated         = 3;
+    rank.compute->result.rows[1].tokens = {generated};
+    rank.compute->phase                 = glm::detail::ComputePhase::PendingCommit;
+    const auto& unfinished              = forward.rows[0];
+    const auto& hit_row                 = forward.rows[1];
+    rank.commit(
+        ticket, {2},
+        {.rows = {{unfinished.member, unfinished.states, 2}, {hit_row.member, hit_row.states, 1}}});
+    device.synchronize();
+    const auto retired = rank.poll();
+    require(retired && std::holds_alternative<runtime::DeviceRetired>(*retired) &&
+                std::get<runtime::DeviceRetired>(*retired).ticket == ticket,
+            "mixed prefill commit did not retire its ticket");
+    const auto counts = rank.resources.tensor(*rank.frame.token_counts);
+    std::vector<std::int32_t> actual(counts.numel()), expected(counts.numel(), 0);
+    expected.at(counts.ne[0] * hit_row.member.residency.lane.value + generated) = 1;
+    CUDA_CHECK(cudaMemcpy(actual.data(), counts.data, counts.bytes(), cudaMemcpyDeviceToHost));
+    require(actual == expected, "mixed prefill committed incorrect per-lane token counts");
 
     auto cached = forward.rows.back();
     forward.rows.pop_back();
@@ -447,8 +474,8 @@ void packed_prefill_inputs(const glm::execution::Parameters& parameters, DeviceC
     rank.bindings[cached.member.residency.lane.value] = cached.member;
     rank.validate_work(hit, runtime::FrameKind::Compute);
     rank.compute.reset();
-    const runtime::ExecutionTicket ticket{{1}, 1, {runtime::FrameKind::Compute, 0, 1}};
-    rank.start({ticket, {1}, std::move(hit)});
+    const runtime::ExecutionTicket hit_ticket{{2}, 1, {runtime::FrameKind::Compute, 0, 2}};
+    rank.start({hit_ticket, {3}, std::move(hit)});
     const auto event = rank.poll();
     require(event && std::holds_alternative<runtime::DecisionNeeded>(*event) &&
                 rank.compute->tokens == 0 && rank.compute->result.rows[0].processed == 0,

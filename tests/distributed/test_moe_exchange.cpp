@@ -141,6 +141,60 @@ public:
                   << " frame=" << parallel.bytes() << " workspace=" << scratch.size() << '\n';
     }
 
+    void tensor_sources() {
+        // Two TP lanes consume the same inputs and hold different shared contributions.
+        // Exercising both replicated and split consumers needs only this two-peer link.
+        if (rank == 1) {
+            std::vector<std::uint16_t> down(fixture.shared_down.size() / 2);
+            fixture.shared_down.copy_to_host(down.data(), fixture.shared_down.size());
+            for (auto& v : down) v = test::f32_to_bf16(2 * test::bf16_to_f32(v));
+            fixture.shared_down.copy_from_host(down.data(), fixture.shared_down.size());
+        }
+        std::vector<std::uint16_t> input(5 * H), output(5 * H);
+        std::vector<double> reference(5 * H);
+        for (int col = 0; col < 5; ++col) {
+            const auto v = column(domain.banks[stage.bank.index], 0, col, col + 2);
+            std::copy(v.input.begin(), v.input.end(), input.begin() + col * H);
+            for (int h = 0; h < H; ++h) {
+                double expected = 3 * v.shared(h);
+                for (int j = 0; j < K; ++j)
+                    expected += v.weights[j] * v.expert(v.experts[j], h, false, false);
+                reference[col * H + h] = expected;
+            }
+        }
+        x.copy_from_host(input.data(), x.size());
+        DeviceBuffer storage(device.device(),
+                             stage.softmax_workspace_bytes(rank, fixture.parameters.profile, 2));
+        MemoryArena workspace(storage.span());
+        models::ParallelExecution tp({&group, 0});
+        for (bool split : {false, true}) {
+            models::TokenPartition columns(5, split ? 2 : 1, split ? rank : 0);
+            std::fill(output.begin(), output.end(), test::f32_to_bf16(42));
+            y.copy_from_host(output.data(), y.size());
+            moe::LayerSource src{
+                {x.span(), DType::BF16, {H, 5}}, {y.span(), DType::BF16, {H, 5}}, {}};
+            const moe::ExpertExchangeWork step{parallel, placement, 5};
+            moe::softmax_exchange(step, fixture.parameters, &src, workspace,
+                                  device.execution_view(), &tp, &columns);
+            device.synchronize();
+            y.copy_to_host(output.data(), y.size());
+            std::vector<double> got, expected;
+            for (int col = 0; col < 5; ++col)
+                for (int h = 0; h < H; ++h) {
+                    const auto i = col * H + h;
+                    if (col < columns.begin || col >= columns.begin + columns.count)
+                        require(output[i] == test::f32_to_bf16(42),
+                                "wrote another TP lane's output");
+                    else {
+                        got.push_back(test::bf16_to_f32(output[i]));
+                        expected.push_back(reference[i]);
+                    }
+                }
+            require(!test::verify_reduction("TP expert sources", got, expected, {.012, 1e-6, .035}),
+                    "TP source ownership duplicated routed or shared contributions");
+        }
+    }
+
     void eager(const Batch& b) {
         upload(b);
         const auto before = peer_bytes();
@@ -291,7 +345,7 @@ int worker() {
         const auto stage   = moe::prepare_expert_exchange(desc, domain, bank, H, K, 2);
         stage.expect(in, 5);
         in.finish();
-        const auto needs = [&] {
+        auto needs = [&] {
             q::RankPreparation preparation(reader, load_bytes, c.identity(), c.device(),
                                            c.topology(), c.communication(), {});
             return preparation.communication_requirements();
@@ -299,6 +353,11 @@ int worker() {
         require(needs.size() == 1 && needs.front().group == stage.group &&
                     needs.front().peers.size() == 1,
                 "TP1 Worker did not prepare its independent expert group");
+        auto& collectives = needs.front().collectives;
+        collectives.push_back({dist::Collective::AllReduce, DType::FP32, H, 2 * H, H});
+        collectives.push_back({dist::Collective::ReduceScatter, DType::FP32, H, 2 * H, H});
+        collectives.push_back(
+            {dist::Collective::Broadcast, DType::BF16, H, 2 * H, H, dist::Reduction::Sum, 0});
         if (!dist::prepare_communication(c, needs, policy)) {
             c.shutdown();
             return 0;
@@ -319,6 +378,7 @@ int worker() {
             const std::array<Batch, 2> service{
                 {{{1, 0}, {7, 0}, {1, 0}}, {{1, 0}, {10, 0}, {1, 0}}}};
             calls.graph(service.front(), service);
+            calls.tensor_sources();
         }
         split_intermediate(c, stage, domain);
         real_layer(c, stage, req, reader, std::move(def));

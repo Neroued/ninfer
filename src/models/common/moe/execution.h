@@ -44,13 +44,15 @@ public:
 struct SigmoidPass {
     ResidentExpertExchange* exchange = nullptr;
     int columns                      = 0;
-    bool representative              = false;
+
     void run(ExpertBankId, const ops::SigmoidMoeProfile&, const ops::SigmoidMoeWeights&,
-             const LayerSource*, ParallelExecution*, MemoryArena&, CudaExecutionView) const;
+             const LayerSource*, ParallelExecution*, MemoryArena&, CudaExecutionView,
+             const TokenPartition* = nullptr) const;
 };
 
 void resident_layer(const Parameters&, const LayerSource*, const ExpertExchangeWork*, MemoryArena&,
-                    CudaExecutionView);
+                    CudaExecutionView, ParallelExecution* = nullptr,
+                    const TokenPartition* = nullptr);
 
 [[nodiscard]] std::size_t
 workspace_bytes(const ops::MoeProfile& profile, ops::MoeEpilogue epilogue, std::int32_t first,

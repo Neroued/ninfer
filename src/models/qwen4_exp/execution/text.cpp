@@ -130,10 +130,20 @@ void TextRun::mixer(std::uint32_t i, const QsaSubmit& submit) {
     mix(p.moe_hc);
 }
 
-void TextRun::resident_moe(std::uint32_t i, const moe::ExpertExchangeWork* step) {
+void TextRun::resident_moe(std::uint32_t i) {
     const moe::LayerSource source{
         roots_.input, roots_.output, {batch_.valid_columns, batch_.tokens}};
-    moe::resident_layer(parameters_.text.layers[i].moe, &source, step, execution_.workspace, cuda_);
+    moe::resident_layer(parameters_.text.layers[i].moe, &source, nullptr, execution_.workspace,
+                        cuda_);
+}
+
+void TextRun::exchanged_moe(std::uint32_t i, const moe::ExpertExchangeWork& step) {
+    const auto valid =
+        std::holds_alternative<PackedPrefillState>(update_) ? Tensor{} : batch_.valid_columns;
+    const moe::LayerSource source{roots_.input, roots_.output, {valid, batch_.tokens}};
+    moe::resident_layer(parameters_.text.layers[i].moe, &source, &step, execution_.workspace, cuda_,
+                        execution_.parallel, &partition_);
+    combine(i, partitioned_ ? partition_.local(roots_.exchange_output, 1) : roots_.output);
 }
 
 void TextRun::gpu_moe(const moe::GpuCall& call) {
@@ -142,8 +152,9 @@ void TextRun::gpu_moe(const moe::GpuCall& call) {
          {});
 }
 
-void TextRun::combine(std::uint32_t i) {
-    const auto output  = reduce_output();
+void TextRun::combine(std::uint32_t i) { combine(i, reduce_output()); }
+
+void TextRun::combine(std::uint32_t i, const Tensor& output) {
     const auto& config = parameters_.profile->config.text;
     if ((parameters_.profile->owns_ple && i + 1 == config.ple.layer) ||
         (!parameters_.profile->output_stage() && i + 1 == config.layers.size())) {

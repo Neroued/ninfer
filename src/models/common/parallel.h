@@ -51,6 +51,8 @@ struct RankPlacement {
     }
 };
 
+[[nodiscard]] std::vector<std::uint32_t>
+expert_replica_members(const distributed::ExecutionTopology&, const distributed::GroupDescription&);
 void add_expert_roles(distributed::ExecutionTopology&);
 
 [[nodiscard]] IndexRange partition_range(std::uint32_t total, std::uint32_t parts,

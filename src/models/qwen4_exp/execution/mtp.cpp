@@ -81,9 +81,9 @@ void MtpRun::feed_forward(const moe::ExpertExchangeWork* step) {
         auto scratch = arena_.scope();
         const moe::LayerSource source{
             roots_.input, roots_.output, {batch_.valid_columns, batch_.tokens}};
-        moe::resident_layer(parameters_.layer.moe, &source, step, arena_, cuda_);
+        moe::resident_layer(parameters_.layer.moe, &source, step, arena_, cuda_, parallel_);
     }
-    if (parallel_) parallel_->sum(roots_.output, cuda_);
+    if (parallel_ && !step) parallel_->sum(roots_.output, cuda_);
     ops::hc_combine_norm(roots_.residual, roots_.output, roots_.injection,
                          parameters_.final_hc.norm, config_.norm_epsilon, roots_.residual,
                          roots_.normalized, cuda_);

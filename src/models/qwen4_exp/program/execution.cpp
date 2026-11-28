@@ -472,8 +472,7 @@ bool RankProgramImpl::advance_layers(std::uint32_t end) {
             const auto stage =
                 exchange->stage(layer.moe.bank, dimension(step->columns.at(f.main_pass)));
             f.run->mixer(f.layer);
-            f.run->resident_moe(f.layer, &stage);
-            f.run->combine(f.layer);
+            f.run->exchanged_moe(f.layer, stage);
         } else if (!f.run->advance_layer(f.layer))
             return false;
         ++f.layer;

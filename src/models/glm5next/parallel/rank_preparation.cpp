@@ -188,6 +188,7 @@ std::vector<distributed::GroupRequirements> RankPreparation::communication_requi
         const auto block = static_cast<std::size_t>(shape.exchange.max_block_columns);
         auto& tp         = requirements(*binding_.tensor.group);
         tp.push_back({Collective::AllReduce, DType::FP32, hidden, hidden * block, hidden});
+        tp.push_back({Collective::ReduceScatter, DType::FP32, hidden, hidden * block, hidden});
         tp.push_back({Collective::Broadcast, DType::BF16, hidden, hidden * block, hidden,
                       Reduction::Sum, 0});
         result.push_back(*expert_requirements_);

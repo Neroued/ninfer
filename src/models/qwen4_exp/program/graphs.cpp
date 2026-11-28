@@ -145,11 +145,11 @@ void forward_resident(RankProgramImpl& p, execution::TextRun& run, execution::Te
         run.mixer(layer, submit);
         if (p.exchange) {
             const auto stage = p.exchange->stage(p.parameters.text.layers[layer].moe.bank, columns);
-            run.resident_moe(layer, &stage);
+            run.exchanged_moe(layer, stage);
         } else {
             run.resident_moe(layer);
+            run.combine(layer);
         }
-        run.combine(layer);
     }
     p.finish_text(run, output);
     head();

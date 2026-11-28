@@ -277,6 +277,20 @@ void qwen_case(const artifact::Reader& reader, const std::filesystem::path& path
         (void)qwen::ple::placements({PleStorage::Disk, PleDeviceLayout::Replicated}, 5, 2);
     } catch (const std::invalid_argument&) { conflict = true; }
     require(conflict, "explicit Disk and device layout conflict was accepted");
+    for (unsigned ranks : {8U, 16U}) {
+        auto options_ep            = options;
+        options_ep.deployment      = deployment(ranks / 2, 2, 1, ranks, path);
+        options_ep.max_concurrency = ranks;
+        qwen::ParallelStartup startup(reader, options_ep);
+        const auto& topology = startup.topology();
+        const auto& experts  = topology.role_group("expert", 0);
+        const auto replicas  = models::expert_replica_members(topology, experts);
+        require(experts.members.size() == ranks && replicas.size() == ranks / 2,
+                "replicated Qwen inputs need one source owner per TP pair");
+        for (unsigned i = 0; i < ranks / 2; ++i)
+            require(replicas[i] == i && topology.replica(i).ranks.size() == 2,
+                    "expert service lost a source replica or its TP follower");
+    }
     auto p   = qwen::plan_parallel(*def, deployment(2, 1, 1, 2, path), qwen::ple::Placement::Disk);
     require(def->weights().mtp.has_value(), "fixture requires MTP");
     const auto full    = qwen::execution::describe_model(*def);

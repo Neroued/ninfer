@@ -35,7 +35,8 @@ public:
     [[nodiscard]] bool advance_layer(std::uint32_t layer);
     void mixer(std::uint32_t layer, const QsaSubmit& = {});
     [[nodiscard]] QsaRun local_qsa(std::uint32_t layer);
-    void resident_moe(std::uint32_t layer, const moe::ExpertExchangeWork* = nullptr);
+    void resident_moe(std::uint32_t layer);
+    void exchanged_moe(std::uint32_t layer, const moe::ExpertExchangeWork&);
     void gpu_moe(const moe::GpuCall&);
     void combine(std::uint32_t layer);
     void finish(TextOutputs, Tensor logits = {});
@@ -46,6 +47,7 @@ public:
 
 
 private:
+    void combine(std::uint32_t, const Tensor&);
     void partition_residual();
     void mix(const HcParameters&);
     [[nodiscard]] Tensor reduce_output();

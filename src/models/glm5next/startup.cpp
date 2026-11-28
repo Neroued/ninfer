@@ -48,7 +48,8 @@ RankPreparation::RankPreparation(const artifact::Reader& reader, RankLoadRequest
                                                                  c.hidden, c.moe.top_k);
         const auto bind = [&](execution::MoeProfile& layer) {
             layer.exchange_workspace =
-                route->stage(layer.bank).sigmoid_workspace_bytes(peer, layer.math);
+                route->stage(layer.bank)
+                    .sigmoid_workspace_bytes(peer, layer.math, profile->local.size);
         };
         for (auto& layer : profile->text.layers)
             if (auto* m = std::get_if<execution::MoeProfile>(&layer.ffn)) bind(*m);

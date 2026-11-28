@@ -196,6 +196,7 @@ struct Regions {
 struct FrameLayout {
     std::vector<Regions> peers;
     LayoutRegion handles;
+    TensorRegion unit;
     std::size_t bytes;
 };
 
@@ -205,6 +206,7 @@ FrameLayout frame_layout(const ExpertExchangeStage& st, unsigned self) {
     LayoutBuilder l;
 
     FrameLayout out;
+    out.unit    = l.add_tensor(DType::FP32, {b}, 16, "unit shared coefficients");
     out.handles = l.add(st.members.size() * sizeof(ops::ExpertPeerBuffers),
                         alignof(ops::ExpertPeerBuffers), "expert peer views");
     for (unsigned p = 0; p < st.members.size(); ++p) {
@@ -237,6 +239,9 @@ ExpertExchange::ExpertExchange(ExpertExchangeStage s, const distributed::Group& 
     storage_           = DeviceBuffer(group.device(), frame.bytes);
     storage_.fill(0);
     const auto arena = storage_.span();
+    unit_            = frame.unit.bind(arena);
+    const std::vector<float> unit(b, 1.F);
+    storage_.copy_from_host(unit.data(), unit_.bytes(), frame.unit.region.offset);
     std::vector<ops::ExpertPeerBuffers> host;
     for (unsigned p = 0; p < group.size(); ++p) {
         const auto& r = frame.peers[p];
@@ -293,11 +298,20 @@ std::size_t ExpertExchangeStage::routed_workspace_bytes(unsigned peer,
     return l.peak_bytes();
 }
 
-std::size_t ExpertExchangeStage::softmax_workspace_bytes(unsigned peer,
-                                                         const ops::MoeProfile& p) const {
+namespace {
+int shared_columns(int block, unsigned lanes) { return 1 + (block - 1) / dimension(lanes); }
+
+void plan_shared_exchange(WorkspaceLayoutBuilder& l, int h, int block, unsigned lanes) {
+    if (lanes > 1) (void)l.alloc(DType::FP32, {h, shared_columns(block, lanes), dimension(lanes)});
+}
+} // namespace
+
+std::size_t ExpertExchangeStage::softmax_workspace_bytes(unsigned peer, const ops::MoeProfile& p,
+                                                         unsigned tensor_size) const {
     const int b = block_columns;
     WorkspaceLayoutBuilder l;
     source_scratch(l, hidden, top_k, b);
+    plan_shared_exchange(l, hidden, b, tensor_size);
     (void)l.alloc(DType::I32, {b});
     const auto route = ops::topk_softmax_route_workspace_capacity_bytes(
         {hidden, p.routed.experts, p.routed.top_k}, 1, b);
@@ -315,10 +329,12 @@ std::size_t ExpertExchangeStage::softmax_workspace_bytes(unsigned peer,
 }
 
 std::size_t ExpertExchangeStage::sigmoid_workspace_bytes(unsigned peer,
-                                                         const ops::SigmoidMoeProfile& p) const {
+                                                         const ops::SigmoidMoeProfile& p,
+                                                         unsigned tensor_size) const {
     WorkspaceLayoutBuilder l;
     const int b = block_columns, local = slots.at(peer);
     source_scratch(l, hidden, top_k, b, false);
+    plan_shared_exchange(l, hidden, b, tensor_size);
     (void)l.alloc(DType::I32, {b});
     {
         auto scratch      = l.scope();
@@ -388,14 +404,15 @@ std::span<const ReceivedExpertRows> ExpertExchange::Call::received() const {
     return frame_->received_;
 }
 
-void ExpertExchange::Call::combine(const Tensor* shared, Tensor* observation) && {
+void ExpertExchange::Call::combine(const Tensor* shared, Tensor* observation,
+                                   const Tensor* shared_gate) && {
     if (!frame_ || (source_ && !shared)) throw std::logic_error("invalid expert combine");
     auto& frame = *frame_;
     frame.group_.exchange(frame.back_, exec_);
     if (source_) {
         auto out = source_->output;
         ops::return_expert_rows(frame.device_peers_, frame.group_.size(), *shared, out,
-                                source_->validity, source_->mode, exec_);
+                                source_->validity, source_->mode, exec_, shared_gate);
     }
     if (observation)
         ops::observe_expert_packets(frame.device_peers_, frame.group_.size(), *observation, exec_);
@@ -423,15 +440,79 @@ void run_experts(std::span<const ReceivedExpertRows> received, const DeviceExper
 void routed_block(const ExpertExchangeWork& work, const ops::RoutedSwiGLUProfile& profile,
                   const ops::CudaSwiGLUExperts& weights, const LayerSource* source,
                   const ops::ExpertRoutes* routes, const Tensor* shared, MemoryArena& arena,
-                  CudaExecutionView exec) {
+                  CudaExecutionView exec, const Tensor* shared_gate = nullptr) {
     auto call = work.frame.dispatch(work.placement, source, routes, exec);
     run_experts(call.received(), work.placement, profile, weights, arena, exec);
-    std::move(call).combine(shared, work.observation);
+    std::move(call).combine(shared, work.observation, shared_gate);
+}
+
+// For split sequences each lane dispatches its own columns. Shared projections use the
+// already gathered input, then reduce-scatter matching segments back to their consumers.
+template <class Route, class Shared>
+void tensor_layer(const ExpertExchangeWork& work, const ops::RoutedSwiGLUProfile& p,
+                  const ops::CudaSwiGLUExperts& experts, const LayerSource& source,
+                  ParallelExecution& tensor, const TokenPartition* partition, bool gated,
+                  MemoryArena& arena, CudaExecutionView exec, Route route, Shared project_shared) {
+    const auto& st  = work.placement.stage;
+    const int lanes = dimension(tensor.size()), rank = dimension(tensor.rank());
+    const bool split  = partition && partition->split();
+    const int width   = split ? shared_columns(st.block_columns, lanes) : st.block_columns;
+    const int segment = split ? partition->segment : source.hidden.ne[1];
+    for (int wave = 0; wave < st.blocks(work.physical_columns); ++wave) {
+        const int offset = wave * width;
+        if (offset >= segment) {
+            routed_block(work, p, experts, nullptr, nullptr, nullptr, arena, exec);
+            continue;
+        }
+        const int span = std::min(width, segment - offset);
+        auto scope     = arena.scope();
+        auto scratch   = source_scratch(arena, st.hidden, st.top_k, span, gated);
+        if (split) {
+            auto all = arena.alloc(DType::FP32, {st.hidden, span * lanes});
+            for (int lane = 0; lane < lanes; ++lane) {
+                const int start = lane * segment + offset;
+                const int count = std::clamp(source.hidden.ne[1] - start, 0, span);
+                if (count) {
+                    auto y = all.slice(1, lane * span, count);
+                    project_shared(source.hidden.slice(1, start, count), y);
+                }
+                if (count < span) {
+                    auto tail = all.slice(1, lane * span + count, span - count);
+                    CUDA_CHECK(cudaMemsetAsync(tail.data, 0, tail.bytes(), exec.stream()));
+                }
+            }
+            tensor.sum_scatter(all, scratch.shared, exec);
+        } else {
+            auto x = source.hidden.slice(1, offset, span);
+            project_shared(x, scratch.shared);
+            tensor.sum(scratch.shared, exec);
+        }
+        const int first = split ? rank * segment + offset : offset;
+        const int n     = std::clamp(source.hidden.ne[1] - first, 0, span);
+        if (n && (split || rank == 0)) {
+            LayerSource local{source.hidden.slice(1, first, n), source.output.slice(1, first, n),
+                              block_validity(source, first, n, arena, exec), source.mode};
+            ops::ExpertRoutes routes{scratch.routes.ids.slice(1, 0, n),
+                                     scratch.routes.coefficients.slice(1, 0, n)};
+            auto shared = scratch.shared.slice(1, 0, n);
+            Tensor gate = gated ? scratch.gate.slice(0, 0, n) : Tensor{};
+            route(local, routes, gate);
+            routed_block(work, p, experts, &local, &routes, &shared, arena, exec,
+                         gated ? &gate : nullptr);
+        } else {
+            routed_block(work, p, experts, nullptr, nullptr, nullptr, arena, exec);
+        }
+        if (!split) {
+            auto out = source.output.slice(1, offset, span);
+            tensor.broadcast(out, 0, exec);
+        }
+    }
 }
 } // namespace
 
 void softmax_exchange(const ExpertExchangeWork& work, const Parameters& p,
-                      const LayerSource* source, MemoryArena& workspace, CudaExecutionView exec) {
+                      const LayerSource* source, MemoryArena& workspace, CudaExecutionView exec,
+                      ParallelExecution* tensor, const TokenPartition* partition) {
     const auto& place = work.placement;
     const auto& stage = place.stage;
     const int extent  = work.physical_columns;
@@ -441,11 +522,26 @@ void softmax_exchange(const ExpertExchangeWork& work, const Parameters& p,
     auto lease = workspace.scope();
     if (workspace.device() != exec.device())
         throw std::invalid_argument("expert workspace belongs to another device");
-    MemoryArena arena(
-        workspace.alloc_bytes(source ? stage.softmax_workspace_bytes(place.peer, p.profile)
-                                     : stage.routed_workspace_bytes(place.peer, p.profile.routed)));
+    MemoryArena arena(workspace.alloc_bytes(
+        source ? stage.softmax_workspace_bytes(place.peer, p.profile, tensor ? tensor->size() : 1)
+               : stage.routed_workspace_bytes(place.peer, p.profile.routed)));
     start_observation(work.observation, exec);
     const ops::CudaSwiGLUExperts weights{p.resident, p.activation_calibration};
+    if (source && tensor) {
+        tensor_layer(
+            work, p.profile.routed, weights, *source, *tensor, partition, true, arena, exec,
+            [&](const LayerSource& local, ops::ExpertRoutes& routes, Tensor& gate) {
+                ops::topk_softmax_route(local.hidden, {stage.hidden, stage.experts, stage.top_k},
+                                        p.control, routes, gate, local.validity, arena, exec);
+            },
+            [&](const Tensor& input, Tensor& output) {
+                ops::routed_swiglu(input, p.profile.routed, {}, {},
+                                   {ops::ExpertSubsetKind::None, {}},
+                                   {p.shared, work.frame.unit_coefficients(input.ne[1])},
+                                   ops::MoeEpilogue::Write, output, arena, exec);
+            });
+        return;
+    }
     for (int wave = 0; wave < stage.blocks(extent); ++wave) {
         const int base = wave * stage.block_columns;
         if (!source || base >= source->hidden.ne[1]) {
@@ -469,16 +565,29 @@ void softmax_exchange(const ExpertExchangeWork& work, const Parameters& p,
 
 void sigmoid_exchange(const ExpertExchangeWork& work, const ops::SigmoidMoeProfile& p,
                       const ops::SigmoidMoeWeights& weights, const LayerSource* source,
-                      bool representative, ParallelExecution* tensor, MemoryArena& workspace,
-                      CudaExecutionView exec) {
+                      ParallelExecution* tensor, MemoryArena& workspace, CudaExecutionView exec,
+                      const TokenPartition* partition) {
     const auto& place = work.placement;
     const auto& stage = place.stage;
     const int extent  = work.physical_columns;
     work.frame.validate(place, p.routed, extent, source, work.observation, exec);
     auto lease = workspace.scope();
-    MemoryArena arena(
-        workspace.alloc_bytes(source ? stage.sigmoid_workspace_bytes(place.peer, p)
-                                     : stage.routed_workspace_bytes(place.peer, p.routed)));
+    MemoryArena arena(workspace.alloc_bytes(
+        source ? stage.sigmoid_workspace_bytes(place.peer, p, tensor ? tensor->size() : 1)
+               : stage.routed_workspace_bytes(place.peer, p.routed)));
+    if (source && tensor) {
+        tensor_layer(
+            work, p.routed, weights.routed, *source, *tensor, partition, false, arena, exec,
+            [&](const LayerSource& local, ops::ExpertRoutes& routes, Tensor&) {
+                ops::topk_sigmoid_route(local.hidden, p.routing, weights.control,
+                                        weights.correction_bias, routes, local.validity, arena,
+                                        exec);
+            },
+            [&](const Tensor& input, Tensor& output) {
+                ops::swiglu(input, p.shared, weights.shared, output, arena, exec);
+            });
+        return;
+    }
     for (int wave = 0; wave < stage.blocks(extent); ++wave) {
         const auto base = wave * stage.block_columns;
         if (!source || base >= source->hidden.ne[1]) {
@@ -491,15 +600,10 @@ void sigmoid_exchange(const ExpertExchangeWork& work, const ops::SigmoidMoeProfi
         LayerSource local{source->hidden.slice(1, base, n), source->output.slice(1, base, n),
                           block_validity(*source, base, n, arena, exec), source->mode};
         ops::swiglu(local.hidden, p.shared, weights.shared, scratch.shared, arena, exec);
-        if (tensor) tensor->sum(scratch.shared, exec);
-        if (representative)
-            ops::topk_sigmoid_route(local.hidden, p.routing, weights.control,
-                                    weights.correction_bias, scratch.routes, local.validity, arena,
-                                    exec);
-        routed_block(work, p.routed, weights.routed, representative ? &local : nullptr,
-                     representative ? &scratch.routes : nullptr,
-                     representative ? &scratch.shared : nullptr, arena, exec);
-        if (tensor) tensor->broadcast(local.output, 0, exec);
+        ops::topk_sigmoid_route(local.hidden, p.routing, weights.control, weights.correction_bias,
+                                scratch.routes, local.validity, arena, exec);
+        routed_block(work, p.routed, weights.routed, &local, &scratch.routes, &scratch.shared,
+                     arena, exec);
     }
 }
 

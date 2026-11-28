@@ -88,7 +88,8 @@ __global__ void scatter(ExpertPacket p, int* cursors, int* rows, float* coeffici
 }
 
 __global__ void combine(const ExpertPeerBuffers* peers, int peer_count, const float* shared,
-                        __nv_bfloat16* out, int h, const int* lengths, int width, bool add) {
+                        __nv_bfloat16* out, int h, const int* lengths, int width, bool add,
+                        const float* gate) {
     const int col   = blockIdx.y;
     const bool live = !lengths || col % width < lengths[col / width];
     for (int r = blockIdx.x * blockDim.x + threadIdx.x; r < h; r += gridDim.x * blockDim.x) {
@@ -97,7 +98,7 @@ __global__ void combine(const ExpertPeerBuffers* peers, int peer_count, const fl
             if (!add) out[i] = __float2bfloat16(0);
             continue;
         }
-        float sum = shared[i];
+        float sum = gate ? shared[i] * gate[col] : shared[i];
         for (int d = 0; d < peer_count; ++d) {
             const auto p = peers[d];
             const int u  = p.source_to_row[col];
@@ -195,7 +196,8 @@ void group_expert_hits(ExpertPacket p, const CompactExpertAssignments& a, Tensor
 }
 
 void return_expert_rows(const ExpertPeerBuffers* p, int peers, const Tensor& shared, Tensor& output,
-                        MoeTokenValidity validity, MoeEpilogue mode, CudaExecutionView exec) {
+                        MoeTokenValidity validity, MoeEpilogue mode, CudaExecutionView exec,
+                        const Tensor* shared_gate) {
     if (!p || peers <= 0 || (mode != MoeEpilogue::Write && mode != MoeEpilogue::AddResidual))
         throw std::invalid_argument("invalid expert return operands");
     const int h = output.ne[0], n = output.ne[1];
@@ -204,10 +206,14 @@ void return_expert_rows(const ExpertPeerBuffers* p, int peers, const Tensor& sha
     common::operand::tensor(output, DType::BF16, {h, n}, 2, "expert return", "output",
                             exec.device());
     validity_view(validity, n, exec.device());
+    if (shared_gate)
+        common::operand::tensor(*shared_gate, DType::FP32, {n}, alignof(float), "expert return",
+                                "shared gate", exec.device());
     combine<<<dim3((output.ne[0] + 255) / 256, output.ne[1]), 256, 0, exec.stream()>>>(
         p, peers, static_cast<const float*>(shared.data), static_cast<__nv_bfloat16*>(output.data),
         output.ne[0], static_cast<const int*>(validity.valid_columns.data), validity.tokens_per_row,
-        mode == MoeEpilogue::AddResidual);
+        mode == MoeEpilogue::AddResidual,
+        shared_gate ? static_cast<const float*>(shared_gate->data) : nullptr);
     CUDA_CHECK(cudaGetLastError());
 }
 

@@ -162,11 +162,7 @@ void ParallelStartup::resolve(std::span<const distributed::wire::Payload> descri
     for (const auto& role : parallel_.topology.roles) {
         if (role.role != "expert") continue;
         const auto& group = parallel_.topology.group(role.group);
-        std::vector<std::uint32_t> replicas;
-        for (auto rank : group.members) {
-            const auto r = parallel_.topology.replica_for_rank(rank).replica_id;
-            if (replicas.empty() || replicas.back() != r) replicas.push_back(r);
-        }
+        const auto replicas = expert_replica_members(parallel_.topology, group);
         if (replicas.size() == 1) continue;
         const auto& first = parallel_.topology.replica(replicas.front());
         const auto& shape = ranks_[first.result_owner].shape;

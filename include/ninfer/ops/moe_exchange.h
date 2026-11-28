@@ -43,7 +43,8 @@ void group_expert_hits(ExpertPacket, const CompactExpertAssignments&, Tensor& cu
                        CudaExecutionView);
 // FP32 partials are already weighted. Add shared once, then apply the model epilogue.
 void return_expert_rows(const ExpertPeerBuffers*, int peers, const Tensor& shared, Tensor& output,
-                        MoeTokenValidity, MoeEpilogue, CudaExecutionView);
+                        MoeTokenValidity, MoeEpilogue, CudaExecutionView,
+                        const Tensor* shared_gate = nullptr);
 // Accumulates tx rows/hits and rx rows/hits per peer for an explicitly observed exchange.
 void observe_expert_packets(const ExpertPeerBuffers*, int peers, Tensor& totals, CudaExecutionView);
 

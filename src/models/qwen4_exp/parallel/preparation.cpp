@@ -62,7 +62,9 @@ RankPreparation::RankPreparation(const artifact::Reader& reader, std::span<const
         auto plan = std::make_shared<moe::ResidentExchangePlan>(load_->rank_plan().expert_domain, *expert_group, peer,
                                 profile->config.text.hidden, profile->config.text.moe.top_k);
         const auto bind = [&](execution::MoeProfile& layer) {
-            layer.exchange_workspace_bytes = plan->stage(layer.bank).softmax_workspace_bytes(peer, layer.math);
+            layer.exchange_workspace_bytes =
+                plan->stage(layer.bank)
+                    .softmax_workspace_bytes(peer, layer.math, profile->local.size);
         };
         for (auto& layer : profile->text.layers) bind(layer.moe);
         if (profile->mtp) bind(profile->mtp->layer.moe);
@@ -164,6 +166,13 @@ std::vector<distributed::GroupRequirements> RankPreparation::communication_requi
     auto& work         = result.collectives;
     const auto columns = std::max({batch, decode, std::size_t(shape.prefill_chunk)});
     work.push_back({Collective::AllReduce, DType::BF16, hidden, hidden * columns, hidden});
+    if (expert_requirements_) {
+        const auto block = shape.exchange.max_block_columns;
+        work.push_back({Collective::AllReduce, DType::FP32, hidden, hidden * block, hidden});
+        work.push_back({Collective::ReduceScatter, DType::FP32, hidden, hidden * block, hidden});
+        work.push_back({Collective::Broadcast, DType::BF16, hidden, hidden * block, hidden,
+                        Reduction::Sum, 0});
+    }
     const auto sequence = execution::sequence_parallel_policy(profile_->local.size);
     if (pipeline_.input) {
         const auto elements = StageBoundaryField::transfer_elements(

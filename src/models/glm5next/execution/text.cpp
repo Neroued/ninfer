@@ -218,7 +218,7 @@ void TextRun::ffn(std::uint32_t layer) {
             const auto& selected = std::get<MoeProfile>(profile);
             const moe::LayerSource source{roots_.input, roots_.output, {valid, batch_.tokens}};
             execution_.experts.run(selected.bank, selected.math, m.weights, &source,
-                                   execution_.parallel, execution_.workspace, cuda_);
+                                   execution_.parallel, execution_.workspace, cuda_, &columns_);
             return;
         }
         ops::topk_sigmoid_swiglu_moe(roots_.input, std::get<MoeProfile>(profile).math, m.weights,

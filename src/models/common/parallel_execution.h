@@ -61,6 +61,7 @@ class ParallelExecution {
 public:
     explicit ParallelExecution(ParallelBinding);
     [[nodiscard]] std::uint32_t size() const;
+    [[nodiscard]] std::uint32_t rank() const;
     void sum(Tensor&, CudaExecutionView);
     void sum_scatter(const Tensor&, Tensor&, CudaExecutionView);
     // Each U32 word has one contributing rank; all other ranks supply zero.

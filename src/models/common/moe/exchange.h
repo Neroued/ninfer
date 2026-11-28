@@ -29,9 +29,10 @@ struct ExpertExchangeStage {
     [[nodiscard]] std::size_t frame_bytes(unsigned peer) const;
     [[nodiscard]] std::size_t routed_workspace_bytes(unsigned peer,
                                                      const ops::RoutedSwiGLUProfile&) const;
-    [[nodiscard]] std::size_t softmax_workspace_bytes(unsigned peer, const ops::MoeProfile&) const;
-    [[nodiscard]] std::size_t sigmoid_workspace_bytes(unsigned peer,
-                                                      const ops::SigmoidMoeProfile&) const;
+    [[nodiscard]] std::size_t softmax_workspace_bytes(unsigned peer, const ops::MoeProfile&,
+                                                      unsigned tensor_size = 1) const;
+    [[nodiscard]] std::size_t sigmoid_workspace_bytes(unsigned peer, const ops::SigmoidMoeProfile&,
+                                                      unsigned tensor_size = 1) const;
     // The rank-load digest binds weights to the installed topology. This description lets
     // participants match layer, peer order and physical envelopes before launching any exchange.
     void encode(distributed::wire::Encoder&, int physical_columns) const;
@@ -95,6 +96,8 @@ public:
     ExpertExchange(ExpertExchangeStage, const distributed::Group&);
     [[nodiscard]] std::size_t bytes() const { return storage_.size(); }
 
+    [[nodiscard]] Tensor unit_coefficients(int columns) const { return unit_.slice(0, 0, columns); }
+
     // One ordered stream owns the frame. The call borrows the source through combine.
     // A failed or abandoned dispatch must be drained with its execution group.
     class Call {
@@ -103,7 +106,8 @@ public:
         Call& operator=(const Call&) = delete;
 
         [[nodiscard]] std::span<const ReceivedExpertRows> received() const;
-        void combine(const Tensor* shared, Tensor* observation) &&;
+        void combine(const Tensor* shared, Tensor* observation,
+                     const Tensor* shared_gate = nullptr) &&;
     private:
         friend class ExpertExchange;
 
@@ -126,16 +130,18 @@ private:
     ops::ExpertPeerBuffers* device_peers_ = nullptr;
     std::vector<ReceivedExpertRows> received_;
     std::vector<distributed::PeerTransfer> send_, back_;
+    Tensor unit_;
     bool occupied_ = false;
 };
 
 // The three callers supply distinct model mathematics. They share the same dispatch,
 // expert and combine path, including when a rank only services other sources.
 void softmax_exchange(const ExpertExchangeWork&, const Parameters&, const LayerSource*,
-                      MemoryArena&, CudaExecutionView);
+                      MemoryArena&, CudaExecutionView, ParallelExecution* = nullptr,
+                      const TokenPartition* = nullptr);
 void sigmoid_exchange(const ExpertExchangeWork&, const ops::SigmoidMoeProfile&,
-                      const ops::SigmoidMoeWeights&, const LayerSource*, bool representative,
-                      ParallelExecution*, MemoryArena&, CudaExecutionView);
+                      const ops::SigmoidMoeWeights&, const LayerSource*, ParallelExecution*,
+                      MemoryArena&, CudaExecutionView, const TokenPartition* = nullptr);
 void routed_exchange(const ExpertExchangeWork&, const ops::RoutedSwiGLUProfile&,
                      const ops::CudaSwiGLUExperts&, const LayerSource*, const ops::ExpertRoutes*,
                      const Tensor* shared, MemoryArena&, CudaExecutionView);

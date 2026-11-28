@@ -8,20 +8,22 @@ namespace ninfer::models::moe {
 
 void SigmoidPass::run(ExpertBankId bank, const ops::SigmoidMoeProfile& p,
                       const ops::SigmoidMoeWeights& weights, const LayerSource* source,
-                      ParallelExecution* tensor, MemoryArena& arena, CudaExecutionView cuda) const {
+                      ParallelExecution* tensor, MemoryArena& arena, CudaExecutionView cuda,
+                      const TokenPartition* partition) const {
 #if NINFER_ENABLE_DISTRIBUTED
     auto step = exchange->stage(bank, columns);
-    sigmoid_exchange(step, p, weights, source, representative, tensor, arena, cuda);
+    sigmoid_exchange(step, p, weights, source, tensor, arena, cuda, partition);
 #else
     throw std::logic_error("sigmoid expert exchange requires distributed execution");
 #endif
 }
 
 void resident_layer(const Parameters& p, const LayerSource* src, const ExpertExchangeWork* step,
-                    MemoryArena& workspace, CudaExecutionView cuda) {
+                    MemoryArena& workspace, CudaExecutionView cuda, ParallelExecution* tensor,
+                    const TokenPartition* partition) {
     if (step) {
 #if NINFER_ENABLE_DISTRIBUTED
-        softmax_exchange(*step, p, src, workspace, cuda);
+        softmax_exchange(*step, p, src, workspace, cuda, tensor, partition);
         return;
 #else
         throw std::invalid_argument("expert exchange requires distributed execution");

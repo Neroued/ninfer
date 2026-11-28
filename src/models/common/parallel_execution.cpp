@@ -80,6 +80,14 @@ std::uint32_t ParallelExecution::size() const {
 #endif
 }
 
+std::uint32_t ParallelExecution::rank() const {
+#if NINFER_ENABLE_DISTRIBUTED
+    return binding_.group->rank();
+#else
+    return 0;
+#endif
+}
+
 void ParallelExecution::sum(Tensor& value, CudaExecutionView cuda) {
 #if NINFER_ENABLE_DISTRIBUTED
     ops::all_reduce(value, value, distributed::Reduction::Sum, *binding_.group, cuda);

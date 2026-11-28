@@ -22,10 +22,6 @@ ParallelStartup::ParallelStartup(const artifact::Reader& reader, const EngineOpt
     frames_ = runtime::ExecutionCapacity::pipeline(options.deployment->parallel.pp,
                                                    batches_->resident_capacity(),
                                                    options.purpose == EnginePurpose::Generation);
-    if (options.deployment->parallel.tp > 1 &&
-        options.deployment->parallel.ep > options.deployment->parallel.tp)
-        throw std::invalid_argument(
-            "Qwen4Exp expert dispatch from replicated TP activations requires a unique source");
     if (options.context_cache.host_capacity_bytes.value_or(0) > 0)
         throw std::invalid_argument(
             "distributed execution requires device-resident Context storage");
@@ -163,10 +159,9 @@ void ParallelStartup::resolve(std::span<const distributed::wire::Payload> descri
     memberships_.assign(plans_.size(), {});
     for (const auto& role : topology.roles) {
         if (role.role != "expert") continue;
-        const auto& members = topology.group(role.group).members;
-        if (topology.replica_for_rank(members.front()).contains(members.back())) continue;
-        const auto& shape =
-            plans_.at(topology.replica_for_rank(members.front()).replica_id).session.shape;
+        const auto replicas = expert_replica_members(topology, topology.group(role.group));
+        if (replicas.size() == 1) continue;
+        const auto& shape      = plans_.at(replicas.front()).session.shape;
         const auto max_control = definition_->resources().text.control_tokens->size();
         const auto windows =
             std::max<std::size_t>(1, (max_control + shape.prefill_chunk - 1) / shape.prefill_chunk);
@@ -180,9 +175,9 @@ void ParallelStartup::resolve(std::span<const distributed::wire::Payload> descri
             limits.push_back({d, std::move(extents)});
         }
         auto domain =
-            std::make_shared<runtime::CollectiveStepDomain>(members.size(), std::move(limits));
-        for (std::size_t i = 0; i < members.size(); ++i) {
-            const auto r = topology.replica_for_rank(members[i]).replica_id;
+            std::make_shared<runtime::CollectiveStepDomain>(replicas.size(), std::move(limits));
+        for (std::size_t i = 0; i < replicas.size(); ++i) {
+            const auto r = replicas[i];
             if (plans_[r].session.shape != shape || memberships_[r].domain)
                 throw std::invalid_argument(
                     "Qwen4Exp replicas disagree on expert service capacity or membership");

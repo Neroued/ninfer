@@ -86,6 +86,16 @@ std::vector<IndexRange> partition_pipeline_layers(std::span<const PipelineLayerD
     return result;
 }
 
+std::vector<std::uint32_t> expert_replica_members(const distributed::ExecutionTopology& topology,
+                                                  const distributed::GroupDescription& group) {
+    std::vector<std::uint32_t> replicas;
+    for (auto rank : group.members) {
+        const auto id = topology.replica_for_rank(rank).replica_id;
+        if (std::ranges::find(replicas, id) == replicas.end()) replicas.push_back(id);
+    }
+    return replicas;
+}
+
 void add_expert_roles(distributed::ExecutionTopology& topology) {
     const RankPlacement first(topology.ranks.front());
     const auto lanes = first.expert_slice().size;

@@ -269,7 +269,7 @@ void RankProgramImpl::forward_packed_prefill(const ForwardWork& work) {
 }
 
 moe::SigmoidPass RankProgramImpl::expert_pass(int columns) {
-    return {expert_exchange.get(), columns, parameters.profile->local.rank == 0};
+    return {expert_exchange.get(), columns};
 }
 
 void RankProgramImpl::serve_expert_pass(bool draft, std::uint32_t columns) {

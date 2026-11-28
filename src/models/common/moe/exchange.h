@@ -85,12 +85,6 @@ private:
     std::size_t bytes_ = 0;
 };
 
-// Inputs received from one source and its destination for weighted FP32 row results.
-struct ReceivedExpertRows {
-    ops::ExpertPacket packet;
-    Tensor counts, hidden, partial;
-};
-
 class ExpertExchange {
 public:
     ExpertExchange(ExpertExchangeStage, const distributed::Group&);
@@ -105,7 +99,7 @@ public:
         Call(const Call&)            = delete;
         Call& operator=(const Call&) = delete;
 
-        [[nodiscard]] std::span<const ReceivedExpertRows> received() const;
+        [[nodiscard]] ops::ExpertPacketBatch received() const;
         void combine(const Tensor* shared, Tensor* observation,
                      const Tensor* shared_gate = nullptr) &&;
     private:
@@ -128,7 +122,6 @@ private:
     const distributed::Group& group_;
     DeviceBuffer storage_;
     ops::ExpertPeerBuffers* device_peers_ = nullptr;
-    std::vector<ReceivedExpertRows> received_;
     std::vector<distributed::PeerTransfer> send_, back_;
     Tensor unit_;
     bool occupied_ = false;

@@ -250,10 +250,9 @@ ExpertExchange::ExpertExchange(ExpertExchangeStage s, const distributed::Group& 
         PacketLayout incoming(h, b, hit_capacity(b, st.top_k, st.slots[self]));
         ops::ExpertPeerBuffers v{
             PacketLayout(h, b, hit_capacity(b, st.top_k, st.slots[p])).view(tx), incoming.view(rx),
-            static_cast<int*>(r.inverse.bind(arena).data), static_cast<float*>(returned.data)};
+            static_cast<int*>(r.inverse.bind(arena).data), static_cast<float*>(returned.data),
+            static_cast<float*>(result.data)};
         host.push_back(v);
-        received_.push_back({v.receive, incoming.counts.bind(rx), incoming.hidden.bind(rx),
-                             Tensor(result, DType::FP32, {h, b})});
         if (p != self) {
             send_.push_back({p, tx, rx});
             back_.push_back({p, result, returned});
@@ -265,13 +264,13 @@ ExpertExchange::ExpertExchange(ExpertExchangeStage s, const distributed::Group& 
 
 namespace {
 struct GroupScratch {
-    Tensor offsets, rows, weights, cursors;
+    Tensor counts, offsets, rows, weights, cursors;
 };
 
 template <class Arena>
 GroupScratch group_scratch(Arena& a, int slots, int m) {
-    return {a.alloc(DType::I32, {slots + 1}), a.alloc(DType::I32, {m}), a.alloc(DType::FP32, {m}),
-            a.alloc(DType::I32, {slots})};
+    return {a.alloc(DType::I32, {2}), a.alloc(DType::I32, {slots + 1}), a.alloc(DType::I32, {m}),
+            a.alloc(DType::FP32, {m}), a.alloc(DType::I32, {slots})};
 }
 
 struct SourceScratch {
@@ -290,7 +289,7 @@ SourceScratch source_scratch(Arena& a, int h, int k, int n, bool gate = true) {
 std::size_t ExpertExchangeStage::routed_workspace_bytes(unsigned peer,
                                                         const ops::RoutedSwiGLUProfile& p) const {
     const int slots = this->slots.at(peer), b = block_columns;
-    const int m = hit_capacity(b, p.top_k, slots);
+    const int m = dimension(members.size() * hit_capacity(b, p.top_k, slots));
     WorkspaceLayoutBuilder l;
     (void)l.alloc(DType::I32, {b}); // Worst-case block validity crossing a packed row boundary.
     group_scratch(l, slots, m);
@@ -318,7 +317,8 @@ std::size_t ExpertExchangeStage::softmax_workspace_bytes(unsigned peer, const op
     const auto shared =
         ops::routed_swiglu_workspace_capacity_bytes(p.routed, p.shared, ops::ExpertSubsetKind::None,
                                                     DType::FP32, ops::MoeEpilogue::Write, 1, b);
-    const int slots = this->slots.at(peer), m = hit_capacity(b, p.routed.top_k, slots);
+    const int slots = this->slots.at(peer);
+    const int m = dimension(members.size() * hit_capacity(b, p.routed.top_k, slots));
     {
         auto scope = l.scope();
         (void)l.alloc_bytes(std::max(route, shared));
@@ -342,7 +342,7 @@ std::size_t ExpertExchangeStage::sigmoid_workspace_bytes(unsigned peer,
         const auto shared = ops::swiglu_workspace_capacity_bytes(p.shared, 1, b, DType::FP32);
         (void)l.alloc_bytes(std::max(route, shared));
     }
-    const auto hits = hit_capacity(b, top_k, local);
+    const auto hits = dimension(members.size() * hit_capacity(b, top_k, local));
     group_scratch(l, local, hits);
     (void)l.alloc_bytes(ops::compact_routed_swiglu_workspace_bytes(p.routed, hits));
     return l.peak_bytes();
@@ -399,9 +399,10 @@ ExpertExchange::Call ExpertExchange::dispatch(const DeviceExpertPlacement& place
     return Call(*this, source, exec);
 }
 
-std::span<const ReceivedExpertRows> ExpertExchange::Call::received() const {
+ops::ExpertPacketBatch ExpertExchange::Call::received() const {
     if (!frame_) throw std::logic_error("expert dispatch has been consumed");
-    return frame_->received_;
+    return {frame_->device_peers_, dimension(frame_->group_.size()), frame_->stage_.block_columns,
+            exec_.device()};
 }
 
 void ExpertExchange::Call::combine(const Tensor* shared, Tensor* observation,
@@ -421,20 +422,18 @@ void ExpertExchange::Call::combine(const Tensor* shared, Tensor* observation,
 }
 
 namespace {
-void run_experts(std::span<const ReceivedExpertRows> received, const DeviceExpertPlacement& place,
+void run_experts(ops::ExpertPacketBatch received, const DeviceExpertPlacement& place,
                  const ops::RoutedSwiGLUProfile& profile, const ops::CudaSwiGLUExperts& weights,
                  MemoryArena& arena, CudaExecutionView exec) {
     const int slots = place.logical_ids.ne[0];
-    const int m     = hit_capacity(place.stage.block_columns, profile.top_k, slots);
+    const int m     = dimension(std::uint64_t(received.segments) *
+                                hit_capacity(received.columns, profile.top_k, slots));
     auto scope      = arena.scope();
     auto scratch    = group_scratch(arena, slots, m);
-    for (const auto& peer : received) {
-        ops::CompactExpertAssignments grouped{peer.counts, scratch.offsets, place.logical_ids,
-                                              scratch.rows, scratch.weights};
-        ops::group_expert_hits(peer.packet, grouped, scratch.cursors, exec);
-        auto partial = peer.partial;
-        ops::compact_routed_swiglu(peer.hidden, profile, weights, grouped, partial, arena, exec);
-    }
+    ops::CompactExpertAssignments grouped{scratch.counts, scratch.offsets, place.logical_ids,
+                                          scratch.rows, scratch.weights};
+    ops::group_expert_hits(received, grouped, scratch.cursors, exec);
+    ops::compact_routed_swiglu(received, profile, weights, grouped, arena, exec);
 }
 
 void routed_block(const ExpertExchangeWork& work, const ops::RoutedSwiGLUProfile& profile,

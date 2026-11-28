@@ -1,4 +1,4 @@
-#include "ninfer/ops/moe_compact.h"
+#include "ninfer/ops/moe_exchange.h"
 #include "core/layout.h"
 #include "ops/moe/operands.h"
 #include "ops/common/cuda/reduce.cuh"
@@ -67,6 +67,38 @@ __global__ void clear_partial(float* out, const int* counts, int hidden) {
         out[i] = 0;
 }
 
+struct ContiguousRows {
+    const __nv_bfloat16* hidden;
+    float* partial;
+
+    __device__ const __nv_bfloat16* input(int row, int h) const {
+        return hidden + std::int64_t(row) * h;
+    }
+
+    __device__ float* output(int row, int h) const { return partial + std::int64_t(row) * h; }
+};
+
+struct PacketRows {
+    ExpertPacketBatch batch;
+
+    __device__ const __nv_bfloat16* input(int row, int h) const {
+        return reinterpret_cast<const __nv_bfloat16*>(
+                   batch.peers[row / batch.columns].receive.hidden) +
+               std::int64_t(row % batch.columns) * h;
+    }
+
+    __device__ float* output(int row, int h) const {
+        return batch.peers[row / batch.columns].partial + std::int64_t(row % batch.columns) * h;
+    }
+};
+
+__global__ void clear_packet_partials(ExpertPacketBatch batch, int h) {
+    const auto peer = batch.peers[blockIdx.y];
+    const auto n    = std::int64_t(peer.receive.counts[0]) * h;
+    for (std::int64_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
+        peer.partial[i] = 0;
+}
+
 struct Matrix {
     const unsigned char* codes;
     const unsigned char* scales;
@@ -111,16 +143,20 @@ __device__ __forceinline__ float dot(float4 a, float4 b, float acc) {
     return fmaf(a.w, b.w, fmaf(a.z, b.z, fmaf(a.y, b.y, fmaf(a.x, b.x, acc))));
 }
 
-template <bool Gate, int Block>
+template <bool Gate, int Block, class RowStorage>
 __global__ void contract(const int* job_count, const Job* jobs, const int* rows, const float* coeff,
-                         ExpertMatrixDeviceView bank, const __nv_bfloat16* hidden, float* product,
-                         float* partial, int h, int intermediate, float clamp) {
+                         ExpertMatrixDeviceView bank, RowStorage storage, float* product, int h,
+                         int intermediate, float clamp) {
     const int r = blockIdx.x * 4 + threadIdx.x / 32, lane = threadIdx.x % 32;
     const int k = Gate ? h : intermediate;
     for (int j = blockIdx.y; j < *job_count; j += gridDim.y) {
         const auto job = jobs[j];
         const auto w   = resolve<Block>(bank, job.expert);
         float sums[Tile]{}, ups[Tile]{};
+        const __nv_bfloat16* inputs[Tile];
+        if constexpr (Gate)
+            for (int t = 0; t < job.end - job.begin; ++t)
+                inputs[t] = storage.input(rows[job.begin + t], h);
         for (int c = lane * 4; c < k; c += 128) {
             const float4 a = weights<Block>(w, r, c, k);
             float4 b;
@@ -129,7 +165,7 @@ __global__ void contract(const int* job_count, const Job* jobs, const int* rows,
                 const int m = job.begin + t;
                 float4 x;
                 if constexpr (Gate) {
-                    const auto* p = hidden + std::int64_t(rows[m]) * h + c;
+                    const auto* p = inputs[t] + c;
                     const auto v  = *reinterpret_cast<const uint2*>(p);
                     const auto lo = common::bf16x2_bits_to_float2(v.x),
                                hi = common::bf16x2_bits_to_float2(v.y);
@@ -152,7 +188,7 @@ __global__ void contract(const int* job_count, const Job* jobs, const int* rows,
                 }
                 if (!lane) product[std::int64_t(m) * intermediate + r] = common::silu(value) * up;
             } else if (!lane) {
-                atomicAdd(partial + std::int64_t(rows[m]) * h + r, value * coeff[m]);
+                atomicAdd(storage.output(rows[m], h) + r, value * coeff[m]);
             }
         }
     }
@@ -166,17 +202,16 @@ std::size_t compact_routed_swiglu_workspace_bytes(const RoutedSwiGLUProfile& p, 
     return layout.peak_bytes();
 }
 
-void compact_routed_swiglu(const Tensor& hidden, const RoutedSwiGLUProfile& p,
-                           const CudaSwiGLUExperts& experts, const CompactExpertAssignments& a,
-                           Tensor& partial, MemoryArena& workspace, CudaExecutionView execution) {
+namespace {
+template <class RowStorage>
+void execute_compact(RowStorage rows, int row_capacity, const RoutedSwiGLUProfile& p,
+                     const CudaSwiGLUExperts& experts, const CompactExpertAssignments& a,
+                     detail::MoeOperands& op, MemoryArena& workspace, CudaExecutionView execution) {
     const int slots = a.logical_ids.ne[0], capacity = a.rows.ne[0], h = p.ffn.hidden,
               i = p.ffn.intermediate;
     validate(p, capacity);
-    if (slots <= 0 || slots > p.experts || slots == INT_MAX || partial.dtype != DType::FP32)
-        throw std::invalid_argument("compact routed SwiGLU: invalid slots or partial output");
-    detail::MoeOperands op("compact routed SwiGLU", execution);
-    const auto u = op.input(hidden, h);
-    op.output(partial, h, u, MoeEpilogue::Write);
+    if (slots <= 0 || slots > p.experts || slots == INT_MAX)
+        throw std::invalid_argument("compact routed SwiGLU: invalid slots");
     op.vector_input(a.counts, DType::I32, 2, "compact counts");
     op.vector_input(a.offsets, DType::I32, slots + 1, "expert offsets");
     op.vector_input(a.logical_ids, DType::I32, slots, "logical expert IDs");
@@ -194,18 +229,20 @@ void compact_routed_swiglu(const Tensor& hidden, const RoutedSwiGLUProfile& p,
     make_jobs<<<(slots + 127) / 128, 128, 0, stream>>>(static_cast<const int*>(a.offsets.data),
                                                        static_cast<const int*>(a.logical_ids.data),
                                                        slots, s.count, s.jobs);
-    clear_partial<<<std::min<std::int64_t>(execution.multiprocessor_count() * 4,
-                                           (partial.numel() + 255) / 256),
-                    256, 0, stream>>>(static_cast<float*>(partial.data),
-                                      static_cast<const int*>(a.counts.data), h);
+    const auto grid = std::min<std::int64_t>(execution.multiprocessor_count() * 4,
+                                             (std::int64_t(row_capacity) * h + 255) / 256);
+    if constexpr (std::is_same_v<RowStorage, PacketRows>)
+        clear_packet_partials<<<dim3(grid, rows.batch.segments), 256, 0, stream>>>(rows.batch, h);
+    else
+        clear_partial<<<grid, 256, 0, stream>>>(rows.partial,
+                                                static_cast<const int*>(a.counts.data), h);
     const auto run = [&]<int Block, bool Gate>() {
         const int n = Gate ? i : h;
         contract<Gate, Block><<<dim3(n / 4, std::min(capacity, 32)), 128, 0, stream>>>(
             s.count, s.jobs, static_cast<const int*>(a.rows.data),
             static_cast<const float*>(a.coefficients.data),
-            Gate ? experts.bank.gate_up : experts.bank.down,
-            static_cast<const __nv_bfloat16*>(hidden.data), s.product,
-            static_cast<float*>(partial.data), h, i, p.ffn.clamp_limit.value_or(0));
+            Gate ? experts.bank.gate_up : experts.bank.down, rows, s.product, h, i,
+            p.ffn.clamp_limit.value_or(0));
     };
     const auto both = [&]<int Block>() {
         run.template operator()<Block, true>();
@@ -218,5 +255,30 @@ void compact_routed_swiglu(const Tensor& hidden, const RoutedSwiGLUProfile& p,
     else
         both.template operator()<128>();
     CUDA_CHECK(cudaGetLastError());
+}
+} // namespace
+
+void compact_routed_swiglu(const Tensor& hidden, const RoutedSwiGLUProfile& p,
+                           const CudaSwiGLUExperts& experts, const CompactExpertAssignments& a,
+                           Tensor& partial, MemoryArena& arena, CudaExecutionView exec) {
+    if (partial.dtype != DType::FP32)
+        throw std::invalid_argument("compact routed SwiGLU: expected FP32 partial output");
+    detail::MoeOperands op("compact routed SwiGLU", exec);
+    const int u = op.input(hidden, p.ffn.hidden);
+    op.output(partial, p.ffn.hidden, u, MoeEpilogue::Write);
+    execute_compact(ContiguousRows{static_cast<const __nv_bfloat16*>(hidden.data),
+                                   static_cast<float*>(partial.data)},
+                    u, p, experts, a, op, arena, exec);
+}
+
+void compact_routed_swiglu(ExpertPacketBatch batch, const RoutedSwiGLUProfile& p,
+                           const CudaSwiGLUExperts& experts, const CompactExpertAssignments& a,
+                           MemoryArena& arena, CudaExecutionView exec) {
+    if (!batch.peers || batch.device != exec.device() || batch.columns <= 0 ||
+        batch.segments <= 0 || batch.segments > 65535 ||
+        std::int64_t(batch.segments) * batch.columns > INT_MAX)
+        throw std::invalid_argument("compact routed SwiGLU: invalid receive segments");
+    detail::MoeOperands op("segmented compact routed SwiGLU", exec);
+    execute_compact(PacketRows{batch}, batch.columns, p, experts, a, op, arena, exec);
 }
 } // namespace ninfer::ops

@@ -56,7 +56,12 @@ __global__ void copy_rows(const std::uint16_t* hidden, int h, ExpertPeerBuffers*
     for (int i = threadIdx.x; i < h / 8; i += blockDim.x) dst[i] = src[i];
 }
 
-__global__ void histogram(ExpertPacket p, int* counts) {
+__global__ void histogram(ExpertPacketBatch batch, int* counts, int* totals) {
+    const auto p = batch.peers[blockIdx.y].receive;
+    if (!blockIdx.x && !threadIdx.x) {
+        atomicAdd(totals, p.counts[0]);
+        atomicAdd(totals + 1, p.counts[1]);
+    }
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < p.counts[1];
          i += gridDim.x * blockDim.x)
         atomicAdd(counts + p.hits[i].slot, 1);
@@ -77,12 +82,13 @@ __global__ void scan_slots(int* counts, int* offsets, int slots) {
     if (!threadIdx.x) offsets[slots] = base;
 }
 
-__global__ void scatter(ExpertPacket p, int* cursors, int* rows, float* coefficients) {
+__global__ void scatter(ExpertPacketBatch batch, int* cursors, int* rows, float* coefficients) {
+    const auto p = batch.peers[blockIdx.y].receive;
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < p.counts[1];
          i += gridDim.x * blockDim.x) {
         const auto hit       = p.hits[i];
         const int target     = atomicAdd(cursors + hit.slot, 1);
-        rows[target]         = hit.row;
+        rows[target]         = blockIdx.y * batch.columns + hit.row;
         coefficients[target] = hit.coefficient;
     }
 }
@@ -169,10 +175,12 @@ void pack_expert_rows(const Tensor* x, const ExpertRoutes* routes, MoeTokenValid
     CUDA_CHECK(cudaGetLastError());
 }
 
-void group_expert_hits(ExpertPacket p, const CompactExpertAssignments& a, Tensor& cursors,
+void group_expert_hits(ExpertPacketBatch batch, const CompactExpertAssignments& a, Tensor& cursors,
                        CudaExecutionView exec) {
     const int slots = a.logical_ids.ne[0], capacity = a.rows.ne[0];
-    if (!p.hits || !p.counts || p.counts != a.counts.data || slots <= 0 || slots == INT_MAX ||
+    if (!batch.peers || batch.device != exec.device() || batch.segments <= 0 ||
+        batch.columns <= 0 || batch.segments > 65535 ||
+        std::int64_t(batch.columns) * batch.segments > INT_MAX || slots <= 0 || slots == INT_MAX ||
         capacity <= 0)
         throw std::invalid_argument("invalid compact expert grouping geometry");
     common::operand::tensor(a.counts, DType::I32, {2}, 4, "expert grouping", "counts",
@@ -188,10 +196,12 @@ void group_expert_hits(ExpertPacket p, const CompactExpertAssignments& a, Tensor
     const int grid = std::min((capacity + 127) / 128, 4 * exec.multiprocessor_count());
     auto* c        = static_cast<int*>(cursors.data);
     CUDA_CHECK(cudaMemsetAsync(c, 0, slots * sizeof(int), exec.stream()));
-    histogram<<<grid, 128, 0, exec.stream()>>>(p, c);
+    CUDA_CHECK(cudaMemsetAsync(a.counts.data, 0, a.counts.bytes(), exec.stream()));
+    const dim3 blocks(grid, batch.segments);
+    histogram<<<blocks, 128, 0, exec.stream()>>>(batch, c, static_cast<int*>(a.counts.data));
     scan_slots<<<1, 128, 0, exec.stream()>>>(c, static_cast<int*>(a.offsets.data), slots);
-    scatter<<<grid, 128, 0, exec.stream()>>>(p, c, static_cast<int*>(a.rows.data),
-                                             static_cast<float*>(a.coefficients.data));
+    scatter<<<blocks, 128, 0, exec.stream()>>>(batch, c, static_cast<int*>(a.rows.data),
+                                               static_cast<float*>(a.coefficients.data));
     CUDA_CHECK(cudaGetLastError());
 }
 

@@ -25,6 +25,15 @@ struct ExpertPeerBuffers {
     ExpertPacket send, receive;
     std::int32_t* source_to_row; // Sender-private inverse, -1 for no hit on this peer.
     float* returned;
+    float* partial; // Weighted rows produced by this rank, sent back to the source.
+};
+
+// A compute window over device-resident receive segments. A grouped row ID is
+// segment * columns + packet_row. Each segment has its own valid prefix.
+struct ExpertPacketBatch {
+    const ExpertPeerBuffers* peers;
+    int segments, columns;
+    Device device;
 };
 
 struct ExpertDispatchView {
@@ -38,9 +47,13 @@ void expert_block_validity(MoeTokenValidity, int base, Tensor& flags, CudaExecut
 void pack_expert_rows(const Tensor* hidden, const ExpertRoutes*, MoeTokenValidity,
                       ExpertDispatchView, ExpertPeerBuffers* device_peers, int peers,
                       int block_columns, CudaExecutionView);
-// Build the expert-major prefix from the incoming compact hits, exactly once per packet.
-void group_expert_hits(ExpertPacket, const CompactExpertAssignments&, Tensor& cursors,
+// Group every source in the window by local expert, retaining its return row.
+void group_expert_hits(ExpertPacketBatch, const CompactExpertAssignments&, Tensor& cursors,
                        CudaExecutionView);
+// Consume the segmented BF16 rows directly and write each weighted FP32 partial
+// into its source's return segment. No concatenation or host count read is required.
+void compact_routed_swiglu(ExpertPacketBatch, const RoutedSwiGLUProfile&, const CudaSwiGLUExperts&,
+                           const CompactExpertAssignments&, MemoryArena&, CudaExecutionView);
 // FP32 partials are already weighted. Add shared once, then apply the model epilogue.
 void return_expert_rows(const ExpertPeerBuffers*, int peers, const Tensor& shared, Tensor& output,
                         MoeTokenValidity, MoeEpilogue, CudaExecutionView,

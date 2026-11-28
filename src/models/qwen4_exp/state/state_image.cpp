@@ -2,14 +2,16 @@
 
 namespace ninfer::models::qwen4_exp {
 StateLayout plan_state_image(const Config& config, const GdnConfig& gdn,
-                             LinearStateDType linear_state_dtype) {
+                             LinearStateDType linear_state_dtype, bool owns_ple,
+                             bool output_stage) {
     const auto& c = config.text;
     StateImageBuilder b;
     StateLayout out;
-    out.gdn        = plan_linear_attention_state(
-        b, {c.gdn_layers, dimension(gdn.conv_channels()), dimension(gdn.conv_width - 1),
-            dimension(gdn.value_heads), dimension(gdn.value_dim), dimension(gdn.key_dim),
-            DType::BF16, to_dtype(linear_state_dtype)});
+    if (c.gdn_layers)
+        out.gdn = plan_linear_attention_state(
+            b, {c.gdn_layers, dimension(gdn.conv_channels()), dimension(gdn.conv_width - 1),
+                dimension(gdn.value_heads), dimension(gdn.value_dim), dimension(gdn.key_dim),
+                DType::BF16, to_dtype(linear_state_dtype)});
     const auto qsa = [&](std::uint32_t layers) {
         return QsaTailLayout{
             b.add(DType::BF16,
@@ -17,11 +19,13 @@ StateLayout plan_state_image(const Config& config, const GdnConfig& gdn,
                   "QSA raw tail"),
             b.add(DType::I32, {3}, layers, "QSA block coordinates")};
     };
-    out.main_qsa = qsa(c.qsa_layers);
-    out.ple_history =
-        b.add(DType::BF16, {dimension(c.residual_width()), dimension(c.ple.history_columns())}, 1,
-              "PLE history");
-    out.sample_hidden = b.add(DType::BF16, {dimension(c.hidden)}, 1, "Main sample hidden");
+    if (c.qsa_layers) out.main_qsa = qsa(c.qsa_layers);
+    if (owns_ple)
+        out.ple_history =
+            b.add(DType::BF16, {dimension(c.residual_width()), dimension(c.ple.history_columns())},
+                  1, "PLE history");
+    if (output_stage)
+        out.sample_hidden = b.add(DType::BF16, {dimension(c.hidden)}, 1, "Main sample hidden");
     if (config.mtp) {
         out.conditioning =
             b.add(DType::BF16, {dimension(c.residual_width())}, 1, "Main MTP conditioning");
@@ -32,7 +36,9 @@ StateLayout plan_state_image(const Config& config, const GdnConfig& gdn,
 }
 
 StateViews::StateViews(MemorySpan backing, const StateLayout& layout)
-    : layout_(layout), storage_(backing, layout.images), gdn_(storage_, layout.gdn) {}
+    : layout_(layout), storage_(backing, layout.images) {
+    if (layout.gdn.spec.layers) gdn_.emplace(storage_, layout.gdn);
+}
 
 ops::QsaTailStateView StateViews::main_tail(Tensor offsets) const {
     return {storage_.field(layout_.main_qsa.raw_keys, offsets),

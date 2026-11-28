@@ -11,8 +11,8 @@ namespace {
 class Describe {
 public:
     Describe(const ModelDefinition& source, std::span<const BoundWeight> weights,
-             std::span<const moe::ExpertDescription> experts)
-        : source_(source), weights_(weights), experts_(experts) {}
+             std::span<const moe::ExpertDescription> experts, const RankPlan& rank)
+        : source_(source), weights_(weights), experts_(experts), rank_(rank) {}
 
     ops::WeightInput input(WeightId id) const { return weight_input(weights_, id); }
 
@@ -80,25 +80,27 @@ public:
         gu.include(input(m.gate));
         gu.include(input(m.up));
         down.include(input(m.down));
-        const auto routed =
-            experts_.empty()
-                ? ops::routed_swiglu_profile(bank.gate_up.layout, bank.down.layout,
-                                             source_.config().text.moe.top_k, gu.policy(),
-                                             down.policy())
-                : moe::describe_experts(experts_[m.bank.index], source_.config().text.moe.top_k,
-                                        gu.policy(), down.policy());
-        out.moe = {
+        const auto routed = experts_.empty()
+                                ? ops::routed_swiglu_profile(bank.gate_up.layout, bank.down.layout,
+                                                             source_.config().text.moe.top_k,
+                                                             gu.policy(), down.policy())
+                                : moe::describe_experts(experts_[rank_.local_bank(m.bank)],
+                                                        source_.config().text.moe.top_k,
+                                                        gu.policy(), down.policy());
+        out.moe           = {
             {routed,
              ops::swiglu_profile(linear({m.shared_gate, m.shared_up}), linear({m.shared_down}))},
             m.bank,
             {gu.calibration(routed.ffn.gate_up_type), down.calibration(routed.ffn.down_type)},
-            experts_.empty() ? ops::ExpertSubsetKind::All : experts_[m.bank.index].subset};
+            experts_.empty() ? ops::ExpertSubsetKind::All
+                                       : experts_[rank_.local_bank(m.bank)].subset};
         return out;
     }
 private:
     const ModelDefinition& source_;
     std::span<const BoundWeight> weights_;
     std::span<const moe::ExpertDescription> experts_;
+    const RankPlan& rank_;
 };
 
 std::shared_ptr<ModelProfile> describe(const ModelDefinition& source,
@@ -107,6 +109,19 @@ std::shared_ptr<ModelProfile> describe(const ModelDefinition& source,
                                        const RankPlan& rank) {
     auto out                 = std::make_shared<ModelProfile>();
     out->config              = source.config();
+    out->stage               = rank.placement.pp;
+    out->layers              = rank.layers;
+    out->owns_ple            = rank.owns_ple;
+    auto& c                  = out->config.text;
+    out->after_ple           = rank.layers.begin > c.ple.layer;
+    const auto local =
+        std::span(source.config().text.layers).subspan(rank.layers.begin, rank.layers.size);
+    c.layers.assign(local.begin(), local.end());
+    c.gdn_layers = c.qsa_layers = 0;
+    for (auto& layer : c.layers)
+        layer.state_index = layer.mixer == MixerKind::Gdn ? c.gdn_layers++ : c.qsa_layers++;
+    c.ple.layer =
+        rank.owns_ple ? c.ple.layer - rank.layers.begin : (out->after_ple ? 0U : rank.layers.size);
     out->options             = source.options();
     out->ple_placement       = rank.ple_placement;
     out->local               = {out->config.text.gdn, out->config.text.qsa,   rank.vocabulary.begin,
@@ -117,18 +132,19 @@ std::shared_ptr<ModelProfile> describe(const ModelDefinition& source,
     out->local.qsa.kv_heads    = rank.qsa_kv.size;
     out->public_tokens         = source.resources().text.public_token_count;
     out->control_token_limit   = source.resources().text.control_tokens->size();
-    const Describe d(source, weights, experts);
+    const Describe d(source, weights, experts, rank);
     const auto& w = source.weights();
-    for (const auto& layer : w.text.layers) out->text.layers.push_back(d.block(layer, false));
-    out->text.final_hc = d.final_hc(w.text.final_hc);
-    out->text.ple      = d.linear({w.text.ple.key, w.text.ple.value});
-    out->text.head     = d.linear({w.text.head});
+    for (const auto& layer : std::span(w.text.layers).subspan(rank.layers.begin, rank.layers.size))
+        out->text.layers.push_back(d.block(layer, false));
+    if (out->output_stage()) out->text.final_hc = d.final_hc(w.text.final_hc);
+    if (out->owns_ple) out->text.ple = d.linear({w.text.ple.key, w.text.ple.value});
+    if (out->output_stage()) out->text.head = d.linear({w.text.head});
     if (w.mtp) {
         const auto& m = *w.mtp;
         out->mtp      = {d.linear({m.fc_embedding}), d.linear({m.fc_hidden}), d.linear({m.head}),
                          d.block(m.layer, true),     d.final_hc(m.final_hc),  d.history(m.layer)};
     }
-    if (w.vision)
+    if (w.vision && out->input_stage())
         out->vision = qwen::describe_vision(*w.vision,
                                             [&](WeightId id) { return weight_input(weights, id); });
     if (experts.empty())
@@ -146,7 +162,7 @@ std::shared_ptr<const ModelProfile> describe_model(const ModelDefinition& source
 std::shared_ptr<ModelProfile>
 describe_model(const ModelDefinition& source, std::span<const BoundWeight> weights,
                std::span<const moe::ExpertDescription> experts, const RankPlan& rank) {
-    if (experts.size() != source.expert_banks().size())
+    if (experts.size() != rank.experts.size())
         throw std::invalid_argument("Qwen4Exp local expert descriptions are incomplete");
     return describe(source, weights, experts, rank);
 }

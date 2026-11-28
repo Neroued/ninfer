@@ -72,6 +72,7 @@ ResolvedLoadPlan resolve_rank_load(const artifact::Reader& reader,
 std::unique_ptr<ModelShard> materialize_model(ResolvedLoadPlan&& plan, DeviceContext& device,
                                               const StartupObserver* observer) {
     if (!plan.definition_) throw artifact::ArtifactError("load plan was already consumed");
+    if (!plan.rank_.owns_ple) return materialize_weights(std::move(plan), device, observer);
     auto table = plan_ple_table(*plan.reader_, *plan.definition_, plan.rank_.ple_placement,
                                 plan.rank_.placement.tp, device.device(), std::move(plan.ple_));
     auto model = materialize_weights(std::move(plan), device, observer);

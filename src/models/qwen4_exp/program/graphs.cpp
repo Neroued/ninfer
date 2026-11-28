@@ -106,8 +106,10 @@ execution::TextOutputs main_outputs(RankProgramImpl& p, execution::BatchView bat
     auto& r        = p.resources;
     const auto& io = r.buffers();
     const auto& c  = p.parameters.profile->config.text;
-    execution::TextOutputs output{
-        r.packed(io.pending_sample, {dimension(c.hidden), batch.tokens, batch.batch}), {}};
+    execution::TextOutputs output{};
+    if (io.pending_sample)
+        output.sample =
+            r.packed(*io.pending_sample, {dimension(c.hidden), batch.tokens, batch.batch});
     if (io.pending_conditioning)
         output.conditioning = r.packed(*io.pending_conditioning,
                                        {dimension(c.residual_width()), batch.tokens, batch.batch});
@@ -136,9 +138,10 @@ void consume_host_ple(RankProgramImpl& p, execution::TextRun& run, execution::Ba
 void forward_resident(RankProgramImpl& p, execution::TextRun& run, execution::TextOutputs output,
                       const execution::QsaSubmit& submit, const GraphBody& ple,
                       const GraphBody& head, int columns) {
-    run.stem();
+    p.begin_text(run);
     for (std::uint32_t layer = 0; layer < p.parameters.text.layers.size(); ++layer) {
-        if (layer == p.parameters.profile->config.text.ple.layer) ple();
+        if (p.parameters.profile->owns_ple && layer == p.parameters.profile->config.text.ple.layer)
+            ple();
         run.mixer(layer, submit);
         if (p.exchange) {
             const auto stage = p.exchange->stage(p.parameters.text.layers[layer].moe.bank, columns);
@@ -148,7 +151,7 @@ void forward_resident(RankProgramImpl& p, execution::TextRun& run, execution::Te
         }
         run.combine(layer);
     }
-    run.finish(output);
+    p.finish_text(run, output);
     head();
 }
 
@@ -175,7 +178,7 @@ ResidentTargetCapture bind_resident(RankProgramImpl& p, ops::ContextBucketRange 
             consume_host_ple(p, run, batch, slot, cuda.stream());
         };
     const auto output = main_outputs(p, batch);
-    capture.head      = bind_head(p, batch, output.sample);
+    if (p.parameters.profile->output_stage()) capture.head = bind_head(p, batch, output.sample);
     capture.body      = [&p, batch, output, expected = std::move(expected)](
                        const ReadoutRecorder& record, const GraphBody& handoff,
                        const GraphBody& head, const StreamSectionRecorder& readback) {
@@ -183,7 +186,7 @@ ResidentTargetCapture bind_resident(RankProgramImpl& p, ops::ContextBucketRange 
         if (!verify) p.install_decode(batch.batch);
         if (!p.host_ple) {
             p.gpu_timer.begin_target(true);
-            p.prepare_device_ple(batch, verify, readback);
+            if (p.parameters.profile->owns_ple) p.prepare_device_ple(batch, verify, readback);
         }
         auto run         = main_run(p, batch, p.cuda);
         std::size_t next = 0;
@@ -279,11 +282,12 @@ void warmup_target(RankProgramImpl& p, execution::BatchView batch) {
     if (!verify) p.install_decode(batch.batch);
     if (!p.host_ple) {
         p.gpu_timer.begin_target();
-        p.prepare_device_ple(batch, verify);
+        if (p.parameters.profile->owns_ple) p.prepare_device_ple(batch, verify);
     }
     auto run          = main_run(p, batch, p.cuda, p.resources.experts.get());
     const auto output = main_outputs(p, batch);
-    const auto head   = bind_head(p, batch, output.sample);
+    const GraphBody head = p.parameters.profile->output_stage() ? bind_head(p, batch, output.sample)
+                                                                : GraphBody([] {});
     const auto ple    = [&] {
         if (p.host_ple) {
             run.consume_ple(p.resources.ple_upload->device_slot(0, batch.tokens, batch.batch));
@@ -293,12 +297,14 @@ void warmup_target(RankProgramImpl& p, execution::BatchView batch) {
         }
     };
     if (p.resources.experts) {
-        run.stem();
+        p.begin_text(run);
         for (std::uint32_t layer = 0; layer < p.parameters.text.layers.size(); ++layer) {
-            if (layer == p.parameters.profile->config.text.ple.layer) ple();
+            if (p.parameters.profile->owns_ple &&
+                layer == p.parameters.profile->config.text.ple.layer)
+                ple();
             while (!run.advance_layer(layer)) std::this_thread::yield();
         }
-        run.finish(output);
+        p.finish_text(run, output);
         head();
     } else {
         forward_resident(p, run, output, {}, ple, head, batch.tokens * batch.batch);
@@ -379,14 +385,15 @@ GraphPreparationSample RankProgramImpl::initialize_graphs(GraphPreparationMode m
         if (resources.experts) return bind_offloaded(*this, buckets, main);
         return bind_resident(*this, buckets, main);
     };
-    bindings.decision = [&](const speculative::RoundRoute& route) {
-        const bool verify = route.width > 1;
-        if (verify)
-            accept_forward(main.batch, main.tokens);
-        else
-            sample_forward(main.batch, false);
-        copy_sample_result(main.batch, verify);
-    };
+    if (parameters.profile->output_stage())
+        bindings.decision = [&](const speculative::RoundRoute& route) {
+            const bool verify = route.width > 1;
+            if (verify)
+                accept_forward(main.batch, main.tokens);
+            else
+                sample_forward(main.batch, false);
+            copy_sample_result(main.batch, verify);
+        };
     if (speculative == SpeculativeBackend::Mtp)
         bindings.commit = [&](const speculative::RoundRoute&, const SectionRecorder& repair,
                               const SectionRecorder& counts) {

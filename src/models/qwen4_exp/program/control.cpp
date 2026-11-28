@@ -20,8 +20,8 @@ void RankProgramImpl::prepare_control_window() {
     row.main_frontier += begin;
     row.mtp_frontier = row.main_frontier ? row.main_frontier - 1 : 0;
     if (begin) {
-        row.states.at(parameters.profile->local.rank).source =
-            row.states.at(parameters.profile->local.rank).destination;
+        row.states.at(parameters.profile->replica_rank()).source =
+            row.states.at(parameters.profile->replica_rank()).destination;
         row.ple_raw_tail = {begin > 1 ? original.ids[begin - 2] : original.ple_raw_tail[1],
                             original.ids[begin - 1]};
         for (int axis = 0; axis < 3; ++axis)
@@ -70,6 +70,10 @@ void RankProgramImpl::finish_control_window() {
     f.control_row    = 0;
     f.control_offset = 0;
     f.phase          = ComputePhase::ControlCounts;
+    if (!parameters.profile->output_stage()) {
+        f.control_row = work.rows.size();
+        f.phase       = ComputePhase::AwaitControl;
+    }
 }
 
 void RankProgramImpl::enqueue_control_counts() {

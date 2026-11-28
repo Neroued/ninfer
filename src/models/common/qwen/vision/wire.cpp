@@ -61,12 +61,12 @@ VisionWork VisionInputBindings::get(std::uint64_t id, bool produce,
 }
 
 std::vector<runtime::InputResource>
-stream_vision_inputs(const VisionWork& work, const distributed::ReplicaTopology& replica) {
-    if (!work.input || work.input->batches.size() != replica.ranks.size())
+stream_vision_inputs(const VisionWork& work, std::span<const distributed::RankId> ranks) {
+    if (!work.input || work.input->batches.size() != ranks.size())
         throw std::logic_error("Vision production does not cover the execution ranks");
     std::vector<runtime::InputResource> result;
-    result.reserve(replica.ranks.size());
-    for (std::size_t rank = 0; rank < replica.ranks.size(); ++rank) {
+    result.reserve(ranks.size());
+    for (std::size_t rank = 0; rank < ranks.size(); ++rank) {
         const auto& batch = work.input->batches[rank];
         wire::Encoder descriptor;
         vision::encode_window(descriptor, work.window);
@@ -79,7 +79,7 @@ stream_vision_inputs(const VisionWork& work, const distributed::ReplicaTopology&
             std::make_shared<StreamOwner>(StreamOwner{work.input, std::move(descriptor).take()});
         wire::Encoder begin;
         begin.u64(owner->descriptor.size());
-        runtime::InputResource resource{replica.ranks[rank],
+        runtime::InputResource resource{ranks[rank],
                                         work.window.id,
                                         std::move(begin).take(),
                                         {owner->descriptor,

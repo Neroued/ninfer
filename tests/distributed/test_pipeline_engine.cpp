@@ -82,7 +82,18 @@ void generation(EngineOptions options) {
     engine.reset_measurement_peaks();
     const auto after = engine.snapshot();
     require(after.in_flight.empty() && !after.runtime.running_requests, "pipeline did not drain");
+    unsigned table_owners = 0;
     for (const auto& rank : after.ranks) {
+        if (const auto& table = rank.memory.ple_table) {
+            ++table_owners;
+            if (options.ple.storage == PleStorage::Disk)
+                require(table->device_bytes == 0 && table->placement == "disk",
+                        "disk PLE was placed on device");
+            if (options.ple.storage == PleStorage::Device)
+                require(table->device_bytes > 0, "device PLE has no device backing");
+            std::cout << "PLE rank=" << rank.rank << " placement=" << table->placement
+                      << " bytes=" << table->device_bytes << '\n';
+        }
         require(!rank.host.supply_ns, "W=1 pipeline waited for a separate grammar command");
         const auto graph = rank.compute_paths[static_cast<std::size_t>(ExecutionPath::Graph)];
         require(!options.use_cuda_graph || graph, "pipeline stage did not replay a decode graph");
@@ -93,6 +104,9 @@ void generation(EngineOptions options) {
         std::cout << "rank=" << rank.rank << " pp_payload=" << tx << " graph_replays=" << graph
                   << '\n';
     }
+    if (options.ple.storage != PleStorage::Auto)
+        require(table_owners == options.deployment->parallel.tp,
+                "PLE has consumers on more or fewer than one stage");
     std::cout << "overlapping_frames=" << peak_frames
               << " prefill=" << long_result.stats.computed_prefill_tokens
               << " grammar=" << choice.content
@@ -130,11 +144,20 @@ void scoring(EngineOptions options) {
 
 int main(int argc, char** argv) {
     try {
-        if (argc != 4)
+        if (argc != 4 && argc != 5)
             throw std::invalid_argument(
-                "usage: pipeline_engine MODEL DEPLOYMENT eager|graph|score");
+                "usage: pipeline_engine MODEL DEPLOYMENT eager|graph|score [disk|device]");
         const std::string_view mode = argv[3];
         EngineOptions options;
+        if (argc == 5) {
+            const std::string_view storage = argv[4];
+            if (storage == "disk")
+                options.ple.storage = PleStorage::Disk;
+            else if (storage == "device")
+                options.ple.storage = PleStorage::Device;
+            else
+                throw std::invalid_argument("unknown PLE storage");
+        }
         options.artifact_path = argv[1];
         options.deployment    = ninfer::product::read_deployment_file(argv[2]);
         require(options.deployment->parallel.pp == 2 && options.deployment->parallel.dp == 1,

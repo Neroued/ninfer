@@ -6,7 +6,7 @@
 namespace ninfer::models::qwen4_exp {
 struct QsaRecordLayout {
     TensorRegion keys, coordinates;
-    std::uint32_t layers, width, batch;
+    std::uint32_t layers = 0, width = 0, batch = 0;
 };
 
 struct BatchLayout {
@@ -48,11 +48,11 @@ struct BufferLayout {
     TensorRegion anchors;
     LayoutRegion ingress, commit_ingress, host_region;
     TensorRegion commit_destination_offsets;
-    TensorRegion prefill_sample;
+    std::optional<TensorRegion> prefill_sample;
     std::optional<TensorRegion> prefill_conditioning;
     std::optional<PackedInputLayout> packed_main, packed_history;
     std::optional<TensorRegion> prefill_sampled_offsets, prefill_sampled_hidden, prefill_aligned;
-    TensorRegion pending_sample;
+    std::optional<TensorRegion> pending_sample;
     std::optional<TensorRegion> pending_conditioning;
     QsaRecordLayout main_qsa;
     TensorRegion ple_records;
@@ -76,5 +76,6 @@ void select_buffer_rows(BufferLayout&, const BufferLayout& backing, std::uint32_
 [[nodiscard]] BufferLayout plan_buffers(LayoutBuilder&, const Config&, const EngineOptions&,
                                         std::uint32_t chunk, std::uint32_t public_tokens,
                                         const GdnConfig&, std::uint32_t local_vocabulary,
-                                        std::uint32_t ranks, bool device_ple);
+                                        std::uint32_t ranks, bool device_ple, bool owns_ple = true,
+                                        bool output_stage = true);
 } // namespace ninfer::models::qwen4_exp

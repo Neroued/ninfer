@@ -39,11 +39,14 @@ public:
     void gpu_moe(const moe::GpuCall&);
     void combine(std::uint32_t layer);
     void finish(TextOutputs, Tensor logits = {});
+    [[nodiscard]] StageBoundaryField boundary();
+    void begin_stage();
 
     [[nodiscard]] Tensor& block_output() { return roots_.output; }
 
 
 private:
+    void partition_residual();
     void mix(const HcParameters&);
     [[nodiscard]] Tensor reduce_output();
     const Parameters& parameters_;

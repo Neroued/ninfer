@@ -70,6 +70,7 @@ struct ForwardWork {
     std::optional<qwen::VisionWork> visual;
     PhysicalBatchShape shape;
     std::shared_ptr<const SpeculativeExecutionGeometry> speculative;
+    bool visual_forward = false;
 };
 
 struct MtpWork {
@@ -101,6 +102,7 @@ struct Work {
     ContextActions actions;
     std::variant<ForwardWork, MtpWork, ContextWork, ScoreWork, moe::ExpertServiceWork> operation;
     std::optional<moe::ExpertStep> exchange;
+    std::optional<runtime::DecisionInput> initial_decision;
 };
 
 struct RowResult {
@@ -144,7 +146,11 @@ struct Commit {
 
 struct ExecutionTypes {
     [[nodiscard]] static ExecutionWork describe_work(const qwen4_exp::Work&);
-    using Work   = qwen4_exp::Work;
+    using Work = qwen4_exp::Work;
+
+    static std::optional<std::uint32_t> submitted_decision_stage(const Work& work) {
+        return work.initial_decision ? std::optional{work.initial_decision->stage} : std::nullopt;
+    }
     using Result = qwen4_exp::Result;
     using Commit = qwen4_exp::Commit;
 };

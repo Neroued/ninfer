@@ -1,6 +1,7 @@
 #include "models/qwen4_exp/parallel/preparation.h"
 #include "models/common/vocabulary.h"
 #include "core/platform.h"
+#include "distributed/pipeline_link.h"
 #include "models/common/moe/exchange.h"
 
 #include <algorithm>
@@ -18,7 +19,8 @@ RankPreparation::RankPreparation(const artifact::Reader& reader, std::span<const
     in.finish();
     if (identity.tp.size > 1) {
         const auto& group    = topology.role_group("tensor", identity.rank);
-        const auto result_id = topology.replica_for_rank(identity.rank).result_owner;
+        const auto result_id =
+            topology.replica_for_rank(identity.rank).stage_ranks.at(identity.pp.rank).front();
         binding_             = {&communication.group(group.id), group.index(result_id)};
     }
     batches_ = std::make_shared<const BatchExecutionPlan>(std::move(request.batches));
@@ -39,16 +41,19 @@ RankPreparation::RankPreparation(const artifact::Reader& reader, std::span<const
             config.moe.top_k, moe::expert_exchange_block_columns);
     }
     placements_ = request.rank.ple_candidates;
-    if (request.rank.ple_shards != ple::shard_range(request.rank.ple_placement,
-                                                    definition->config().text.ple.shards,
-                                                    identity.tp))
+    if (request.rank.ple_shards !=
+        (request.rank.owns_ple ? ple::shard_range(request.rank.ple_placement,
+                                                  definition->config().text.ple.shards, identity.tp)
+                               : IndexRange{}))
         throw std::invalid_argument(
             "Qwen4Exp PLE shard range differs from its consumer coordinate");
-    if (std::ranges::find(placements_, ple::Placement::Sharded) != placements_.end()) {
+    if (request.rank.owns_ple &&
+        std::ranges::find(placements_, ple::Placement::Sharded) != placements_.end()) {
         const auto& consumers = topology.role_group("ple", identity.rank);
         ple_group_            = &communication.group(consumers.id);
         if (consumers.index(identity.rank) != identity.tp.rank ||
-            consumers.members != topology.replica_for_rank(identity.rank).ranks)
+            consumers.members !=
+                topology.replica_for_rank(identity.rank).stage_ranks.at(identity.pp.rank))
             throw std::invalid_argument(
                 "Qwen4Exp PLE shards must cover consumers of the same windows in order");
     }
@@ -69,6 +74,18 @@ RankPreparation::RankPreparation(const artifact::Reader& reader, std::span<const
         profile->exchange = std::move(plan);
     }
     profile_ = std::move(profile);
+    const auto shape = describe_execution_shape(*profile_, options_);
+    const auto bind_link =
+        [&](const distributed::GroupDescription* edge) -> const distributed::Group* {
+        if (!edge) return nullptr;
+        pipeline_requirements_.push_back(distributed::PpStageLink::requirements(
+            *edge, identity.rank,
+            pipeline_packet_bytes(*profile_,
+                                  std::max(shape.prefill_chunk, shape.max_concurrency))));
+        return &communication.group(edge->id);
+    };
+    pipeline_ = {bind_link(topology.pipeline_input(identity.rank)),
+                 bind_link(topology.pipeline_output(identity.rank))};
     const WorkContract contract{describe_execution_shape(*profile_, options_),
                                 profile_->config.text.vocabulary,
                                 profile_->public_tokens,
@@ -76,9 +93,11 @@ RankPreparation::RankPreparation(const artifact::Reader& reader, std::span<const
                                 bool(profile_->vision),
                                 profile_->control_token_limit,
                                 batches_};
-    host_reservation_bytes_ =
-        runtime::protocol::work_payload_memory(contract.payload_capacity(identity.tp.size),
-                                               RankProgram::capacity(), identity.tp.size, false);
+    host_reservation_bytes_ = runtime::protocol::work_payload_memory(
+        contract.payload_capacity(profile_->replica_size()),
+        runtime::ExecutionCapacity::pipeline(identity.pp.size, shape.max_concurrency,
+                                             shape.purpose == EnginePurpose::Generation),
+        profile_->replica_size(), false);
 }
 
 runtime::PreparationMemory RankPreparation::memory() const {
@@ -96,6 +115,8 @@ void RankPreparation::materialize() {
 runtime::PlacementOffer RankPreparation::offer_placement(std::size_t id) const {
     const auto& model = *instance_->model;
     const auto layout = placements_.at(id);
+    if (!profile_->owns_ple)
+        return {describe_execution_capacity(profile_, options_, batches_, device_, {}), 0, 0};
     auto table = plan_ple_table(reader_, model.definition(), layout, model.rank_plan().placement.tp,
                                 device_.device());
     auto profile           = std::make_shared<execution::ModelProfile>(*profile_);
@@ -111,6 +132,10 @@ runtime::PlacementOffer RankPreparation::offer_placement(std::size_t id) const {
 void RankPreparation::materialize_placement(std::size_t id) {
     auto& model       = *instance_->model;
     const auto layout = placements_.at(id);
+    if (!profile_->owns_ple) {
+        capacity_plan_ = describe_execution_capacity(profile_, options_, batches_, device_, {});
+        return;
+    }
     auto table = plan_ple_table(reader_, model.definition(), layout, model.rank_plan().placement.tp,
                                 device_.device());
     ple_geometry_           = table.geometry();
@@ -128,7 +153,7 @@ void RankPreparation::release_placement() {
 }
 
 std::vector<distributed::GroupRequirements> RankPreparation::communication_requirements() const {
-    std::vector<distributed::GroupRequirements> requirements;
+    auto requirements = pipeline_requirements_;
     if (expert_requirements_) requirements.push_back(*expert_requirements_);
     if (!binding_.group) return requirements;
     using distributed::Collective;
@@ -143,6 +168,11 @@ std::vector<distributed::GroupRequirements> RankPreparation::communication_requi
     const auto columns = std::max({batch, decode, std::size_t(shape.prefill_chunk)});
     work.push_back({Collective::AllReduce, DType::BF16, hidden, hidden * columns, hidden});
     const auto sequence = execution::sequence_parallel_policy(profile_->local.size);
+    if (pipeline_.input) {
+        const auto elements = StageBoundaryField::transfer_elements(
+            profile_->config.text.residual_width(), TpLayout::Replicated, profile_->local.size);
+        work.push_back({Collective::AllGather, DType::BF16, 1, elements * columns, 1});
+    }
     if (sequence.minimum_columns &&
         shape.prefill_chunk >= std::uint32_t(sequence.minimum_columns)) {
         const auto local = sequence.partition(dimension(shape.prefill_chunk), 0).segment;
@@ -155,12 +185,12 @@ std::vector<distributed::GroupRequirements> RankPreparation::communication_requi
                                 conditioning * batch, 1, Reduction::Sum, owner});
         }
     }
-    if (profile_->ple_placement == ple::Placement::Sharded) {
+    if (profile_->owns_ple && profile_->ple_placement == ple::Placement::Sharded) {
         const auto words =
             profile_->config.text.ple.embedding * dtype_size(DType::BF16) / dtype_size(DType::U32);
         work.push_back({Collective::AllReduce, DType::U32, words, words * columns, words});
     }
-    if (shape.purpose == EnginePurpose::Generation) {
+    if (profile_->output_stage() && shape.purpose == EnginePurpose::Generation) {
         constexpr auto candidates = std::size_t(DistributedVocabulary::candidates);
         work.push_back(
             {Collective::AllGather, DType::I64, candidates, candidates * decode, candidates});
@@ -169,7 +199,7 @@ std::vector<distributed::GroupRequirements> RankPreparation::communication_requi
             work.push_back({Collective::AllGather, DType::U64, records, records * batch, records});
             work.push_back({Collective::AllGather, DType::U64, 2, 2 * batch, 2});
         }
-    } else {
+    } else if (profile_->output_stage()) {
         work.push_back({Collective::AllGather, DType::FP32, 3,
                         3 * std::size_t(std::min(shape.prefill_chunk, 1024U)), 3});
     }
@@ -220,7 +250,9 @@ void RankPreparation::create_probe(GraphProbeBacking backing) {
     probe_    = std::make_unique<RankProgram>(
         instance_->parameters, std::move(plan), device_, options_.startup_observer, binding_,
         expert_group_ ? profile_->exchange->prepare(*expert_group_) : nullptr,
-        profile_->ple_placement == ple::Placement::Sharded ? ple_group_ : nullptr);
+        profile_->owns_ple && profile_->ple_placement == ple::Placement::Sharded ? ple_group_
+                                                                                    : nullptr,
+        pipeline_);
 }
 
 void RankPreparation::calibrate() {
@@ -269,7 +301,9 @@ void RankPreparation::prepare(runtime::ContextCapacity capacity, std::size_t ava
     instance_->program = std::make_unique<RankProgram>(
         instance_->parameters, std::move(*plan), device_, options_.startup_observer, binding_,
         expert_group_ ? profile_->exchange->prepare(*expert_group_) : nullptr,
-        profile_->ple_placement == ple::Placement::Sharded ? ple_group_ : nullptr);
+        profile_->owns_ple && profile_->ple_placement == ple::Placement::Sharded ? ple_group_
+                                                                                 : nullptr,
+        pipeline_);
 }
 
 void RankPreparation::release_resources() {

@@ -25,7 +25,7 @@ std::vector<runtime::InputResource>
 ExecutionCodec::prepare_inputs(const Work& work, const distributed::ReplicaTopology& replica) {
     const auto* visual = find_produced_visual(work);
     if (!visual) return {};
-    auto resources = qwen::stream_vision_inputs(*visual, replica);
+    auto resources = qwen::stream_vision_inputs(*visual, replica.ranks);
     inputs_.install(*visual);
     return resources;
 }

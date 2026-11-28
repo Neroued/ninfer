@@ -24,14 +24,15 @@ RankMemoryUsage RankProgramImpl::observe_resources() const {
     auto& a                    = out.allocations;
     const auto& model          = parameters.model;
     const auto& rank           = model.rank_plan();
-    out.ple_table              = PleTableSummary{
-        ple::name(rank.ple_placement),
-        rank.ple_shards.begin,
-        rank.ple_shards.size,
-        static_cast<std::uint32_t>(model.definition().ple_parameters().shards.size()),
-        model.ple_device_bytes(),
-        model.ple_host_bytes(),
-        merged_ple_windows};
+    if (rank.owns_ple)
+        out.ple_table = PleTableSummary{
+            ple::name(rank.ple_placement),
+            rank.ple_shards.begin,
+            rank.ple_shards.size,
+            static_cast<std::uint32_t>(model.definition().ple_parameters().shards.size()),
+            model.ple_device_bytes(),
+            model.ple_host_bytes(),
+            merged_ple_windows};
     a.device_weights_bytes =
         weights.device_capacity_bytes + model.metadata_bytes() - model.ple_device_bytes();
     a.host_weights_bytes       = weights.host_capacity_bytes;

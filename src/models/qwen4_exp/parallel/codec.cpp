@@ -54,14 +54,20 @@ GroupExecutionPlan plan_replica_execution(const distributed::ReplicaTopology& re
     plan.session.context.ranks.clear();
     plan.session.context.state.layouts.front().parts.clear();
     plan.session.context.metadata_budget_bytes = 0;
-    for (auto& pool : plan.session.context.pools) pool.parts.clear();
+    for (auto& pool : plan.session.context.pools) {
+        pool.parts.clear();
+        pool.logical_pages = UINT32_MAX;
+    }
+    plan.session.vision_max_features =
+        description(replica.stage_ranks.front().front()).session.vision_max_features;
     for (const auto global : replica.ranks) {
         const auto& rank    = description(global);
         const auto& session = rank.session;
         if (session.shape != plan.session.shape || !session.batches || !plan.session.batches ||
             session.batches->spec() != plan.session.batches->spec() ||
             session.checkpoint_interval != plan.session.checkpoint_interval ||
-            session.vision_max_features != plan.session.vision_max_features ||
+            (replica.local_index(global) < replica.stage_ranks.front().size() &&
+             session.vision_max_features != plan.session.vision_max_features) ||
             session.context.pools.size() != plan.session.context.pools.size())
             throw std::invalid_argument("Qwen4Exp rank execution semantics differ");
         if (session.decode_path == ExecutionPath::Mixed)
@@ -83,7 +89,8 @@ GroupExecutionPlan plan_replica_execution(const distributed::ReplicaTopology& re
             if (pool.pool_id != local.pool_id || pool.page_capacity != local.page_capacity ||
                 pool.table_rows != local.table_rows)
                 throw std::invalid_argument("Qwen4Exp history geometry differs across ranks");
-            pool.logical_pages = std::min(pool.logical_pages, local.logical_pages);
+            if (!local.parts.empty())
+                pool.logical_pages = std::min(pool.logical_pages, local.logical_pages);
             pool.parts.insert(pool.parts.end(), local.parts.begin(), local.parts.end());
         }
         plan.capacity.compute_frames =
@@ -113,7 +120,7 @@ ExecutionCodec::ExecutionCodec(const ModelDefinition& definition,
     ranks_                 = static_cast<std::uint32_t>(replica_.ranks.size());
     max_features_          = rank.session.vision_max_features;
     scope_.participants    = replica_.ranks;
-    scope_.decision_owners = replica_.ranks;
+    scope_.decision_owners = replica_.stage_ranks.back();
     scope_.result_owner    = replica_.result_owner;
     scope_.validate(topology);
     auto described = rank;
@@ -151,7 +158,9 @@ runtime::protocol::Scope ExecutionCodec::scope(const Work& work,
 
 void ExecutionCodec::encode_work(wire::Encoder& out, const Work& work,
                                  distributed::RankId rank) const {
-    qwen4_exp::encode_work(out, work, inputs_, replica_.local_index(rank));
+    qwen4_exp::encode_work(out, work, inputs_, replica_.local_index(rank),
+                           scope_.is_decision_owner(rank),
+                           replica_.local_index(rank) < replica_.stage_ranks.front().size());
 }
 
 Work ExecutionCodec::decode_work(wire::Decoder& in) const {

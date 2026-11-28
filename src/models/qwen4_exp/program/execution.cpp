@@ -32,6 +32,73 @@ ops::SamplingConfig sampling_config(const ResolvedSamplingParameters& p) {
             .mask              = {}};
 }
 
+void RankProgramImpl::begin_text(execution::TextRun& run,
+                                 std::optional<models::vision::EmbeddingView> visual) {
+#if NINFER_ENABLE_DISTRIBUTED
+    if (pipeline_input) {
+        auto field = run.boundary();
+        const MemorySpan dst{field.transfer.data, field.transfer.bytes(), cuda.device()};
+        if (graph_inputs)
+            copy_bytes_async(dst,
+                             resources.plan.persistent.graph_input.bind(resources.persistent())
+                                 .subspan(0, dst.bytes),
+                             cuda);
+        else if (!pipeline_input->try_receive(transfer_sequence, {&dst, 1}, cuda))
+            throw std::logic_error("pipeline input credit lost");
+        if (field.replica.data) parallel->gather(field.transfer, field.replica, cuda);
+        run.begin_stage();
+        return;
+    }
+#endif
+    run.stem(visual);
+}
+
+void RankProgramImpl::finish_text(execution::TextRun& run, execution::TextOutputs out,
+                                  Tensor logits) {
+#if NINFER_ENABLE_DISTRIBUTED
+    if (pipeline_output) {
+        auto field = run.boundary();
+        const ConstMemorySpan src{field.transfer.data, field.transfer.bytes(), cuda.device()};
+        if (graph_inputs)
+            copy_bytes_async(resources.plan.persistent.graph_output.bind(resources.persistent())
+                                 .subspan(0, src.bytes),
+                             src, cuda);
+        else if (!(compute->sent = pipeline_output->try_send(transfer_sequence, {&src, 1}, cuda)))
+            throw std::logic_error("pipeline output credit lost");
+        return;
+    }
+#endif
+    run.finish(out, logits);
+}
+
+void RankProgramImpl::graph_receive(int rows) {
+#if NINFER_ENABLE_DISTRIBUTED
+    if (!pipeline_input) return;
+    const auto& p    = *parameters.profile;
+    const auto bytes = StageBoundaryField::transfer_elements(p.config.text.residual_width() * rows,
+                                                             TpLayout::Replicated, p.local.size) *
+                       sizeof(std::uint16_t);
+    const auto dst =
+        resources.plan.persistent.graph_input.bind(resources.persistent()).subspan(0, bytes);
+    if (!pipeline_input->try_receive(transfer_sequence, {&dst, 1}, cuda))
+        throw std::logic_error("pipeline graph input credit lost");
+#endif
+}
+
+void RankProgramImpl::graph_send(int rows) {
+#if NINFER_ENABLE_DISTRIBUTED
+    if (!pipeline_output) return;
+    const auto& p    = *parameters.profile;
+    const auto bytes = StageBoundaryField::transfer_elements(p.config.text.residual_width() * rows,
+                                                             TpLayout::Replicated, p.local.size) *
+                       sizeof(std::uint16_t);
+    const ConstMemorySpan src =
+        resources.plan.persistent.graph_output.bind(resources.persistent()).subspan(0, bytes);
+    if (!(compute->sent = pipeline_output->try_send(transfer_sequence, {&src, 1}, cuda)))
+        throw std::logic_error("pipeline graph output credit lost");
+#endif
+}
+
 void RankProgramImpl::prepare_main_inputs(std::span<const WorkRow> rows, std::uint32_t tokens) {
     auto& frame         = *compute;
     const auto& buffers = resources.buffers();
@@ -59,9 +126,9 @@ void RankProgramImpl::prepare_main_inputs(std::span<const WorkRow> rows, std::ui
         const auto valid          = frame.verify ? frame.verify->extents[b] + 1 : row.ids.size();
         host(io.valid_columns)[b] = valid;
         active_tokens += valid;
-        offsets(io.source_offsets)[b] = row.states.at(parameters.profile->local.rank).source;
+        offsets(io.source_offsets)[b] = row.states.at(parameters.profile->replica_rank()).source;
         offsets(io.destination_offsets)[b] =
-            row.states.at(parameters.profile->local.rank).destination;
+            row.states.at(parameters.profile->replica_rank()).destination;
         host(io.main_tables)[b]        = row.main_table.index;
         host(io.base_positions)[b]     = row.main_frontier;
         host(io.record_offsets)[b]     = 0;
@@ -138,7 +205,7 @@ execution::BatchView RankProgramImpl::prepare_packed_inputs(const PackedInputLay
     auto table_rows       = i32(io.table_rows);
     auto sources          = host.operator()<std::int64_t>(io.source_offsets);
     auto destinations     = host.operator()<std::int64_t>(io.destination_offsets);
-    const auto rank       = parameters.profile->local.rank;
+    const auto rank       = parameters.profile->replica_rank();
     std::uint32_t visible = 1;
     std::int32_t column   = 0;
     for (std::size_t s = 0; s < members.size(); ++s) {
@@ -198,6 +265,12 @@ execution::BatchView RankProgramImpl::prepare_packed_inputs(const PackedInputLay
 void RankProgramImpl::prepare_packed_prefill() {
     auto& f      = *compute;
     auto& packed = *f.packed;
+    if (!f.tokens && !parameters.profile->output_stage()) {
+        gpu_timer.record_result();
+        compute_done.record(cuda.stream());
+        f.phase = ComputePhase::AwaitResult;
+        return;
+    }
     if (!f.tokens) {
         f.phase = ComputePhase::Decision;
         request_decision();
@@ -217,7 +290,7 @@ void RankProgramImpl::prepare_packed_prefill() {
     const auto layout = packed_input_view(*resources.buffers().packed_main, dimension(f.tokens),
                                           dimension(packed.segments.size()));
     f.batch = prepare_packed_inputs(layout, packed.segments, f.tokens, false, packed.ragged);
-    if (!host_ple) prepare_packed_device_ple(layout);
+    if (parameters.profile->owns_ple && !host_ple) prepare_packed_device_ple(layout);
     prepare_main();
     request_decision();
 }
@@ -239,9 +312,15 @@ void RankProgramImpl::prepare_forward() {
     f.tokens       = f.rows.front().ids.size();
     f.first_sample = forward && forward->sample == SampleKind::FirstToken;
     resources.select_batch(f.sequence ? 1 : f.physical.rows);
+    if (!f.tokens && !parameters.profile->output_stage()) {
+        gpu_timer.record_result();
+        compute_done.record(cuda.stream());
+        f.phase = ComputePhase::AwaitResult;
+        return;
+    }
     if (!f.tokens) {
         f.sample = resources.states->sample_hidden(
-            f.rows.front().states.at(parameters.profile->local.rank).source);
+            f.rows.front().states.at(parameters.profile->replica_rank()).source);
         f.phase = ComputePhase::Decision;
         request_decision();
         return;
@@ -260,7 +339,8 @@ void RankProgramImpl::prepare_forward() {
     }
     prepare_main_inputs(f.rows, f.tokens);
     if (!f.sequence && !f.graph_route) install_decode(f.physical.rows);
-    if (!host_ple && (!f.graph_route || f.sequence)) prepare_device_ple(f.batch);
+    if (parameters.profile->owns_ple && !host_ple && (!f.graph_route || f.sequence))
+        prepare_device_ple(f.batch);
     prepare_main();
     request_decision();
 }
@@ -277,11 +357,13 @@ void RankProgramImpl::prepare_main() {
                              : TokenPartition(t * batch);
     if (f.verify) {
         const auto channels = dimension(parameters.profile->config.text.residual_width());
-        f.sample            = packed_tensor(layout.pending_sample, {hidden, t, batch});
+        f.sample            = packed_tensor(*layout.pending_sample, {hidden, t, batch});
         f.conditioning      = packed_tensor(*layout.pending_conditioning, {channels, t, batch});
     } else {
-        f.sample = f.sequence ? device_tensor(layout.prefill_sample).slice(1, 0, columns.padded)
-                              : packed_tensor(layout.pending_sample, {hidden, t, batch});
+        if (parameters.profile->output_stage())
+            f.sample = f.sequence
+                           ? device_tensor(*layout.prefill_sample).slice(1, 0, columns.padded)
+                           : packed_tensor(*layout.pending_sample, {hidden, t, batch});
         if (parameters.mtp) {
             const auto channels = dimension(parameters.profile->config.text.residual_width());
             auto base           = packed_tensor(layout.mtp->base_conditioning, {channels, batch});
@@ -289,7 +371,7 @@ void RankProgramImpl::prepare_main() {
                 auto window = device_tensor(*layout.prefill_conditioning);
                 if (!f.packed) {
                     const auto previous = resources.states->conditioning(
-                        f.rows.front().states.at(parameters.profile->local.rank).source);
+                        f.rows.front().states.at(parameters.profile->replica_rank()).source);
                     copy_bytes_async({base.data, base.bytes(), cuda.device()},
                                      {previous.data, previous.bytes(), cuda.device()}, cuda);
                     auto first = window.slice(1, 0, 1);
@@ -317,12 +399,17 @@ void RankProgramImpl::prepare_main() {
         for (auto extent : f.verify->extents) f.attention.valid_positions += extent + 1;
     else
         for (const auto& row : f.rows) f.attention.valid_positions += row.ids.size();
+#if NINFER_ENABLE_DISTRIBUTED
+    if (pipeline_input || pipeline_output) ++transfer_sequence;
+#endif
     if (f.graph_route && !f.sequence) {
+        graph_receive(batch);
         const auto* forward = std::get_if<ForwardWork>(&f.request.work.operation);
         const auto& route   = *f.graph_route;
         f.graph             = &graphs->target(route);
-        f.target_replay     = {.bucket        = ops::select_context_bucket(f.visible),
-                               .head          = f.verify || forward->sample != SampleKind::None,
+        f.target_replay     = {.bucket = ops::select_context_bucket(f.visible),
+                               .head   = parameters.profile->output_stage() &&
+                                       (f.verify || forward->sample != SampleKind::None),
                                .active_tokens = dimension(f.batch.active_tokens)};
         if (!host_ple) {
             if (f.verify) {
@@ -367,12 +454,12 @@ void RankProgramImpl::prepare_main() {
         update.emplace<execution::PackedPrefillState>(f.packed->ragged);
     else if (f.sequence)
         update = execution::SequenceState{
-            f.rows[0].states.at(parameters.profile->local.rank).source,
-            f.rows[0].states.at(parameters.profile->local.rank).destination};
+            f.rows[0].states.at(parameters.profile->replica_rank()).source,
+            f.rows[0].states.at(parameters.profile->replica_rank()).destination};
     f.run   = std::make_unique<execution::TextRun>(parameters, execution, f.batch, update, cuda);
     f.layer = 0;
-    f.run->stem(f.visual);
-    f.phase = ComputePhase::Prefix;
+    begin_text(*f.run, f.visual);
+    f.phase = parameters.profile->owns_ple ? ComputePhase::Prefix : ComputePhase::Suffix;
 }
 
 bool RankProgramImpl::advance_layers(std::uint32_t end) {
@@ -399,6 +486,14 @@ void RankProgramImpl::after_main() {
     if (f.request.work.exchange) ++f.main_pass;
     if (!f.sequence && !f.graph_main) gpu_timer.end_target();
     f.run.reset();
+    if (f.graph) graph_send(f.physical.rows);
+    if (!parameters.profile->output_stage()) {
+        if (f.timer_started) prefill_timer.record_stop();
+        gpu_timer.record_result();
+        compute_done.record(cuda.stream());
+        f.phase = ComputePhase::AwaitResult;
+        return;
+    }
     const auto* source    = std::get_if<ForwardWork>(&f.request.work.operation);
     const bool mtp_decode = parameters.mtp && source && source->kind == ForwardKind::Ordinary;
     if (f.packed) {
@@ -412,7 +507,7 @@ void RankProgramImpl::after_main() {
         if (f.sequence) {
             const auto last  = f.sample.slice(1, f.tokens - 1, 1);
             auto destination = resources.states->sample_hidden(
-                f.rows[0].states.at(parameters.profile->local.rank).destination);
+                f.rows[0].states.at(parameters.profile->replica_rank()).destination);
             copy_bytes_async({destination.data, destination.bytes(), cuda.device()},
                              {last.data, last.bytes(), cuda.device()}, cuda);
         } else {
@@ -467,8 +562,9 @@ void RankProgramImpl::sample_forward(std::int32_t batch, bool first_token) {
 }
 
 void RankProgramImpl::request_decision() {
+    if (!parameters.profile->output_stage()) return;
     auto& f = *compute;
-    if (f.decision_requested) return;
+    if (f.decision_requested || f.decision) return;
     const auto* forward = std::get_if<ForwardWork>(&f.request.work.operation);
     if (forward && forward->sample == SampleKind::None) return;
     if (std::holds_alternative<ScoreWork>(f.request.work.operation)) return;
@@ -547,7 +643,7 @@ void RankProgramImpl::install_sampling(bool speculative) {
             f.packed
                 ? static_cast<std::int64_t*>(host_tensor(*buffers.prefill_sampled_offsets).data)
                 : nullptr;
-        const auto rank = parameters.profile->local.rank;
+        const auto rank = parameters.profile->replica_rank();
         for (std::size_t b = 0; b < batch; ++b) {
             const auto& row = f.rows[member(b)];
             configs[b]      = sampling_config(row.sampling);

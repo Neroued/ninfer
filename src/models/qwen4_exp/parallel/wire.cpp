@@ -21,6 +21,8 @@ void encode_rank_load(Encoder& out, const RankLoadRequest& request) {
     out.raw(request.artifact);
     const auto& p = request.rank;
     out.u32(p.placement.global_rank);
+    range(out, p.layers);
+    out.boolean(p.owns_ple);
     out.u8(static_cast<std::uint8_t>(p.ple_placement));
     out.u32(p.ple_candidates.size());
     for (const auto candidate : p.ple_candidates) out.u8(static_cast<std::uint8_t>(candidate));
@@ -49,6 +51,8 @@ RankLoadRequest decode_rank_load(Decoder& in, const distributed::RankIdentity& i
     if (in.u32() != identity.rank)
         throw std::invalid_argument("Qwen4Exp load request addressed to another global rank");
     p.placement                    = RankPlacement(identity);
+    p.layers                       = range(in);
+    p.owns_ple                     = in.boolean();
     p.ple_placement                = static_cast<ple::Placement>(in.u8());
     p.ple_candidates.resize(in.u32());
     for (auto& candidate : p.ple_candidates) candidate = static_cast<ple::Placement>(in.u8());
@@ -89,6 +93,7 @@ void encode(Encoder& out, const RankExecutionDescription& r) {
     out.boolean(s.gpu_timing);
     out.u8(static_cast<std::uint8_t>(s.length_policy));
     out.u8(static_cast<std::uint8_t>(s.linear_state_dtype));
+    out.u32(s.pipeline_stages);
     out.u8(static_cast<std::uint8_t>(p.decode_path));
     encode_batch_execution_spec(out, p.batches->spec());
     context::encode_directory(out, p.context);
@@ -114,6 +119,7 @@ RankExecutionDescription decode_rank_execution(Decoder& in) {
                      in.boolean(),
                      static_cast<SpeculativeLengthPolicy>(in.u8()),
                      static_cast<LinearStateDType>(in.u8())};
+    p.shape.pipeline_stages = in.u32();
     p.decode_path = static_cast<ExecutionPath>(in.u8());
     p.batches = std::make_shared<const BatchExecutionPlan>(decode_batch_execution_spec(in));
     if (p.shape.cuda_graph)

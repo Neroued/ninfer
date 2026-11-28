@@ -14,6 +14,7 @@ struct ExecutionShape {
     SpeculativeLengthPolicy length_policy = SpeculativeLengthPolicy::Adaptive;
     LinearStateDType linear_state_dtype   = LinearStateDType::Float32;
 
+    std::uint32_t pipeline_stages                = 1;
     bool operator==(const ExecutionShape&) const = default;
 };
 

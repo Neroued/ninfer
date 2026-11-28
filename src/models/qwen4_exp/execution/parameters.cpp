@@ -100,16 +100,20 @@ Parameters::Parameters(const ModelShard& model, std::shared_ptr<const ModelProfi
     if (!this->profile) throw std::invalid_argument("Parameters require an execution profile");
     const Prepare p(model, *this->profile);
     const auto& w  = model.definition().weights();
-    text.embedding = native_weight(model.weight(w.text.embedding).view);
-    text.head      = p.linear({w.text.head});
-    text.final_hc  = p.final_hc(w.text.final_hc);
-    for (std::size_t i = 0; i < w.text.layers.size(); ++i)
-        text.layers.push_back(p.block(w.text.layers[i], this->profile->text.layers.at(i), false));
+    if (this->profile->input_stage())
+        text.embedding = native_weight(model.weight(w.text.embedding).view);
+    if (this->profile->output_stage()) text.head = p.linear({w.text.head});
+    if (this->profile->output_stage()) text.final_hc = p.final_hc(w.text.final_hc);
+    const auto local =
+        std::span(w.text.layers).subspan(this->profile->layers.begin, this->profile->layers.size);
+    for (std::size_t i = 0; i < local.size(); ++i)
+        text.layers.push_back(p.block(local[i], this->profile->text.layers.at(i), false));
     const auto& ple = w.text.ple;
-    text.ple        = {p.linear({ple.key, ple.value}),
-                       {p.hc_norm(ple.norm_key), p.hc_norm(ple.norm_query), p.hc_norm(ple.norm_conv),
-                        this->profile->config.text.norm_epsilon},
-                       p.tensor(ple.convolution)};
+    if (this->profile->owns_ple)
+        text.ple = {p.linear({ple.key, ple.value}),
+                    {p.hc_norm(ple.norm_key), p.hc_norm(ple.norm_query), p.hc_norm(ple.norm_conv),
+                     this->profile->config.text.norm_epsilon},
+                    p.tensor(ple.convolution)};
     if (w.mtp) {
         const auto& m = *w.mtp;
         mtp           = {native_weight(model.weight(m.embedding).view),
@@ -122,6 +126,7 @@ Parameters::Parameters(const ModelShard& model, std::shared_ptr<const ModelProfi
                          p.final_hc(m.final_hc),
                          p.history(m.layer)};
     }
-    if (w.vision) vision = qwen::prepare_vision(model.weight_data(), *w.vision);
+    if (w.vision && this->profile->input_stage())
+        vision = qwen::prepare_vision(model.weight_data(), *w.vision);
 }
 } // namespace ninfer::models::qwen4_exp::execution

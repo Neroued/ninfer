@@ -13,8 +13,7 @@ bool reached_dead_end(const RowResult& row) {
 }
 } // namespace
 
-void SessionImpl::finish_result(ComputeResult result) {
-    auto& tx = *compute;
+void SessionImpl::finish_result(ComputeTransaction& tx, ComputeResult result) {
     if (result.rows.size() != tx.members.size())
         throw std::logic_error("Qwen4Exp result changed its membership");
     tx.result.emplace(std::move(result));
@@ -136,7 +135,7 @@ void SessionImpl::finish_result(ComputeResult result) {
 }
 
 void SessionImpl::retire_compute(const runtime::DeviceRetired& event) {
-    auto& tx = *compute;
+    auto& tx = require_compute(event.ticket);
     for (auto h : tx.members) sequence(h).computing = false;
     if (tx.vision_id) {
         const auto* window = vision_window.current();
@@ -175,7 +174,7 @@ void SessionImpl::retire_compute(const runtime::DeviceRetired& event) {
     }
     if (tx.event) events.push_back(std::move(*tx.event));
     const bool score = tx.kind == Kind::Score;
-    compute.reset();
+    flights.at(event.ticket.frame.index).reset();
     if (score && scoring) (void)submit_score();
 }
 
@@ -186,10 +185,11 @@ namespace ninfer::models::qwen4_exp {
 CommitResult Session::commit(PendingBatch&& batch,
                              std::span<const runtime::CommitDecision> decisions) {
     auto& p = *impl_;
-    if (!p.compute || batch.ticket_ != p.compute->ticket || batch.members_ != p.compute->members ||
-        !p.compute->result || p.compute->committed || decisions.size() != batch.row_count())
+    auto* active = p.find_compute(batch.ticket_);
+    if (!active || batch.members_ != active->members || !active->result || active->committed ||
+        decisions.size() != batch.row_count())
         throw std::logic_error("invalid pending Qwen4Exp transaction");
-    auto& tx = *p.compute;
+    auto& tx = *active;
     for (std::size_t b = 0; b < decisions.size(); ++b) {
         const auto& decision = decisions[b];
         const auto produced  = tx.result->rows[b].tokens.size();
@@ -306,13 +306,12 @@ CommitResult Session::commit(PendingBatch&& batch,
 
 DiscardResult Session::discard(PendingBatch&& batch) noexcept {
     auto& p = *impl_;
-    if (!p.compute || batch.ticket_ != p.compute->ticket || batch.members_ != p.compute->members ||
-        p.compute->committed)
-        return {};
+    auto* active = p.find_compute(batch.ticket_);
+    if (!active || batch.members_ != active->members || active->committed) return {};
     try {
-        p.executor->discard(p.compute->ticket);
-        p.compute->discarded = true;
-        p.compute->committed = true;
+        p.executor->discard(active->ticket);
+        active->discarded    = true;
+        active->committed    = true;
         batch.ticket_        = {};
         return {runtime::ConsumeStatus::Consumed, batch.row_count()};
     } catch (...) { return {}; }
@@ -345,17 +344,17 @@ AbortResult Session::abort(SequenceHandle handle) {
 
 bool Session::withdraw_cancelled(runtime::ExecutionTicket ticket) {
     auto& p = *impl_;
-    if (!p.compute || p.compute->ticket != ticket || p.compute->committed || p.compute->result ||
-        !p.executor->try_withdraw(ticket))
+    auto* active = p.find_compute(ticket);
+    if (!active || active->committed || active->result || !p.executor->try_withdraw(ticket))
         return false;
-    auto& tx = *p.compute;
+    auto& tx = *active;
     tx.context.withdraw_submission();
     if (tx.vision_id) {
         p.vision_window.consumed(tx.vision_id, true);
         p.vision_window.retired(ticket);
     }
     for (auto h : tx.members) p.sequence(h).computing = false;
-    p.compute.reset();
+    p.flights.at(ticket.frame.index).reset();
     return true;
 }
 

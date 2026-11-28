@@ -26,13 +26,29 @@ RankProgramImpl::RankProgramImpl(const execution::Parameters& p, ExecutionPlan p
                                  DeviceContext& d, const StartupObserver& observer,
                                  ParallelBinding binding,
                                  std::unique_ptr<moe::ResidentExpertExchange> expert_exchange,
-                                 const distributed::Group* ple_group)
+                                 const distributed::Group* ple_group, PipelineBinding pipeline)
     : parameters(p), device(d), cuda(d.execution_view()), exchange(std::move(expert_exchange)),
       resources(p, std::move(plan), d, observer), ple_inputs(d), ple_ready(d), draft_copied(d),
       draft_output(resources.plan.pinned_draft_bytes), shape(resources.plan.shape),
       prefill_timer(d), gpu_timer(d, shape.gpu_timing), compute_done(d), context_done(d),
       bindings(shape.max_concurrency), input_rows(shape.max_concurrency),
       mtp_rows(shape.max_concurrency), valid_rows(shape.max_concurrency) {
+#if NINFER_ENABLE_DISTRIBUTED
+    const auto& persistent = resources.plan.persistent;
+    if (pipeline.input)
+        pipeline_input.emplace(*pipeline.input, d,
+                               persistent.pipeline_input.bind(resources.persistent()));
+    if (pipeline.output)
+        pipeline_output.emplace(*pipeline.output, d,
+                                persistent.pipeline_output.bind(resources.persistent()));
+    if (bool(pipeline_input) == p.profile->input_stage() ||
+        bool(pipeline_output) == p.profile->output_stage())
+        throw std::logic_error("Qwen4Exp pipeline endpoints differ from the layer assignment");
+#endif
+    retained.resize(runtime::ExecutionCapacity::pipeline(p.profile->stage.size,
+                                                         shape.max_concurrency,
+                                                         shape.purpose == EnginePurpose::Generation)
+                        .compute_frames);
     if (binding.group) parallel.emplace(binding);
     if (ple_group) ple_merge.emplace(ParallelBinding{ple_group});
     if (parallel) parallel->track_graph_group(ple_group);
@@ -40,7 +56,8 @@ RankProgramImpl::RankProgramImpl(const execution::Parameters& p, ExecutionPlan p
         service_graphs.emplace(exchange->group());
         if (parallel) parallel->track_graph_group(&exchange->group());
     }
-    if (bool(ple_merge) != (parameters.profile->ple_placement == ple::Placement::Sharded))
+    if (bool(ple_merge) != (parameters.profile->owns_ple &&
+                            parameters.profile->ple_placement == ple::Placement::Sharded))
         throw std::logic_error("Qwen4Exp PLE merge group differs from table placement");
     if (static_cast<bool>(exchange) != static_cast<bool>(parameters.profile->exchange))
         throw std::logic_error("Qwen4Exp Program is missing its prepared expert route");
@@ -93,10 +110,23 @@ void RankProgramImpl::validate_work(const Work& work, runtime::FrameKind kind) c
         if (!resident || !same_member(resident->member, member))
             throw std::logic_error("Qwen4Exp work refers to a stale resident");
     };
+    const auto busy = [&](runtime::ResidencyId id) {
+        const auto contains = [&](const auto& request) {
+            return std::ranges::any_of(work_rows(request.work),
+                                       [&](const auto& row) { return row.member.residency == id; });
+        };
+        return (compute && contains(compute->request)) ||
+               std::ranges::any_of(
+                   retained, [&](const auto& slot) { return slot && contains(slot->request); }) ||
+               std::ranges::any_of(waiting, contains);
+    };
     for (const auto& row : work_rows(work)) {
+        if (busy(row.member.residency))
+            throw std::logic_error("Qwen4Exp residency has live compute");
         check_resident(row.member);
-        check_selectors(row.states.at(parameters.profile->local.rank), resources.states->storage());
-        check_table(row.main_table, 0, *resources.main);
+        check_selectors(row.states.at(parameters.profile->replica_rank()),
+                        resources.states->storage());
+        if (resources.main->has_pages()) check_table(row.main_table, 0, *resources.main);
         if (parameters.mtp) check_table(row.mtp_table, 1, *resources.mtp);
     }
     if (const auto* forward = std::get_if<ForwardWork>(&work.operation);
@@ -110,10 +140,7 @@ void RankProgramImpl::validate_work(const Work& work, runtime::FrameKind kind) c
             if (!bindings[lane] || bindings[lane]->member.residency != residency)
                 throw std::logic_error("Qwen4Exp release refers to a stale resident");
             released.push_back(lane);
-            if (compute)
-                for (const auto& row : work_rows(compute->request.work))
-                    if (row.member.residency == residency)
-                        throw std::logic_error("Qwen4Exp resident still has live compute");
+            if (busy(residency)) throw std::logic_error("Qwen4Exp resident still has live compute");
         }
         std::sort(released.begin(), released.end());
         const auto is_released = [&](std::uint32_t lane) {
@@ -132,7 +159,7 @@ void RankProgramImpl::validate_work(const Work& work, runtime::FrameKind kind) c
     }
     const auto& actions =
         kind == runtime::FrameKind::Context ? resources.context_actions : resources.compute_actions;
-    actions->validate(local_actions(work.actions, parameters.profile->local.rank));
+    actions->validate(local_actions(work.actions, parameters.profile->replica_rank()));
 }
 
 void RankProgramImpl::validate_decision(runtime::ExecutionTicket ticket,
@@ -159,31 +186,43 @@ void RankProgramImpl::supply(runtime::ExecutionTicket ticket, runtime::CommandSe
 }
 
 void RankProgramImpl::prepare_commit(runtime::ExecutionTicket ticket, const Commit& commit) const {
-    if (!compute || compute->request.ticket != ticket ||
-        compute->phase != ComputePhase::PendingCommit)
-        throw std::logic_error("Qwen4Exp commit does not match the pending execution");
-    const auto& frame = *compute;
-    WorkContract{shape,
-                 parameters.profile->config.text.vocabulary,
-                 parameters.profile->public_tokens,
-                 bool(parameters.mtp),
-                 bool(parameters.vision),
-                 parameters.profile->control_token_limit,
-                 resources.plan.batches,
-                 resources.plan.decode_routes}
-        .validate_commit(frame.request.work, frame.result.rows, commit);
+    const auto* active = find_frame(ticket);
+    if (!active || active->deferred_commit || active->deferred_discard ||
+        active->phase != ComputePhase::PendingCommit)
+        throw std::logic_error("Qwen4Exp commit has no pending result");
+    const auto& frame = *active;
+    if (!parameters.profile->output_stage()) {
+        const auto rows = work_rows(frame.request.work);
+        if (rows.size() != commit.rows.size())
+            throw std::logic_error("pipeline commit changed membership");
+        for (std::size_t i = 0; i < rows.size(); ++i)
+            if (!same_member(rows[i].member, commit.rows[i].member))
+                throw std::logic_error("pipeline commit changed residency");
+    } else
+        WorkContract{shape,
+                     parameters.profile->config.text.vocabulary,
+                     parameters.profile->public_tokens,
+                     bool(parameters.mtp),
+                     bool(parameters.vision),
+                     parameters.profile->control_token_limit,
+                     resources.plan.batches,
+                     resources.plan.decode_routes}
+            .validate_commit(frame.request.work, frame.result.rows, commit);
     if (std::holds_alternative<moe::ExpertServiceWork>(frame.request.work.operation)) return;
     for (const auto& row : commit.rows)
-        check_selectors(row.states.at(parameters.profile->local.rank), resources.states->storage());
+        check_selectors(row.states.at(parameters.profile->replica_rank()),
+                        resources.states->storage());
     resources.compute_actions->validate(
-        local_actions(commit.actions, parameters.profile->local.rank));
+        local_actions(commit.actions, parameters.profile->replica_rank()));
 }
 
 bool RankProgramImpl::can_discard(runtime::ExecutionTicket ticket) const {
-    if (!compute || compute->request.ticket != ticket) return false;
-    return compute->phase == ComputePhase::PendingCommit ||
-           (compute->phase == ComputePhase::AwaitResult && !compute->request.work.exchange) ||
-           (compute->phase == ComputePhase::Decision && !compute->decision);
+    const auto* f = find_frame(ticket);
+    if (!f || f->deferred_commit || f->deferred_discard) return false;
+    return f->phase == ComputePhase::PendingCommit ||
+           (f->phase == ComputePhase::AwaitResult && parameters.profile->stage.size == 1 &&
+            !f->request.work.exchange) ||
+           (f->phase == ComputePhase::Decision && !f->decision);
 }
 
 } // namespace ninfer::models::qwen4_exp::detail
@@ -193,16 +232,20 @@ RankProgram::RankProgram(const execution::Parameters& parameters, ExecutionPlan 
                          DeviceContext& device, const StartupObserver& observer,
                          ParallelBinding binding,
                          std::unique_ptr<moe::ResidentExpertExchange> expert_exchange,
-                         const distributed::Group* ple_group)
+                         const distributed::Group* ple_group, PipelineBinding pipeline)
     : impl_(std::make_unique<detail::RankProgramImpl>(parameters, std::move(plan), device, observer,
                                                       binding, std::move(expert_exchange),
-                                                      ple_group)) {}
+                                                      ple_group, pipeline)) {}
 
 GraphPreparationSample RankProgram::prepare_execution(GraphPreparationMode mode) {
     return impl_->initialize_graphs(mode);
 }
 
 void RankProgram::release_execution() { impl_->release_graphs(); }
+
+runtime::ExecutionCapacity RankProgram::capacity() const noexcept {
+    return {static_cast<std::uint32_t>(impl_->retained.size()), 1};
+}
 
 RankProgram::~RankProgram() = default;
 

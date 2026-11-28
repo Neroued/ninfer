@@ -27,6 +27,7 @@ TextRun::TextRun(const Parameters& p, TextExecution execution, BatchView batch, 
         throw std::invalid_argument("invalid Qwen4Exp sequence/step window");
     if (partition_.split() && !execution_.parallel)
         throw std::invalid_argument("Qwen4Exp sequence partition requires its parallel group");
+    if (p.profile->after_ple) partition_residual();
     partition_.clear_padding(roots_.exchange_input, 1, cuda_);
     partition_.clear_padding(roots_.exchange_output, 1, cuda_);
 }
@@ -144,7 +145,8 @@ void TextRun::gpu_moe(const moe::GpuCall& call) {
 void TextRun::combine(std::uint32_t i) {
     const auto output  = reduce_output();
     const auto& config = parameters_.profile->config.text;
-    if (i + 1 == config.ple.layer) {
+    if ((parameters_.profile->owns_ple && i + 1 == config.ple.layer) ||
+        (!parameters_.profile->output_stage() && i + 1 == config.layers.size())) {
         ops::hc_combine(roots_.residual, output, roots_.injection, roots_.residual, cuda_);
     } else {
         const auto& norm = i + 1 < config.layers.size()
@@ -168,6 +170,25 @@ void TextRun::consume_ple(const Tensor& embedding) {
         execution_.states.ple(batch_.source_offsets), after, records, p.layers[start].attention_hc,
         roots_.residual, roots_.normalized, execution_.workspace, cuda_,
         std::get_if<PackedPrefillState>(&update_));
+    partition_residual();
+}
+
+StageBoundaryField TextRun::boundary() {
+    const auto& local = parameters_.profile->local;
+    return StageBoundaryField::bind(roots_.residual,
+                                    partitioned_ ? TpLayout::Sharded : TpLayout::Replicated,
+                                    local.rank, local.size);
+}
+
+void TextRun::begin_stage() {
+    const auto& profile = *parameters_.profile;
+    // PLE consumes the raw HC residual before normalizing with this layer's weights.
+    if (profile.owns_ple && profile.config.text.ple.layer == 0) return;
+    ops::hc_grouped_rmsnorm(roots_.residual, parameters_.text.layers.front().attention_hc.norm,
+                            profile.config.text.norm_epsilon, roots_.normalized, cuda_);
+}
+
+void TextRun::partition_residual() {
     if (partition_.split()) {
         roots_.residual   = partition_.local(roots_.residual, 2);
         roots_.normalized = partition_.local(roots_.normalized, 2);

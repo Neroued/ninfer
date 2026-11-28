@@ -19,9 +19,12 @@ struct PersistentLayout {
     QsaCacheLayout main;
     std::optional<QsaCacheLayout> mtp;
     BufferLayout buffers;
+    LayoutRegion pipeline_input, pipeline_output, graph_input, graph_output;
     std::size_t bytes;
 };
 
+[[nodiscard]] std::size_t pipeline_packet_bytes(const execution::ModelProfile&,
+                                                std::uint32_t columns);
 struct ExecutionPlan {
     std::shared_ptr<const execution::ModelProfile> profile;
     ExecutionShape shape;

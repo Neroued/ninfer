@@ -42,9 +42,10 @@ Resources::Resources(const execution::Parameters& p, ExecutionPlan input, Device
     if (plan.persistent.mtp)
         mtp = std::make_unique<QsaCache>(context_.span(), backing, *plan.persistent.mtp);
     std::vector<context::ContextTableStorage> pools;
-    for (std::uint32_t i = 0; i < pool_count(); ++i) pools.push_back({i, &pool(i).tables()});
+    for (std::uint32_t i = 0; i < pool_count(); ++i)
+        if (pool(i).has_pages()) pools.push_back({i, &pool(i).tables()});
     context = std::make_unique<context::ContextStorage>(context_.span(), host_context_.span(),
-                                                        pools, p.profile->local.rank);
+                                                        pools, p.profile->replica_rank());
     const auto mapping_elements = plan.pinned_context_bytes() / 2 / sizeof(std::int64_t);
     compute_actions             = std::make_unique<context::ContextMigration>(
         device, *context, device.execution_view(), mapping_elements);
@@ -66,11 +67,11 @@ Resources::Resources(const execution::Parameters& p, ExecutionPlan input, Device
                                    plan.graph_probe ? moe::ResourcePurpose::GraphCalibration
                                                     : moe::ResourcePurpose::Execution);
     }
-    if (const auto* table =
-            std::get_if<std::shared_ptr<const ple::disk::Table>>(&p.model.ple_table())) {
+    if (p.profile->owns_ple && p.profile->ple_placement == ple::Placement::Disk) {
+        const auto& table = std::get<std::shared_ptr<const ple::disk::Table>>(p.model.ple_table());
         ple_upload  = std::make_unique<ple::UploadSlots>(device, plan.ple.max_positions, 2);
-        ple_prepare = std::make_unique<ple::disk::PrepareService>(
-            **table, p.profile->config.text.ple.eos, plan.ple, ple_upload->host_slots());
+        ple_prepare       = std::make_unique<ple::disk::PrepareService>(
+            *table, p.profile->config.text.ple.eos, plan.ple, ple_upload->host_slots());
         if (ple_prepare->memory_bytes() != plan.ple_prepare_bytes ||
             ple_upload->memory().device_bytes != plan.ple_upload.device_bytes)
             throw std::logic_error("PLE allocated capacity differs from the execution plan");
@@ -160,10 +161,15 @@ Tensor Resources::packed(const TensorRegion& region, std::initializer_list<std::
 
 Resources::MainRecords Resources::main_records(std::int32_t width, std::int32_t batch) {
     const auto& qsa   = buffers_.main_qsa;
-    const auto layers = dimension(qsa.layers);
-    return {packed(qsa.keys, {qsa.keys.shape[0], width, batch, layers}),
-            packed(qsa.coordinates, {3, width, batch, layers}),
-            packed(buffers_.ple_records, {buffers_.ple_records.shape[0], width, batch})};
+    MainRecords result{};
+    if (qsa.layers) {
+        const auto layers  = dimension(qsa.layers);
+        result.keys        = packed(qsa.keys, {qsa.keys.shape[0], width, batch, layers});
+        result.coordinates = packed(qsa.coordinates, {3, width, batch, layers});
+    }
+    if (buffers_.ple_records.region.bytes)
+        result.ple = packed(buffers_.ple_records, {buffers_.ple_records.shape[0], width, batch});
+    return result;
 }
 
 void Resources::select_batch(std::uint32_t rows) {

@@ -18,17 +18,22 @@ class RankProgramImpl;
 
 // Owns one rank's physical execution resources. Work and commits carry already-resolved
 // context identities; logical sequence, checkpoint and allocation ownership stays in Session.
+struct PipelineBinding {
+    const distributed::Group* input  = nullptr;
+    const distributed::Group* output = nullptr;
+};
+
 class RankProgram {
 public:
     RankProgram(const execution::Parameters&, ExecutionPlan, DeviceContext&,
                 const StartupObserver& observer = {}, ParallelBinding = {},
                 std::unique_ptr<moe::ResidentExpertExchange> exchange = {},
-                const distributed::Group* ple_group                   = nullptr);
+                const distributed::Group* ple_group = nullptr, PipelineBinding = {});
     ~RankProgram();
     RankProgram(const RankProgram&)            = delete;
     RankProgram& operator=(const RankProgram&) = delete;
 
-    [[nodiscard]] static constexpr runtime::ExecutionCapacity capacity() noexcept { return {1, 1}; }
+    [[nodiscard]] runtime::ExecutionCapacity capacity() const noexcept;
 
     [[nodiscard]] SessionPlan session_plan() const;
     GraphPreparationSample prepare_execution(GraphPreparationMode = GraphPreparationMode::Complete);

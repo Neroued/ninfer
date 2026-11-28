@@ -177,7 +177,10 @@ runtime::WorkPayloadCapacity WorkContract::payload_capacity(std::uint32_t rank_c
     // The longest schedule is a forced-control window split at the prefill boundary.
     const auto passes = std::max<std::size_t>(
         width, batch * (1 + control_token_limit / std::max<std::size_t>(chunk, 1)));
-    return {work + 22 + 4 * passes,
+    const auto inline_mask = shape.pipeline_stages > 1 && shape.purpose == EnginePurpose::Generation
+                                 ? 12 + batch * (20 + 4 * ((public_tokens + 31ULL) / 32))
+                                 : 0;
+    return {work + 24 + inline_mask + 4 * passes,
             context,
             decision,
             commit,
@@ -187,6 +190,19 @@ runtime::WorkPayloadCapacity WorkContract::payload_capacity(std::uint32_t rank_c
 }
 
 void WorkContract::validate(const Work& work, runtime::FrameKind kind) const {
+    if (work.initial_decision) {
+        const auto* f = std::get_if<ForwardWork>(&work.operation);
+        if (kind != runtime::FrameKind::Compute || shape.pipeline_stages <= 1 || !f ||
+            (f->kind != ForwardKind::Prefill && f->kind != ForwardKind::Ordinary) ||
+            f->sample == SampleKind::None || work.initial_decision->rows.empty())
+            throw std::invalid_argument(
+                "inline Qwen4Exp grammar requires a sampled pipeline forward");
+        runtime::DecisionRequest expected{0, public_tokens, {}};
+        for (std::uint32_t i = 0; i < f->rows.size(); ++i)
+            if (f->rows[i].constrained && (f->kind != ForwardKind::Prefill || f->rows[i].sample))
+                expected.rows.push_back({i, {}});
+        validate(work, expected, *work.initial_decision);
+    }
     const bool service = std::holds_alternative<moe::ExpertServiceWork>(work.operation);
     if (service || work.exchange) {
         if (kind != runtime::FrameKind::Compute || !work.exchange || !work.exchange->id ||

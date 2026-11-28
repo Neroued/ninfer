@@ -1,4 +1,5 @@
 #pragma once
+#include "distributed/bootstrap.h"
 
 #include "models/qwen4_exp/parallel/codec.h"
 #include "models/qwen4_exp/runtime_types.h"
@@ -17,6 +18,8 @@ public:
 
     [[nodiscard]] const auto& topology() const { return parallel_.topology; }
 
+    [[nodiscard]] distributed::SelectShards select_shards(const artifact::Reader&,
+                                                          const EngineOptions&);
     [[nodiscard]] qwen::Frontend frontend(const EngineOptions&) const;
     [[nodiscard]] std::vector<distributed::wire::Bytes> requests(const EngineOptions&,
                                                                  bool narrow_targets = false) const;
@@ -56,6 +59,7 @@ private:
     };
 
     std::vector<Membership> memberships_;
+    runtime::ExecutionCapacity frames_;
     std::vector<RankExecutionDescription> ranks_;
 };
 

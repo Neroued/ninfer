@@ -1,5 +1,8 @@
 #include "models/qwen4_exp/parallel/startup.h"
 #include "runtime/observability/snapshot.h"
+#include "models/common/pipeline_placement.h"
+#include "models/qwen4_exp/load.h"
+#include "models/qwen4_exp/ple/table.h"
 #include "runtime/executor/collective_executor.h"
 #include "models/common/moe/step_schedule.h"
 
@@ -16,6 +19,9 @@ ParallelStartup::ParallelStartup(const artifact::Reader& reader, const EngineOpt
       batches_(std::make_shared<const BatchExecutionPlan>(make_batch_execution_spec(
           (options.max_concurrency - 1) / options.deployment->parallel.dp + 1, 1,
           options.use_cuda_graph && options.purpose == EnginePurpose::Generation))) {
+    frames_ = runtime::ExecutionCapacity::pipeline(options.deployment->parallel.pp,
+                                                   batches_->resident_capacity(),
+                                                   options.purpose == EnginePurpose::Generation);
     if (options.deployment->parallel.tp > 1 &&
         options.deployment->parallel.ep > options.deployment->parallel.tp)
         throw std::invalid_argument(
@@ -23,6 +29,55 @@ ParallelStartup::ParallelStartup(const artifact::Reader& reader, const EngineOpt
     if (options.context_cache.host_capacity_bytes.value_or(0) > 0)
         throw std::invalid_argument(
             "distributed execution requires device-resident Context storage");
+}
+
+distributed::SelectShards ParallelStartup::select_shards(const artifact::Reader& reader,
+                                                         const EngineOptions& options) {
+    if (options.deployment->parallel.pp == 1 || !options.deployment->parallel.stage_layers.empty())
+        return {};
+    return [this, &reader, &options](std::span<const distributed::RankMemoryOffer> offers)
+               -> std::optional<distributed::ShardAssignment> {
+        const auto& hardware = parallel_.topology;
+        std::vector<IndexRange> current;
+        for (const auto& stage : hardware.replicas.front().stage_ranks)
+            current.push_back(parallel_.ranks.at(stage.front()).layers);
+        std::vector<std::optional<std::size_t>> ple_minimum(hardware.ranks.size());
+        const auto selected = fit_pipeline_layers(
+            hardware, options, offers, current, pipeline_layer_demands(*definition_),
+            [&](const distributed::RankIdentity& id, IndexRange range, bool shared) {
+                auto rank = plan_rank_layers(*definition_, id, placements_.front(), range);
+                const bool table_owner = rank.owns_ple;
+                auto load              = resolve_rank_load(reader, definition_, std::move(rank),
+                                                           Device::cuda(id.device));
+                const auto& storage    = load.materialization();
+                auto bytes             = artifact::checked_add(storage.device_capacity_bytes,
+                                                   shared ? storage.host_capacity_bytes : 0,
+                                                               "pipeline shard capacity");
+                if (table_owner) {
+                    auto& minimum = ple_minimum[id.rank];
+                    if (!minimum)
+                        for (const auto placement : placements_) {
+                            const auto table = plan_ple_table(reader, *definition_, placement,
+                                                              id.tp, Device::cuda(id.device));
+                            const auto cost  = artifact::checked_add(table.device_bytes(),
+                                                                    shared ? table.host_bytes() : 0,
+                                                                     "PLE placement capacity");
+                            minimum          = std::min(minimum.value_or(SIZE_MAX), cost);
+                        }
+                    bytes =
+                        artifact::checked_add(bytes, *minimum, "pipeline shard and PLE capacity");
+                }
+                return bytes;
+            });
+        if (!selected) return {};
+        auto deployment = *options.deployment;
+        for (auto range : *selected) deployment.parallel.stage_layers.push_back(range.size);
+        parallel_ = plan_parallel(*definition_, deployment, placements_);
+        distributed::ShardAssignment assignment{parallel_.topology.plan, {}};
+        for (const auto& rank : parallel_.topology.ranks)
+            assignment.digests.push_back(rank.shard_digest);
+        return assignment;
+    };
 }
 
 qwen::Frontend ParallelStartup::frontend(const EngineOptions& options) const {
@@ -66,6 +121,7 @@ std::size_t ParallelStartup::coordinator_payload_bytes(const EngineOptions& opti
     shape.max_concurrency = batch;
     shape.prefill_chunk =
         std::min(options.prefill_chunk ? options.prefill_chunk : 4096U, options.max_context);
+    shape.pipeline_stages = options.deployment->parallel.pp;
     shape.draft_tokens = options.speculative.draft_tokens;
     shape.purpose      = options.purpose;
     const auto& text   = definition_->resources().text;
@@ -160,7 +216,7 @@ ParallelStartup::coordinate(std::uint32_t replica, std::unique_ptr<Executor> phy
 
 runtime::ExecutionCapacity ParallelStartup::capacity(std::uint32_t replica_id) const {
     (void)parallel_.topology.replica(replica_id);
-    return RankProgram::capacity();
+    return frames_;
 }
 
 std::string ParallelStartup::prefill_signature(std::uint32_t chunk,
@@ -171,7 +227,14 @@ std::string ParallelStartup::prefill_signature(std::uint32_t chunk,
                      ";tp=" + std::to_string(rank.placement.tp.size) +
                      ";ep=" + std::to_string(rank.placement.ep.size);
     const auto& observation = ranks_.at(replica.result_owner).observation;
-    signature += ";ple=" + observation.memory.ple_table.value().placement;
+    const auto owner =
+        std::ranges::find_if(replica.ranks, [&](auto r) { return parallel_.ranks.at(r).owns_ple; });
+    signature += ";ple=" + ranks_.at(*owner).observation.memory.ple_table.value().placement;
+    if (replica.stage_ranks.size() > 1) {
+        signature += ";pp_layers=";
+        for (const auto& stage : replica.stage_ranks)
+            signature += std::to_string(parallel_.ranks.at(stage.front()).layers.size) + ",";
+    }
     for (const auto& group : observation.communication)
         for (const auto& backend : group.backends)
             signature +=

@@ -22,7 +22,7 @@ void GraphInputs::prepare() {
     std::vector<RecordSpec> specs{{images.image_bytes, images.alignment}};
     for (std::uint32_t history = 0; history < r.pool_count(); ++history) {
         const auto& layout = history == 0 ? r.plan.persistent.main : *r.plan.persistent.mtp;
-        specs.push_back({layout.pages.page_bytes, layout.pages.alignment});
+        if (layout.layers) specs.push_back({layout.pages.page_bytes, layout.pages.alignment});
     }
     const auto geometry = describe_context_pool(specs);
     std::vector<RecordRequest> demand;
@@ -46,6 +46,7 @@ void GraphInputs::prepare() {
     for (std::uint32_t b = 0; b < owner_.shape.max_concurrency; ++b)
         state_offsets_.push_back(allocate(0));
     for (std::uint32_t pool = 0; pool < r.pool_count(); ++pool) {
+        if (!r.pool(pool).has_pages()) continue;
         auto& tables         = r.pool(pool).tables();
         const auto capacity  = tables.logical_page_capacity();
         const auto row_bytes = std::size_t(capacity) * sizeof(std::int64_t);
@@ -71,6 +72,7 @@ void GraphInputs::prepare() {
             CUDA_CHECK(cudaMemsetAsync(value.data, 0, value.bytes(), owner_.cuda.stream()));
         }
     }
+    if (!buffers.sampling) return;
     std::vector<ops::SamplingConfig> configs(owner_.shape.max_concurrency);
     for (auto& config : configs) config.temperature = 0;
     const auto target = r.tensor(*buffers.sampling);
@@ -144,11 +146,14 @@ void GraphInputs::batch(execution::BatchView call, std::uint32_t visible) {
     write_values<std::int32_t>(call.valid_columns, counts, owner_.cuda);
     write_values<std::int32_t>(call.record_offsets, offsets, owner_.cuda);
     const auto& buffers = owner_.resources.buffers();
-    std::vector<ops::SamplingConfig> configs(b);
-    for (auto& config : configs) config.temperature = 0;
-    const auto target = owner_.resources.tensor(*buffers.sampling);
-    copy_bytes({target.data, target.bytes(), owner_.cuda.device()},
-               {configs.data(), configs.size() * sizeof(configs[0]), Device::cpu()}, owner_.cuda);
+    if (buffers.sampling) {
+        std::vector<ops::SamplingConfig> configs(b);
+        for (auto& config : configs) config.temperature = 0;
+        const auto target = owner_.resources.tensor(*buffers.sampling);
+        copy_bytes({target.data, target.bytes(), owner_.cuda.device()},
+                   {configs.data(), configs.size() * sizeof(configs[0]), Device::cpu()},
+                   owner_.cuda);
+    }
     const auto& io = buffers.batch;
     std::vector<std::int32_t> slots(b, -1), sampling_positions(b), extents(b);
     for (std::uint32_t row = 0; row < live; ++row) {

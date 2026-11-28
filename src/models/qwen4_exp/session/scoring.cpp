@@ -9,7 +9,8 @@ std::optional<runtime::ExecutionTicket> Session::start_score(qwen::PreparedPromp
     auto& p = *impl_;
     if (p.shape.purpose != EnginePurpose::CausalScoring)
         throw std::logic_error("not a causal scoring Session");
-    if (p.compute || p.operation || p.scoring || p.release_ticket || !p.releases.empty()) return {};
+    if (p.has_compute() || p.operation || p.scoring || p.release_ticket || !p.releases.empty())
+        return {};
     runtime::ResolvedExecutionOptions options;
     options.allow_prefix_reuse = false;
     auto base                  = plan_request(std::move(prompt), options);
@@ -37,7 +38,7 @@ std::optional<runtime::ExecutionTicket> Session::start_score(qwen::PreparedPromp
 namespace ninfer::models::qwen4_exp::detail {
 
 bool SessionImpl::submit_score() {
-    if (!scoring || !scoring->sequence || compute)
+    if (!scoring || !scoring->sequence || has_compute())
         throw std::logic_error("scoring continuation is unavailable");
     auto& s          = sequence(*scoring->sequence);
     const auto begin = s.continuation.metadata.main_frontier;
@@ -56,6 +57,7 @@ bool SessionImpl::submit_score() {
     const auto end   = window_end(s, begin, total - 1);
     auto reservation = executor->try_reserve(runtime::FrameKind::Compute);
     if (!reservation) return false;
+    auto& compute = vacant_compute(reservation->frame());
     compute  = std::make_unique<ComputeTransaction>(ComputeTransaction::Kind::Score, directory);
     auto& tx = *compute;
     tx.members.push_back(handle(s));
@@ -83,8 +85,7 @@ bool SessionImpl::submit_score() {
     }
 }
 
-void SessionImpl::finish_score(ScoreResult result) {
-    auto& tx = *compute;
+void SessionImpl::finish_score(ComputeTransaction& tx, ScoreResult result) {
     if (!scoring || tx.kind != ComputeTransaction::Kind::Score || tx.rows.size() != 1 ||
         result.processed != tx.rows[0].ids.size())
         throw std::logic_error("invalid Qwen4Exp score result");

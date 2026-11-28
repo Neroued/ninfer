@@ -22,12 +22,14 @@ public:
     QsaCache(MemorySpan context, MemorySpan fixed, const QsaCacheLayout&);
     [[nodiscard]] ops::QsaCacheView layer(std::uint32_t) const;
 
-    [[nodiscard]] context::ExecutionTableStorage& tables() { return tables_; }
+    [[nodiscard]] context::ExecutionTableStorage& tables() { return tables_.value(); }
 
-    [[nodiscard]] const context::ExecutionTableStorage& tables() const { return tables_; }
+    [[nodiscard]] bool has_pages() const { return tables_.has_value(); }
+
+    [[nodiscard]] const context::ExecutionTableStorage& tables() const { return tables_.value(); }
 private:
     QsaCacheLayout layout_;
     MemorySpan context_;
-    context::ExecutionTableStorage tables_;
+    std::optional<context::ExecutionTableStorage> tables_;
 };
 } // namespace ninfer::models::qwen4_exp

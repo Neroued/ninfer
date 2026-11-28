@@ -21,7 +21,7 @@ private:
 };
 
 [[nodiscard]] std::vector<runtime::InputResource>
-stream_vision_inputs(const VisionWork&, const distributed::ReplicaTopology&);
+stream_vision_inputs(const VisionWork&, std::span<const distributed::RankId>);
 
 // One window at a time. BF16 patches use the Program's pinned receive slot.
 // Coordinate arrays are received directly into the owning encoder batch.

@@ -257,7 +257,8 @@ BindingReservation Session::start_binding(const RequestBasePlan& base, runtime::
                               .capacity_possible = plan.evaluation.capacity_possible,
                               .assessment        = std::move(plan.evaluation.assessment)};
     if (!result.source_valid || !result.assessment.feasible()) return result;
-    if (result.assessment.requires_maintenance() && (p.compute || p.executor->has_pending_work())) {
+    if (result.assessment.requires_maintenance() &&
+        (p.has_compute() || p.executor->has_pending_work())) {
         p.pending_maintenance = result.assessment;
         p.directory.request_maintenance();
         result.assessment.status = context::ContextAvailability::Waiting;

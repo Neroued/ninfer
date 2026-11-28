@@ -19,7 +19,7 @@ SessionPlan plan_session(const ExecutionPlan& execution) {
                                : execution.moe                         ? ExecutionPath::Mixed
                                                                        : ExecutionPath::Graph;
     plan.checkpoint_interval = execution.checkpoint_interval;
-    const auto rank          = execution.profile->local.rank;
+    const auto rank          = execution.profile->replica_rank();
     const auto& image        = execution.persistent.state.images;
     const auto capacity      = execution.capacity.device_bytes + execution.host_context_bytes;
     const auto states = count(capacity / image.image_bytes + execution.shape.max_concurrency * 2);
@@ -30,14 +30,18 @@ SessionPlan plan_session(const ExecutionPlan& execution) {
     plan.context.state = {states, {{0, {{rank, image.image_bytes, image.alignment}}}}};
     const auto add     = [&](const QsaCacheLayout& cache) {
         plan.context.pools.push_back({
-                .pool_id = count(plan.context.pools.size()),
-                .logical_pages =
-                count(capacity / cache.pages.page_bytes + execution.shape.max_concurrency * 2),
+                .pool_id       = count(plan.context.pools.size()),
+                .logical_pages = cache.layers ? count(capacity / cache.pages.page_bytes +
+                                                      execution.shape.max_concurrency * 2)
+                                              : 0,
                 .histories     = histories,
                 .page_capacity = cache.tables.spec.logical_page_capacity,
                 .table_rows    = static_cast<std::uint32_t>(cache.tables.spec.table_rows),
-                .parts         = {{rank, {cache.pages.page_bytes, cache.pages.alignment}}},
+                .parts         = {},
         });
+        if (cache.layers)
+            plan.context.pools.back().parts.push_back(
+                {rank, {cache.pages.page_bytes, cache.pages.alignment}});
     };
     add(execution.persistent.main);
     if (execution.persistent.mtp) add(*execution.persistent.mtp);
@@ -54,13 +58,14 @@ SessionPlan plan_session(const ExecutionPlan& execution) {
 runtime::ContextMetadataPlan session_metadata_plan(const ExecutionPlan& execution,
                                                    const ContextPoolGeometry& geometry) {
     auto schema           = plan_session(execution).context;
-    const auto rank       = execution.profile->local.rank;
-    const auto ranks      = execution.profile->local.size;
+    const auto rank       = execution.profile->replica_rank();
+    const auto ranks      = execution.profile->replica_size();
     const auto local_rank = schema.ranks.front();
     const auto state_part = schema.state.layouts.front().parts.front();
     schema.ranks.clear();
     schema.state.layouts.front().parts.clear();
     for (auto& pool : schema.pools) {
+        if (pool.parts.empty()) continue;
         const auto part = pool.parts.front();
         pool.parts.clear();
         for (std::uint32_t i = 0; i < ranks; ++i) pool.parts.push_back({i, part.record});
@@ -104,14 +109,16 @@ runtime::ContextMetadataPlan session_metadata_plan(const ExecutionPlan& executio
          context::PrefixStore::metadata_bytes(0, 1, prefix_layout) -
          context::PrefixStore::metadata_bytes(0, 0, prefix_layout) + ranks - 1) /
         ranks;
-    const auto main_class = geometry.spec_classes.at(schema.state.layouts.size()).index;
-    const auto prefix_page_cost =
-        (context::PrefixStore::metadata_bytes(kPagedKVPageSize, 0, prefix_layout) -
-         context::PrefixStore::metadata_bytes(0, 0, prefix_layout) + ranks - 1) /
-        ranks;
-    metadata.bytes_per_record.at(main_class) += prefix_page_cost;
-    metadata.fixed_bytes += (local_rank.host_bytes / geometry.block_bytes) *
-                            geometry.classes[main_class].records_per_block * prefix_page_cost;
+    if (execution.persistent.main.layers) {
+        const auto main_class = geometry.spec_classes.at(schema.state.layouts.size()).index;
+        const auto prefix_page_cost =
+            (context::PrefixStore::metadata_bytes(kPagedKVPageSize, 0, prefix_layout) -
+             context::PrefixStore::metadata_bytes(0, 0, prefix_layout) + ranks - 1) /
+            ranks;
+        metadata.bytes_per_record.at(main_class) += prefix_page_cost;
+        metadata.fixed_bytes += (local_rank.host_bytes / geometry.block_bytes) *
+                                geometry.classes[main_class].records_per_block * prefix_page_cost;
+    }
     if (rank == 0 && execution.workspace.vision)
         metadata.fixed_bytes +=
             ((std::size_t(execution.shape.max_context) + prefix_layout.span_stride - 1) /

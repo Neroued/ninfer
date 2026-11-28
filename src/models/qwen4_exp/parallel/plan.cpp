@@ -5,16 +5,20 @@
 
 #include <algorithm>
 #include <bit>
+#include <cmath>
 #include <numeric>
 
 namespace ninfer::models::qwen4_exp {
-namespace {
-RankPlan rank_plan(const ModelDefinition& definition, const distributed::RankIdentity& id,
-                   ple::Placement table) {
+RankPlan plan_rank_layers(const ModelDefinition& definition, const distributed::RankIdentity& id,
+                          ple::Placement table, IndexRange layers) {
     const auto& c = definition.config().text;
     const auto& w = definition.weights();
     RankPlan p;
-    p.placement             = RankPlacement(id);
+    p.placement      = RankPlacement(id);
+    p.layers         = layers;
+    p.owns_ple       = c.ple.layer >= layers.begin && c.ple.layer - layers.begin < layers.size;
+    const auto local = std::span(w.text.layers).subspan(layers.begin, layers.size);
+    const bool first = id.pp.rank == 0, last = id.pp.rank + 1 == id.pp.size;
     const auto [rank, size] = id.tp;
     p.ple_candidates        = {table};
     p.ple_placement         = table;
@@ -23,11 +27,11 @@ RankPlan rank_plan(const ModelDefinition& definition, const distributed::RankIde
     p.qsa_queries           = partition_range(c.qsa.query_heads, size, rank);
     p.qsa_kv                = partition_range(c.qsa.kv_heads, size, rank);
     p.vocabulary            = partition_vocabulary_range(c.vocabulary, size, rank);
-    p.ple_shards            = ple::shard_range(table, c.ple.shards, id.tp);
+    if (p.owns_ple) p.ple_shards = ple::shard_range(table, c.ple.shards, id.tp);
     p.shared_intermediate = partition_range(c.moe.shared_intermediate, size, rank).size;
     const auto per_owner  = partition_range(c.moe.experts, id.ep.size, id.ep.rank);
     const auto slice      = p.placement.expert_slice();
-    p.experts.resize(definition.expert_banks().size());
+    p.experts.resize(layers.size + bool(w.mtp));
     for (std::size_t layer = 0; layer < p.experts.size(); ++layer) {
         auto& bank        = p.experts[layer];
         bank.intermediate = partition_range(c.moe.intermediate, slice.size, slice.rank);
@@ -35,8 +39,9 @@ RankPlan rank_plan(const ModelDefinition& definition, const distributed::RankIde
             bank.ids.resize(c.moe.experts);
             std::iota(bank.ids.begin(), bank.ids.end(), 0);
         } else {
-            const auto priority = layer < w.text.layers.size() ? default_expert_priority(c, layer)
-                                                               : std::span<const std::uint32_t>{};
+            const auto priority = layer < layers.size
+                                      ? default_expert_priority(c, layers.begin + layer)
+                                      : std::span<const std::uint32_t>{};
             bank.ids.reserve(per_owner.size);
             for (std::uint32_t index = id.ep.rank; index < c.moe.experts; index += id.ep.size)
                 bank.ids.push_back(priority.empty() ? index : priority[index]);
@@ -73,20 +78,34 @@ RankPlan rank_plan(const ModelDefinition& definition, const distributed::RankIde
         }
     };
 
-    whole({w.text.embedding, w.text.ple.key, w.text.ple.value, w.text.ple.norm_key,
-           w.text.ple.norm_query, w.text.ple.norm_conv, w.text.ple.convolution});
-    whole_hc(w.text.final_hc);
-    for (const auto& b : w.text.layers) whole_block_constants(b);
+    if (first) whole({w.text.embedding});
+    if (p.owns_ple)
+        whole({w.text.ple.key, w.text.ple.value, w.text.ple.norm_key, w.text.ple.norm_query,
+               w.text.ple.norm_conv, w.text.ple.convolution});
+    if (last) whole_hc(w.text.final_hc);
+    for (const auto& b : local) whole_block_constants(b);
     if (w.mtp) {
         whole({w.mtp->embedding, w.mtp->embedding_norm, w.mtp->hidden_norm, w.mtp->fc_embedding,
                w.mtp->fc_hidden});
         whole_block_constants(w.mtp->layer);
         whole_hc(w.mtp->final_hc);
     }
-    if (w.vision) whole_vision(*w.vision);
+    if (w.vision && first) whole_vision(*w.vision);
 
+    const auto omit_foreign = [&] {
+        if (id.pp.size == 1) return;
+        std::vector<bool> bound(definition.parameters().size());
+        for (auto weight : p.whole) bound.at(weight.index) = true;
+        for (const auto& a : p.assemblies)
+            for (const auto& binding : a.bindings) bound.at(binding.parameter.index) = true;
+        for (const auto& layer : local)
+            for (auto weight : {layer.moe.gate, layer.moe.up, layer.moe.down})
+                bound.at(weight.index) = true;
+        for (std::size_t i = 0; i < bound.size(); ++i)
+            if (!bound[i]) p.omitted.push_back({i});
+    };
     if (size == 1) {
-        whole({w.text.head});
+        if (last) whole({w.text.head});
         const auto whole_block_dynamic = [&](const BlockWeights& b) {
             if (const auto* g = std::get_if<GdnWeights>(&b.mixer)) {
                 whole({g->query, g->key, g->value, g->z, g->a, g->b, g->a_log, g->dt_bias,
@@ -98,11 +117,12 @@ RankPlan rank_plan(const ModelDefinition& definition, const distributed::RankIde
             const auto& m = b.moe;
             whole({m.router, m.shared_score, m.shared_gate, m.shared_up, m.shared_down});
         };
-        for (const auto& b : w.text.layers) whole_block_dynamic(b);
+        for (const auto& b : local) whole_block_dynamic(b);
         if (w.mtp) {
             whole({w.mtp->head});
             whole_block_dynamic(w.mtp->layer);
         }
+        omit_foreign();
         return p;
     }
 
@@ -181,21 +201,24 @@ RankPlan rank_plan(const ModelDefinition& definition, const distributed::RankIde
         rows({{m.shared_gate, true}, {m.shared_up, true}});
         columns(m.shared_down);
     };
-    for (const auto& b : w.text.layers) block(b, false);
-    vocabulary_head(w.text.head);
+    for (const auto& b : local) block(b, false);
+    if (last) vocabulary_head(w.text.head);
     if (w.mtp) {
         block(w.mtp->layer, true);
         vocabulary_head(w.mtp->head);
     }
+    omit_foreign();
     return p;
 }
-} // namespace
 
 std::uint64_t compute_rank_shard_digest(const artifact::ArtifactId& artifact_id,
                                         LoadOptions options, const RankPlan& r) {
-    std::vector<std::uint64_t> geometry{r.placement.tp.rank, r.placement.tp.size,
-                                        r.placement.ep.rank, r.placement.ep.size,
-                                        static_cast<std::uint64_t>(r.ple_placement)};
+    std::vector<std::uint64_t> geometry{
+        r.placement.pp.rank, r.placement.pp.size,
+        r.layers.begin,      r.layers.size,
+        r.owns_ple,          r.placement.tp.rank,
+        r.placement.tp.size, r.placement.ep.rank,
+        r.placement.ep.size, static_cast<std::uint64_t>(r.ple_placement)};
     for (const auto range :
          {r.gdn_keys, r.gdn_values, r.qsa_queries, r.qsa_kv, r.vocabulary, r.ple_shards}) {
         geometry.push_back(range.begin);
@@ -209,8 +232,48 @@ std::uint64_t compute_rank_shard_digest(const artifact::ArtifactId& artifact_id,
                               r.experts, r.expert_domain.get());
 }
 
+std::vector<PipelineLayerDemand> pipeline_layer_demands(const ModelDefinition& definition) {
+    const auto& config = definition.config().text;
+    std::vector<PipelineLayerDemand> result;
+    for (const auto& layer : definition.weights().text.layers) {
+        PipelineLayerDemand demand{};
+        const auto add = [&](std::initializer_list<WeightId> ids, bool experts = false) {
+            for (const auto id : ids) {
+                const auto& view = definition.weight_data()[id.index].view;
+                const auto count = weight_element_count(definition.parameter(id).shape);
+                demand.work += experts ? count / config.moe.experts * config.moe.top_k : count;
+                for (const auto& part : view.parts) {
+                    const auto& geometry = part.parent->geometry;
+                    demand.resident_bytes += static_cast<std::uint64_t>(
+                        std::ceil(static_cast<long double>(geometry.bytes) *
+                                  (part.end - part.begin) / geometry.elements));
+                }
+            }
+        };
+        for (const auto* hc : {&layer.attention_hc, &layer.moe_hc}) {
+            add({hc->norm, hc->down, hc->up});
+            if (hc->injection) add({*hc->injection});
+        }
+        if (const auto* g = std::get_if<GdnWeights>(&layer.mixer))
+            add({g->query, g->key, g->value, g->z, g->a, g->b, g->a_log, g->dt_bias, g->convolution,
+                 g->norm, g->output});
+        else {
+            const auto& q = std::get<QsaWeights>(layer.mixer);
+            add({q.query, q.key, q.gate, q.value, q.index_query, q.index_key, q.query_norm,
+                 q.key_norm, q.index_query_norm, q.index_key_norm, q.output});
+        }
+        const auto& m = layer.moe;
+        add({m.router, m.shared_score, m.shared_gate, m.shared_up, m.shared_down});
+        add({m.gate, m.up, m.down}, true);
+        result.push_back(demand);
+    }
+    return result;
+}
+
 RankPlan plan_single_rank(const ModelDefinition& definition, ple::Placement table) {
-    return rank_plan(definition, {}, table);
+    return plan_rank_layers(
+        definition, {}, table,
+        {0, static_cast<std::uint32_t>(definition.config().text.layers.size())});
 }
 
 ParallelPlan plan_parallel(const ModelDefinition& definition, const DeploymentOptions& deployment,
@@ -223,21 +286,29 @@ ParallelPlan plan_parallel(const ModelDefinition& definition, const DeploymentOp
     if (candidates.empty()) throw std::invalid_argument("Qwen4Exp requires a PLE placement");
     const auto normalized = normalize_deployment(deployment);
     const auto& o         = normalized.parallel;
-    if (o.pp != 1 || o.adp != 1)
-        throw std::invalid_argument(
-            "Qwen4Exp weight placement requires PP1 and a single QSA owner");
+    if (o.adp != 1) throw std::invalid_argument("Qwen4Exp requires a single QSA owner per stage");
+    if (o.pp > 1 && definition.options().mtp())
+        throw std::invalid_argument("Qwen4Exp pipeline stages support target width one");
+    const auto ranges =
+        o.pp == 1 && o.stage_layers.empty()
+            ? std::vector<IndexRange>{{0, static_cast<std::uint32_t>(
+                                              definition.config().text.layers.size())}}
+            : partition_pipeline_layers(pipeline_layer_demands(definition), o);
     ParallelPlan out;
     out.topology = distributed::build_cluster_topology(normalized);
     out.ranks.reserve(out.topology.ranks.size());
     for (const auto& id : out.topology.ranks) {
-        auto& rank = out.ranks.emplace_back(rank_plan(definition, id, candidates.front()));
+        auto& rank = out.ranks.emplace_back(
+            plan_rank_layers(definition, id, candidates.front(), ranges[id.pp.rank]));
         rank.ple_candidates.assign(candidates.begin(), candidates.end());
     }
     for (const auto& replica : out.topology.replicas) {
-        out.topology.add_role("tensor", replica.ranks);
-        out.topology.add_role("vocabulary", replica.ranks);
-        if (std::ranges::find(candidates, ple::Placement::Sharded) != candidates.end())
-            out.topology.add_role("ple", replica.ranks);
+        for (const auto& stage : replica.stage_ranks) {
+            out.topology.add_role("tensor", stage);
+            if (stage == replica.stage_ranks.back()) out.topology.add_role("vocabulary", stage);
+            if (std::ranges::find(candidates, ple::Placement::Sharded) != candidates.end())
+                out.topology.add_role("ple", stage);
+        }
     }
     add_expert_roles(out.topology);
     const auto& moe = definition.config().text.moe;

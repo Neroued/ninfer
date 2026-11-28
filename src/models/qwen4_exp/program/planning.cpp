@@ -9,18 +9,41 @@
 #include <numeric>
 
 namespace ninfer::models::qwen4_exp {
+std::size_t pipeline_packet_bytes(const execution::ModelProfile& profile, std::uint32_t columns) {
+    // A replicated field is divided over TP lanes; a sequence-partitioned field has at
+    // most ceil(columns / TP) local columns. Cover both representations at a PLE cut.
+    const auto ranks = profile.local.size;
+    const auto width = profile.config.text.residual_width();
+    const auto lane  = StageBoundaryField::transfer_elements(width, TpLayout::Replicated, ranks);
+    return std::max(lane * columns, width * ((std::size_t(columns) + ranks - 1) / ranks)) *
+           sizeof(std::uint16_t);
+}
 namespace {
 PersistentLayout persistent(const execution::ModelProfile& p, const EngineOptions& o) {
     LayoutBuilder b;
     PersistentLayout out;
-    out.state = plan_state_image(p.config, p.local.gdn, o.linear_state_dtype);
+    out.state =
+        plan_state_image(p.config, p.local.gdn, o.linear_state_dtype, p.owns_ple, p.output_stage());
     out.main  = plan_qsa_cache(b, p.local.qsa, p.config.text.qsa_layers, o.max_context,
                                o.max_concurrency, o.kv_cache);
     if (p.mtp)
         out.mtp = plan_qsa_cache(b, p.local.qsa, 1, o.max_context, o.max_concurrency, o.kv_cache);
-    out.buffers =
-        plan_buffers(b, p.config, o, o.prefill_chunk, p.public_tokens, p.local.gdn,
-                     p.local.vocabulary, p.local.size, p.ple_placement != ple::Placement::Disk);
+    out.buffers = plan_buffers(b, p.config, o, o.prefill_chunk, p.public_tokens, p.local.gdn,
+                               p.local.vocabulary, p.local.size,
+                               p.owns_ple && p.ple_placement != ple::Placement::Disk, p.owns_ple,
+                               p.output_stage());
+    if (p.stage.size > 1) {
+        const auto packet = pipeline_packet_bytes(p, std::max(o.prefill_chunk, o.max_concurrency));
+        const auto graph  = pipeline_packet_bytes(p, o.max_concurrency);
+        if (!p.input_stage()) {
+            out.pipeline_input = b.add(2 * packet, 256, "pipeline receive buffers");
+            if (o.use_cuda_graph) out.graph_input = b.add(graph, 256, "pipeline graph input");
+        }
+        if (!p.output_stage()) {
+            out.pipeline_output = b.add(2 * packet, 256, "pipeline send buffers");
+            if (o.use_cuda_graph) out.graph_output = b.add(graph, 256, "pipeline graph output");
+        }
+    }
     out.bytes = b.finish(256);
     return out;
 }
@@ -97,15 +120,15 @@ ExecutionPlan physical_plan(std::shared_ptr<const execution::ModelProfile> profi
     out.ple.max_rows      = o.max_concurrency;
     out.ple.max_positions = dimension(std::max<std::uint64_t>(
         o.prefill_chunk, std::uint64_t(o.max_concurrency) * (o.speculative.draft_tokens + 1)));
-    if (out.profile->ple_placement == ple::Placement::Disk) {
+    if (out.profile->owns_ple && out.profile->ple_placement == ple::Placement::Disk) {
         out.ple_upload        = ple::UploadSlots::memory(out.ple.max_positions, 2);
         out.ple_prepare_bytes = ple::disk::PrepareService::memory_bytes(table, out.ple, 2);
     }
-    if (out.profile->local.size > 1 && o.context_cache.host_capacity_bytes.value_or(0)) {
+    if (out.profile->replica_size() > 1 && o.context_cache.host_capacity_bytes.value_or(0)) {
         throw std::invalid_argument("Qwen4Exp distributed context uses device-resident storage");
     }
     out.host_context_bytes =
-        out.profile->local.size > 1
+        out.profile->replica_size() > 1
             ? 0
             : context::host_context_capacity(o.context_cache.host_capacity_bytes,
                                              out.persistent.state.images.image_bytes);
@@ -124,7 +147,7 @@ ExecutionPlan physical_plan(std::shared_ptr<const execution::ModelProfile> profi
         out.pinned_output_bytes =
             end.region.offset + end.region.bytes - buffers.sampled_ids->region.offset;
     }
-    if (o.purpose == EnginePurpose::CausalScoring)
+    if (o.purpose == EnginePurpose::CausalScoring && out.profile->output_stage())
         out.pinned_output_bytes = std::min(o.prefill_chunk, 1024U) * sizeof(float);
     return out;
 }
@@ -143,7 +166,8 @@ ExecutionShape describe_execution_shape(const execution::ModelProfile& profile,
             o.use_cuda_graph,
             o.observability.gpu_timing,
             o.speculative.length_policy,
-            o.linear_state_dtype};
+            o.linear_state_dtype,
+            profile.stage.size};
 }
 
 std::size_t ExecutionPlan::device_bytes() const {
@@ -154,7 +178,7 @@ std::size_t ExecutionPlan::device_bytes() const {
 
 std::size_t ExecutionPlan::pinned_context_bytes() const {
     const auto mapping_elements = [](const QsaCacheLayout& pool) {
-        return std::size_t(pool.tables.spec.logical_page_capacity) * pool.tables.spec.table_rows;
+        return pool.tables.page_offsets.region.bytes / sizeof(std::int64_t);
     };
     const auto elements = mapping_elements(persistent.main) +
                           (persistent.mtp ? mapping_elements(*persistent.mtp) : 0);
@@ -190,8 +214,9 @@ runtime::ContextCapacityPlan capacity_plan(const ExecutionPlan& base, const Engi
     runtime::ContextCapacityPlan plan;
     const auto& state = base.persistent.state.images;
     plan.records.push_back({state.image_bytes, state.alignment});
-    plan.records.push_back(
-        {base.persistent.main.pages.page_bytes, base.persistent.main.pages.alignment});
+    if (base.persistent.main.layers)
+        plan.records.push_back(
+            {base.persistent.main.pages.page_bytes, base.persistent.main.pages.alignment});
     if (base.persistent.mtp)
         plan.records.push_back(
             {base.persistent.mtp->pages.page_bytes, base.persistent.mtp->pages.alignment});
@@ -200,7 +225,7 @@ runtime::ContextCapacityPlan capacity_plan(const ExecutionPlan& base, const Engi
                           std::uint32_t mtp) {
         runtime::ContextStartupWorkingSet set{std::move(name)};
         set.records.push_back({geometry.spec_classes[0], states});
-        set.records.push_back({geometry.spec_classes[1], main});
+        if (base.persistent.main.layers) set.records.push_back({geometry.spec_classes[1], main});
         if (base.persistent.mtp) set.records.push_back({geometry.spec_classes[2], mtp});
         return set;
     };

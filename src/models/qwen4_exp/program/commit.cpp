@@ -36,7 +36,7 @@ void RankProgramImpl::commit_mtp(const Commit& commit) {
         count_tokens |= count_columns[b] != 0;
         last[b]         = accepted[b] - 1;
         active[b]       = accepted[b] ? 0 : -1;
-        destinations[b] = decision.states.at(parameters.profile->local.rank).destination;
+        destinations[b] = decision.states.at(parameters.profile->replica_rank()).destination;
         any |= decision.accepted != 0;
         const auto f     = rows[b].main_frontier;
         const auto pairs = mtp_history_frontier(f + decision.accepted) - rows[b].mtp_frontier;
@@ -78,7 +78,7 @@ void RankProgramImpl::execute_mtp_commit(std::int32_t batch, std::int32_t width,
     history.record_offsets = main.record_offsets;
     history.live_rows      = main.live_rows;
     auto last = row(mtp.last_columns), active = row(mtp.active_columns);
-    const auto sample       = packed_tensor(io.pending_sample, {hidden, width, batch});
+    const auto sample       = packed_tensor(*io.pending_sample, {hidden, width, batch});
     const auto conditioning = packed_tensor(*io.pending_conditioning, {channels, width, batch});
     auto aligned            = packed_tensor(mtp.alignment_conditioning, {channels, k, batch});
     if (width > 1) {

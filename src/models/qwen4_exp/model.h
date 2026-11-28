@@ -43,7 +43,7 @@ public:
     [[nodiscard]] const RankPlan& rank_plan() const { return rank_; }
 
     [[nodiscard]] const moe::ResidentExpertBank* resident_experts(ExpertBankId id) const {
-        return local_banks_.empty() ? nullptr : &local_banks_.at(id.index);
+        return local_banks_.empty() ? nullptr : &local_banks_.at(rank_.local_bank(id));
     }
 
     [[nodiscard]] std::size_t metadata_bytes() const;

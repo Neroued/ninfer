@@ -141,6 +141,34 @@ void SessionImpl::clear(Sequence& s) noexcept {
     } catch (...) { std::terminate(); }
 }
 
+bool SessionImpl::has_compute() const noexcept {
+    return std::ranges::any_of(flights, [](const auto& f) { return bool(f); });
+}
+
+bool SessionImpl::compute_full() const noexcept {
+    return std::ranges::all_of(flights, [](const auto& f) { return bool(f); });
+}
+
+std::unique_ptr<ComputeTransaction>& SessionImpl::vacant_compute(runtime::FrameId frame) {
+    if (frame.kind != runtime::FrameKind::Compute || frame.index >= flights.size() ||
+        flights[frame.index])
+        throw std::logic_error("Qwen4Exp compute reservation has no vacant transaction slot");
+    return flights[frame.index];
+}
+
+ComputeTransaction* SessionImpl::find_compute(runtime::ExecutionTicket ticket) const noexcept {
+    if (ticket.frame.kind != runtime::FrameKind::Compute || ticket.frame.index >= flights.size())
+        return nullptr;
+    auto* tx = flights[ticket.frame.index].get();
+    return tx && tx->ticket == ticket ? tx : nullptr;
+}
+
+ComputeTransaction& SessionImpl::require_compute(runtime::ExecutionTicket ticket) const {
+    auto* tx = find_compute(ticket);
+    if (!tx) throw std::logic_error("Qwen4Exp execution event has a stale compute ticket");
+    return *tx;
+}
+
 void SessionImpl::cleanup() noexcept {
     if (!executor) return;
     pause_reservation.reset();
@@ -151,7 +179,8 @@ void SessionImpl::cleanup() noexcept {
         // Rank teardown has attempted every reader stream before reporting a device failure.
     }
     try {
-        if (compute) {
+        for (auto& compute : flights) {
+            if (!compute) continue;
             compute->context.fail_after_drain();
             if (compute->completion) compute->completion->fail_after_drain();
             compute.reset();
@@ -306,7 +335,8 @@ PhysicalUsageSnapshot SessionImpl::usage() const noexcept { return directory.usa
 std::optional<qwen::VisionWork> SessionImpl::prepare_visual(const Sequence& s, std::uint32_t begin,
                                                             std::uint32_t end) {
     if (!s.request->vision || begin >= end) return {};
-    const auto ranks   = static_cast<std::uint32_t>(plan.context.ranks.size());
+    const auto ranks =
+        static_cast<std::uint32_t>(plan.context.ranks.size() / shape.pipeline_stages);
     const auto* active = vision_window.current();
     if (active && active->owner.sequence == member(s).sequence &&
         active->owner.residency == member(s).residency)
@@ -340,6 +370,7 @@ Session::Session(PreparedSession&& prepared, runtime::Executor<ExecutionTypes>& 
     : impl_(std::move(prepared.impl_)) {
     if (!impl_ || impl_->executor || !executor.epoch().value)
         throw std::invalid_argument("invalid prepared Qwen4Exp Session");
+    impl_->flights.resize(executor.capacity().compute_frames);
     impl_->executor            = &executor;
     impl_->identity_generation = executor.epoch().value;
 }
@@ -393,8 +424,8 @@ speculative::CalibrationConstraints Session::calibration_constraints() const {
 
 std::optional<speculative::CostQuery>
 Session::decode_cost_query(runtime::ExecutionTicket ticket) const noexcept {
-    const auto& active = impl_->compute;
-    return active && active->ticket == ticket ? active->cost_query : std::nullopt;
+    const auto* active = impl_->find_compute(ticket);
+    return active ? active->cost_query : std::nullopt;
 }
 
 void Session::fit_speculative_cost_model(std::span<const speculative::TimedCostAnchor> anchors,
@@ -446,7 +477,7 @@ void Session::cancel_context() {
 }
 
 void Session::supply(runtime::ExecutionTicket ticket, runtime::DecisionInput&& input) {
-    if (!impl_->compute || impl_->compute->ticket != ticket)
+    if (!impl_->find_compute(ticket))
         throw std::logic_error("decision input has no active Qwen4Exp execution");
     impl_->executor->supply(ticket, std::move(input));
 }
@@ -470,14 +501,11 @@ std::optional<SessionEvent> Session::poll() {
                     if constexpr (std::is_same_v<T, runtime::ExecutionFailed>) {
                         throw std::runtime_error(value.message);
                     } else if constexpr (std::is_same_v<T, runtime::DecisionNeeded>) {
-                        if (!p.compute || p.compute->ticket != value.ticket)
-                            throw std::logic_error("decision request belongs to another execution");
-                        p.events.push_back(
-                            {value.ticket, p.compute->members, std::move(value.request)});
+                        auto& tx = p.require_compute(value.ticket);
+                        p.events.push_back({value.ticket, tx.members, std::move(value.request)});
                     } else if constexpr (std::is_same_v<T, runtime::DecisionConsumed>) {
-                        if (!p.compute || p.compute->ticket != value.ticket)
-                            throw std::logic_error("decision upload belongs to another execution");
-                        p.events.push_back({value.ticket, p.compute->members, std::move(value)});
+                        auto& tx = p.require_compute(value.ticket);
+                        p.events.push_back({value.ticket, tx.members, std::move(value)});
                     } else if constexpr (std::is_same_v<T, runtime::ResultReady<ExecutionTypes>>) {
                         if (p.release_ticket == value.ticket) {
                             if (!std::holds_alternative<ContextResult>(value.result))
@@ -487,13 +515,13 @@ std::optional<SessionEvent> Session::poll() {
                             p.operation->result.emplace(
                                 std::get<ContextResult>(std::move(value.result)));
                         } else {
-                            if (!p.compute || p.compute->ticket != value.ticket)
-                                throw std::logic_error("result belongs to another execution");
-                            p.compute->observed_result = value.execution;
+                            auto& tx           = p.require_compute(value.ticket);
+                            tx.observed_result = value.execution;
                             if (auto* score = std::get_if<ScoreResult>(&value.result))
-                                p.finish_score(std::move(*score));
+                                p.finish_score(tx, std::move(*score));
                             else
-                                p.finish_result(std::get<ComputeResult>(std::move(value.result)));
+                                p.finish_result(tx,
+                                                std::get<ComputeResult>(std::move(value.result)));
                         }
                     } else if constexpr (std::is_same_v<T, runtime::DeviceRetired>) {
                         if (p.release_ticket == value.ticket) {
@@ -517,7 +545,7 @@ std::optional<SessionEvent> Session::poll() {
                             } else {
                                 p.events.push_back({value.ticket, {}, std::move(progress)});
                             }
-                        } else if (p.compute && p.compute->ticket == value.ticket) {
+                        } else if (p.find_compute(value.ticket)) {
                             p.retire_compute(value);
                         } else {
                             throw std::logic_error("retirement belongs to another execution");

@@ -54,7 +54,7 @@ std::size_t body(const ModelProfile& p, const EngineOptions& options, int first,
         scratch(linear(p.mtp->fc_hidden,
                        dimension(std::uint64_t(p.config.text.hc.streams) * minimum),
                        dimension(std::uint64_t(p.config.text.hc.streams) * columns)));
-    } else {
+    } else if (p.owns_ple) {
         auto scope = a.scope();
         (void)workspace::ple(a, p.config.text, columns, prefill);
         scratch(linear(p.text.ple, minimum, columns));
@@ -123,9 +123,10 @@ std::size_t body(const ModelProfile& p, const EngineOptions& options, int first,
     else
         for (std::size_t i = 0; i < p.text.layers.size(); ++i)
             layer(p.text.layers[i], partition.split() && i >= p.config.text.ple.layer);
-    scratch(ops::hc_mix_workspace_capacity_bytes(mtp ? p.mtp->final_hc : p.text.final_hc,
-                                                 local_minimum, partition.count));
-    if (!mtp && !prefill && options.purpose == EnginePurpose::Generation)
+    if (p.output_stage())
+        scratch(ops::hc_mix_workspace_capacity_bytes(mtp ? p.mtp->final_hc : p.text.final_hc,
+                                                     local_minimum, partition.count));
+    if (p.output_stage() && !mtp && !prefill && options.purpose == EnginePurpose::Generation)
         scratch(linear(p.text.head, minimum, columns));
     return a.peak_bytes();
 }
@@ -201,9 +202,9 @@ WorkspacePlan plan_workspace(const ModelProfile& p, const EngineOptions& o, std:
         o.purpose == EnginePurpose::CausalScoring
             ? std::min(chunk, 1024U)
             : dimension(std::uint64_t(o.max_concurrency) * (o.speculative.draft_tokens + 1));
-    out.finish = linear(p.text.head, 1, head_columns);
+    if (p.output_stage()) out.finish = linear(p.text.head, 1, head_columns);
     if (p.mtp) out.finish = std::max(out.finish, linear(p.mtp->head, 1, o.max_concurrency));
-    if (o.purpose == EnginePurpose::Generation) {
+    if (p.output_stage() && o.purpose == EnginePurpose::Generation) {
         if (o.speculative.draft_tokens) {
             if (p.local.size > 1) {
                 out.finish = std::max(out.finish,
@@ -235,7 +236,7 @@ WorkspacePlan plan_workspace(const ModelProfile& p, const EngineOptions& o, std:
                          ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
                              p.public_tokens, 1, o.speculative.draft_tokens, 1, o.max_concurrency));
     }
-    if (o.purpose == EnginePurpose::CausalScoring) {
+    if (p.output_stage() && o.purpose == EnginePurpose::CausalScoring) {
         WorkspaceLayoutBuilder a;
         (void)workspace::score(a, p.local.vocabulary, head_columns);
         if (p.local.size > 1) {

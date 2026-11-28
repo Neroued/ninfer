@@ -21,7 +21,8 @@ struct StateLayout {
 };
 
 [[nodiscard]] StateLayout plan_state_image(const Config&, const GdnConfig&,
-                                           LinearStateDType = LinearStateDType::Float32);
+                                           LinearStateDType = LinearStateDType::Float32,
+                                           bool owns_ple = true, bool output_stage = true);
 
 class StateViews {
 public:
@@ -31,7 +32,7 @@ public:
 
     [[nodiscard]] const StateImageStorage& storage() const { return storage_; }
 
-    [[nodiscard]] const LinearAttentionStateView& gdn() const { return gdn_; }
+    [[nodiscard]] const LinearAttentionStateView& gdn() const { return gdn_.value(); }
 
     [[nodiscard]] ops::QsaTailStateView main_tail(Tensor offsets) const;
     [[nodiscard]] ops::QsaTailStateView main_tail(std::uint32_t layer, Tensor offsets) const;
@@ -45,6 +46,6 @@ public:
 private:
     StateLayout layout_;
     StateImageStorage storage_;
-    LinearAttentionStateView gdn_;
+    std::optional<LinearAttentionStateView> gdn_;
 };
 } // namespace ninfer::models::qwen4_exp

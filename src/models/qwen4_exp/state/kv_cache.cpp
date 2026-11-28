@@ -6,6 +6,8 @@ QsaCacheLayout plan_qsa_cache(LayoutBuilder& builder, const QsaConfig& config, s
                               KvCacheStorage storage) {
     const auto head_dim = dimension(config.head_dim), kv_heads = dimension(config.kv_heads);
     const auto schema = paged_kv_storage_layout(storage, head_dim);
+    if (!layers)
+        return {{}, {{(max_context + 63) / 64, table_rows}, {}}, schema, 0, head_dim, kv_heads};
     KVPageGeometry geometry;
     for (std::uint32_t i = 0; i < layers; ++i) {
         geometry.planes.push_back(
@@ -30,14 +32,15 @@ QsaCacheLayout plan_qsa_cache(LayoutBuilder& builder, const QsaConfig& config, s
 }
 
 QsaCache::QsaCache(MemorySpan context, MemorySpan fixed, const QsaCacheLayout& layout)
-    : layout_(layout), context_(context),
-      tables_(fixed, layout.tables, context, layout.pages.page_bytes) {}
+    : layout_(layout), context_(context) {
+    if (layout.layers) tables_.emplace(fixed, layout.tables, context, layout.pages.page_bytes);
+}
 
 ops::QsaCacheView QsaCache::layer(std::uint32_t layer) const {
     if (layer >= layout_.layers) throw std::out_of_range("QSA cache layer");
     const auto& s   = layout_.storage;
     const auto base = layer * (s.planes_per_layer() + 1);
-    const PagedRecordView records{context_, tables_.matrix(), layout_.pages.geometry.page_tokens};
+    const PagedRecordView records{context_, tables().matrix(), layout_.pages.geometry.page_tokens};
     const auto plane = [&](std::uint32_t index) {
         return PagedPlaneView{records, layout_.pages.planes.at(index)};
     };

@@ -20,7 +20,7 @@ std::vector<runtime::InputResource>
 ExecutionCodec::prepare_inputs(const Work& work, const distributed::ReplicaTopology& replica) {
     const auto* visual = find_produced_visual(work);
     if (!visual) return {};
-    auto resources = qwen::stream_vision_inputs(*visual, replica);
+    auto resources = qwen::stream_vision_inputs(*visual, replica.stage_ranks.front());
     inputs_.install(*visual);
     return resources;
 }
@@ -31,7 +31,8 @@ void ExecutionCodec::retire_inputs(const Work& work) {
 
 std::optional<std::uint64_t> ExecutionCodec::receive_input(wire::Kind kind,
                                                            std::span<const std::byte> bytes) {
-    return receiver_.receive(kind, bytes, contract_.vision ? max_features_ : 0, rank_, ranks_,
+    return receiver_.receive(kind, bytes, contract_.vision ? max_features_ : 0, rank_,
+                             static_cast<std::uint32_t>(replica_.stage_ranks.front().size()),
                              inputs_);
 }
 

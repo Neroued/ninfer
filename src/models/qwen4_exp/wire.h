@@ -10,7 +10,7 @@ namespace ninfer::models::qwen4_exp {
 using qwen::VisionInputBindings;
 
 void encode_work(distributed::wire::Encoder&, const Work&, const VisionInputBindings&,
-                 std::uint32_t rank);
+                 std::uint32_t rank, bool decision_owner = true, bool vision_owner = true);
 [[nodiscard]] Work decode_work(distributed::wire::Decoder&, const VisionInputBindings&);
 void encode_commit(distributed::wire::Encoder&, const Commit&, std::uint32_t rank);
 [[nodiscard]] Commit decode_commit(distributed::wire::Decoder&);

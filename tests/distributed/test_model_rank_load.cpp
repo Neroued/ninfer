@@ -5,6 +5,8 @@
 #include "models/qwen4_exp/load.h"
 #include "models/qwen4_exp/execution/profile.h"
 #include "models/qwen4_exp/parallel/wire.h"
+#include "models/qwen4_exp/parallel/startup.h"
+#include "models/qwen4_exp/ple/table.h"
 #include "models/common/moe/exchange.h"
 #include "models/qwen4_exp/program/planning.h"
 #include "artifact/reader.h"
@@ -384,6 +386,129 @@ void glm_case(const artifact::Reader& reader, const std::filesystem::path& path,
     }
 }
 
+void qwen_pipeline_capacity(const artifact::Reader& reader, const std::filesystem::path& path,
+                            EngineOptions options) {
+    auto deployment_options        = deployment(2, 1, 1, 1, path);
+    deployment_options.parallel.dp = 1;
+    deployment_options.parallel.pp = 2;
+    options.deployment             = deployment_options;
+    options.memory_headroom_bytes  = 0;
+    options.context_capacity       = ContextCapacityPolicy::automatic();
+    options.ple.storage            = PleStorage::Device;
+    qwen::ParallelStartup startup(reader, options);
+    const auto& def = startup.definition();
+    const auto original =
+        qwen::plan_parallel(*def, deployment_options, qwen::ple::Placement::Replicated);
+    const auto choose       = startup.select_shards(reader, options);
+    const auto weight_bytes = [&](const auto& rank) {
+        return qwen::resolve_rank_load(reader, def, rank, Device::cuda(0))
+            .materialization()
+            .device_capacity_bytes;
+    };
+    const auto table = qwen::plan_ple_table(reader, *def, qwen::ple::Placement::Replicated,
+                                            original.ranks[0].placement.tp, Device::cuda(0))
+                           .device_bytes();
+    std::array<dist::RankMemoryOffer, 2> offers{};
+    for (unsigned i = 0; i < 2; ++i)
+        offers[i].available_bytes =
+            weight_bytes(original.ranks[i]) + (original.ranks[i].owns_ple ? table : 0);
+    require(!choose(offers), "fitting Qwen4Exp pipeline changed its partition");
+    const auto cut = def->config().text.ple.layer;
+    if (!cut || !original.ranks[0].owns_ple) return;
+    offers[1].available_bytes += offers[0].available_bytes;
+    const auto first          = qwen::plan_rank_layers(*def, original.topology.rank(0),
+                                                       qwen::ple::Placement::Replicated, {0, cut});
+    offers[0].available_bytes = weight_bytes(first);
+    const auto reassigned     = choose(offers);
+    require(reassigned && reassigned->plan == startup.topology().plan &&
+                reassigned->plan != original.topology.plan,
+            "PLE device allowance did not change the shard assignment");
+    const auto payloads = startup.requests(options);
+    for (unsigned i = 0; i < 2; ++i) {
+        wire::Decoder in(payloads[i]);
+        const auto req =
+            qwen::decode_rank_load(in, startup.topology().rank(i), reader.artifact_id());
+        in.finish();
+        require(req.rank.owns_ple == (i == 1) && (i || req.rank.layers.size <= cut) &&
+                    weight_bytes(req.rank) + (req.rank.owns_ple ? table : 0) <=
+                        offers[i].available_bytes,
+                "reassigned table or layer weights exceed their physical allowance");
+    }
+    std::cout << "PP2 capacity moved the PLE table to stage 1" << std::endl;
+}
+
+void qwen_pipeline(const artifact::Reader& reader, const std::filesystem::path& path,
+                   EngineOptions o) {
+    o.speculative = {};
+    qwen_pipeline_capacity(reader, path, o);
+    const auto def   = qwen::read_definition(reader, models::load_options(o));
+    const auto& c    = def->config().text;
+    const auto& text = def->weights().text;
+    const auto n     = static_cast<std::uint32_t>(c.layers.size());
+    const auto check = [&](std::uint32_t stages, std::uint32_t tp,
+                           std::vector<std::uint32_t> counts) {
+        auto d                  = deployment(stages, tp, 1, tp, path);
+        d.parallel.dp           = 1;
+        d.parallel.pp           = stages;
+        d.parallel.stage_layers = std::move(counts);
+        auto plan               = qwen::plan_parallel(*def, d, qwen::ple::Placement::Disk);
+        unsigned covered = 0, ple_owners = 0;
+        for (const auto& proposed : plan.ranks) {
+            const auto rank = roundtrip(
+                qwen::RankLoadRequest{.artifact = reader.artifact_id(),
+                                      .rank     = proposed,
+                                      .options  = o,
+                                      .batches  = models::make_batch_execution_spec(2, 1, false)},
+                plan.topology, qwen::decode_rank_load);
+            const auto stage = rank.placement.pp.rank;
+            const auto own   = [&](std::size_t i) {
+                return i >= rank.layers.begin && i - rank.layers.begin < rank.layers.size;
+            };
+            if (!rank.placement.tp.rank) {
+                require(rank.layers.begin == covered, "pipeline intervals do not meet");
+                covered += rank.layers.size;
+                ple_owners += rank.owns_ple;
+            }
+            require(own(c.ple.layer) == rank.owns_ple,
+                    "different stage owns the PLE table and injection");
+            auto load        = qwen::resolve_rank_load(reader, def, rank, Device::cuda(0));
+            const auto bound = load.weight_data();
+            const auto has   = [&](auto id) { return !bound[id.index].view.parts.empty(); };
+            require(has(text.embedding) == (stage == 0) &&
+                        has(text.head) == (stage + 1 == stages) &&
+                        has(text.ple.key) == rank.owns_ple &&
+                        has(text.ple.convolution) == rank.owns_ple,
+                    "pipeline endpoint or PLE parameters bound on the wrong stage");
+            for (std::size_t i = 0; i < n; ++i)
+                require(has(text.layers[i].attention_hc.norm) == own(i) &&
+                            has(text.layers[i].moe.router) == own(i),
+                        "HC or router binding differs from the stage interval");
+            require(load.expert_data().size() == rank.layers.size,
+                    "foreign expert bank was materialized");
+            // Weight binding is CPU-only. The production projection profiles also query
+            // the compiled Op catalog; multi-lane Flash Next is qualified on Spark.
+            if (tp == 1 || NINFER_TARGET_SPARK) {
+                const auto profile =
+                    qwen::execution::describe_model(*def, bound, load.expert_data(), rank);
+                require(profile->config.text.gdn_layers + profile->config.text.qsa_layers ==
+                                rank.layers.size &&
+                            bool(profile->vision) == (stage == 0 && o.enable_vision),
+                        "rank state or visual ownership differs");
+            }
+        }
+        require(covered == n && ple_owners == 1, "incomplete Qwen4Exp pipeline");
+        std::cout << "PP" << stages << "/TP" << tp << " layers";
+        for (const auto& stage : plan.topology.replica(0).stage_ranks)
+            std::cout << ' ' << plan.ranks[stage.front()].layers.size;
+        std::cout << " PLE layer " << c.ple.layer << std::endl;
+    };
+    check(2, 1, {});
+    if (c.ple.layer) check(2, 1, {c.ple.layer, n - c.ple.layer});
+    if (c.ple.layer + 1 < n) check(2, 1, {c.ple.layer + 1, n - c.ple.layer - 1});
+    if (c.ple.layer != 1) check(2, 1, {1, n - 1});
+    check(4, 2, {});
+}
+
 void glm_pipeline_capacity(const artifact::Reader& reader, const std::filesystem::path& path,
                            EngineOptions options) {
     auto d                        = deployment(2, 1, 1, 1, path);
@@ -489,9 +614,9 @@ void glm_pipeline(const artifact::Reader& reader, const std::filesystem::path& p
 int main(int argc, char** argv) {
     try {
         if (argc != 3 && argc != 4)
-            throw std::invalid_argument(
-                "usage: ninfer_model_rank_load_test "
-                "qwen-dp2|glm-rank7|glm-mixed|glm-pipeline ARTIFACT [MATERIALIZE_RANK]");
+            throw std::invalid_argument("usage: ninfer_model_rank_load_test "
+                                        "qwen-dp2|qwen-pipeline|glm-rank7|glm-mixed|glm-pipeline "
+                                        "ARTIFACT [MATERIALIZE_RANK]");
         const std::string_view name = argv[1];
         const auto path             = std::filesystem::absolute(argv[2]);
         std::optional<std::uint32_t> rank;
@@ -511,6 +636,8 @@ int main(int argc, char** argv) {
         artifact::Reader reader(path);
         if (name == "qwen-dp2")
             qwen_case(reader, path, options, rank);
+        else if (name == "qwen-pipeline")
+            qwen_pipeline(reader, path, options);
         else if (name == "glm-pipeline")
             glm_pipeline(reader, path, options);
         else if (name == "glm-rank7" || name == "glm-mixed")

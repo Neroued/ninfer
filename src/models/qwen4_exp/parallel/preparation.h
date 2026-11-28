@@ -48,6 +48,8 @@ private:
     const artifact::Reader& reader_;
     std::vector<ple::Placement> placements_;
     ParallelBinding binding_;
+    PipelineBinding pipeline_;
+    std::vector<distributed::GroupRequirements> pipeline_requirements_;
     const distributed::Group* ple_group_    = nullptr;
     const distributed::Group* expert_group_ = nullptr;
     std::optional<distributed::GroupRequirements> expert_requirements_;

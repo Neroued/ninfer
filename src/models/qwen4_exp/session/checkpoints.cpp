@@ -429,7 +429,7 @@ bool Session::prepare_pause(SequenceHandle h, runtime::PauseAction action,
     if (selected->host_write) targets = demand.add_host(*selected->host_write);
     const auto assessment = p.directory.assess(demand, released);
     if (!assessment.feasible()) return false;
-    if (assessment.requires_maintenance() && (p.compute || p.executor->has_pending_work()))
+    if (assessment.requires_maintenance() && (p.has_compute() || p.executor->has_pending_work()))
         return false;
     auto execution = p.executor->try_reserve(runtime::FrameKind::Context);
     if (!execution) return false;

@@ -1,6 +1,9 @@
 #pragma once
 
 #include "runtime/observability/gpu_timing.h"
+#if NINFER_ENABLE_DISTRIBUTED
+#    include "distributed/pipeline_link.h"
+#endif
 
 #include "models/qwen4_exp/program/program.h"
 #include "models/qwen4_exp/program/resources.h"
@@ -61,6 +64,9 @@ struct ComputeFrame {
     std::span<const WorkRow> rows;
     PhysicalBatchShape physical;
     std::optional<ple::Ticket> ple;
+#if NINFER_ENABLE_DISTRIBUTED
+    std::optional<distributed::PpStageLink::Transfer> sent;
+#endif
     std::optional<VerifyRound> verify;
     std::optional<PackedPrefill> packed;
     std::unique_ptr<execution::TextRun> run;
@@ -85,6 +91,8 @@ struct ComputeFrame {
     std::optional<WorkRow> control_window;
     std::vector<std::uint32_t> dead_positions;
     runtime::CommandSequence retirement;
+    std::optional<Commit> deferred_commit;
+    bool deferred_discard = false;
     GpuExecutionObservation gpu;
     AttentionWorkCounters attention;
     ComputeResult result;
@@ -100,7 +108,7 @@ public:
     RankProgramImpl(const execution::Parameters&, ExecutionPlan, DeviceContext&,
                     const StartupObserver& observer = {}, ParallelBinding = {},
                     std::unique_ptr<moe::ResidentExpertExchange> = {},
-                    const distributed::Group* ple_group          = nullptr);
+                    const distributed::Group* ple_group = nullptr, PipelineBinding = {});
     ~RankProgramImpl();
 
     GraphPreparationSample initialize_graphs(GraphPreparationMode = GraphPreparationMode::Complete);
@@ -117,6 +125,12 @@ public:
     [[nodiscard]] std::optional<runtime::ExecutionEvent<ExecutionTypes>> poll();
     void drain();
     void advance_compute();
+    void submit_compute(runtime::ExecutionRequest<ExecutionTypes>&&);
+    void admit_compute();
+    [[nodiscard]] const ComputeFrame* find_frame(runtime::ExecutionTicket) const;
+    void apply_commit(runtime::ExecutionTicket, runtime::CommandSequence, Commit&&);
+    void apply_discard(runtime::ExecutionTicket, runtime::CommandSequence);
+    void update_pipeline_counts(const Commit&);
     void advance_context();
     void prepare_forward();
     void prepare_mtp();
@@ -125,13 +139,19 @@ public:
                             const StreamSectionRecorder& readback = {});
     [[nodiscard]] Tensor device_embedding(std::int32_t tokens, std::int32_t batch);
     void after_main();
+    void begin_text(execution::TextRun&, std::optional<models::vision::EmbeddingView> = {});
+    void finish_text(execution::TextRun&, execution::TextOutputs, Tensor logits = {});
+    void graph_receive(int rows);
+    void graph_send(int rows);
     void prepare_decision();
     void finish_result();
     void score_next();
     void prepare_control_window();
     void finish_control_window();
     void enqueue_control_counts();
-    void retire_compute();
+    [[nodiscard]] bool pipeline_counts_needed(const ComputeFrame&, const Commit&) const;
+    [[nodiscard]] bool consumers_retired(const ComputeFrame&);
+    void publish_retirement(std::unique_ptr<ComputeFrame>);
     [[nodiscard]] bool advance_layers(std::uint32_t end);
     void request_decision();
     void install_sampling(bool speculative);
@@ -192,6 +212,10 @@ public:
     std::unique_ptr<moe::ResidentExpertExchange> exchange;
     std::uint64_t last_expert_step = 0;
     Resources resources;
+#if NINFER_ENABLE_DISTRIBUTED
+    std::optional<distributed::PpStageLink> pipeline_input, pipeline_output;
+    std::uint64_t transfer_sequence = 0;
+#endif
     std::unique_ptr<PlePipeline> host_ple;
     CudaCompletionEvent ple_inputs, ple_ready, draft_copied;
     PinnedHostBuffer draft_output;
@@ -208,7 +232,9 @@ public:
     std::vector<ple::InputRow> input_rows;
     std::vector<MtpInputRow> mtp_rows;
     std::vector<std::uint32_t> valid_rows;
-    std::optional<ComputeFrame> compute;
+    std::unique_ptr<ComputeFrame> compute;
+    std::vector<std::unique_ptr<ComputeFrame>> retained;
+    std::deque<runtime::ExecutionRequest<ExecutionTypes>> waiting;
     std::optional<ContextFrame> context;
     std::deque<runtime::ExecutionEvent<ExecutionTypes>> events;
     bool drained = false;

@@ -1,4 +1,5 @@
 #include "models/qwen4_exp/wire.h"
+#include "runtime/executor/protocol.h"
 
 #include "models/common/context/wire.h"
 #include "models/common/parallel_wire.h"
@@ -162,9 +163,12 @@ decode_route(Decoder& in, PhysicalBatchShape shape, std::uint64_t positions) {
 } // namespace
 
 void encode_work(Encoder& out, const Work& work, const VisionInputBindings& inputs,
-                 std::uint32_t rank) {
+                 std::uint32_t rank, bool decision_owner, bool vision_owner) {
     out.u32(rank);
     context::encode_actions(out, local_actions(work.actions, rank));
+    out.boolean(decision_owner && work.initial_decision.has_value());
+    if (decision_owner && work.initial_decision)
+        runtime::protocol::encode(out, *work.initial_decision);
     out.boolean(work.exchange.has_value());
     if (work.exchange) {
         out.u64(work.exchange->id);
@@ -184,8 +188,9 @@ void encode_work(Encoder& out, const Work& work, const VisionInputBindings& inpu
                 rows(out, v.rows, rank);
                 out.boolean(static_cast<bool>(v.speculative));
                 if (v.speculative) decode_route(out, *v.speculative);
-                out.boolean(v.visual.has_value());
-                if (v.visual) {
+                out.boolean(v.visual_forward || v.visual.has_value());
+                out.boolean(vision_owner && v.visual.has_value());
+                if (vision_owner && v.visual) {
                     out.u64(v.visual->window.id);
                     out.boolean(v.visual->window.produce);
                 }
@@ -231,6 +236,7 @@ Work decode_work(Decoder& in, const VisionInputBindings& inputs) {
     Work work;
     const auto rank = in.u32();
     work.actions.emplace(rank, context::decode_actions(in));
+    if (in.boolean()) work.initial_decision = runtime::protocol::decision_input(in);
     if (in.boolean())
         work.exchange =
             moe::ExpertStep{in.u64(), in.u32(), integers<std::uint32_t>(in), in.boolean()};
@@ -242,6 +248,7 @@ Work decode_work(Decoder& in, const VisionInputBindings& inputs) {
         v.sample = static_cast<SampleKind>(in.u8());
         v.rows   = rows(in, rank);
         if (in.boolean()) v.speculative = decode_route(in, v.shape, v.rows.size());
+        v.visual_forward = in.boolean();
         if (in.boolean()) {
             const auto id = in.u64();
             if (v.rows.size() != 1)

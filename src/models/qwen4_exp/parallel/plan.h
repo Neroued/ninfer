@@ -8,6 +8,14 @@ namespace ninfer::models::qwen4_exp {
 
 struct RankPlan {
     RankPlacement placement;
+    IndexRange layers;
+    bool owns_ple = true;
+
+    [[nodiscard]] std::size_t local_bank(ExpertBankId bank) const {
+        if (bank.index < layers.begin || bank.index - layers.begin >= experts.size())
+            throw std::out_of_range("Qwen4Exp expert bank belongs to another stage");
+        return bank.index - layers.begin;
+    }
     ple::Placement ple_placement = ple::Placement::Disk;
     std::vector<ple::Placement> ple_candidates{ple::Placement::Disk};
     IndexRange gdn_keys, gdn_values, qsa_queries, qsa_kv, vocabulary, ple_shards;
@@ -24,6 +32,9 @@ struct ParallelPlan {
     std::vector<RankPlan> ranks;
 };
 
+[[nodiscard]] RankPlan plan_rank_layers(const ModelDefinition&, const distributed::RankIdentity&,
+                                        ple::Placement, IndexRange);
+[[nodiscard]] std::vector<PipelineLayerDemand> pipeline_layer_demands(const ModelDefinition&);
 [[nodiscard]] std::uint64_t compute_rank_shard_digest(const artifact::ArtifactId&, LoadOptions,
                                                       const RankPlan&);
 [[nodiscard]] ParallelPlan plan_parallel(const ModelDefinition&, const DeploymentOptions&,

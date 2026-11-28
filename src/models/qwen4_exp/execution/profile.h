@@ -1,7 +1,7 @@
 #pragma once
 
 #include "models/qwen4_exp/config.h"
-#include "models/common/weights.h"
+#include "models/common/parallel.h"
 #include "models/qwen4_exp/ple/parameters.h"
 #include "ninfer/ops/moe.h"
 #include "ninfer/ops/gated_residual.h"
@@ -77,6 +77,19 @@ struct BankLayout {
 
 struct ModelProfile {
     Config config;
+    ParallelCoordinate stage;
+    IndexRange layers;
+    bool owns_ple = true, after_ple = false;
+
+    [[nodiscard]] bool input_stage() const { return stage.rank == 0; }
+
+    [[nodiscard]] bool output_stage() const { return stage.rank + 1 == stage.size; }
+
+    [[nodiscard]] std::uint32_t replica_rank() const {
+        return stage.rank * local.size + local.rank;
+    }
+
+    [[nodiscard]] std::uint32_t replica_size() const { return stage.size * local.size; }
     ple::Placement ple_placement = ple::Placement::Disk;
 
     struct LocalGeometry {

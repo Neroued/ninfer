@@ -18,7 +18,7 @@ option in `tools/bench/run_serve_concurrency.py`). Hardware is one NVIDIA GeForc
 
 The artifact is `/home/neroued/ninfer/out/inkling2_mini.ninfer` (artifact ID
 `2f56511438ec42298bfa359cf6f54fd3`, 18.89 GiB single-file v3 artifact): calibrated `nvfp4_mul`
-routed MoE experts (40 tensors), `mxfp8` linear projections (8 tensors), BF16/FP32 retained weights,
+routed MoE experts (layers 0–19, 40 tensors), `mxfp8` routed MoE experts (layers 20–23, 8 tensors), BF16/FP32 retained weights,
 the PE-Lang vision encoder, and the 3-layer DSpark draft model (`block_size=8`, Markov RNN head).
 Vision is disabled during text serving; resident device weights are 17.58 GiB (`MTP0`) and
 18.27 GiB (`DSpark K=7`), with a 656.2 MiB workspace arena.

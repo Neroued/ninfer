@@ -134,6 +134,10 @@ draft context 与各自 frontier 同时一致。
 [GLM5Next DFlash2](../../src/models/glm5next/execution/dflash.cpp)，
 数学接口在相应 attention、动态卷积和候选选择 Ops 中。
 
+## DSpark
+
+Inkling2 使用 3 层 DSpark 草稿模型（2 层 cyclic SWA + 1 层 full paged KV，`block_size=8` 对应 `1..7` drafts）与递推 Markov RNN head（`rnn_hidden`）。主干从 `target_layer_ids` 截取的多层隐藏态经 `weighted_sum_rmsnorm` 融合为草稿上下文 K/V；proposal 阶段对 anchor + mask block 执行非因果注意力，再由 Markov RNN 结合持久化状态 `dspark_f_rnn` 生成稀疏/条件候选分布。主干 verify 通过短卷积快照记录与全长/cyclic KV 验证候选，提交阶段按最终接受前缀折叠短卷积历史并同步推进 DSpark 上下文与 `dspark_f_rnn`。自适应模式下窄 target 图覆盖 `{2, 4, K+1}` 宽度，受同一 95% 容量门控约束。实现见 [Inkling2 DSpark](../../src/models/inkling2/execution/dspark.cpp)与[Inkling2 架构](inkling2-model.md#dspark-与-markov-rnn-head)。
+
 ## Graph 与生命周期
 
 图保持稳定输入、frame 和状态寻址，按必要的计算容量组织，实际有效列、accepted 长度和采样

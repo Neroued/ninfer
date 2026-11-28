@@ -94,7 +94,7 @@ printf '%s\n' '{"type":"object","properties":{"answer":{"type":"integer"}},"requ
 ```
 
 GBNF supports recursive rules, Unicode character classes and repetition. All constraint modes work with
-ordinary decoding, MTP, DFlash and DFlash2. Thinking may precede the constrained answer; an output
+ordinary decoding, MTP, DFlash, DFlash2 and DSpark. Thinking may precede the constrained answer; an output
 limit or cancellation can leave it incomplete. JSON modes can accompany tools supplied in messages:
 the answer is either JSON or a tool-call sequence. GBNF, choice and regex require no active tools.
 Constraints reject custom stops and `--raw-output`. JSON permits whitespace and emits declared
@@ -104,7 +104,7 @@ to it automatically. See the [supported schema subset](../src/text/json_schema.c
 ## Thinking and sampling
 
 Omitted thinking, effort and history-preservation settings use the selected template's defaults.
-The maintained templates and GLM frontend have these behaviors:
+The maintained templates and model frontends have these behaviors:
 
 | Model/template | Thinking | Reasoning effort |
 |---|---|---|
@@ -112,17 +112,20 @@ The maintained templates and GLM frontend have these behaviors:
 | Qwen3.8-27B | On by default; can be disabled | `low`, `medium`, `xhigh` (default) |
 | Qwen3.8-Flash-Next | On by default; can be disabled | `low`, `medium`, `xhigh` (default); `minimal` maps to low, `high`/`max` to xhigh |
 | GLM-5.3-Flash | Always enabled | `low`, `high`, `max`; default comes from the artifact template |
+| Inkling-2-Mini | On by default; can be disabled | `none` (0.0), `minimal` (0.1), `low` (0.2), `medium` (0.7), `high` (0.9, default), `xhigh`/`max` (0.99); HTTP kwargs also accept numeric `[0.0, 0.99]` |
 
-For Qwen, `--no-thinking` or `--reasoning-effort none` disables thinking. GLM rejects that choice.
+For Qwen and Inkling-2-Mini, `--no-thinking` or `--reasoning-effort none` disables thinking. GLM rejects that choice.
 `--temperature 0` selects greedy sampling independently of thinking. `--preserve-thinking` keeps
 closed-turn reasoning when the template supports it; the GLM frontend maps this to `clear_thinking=false`.
-Qwen3.8 maintained templates retain it by default; Qwen3.6 omits it by default.
+Qwen3.8 maintained templates and Inkling-2-Mini retain it by default; Qwen3.6 omits it by default.
 A custom `--chat-template` can change template defaults.
 
 `--thinking-budget N` caps accepted model-origin thinking tokens. At the boundary, a natural thinking
 close, stop, cancellation or total output/context limit takes precedence. Otherwise the Engine
 commits the model's closing suffix and continues generation. Qwen uses its early-close guidance
-plus `</think>`; GLM uses `</think>` without the Qwen guidance. The budget cannot be paired with an
+plus `</think>`; GLM uses `</think>` without the Qwen guidance; Inkling-2-Mini closes the thinking
+block with `<|end_message|><|message_model|><|content_text|>` (or
+`<|end_message|><|message_model|>` when a tool call is required). The budget cannot be paired with an
 explicitly disabled CLI thinking mode.
 
 `--max-tokens` counts every committed generated token, including internally inserted control tokens.
@@ -189,7 +192,8 @@ current directory:
 
 Supported roles are `system`, `developer`, `user`, `assistant`, and `tool`.
 The model frontend formats these roles while preserving message order. Qwen maintains system/developer
-positions; GLM renders developer turns as system turns at the same positions.
+positions; GLM and Inkling-2-Mini render developer turns as system turns at the same positions.
+Inkling-2-Mini supports image media only (in user and tool messages) and rejects video inputs.
 
 Message content may be a string or an ordered array containing:
 
@@ -215,6 +219,7 @@ Select a backend at startup; its weights must be present in the artifact:
 | `mtp` | All supported models with MTP weights | 1..5 |
 | `dflash` | Qwen3.6-35B-A3B with DFlash companion weights | 1..15 |
 | `dflash2` | Qwen3.8-27B or GLM-5.3-Flash with DFlash2 companion weights | 1..15 |
+| `dspark` | Inkling-2-Mini with DSpark weights | 1..7 (default 7) |
 
 ```bash
 ./build/rtx5090-release/apps/ninfer models/qwen3_6_35b_a3b.ninfer \
@@ -225,7 +230,8 @@ Select a backend at startup; its weights must be present in the artifact:
 `--proposal-head full` uses the artifact's full head in its stored representation;
 `optimized` selects additional conversion-time weights.
 Qwen3.5-family optimized heads use a selected vocabulary. Flash Next and GLM use an additional
-full-vocabulary Q4 A16 head, keeping the main head unchanged. The artifact must contain the selected
+full-vocabulary Q4 A16 head, keeping the main head unchanged. Inkling-2-Mini DSpark uses
+`--proposal-head full`. The artifact must contain the selected
 head. Only one backend is active per Engine; `--spec none` disables speculation.
 
 `--spec-length-policy default|adaptive|fixed` selects how the draft window is used. The CLI
@@ -269,7 +275,7 @@ and rendered prompt mode. The current official models use:
 Frequency penalty is `0` in these Qwen3.5-family presets. Task-specific profiles such as Qwen's
 precise-coding profile use explicit sampling overrides.
 
-Flash Next and GLM read their sampling defaults from the artifact's `generation_config.json`.
+Flash Next, GLM and Inkling-2-Mini read their sampling defaults from the artifact's `generation_config.json`.
 Explicit sampling flags override these values; GLM retains its thinking-only prompt mode.
 
 Repeat `--stop-token-id`, `--stop`, or `--reasoning-stop` to add stop conditions. Use

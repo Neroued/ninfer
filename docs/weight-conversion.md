@@ -46,6 +46,7 @@ The built-in recipes are ordinary Python functions in
 | `qwen3_8_flash_next` | Q8 main projections, NVIDIA NVFP4 experts, block-FP8 MTP experts, NF4 PLE, BF16 auxiliary projections/Vision | `nvidia` |
 | `glm5next` | NVIDIA NVFP4 Main experts/dense MLP, Q8 KDA and MLA output/shared projections, block-FP8 MTP experts; BF16 Main head, embedding and Vision | None; NVIDIA checkpoint is the primary source |
 | `glm5next_fp4_local` | Native multiplier NVFP4/CSF, MXFP8 and block-FP8 with FP32 scales; retained floating-point parameters | None; NVIDIA FP4 Local checkpoint is the primary source |
+| `inkling2` | Native `nvfp4_mul` (layers 0–19) and `mxfp8` (layers 20–23) routed MoE experts; BF16/FP32 backbone, PE-Lang Vision and 3-layer DSpark | None (`mtp.safetensors` from `--model` or `--source dspark=PATH`) |
 
 These names select conversion choices. Runtime execution is selected from the architecture,
 configuration and actual bindings stored in the artifact. `--name` sets the public model name;
@@ -156,6 +157,37 @@ loaded. `full` uses the artifact's Main head representation and `optimized` sele
 After conversion, keep the entry and every part together on both Sparks and use the
 [GLM deployment example](../examples/configs/spark2-glm5_3-flash.toml).
 The [GLM5Next reference](maintainer/glm5next-model.md) records the model's representation choices.
+
+### Inkling-2-Mini
+
+The `inkling2` recipe supports both non-looped (`Inkling2For*`) and looped (`Inkling2LoopFor*`)
+checkpoints under the unified `Inkling2ForCausalLM` artifact schema, with optional `vision`
+(PE-Lang ViT) and `dspark` (`mtp.safetensors`) components:
+
+```bash
+python3 -m tools.convert \
+  --model /path/to/Inkling-2-Mini \
+  --recipe inkling2 \
+  --components text,vision,dspark \
+  --name inkling2-mini \
+  --out models/inkling2_mini.ninfer
+```
+
+When `dspark` is selected, the converter reads `mtp.safetensors` inside `--model` by default, or
+from `--source dspark=PATH`. Native `nvfp4_mul` (layers 0–19) and `mxfp8` (layers 20–23) routed
+MoE experts are imported directly without requantization, with `gate+up` deinterleaved into one
+bank parent and `down` into a second parent. Vocabulary weights are zero-padded to a 64-row
+alignment while keeping `unpadded_vocab_size` exact; DSpark shares `token_embedding`, `embed_norm`
+and `output_head` with Text and pre-folds its Markov RNN unembed projection offline in FP64.
+
+The base `inkling2` recipe emits `A16Only` for `nvfp4_mul` uses (because the upstream checkpoint
+carries no activation multipliers) and `AllowA8` for `mxfp8` uses. The published
+[Inkling-2-Mini artifact](https://huggingface.co/neroued/Inkling-2-Mini-NInfer) additionally
+attaches offline `max`-calibrated FP32 `activation_input_multiplier` tensors (`per_expert_down`)
+promoting layers 0–19 to `AllowA4` W4A4 execution on RTX 5090. `--proposal` is not used because
+DSpark runs with `--proposal-head full`. Start from the
+[Inkling-2-Mini deployment example](../examples/configs/rtx5090-inkling2-mini.toml); see the
+[Inkling2 architecture reference](maintainer/inkling2-model.md) for representation details.
 
 ## Conversion resources
 
@@ -490,6 +522,7 @@ The official conversion examples select these maintained templates:
 | Qwen3.8 27B | [qwen3_8.jinja](../tools/chat_templates/qwen3_8.jinja) | thinking on; effort `xhigh`; closed-turn reasoning retained |
 | Qwen3.8 Flash Next | [qwen3_8_flash_next.jinja](../tools/chat_templates/qwen3_8_flash_next.jinja) | thinking on; effort `xhigh`; closed-turn reasoning retained |
 | GLM-5.3-Flash | Primary checkpoint template | thinking enabled; effort and history defaults from that template |
+| Inkling-2-Mini | Primary checkpoint template | thinking on; effort `high` (`0.9`); closed-turn reasoning retained |
 
 The Flash Next template maps `minimal` to `low`, `high`/`max` to `xhigh`, and `none` to disabled
 thinking. Final-assistant continuation preserves its content, including trailing whitespace.

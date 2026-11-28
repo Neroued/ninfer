@@ -32,14 +32,16 @@ ID in requests; `GET /v1/models` returns it.
 
 Enable `--vision` at startup for image/video requests. Without it, media generation and media
 counting requests return HTTP 400 `vision_disabled`. Select a speculative backend with
-`--spec mtp|dflash|dflash2` and `--draft-tokens`; `--proposal-head optimized` loads the additional
-head when available. Serve defaults to adaptive verification length. Use `--spec-length-policy fixed`
+`--spec mtp|dflash|dflash2|dspark` and `--draft-tokens`; `--proposal-head optimized` loads the additional
+head when available (DSpark uses `--proposal-head full`). Serve defaults to adaptive verification length. Use `--spec-length-policy fixed`
 to skip speculative cost calibration and use the fixed window subject to request and capacity limits.
 Components omitted at startup cannot be enabled by a later HTTP request.
 The [CLI guide](cli.md#speculative-decoding) describes backend and head differences across models.
 
-Qwen and GLM use the same protocol surfaces with their own templates and output decoders.
-In particular, GLM supports `low/high/max` reasoning effort and requires thinking to remain enabled.
+Qwen, GLM and Inkling-2-Mini use the same protocol surfaces with their own templates and output decoders.
+In particular, GLM supports `low/high/max` reasoning effort and requires thinking to remain enabled,
+while Inkling-2-Mini supports `none/minimal/low/medium/high/xhigh/max` (or numeric `[0.0, 0.99]` in
+`chat_template_kwargs`) and image-only Vision.
 See [thinking options](cli.md#thinking-and-sampling) before copying model-specific request settings.
 
 ## Endpoints
@@ -240,7 +242,8 @@ unambiguously. After a declared function header has started, malformed structure
 with `invalid_tool_output`; earlier tool events are never retracted into ordinary content.
 An unrecognized Qwen header on the free-generation route can still be returned as text.
 GLM uses `<tool_call>`, `<arg_key>` and `<arg_value>` framing. Its raw argument values end at
-`</arg_value>`; clients continue to send and receive protocol tool objects, not these model markers.
+`</arg_value>`. Inkling-2-Mini uses `<|content_invoke_tool_json|>` JSON blocks terminated by
+`<|end_message|>`. Clients continue to send and receive protocol tool objects, not these model markers.
 
 ### Tool constraints
 
@@ -318,7 +321,7 @@ deltas. Ordinary text continuation still emits only its new suffix; seeded bytes
 newly generated tokens.
 
 Messages enter the selected template in their input order. Qwen retains system/developer positions;
-GLM renders developer turns as system turns in place.
+GLM and Inkling-2-Mini render developer turns as system turns in place.
 
 Prompt-bearing JSON objects retain their received member order through request parsing and prompt
 rendering, including tool schemas and historical tool inputs. Canonical model-origin tool arguments
@@ -347,18 +350,20 @@ because requests can explicitly enable thinking. Anthropic
 Add `--thinking-budget 512` to the startup command to cap model-origin thinking at 512
 tokens for every thinking-enabled request.
 
-At the cap boundary, Engine first honors a natural `</think>`, stop condition, cancellation, or
+At the cap boundary, Engine first honors a natural thinking close, stop condition, cancellation, or
 total output/context limit. If thinking remains open, it commits the model's closing suffix to the
 same sequence without sampling and continues normal content or tool-call generation. Qwen inserts
-early-close guidance plus `</think>` and streams the guidance as reasoning; GLM inserts `</think>`.
+early-close guidance plus `</think>` and streams the guidance as reasoning; GLM inserts `</think>`;
+Inkling-2-Mini inserts `<|end_message|><|message_model|><|content_text|>` (or
+`<|end_message|><|message_model|>` when a tool call is required).
 Inserted tokens count in completion usage and the request's `max_tokens`/`max_output_tokens` budget. If the effective output
 capacity extends past the cap but cannot fit the complete tokenizer-derived control suffix plus one
 post-close model token, preparation is rejected with HTTP 400 code
 `thinking_budget_capacity_insufficient` rather than partially inserting control. The server does
 not promise that the model will emit nonempty content or a tool call after the marker.
 
-For Chat Completions, `reasoning_effort: "none"` requests disabled thinking on Qwen. GLM rejects
-disabled thinking and accepts only `low`, `high` and `max`. Other Qwen effort values depend on the
+For Chat Completions, `reasoning_effort: "none"` requests disabled thinking on Qwen and Inkling-2-Mini. GLM rejects
+disabled thinking and accepts only `low`, `high` and `max`. Other effort values depend on the
 selected template; see the [model table](cli.md#thinking-and-sampling).
 Conflicting explicit `enable_thinking` and effort values return `conflicting_template_option`.
 
@@ -459,7 +464,9 @@ OpenAI image and video sources may be HTTP(S) URLs or base64 data URLs.
 Text and media requests use one complete-prompt context contract. After chat-template rendering and
 media-token expansion, the result must fit Engine `--max-context`. Qwen additionally limits prompt
 Vision input to 32,768 merged tokens (131,072 raw patches), bounded by the context limit. GLM uses its
-processor geometry, context limit and live-payload budget. Media admission also checks source bytes
+processor geometry, context limit and live-payload budget. Inkling-2-Mini accepts image media only (in
+user and tool messages, rejecting video) and expands each image into 40×40-pixel merged cells (20×20
+native patches with 2×2 merge) within the context and live-payload budgets. Media admission also checks source bytes
 and decoded image/video sizes. These request limits are separate from the bounded GPU encoder/output
 window selected by `--vision-memory-budget`.
 
@@ -606,7 +613,7 @@ fail.
 
 System and developer message Items retain their positions in the input array. Top-level
 `instructions` is represented as a leading developer turn for the current request; target-specific
-role rendering is handled by the model frontend. GLM renders developer turns as system turns.
+role rendering is handled by the model frontend. GLM and Inkling-2-Mini render developer turns as system turns.
 
 An `input_text`, `input_image`, or tool-result part may carry
 `prompt_cache_breakpoint:{"mode":"explicit"}`. Write selection follows

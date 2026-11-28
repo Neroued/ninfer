@@ -87,7 +87,7 @@ codes 与 represented values 不变。它是加载期的保值物化，不是再
 执行期只消费准备好的稳定视图，不隐藏 packing 或设备分配。
 
 共享分片实现见 [parallel_weights](../../src/models/common/parallel_weights.cpp)。
-具体量化取舍与特殊连续前缀见 [Qwen4Exp](qwen4_exp-model.md)和[GLM5Next](glm5next-model.md)。
+具体量化取舍与特殊连续前缀见 [Qwen4Exp](qwen4_exp-model.md)、[GLM5Next](glm5next-model.md)和[Inkling2](inkling2-model.md)。
 
 ## Backing 与传输
 

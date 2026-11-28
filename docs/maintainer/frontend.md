@@ -1,6 +1,6 @@
 # Frontend 架构
 
-Frontend 将产品输入转换为模型输入，并解释模型已提交的输出。公共机制服务 Qwen 与 GLM，
+Frontend 将产品输入转换为模型输入，并解释模型已提交的输出。公共机制服务 Qwen、GLM 与 Inkling2，
 模板、媒体算法和输出语言仍属于各自模型。它与 GPU 模型执行通过拥有型输入及事务边界连接。
 
 ## 输入与模型策略
@@ -17,8 +17,9 @@ Tokenizer 的 normalization、pre-tokenization 和 BPE 行为来自资源描述�
 Padding 权重行不会自动成为可生成 token；indexed proposal 通过自己的映射回到真实 token ID。
 
 实现分工见 [text](../../src/text/)、[共享 Frontend](../../src/models/common/frontend/)、
-[Qwen Frontend](../../src/models/common/qwen/frontend/)和
-[GLM Frontend](../../src/models/glm5next/frontend/)。
+[Qwen Frontend](../../src/models/common/qwen/frontend/)、
+[GLM Frontend](../../src/models/glm5next/frontend/)和
+[Inkling2 Frontend](../../src/models/inkling2/frontend/)。
 
 ## 输入身份与缓存边界
 
@@ -44,7 +45,7 @@ Padding 权重行不会自动成为可生成 token；indexed proposal 通过自�
 解析状态的副作用。跨 token 的 UTF-8、标记和参数片段由同一 decoder 持续处理，流式和聚合
 共享语义。长度停止时的未完成工具调用与正常完整调用分别表达。
 
-Qwen 与 GLM 的工具值编码、thinking framing、停止与强制关闭规则各自维护。
+Qwen、GLM 与 Inkling2 的工具值编码、thinking framing、停止与强制关闭规则各自维护。
 模板生成、grammar 和 decoder 必须使用同一模型合同；不能让一套规则允许的参数在另一套规则中
 被解释为不同类型。具体实现与测试维护标记字节和协议字段，本文不复制这些表。
 
@@ -80,7 +81,7 @@ Scratch 可以借用 Program 的 compute workspace，features 保留到相应 Te
 一次输入含很多媒体，不意味着同时物化所有 encoder 中间结果；一个 attention segment 的完整
 数学也不能通过任意截断来满足预算。
 
-Qwen 与 GLM 共享上述资源机制，各自拥有 processor、encoder 与 segment 的数学。
+Qwen、GLM 与 Inkling2 共享上述资源机制，各自拥有 processor、encoder 与 segment 的数学（Inkling2 仅支持图像）。
 媒体请求进入 decode 后使用普通模型上下文，不继续占用无消费者的 Vision 临时激活。
 
 入口：[媒体缓存](../../src/models/common/frontend/media_cache.h)、

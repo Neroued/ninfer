@@ -16,8 +16,9 @@ resources required by that capacity; decode batches use the requests currently r
 | Qwen3.6-35B-A3B | Qwen3.5 MoE | RTX 5090, resident or CPU expert offload | MTP or DFlash with companion weights |
 | Qwen3.8-Flash-Next | Qwen4Exp | RTX 5090 with CPU expert offload; one or two Sparks | MTP |
 | GLM-5.3-Flash | GLM5Next | Two Sparks | MTP or DFlash2 with companion weights |
+| Inkling-2-Mini | Inkling2 | RTX 5090 | DSpark |
 
-All rows support text, Vision, tools, constrained output, and offline perplexity scoring.
+All rows support text, Vision (image-only on Inkling-2-Mini), tools, constrained output, and offline perplexity scoring.
 Vision and speculative decoding require the corresponding components in the artifact and must be
 enabled at startup. Scoring loads Text only. CPU expert offload applies to the RTX 5090 target;
 Spark execution keeps selected weights on the GPU. Flash Next offload also needs substantial system
@@ -78,10 +79,14 @@ and component resources. These official downloads are available:
 | Qwen3.6-35B-A3B | `groupwise-int` | `qwen3_6_35b_a3b.ninfer` | [Qwen3.6-35B-A3B](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer) |
 | Qwen3.8-Flash-Next | Mixed NVFP4/Q8/NF4 | `qwen3_8_flash_next.ninfer` + 3 parts | [Qwen3.8-Flash-Next](https://huggingface.co/neroued/Qwen3.8-Flash-Next-NInfer) |
 | GLM-5.3-Flash | Mixed NVFP4/Q8 | `glm5_3_flash.ninfer` + 5 parts | [GLM-5.3-Flash](https://huggingface.co/neroued/GLM-5.3-Flash-NInfer) |
+| Inkling-2-Mini | Native NVFP4_MUL/MXFP8 | `inkling2_mini.ninfer` | [Inkling-2-Mini](https://huggingface.co/neroued/Inkling-2-Mini-NInfer) |
 
 ```bash
 hf download neroued/Qwen3.8-27B-nvfp4-NInfer \
   qwen3_8_27b_nvfp4.ninfer --local-dir models
+
+hf download neroued/Inkling-2-Mini-NInfer \
+  inkling2_mini.ninfer --local-dir models
 ```
 
 Download Flash Next or GLM with all their storage parts:
@@ -223,6 +228,18 @@ linked from each model below.
 | [Qwen3.8-27B](docs/performance/qwen3.8-27b.md#single-request-speculative-decode) `groupwise-int` | 3,331.9 tok/s | 2,139.4 tok/s | 214.7 tok/s |
 | [Qwen3.8-27B](docs/performance/qwen3.8-27b.md#single-request-speculative-decode) `nvfp4` | 12,819.1 tok/s | 4,016.4 tok/s | 231.7 tok/s |
 
+#### Inkling-2-Mini (DSpark K=7)
+
+[Measured November 27, 2026](docs/performance/inkling2-mini.md): calibrated native NVFP4_MUL /
+MXFP8 experts, FP8 full-attention KV, BF16 SWA KV, DSpark `K=7` (adaptive, full head), CUDA
+Graphs, and a 4,096-token prefill chunk. Copy-edit decode saturation (`8,192`-token budget) scales
+from **568.8 tok/s at C=1** to **4,360.8 tok/s at C=16** (94.1%–94.6% acceptance, 7.67× scaling),
+with a supplementary `--swa-kv-dtype fp8` C=32 wave sustaining **6,439.6 tok/s** across 28 active
+streams (peak 1s **6,804.0 tok/s**). Single-request Long NIAH prefill reaches **27,526.6 tok/s**
+at 8,142 tokens and **10,945.2 tok/s** at 275,395 tokens, while DSpark `K=7` decode reaches
+**388.5–286.4 tok/s** (2.00×–2.36× over MTP0). On the 75-request fixed corpus, serving throughput
+scales from **352.0 tok/s at C=1** to **1,224.5 tok/s at C=8** (3.16× makespan speedup).
+
 ## Evaluation
 
 The 27B/35B capability scores below were measured through NInfer's OpenAI-compatible serving route with thinking
@@ -257,6 +274,20 @@ These are mean sample accuracies, not pass@k. The card records the generation se
 the truncated/unparsed samples in the totals. Vision scores retain the original campaign's decoder
 and scoring behavior.
 
+[Inkling-2-Mini](model-cards/Inkling-2-Mini-NInfer/README.md#evaluation) was evaluated on one RTX
+5090 with FP8 full-attention KV, BF16 SWA KV, CUDA Graphs and EvalScope 1.10.0 (0-shot, rule
+scoring, one sample per question):
+
+| Benchmark | Metric | Score | Scored / slice | Configuration |
+|---|---|---:|---:|---|
+| IFBench | Prompt-level strict (loose) | 71.33% (76.00%) | 300 / 300 | DSpark K=7, C=8, 131K ctx, `xhigh` |
+| GPQA-Diamond | Accuracy | 87.88% | 174 / 198 | DSpark K=7, C=8, 196K ctx, `high` |
+| MMMU-Pro, standard 10 options | Accuracy | 75.66% | 1,309 / 1,730 | Vision + DSpark K=7, C=8, 163K ctx, `high` |
+| OpenAI MRCR, 8-needle 262K–524K | Overall MRCR score | 51.52% | 99 / 99 | MTP0, C=1, 589K ctx, `high` |
+
+The [Inkling-2-Mini model card](model-cards/Inkling-2-Mini-NInfer/README.md#evaluation) records
+all generation parameters, budgets, and retained context-truncated or unparsed samples.
+
 ## Docker
 
 The included Dockerfile builds the RTX 5090 CLI and server. It requires the NVIDIA Container Toolkit
@@ -283,7 +314,7 @@ docker run --rm --gpus '"device=0"' --publish 8080:8080 \
 
 NInfer is licensed under the [Apache License 2.0](LICENSE).
 
-The 27B and 35B-A3B artifact sources use Apache-2.0, as recorded in their model cards.
+The 27B, 35B-A3B and Inkling-2-Mini artifact sources use Apache-2.0, as recorded in their model cards.
 Flash Next combines the [Qwen Community License 1.0](https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/main/LICENSE)
 source with [NVIDIA Open Model License](https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-license/)
 weights. GLM's source weights use [MIT](https://huggingface.co/zai-org/GLM-5.3-Flash/blob/main/LICENSE).

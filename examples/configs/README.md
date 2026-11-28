@@ -1,7 +1,8 @@
 # Deployment configurations
 
 These TOML files are starting points for the product CLI and HTTP server. All enable Vision,
-FP8 KV, CUDA Graph decode, speculative decoding, and the optimized proposal head. Use artifacts
+FP8 KV, CUDA Graph decode, and speculative decoding (using the optimized proposal head where
+supported, and the full head for Inkling-2-Mini DSpark). Use artifacts
 with the selected components. Model sampling defaults are retained. Published artifacts are listed
 in the [weight table](../../README.md#get-weights). Flash Next and GLM require every storage part.
 
@@ -10,6 +11,7 @@ in the [weight table](../../README.md#get-weights). Flash Next and GLM require e
 | [Qwen3.6-35B-A3B](rtx5090-qwen3_6-35b-a3b.toml) | RTX 5090 | 262,144 | 8 | MTP3 |
 | [Qwen3.8-27B NVFP4](rtx5090-qwen3_8-27b-nvfp4.toml) | RTX 5090 | 240,000 | 2 | MTP3 |
 | [Qwen3.8-27B groupwise](rtx5090-qwen3_8-27b-groupwise.toml) | RTX 5090 | 262,144 | 2 | MTP3 |
+| [Inkling-2-Mini](rtx5090-inkling2-mini.toml) | RTX 5090 | 131,072 | 4 | DSpark (7) |
 | [Flash Next](spark-qwen3_8-flash-next.toml) | One Spark | 262,144 | 8 | MTP3 |
 | [Flash Next TP2](spark2-qwen3_8-flash-next.toml) | Two Sparks | 262,144 | 8 | MTP3 |
 | [GLM-5.3-Flash TP2/ADP2](spark2-glm5_3-flash.toml) | Two Sparks | 1,048,576 | 8 | MTP3 |
@@ -22,9 +24,12 @@ The listed concurrency values are example settings. Larger resident capacities a
 their required working sets fit the deployment.
 
 `ninfer-serve` defaults `speculative.length_policy` to `adaptive`. It can shorten verification
-or bypass drafts when expected acceptance drops, so DFlash2 can use `draft_tokens = 7` as a
-ceiling across mixed workloads. `ninfer` defaults to `fixed` for these examples. Pass
+or bypass drafts when expected acceptance drops, so DFlash2 and DSpark can use `draft_tokens = 7`
+as a ceiling across mixed workloads. `ninfer` defaults to `fixed` for these examples. Pass
 `--spec-length-policy adaptive` to enable the same policy in the CLI.
+
+The Inkling-2-Mini example uses `swa_kv_dtype = "bf16"` and `proposal_head = "full"`; set
+`swa_kv_dtype = "fp8"` when targeting higher concurrency (`C=16..32`) on one RTX 5090.
 
 Both GLM examples can use FP4 Local. Set `model.path` and both node artifact paths to an artifact
 with the required components. The DFlash2 example requires the companion weights. Set

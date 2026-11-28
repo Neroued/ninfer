@@ -29,11 +29,11 @@ the file even though its own default profile is smaller.
 | Active requests | 1 | 1 |
 | Output limit | 128 | 8192; requests can override |
 | Prefix reuse | false | true |
-| Host context capacity | 0 B | RTX 5090: 8 GiB + eight native StateImages; Spark: 0 B |
+| Host context capacity | 0 B | RTX 5090: 8 GiB + eight native StateImages (Inkling2: 0 B); Spark: 0 B |
 | Speculative length policy | fixed | adaptive |
 | Seed | 0 | Random per request |
 
-[PPL](perplexity.md) consumes model path, device, max context, KV type, Context capacity, memory
+[PPL](perplexity.md) consumes model path, device, max context, KV type, SWA KV type, Context capacity, memory
 headroom, prefill chunk, GPU timing, log level and distributed deployment. Its default KV is FP8;
 its Engine context limit follows the scoring window unless explicitly set. Generation settings
 do not affect scoring.
@@ -82,17 +82,18 @@ are not opened.
 | `model.vision` | `--vision` / `--no-vision` | bool / false | Load Vision and enable image/video requests |
 | `engine.device` | `--device` | Nonnegative int / 0 | Local device; distributed ranks declare devices separately |
 | `engine.max_context` | `--max-context` | Positive uint32 / 8192 | Per-request input plus generation limit |
-| `engine.kv_dtype` | `--kv-dtype` | `bf16/int8/fp8/nvfp4/k8v4` / `bf16` | Runtime KV representation; GLM latent KV supports BF16 and FP8 |
+| `engine.kv_dtype` | `--kv-dtype` | `bf16/int8/fp8/nvfp4/k8v4` / `bf16` | Runtime KV representation; GLM latent KV and Inkling2 full-attention KV support BF16 and FP8 |
+| `engine.swa_kv_dtype` | `--swa-kv-dtype` | `bf16/fp8` / `bf16` | Runtime sliding-window attention KV representation (Inkling2) |
 | `engine.linear_state_dtype` | `--linear-state-dtype` | `fp32/bf16` / `fp32` | Runtime linear-attention (GDN/KDA) recurrent state representation; conv history stays BF16 |
 | `engine.context_capacity` | `--context-capacity` | Positive bytes or `auto` / `auto` | Shared Device KV/State capacity per rank |
 | `engine.memory_headroom` | `--memory-headroom` | Nonnegative bytes / `512MiB` | Per-rank startup planning allowance; `0B` adds no headroom |
-| `engine.prefill_chunk` | `--prefill-chunk` | Positive multiple of 128 or `default` | Qwen4Exp, GLM5Next and CPU expert offload default to 4096; other paths to 1024; bounded by max context |
+| `engine.prefill_chunk` | `--prefill-chunk` | Positive multiple of 128 or `default` | Qwen4Exp, GLM5Next, Inkling2 and CPU expert offload default to 4096; other paths to 1024; bounded by max context |
 | `engine.cuda_graph` | `--cuda-graph` / `--no-cuda-graph` | bool / true | CUDA Graph decode; prefill and Vision encoding remain eager |
 | `engine.max_concurrency` | `--max-concurrency` | positive integer / 1 | Maximum resident request lanes across the deployment; startup checks the required resources |
 | `engine.max_pending_requests` | `--max-pending-requests` | Positive uint32 / 16 | Additional waiting requests |
 | `engine.pending_timeout` | `--pending-timeout` | Positive duration / `30s` | Deadline before execution; not a generation time limit |
 
-Weight formats are stored in the artifact and are independent of `kv_dtype` and `linear_state_dtype`. Optional components
+Weight formats are stored in the artifact and are independent of `kv_dtype`, `swa_kv_dtype` and `linear_state_dtype`. Optional components
 must be present when enabled. Supported model/deployment combinations are listed in the
 [README](../README.md#supported-models-and-deployments).
 
@@ -135,8 +136,8 @@ TP/attention-owner placement.
 | `media.preprocess_threads` | `--media-preprocess-threads` | 1..64 or `auto` / `auto` | CPU media preprocessing; auto uses at most 16 workers |
 
 Host context holds State, KV, paused snapshots and in-flight destinations. It excludes CPU expert
-weights, PLE, media and other process memory. Spark uses Device context and requires Host context
-capacity to be zero; shared-memory planning also accounts for Host resources such as live media.
+weights, PLE, media and other process memory. Spark and Inkling2 use Device context and require
+Host context capacity to be zero; shared-memory planning also accounts for Host resources such as live media.
 Disabling prefix reuse does not disable pause/recovery or release the configured backing.
 
 Vision is selected at startup. Its bounded execution window processes media before the corresponding
@@ -147,8 +148,8 @@ are separate from the GPU Vision budget. Processor-specific media limits still a
 
 | TOML field | CLI flag | Values / default | Meaning |
 |---|---|---|---|
-| `speculative.backend` | `--spec` | `none/mtp/dflash/dflash2` / `none` | One backend per Engine |
-| `speculative.draft_tokens` | `--draft-tokens` | 0 when none; MTP 1..5; DFlash/DFlash2 1..15 | Startup draft window. Under `adaptive`, this is the maximum, and verification depth can vary by request and step |
+| `speculative.backend` | `--spec` | `none/mtp/dflash/dflash2/dspark` / `none` | One backend per Engine |
+| `speculative.draft_tokens` | `--draft-tokens` | 0 when none; MTP 1..5; DFlash/DFlash2 1..15; DSpark 1..7 (default 7) | Startup draft window. Under `adaptive`, this is the maximum, and verification depth can vary by request and step |
 | `speculative.proposal_head` | `--proposal-head` | `full/optimized` / `full` | Draft head; requires a backend and the selected weights |
 | `speculative.length_policy` | `--spec-length-policy` | `default/adaptive/fixed` / `default` | `default` resolves to `fixed` for `ninfer` and `adaptive` for `ninfer-serve` and `ninfer_bench` |
 

@@ -1,0 +1,31 @@
+# rtx5090-inkling2-mini: CLI/Serve deployment example.
+# Set model.path to your artifact entry file before use.
+# Requires an artifact containing Text, Vision and DSpark.
+
+[model]
+path = "/srv/models/inkling2_mini.ninfer"
+vision = true
+
+[engine]
+max_context = 131072 # Per-request limit; shared physical capacity is planned separately.
+max_concurrency = 4
+kv_dtype = "fp8"
+swa_kv_dtype = "bf16" # Use "fp8" when targeting higher concurrency (e.g. C=16..32) within VRAM.
+context_capacity = "auto"
+memory_headroom = "512MiB"
+prefill_chunk = 4096
+cuda_graph = true
+
+[speculative]
+backend = "dspark"
+draft_tokens = 7
+proposal_head = "full"
+
+[vision]
+memory_budget = "1GiB"
+
+[server]
+host = "127.0.0.1" # Use 0.0.0.0 for LAN access.
+port = 8080
+model_id = "inkling2-mini"
+# api_key = "replace-with-your-key"

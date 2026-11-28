@@ -38,7 +38,8 @@ Published artifact downloads are listed in the [project README](../README.md).
 | [Qwen3.5](maintainer/qwen3_5-model.md) | Dense/MoE、Main/MTP/DFlash、Vision 与状态组合 |
 | [Qwen4Exp](maintainer/qwen4_exp-model.md) | Flash Next、HC/QSA/PLE、量化、TP/EP 与执行组合 |
 | [GLM5Next](maintainer/glm5next-model.md) | KDA/MLA/mHC、权重表示、ADP、MTP/DFlash2、Vision 与 Graph |
-| [Speculative execution](maintainer/speculative-decoding.md) | 自适应验证长度与启动校准、MTP 对齐、ReplaySSM、DFlash/DFlash2 分布与接受前缀 |
+| [Inkling2](maintainer/inkling2-model.md) | Looped Block-AttnRes、短卷积相对注意力、NVFP4_MUL/MXFP8 MoE、DSpark、PE-Lang Vision 与 Graph |
+| [Speculative execution](maintainer/speculative-decoding.md) | 自适应验证长度与启动校准、MTP 对齐、ReplaySSM、DFlash/DFlash2 与 DSpark 分布与接受前缀 |
 | [Expert cache](maintainer/expert-weight-cache.md) | 固定与流式缓存、CPU/GPU 分工、上传和消费寿命 |
 | [Observability](maintainer/observability.md) | 时间和资源口径、测量窗口、rank 统计与日志边界 |
 | [Op development](maintainer/op-development.md) | 语义、实现组织、数值验证与调优方法 |
@@ -55,6 +56,6 @@ Published artifact downloads are listed in the [project README](../README.md).
 
 [未完成事项](issue-checklist.md)保留待处理问题与 MLA 性能工作。
 Qwen4-27B 的[架构与量化](designs/qwen4-27b-rtx5090.md)保留独立预研的几何假设与表示选择。
-Inkling-2-Mini 的[扩展 Op 规范](designs/inkling2-extended-ops-rtx5090.md)、[新增 Op 规范](designs/inkling2-new-ops-rtx5090.md)与[整模接入方案](designs/inkling2-model-integration-rtx5090.md)记录 RTX 5090 算子合同、组件边界与实施节奏。
+Inkling-2-Mini 的[扩展 Op 规范](designs/inkling2-extended-ops-rtx5090.md)、[新增 Op 规范](designs/inkling2-new-ops-rtx5090.md)与[整模接入方案](designs/inkling2-model-integration-rtx5090.md)保留 RTX 5090 算子合同与接入设计记录；已实现的架构说明见 [Inkling2](maintainer/inkling2-model.md)。
 
-Qwen3.8-Flash-Next 使用 Qwen4Exp；Qwen3.8-27B 使用 Qwen3.5。
+Qwen3.8-Flash-Next 使用 Qwen4Exp；Qwen3.8-27B 使用 Qwen3.5；Inkling-2-Mini 使用 Inkling2。

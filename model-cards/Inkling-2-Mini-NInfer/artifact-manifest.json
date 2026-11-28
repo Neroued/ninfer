@@ -1,0 +1,85 @@
+{
+  "schema": "ninfer.artifact-manifest",
+  "schema_version": 2,
+  "artifact": {
+    "filename": "inkling2_mini.ninfer",
+    "bytes": 20281047044,
+    "sha256": "ef6f6ae298795023cd513ef9442743dde06be2f38404283bf14af43c9ec910b6",
+    "container_version": 3,
+    "artifact_id": "2f56511438ec42298bfa359cf6f54fd3",
+    "architecture": "Inkling2ForCausalLM",
+    "name": null,
+    "components": [
+      "text",
+      "vision",
+      "dspark"
+    ]
+  },
+  "source": {
+    "base": {
+      "repo_id": "thinkingmachines/Inkling-2-Mini",
+      "revision": "c9d028302cd0f035fdf8e7e91f089a4ce94d2195",
+      "license": "Apache-2.0"
+    }
+  },
+  "conversion": {
+    "recipe_id": "inkling2",
+    "recipe_details": {
+      "mapping": "inkling2_v1",
+      "moe_w13_order": "deinterleaved_gate_then_up",
+      "vocab_padding": "truncated_64_aligned_zero_padded",
+      "dspark_fold": "offline_fp64_unembed_hidden_out"
+    },
+    "calibration": {
+      "method": "max",
+      "granularity": "per_expert_down",
+      "min_expert_elements": 36864,
+      "calibrated_uses": 132,
+      "calibration_tensors": 88
+    },
+    "converter_repository": "https://github.com/Neroued/ninfer"
+  },
+  "runtime": {
+    "repository": "https://github.com/Neroued/ninfer",
+    "cuda_architecture": "sm_120a",
+    "dspark_draft_tokens": {
+      "recommended": 7,
+      "minimum": 1,
+      "maximum": 7
+    },
+    "proposal_head": "full"
+  },
+  "inventory": {
+    "objects": 980,
+    "tensors": 974,
+    "resources": 6,
+    "bindings": 1105,
+    "uses": 670,
+    "formats": {
+      "bf16": 752,
+      "fp32": 174,
+      "mxfp8": 8,
+      "nvfp4_mul": 40
+    },
+    "layouts": {
+      "batched_block_scale_k16_m128x4_v1": 40,
+      "contiguous_le_v1": 926,
+      "row_group_scale_v1": 8
+    },
+    "encodings": {
+      "raw_bytes_v1": 6
+    },
+    "use_activation_policies": {
+      "A16Only": 526,
+      "AllowA4": 132,
+      "AllowA8": 12
+    },
+    "bytes": {
+      "tensor": 20254000368,
+      "resource": 26199869,
+      "object": 20280200237,
+      "payload_span": 20280211460,
+      "alignment": 11223
+    }
+  }
+}

@@ -1,0 +1,248 @@
+{
+  "schema_version": 1,
+  "artifact_id": "2f56511438ec42298bfa359cf6f54fd3",
+  "evalscope_version": "1.10.0",
+  "hardware": "1 x NVIDIA GeForce RTX 5090 (32 GiB, SM 12.0)",
+  "evaluation": {
+    "few_shot_num": 0,
+    "judge_strategy": "rule",
+    "dataset_hub": "modelscope",
+    "evaluator_seed": 42
+  },
+  "runs": [
+    {
+      "dataset": "ifbench",
+      "name": "IFBench",
+      "run_id": "20261128T081314Z-00de710c",
+      "started_at": "2026-11-28T08:13:14.394634+00:00",
+      "finished_at": "2026-11-28T09:09:46.433988+00:00",
+      "duration_seconds": 3390.62,
+      "serve_commit": "b2514a7ae",
+      "harness_commit": "b36b06b23d9145d3f09741680da30519fd5b625a",
+      "deployment": {
+        "max_concurrency": 8,
+        "max_context": 131072,
+        "kv_dtype": "fp8",
+        "swa_kv_dtype": "bf16",
+        "prefill_chunk": 4096,
+        "cuda_graph": true,
+        "vision": false,
+        "speculative_backend": "dspark",
+        "draft_tokens": 7,
+        "proposal_head": "full",
+        "thinking_budget": null
+      },
+      "generation": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "frequency_penalty": 0.0,
+        "thinking": true,
+        "reasoning_effort": "xhigh",
+        "max_tokens": 131072,
+        "seed": 42
+      },
+      "metrics": {
+        "prompt_level_strict": 0.7133,
+        "inst_level_strict": 0.7417,
+        "prompt_level_loose": 0.76,
+        "inst_level_loose": 0.7867
+      },
+      "counts": {
+        "questions": 300,
+        "scored": 300,
+        "repeats": 1,
+        "prompt_strict_pass": 214,
+        "prompt_loose_pass": 228,
+        "failed": 0,
+        "truncated": 13,
+        "empty_answers": 12,
+        "unparsed_answers": 12
+      },
+      "tokens": {
+        "input_tokens": 28111,
+        "output_tokens": 3608969
+      },
+      "notes": [
+        "13 of 300 prompts hit the 131,072-token context ceiling during xhigh reasoning loops (12 empty content, 1 passed loose) and are retained in the reported totals.",
+        "Across the 287 non-truncated prompts, prompt_level_strict is 0.7422 (213/287) and prompt_level_loose is 0.7909 (227/287)."
+      ]
+    },
+    {
+      "dataset": "gpqa_diamond",
+      "name": "GPQA-Diamond",
+      "run_id": "20261126T205646Z-55037c1d",
+      "started_at": "2026-11-26T21:24:29.413988+00:00",
+      "finished_at": "2026-11-26T22:15:38.752930+00:00",
+      "duration_seconds": 3069.3,
+      "serve_commit": "cc8e8153b",
+      "harness_commit": "bbaeffdfe1efb39f9c5f82a8c4460917720b2cd8",
+      "deployment": {
+        "max_concurrency": 8,
+        "max_context": 196608,
+        "kv_dtype": "fp8",
+        "swa_kv_dtype": "bf16",
+        "prefill_chunk": 4096,
+        "cuda_graph": true,
+        "vision": false,
+        "speculative_backend": "dspark",
+        "draft_tokens": 7,
+        "proposal_head": "full",
+        "thinking_budget": 131072
+      },
+      "generation": {
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "frequency_penalty": 0.0,
+        "thinking": true,
+        "reasoning_effort": "high (template default 0.9)",
+        "max_tokens": 163840,
+        "seed": 42
+      },
+      "metrics": {
+        "accuracy": 0.8788
+      },
+      "counts": {
+        "questions": 198,
+        "scored": 198,
+        "repeats": 1,
+        "correct": 174,
+        "failed": 0,
+        "truncated": 0,
+        "empty_answers": 0,
+        "unparsed_answers": 0
+      },
+      "tokens": {
+        "input_tokens": 57068,
+        "output_tokens": 2956735
+      }
+    },
+    {
+      "dataset": "mmmu_pro",
+      "name": "MMMU-Pro (standard, 10 options)",
+      "run_id": "20261126T225950Z-b984784a",
+      "started_at": "2026-11-26T22:59:50.199843+00:00",
+      "finished_at": "2026-11-27T02:21:09.418884+00:00",
+      "duration_seconds": 12076.86,
+      "serve_commit": "cc8e8153b",
+      "harness_commit": "bbaeffdfe1efb39f9c5f82a8c4460917720b2cd8",
+      "deployment": {
+        "max_concurrency": 8,
+        "max_context": 163840,
+        "kv_dtype": "fp8",
+        "swa_kv_dtype": "bf16",
+        "prefill_chunk": 4096,
+        "cuda_graph": true,
+        "vision": true,
+        "vision_memory_budget": "1GiB",
+        "speculative_backend": "dspark",
+        "draft_tokens": 7,
+        "proposal_head": "full",
+        "thinking_budget": 98304
+      },
+      "generation": {
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "frequency_penalty": 0.0,
+        "thinking": true,
+        "reasoning_effort": "high (template default 0.9)",
+        "max_tokens": 131072,
+        "seed": 42
+      },
+      "metrics": {
+        "accuracy": 0.7566
+      },
+      "counts": {
+        "questions": 1730,
+        "scored": 1730,
+        "repeats": 1,
+        "correct": 1309,
+        "failed": 0,
+        "truncated": 0,
+        "empty_answers": 0,
+        "unparsed_answers": 1
+      },
+      "tokens": {
+        "input_tokens": 988401,
+        "output_tokens": 11527502
+      },
+      "notes": [
+        "1 of 1,730 responses was unparsed and is retained in the scored total."
+      ]
+    },
+    {
+      "dataset": "openai_mrcr",
+      "name": "OpenAI MRCR (8-needle, 262K-524K)",
+      "run_id": "20261127T022117Z-450c1cf1",
+      "started_at": "2026-11-27T02:21:17.721752+00:00",
+      "finished_at": "2026-11-27T07:53:20.288956+00:00",
+      "duration_seconds": 13759.85,
+      "serve_commit": "cc8e8153b (samples 1-18); b2514a7ae (samples 19-99)",
+      "harness_commit": "bbaeffdfe1efb39f9c5f82a8c4460917720b2cd8",
+      "deployment": {
+        "max_concurrency": 1,
+        "max_context": 589824,
+        "kv_dtype": "fp8",
+        "swa_kv_dtype": "bf16",
+        "prefill_chunk": 4096,
+        "cuda_graph": true,
+        "vision": false,
+        "prefix_reuse": false,
+        "speculative_backend": "none",
+        "draft_tokens": 0,
+        "thinking_budget": 49152
+      },
+      "generation": {
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "frequency_penalty": 0.0,
+        "thinking": true,
+        "reasoning_effort": "high (template default 0.9)",
+        "max_tokens": 65536,
+        "seed": 42
+      },
+      "dataset_filter": {
+        "needle_count": [8],
+        "min_context_size": 262144,
+        "max_context_size": 524288
+      },
+      "metrics": {
+        "overall_mrcr_score": 0.5152,
+        "262144-524288_mrcr_score": 0.5152
+      },
+      "counts": {
+        "slice_questions": 99,
+        "scored": 99,
+        "repeats": 1,
+        "exact_matches": 26,
+        "failed": 0,
+        "truncated": 5,
+        "empty_answers": 5,
+        "unparsed_answers": 5
+      },
+      "tokens": {
+        "input_tokens": 43095702,
+        "output_tokens": 1316327
+      },
+      "notes": [
+        "All 99 items in the 8-needle 262,144-524,288 character slice completed without request errors.",
+        "5 of 99 items hit the 589,824-token context ceiling during reasoning (scored 0.0) and are retained in the 0.5152 overall mean; mean score over the 94 non-truncated items is 0.5426."
+      ]
+    }
+  ],
+  "notes": [
+    "Original EvalScope scorer outputs are retained, including truncated and unparsed responses.",
+    "All evaluations ran through NInfer's public OpenAI Chat Completions API on one RTX 5090 with FP8 full-attention KV and BF16 sliding-window KV."
+  ]
+}

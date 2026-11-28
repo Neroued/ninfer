@@ -1,0 +1,119 @@
+schema_version: 1
+
+targets:
+  inkling2_mini:
+    protocol: openai_chat
+    base_url: http://127.0.0.1:18080/v1
+    model: inkling2-mini
+    max_concurrency: 8
+    request:
+      timeout_seconds: 86400
+      retries: 2
+      retry_interval_seconds: 10
+
+  inkling2_mini_long:
+    protocol: openai_chat
+    base_url: http://127.0.0.1:18080/v1
+    model: inkling2-mini
+    max_concurrency: 1
+    request:
+      timeout_seconds: 86400
+      retries: 2
+      retry_interval_seconds: 10
+
+suites:
+  # Run with --no-vision --kv-dtype fp8 --swa-kv-dtype bf16 --spec dspark --draft-tokens 7
+  # --proposal-head full --max-context 131072 --max-concurrency 8 --thinking-budget none
+  ifbench:
+    jobs:
+      - id: ifbench
+        backend: evalscope
+        dataset: ifbench
+        target: inkling2_mini
+        repeats: 1
+        generation:
+          temperature: 1.0
+          top_p: 0.95
+          top_k: 20
+          presence_penalty: 0.0
+          frequency_penalty: 0.0
+          max_tokens: 131072
+          seed: 42
+          extra_body:
+            reasoning_effort: xhigh
+            min_p: 0.0
+        backend_args: &backend
+          seed: 42
+          few_shot_num: 0
+          judge_strategy: rule
+          dataset_hub: modelscope
+
+  # Run with --no-vision --kv-dtype fp8 --swa-kv-dtype bf16 --spec dspark --draft-tokens 7
+  # --proposal-head full --max-context 196608 --max-concurrency 8 --thinking-budget 131072
+  gpqa_diamond:
+    jobs:
+      - id: gpqa_diamond
+        backend: evalscope
+        dataset: gpqa_diamond
+        target: inkling2_mini
+        repeats: 1
+        generation: &default_high_generation
+          temperature: 1.0
+          top_p: 1.0
+          top_k: 20
+          presence_penalty: 0.0
+          frequency_penalty: 0.0
+          max_tokens: 163840
+          seed: 42
+          extra_body:
+            min_p: 0.0
+        backend_args: *backend
+
+  # Run with --vision --vision-memory-budget 1GiB --kv-dtype fp8 --swa-kv-dtype bf16
+  # --spec dspark --draft-tokens 7 --proposal-head full --max-context 163840
+  # --max-concurrency 8 --thinking-budget 98304
+  mmmu_pro:
+    jobs:
+      - id: mmmu_pro
+        backend: evalscope
+        dataset: mmmu_pro
+        target: inkling2_mini
+        repeats: 1
+        generation:
+          <<: *default_high_generation
+          max_tokens: 131072
+        backend_args:
+          <<: *backend
+          dataset_args:
+            extra_params:
+              dataset_format: standard (10 options)
+
+  # Run with --no-vision --kv-dtype fp8 --swa-kv-dtype bf16 --spec none
+  # --max-context 589824 --max-concurrency 1 --thinking-budget 49152 --no-prefix-reuse
+  openai_mrcr:
+    jobs:
+      - id: openai_mrcr
+        backend: evalscope
+        dataset: openai_mrcr
+        target: inkling2_mini_long
+        repeats: 1
+        generation:
+          <<: *default_high_generation
+          max_tokens: 65536
+        backend_args:
+          <<: *backend
+          dataset_args:
+            extra_params:
+              needle_count: [8]
+              min_context_size: 262144
+              max_context_size: 524288
+
+runtime:
+  max_parallel_jobs: 1
+  runs_dir: .agent-tmp/inkling2-eval/runs
+  progress:
+    enabled: true
+    refresh_seconds: 2
+    heartbeat_seconds: 60
+  samples:
+    retention: all

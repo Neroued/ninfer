@@ -70,6 +70,7 @@ public:
     Tensor logical_ids;
     const ExpertExchangeStage stage;
     const unsigned peer;
+    const std::vector<std::uint32_t> peer_owners;
 private:
     DeviceBuffer storage_;
 };
@@ -172,7 +173,8 @@ public:
     void validate(const DeviceExpertPlacement&, const ops::RoutedSwiGLUProfile&, int extent,
                   const LayerSource*, Tensor* observation, CudaExecutionView) const;
     [[nodiscard]] Call dispatch(const DeviceExpertPlacement&, const LayerSource*,
-                                const ops::ExpertRoutes*, int matched_columns, CudaExecutionView);
+                                const ops::ExpertRoutes*, int matched_columns, CudaExecutionView,
+                                std::span<const std::uint8_t> source_owners = {});
 private:
     ExpertExchangeStage stage_;
     const distributed::Group& group_;
@@ -180,6 +182,8 @@ private:
     DeviceBuffer metadata_;
     ops::ExpertPeerBuffers* device_peers_ = nullptr;
     std::vector<distributed::PeerTransfer> send_, back_;
+    std::vector<distributed::PeerTransfer> selected_send_, selected_back_;
+    bool sparse_ = false;
     Tensor unit_;
 };
 

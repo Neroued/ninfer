@@ -118,6 +118,7 @@ std::size_t ParallelStartup::coordinator_payload_bytes(const EngineOptions& opti
     shape.prefill_chunk =
         std::min(options.prefill_chunk ? options.prefill_chunk : 4096U, options.max_context);
     shape.pipeline_stages = options.deployment->parallel.pp;
+    shape.exchange.owners = replicas;
     shape.draft_tokens = options.speculative.draft_tokens;
     shape.purpose      = options.purpose;
     const auto& text   = definition_->resources().text;

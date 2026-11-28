@@ -575,7 +575,7 @@ void schedule_experts(const artifact::Reader& reader, const DeploymentOptions& d
     options.speculative.draft_tokens = layout.shape.draft_tokens;
     options.context_cache.host_capacity_bytes = 0;
     auto shape = layout.shape;
-    shape.exchange = {64};
+    shape.exchange = {64, 1, false, deployment.parallel.ep / deployment.parallel.tp};
     glm::ParallelStartup startup(reader, options);
     const auto& topo = startup.topology();
     std::vector<distributed::wire::Payload> layouts;

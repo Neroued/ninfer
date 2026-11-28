@@ -25,8 +25,8 @@ struct ExpertSchedule {
     }
 
     void bind(Work& work, const runtime::CollectiveDecision& d) const {
-        work.exchange =
-            ExpertStep{d.step, d.shape.route, d.shape.extents, !d.shape.captured_buckets.empty()};
+        work.exchange = ExpertStep{d.step, d.shape.route, d.shape.extents,
+                                   !d.shape.captured_buckets.empty(), d.source_owners};
     }
 
     Work service(const runtime::CollectiveDecision& d) const {

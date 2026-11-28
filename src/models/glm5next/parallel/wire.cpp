@@ -92,6 +92,7 @@ void encode(Encoder& out, const RankResourceDescription& r) {
     out.u32(s.exchange.max_block_columns);
     out.u32(s.exchange.blocks_per_window);
     out.boolean(s.exchange.overlap);
+    out.u32(s.exchange.owners);
     encode_batch_execution_spec(out, r.batches);
     for (auto record : {r.state.common, r.state.owner}) {
         out.u64(record.bytes);
@@ -140,7 +141,7 @@ RankResourceDescription decode_rank_resources(Decoder& in) {
                             static_cast<SpeculativeLengthPolicy>(in.u8()),
                             static_cast<LinearStateDType>(in.u8()),
                             in.u32()};
-    r.shape.exchange     = {in.u32(), in.u32(), in.boolean()};
+    r.shape.exchange     = {in.u32(), in.u32(), in.boolean(), in.u32()};
     r.batches            = decode_batch_execution_spec(in);
     r.state.common       = {in.u64(), in.u64()};
     r.state.owner        = {in.u64(), in.u64()};

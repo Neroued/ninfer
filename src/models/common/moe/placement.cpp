@@ -19,6 +19,7 @@ std::uint64_t ExpertDomain::bank_signature(std::size_t b) const {
     const auto& parts = banks.at(b);
     for (std::size_t peer = 0; peer < members.size(); ++peer) {
         mix(members[peer]);
+        mix(peer_owners.at(peer));
         const auto& p = parts.at(peer);
         mix(p.intermediate.begin);
         mix(p.intermediate.size);
@@ -32,6 +33,13 @@ void ExpertDomain::validate() const {
     if (!experts || !intermediate || members.empty() || banks.empty() ||
         std::set<distributed::RankId>(members.begin(), members.end()).size() != members.size())
         throw std::invalid_argument("invalid expert dispatch domain");
+    if (peer_owners.size() != members.size())
+        throw std::invalid_argument("missing expert peer ownership");
+    std::uint32_t next_owner = 0;
+    for (auto owner : peer_owners) {
+        if (owner > next_owner) throw std::invalid_argument("invalid expert peer ownership");
+        if (owner == next_owner) ++next_owner;
+    }
     for (const auto& bank : banks) {
         if (bank.size() != members.size())
             throw std::invalid_argument("invalid expert dispatch peers");

@@ -113,7 +113,8 @@ public:
 
     GraphPreparationSample initialize_graphs(GraphPreparationMode = GraphPreparationMode::Complete);
     void release_graphs();
-    void serve_expert_pass(bool draft, std::uint32_t columns);
+    void serve_expert_pass(bool draft, std::uint32_t columns,
+                           std::span<const std::uint8_t> owners = {});
     void validate_work(const Work&, runtime::FrameKind) const;
     void start(runtime::ExecutionRequest<ExecutionTypes>&&);
     void validate_decision(runtime::ExecutionTicket, const runtime::DecisionInput&) const;

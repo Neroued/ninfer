@@ -65,6 +65,9 @@ bool CollectiveStepDomain::publish() {
             for (std::size_t i = 0; i < active_->extents.size(); ++i)
                 active_->extents[i] = std::max(active_->extents[i], m.source->extents[i]);
     }
+    active_sources_.clear();
+    if (active_->captured_buckets.empty() && !std::ranges::all_of(members_, &Member::chosen))
+        for (const auto& m : members_) active_sources_.push_back(m.chosen);
     ++step_;
     return true;
 }
@@ -109,7 +112,7 @@ std::optional<CollectiveDecision> CollectiveStepDomain::decision(std::size_t own
     const auto& m = members_.at(owner);
     if (failure_) throw std::runtime_error(*failure_);
     if (!active_ || m.retired || !m.offered || m.generation != generation) return {};
-    return CollectiveDecision{step_, *active_, m.chosen, m.frame};
+    return CollectiveDecision{step_, *active_, m.chosen, m.frame, active_sources_};
 }
 
 bool CollectiveStepDomain::ready(std::size_t owner) const {

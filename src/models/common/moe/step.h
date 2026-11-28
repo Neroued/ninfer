@@ -15,6 +15,7 @@ struct ExchangeGeometry {
     std::uint32_t max_block_columns                            = 0;
     std::uint32_t blocks_per_window                            = 1;
     bool overlap                                               = false;
+    std::uint32_t owners                                       = 0;
     friend bool operator==(ExchangeGeometry, ExchangeGeometry) = default;
 
     [[nodiscard]] std::uint32_t window_columns() const {
@@ -52,6 +53,14 @@ struct ExpertStep {
     std::uint32_t draft_passes = 0;
     std::vector<std::uint32_t> columns;
     bool graph = false;
+    std::vector<std::uint8_t> source_owners;
+
+    [[nodiscard]] bool valid_sources(ExchangeGeometry geometry) const {
+        return source_owners.empty() ||
+               (!graph && source_owners.size() == geometry.owners &&
+                std::ranges::all_of(source_owners, [](auto v) { return v <= 1; }) &&
+                std::ranges::find(source_owners, 1) != source_owners.end());
+    }
 
     [[nodiscard]] bool covers(const ExpertStep& source, ExchangeGeometry geometry) const {
         if (graph != source.graph || draft_passes != source.draft_passes ||

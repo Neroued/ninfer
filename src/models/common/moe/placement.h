@@ -12,6 +12,10 @@ struct ExpertDomain {
     std::uint32_t experts = 0, intermediate = 0;
     std::vector<distributed::RankId> members;
     std::vector<std::vector<ExpertPartition>> banks;
+    // Index of each peer's replica in expert_replica_members order.
+    std::vector<std::uint32_t> peer_owners;
+
+    [[nodiscard]] std::uint32_t owner_count() const { return std::ranges::max(peer_owners) + 1; }
 
     [[nodiscard]] std::uint64_t bank_signature(std::size_t bank) const;
     void validate() const;
@@ -31,7 +35,10 @@ void bind_expert_domains(const distributed::ExecutionTopology& topology,
         domain->experts      = experts;
         domain->intermediate = intermediate;
         domain->banks.resize(ranks.at(group.members.front()).experts.size());
+        const auto owners = expert_replica_members(topology, group);
         for (const auto member : group.members) {
+            const auto owner = topology.replica_for_rank(member).replica_id;
+            domain->peer_owners.push_back(std::ranges::find(owners, owner) - owners.begin());
             const auto& local = ranks.at(member).experts;
             if (local.size() != domain->banks.size())
                 throw std::invalid_argument("expert dispatch bank counts differ");

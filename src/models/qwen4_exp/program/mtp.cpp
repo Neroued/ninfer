@@ -120,7 +120,10 @@ void RankProgramImpl::draft_forward(std::uint32_t step, std::int32_t batch, std:
         if (exchange) {
             const auto columns =
                 compute ? dimension(compute->request.work.exchange->columns.at(step)) : batch;
-            const auto stage = exchange->stage(parameters.mtp->layer.moe.bank, columns);
+            const auto stage =
+                exchange->stage(parameters.mtp->layer.moe.bank, columns,
+                                compute ? std::span(compute->request.work.exchange->source_owners)
+                                        : std::span<const std::uint8_t>{});
             run.feed_forward(&stage);
         } else
             run.feed_forward();

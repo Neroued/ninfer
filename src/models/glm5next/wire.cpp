@@ -219,12 +219,7 @@ void encode_work(Encoder& out, const Work& work, std::uint32_t rank, bool decisi
     if (decision_owner && work.initial_decision)
         runtime::protocol::encode(out, *work.initial_decision);
     out.boolean(bool(work.exchange));
-    if (work.exchange) {
-        out.u64(work.exchange->id);
-        out.u32(work.exchange->draft_passes);
-        integers(out, work.exchange->columns);
-        out.boolean(work.exchange->graph);
-    }
+    if (work.exchange) encode_expert_step(out, *work.exchange);
     std::visit(
         [&](const auto& v) {
             using T = std::decay_t<decltype(v)>;
@@ -273,9 +268,7 @@ Work decode_work(Decoder& in, const VisionInputBindings& inputs) {
     const auto rank = in.u32();
     work.actions.emplace(rank, context::decode_actions(in));
     if (in.boolean()) work.initial_decision = runtime::protocol::decision_input(in);
-    if (in.boolean())
-        work.exchange =
-            moe::ExpertStep{in.u64(), in.u32(), integers<std::uint32_t>(in), in.boolean()};
+    if (in.boolean()) work.exchange = decode_expert_step(in);
     switch (in.u8()) {
     case 1: {
         ForwardWork v;

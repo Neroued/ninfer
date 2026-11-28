@@ -31,6 +31,8 @@ struct CollectiveDecision {
     CollectiveShape shape;
     bool source;
     FrameId reserved_frame;
+    // Set on eager steps with idle owners. Captures always use the full prepared exchange.
+    std::vector<std::uint8_t> source_owners;
 };
 
 // One instance per communicating set of replica owners. Offers describe already reserved
@@ -86,6 +88,7 @@ private:
     const std::vector<CollectiveRouteLimit> limits_;
     std::vector<Member> members_;
     std::optional<CollectiveShape> active_;
+    std::vector<std::uint8_t> active_sources_;
     std::optional<std::string> failure_;
     std::uint64_t next_offer_ = 0, step_ = 0;
     std::size_t next_source_ = 0;

@@ -11,7 +11,7 @@ void SigmoidPass::run(ExpertBankId bank, const ops::SigmoidMoeProfile& p,
                       ParallelExecution* tensor, MemoryArena& arena, CudaExecutionView cuda,
                       const TokenPartition* partition) const {
 #if NINFER_ENABLE_DISTRIBUTED
-    auto step = exchange->stage(bank, columns);
+    auto step = exchange->stage(bank, columns, source_owners);
     sigmoid_exchange(step, p, weights, source, tensor, arena, cuda, partition);
 #else
     throw std::logic_error("sigmoid expert exchange requires distributed execution");

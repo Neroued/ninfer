@@ -193,7 +193,7 @@ runtime::WorkPayloadCapacity WorkContract::payload_capacity(std::uint32_t rank_c
     const auto inline_mask = shape.pipeline_stages > 1 && shape.purpose == EnginePurpose::Generation
                                  ? 12 + batch * (20 + 4 * ((public_tokens + 31ULL) / 32))
                                  : 0;
-    return {work + 22 + inline_mask + 4 * windows,
+    return {work + 22 + 8 + shape.exchange.owners + inline_mask + 4 * windows,
             context,
             decision,
             commit,
@@ -221,6 +221,7 @@ void WorkContract::validate(const Work& work, runtime::FrameKind kind) const {
             !work.exchange || !work.exchange->id || work.exchange->columns.empty() ||
             work.exchange->draft_passes > shape.draft_tokens ||
             work.exchange->draft_passes >= work.exchange->columns.size() ||
+            !work.exchange->valid_sources(shape.exchange) ||
             std::ranges::count(work.exchange->columns, 0U))
             throw std::invalid_argument("invalid GLM5Next expert traversal");
         if (work.exchange->graph && !decode_routes)

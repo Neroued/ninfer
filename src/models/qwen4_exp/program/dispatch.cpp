@@ -5,9 +5,10 @@
 
 namespace ninfer::models::qwen4_exp::detail {
 
-void RankProgramImpl::serve_expert_pass(bool draft, std::uint32_t columns) {
+void RankProgramImpl::serve_expert_pass(bool draft, std::uint32_t columns,
+                                        std::span<const std::uint8_t> owners) {
     const auto serve = [&](const moe::Parameters& layer) {
-        const auto stage = exchange->stage(layer.bank, dimension(columns));
+        const auto stage = exchange->stage(layer.bank, dimension(columns), owners);
         moe::resident_layer(layer, nullptr, &stage, resources.workspace, cuda);
     };
     if (draft)
@@ -89,7 +90,7 @@ void RankProgramImpl::submit_compute(runtime::ExecutionRequest<ExecutionTypes>&&
                 if (step->graph)
                     service_graphs->launch(draft, step->columns[pass], cuda);
                 else
-                    serve_expert_pass(draft, step->columns[pass]);
+                    serve_expert_pass(draft, step->columns[pass], step->source_owners);
             }
             gpu_timer.record_result();
             compute_done.record(cuda.stream());

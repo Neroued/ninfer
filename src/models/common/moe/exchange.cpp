@@ -193,7 +193,7 @@ struct PlacementLayout {
 DeviceExpertPlacement::DeviceExpertPlacement(const ExpertDomain& domain,
                                              const ExpertExchangeStage& s, unsigned local,
                                              Device device)
-    : stage(s), peer(local) {
+    : stage(s), peer(local), peer_owners(domain.peer_owners) {
     const auto& parts = domain.banks.at(s.bank.index);
     if (s.placement_signature != domain.bank_signature(s.bank.index) ||
         s.members != domain.members || parts.size() != s.slots.size() ||
@@ -306,6 +306,8 @@ ExpertExchange::ExpertExchange(ExpertExchangeStage s, const distributed::Group& 
             back_.push_back({p, result, returned});
         }
     }
+    selected_send_ = send_;
+    selected_back_ = back_;
     metadata_.copy_from_host(host.data(), frame.handles.bytes, frame.handles.offset);
     device_peers_ = static_cast<ops::ExpertPeerBuffers*>(frame.handles.bind(metadata_.span()).data);
 }
@@ -472,13 +474,23 @@ LayerSource packet_source(const LayerSource& source, int begin, int count) {
 ExpertExchange::Call ExpertExchange::dispatch(const DeviceExpertPlacement& place,
                                               const LayerSource* source,
                                               const ops::ExpertRoutes* routes, int matched_columns,
-                                              CudaExecutionView exec) {
+                                              CudaExecutionView exec,
+                                              std::span<const std::uint8_t> owners) {
     const auto packets = stage_.blocks(matched_columns);
     if (packets > stage_.blocks_per_window || bool(source) != bool(routes) ||
         (source && (source->hidden.ne[1] > matched_columns ||
                     (source->validity.valid_columns.data && source->validity.tokens_per_row != 1))))
         throw std::invalid_argument("invalid expert dispatch window");
     if (storage_->occupied) throw std::logic_error("previous expert dispatch still owns the frame");
+    sparse_          = !owners.empty();
+    bool send_source = true;
+    if (sparse_) {
+        if (owners.size() <= std::ranges::max(place.peer_owners))
+            throw std::invalid_argument("expert source ownership differs from placement");
+        send_source = owners[place.peer_owners[place.peer]];
+        if (source && !send_source)
+            throw std::invalid_argument("inactive expert source supplied rows");
+    }
     storage_->occupied = true;
     const int peers = dimension(group_.size()), b = stage_.block_columns;
     for (int i = 0; i < packets; ++i) {
@@ -494,7 +506,21 @@ ExpertExchange::Call ExpertExchange::dispatch(const DeviceExpertPlacement& place
         } else {
             ops::pack_expert_rows(nullptr, nullptr, {}, place.dispatch, handles, peers, b, exec);
         }
-        group_.exchange(std::span(send_).subspan(i * (peers - 1), peers - 1), exec);
+        const auto first = i * (peers - 1);
+        if (sparse_) {
+            for (int j = first; j < first + peers - 1; ++j) {
+                auto& tx = selected_send_[j] = send_[j];
+                auto& rx = selected_back_[j] = back_[j];
+                if (!send_source) tx.send.bytes = rx.receive.bytes = 0;
+                if (!owners[place.peer_owners[tx.peer]]) {
+                    // The expert kernel consumes both counters even when this source is absent.
+                    CUDA_CHECK(cudaMemsetAsync(tx.receive.data, 0, 2 * sizeof(int), exec.stream()));
+                    tx.receive.bytes = rx.send.bytes = 0;
+                }
+            }
+        }
+        group_.exchange(std::span(sparse_ ? selected_send_ : send_).subspan(first, peers - 1),
+                        exec);
     }
     return Call(*this, source, packets, exec);
 }
@@ -512,7 +538,9 @@ void ExpertExchange::Call::combine(const Tensor* shared, Tensor* observation,
     const int peers = dimension(frame.group_.size()), b = frame.stage_.block_columns;
     for (int i = 0; i < packets_; ++i) {
         auto* handles = frame.device_peers_ + i * peers;
-        frame.group_.exchange(std::span(frame.back_).subspan(i * (peers - 1), peers - 1), exec_);
+        frame.group_.exchange(std::span(frame.sparse_ ? frame.selected_back_ : frame.back_)
+                                  .subspan(i * (peers - 1), peers - 1),
+                              exec_);
         const int base = i * b;
         if (source_ && base < source_->hidden.ne[1]) {
             const int n = std::min(b, source_->hidden.ne[1] - base);
@@ -669,7 +697,8 @@ void run_windows(const ExpertExchangeWork& work, const ops::RoutedSwiGLUProfile&
             const auto extent = std::min(c, work.physical_columns - window * c);
             auto& frame       = i ? work.overlap->alternate : work.frame;
             slot.call.emplace(frame.dispatch(work.placement, slot.source ? &*slot.source : nullptr,
-                                             slot.source ? &slot.routes : nullptr, extent, main));
+                                             slot.source ? &slot.routes : nullptr, extent, main,
+                                             work.source_owners));
             auto compute = main;
             if (overlap) {
                 compute = overlap->compute;
@@ -797,10 +826,13 @@ public:
         if (geometry.overlap) streams.emplace(device);
     }
     const distributed::Group& group() const noexcept override { return communication_; }
-    ExpertExchangeWork stage(ExpertBankId bank, int columns) override {
+
+    ExpertExchangeWork stage(ExpertBankId bank, int columns,
+                             std::span<const std::uint8_t> owners) override {
         auto& variants = frames.at(bank_frames.at(bank.index));
         auto& pair     = variants.at(geometry_.variant(columns));
         ExpertExchangeWork work{*pair.primary, placements.at(bank.index), columns};
+        work.source_owners = owners;
         if (pair.alternate) work.overlap.emplace(ExpertOverlapWork{*pair.alternate, *streams});
         return work;
     }
@@ -827,6 +859,7 @@ ResidentExchangePlan::ResidentExchangePlan(std::shared_ptr<const ExpertDomain> d
     if (!domain_ || domain_->banks.empty())
         throw std::invalid_argument("expert exchange plan requires at least one bank");
     (void)geometry_.window_columns();
+    geometry_.owners = domain_->owner_count();
     for (std::uint32_t i = 0; i < domain_->banks.size(); ++i) {
         auto make = [&](unsigned b, unsigned w) {
             return prepare_expert_exchange(group, *domain_, ExpertBankId{i}, hidden, top_k,

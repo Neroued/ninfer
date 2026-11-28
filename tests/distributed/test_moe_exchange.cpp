@@ -62,7 +62,7 @@ public:
         length.copy_from_host(&b.valid[rank], 4);
     }
 
-    void run(const Batch& b) {
+    void run(const Batch& b, std::span<const std::uint8_t> owners = {}) {
         const int n = b.columns[rank];
         std::optional<moe::LayerSource> source;
         if (n)
@@ -73,6 +73,7 @@ public:
                                                        : ops::MoeEpilogue::Write});
         moe::ExpertExchangeWork work{parallel, placement, std::max(b.columns[0], b.columns[1]),
                                      &totals};
+        work.source_owners = owners;
         if (streams) work.overlap.emplace(moe::ExpertOverlapWork{*alternate, *streams});
         moe::resident_layer(fixture.parameters, source ? &*source : nullptr, &work, arena,
                             device.execution_view());
@@ -86,7 +87,8 @@ public:
         return bytes;
     }
 
-    void verify(const Batch& b, const char* kind, std::array<std::uint64_t, 2> before) {
+    void verify(const Batch& b, const char* kind, std::array<std::uint64_t, 2> before,
+                std::span<const std::uint8_t> owners = {}) {
         device.synchronize();
         std::array<std::uint64_t, 8> counts{}, expected{};
         obs.copy_to_host(counts.data(), obs.size());
@@ -136,8 +138,12 @@ public:
         const auto now   = peer_bytes();
         const auto waves = stage.blocks(std::max(b.columns[0], b.columns[1]));
         const auto sent = now[0] - before[0], received = now[1] - before[1];
-        require(sent == waves * (stage.dispatch_bytes[other] + stage.return_bytes) &&
-                    received == waves * (stage.dispatch_bytes[rank] + stage.return_bytes),
+        const bool local_active = owners.empty() || owners[rank];
+        const bool peer_active  = owners.empty() || owners[other];
+        require(sent == waves * (local_active * stage.dispatch_bytes[other] +
+                                 peer_active * stage.return_bytes) &&
+                    received == waves * (peer_active * stage.dispatch_bytes[rank] +
+                                         local_active * stage.return_bytes),
                 "backend physical byte counters differ from matched dispatch/return lengths");
         std::cerr << kind << " rank=" << rank << " source=" << b.valid[rank]
                   << " rx_unique=" << counts[4 * other + 2]
@@ -205,8 +211,11 @@ public:
     void eager(const Batch& b) {
         upload(b);
         const auto before = peer_bytes();
-        run(b);
-        verify(b, "eager", before);
+        const std::array<std::uint8_t, 2> owners{b.columns[0] != 0, b.columns[1] != 0};
+        const auto active =
+            owners[0] && owners[1] ? std::span<const std::uint8_t>{} : std::span(owners);
+        run(b, active);
+        verify(b, "eager", before, active);
     }
 
     void graph(Batch shape, std::span<const Batch> replays) {
@@ -253,7 +262,11 @@ wire::Message receive(dist::WorkerConnection& c) {
 void split_intermediate(dist::WorkerConnection& c, const moe::ExpertExchangeStage& original,
                         const moe::ExpertDomain& original_domain) {
     // The same expert runs on both peers. A's output must receive both down-column slices.
-    moe::ExpertDomain d{E, I, original.members, {std::vector<models::ExpertPartition>{}}};
+    moe::ExpertDomain d{E,
+                        I,
+                        original.members,
+                        {std::vector<models::ExpertPartition>{}},
+                        original_domain.peer_owners};
     for (unsigned peer = 0; peer < 2; ++peer) {
         models::ExpertPartition p;
         p.intermediate = {peer * (I / 2), I / 2};
@@ -483,7 +496,8 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--local") {
             int devices = 0;
             if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices) return 77;
-            moe::ExpertDomain domain{E, I, {0, 1}, {std::vector<models::ExpertPartition>(2)}};
+            moe::ExpertDomain domain{
+                E, I, {0, 1}, {std::vector<models::ExpertPartition>(2)}, {0, 1}};
             for (int peer = 0; peer < 2; ++peer) {
                 auto& part        = domain.banks.front()[peer];
                 part.intermediate = {0, I};

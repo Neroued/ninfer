@@ -37,6 +37,7 @@ struct ExpertExchangeWork {
     int physical_columns;
     Tensor* observation = nullptr;
     std::optional<ExpertOverlapWork> overlap;
+    std::span<const std::uint8_t> source_owners;
 };
 
 // Immutable bank maps and reusable exchange frames belong to the rank Program. A layer
@@ -45,12 +46,14 @@ class ResidentExpertExchange {
 public:
     virtual ~ResidentExpertExchange()                                                  = default;
     [[nodiscard]] virtual const distributed::Group& group() const noexcept             = 0;
-    [[nodiscard]] virtual ExpertExchangeWork stage(ExpertBankId, int physical_columns) = 0;
+    [[nodiscard]] virtual ExpertExchangeWork
+    stage(ExpertBankId, int physical_columns, std::span<const std::uint8_t> source_owners = {}) = 0;
 };
 
 struct SigmoidPass {
     ResidentExpertExchange* exchange = nullptr;
     int columns                      = 0;
+    std::span<const std::uint8_t> source_owners;
 
     void run(ExpertBankId, const ops::SigmoidMoeProfile&, const ops::SigmoidMoeWeights&,
              const LayerSource*, ParallelExecution*, MemoryArena&, CudaExecutionView,

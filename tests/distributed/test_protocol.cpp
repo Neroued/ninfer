@@ -552,7 +552,7 @@ void native_work() {
     q::VisionInputBindings bindings;
     q::WorkContract contract{
         {128, 2, 32, 3, KvCacheStorage::BFloat16, EnginePurpose::Generation}, 256, 250, true, true};
-    contract.shape.exchange = {64};
+    contract.shape.exchange = {64, 1, false, 2};
     const models::moe::ExchangeGeometry geometry_plan{64, 4};
     require(geometry_plan.capture_bucket(1) == 1 && geometry_plan.capture_bucket(3) == 4 &&
                 geometry_plan.capture_bucket(63) == geometry_plan.capture_bucket(64) &&
@@ -575,7 +575,8 @@ void native_work() {
     work.exchange = q::plan_expert_step(work, contract.shape.prefill_chunk);
     require(work.exchange && work.exchange->columns == std::vector{1U, 1U, 3U},
             "proposal and verification traversals have incorrect extents");
-    work.exchange->id          = 17;
+    work.exchange->id            = 17;
+    work.exchange->source_owners = {0, 1};
     work.actions[0].operations = {ctx::RecordClear{{ctx::ContextMemory::Device, 16384, 1024}},
                                   ctx::RecordCopy{{ctx::ContextMemory::Device, 2176, 256},
                                                   {ctx::ContextMemory::Device, 4224, 256},
@@ -597,6 +598,7 @@ void native_work() {
     input.finish();
     contract.validate(decoded, runtime::FrameKind::Compute);
     require(decoded.exchange && decoded.exchange->id == 17 && decoded.exchange->draft_passes == 2 &&
+                decoded.exchange->source_owners == work.exchange->source_owners &&
                 decoded.exchange->columns == work.exchange->columns,
             "Qwen4Exp worker lost the published expert traversal");
     const auto& mtp = std::get<q::MtpWork>(decoded.operation);
@@ -2554,6 +2556,21 @@ void collective_graph_matching() {
     check({0, {1}, {1}}, {0, {63}, {1}}, true);
     check({0, {1}, {1}}, {0, {65}, {2}}, false);
     check({0, {1}, {1}}, {0, {1}, {}}, false);
+    runtime::CollectiveStepDomain domain(2, {{0, {256}}});
+    const runtime::FrameId frame{runtime::FrameKind::Compute, 0, 1};
+    auto a          = domain.offer(0, frame, CollectiveShape{0, {1}});
+    auto b          = domain.offer(1, frame, {});
+    const auto step = domain.decision(0, a).value();
+    require(step.source_owners == std::vector<std::uint8_t>{1, 0}, "idle source admitted");
+    domain.retire(0, step.step);
+    a = domain.offer(0, frame, {});
+    require(domain.decision(1, b)->source_owners == step.source_owners,
+            "retirement changed a decision still consumed by another owner");
+    domain.retire(1, step.step);
+    b = domain.offer(1, frame, CollectiveShape{0, {2}});
+    require(!domain.decision(0, a)->source &&
+                domain.decision(1, b)->source_owners == std::vector<std::uint8_t>{0, 1},
+            "alternating owner inherited the last step's source mask");
 }
 
 void stop_during_published_exchange() {

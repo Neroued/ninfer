@@ -87,13 +87,38 @@ std::vector<ExpertPartition> decode_expert_partitions(Decoder& in) {
     return partitions;
 }
 
+void encode_expert_step(Encoder& out, const moe::ExpertStep& s) {
+    out.u64(s.id);
+    out.u32(s.draft_passes);
+    out.u64(s.columns.size());
+    for (auto c : s.columns) out.u32(c);
+    out.boolean(s.graph);
+    out.bytes(std::as_bytes(std::span(s.source_owners)));
+}
+
+moe::ExpertStep decode_expert_step(Decoder& in) {
+    moe::ExpertStep s;
+    s.id           = in.u64();
+    s.draft_passes = in.u32();
+    s.columns.resize(in.count(4));
+    for (auto& c : s.columns) c = in.u32();
+    s.graph           = in.boolean();
+    const auto owners = in.bytes();
+    s.source_owners.reserve(owners.size());
+    for (auto owner : owners) s.source_owners.push_back(std::to_integer<std::uint8_t>(owner));
+    return s;
+}
+
 void encode_expert_domain(Encoder& out, const moe::ExpertDomain* d) {
     out.boolean(d != nullptr);
     if (!d) return;
     out.u32(d->experts);
     out.u32(d->intermediate);
     out.u64(d->members.size());
-    for (auto r : d->members) out.u32(r);
+    for (std::size_t i = 0; i < d->members.size(); ++i) {
+        out.u32(d->members[i]);
+        out.u32(d->peer_owners.at(i));
+    }
     out.u64(d->banks.size());
     for (const auto& bank : d->banks) encode_expert_partitions(out, bank);
 }
@@ -103,8 +128,12 @@ std::shared_ptr<const moe::ExpertDomain> decode_expert_domain(Decoder& in) {
     auto d          = std::make_shared<moe::ExpertDomain>();
     d->experts      = in.u32();
     d->intermediate = in.u32();
-    d->members.resize(in.count(4));
-    for (auto& r : d->members) r = in.u32();
+    d->members.resize(in.count(8));
+    d->peer_owners.resize(d->members.size());
+    for (std::size_t i = 0; i < d->members.size(); ++i) {
+        d->members[i]     = in.u32();
+        d->peer_owners[i] = in.u32();
+    }
     d->banks.resize(in.count(8));
     for (auto& bank : d->banks) bank = decode_expert_partitions(in);
     d->validate();

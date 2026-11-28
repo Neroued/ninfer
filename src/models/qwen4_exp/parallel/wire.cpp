@@ -97,6 +97,7 @@ void encode(Encoder& out, const RankExecutionDescription& r) {
     out.u32(s.exchange.max_block_columns);
     out.u32(s.exchange.blocks_per_window);
     out.boolean(s.exchange.overlap);
+    out.u32(s.exchange.owners);
     out.u8(static_cast<std::uint8_t>(p.decode_path));
     encode_batch_execution_spec(out, p.batches->spec());
     context::encode_directory(out, p.context);
@@ -123,7 +124,7 @@ RankExecutionDescription decode_rank_execution(Decoder& in) {
                      static_cast<SpeculativeLengthPolicy>(in.u8()),
                      static_cast<LinearStateDType>(in.u8())};
     p.shape.pipeline_stages = in.u32();
-    p.shape.exchange        = {in.u32(), in.u32(), in.boolean()};
+    p.shape.exchange        = {in.u32(), in.u32(), in.boolean(), in.u32()};
     p.decode_path = static_cast<ExecutionPath>(in.u8());
     p.batches = std::make_shared<const BatchExecutionPlan>(decode_batch_execution_spec(in));
     if (p.shape.cuda_graph)

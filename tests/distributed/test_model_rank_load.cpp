@@ -82,6 +82,12 @@ auto roundtrip(Request request, const dist::ExecutionTopology& topology, Decode 
     const auto& domain = *rank.expert_domain;
     require(domain.members == topology.role_group("expert", id).members,
             "dispatch peer order differs");
+    const auto owners = models::expert_replica_members(topology, topology.role_group("expert", id));
+    require(domain.owner_count() == owners.size(), "expert owner count differs from topology");
+    for (std::size_t peer = 0; peer < domain.members.size(); ++peer)
+        require(owners.at(domain.peer_owners.at(peer)) ==
+                    topology.replica_for_rank(domain.members[peer]).replica_id,
+                "expert peer assigned to the wrong source owner");
     for (std::size_t bank = 0; bank < rank.experts.size(); ++bank) {
         const auto& local = domain.banks[bank].at(topology.role_group("expert", id).index(id));
         require(local.ids == rank.experts[bank].ids &&

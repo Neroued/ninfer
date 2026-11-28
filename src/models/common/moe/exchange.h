@@ -7,6 +7,7 @@
 #include "distributed/communication.h"
 #include "distributed/wire.h"
 #include "ninfer/ops/moe_exchange.h"
+#include <array>
 #include <utility>
 
 namespace ninfer::models::moe {
@@ -27,14 +28,13 @@ struct ExpertExchangeStage {
     std::vector<std::size_t> dispatch_bytes;
     std::size_t return_bytes;
     int blocks_per_window = 1;
-    bool overlap                   = false;
+    bool overlap = false;
     ExpertInputLayout input_layout = ExpertInputLayout::PacketRows;
 
     [[nodiscard]] int window_columns() const { return block_columns * blocks_per_window; }
 
     [[nodiscard]] int windows(int extent) const;
     [[nodiscard]] std::size_t layer_workspace_bytes(std::size_t per_window) const;
-
 
     [[nodiscard]] distributed::GroupRequirements requirements(unsigned peer) const;
     [[nodiscard]] int blocks(int physical_columns) const;

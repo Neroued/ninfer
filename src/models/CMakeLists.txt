@@ -95,7 +95,7 @@ target_link_libraries(ninfer_model_execution
   PUBLIC ninfer_model_loading ninfer_model_control ninfer_ops ninfer_runtime_support)
 
 if(NINFER_ENABLE_DISTRIBUTED)
-  target_sources(ninfer_model_execution PRIVATE common/moe/exchange.cpp)
+  target_sources(ninfer_model_execution PRIVATE common/moe/exchange.cpp common/moe/exchange_layer.cpp)
 endif()
 
 if(NINFER_TARGET STREQUAL "rtx5090")

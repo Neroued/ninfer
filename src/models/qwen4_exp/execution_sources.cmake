@@ -32,7 +32,6 @@ target_sources(ninfer_model_execution PRIVATE
 
 if(NINFER_ENABLE_DISTRIBUTED)
   target_sources(ninfer_model_execution PRIVATE "${CMAKE_CURRENT_LIST_DIR}/parallel/startup.cpp")
-  target_compile_definitions(ninfer_model_execution PRIVATE NINFER_ENABLE_DISTRIBUTED=1)
   target_sources(ninfer_model_execution PRIVATE "${CMAKE_CURRENT_LIST_DIR}/parallel/preparation.cpp")
   target_link_libraries(ninfer_model_execution PRIVATE ninfer_runtime_distributed)
 endif()

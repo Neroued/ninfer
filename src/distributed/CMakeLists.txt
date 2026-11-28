@@ -6,6 +6,8 @@ if(NINFER_ENABLE_DISTRIBUTED)
   add_library(ninfer_distributed_wire STATIC wire.cpp)
   set_target_properties(ninfer_distributed_wire PROPERTIES POSITION_INDEPENDENT_CODE ON)
   ninfer_internal_includes(ninfer_distributed_wire)
+  # Distributed model headers and their consumers must agree on rank-program layout.
+  target_compile_definitions(ninfer_distributed_wire PUBLIC NINFER_ENABLE_DISTRIBUTED=1)
   target_link_libraries(ninfer_distributed_wire PUBLIC ninfer_deployment)
   add_library(ninfer_distributed_control STATIC
     transport.cpp launch.cpp startup.cpp bootstrap.cpp communication/preparation.cpp)

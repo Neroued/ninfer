@@ -386,7 +386,7 @@ void packed_prefill_inputs(const glm::execution::Parameters& parameters, DeviceC
     // The loading fixture has small matrices. Exercise the rank's actual ingress without
     // dispatching the model mixers, which require production Op geometry.
     glm::detail::RankProgramImpl rank(
-        parameters, std::make_unique<glm::Resources>(std::move(plan), device), device, {});
+        parameters, std::make_unique<glm::Resources>(std::move(plan), device), device, {}, nullptr);
     glm::ForwardWork forward{.kind = glm::ForwardKind::Prefill};
     forward.rows.resize(2);
     for (std::uint32_t row = 0; row < forward.rows.size(); ++row) {

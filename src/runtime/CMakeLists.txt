@@ -34,7 +34,6 @@ target_link_libraries(ninfer_engine PRIVATE
 add_library(ninfer::engine ALIAS ninfer_engine)
 
 if(NINFER_ENABLE_DISTRIBUTED)
-  target_compile_definitions(ninfer_engine PRIVATE NINFER_ENABLE_DISTRIBUTED=1)
   add_library(ninfer_runtime_distributed STATIC executor/protocol.cpp executor/observations.cpp
     executor/preparation.cpp executor/input.cpp executor/collective_step.cpp)
   ninfer_internal_includes(ninfer_runtime_distributed)

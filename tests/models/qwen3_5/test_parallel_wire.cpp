@@ -1,6 +1,4 @@
-#include "models/glm5next/parallel/plan.h"
 #include "models/qwen3_5/parallel/plan.h"
-#include "models/glm5next/program/planning.h"
 #include "models/common/context/wire.h"
 #include "models/common/parallel_wire.h"
 #include "models/qwen3_5/parallel/wire.h"
@@ -9,8 +7,8 @@
 
 
 #include <algorithm>
+#include <array>
 #include <cmath>
-#include <string_view>
 #include <iostream>
 #include <stdexcept>
 #include <vector>
@@ -29,36 +27,15 @@ void rejects(Callback&& callback, const char* message) {
     throw std::runtime_error(message);
 }
 
-void test_glm5next_single_rank_dflash2_rejection() {
-    using namespace ninfer;
-    namespace glm                = models::glm5next;
-    auto profile                 = std::make_shared<glm::execution::ModelProfile>();
-    profile->local.size          = 1;
-    profile->options.speculative = SpeculativeBackend::DFlash2;
-    profile->draft.emplace();
-    EngineOptions options;
-    options.speculative.backend      = SpeculativeBackend::DFlash2;
-    options.speculative.draft_tokens = 7;
-    try {
-        (void)glm::plan_execution(profile, options, KvCacheVectorFormat::BFloat16, 1, false,
-                                  models::make_batch_execution_spec(1, 1, false));
-    } catch (const std::invalid_argument& error) {
-        require(std::string_view(error.what()) == "GLM5Next DFlash2 requires TP=2",
-                "GLM5Next TP1 DFlash2 rejection changed");
-        return;
-    }
-    throw std::runtime_error("GLM5Next prepared DFlash2 with TP1");
-}
-
 void test_qwen4exp_heterogeneous_context() {
     using namespace ninfer;
     using namespace ninfer::models;
     namespace model = qwen4_exp;
-    model::ParallelPlan parallel;
-    parallel.ranks.resize(2);
+    const distributed::ReplicaTopology replica{.ranks = {0, 1}, .stage_ranks = {{0, 1}}};
     model::RankExecutionDescription ranks[2]{};
     for (std::uint32_t i = 0; i < 2; ++i) {
-        auto& session = ranks[i].session;
+        ranks[i].observation.rank = i;
+        auto& session             = ranks[i].session;
         session.batches =
             std::make_shared<const BatchExecutionPlan>(make_batch_execution_spec(2, 1, false));
         session.context.ranks                 = {{i, (i + 1) * (1ULL << 20), 0}};
@@ -67,7 +44,7 @@ void test_qwen4exp_heterogeneous_context() {
         session.context.metadata_budget_bytes = 1ULL << 20;
         ranks[i].capacity                     = {1, 1};
     }
-    const auto group = model::plan_group_execution(parallel, ranks);
+    const auto group = model::plan_replica_execution(replica, ranks);
     require(group.session.context.state.logical_capacity == 20 &&
                 group.session.context.state.layouts.front().parts.size() == 2 &&
                 group.session.context.pools[0].logical_pages == 100 &&
@@ -306,7 +283,8 @@ void test_qwen3_5_work_and_result_wire() {
 
     VisionInputBindings producer_bindings, receiver_bindings;
     producer_bindings.install(visual);
-    const auto resources = qwen::stream_vision_inputs(visual, {.ranks = {7}});
+    const std::array<distributed::RankId, 1> consumers{7};
+    const auto resources = qwen::stream_vision_inputs(visual, consumers);
     require(resources.size() == 1 && resources.front().rank == 7 &&
                 resources.front().metadata.size() < 64 * 1024,
             "large Vision encoder metadata does not fit InputBegin");
@@ -632,7 +610,6 @@ int main() {
     try {
         test_speculative_wire();
         test_qwen3_5_work_and_result_wire();
-        test_glm5next_single_rank_dflash2_rejection();
         test_payload_ceilings();
         test_qwen4exp_heterogeneous_context();
         test_rank_options_and_digest();

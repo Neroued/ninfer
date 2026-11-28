@@ -68,7 +68,7 @@ if(NINFER_ENABLE_DISTRIBUTED)
     common/qwen/vision/wire.cpp
     common/parallel_wire.cpp
     common/pipeline_placement.cpp)
-  target_link_libraries(ninfer_model_control PRIVATE ninfer_distributed_wire)
+  target_link_libraries(ninfer_model_control PUBLIC ninfer_distributed_wire)
 endif()
 
 # Rank-owned storage, mathematical execution and graph preparation.

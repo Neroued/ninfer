@@ -5,10 +5,6 @@ endif()
 ninfer_add_test(ninfer_cluster_topology_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_cluster_topology.cpp"
   LIBRARIES ${ninfer_cluster_topology_libs})
-if(NINFER_ENABLE_DISTRIBUTED)
-  target_compile_definitions(ninfer_cluster_topology_test PRIVATE NINFER_ENABLE_DISTRIBUTED=1)
-endif()
-
 if(NINFER_ENABLE_DISTRIBUTED AND NINFER_BUILD_ENGINE)
   # Explicit artifacts and optional device materialization; not an automatic download or GPU test.
   add_executable(ninfer_model_rank_load_test "${CMAKE_CURRENT_LIST_DIR}/test_model_rank_load.cpp")

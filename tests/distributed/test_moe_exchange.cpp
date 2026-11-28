@@ -380,6 +380,15 @@ int worker() {
             calls.graph(service.front(), service);
             calls.tensor_sources();
         }
+        {
+            auto native_stage         = stage;
+            native_stage.input_layout = moe::ExpertInputLayout::TokenRoutes;
+            Calls native(c, domain, native_stage);
+            native.eager({{5, 2}, {1, 9}, {4, 1}, true});
+            const std::array<Batch, 2> graphs{
+                {{{2, 2}, {7, 7}, {2, 0}}, {{2, 2}, {0, 10}, {0, 2}}}};
+            native.graph(graphs.front(), graphs);
+        }
         split_intermediate(c, stage, domain);
         real_layer(c, stage, req, reader, std::move(def));
         const auto stats  = c.communication().group(stage.group).statistics();

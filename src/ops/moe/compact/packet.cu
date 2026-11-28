@@ -93,6 +93,53 @@ __global__ void scatter(ExpertPacketBatch batch, int* cursors, int* rows, float*
     }
 }
 
+__global__ void unpack_rows(ExpertPacketBatch batch, std::uint16_t* hidden, int width, int* ids,
+                            float* weights, int* cursors, int k) {
+    const int row     = blockIdx.x;
+    const auto packet = batch.peers[blockIdx.y].receive;
+    const auto dst    = std::int64_t(blockIdx.y) * batch.columns + row;
+    const bool live   = row < packet.counts[0];
+    const auto* x     = reinterpret_cast<const uint4*>(packet.hidden) + std::int64_t(row) * width;
+    auto* y           = reinterpret_cast<uint4*>(hidden) + dst * width;
+    for (int i = threadIdx.x; i < width; i += blockDim.x)
+        y[i] = live ? x[i] : make_uint4(0, 0, 0, 0);
+    for (int j = threadIdx.x; j < k; j += blockDim.x) {
+        ids[dst * k + j]     = -1;
+        weights[dst * k + j] = 0;
+    }
+    if (!threadIdx.x) cursors[dst] = 0;
+}
+
+__global__ void unpack_hits(ExpertPacketBatch batch, const int* logical, int* ids, float* weights,
+                            int* cursors, int k) {
+    const auto packet = batch.peers[blockIdx.y].receive;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < packet.counts[1];
+         i += gridDim.x * blockDim.x) {
+        const auto hit = packet.hits[i];
+        const auto row = std::int64_t(blockIdx.y) * batch.columns + hit.row;
+        const auto j   = row * k + atomicAdd(cursors + row, 1);
+        ids[j]         = logical[hit.slot];
+        weights[j]     = hit.coefficient;
+    }
+}
+
+__global__ void pack_partials(ExpertPacketBatch batch, const float* partial, int width) {
+    const auto peer = batch.peers[blockIdx.y];
+    if (blockIdx.x >= peer.receive.counts[0]) return;
+    const auto row = std::int64_t(blockIdx.y) * batch.columns + blockIdx.x;
+    const auto* x  = reinterpret_cast<const float4*>(partial) + row * width;
+    auto* y        = reinterpret_cast<float4*>(peer.partial) + std::int64_t(blockIdx.x) * width;
+    for (int i = threadIdx.x; i < width; i += blockDim.x) y[i] = x[i];
+}
+
+int window_rows(ExpertPacketBatch batch, CudaExecutionView exec) {
+    const auto n = std::int64_t(batch.segments) * batch.columns;
+    if (!batch.peers || batch.device != exec.device() || batch.segments <= 0 ||
+        batch.segments > 65535 || batch.columns <= 0 || n > INT_MAX)
+        throw std::invalid_argument("invalid expert receive window");
+    return static_cast<int>(n);
+}
+
 __global__ void combine(const ExpertPeerBuffers* peers, int peer_count, const float* shared,
                         __nv_bfloat16* out, int h, const int* lengths, int width, bool add,
                         const float* gate) {
@@ -202,6 +249,41 @@ void group_expert_hits(ExpertPacketBatch batch, const CompactExpertAssignments& 
     scan_slots<<<1, 128, 0, exec.stream()>>>(c, static_cast<int*>(a.offsets.data), slots);
     scatter<<<blocks, 128, 0, exec.stream()>>>(batch, c, static_cast<int*>(a.rows.data),
                                                static_cast<float*>(a.coefficients.data));
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void unpack_expert_routes(ExpertPacketBatch batch, const Tensor& logical_ids, Tensor& hidden,
+                          ExpertRoutes& routes, Tensor& cursors, CudaExecutionView exec) {
+    const int n = window_rows(batch, exec), h = hidden.ne[0], k = routes.ids.ne[0];
+    const auto device = exec.device();
+    if (h <= 0 || h % 8 || k <= 0 || logical_ids.ne[0] <= 0)
+        throw std::invalid_argument("invalid native expert window shape");
+    common::operand::tensor(logical_ids, DType::I32, {logical_ids.ne[0]}, 4, "expert unpack",
+                            "logical IDs", device);
+    common::operand::tensor(hidden, DType::BF16, {h, n}, 16, "expert unpack", "hidden", device);
+    common::operand::tensor(routes.ids, DType::I32, {k, n}, 16, "expert unpack", "IDs", device);
+    common::operand::tensor(routes.coefficients, DType::FP32, {k, n}, 16, "expert unpack",
+                            "weights", device);
+    common::operand::tensor(cursors, DType::I32, {n}, 4, "expert unpack", "row cursors", device);
+    auto* ids     = static_cast<int*>(routes.ids.data);
+    auto* weights = static_cast<float*>(routes.coefficients.data);
+    auto* next    = static_cast<int*>(cursors.data);
+    unpack_rows<<<dim3(batch.columns, batch.segments), 128, 0, exec.stream()>>>(
+        batch, static_cast<std::uint16_t*>(hidden.data), h / 8, ids, weights, next, k);
+    const auto blocks = std::min<std::int64_t>(exec.multiprocessor_count() * 4,
+                                               (std::int64_t(batch.columns) * k + 127) / 128);
+    unpack_hits<<<dim3(blocks, batch.segments), 128, 0, exec.stream()>>>(
+        batch, static_cast<const int*>(logical_ids.data), ids, weights, next, k);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void pack_expert_partials(ExpertPacketBatch batch, const Tensor& partial, CudaExecutionView exec) {
+    const int n = window_rows(batch, exec), h = partial.ne[0];
+    if (h <= 0 || h % 4) throw std::invalid_argument("invalid expert partial shape");
+    common::operand::tensor(partial, DType::FP32, {h, n}, 16, "expert return", "weighted partials",
+                            exec.device());
+    pack_partials<<<dim3(batch.columns, batch.segments), 128, 0, exec.stream()>>>(
+        batch, static_cast<const float*>(partial.data), h / 4);
     CUDA_CHECK(cudaGetLastError());
 }
 

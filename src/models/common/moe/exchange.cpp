@@ -307,14 +307,41 @@ SourceScratch source_scratch(Arena& a, int h, int k, int n, bool gate = true) {
 }
 } // namespace
 
-std::size_t ExpertExchangeStage::routed_workspace_bytes(unsigned peer,
-                                                        const ops::RoutedSwiGLUProfile& p) const {
-    const int slots = this->slots.at(peer), b = window_columns();
-    const int m = dimension(members.size() * hit_capacity(b, p.top_k, slots));
+namespace {
+struct RoutedBatch {
+    Tensor hidden, partial, cursors;
+    ops::ExpertRoutes routes;
+};
+
+template <class Arena>
+RoutedBatch routed_batch(Arena& arena, int h, int k, int rows) {
+    return {arena.alloc(DType::BF16, {h, rows}),
+            arena.alloc(DType::FP32, {h, rows}),
+            arena.alloc(DType::I32, {rows}),
+            {arena.alloc(DType::I32, {k, rows}), arena.alloc(DType::FP32, {k, rows})}};
+}
+
+void expert_workspace(WorkspaceLayoutBuilder& arena, const ExpertExchangeStage& st, unsigned peer,
+                      const ops::RoutedSwiGLUProfile& profile, ExpertInputLayout layout) {
+    const int rows = dimension(st.members.size() * st.window_columns());
+    if (layout == ExpertInputLayout::TokenRoutes) {
+        (void)routed_batch(arena, st.hidden, st.top_k, rows);
+        (void)arena.alloc_bytes(ops::routed_swiglu_workspace_capacity_bytes(
+            profile, ops::ExpertSubsetKind::All, DType::FP32, ops::MoeEpilogue::Write, 1, rows));
+    } else {
+        const auto m = hit_capacity(rows, st.top_k, st.slots.at(peer));
+        group_scratch(arena, st.slots.at(peer), m);
+        (void)arena.alloc_bytes(ops::compact_routed_swiglu_workspace_bytes(profile, m));
+    }
+}
+} // namespace
+
+std::size_t
+ExpertExchangeStage::routed_workspace_bytes(unsigned peer, const ops::RoutedSwiGLUProfile& p,
+                                            std::optional<ExpertInputLayout> layout) const {
     WorkspaceLayoutBuilder l;
-    (void)l.alloc(DType::I32, {b}); // Worst-case block validity crossing a packed row boundary.
-    group_scratch(l, slots, m);
-    (void)l.alloc_bytes(ops::compact_routed_swiglu_workspace_bytes(p, m));
+    (void)l.alloc(DType::I32, {window_columns()});
+    expert_workspace(l, *this, peer, p, layout.value_or(input_layout));
     return l.peak_bytes();
 }
 
@@ -326,8 +353,10 @@ void plan_shared_exchange(WorkspaceLayoutBuilder& l, int h, int block, unsigned 
 }
 } // namespace
 
-std::size_t ExpertExchangeStage::softmax_workspace_bytes(unsigned peer, const ops::MoeProfile& p,
-                                                         unsigned tensor_size) const {
+std::size_t
+ExpertExchangeStage::softmax_workspace_bytes(unsigned peer, const ops::MoeProfile& p,
+                                             unsigned tensor_size,
+                                             std::optional<ExpertInputLayout> layout) const {
     const int b = window_columns();
     WorkspaceLayoutBuilder l;
     source_scratch(l, hidden, top_k, b);
@@ -338,22 +367,20 @@ std::size_t ExpertExchangeStage::softmax_workspace_bytes(unsigned peer, const op
     const auto shared =
         ops::routed_swiglu_workspace_capacity_bytes(p.routed, p.shared, ops::ExpertSubsetKind::None,
                                                     DType::FP32, ops::MoeEpilogue::Write, 1, b);
-    const int slots = this->slots.at(peer);
-    const int m = dimension(members.size() * hit_capacity(b, p.routed.top_k, slots));
     {
         auto scope = l.scope();
         (void)l.alloc_bytes(std::max(route, shared));
     }
-    group_scratch(l, slots, m);
-    (void)l.alloc_bytes(ops::compact_routed_swiglu_workspace_bytes(p.routed, m));
+    expert_workspace(l, *this, peer, p.routed, layout.value_or(input_layout));
     return l.peak_bytes();
 }
 
-std::size_t ExpertExchangeStage::sigmoid_workspace_bytes(unsigned peer,
-                                                         const ops::SigmoidMoeProfile& p,
-                                                         unsigned tensor_size) const {
+std::size_t
+ExpertExchangeStage::sigmoid_workspace_bytes(unsigned peer, const ops::SigmoidMoeProfile& p,
+                                             unsigned tensor_size,
+                                             std::optional<ExpertInputLayout> layout) const {
     WorkspaceLayoutBuilder l;
-    const int b = window_columns(), local = slots.at(peer);
+    const int b = window_columns();
     source_scratch(l, hidden, top_k, b, false);
     plan_shared_exchange(l, hidden, b, tensor_size);
     (void)l.alloc(DType::I32, {b});
@@ -363,9 +390,7 @@ std::size_t ExpertExchangeStage::sigmoid_workspace_bytes(unsigned peer,
         const auto shared = ops::swiglu_workspace_capacity_bytes(p.shared, 1, b, DType::FP32);
         (void)l.alloc_bytes(std::max(route, shared));
     }
-    const auto hits = dimension(members.size() * hit_capacity(b, top_k, local));
-    group_scratch(l, local, hits);
-    (void)l.alloc_bytes(ops::compact_routed_swiglu_workspace_bytes(p.routed, hits));
+    expert_workspace(l, *this, peer, p.routed, layout.value_or(input_layout));
     return l.peak_bytes();
 }
 
@@ -479,6 +504,18 @@ namespace {
 void run_experts(ops::ExpertPacketBatch received, const DeviceExpertPlacement& place,
                  const ops::RoutedSwiGLUProfile& profile, const ops::CudaSwiGLUExperts& weights,
                  MemoryArena& arena, CudaExecutionView exec) {
+    if (place.stage.input_layout == ExpertInputLayout::TokenRoutes) {
+        auto scope      = arena.scope();
+        const auto rows = dimension(std::uint64_t(received.segments) * received.columns);
+        auto batch      = routed_batch(arena, profile.ffn.hidden, profile.top_k, rows);
+        ops::unpack_expert_routes(received, place.logical_ids, batch.hidden, batch.routes,
+                                  batch.cursors, exec);
+        ops::routed_swiglu(batch.hidden, profile, weights, batch.routes,
+                           {ops::ExpertSubsetKind::All, {}}, ops::MoeEpilogue::Write, batch.partial,
+                           arena, exec);
+        ops::pack_expert_partials(received, batch.partial, exec);
+        return;
+    }
     const int slots = place.logical_ids.ne[0];
     const int m     = dimension(std::uint64_t(received.segments) *
                                 hit_capacity(received.columns, profile.top_k, slots));
@@ -508,7 +545,7 @@ void tensor_layer(const ExpertExchangeWork& work, const ops::RoutedSwiGLUProfile
                   const ops::CudaSwiGLUExperts& experts, const LayerSource& source,
                   ParallelExecution& tensor, const TokenPartition* partition, bool gated,
                   MemoryArena& arena, CudaExecutionView exec, Route route, Shared project_shared) {
-    const auto& st  = work.placement.stage;
+    const auto& st  = work.frame.stage();
     const int lanes = dimension(tensor.size()), rank = dimension(tensor.rank());
     const bool split  = partition && partition->split();
     const int width   = split ? shared_columns(st.window_columns(), lanes) : st.window_columns();
@@ -578,8 +615,10 @@ void softmax_exchange(const ExpertExchangeWork& work, const Parameters& p,
     if (workspace.device() != exec.device())
         throw std::invalid_argument("expert workspace belongs to another device");
     MemoryArena arena(workspace.alloc_bytes(
-        source ? stage.softmax_workspace_bytes(place.peer, p.profile, tensor ? tensor->size() : 1)
-               : stage.routed_workspace_bytes(place.peer, p.profile.routed)));
+        source ? stage.softmax_workspace_bytes(place.peer, p.profile, tensor ? tensor->size() : 1,
+                                               place.stage.input_layout)
+               : stage.routed_workspace_bytes(place.peer, p.profile.routed,
+                                              place.stage.input_layout)));
     start_observation(work.observation, exec);
     const ops::CudaSwiGLUExperts weights{p.resident, p.activation_calibration};
     if (source && tensor) {
@@ -629,8 +668,9 @@ void sigmoid_exchange(const ExpertExchangeWork& work, const ops::SigmoidMoeProfi
     work.frame.validate(place, p.routed, extent, source, work.observation, exec);
     auto lease = workspace.scope();
     MemoryArena arena(workspace.alloc_bytes(
-        source ? stage.sigmoid_workspace_bytes(place.peer, p, tensor ? tensor->size() : 1)
-               : stage.routed_workspace_bytes(place.peer, p.routed)));
+        source ? stage.sigmoid_workspace_bytes(place.peer, p, tensor ? tensor->size() : 1,
+                                               place.stage.input_layout)
+               : stage.routed_workspace_bytes(place.peer, p.routed, place.stage.input_layout)));
     if (source && tensor) {
         tensor_layer(
             work, p.routed, weights.routed, *source, *tensor, partition, false, arena, exec,
@@ -684,7 +724,8 @@ void routed_exchange(const ExpertExchangeWork& work, const ops::RoutedSwiGLUProf
     auto lease = workspace.scope();
     if (workspace.device() != exec.device())
         throw std::invalid_argument("expert workspace belongs to another device");
-    MemoryArena arena(workspace.alloc_bytes(stage.routed_workspace_bytes(place.peer, p)));
+    MemoryArena arena(workspace.alloc_bytes(
+        stage.routed_workspace_bytes(place.peer, p, place.stage.input_layout)));
     start_observation(work.observation, exec);
     for (int wave = 0; wave < stage.windows(extent); ++wave) {
         const int base = wave * stage.window_columns();
@@ -757,6 +798,27 @@ ResidentExchangePlan::ResidentExchangePlan(std::shared_ptr<const ExpertDomain> d
         }
     }
     bytes_ += payload_bytes_;
+}
+
+void ResidentExchangePlan::bind_experts(ExpertBankId bank, const ops::RoutedSwiGLUProfile& profile,
+                                        ExpertInputLayout preferred) {
+    auto& st           = stages_.at(bank.index);
+    const auto prepare = [&](ExpertInputLayout layout) {
+        WorkspaceLayoutBuilder workspace;
+        expert_workspace(workspace, st, peer_, profile, layout);
+        st.input_layout = layout;
+    };
+    try {
+        prepare(preferred);
+    } catch (const std::invalid_argument& first) {
+        try {
+            prepare(preferred == ExpertInputLayout::PacketRows ? ExpertInputLayout::TokenRoutes
+                                                               : ExpertInputLayout::PacketRows);
+        } catch (const std::invalid_argument& second) {
+            throw std::invalid_argument(std::string("expert kernel preparation: ") + first.what() +
+                                        " / " + second.what());
+        }
+    }
 }
 
 std::unique_ptr<ResidentExpertExchange>

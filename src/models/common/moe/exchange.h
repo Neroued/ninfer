@@ -13,6 +13,8 @@ namespace ninfer::models::moe {
 // Logical group members, per-destination send sizes and return size completely specify one
 // dispatch/return pair. A committed physical column extent determines the same block count
 // on every peer, independently of local active rows.
+enum class ExpertInputLayout { PacketRows, TokenRoutes };
+
 struct ExpertExchangeStage {
     distributed::GroupId group;
     ExpertBankId bank;
@@ -24,6 +26,7 @@ struct ExpertExchangeStage {
     std::vector<std::size_t> dispatch_bytes;
     std::size_t return_bytes;
     int blocks_per_window = 1;
+    ExpertInputLayout input_layout = ExpertInputLayout::PacketRows;
 
     [[nodiscard]] int window_columns() const { return block_columns * blocks_per_window; }
 
@@ -33,12 +36,14 @@ struct ExpertExchangeStage {
     [[nodiscard]] distributed::GroupRequirements requirements(unsigned peer) const;
     [[nodiscard]] int blocks(int physical_columns) const;
     [[nodiscard]] std::size_t frame_bytes(unsigned peer) const;
-    [[nodiscard]] std::size_t routed_workspace_bytes(unsigned peer,
-                                                     const ops::RoutedSwiGLUProfile&) const;
+    [[nodiscard]] std::size_t routed_workspace_bytes(unsigned peer, const ops::RoutedSwiGLUProfile&,
+                                                     std::optional<ExpertInputLayout> = {}) const;
     [[nodiscard]] std::size_t softmax_workspace_bytes(unsigned peer, const ops::MoeProfile&,
-                                                      unsigned tensor_size = 1) const;
+                                                      unsigned tensor_size             = 1,
+                                                      std::optional<ExpertInputLayout> = {}) const;
     [[nodiscard]] std::size_t sigmoid_workspace_bytes(unsigned peer, const ops::SigmoidMoeProfile&,
-                                                      unsigned tensor_size = 1) const;
+                                                      unsigned tensor_size             = 1,
+                                                      std::optional<ExpertInputLayout> = {}) const;
     // The rank-load digest binds weights to the installed topology. This description lets
     // participants match layer, peer order and physical envelopes before launching any exchange.
     void encode(distributed::wire::Encoder&, int physical_columns) const;
@@ -77,6 +82,7 @@ public:
 
     [[nodiscard]] std::size_t bytes() const noexcept { return bytes_; }
 
+    void bind_experts(ExpertBankId, const ops::RoutedSwiGLUProfile&, ExpertInputLayout preferred);
     [[nodiscard]] ExchangeGeometry geometry() const noexcept { return geometry_; }
 
     [[nodiscard]] distributed::GroupRequirements requirements() const;

@@ -47,6 +47,7 @@ RankPreparation::RankPreparation(const artifact::Reader& reader, RankLoadRequest
         auto route = std::make_shared<moe::ResidentExchangePlan>(rp.expert_domain, *experts, peer,
                                                                  c.hidden, c.moe.top_k);
         const auto bind = [&](execution::MoeProfile& layer) {
+            route->bind_experts(layer.bank, layer.math.routed, moe::ExpertInputLayout::PacketRows);
             layer.exchange_workspace =
                 route->stage(layer.bank)
                     .sigmoid_workspace_bytes(peer, layer.math, profile->local.size);

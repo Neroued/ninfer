@@ -54,6 +54,11 @@ void group_expert_hits(ExpertPacketBatch, const CompactExpertAssignments&, Tenso
 // into its source's return segment. No concatenation or host count read is required.
 void compact_routed_swiglu(ExpertPacketBatch, const RoutedSwiGLUProfile&, const CudaSwiGLUExperts&,
                            const CompactExpertAssignments&, MemoryArena&, CudaExecutionView);
+// Convert a receive window to the native routed Op's contiguous [H,T] and [K,T]
+// inputs. T=segments*columns. Empty slots are -1 and weight zero; expert IDs are global.
+void unpack_expert_routes(ExpertPacketBatch, const Tensor& logical_ids, Tensor& hidden,
+                          ExpertRoutes&, Tensor& cursors, CudaExecutionView);
+void pack_expert_partials(ExpertPacketBatch, const Tensor& partial, CudaExecutionView);
 // FP32 partials are already weighted. Add shared once, then apply the model epilogue.
 void return_expert_rows(const ExpertPeerBuffers*, int peers, const Tensor& shared, Tensor& output,
                         MoeTokenValidity, MoeEpilogue, CudaExecutionView,

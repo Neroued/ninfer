@@ -343,6 +343,21 @@ void qwen_case(const artifact::Reader& reader, const std::filesystem::path& path
                     profile->text.layers.front().moe.subset == ops::ExpertSubsetKind::MaskOnes &&
                     profile->mtp->layer.moe.subset == ops::ExpertSubsetKind::MaskOnes,
                 "TP1 execution description rebound an unowned full bank");
+        if (id == 0) {
+            const auto& domain = load.rank_plan().expert_domain;
+            const auto& group  = p.topology.role_group("expert", id);
+            const auto& layer  = profile->text.layers.front().moe;
+            const auto prepare = [&](bool overlap) {
+                models::moe::ResidentExchangePlan plan(domain, group, group.index(id),
+                                                       layer.math.routed.ffn.hidden,
+                                                       layer.math.routed.top_k, {2, 2, overlap});
+                const auto scratch = plan.bind_layer(layer.bank, layer.math, profile->local.size);
+                return std::pair{plan.bytes(), scratch};
+            };
+            const auto serial = prepare(false), overlap = prepare(true);
+            require(overlap.first > serial.first && overlap.second > serial.second,
+                    "two live expert windows were budgeted as a single frame or workspace");
+        }
         if (materialize == id) {
             DeviceContext device(0);
             auto model = qwen::materialize_model(std::move(load), device);

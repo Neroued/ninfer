@@ -30,11 +30,16 @@ struct ExpertOverlapWork {
     ExpertOverlapResources& streams;
 };
 
-// A matched layer stage borrows a single frame and immutable placement until consumption.
+struct ExpertWindowWorkspace {
+    std::size_t source, service;
+};
+
+// A matched layer borrows prepared frames and its bank's workspace requirements.
 struct ExpertExchangeWork {
     ExpertExchange& frame;
     const DeviceExpertPlacement& placement;
     int physical_columns;
+    ExpertWindowWorkspace workspace;
     Tensor* observation = nullptr;
     std::optional<ExpertOverlapWork> overlap;
     std::span<const std::uint8_t> source_owners;

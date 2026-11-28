@@ -41,8 +41,9 @@ public:
           fixture(device.device(), d.banks.at(st.bank.index).at(rank).ids, st.bank),
           x(device.device(), 5 * H * 2), y(device.device(), 5 * H * 2), length(device.device(), 4),
           obs(device.device(), 64),
-          scratch(device.device(), stage.layer_workspace_bytes(stage.softmax_workspace_bytes(
-                                       rank, fixture.parameters.profile))),
+          window(stage.workspace(rank, fixture.parameters.profile, 1, stage.input_layout)),
+          scratch(device.device(),
+                  stage.layer_workspace_bytes(std::max(window.source, window.service))),
           arena(scratch.span()), totals(obs.span(), DType::U64, {4, 2}) {
         if (stage.overlap) {
             alternate.emplace(stage, group);
@@ -72,7 +73,7 @@ public:
                                             b.residual ? ops::MoeEpilogue::AddResidual
                                                        : ops::MoeEpilogue::Write});
         moe::ExpertExchangeWork work{parallel, placement, std::max(b.columns[0], b.columns[1]),
-                                     &totals};
+                                     window, &totals};
         work.source_owners = owners;
         if (streams) work.overlap.emplace(moe::ExpertOverlapWork{*alternate, *streams});
         moe::resident_layer(fixture.parameters, source ? &*source : nullptr, &work, arena,
@@ -176,8 +177,9 @@ public:
             }
         }
         x.copy_from_host(input.data(), x.size());
-        DeviceBuffer storage(device.device(),
-                             stage.softmax_workspace_bytes(rank, fixture.parameters.profile, 2));
+        const auto tp_window =
+            stage.workspace(rank, fixture.parameters.profile, 2, stage.input_layout);
+        DeviceBuffer storage(device.device(), tp_window.source);
         MemoryArena workspace(storage.span());
         models::ParallelExecution tp({&group, 0});
         for (bool split : {false, true}) {
@@ -186,7 +188,7 @@ public:
             y.copy_from_host(output.data(), y.size());
             moe::LayerSource src{
                 {x.span(), DType::BF16, {H, 5}}, {y.span(), DType::BF16, {H, 5}}, {}};
-            const moe::ExpertExchangeWork step{parallel, placement, 5};
+            const moe::ExpertExchangeWork step{parallel, placement, 5, tp_window};
             moe::softmax_exchange(step, fixture.parameters, &src, workspace,
                                   device.execution_view(), &tp, &columns);
             device.synchronize();
@@ -247,7 +249,9 @@ public:
     Fixture fixture;
     std::optional<moe::ExpertExchange> alternate;
     std::optional<moe::ExpertOverlapResources> streams;
-    DeviceBuffer x, y, length, obs, scratch;
+    DeviceBuffer x, y, length, obs;
+    moe::ExpertWindowWorkspace window;
+    DeviceBuffer scratch;
     MemoryArena arena;
     Tensor totals;
 };
@@ -314,8 +318,9 @@ void split_intermediate(dist::WorkerConnection& c, const moe::ExpertExchangeStag
         MemoryArena short_frame(memory.span().subspan(0, capacity - 1));
         bool refused = false;
         try {
-            moe::routed_exchange({frame, placement, 1, &totals}, prof, experts, nullptr, nullptr,
-                                 nullptr, short_frame, device.execution_view());
+            moe::routed_exchange({frame, placement, 1, {capacity, capacity}, &totals}, prof,
+                                 experts, nullptr, nullptr, nullptr, short_frame,
+                                 device.execution_view());
         } catch (const std::bad_alloc&) { refused = true; }
         require(refused, "undersized expert workspace reached device communication");
     }
@@ -323,7 +328,7 @@ void split_intermediate(dist::WorkerConnection& c, const moe::ExpertExchangeStag
         valid.copy_from_host(&live, 4);
         std::vector<std::uint16_t> out(H, test::f32_to_bf16(.5F));
         y.copy_from_host(out.data(), y.size());
-        moe::routed_exchange({frame, placement, 1, &totals}, prof, experts,
+        moe::routed_exchange({frame, placement, 1, {capacity, capacity}, &totals}, prof, experts,
                              peer ? nullptr : &source, peer ? nullptr : &routes,
                              peer ? nullptr : &sh_view, arena, device.execution_view());
         device.synchronize();

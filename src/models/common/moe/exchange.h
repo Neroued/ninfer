@@ -47,6 +47,10 @@ struct ExpertExchangeStage {
     [[nodiscard]] std::size_t sigmoid_workspace_bytes(unsigned peer, const ops::SigmoidMoeProfile&,
                                                       unsigned tensor_size             = 1,
                                                       std::optional<ExpertInputLayout> = {}) const;
+    [[nodiscard]] ExpertWindowWorkspace workspace(unsigned peer, const ops::MoeProfile&,
+                                                  unsigned tensor_size, ExpertInputLayout) const;
+    [[nodiscard]] ExpertWindowWorkspace workspace(unsigned peer, const ops::SigmoidMoeProfile&,
+                                                  unsigned tensor_size, ExpertInputLayout) const;
     // The rank-load digest binds weights to the installed topology. This description lets
     // participants match layer, peer order and physical envelopes before launching any exchange.
     void encode(distributed::wire::Encoder&, int physical_columns) const;
@@ -80,13 +84,11 @@ public:
     ResidentExchangePlan(std::shared_ptr<const ExpertDomain>, const distributed::GroupDescription&,
                          unsigned peer, int hidden, int top_k, ExchangeGeometry geometry = {64, 1});
 
-    [[nodiscard]] const ExpertExchangeStage& stage(ExpertBankId bank) const {
-        return stages_.at(bank.index);
-    }
-
     [[nodiscard]] std::size_t bytes() const noexcept { return bytes_; }
-
-    void bind_experts(ExpertBankId, const ops::RoutedSwiGLUProfile&, ExpertInputLayout preferred);
+    template <class Profile>
+    [[nodiscard]] std::size_t
+    bind_layer(ExpertBankId, const Profile&, unsigned tensor_size,
+               ExpertInputLayout preferred = ExpertInputLayout::PacketRows);
     [[nodiscard]] ExchangeGeometry geometry() const noexcept { return geometry_; }
 
     [[nodiscard]] distributed::GroupRequirements requirements() const;
@@ -101,6 +103,7 @@ private:
     std::vector<std::vector<ExpertExchangeStage>> frame_shapes_;
     std::size_t payload_bytes_ = 0;
     std::vector<std::size_t> bank_frames_;
+    std::vector<std::vector<ExpertWindowWorkspace>> workspaces_;
     std::size_t bytes_ = 0;
 };
 

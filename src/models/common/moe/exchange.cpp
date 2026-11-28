@@ -423,6 +423,21 @@ ExpertExchangeStage::sigmoid_workspace_bytes(unsigned peer, const ops::SigmoidMo
     return l.peak_bytes();
 }
 
+ExpertWindowWorkspace ExpertExchangeStage::workspace(unsigned peer, const ops::MoeProfile& profile,
+                                                     unsigned lanes,
+                                                     ExpertInputLayout layout) const {
+    return {softmax_workspace_bytes(peer, profile, lanes, layout),
+            routed_workspace_bytes(peer, profile.routed, layout)};
+}
+
+ExpertWindowWorkspace ExpertExchangeStage::workspace(unsigned peer,
+                                                     const ops::SigmoidMoeProfile& profile,
+                                                     unsigned lanes,
+                                                     ExpertInputLayout layout) const {
+    return {sigmoid_workspace_bytes(peer, profile, lanes, layout),
+            routed_workspace_bytes(peer, profile.routed, layout)};
+}
+
 void ExpertExchange::validate(const DeviceExpertPlacement& placement,
                               const ops::RoutedSwiGLUProfile& p, int extent, const LayerSource* src,
                               Tensor* totals, CudaExecutionView exec) const {
@@ -741,10 +756,7 @@ void softmax_exchange(const ExpertExchangeWork& work, const Parameters& p,
                         exec);
     if (p.bank != place.stage.bank)
         throw std::invalid_argument("expert parameters belong to another bank");
-    const auto layout = place.stage.input_layout;
-    const auto bytes  = source ? st.softmax_workspace_bytes(place.peer, p.profile,
-                                                           tensor ? tensor->size() : 1, layout)
-                               : st.routed_workspace_bytes(place.peer, p.profile.routed, layout);
+    const auto bytes = source ? work.workspace.source : work.workspace.service;
     run_layer(
         work, p.profile.routed, {p.resident, p.activation_calibration}, source, tensor, partition,
         true, bytes, workspace, exec,
@@ -766,12 +778,8 @@ void sigmoid_exchange(const ExpertExchangeWork& work, const ops::SigmoidMoeProfi
                       ParallelExecution* tensor, MemoryArena& workspace, CudaExecutionView exec,
                       const TokenPartition* partition) {
     const auto& place = work.placement;
-    const auto& st    = work.frame.stage();
     work.frame.validate(place, p.routed, work.physical_columns, source, work.observation, exec);
-    const auto layout = place.stage.input_layout;
-    const auto bytes =
-        source ? st.sigmoid_workspace_bytes(place.peer, p, tensor ? tensor->size() : 1, layout)
-               : st.routed_workspace_bytes(place.peer, p.routed, layout);
+    const auto bytes = source ? work.workspace.source : work.workspace.service;
     run_layer(
         work, p.routed, weights.routed, source, tensor, partition, false, bytes, workspace, exec,
         [&](const LayerSource& local, ops::ExpertRoutes& routes, Tensor&, MemoryArena& arena,
@@ -802,7 +810,7 @@ void routed_exchange(const ExpertExchangeWork& work, const ops::RoutedSwiGLUProf
                        exec.device());
         require_tensor(*shared, DType::FP32, {stage.hidden, n}, 4, "shared", exec.device());
     }
-    const auto bytes = stage.routed_workspace_bytes(place.peer, p, place.stage.input_layout);
+    const auto bytes = work.workspace.service;
     run_windows(
         work, p, weights, nullptr, bytes, workspace, exec,
         [&](PendingWindow& slot, int window, MemoryArena& arena, ExpertOverlapResources*) {
@@ -830,8 +838,10 @@ public:
     ExpertExchangeWork stage(ExpertBankId bank, int columns,
                              std::span<const std::uint8_t> owners) override {
         auto& variants = frames.at(bank_frames.at(bank.index));
-        auto& pair     = variants.at(geometry_.variant(columns));
-        ExpertExchangeWork work{*pair.primary, placements.at(bank.index), columns};
+        const auto shape = geometry_.variant(columns);
+        auto& pair       = variants.at(shape);
+        ExpertExchangeWork work{*pair.primary, placements.at(bank.index), columns,
+                                workspaces.at(bank.index).at(shape)};
         work.source_owners = owners;
         if (pair.alternate) work.overlap.emplace(ExpertOverlapWork{*pair.alternate, *streams});
         return work;
@@ -844,6 +854,7 @@ public:
     std::vector<std::vector<Frames>> frames;
     std::vector<DeviceExpertPlacement> placements;
     std::vector<std::size_t> bank_frames;
+    std::vector<std::vector<ExpertWindowWorkspace>> workspaces;
     std::optional<ExpertOverlapResources> streams;
 private:
     const distributed::Group& communication_;
@@ -860,6 +871,7 @@ ResidentExchangePlan::ResidentExchangePlan(std::shared_ptr<const ExpertDomain> d
         throw std::invalid_argument("expert exchange plan requires at least one bank");
     (void)geometry_.window_columns();
     geometry_.owners = domain_->owner_count();
+    workspaces_.resize(domain_->banks.size());
     for (std::uint32_t i = 0; i < domain_->banks.size(); ++i) {
         auto make = [&](unsigned b, unsigned w) {
             return prepare_expert_exchange(group, *domain_, ExpertBankId{i}, hidden, top_k,
@@ -888,32 +900,52 @@ ResidentExchangePlan::ResidentExchangePlan(std::shared_ptr<const ExpertDomain> d
     bytes_ += payload_bytes_ * (geometry_.overlap ? 2 : 1);
 }
 
-void ResidentExchangePlan::bind_experts(ExpertBankId bank, const ops::RoutedSwiGLUProfile& profile,
-                                        ExpertInputLayout preferred) {
-    auto& st           = stages_.at(bank.index);
-    const auto prepare = [&](ExpertInputLayout layout) {
-        WorkspaceLayoutBuilder workspace;
-        expert_workspace(workspace, st, peer_, profile, layout);
-        st.input_layout = layout;
+template <class Profile>
+std::size_t ResidentExchangePlan::bind_layer(ExpertBankId bank, const Profile& profile,
+                                             unsigned lanes, ExpertInputLayout preferred) {
+    auto& st                 = stages_.at(bank.index);
+    const auto& variants     = frame_shapes_.at(bank_frames_.at(bank.index));
+    const auto check_experts = [&](ExpertInputLayout choice) {
+        for (const auto& v : variants)
+            (void)v.routed_workspace_bytes(peer_, profile.routed, choice);
+        return choice;
     };
     try {
-        prepare(preferred);
+        st.input_layout = check_experts(preferred);
     } catch (const std::invalid_argument& first) {
         try {
-            prepare(preferred == ExpertInputLayout::PacketRows ? ExpertInputLayout::TokenRoutes
-                                                               : ExpertInputLayout::PacketRows);
+            st.input_layout = check_experts(preferred == ExpertInputLayout::PacketRows
+                                                ? ExpertInputLayout::TokenRoutes
+                                                : ExpertInputLayout::PacketRows);
         } catch (const std::invalid_argument& second) {
             throw std::invalid_argument(std::string("expert kernel preparation: ") + first.what() +
                                         " / " + second.what());
         }
     }
+    std::vector<ExpertWindowWorkspace> shapes;
+    std::size_t peak = 0;
+    for (const auto& v : variants) {
+        const auto w = v.workspace(peer_, profile, lanes, st.input_layout);
+        shapes.push_back(w);
+        peak = std::max(peak, v.layer_workspace_bytes(std::max(w.source, w.service)));
+    }
+    workspaces_.at(bank.index) = std::move(shapes);
+    return peak;
 }
+
+template std::size_t ResidentExchangePlan::bind_layer(ExpertBankId, const ops::MoeProfile&,
+                                                      unsigned, ExpertInputLayout);
+template std::size_t ResidentExchangePlan::bind_layer(ExpertBankId, const ops::SigmoidMoeProfile&,
+                                                      unsigned, ExpertInputLayout);
 
 std::unique_ptr<ResidentExpertExchange>
 ResidentExchangePlan::prepare(const distributed::Group& group, const DeviceContext& device) const {
     if (group.rank() != peer_) throw std::logic_error("expert exchange prepared for another peer");
     auto out         = std::make_unique<ResidentExchange>(group, geometry_, device);
+    if (std::ranges::any_of(workspaces_, [](const auto& bank) { return bank.empty(); }))
+        throw std::logic_error("expert exchange prepared before all layer kernels were bound");
     out->bank_frames = bank_frames_;
+    out->workspaces  = workspaces_;
     auto backing     = std::make_shared<ExpertExchangeStorage>(group.device(), payload_bytes_);
     auto second      = geometry_.overlap
                            ? std::make_shared<ExpertExchangeStorage>(group.device(), payload_bytes_)

@@ -62,10 +62,8 @@ RankPreparation::RankPreparation(const artifact::Reader& reader, std::span<const
         auto plan = std::make_shared<moe::ResidentExchangePlan>(load_->rank_plan().expert_domain, *expert_group, peer,
                                 profile->config.text.hidden, profile->config.text.moe.top_k);
         const auto bind = [&](execution::MoeProfile& layer) {
-            plan->bind_experts(layer.bank, layer.math.routed, moe::ExpertInputLayout::PacketRows);
-            const auto& stage              = plan->stage(layer.bank);
-            layer.exchange_workspace_bytes = stage.layer_workspace_bytes(
-                stage.softmax_workspace_bytes(peer, layer.math, profile->local.size));
+            layer.exchange_workspace_bytes =
+                plan->bind_layer(layer.bank, layer.math, profile->local.size);
         };
         for (auto& layer : profile->text.layers) bind(layer.moe);
         if (profile->mtp) bind(profile->mtp->layer.moe);

@@ -122,7 +122,6 @@ void real_layer(distributed::WorkerConnection& c, const moe::ExpertExchangeStage
                 std::shared_ptr<const q::ModelDefinition> def) {
     auto& device       = c.device();
     const auto& group  = c.communication().group(stage.group);
-    const auto& domain = *request.rank.expert_domain;
     auto load          = q::resolve_rank_load(reader, def, request.rank, device.device());
     auto profile       = q::execution::describe_model(*def, load.weight_data(), load.expert_data(),
                                                       load.rank_plan());
@@ -139,25 +138,24 @@ void real_layer(distributed::WorkerConnection& c, const moe::ExpertExchangeStage
     // Main and MTP have different ownership/weight formats but identical physical envelopes.
     // Bind both before enqueue and reuse one frame and one caller workspace across layers.
     const auto& description = c.topology().role_group("expert", c.identity().rank);
-    std::vector<moe::DeviceExpertPlacement> placements;
+    moe::ResidentExchangePlan plan(request.rank.expert_domain, description, group.rank(),
+                                   stage.hidden, stage.top_k, {1, 1});
     std::size_t peak = 0;
-    for (const auto* p : layers) {
-        const auto st = moe::prepare_expert_exchange(description, domain, p->bank, stage.hidden,
-                                                     stage.top_k, 1);
-        placements.emplace_back(domain, st, group.rank(), d);
-        peak = std::max(peak, st.softmax_workspace_bytes(group.rank(), p->profile));
-    }
-    moe::ExpertExchange execution(placements.front().stage, group);
+    const auto bind  = [&](const moe::Parameters& p) {
+        peak = std::max(peak, plan.bind_layer(p.bank, p.profile, 1));
+    };
+    for (const auto& layer : parameters.text.layers) bind(layer.moe);
+    bind(parameters.mtp->layer.moe);
+    auto exchange = plan.prepare(group, device);
     DeviceBuffer storage(d, peak);
     MemoryArena arena(storage.span());
-    for (std::size_t index = 0; index < layers.size(); ++index) {
-        const auto* p         = layers[index];
-        const auto& placement = placements[index];
+    for (const auto* p : layers) {
         Tensor totals(obs.span(), DType::U64, {4, int(group.size())});
         const moe::LayerSource source{{x.span(), DType::BF16, {stage.hidden, 1}},
                                       {y.span(), DType::BF16, {stage.hidden, 1}},
                                       {}};
-        const moe::ExpertExchangeWork work{execution, placement, 1, &totals};
+        auto work        = exchange->stage(p->bank, 1);
+        work.observation = &totals;
         moe::resident_layer(*p, &source, &work, arena, device.execution_view());
         device.synchronize();
         std::vector<std::uint16_t> actual(inputs.size());
